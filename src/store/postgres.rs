@@ -421,7 +421,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       postgres ladder version-bumps to keep the SQLite/postgres
 //       CURRENT_SCHEMA_VERSION pinned in lockstep — this migration
 //       is a no-op DDL stub recording the version reach.
-const CURRENT_SCHEMA_VERSION: i32 = 51;
+const CURRENT_SCHEMA_VERSION: i32 = 52;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1154,6 +1154,9 @@ impl PostgresStore {
         }
         if current_version < 51 {
             self.migrate_v51().await?;
+        }
+        if current_version < 52 {
+            self.migrate_v52().await?;
         }
 
         Ok(())
@@ -2074,6 +2077,83 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v51 applied (#1255: federation_nonce_cache lives in sqlite; no-op postgres DDL)"
+        );
+        Ok(())
+    }
+
+    /// v52 (#1389) — `transcript_line_dedup` table backing the
+    /// sha256-keyed idempotency layer for the four-layer capture
+    /// architecture (L2 recover-on-boot + L3 substrate watcher +
+    /// L4 `memory_capture_turn` MCP tool). Postgres twin of the
+    /// SQLite migration at `migrations/sqlite/0044_v52_transcript_line_dedup.sql`.
+    ///
+    /// Schema parity with SQLite:
+    /// - `sha256 BYTEA NOT NULL PRIMARY KEY` — canonical dedup key.
+    /// - `memory_id TEXT NOT NULL` — created memory's id; not
+    ///   FK-constrained because the recovery paths cross adapters
+    ///   and the archive sweep may move the memory.
+    /// - `host_kind TEXT NOT NULL` — `claude-code` / `codex` /
+    ///   `gemini` / `auto`.
+    /// - `transcript_path TEXT` — file path for L2/L3; NULL for L4.
+    /// - `host_session_id TEXT`, `host_turn_index BIGINT` — L4
+    ///   request envelope fields; NULL for L2/L3.
+    /// - `recovered_at BIGINT NOT NULL` — unix epoch ms.
+    ///
+    /// Indexes mirror the SQLite migration: a partial index over
+    /// `(host_session_id, host_turn_index)` for the L4 fast-path
+    /// dedup lookup, and a `(recovered_at, host_kind)` index for
+    /// operator audit-by-time queries.
+    ///
+    /// Pure additive — `CREATE TABLE IF NOT EXISTS` + two indexes
+    /// — idempotent across re-applies.
+    async fn migrate_v52(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v52 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS transcript_line_dedup (\
+             sha256          BYTEA NOT NULL PRIMARY KEY,\
+             memory_id       TEXT NOT NULL,\
+             host_kind       TEXT NOT NULL,\
+             transcript_path TEXT,\
+             host_session_id TEXT,\
+             host_turn_index BIGINT,\
+             recovered_at    BIGINT NOT NULL\
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("create transcript_line_dedup", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_transcript_line_dedup_host_turn \
+             ON transcript_line_dedup(host_session_id, host_turn_index) \
+             WHERE host_session_id IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("create idx_transcript_line_dedup_host_turn", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_transcript_line_dedup_recovered_at \
+             ON transcript_line_dedup(recovered_at, host_kind)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("create idx_transcript_line_dedup_recovered_at", e))?;
+
+        record_schema_version(&mut tx, 52).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v52 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v52 applied (#1389: transcript_line_dedup table + indexes for layered-capture idempotency)"
         );
         Ok(())
     }

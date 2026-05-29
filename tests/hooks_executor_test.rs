@@ -265,8 +265,9 @@ while IFS= read -r _line; do printf '%s\n' '{"action":"allow"}'; done
 "#,
     );
 
-    let exec_cfg = cfg_for(exec_script, HookMode::Exec, 2_000);
-    let daemon_cfg = cfg_for(daemon_script, HookMode::Daemon, 2_000);
+    // #1400 — widen 2s → 5s; same OS-pressure class as #1208 / #1207.
+    let exec_cfg = cfg_for(exec_script, HookMode::Exec, 5_000);
+    let daemon_cfg = cfg_for(daemon_script, HookMode::Daemon, 5_000);
 
     let mut reg = ExecutorRegistry::new();
     let ex = reg.get(&exec_cfg);
@@ -305,7 +306,8 @@ cat >/dev/null
 printf '%s\n' '{"action":"deny","reason":"redact required","code":451}'
 "#,
     );
-    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
+    // #1400 — widen 2s → 5s; same OS-pressure class as #1208 / #1207.
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000));
     let r = exec
         .fire(HookEvent::PostStore, json!({}))
         .await
@@ -489,7 +491,8 @@ printf 'failure diagnostic\n' >&2
 exit 42
 ",
     );
-    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
+    // #1400 — widen 2s → 5s; same OS-pressure class as #1208 / #1207.
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
     match r {
         Err(ai_memory::hooks::ExecutorError::ChildExit { code, stderr }) => {
@@ -516,7 +519,8 @@ cat >/dev/null
 printf '%s\n' '{"action":"unknown_action_zzz"}'
 "#,
     );
-    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
+    // #1400 — widen 2s → 5s; same OS-pressure class as #1208 / #1207.
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000));
     let r = exec.fire(HookEvent::PostStore, json!({})).await;
     match r {
         Err(ai_memory::hooks::ExecutorError::Decode { reason }) => {
@@ -545,7 +549,8 @@ printf 'debug info\n' >&2
 printf '%s\n' '{"action":"allow"}'
 "#,
     );
-    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 2_000));
+    // #1400 — widen 2s → 5s; same OS-pressure class as #1208 / #1207.
+    let exec = ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000));
     let r = exec
         .fire(HookEvent::PostStore, json!({}))
         .await

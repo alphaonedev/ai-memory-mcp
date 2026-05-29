@@ -19,7 +19,7 @@ forms cleanly IMPLEMENTED at the pre-wave HEAD. The closeout campaign:
 
 1. **Cataloguer** built [`v070-feature-inventory.md`](v070-feature-inventory.md)
    — 11 open questions + canonical feature truth (453 commits ahead of
-   v0.6.4, +233,589/−23,541 lines, 73 MCP tools at release HEAD, 17
+   v0.6.4, +233,589/−23,541 lines, 74 MCP tools at release HEAD, 17
    net-new env vars, 73 HTTP routes total).
 2. **6 parallel reviewers** (security / correctness / performance /
    API-UX / docs / coverage) generated 111 raw findings → dedup'd to

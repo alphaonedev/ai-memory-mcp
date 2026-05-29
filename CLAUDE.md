@@ -2,6 +2,44 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)
+
+> **This is the substrate's first line of defense against the #1388 failure mode** (operator-agent test-plan dialog lost on tmux lockup + SIGKILL). Read this BEFORE the Required Reading list below; this rule has primacy.
+
+**When the operator gives you a multi-step directive — a numbered list, an enumerated plan, a scope statement, an "approved YES" with conditions, ANY content that establishes how you will work — your FIRST action MUST be:**
+
+```
+mcp__memory__memory_store {
+  title: "<short summary>",
+  content: "<verbatim operator message preserved>",
+  kind: "plan",
+  priority: 8 (or higher when load-bearing for ship gates),
+  namespace: "<resolved campaign / release-gate namespace>",
+  tags: ["operator-directive", "<campaign-tag>", "2026-MM-DD"],
+}
+```
+
+**No tool calls. No reasoning steps. No "I'll get started on…" stalling. `memory_store` FIRST, then everything else.**
+
+The substrate is volunteer-mode about capture — there is no automatic mechanism that catches operator directives until you call `memory_store`. Layers L2 (recover-on-boot), L3 (substrate watcher), and L4 (`memory_capture_turn` MCP tool) are the BACKSTOPS that catch the directive when L1 fails. The full layered-defense architecture is canonical in policy memory `f62cb182-7dd7-4513-80c8-bc215f5c6169` (`global/policies`, long tier, priority 10).
+
+### What counts as a "multi-step directive"
+
+- A numbered list (`1.) ... 2.) ... 3.)`).
+- An enumerated bullet plan, scope statement, or roadmap.
+- An "approved yes" / "do it" / "ship it" / "run with it" / "get it done" decision that commits the agent to a course of action.
+- A correction or scope refinement that supersedes a prior directive.
+- An architectural decision ("DO the RIGHT ARCHITECTURE", "use X not Y").
+- Anything the operator says they want PRESERVED — "document this", "keep this in mind", "do not forget this".
+
+When in doubt, store. The cost of an unused stored directive is ~0; the cost of a lost directive is what #1388 documented.
+
+### Failure mode — `memory_capture_nag` substrate watcher
+
+The substrate enforces this rule via the L1 nag watcher (`src/recover/nag.rs`): when an agent goes N turns without a `memory_store` call after a substantive user prompt, the watcher emits a stderr WARN + a `capture_lag` signed event. Operators see the lag in the audit trail. The default threshold is 5 turns; configurable via `AI_MEMORY_CAPTURE_NAG_THRESHOLD`.
+
+This rule and its enforcement are part of #1389; see also #1388 (RCA) and policy memory `f62cb182`.
+
 ## Required Reading at Session Start (AI agents)
 
 Before proposing any change to this repository, load the following into context:
@@ -216,7 +254,7 @@ release-notes intro lives under `docs/v0.7.0/release-notes.md`
 
 **ai-memory** is a Rust-based persistent memory system exposing three interfaces over a shared SQLite database layer:
 
-1. **MCP Server** (`src/mcp/`) — stdio JSON-RPC 2.0 with **73 advertised entries at `--profile full`** at v0.7.0 (72 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation, and `Profile::full().expected_tool_count()` in `src/profile.rs` for the canonical assertion). Default `--profile core` ships **7 tools** at v0.7.0 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. Plus 2 prompts (`recall-first`, `memory-workflow`).
+1. **MCP Server** (`src/mcp/`) — stdio JSON-RPC 2.0 with **74 advertised entries at `--profile full`** at v0.7.0 (72 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation, and `Profile::full().expected_tool_count()` in `src/profile.rs` for the canonical assertion). Default `--profile core` ships **7 tools** at v0.7.0 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. Plus 2 prompts (`recall-first`, `memory-workflow`).
 2. **HTTP API** (`src/handlers/`) — Axum REST server on port 9077, **87 production `.route(...)` registrations in `src/lib.rs`** at `/api/v1/` (73 unique URL paths × multiple HTTP methods per path; the 88th `.route(` at `src/lib.rs:582` is `/slow` under `#[cfg(test)]`. Multi-line-aware extraction: `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u | wc -l` = 74 including `/slow`, 73 excluding. Earlier single-line grep undercounted unique paths by 30 because `.route()` calls are formatted across multiple lines. Codegraph `codegraph_search kind=route limit=100` is the authoritative source. Count grew from v0.6.4's 73 via the #1146 sectioned-config + `config migrate` HTTP paths and the v0.7 atomisation / persona / skills / kg surface additions) (plus the bare `/metrics` Prometheus surface). Handlers split per domain under `src/handlers/{http,federation_receive,hook_subscribers,transport}.rs` (#650 partially addressed at v0.7.0; full per-domain split tracked in #650).
 3. **CLI** (`src/main.rs` thin shim + `src/daemon_runtime.rs::Command`) — clap-based, **79 top-level subcommands** at v0.7.0 release (was 40 at v0.6.4; 79 verified via `awk '/^pub enum Command/,/^}/' src/daemon_runtime.rs | grep -E '^    [A-Z]' | wc -l` — count grew from 57 at v0.7.0 dev tip via #1146 adding the `Config` subcommand for `ai-memory config migrate`, then to 58 with the #1095 `Share` subcommand, then to 63 via FX-12/ARCH-3 adding `KgQuery` / `FindPaths` / `RecallObservations` / `CheckDuplicate` / `Replay` for MCP/CLI parity build-out, then to 79 via fix/arch3-mcp-cli-parity-batch2 (FX-C3) closing every remaining applicable MCP/CLI parity deferral — `Reflect` / `Subscribe` / `Unsubscribe` / `ListSubscriptions` / `SubscriptionReplay` / `SubscriptionDlqList` / `Notify` / `Inbox` / `IngestMultistep` / `KgInvalidate` / `KgTimeline` / `EntityRegister` / `EntityGetByAlias` / `DependentsOfInvalidated` / `ReflectionOrigin` / `QuotaStatus`) with optional `--json` output (count: `--features sal` OR `--features sal-postgres` (sal-postgres implies sal in `Cargo.toml`) yields 81 by unlocking `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs:311,321` — neither is postgres-only at compile time, though `SchemaInit` performs an additional `SELECT create_graph('memory_graph')` call when the target store is Postgres + AGE; the default build ships 79)
 
@@ -567,10 +605,19 @@ Tracking issue: #198.
 **New MCP tool** (post-v0.7.0 #987, the D1.6 split landed):
 
 1. Define `<ToolName>Request` in `src/mcp/tools/<name>.rs` with
-   `#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]` +
-   `#[schemars(deny_unknown_fields)]`. Per-field doc-comments become
-   the JSON-Schema `description`s. For descriptions starting with
-   `#` (markdown heading sigil), use
+   `#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]`.
+   **Do NOT add `#[schemars(deny_unknown_fields)]` or
+   `#[serde(deny_unknown_fields)]`** — per the #1052 (Agent-4 F2)
+   wire-truthfulness decision every tool-request struct stays
+   permissive (the wire schema must not advertise
+   `additionalProperties: false` while the runtime tolerates unknown
+   fields, for wider host compat with newer field sets). The honesty
+   pin is `tests/mcp_input_schema_no_false_strict_1052.rs`;
+   re-introducing the attribute on ANY struct fails that test.
+   Required fields are still enforced by serde (a field with no
+   `#[serde(default)]` errors when missing). Per-field doc-comments
+   become the JSON-Schema `description`s. For descriptions starting
+   with `#` (markdown heading sigil), use
    `#[schemars(description = "...")]` instead of a `///` comment.
 2. Define `pub struct <ToolName>Tool` (zero-sized) and
    `impl McpTool for <ToolName>Tool` — return `name()`,
@@ -672,7 +719,7 @@ disciplines the Wave 1+2 #1174 refactor train landed:
 - **Vendor identifiers** (`"claude" | "openai" | "xai" |
   "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
   "grok" | "mistral" | "cohere" | "huggingface"`) are legitimate
-  ONLY in the 7 substrate carve-outs:
+  ONLY in the 9 substrate carve-outs:
   - `src/llm.rs` — canonical alias tables, default URLs
   - `src/config.rs` — per-vendor URL/key/model defaults
   - `src/mine.rs` — `Format::Claude` conversation-mining enum
@@ -680,6 +727,8 @@ disciplines the Wave 1+2 #1174 refactor train landed:
   - `src/cli/wrap.rs` — CLI-binary-name → `WrapStrategy` picker
   - `src/llm_cli_wrap.rs` — per-vendor CLI-binary `WrapStrategy` table (split from `src/cli/wrap.rs` per #1183)
   - `src/harness.rs` — harness vendor-variant enum
+  - `src/recover/transcript_paths.rs` — per-AI-host transcript directory router; vendor IS the routing key (#1389 L2)
+  - `src/cli/commands/recover_previous_session.rs` — per-AI-host CLI dispatcher; vendor IS the routing key (#1389 L2)
 
   Every other production-code site must read the vendor string
   from `crate::llm::*` / `crate::config::*` (e.g.
@@ -750,7 +799,7 @@ that would let the issue rot in a queue. Every gap is a defect.
 Every defect is fixed.
 
 **World-class only.** We are driving toward perfection. The
-ai-memory codebase is now substantial (73 MCP tools at `--profile
+ai-memory codebase is now substantial (74 MCP tools at `--profile
 full`, 87 production HTTP route registrations / 73 unique URL paths, 79 CLI subcommands at v0.7.0 (post FX-12/ARCH-3 + FX-C3 batch2), tens of
 thousands of lines of Rust); the architectural North Star is
 long-term code-base manageability so the codebase lasts for a

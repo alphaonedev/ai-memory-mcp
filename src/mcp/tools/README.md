@@ -51,8 +51,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// Request body for `memory_auto_tag`.
+//
+// Do NOT add `#[schemars(deny_unknown_fields)]` / `#[serde(deny_unknown_fields)]`.
+// Per the #1052 (Agent-4 F2) wire-truthfulness decision, every tool-request
+// struct stays permissive: the wire schema must not advertise
+// `additionalProperties: false` while the runtime tolerates unknown fields
+// (wider host compat for clients with newer field sets). The honesty pin is
+// `tests/mcp_input_schema_no_false_strict_1052.rs` — re-introducing the
+// attribute on ANY struct fails that test. Required fields are still enforced
+// by serde (a field with no `#[serde(default)]` errors when missing).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
 pub struct AutoTagRequest {
     /// Memory ID.
     pub id: String,

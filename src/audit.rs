@@ -128,6 +128,12 @@ pub enum AuditAction {
     Approve,
     Reject,
     SessionBoot,
+    /// L1 capture-nag (#1389 / #1398). Emitted by the MCP dispatch loop
+    /// when an agent crosses the consecutive-non-capture-tool-call
+    /// threshold without a `memory_store` / `memory_capture_turn`.
+    /// Informational (`outcome = Allow`); surfaces capture drift to the
+    /// SIEM in real time rather than at next-session recovery (L2).
+    CaptureLag,
 }
 
 impl AuditAction {
@@ -148,6 +154,7 @@ impl AuditAction {
             Self::Approve => "approve",
             Self::Reject => "reject",
             Self::SessionBoot => "session_boot",
+            Self::CaptureLag => "capture_lag",
         }
     }
 }
@@ -335,6 +342,19 @@ pub fn init_for_test(buf: std::sync::Arc<Mutex<Vec<u8>>>) {
     if let Ok(mut guard) = audit.sink.write() {
         *guard = Some(std::sync::Arc::new(sink));
     }
+}
+
+/// Process-wide lock serialising any test that installs or removes the
+/// global audit sink. The sink lives on the shared [`RuntimeContext`],
+/// so tests across modules (audit's own + the `mcp` dispatch tests that
+/// exercise `capture_lag` emission) MUST hold this for their duration or
+/// they stomp each other's buffers and hash chains.
+#[cfg(test)]
+pub(crate) fn sink_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// Test-only helper to remove the active sink so subsequent emissions
@@ -1164,10 +1184,7 @@ mod tests {
     /// concurrent test runners don't stomp on each other. Tests that
     /// touch the live SINK should hold this lock for their duration.
     fn sink_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        super::sink_test_lock()
     }
 
     /// PR-5 (issue #487) load-bearing integration test. Wire the
@@ -1194,6 +1211,7 @@ mod tests {
             AuditAction::Approve,
             AuditAction::Reject,
             AuditAction::SessionBoot,
+            AuditAction::CaptureLag,
         ];
         for (i, action) in actions.iter().copied().enumerate() {
             let id = format!("mem-{i}");

@@ -1912,10 +1912,8 @@ fn test_mcp_tools_list() {
         tools.len(),
         ai_memory::profile::Profile::full().expected_tool_count(),
         "expected the canonical full-profile tool count from \
-         `Profile::full().expected_tool_count()` = 72 at v0.7.0 \
-         (issues #224 + #311 pulled memory_share forward from v0.8 \
-         Phase 3 Memory Sharing & Sync RFC per operator directive \
-         `28860423-d12c-4959-bc8b-8fa9a94a33d9`)"
+         `Profile::full().expected_tool_count()` (SSOT-derived from the \
+         per-family tool_names slices; no hardcoded literal)"
     );
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();

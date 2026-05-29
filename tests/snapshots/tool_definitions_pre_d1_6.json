@@ -2236,6 +2236,69 @@
         "type": "object"
       },
       "name": "memory_deref"
+    },
+    {
+      "description": "L4 host-volunteered turn capture per RFC-0001 (mcp-turn-capture). Idempotent by (host_session_id, host_turn_index).",
+      "docs": "v0.7.0 #1389 L4: host volunteers each conversation turn directly via the MCP protocol. Substrate stores it idempotently and writes a signed_events row tagged layer=L4. Replaces transcript-file scraping with a clean protocol-level contract. Full design at docs/rfc/RFC-0001-mcp-turn-capture.md. Closes the #1388 substrate failure mode at the protocol layer.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "Verbatim turn text. The substrate preserves this byte-for-byte; classifiers run separately downstream via the existing atomiser / curator surface.",
+            "type": "string"
+          },
+          "host_kind": {
+            "description": "Identifier for the host implementation (e.g. `\"claude-code\"`, `\"codex\"`, `\"gemini\"`, `\"cursor\"`, `\"cline\"`). Surfaced in the audit trail + the operator-facing per-host coverage report. When omitted, defaults to `\"unknown\"`.",
+            "type": "string"
+          },
+          "host_pubkey_b64": {
+            "description": "Ed25519 pubkey the substrate should verify `host_signature_b64` against. The pubkey MUST be pre-enrolled via the existing federation peer-allowlist mechanism. Unenrolled pubkeys cause the call to fail with `HOST_PUBKEY_NOT_ENROLLED`.",
+            "type": "string"
+          },
+          "host_session_id": {
+            "description": "Opaque identifier the host issues per conversation session. Stable across turns within a session; distinct across sessions. Used as one half of the dedup key `(host_session_id, host_turn_index)`.",
+            "type": "string"
+          },
+          "host_signature_b64": {
+            "description": "Optional Ed25519 signature over the canonical-bytes encoding `host_session_id || 0x00 || host_turn_index || 0x00 || role || 0x00 || content`. When present + verified, the substrate writes `attest_level = \"signed_by_peer\"` on the resulting memory. When absent, `attest_level = \"self_signed\"`.",
+            "type": "string"
+          },
+          "host_turn_index": {
+            "description": "Monotonically increasing per-`(host_session_id)` turn counter. Starts at 0 for the first turn. The substrate uses `(host_session_id, host_turn_index)` as the canonical dedup key so re-delivery of the same turn is idempotent.",
+            "type": "integer"
+          },
+          "host_version": {
+            "description": "Version string for the host implementation. Surfaced in the audit trail so future format drift can be diagnosed by host version.",
+            "type": "string"
+          },
+          "metadata": {
+            "description": "Optional arbitrary metadata the host wants to preserve alongside the turn. Reserved keys (`agent_id`, `entity_id`, `mentioned_entity_id`) follow the existing `crate::validate::RequestValidator` rules."
+          },
+          "namespace": {
+            "description": "Substrate namespace the turn lands in. Defaults to the agent's resolved default namespace per the calling context.",
+            "type": "string"
+          },
+          "role": {
+            "description": "Speaker classification — `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
+            "type": "string"
+          },
+          "timestamp_iso": {
+            "description": "RFC3339 instant the host emitted the turn. Used as the recovered memory's `created_at` so the timeline matches the original conversation rather than the capture-call wall-clock. When omitted, the substrate stamps with its current clock.",
+            "type": "string"
+          },
+          "tool_calls": {
+            "description": "Optional summary of tool invocations within this assistant turn. Each entry is `{tool: string, brief: string}`. The substrate preserves the list verbatim but does not (at v0.7.0) classify or index per-tool-call.",
+            "type": "array"
+          }
+        },
+        "required": [
+          "content",
+          "host_session_id",
+          "host_turn_index",
+          "role"
+        ],
+        "type": "object"
+      },
+      "name": "memory_capture_turn"
     }
   ],
   "toolsVersion": "2026-05-06"

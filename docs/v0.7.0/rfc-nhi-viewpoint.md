@@ -2,7 +2,7 @@
 
 > **Forward note (2026-05-22, DOC-F audit).** This RFC was authored at
 > the `3cdec59` mid-cycle HEAD when the substrate was at 71 callable
-> tools. By v0.7.0 release HEAD the substrate is at **73 tools at
+> tools. By v0.7.0 release HEAD the substrate is at **74 tools at
 > `--profile full`** (72 callable memory tools + the always-on
 > `memory_capabilities` bootstrap). Where the body below references
 > "71 tools" or "71 across 8 families" the historical count is

@@ -197,38 +197,20 @@ mod tests {
     /// `tool_definitions()` regressions that would silently hide other
     /// failures.
     #[test]
-    fn table_has_51_entries_matching_tool_definitions_count() {
+    fn table_entry_count_matches_full_profile() {
         // v0.7.0 refactor PR-2 (#793) — tool-count SSOT. Anchor the
-        // assertion on `Profile::full().expected_tool_count()` rather
-        // than a hardcoded literal so adding a new MCP tool touches
-        // ONE site (the per-Family `expected_tool_count` arm) instead
-        // of N hardcoded assertions across the codebase.
+        // assertion on `Profile::full().expected_tool_count()` (derived
+        // from the per-Family `tool_names` slices) rather than a
+        // hardcoded literal, so adding a new MCP tool touches ONE site
+        // (the family slice) instead of N assertions across the
+        // codebase.
         let n = tool_sizes().len();
         let expected = crate::profile::Profile::full().expected_tool_count();
         assert_eq!(
             n, expected,
-            "expected exactly {expected} tools (v0.6.3.1 baseline 43 + v0.7.0 I4 \
-             `memory_replay` + v0.7 H4 `memory_verify` + v0.7 B1 \
-             `memory_load_family` + v0.7 B2 `memory_smart_load` + v0.7 K7 \
-             `memory_subscription_replay` + `memory_subscription_dlq_list` \
-             + v0.7 J7 `memory_find_paths` + v0.7 K8 `memory_quota_status` \
-             + v0.7.0 Task 4/8 `memory_reflect` + v0.7.0 L2-2 \
-             `memory_reflection_origin` + v0.7.0 L2-3 \
-             `memory_dependents_of_invalidated` + v0.7.0 issue #691 \
-             `memory_check_agent_action` + `memory_rule_list` + v0.7.0 L1-5 \
-             `memory_skill_register` + `memory_skill_list` + \
-             `memory_skill_get` + `memory_skill_resource` + \
-             `memory_skill_export` + v0.7.0 L2-6 \
-             `memory_skill_promote_from_reflection` + v0.7.0 L2-7 \
-             `memory_skill_compositional_context` + v0.7.0 QW-1 \
-             `memory_export_reflection` + v0.7.0 QW-3 follow-up \
-             `memory_offload` + `memory_deref` + v0.7.0 WT-1-C \
-             `memory_atomise` + v0.7.0 QW-2 `memory_persona` + \
-             `memory_persona_generate` + v0.7.0 Form 3 \
-             `memory_ingest_multistep` + v0.7.0 Form 5 (issue #758) \
-             `memory_calibrate_confidence`, source-anchored at \
-             crate::mcp::registry::tool_definitions); got {n}. If the count changed, \
-             update the family map and this assertion together."
+            "tool_sizes() must hold exactly {expected} tools (the full-profile \
+             SSOT count); got {n}. If these diverge, a tool was added to one \
+             surface but not the other."
         );
     }
 

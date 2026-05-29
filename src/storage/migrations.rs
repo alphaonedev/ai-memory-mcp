@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 51).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 52).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -17,6 +17,11 @@
 //! `FederationNonceCache` LRU persists across daemon restarts —
 //! pre-#1255 every restart opened a fresh replay window for any
 //! `(body, sig, nonce)` tuple captured before the restart.
+//! v52 (#1389) adds the `transcript_line_dedup` table backing the
+//! sha256-keyed idempotency layer for the four-layer capture
+//! architecture (L2 recover-on-boot + L3 substrate watcher + L4
+//! `memory_capture_turn` MCP tool). Closes the #1388 substrate
+//! failure mode at the storage layer.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -529,7 +534,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       column in the migration arm. NSA CSI mapping: recommendation
 //       (c) — defense-in-depth blast-radius controls on a compromised
 //       or misbehaving agent.
-const CURRENT_SCHEMA_VERSION: i64 = 51;
+const CURRENT_SCHEMA_VERSION: i64 = 52;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -888,6 +893,14 @@ const MIGRATION_V50_SQLITE: &str =
 // + two indexes — fully idempotent.
 const MIGRATION_V51_SQLITE: &str =
     include_str!("../../migrations/sqlite/0043_v51_federation_nonce_cache.sql");
+// v0.7.0 #1389 — `transcript_line_dedup` table backing the
+// sha256-keyed idempotency layer for the four-layer capture
+// architecture (L2 recover-on-boot + L3 substrate watcher + L4
+// `memory_capture_turn` MCP tool). Closes the #1388 substrate
+// failure mode at the storage layer. Pure additive — one
+// `CREATE TABLE IF NOT EXISTS` + two indexes — fully idempotent.
+const MIGRATION_V52_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0044_v52_transcript_line_dedup.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2131,6 +2144,16 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // migration is replay-safe even if the operator
             // hand-rolled the table earlier.
             conn.execute_batch(MIGRATION_V51_SQLITE)?;
+        }
+        if version < 52 {
+            // v0.7.0 #1389 — `transcript_line_dedup` table for
+            // sha256-keyed idempotency across the four-layer
+            // capture architecture (L2 recover-on-boot + L3
+            // substrate watcher + L4 `memory_capture_turn` MCP
+            // tool). Closes the #1388 substrate failure mode at
+            // the storage layer. `CREATE TABLE IF NOT EXISTS` so
+            // the migration is replay-safe.
+            conn.execute_batch(MIGRATION_V52_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

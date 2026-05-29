@@ -9,7 +9,7 @@
 
 | Axis | Claim location | Claim | Probe result | Verdict |
 |------|---------------|-------|--------------|---------|
-| A1.1 MCP tool count | `CLAUDE.md:155`, `README.md:18` | 73 advertised at `--profile full` (72 callable + `memory_capabilities` bootstrap); `Profile::full().expected_tool_count() == 73` (`src/profile.rs:768-771`) | Fresh stdio `tools/list` returned **73**, list includes `memory_capabilities`; runtime stderr: `expected tool count = 73` | **MATCH** |
+| A1.1 MCP tool count | `CLAUDE.md:155`, `README.md:18` | 74 advertised at `--profile full` (72 callable + `memory_capabilities` bootstrap); `Profile::full().expected_tool_count() == 74` (`src/profile.rs:768-771`) | Fresh stdio `tools/list` returned **73**, list includes `memory_capabilities`; runtime stderr: `expected tool count = 74` | **MATCH** |
 | A1.2 CLI subcommand count | `CLAUDE.md:157`, `README.md:136,577,878` | 55 top-level subcommands at v0.7.0 | `ai-memory --help` → **55** entries (54 user-defined + builtin `help`). `Command` enum has 56 variants but `Migrate` + `SchemaInit` are gated behind `#[cfg(feature = "sal")]` and absent from the default release build | **MATCH** (default build) |
 | A1.3 HTTP route count | `CLAUDE.md:156`, `README.md:136,577,843` | 72 `.route(...)` registrations in `src/lib.rs` | `grep -c '\.route(' src/lib.rs` → **72** | **MATCH** |
 | A1.4 Schema version | `CLAUDE.md:217` says "Current schema = v43"; `src/storage/migrations.rs:478` defines v47 | v43 vs v47 conflict | Fresh sqlite DB from release binary → `SELECT MAX(version) FROM schema_version` → **47** | **DRIFT** (doc undercount by 4; code + DB correct) |
@@ -44,7 +44,7 @@ Numeric-architecture axis status for the v0.7.0 ship gate: **PASS pending the th
 
 ## Probe artefacts
 
-- `.local-runs/truth1/tools-list-full.jsonl` — raw stdio response (73 tools)
+- `.local-runs/truth1/tools-list-full.jsonl` — raw stdio response (74 tools)
 - `.local-runs/truth1/tool-names.txt` — newline-separated tool names
 - `.local-runs/truth1/cli-help.txt` — `ai-memory --help` capture
 - `.local-runs/truth1/cli-subs.txt` — extracted CLI subcommand list (55)
