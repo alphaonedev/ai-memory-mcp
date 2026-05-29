@@ -49,6 +49,8 @@ Every property in this section was identified during the v0.7.0 codegraph-anchor
 
 Every commitment in §§7–18 below must strengthen one or more of these seven properties or be reclassified.
 
+Prior art on cognitive architectures for language agents (Sumers et al., TMLR 02/2024)[^2] organizes language agents around modular memory, structured action space, and a generalized decision procedure. The substrate's properties below derive from the moonshot synthesis, not from this framework. A mapping with code anchors is documented at [`docs/strategy/coala-mapping.md`](docs/strategy/coala-mapping.md) for readers familiar with the literature. Where the two frame the same primitive differently, the moonshot wins.
+
 ### 2.1 Endpoint-resident
 
 The substrate runs at the point of contact, not at a centralized API boundary above it.
@@ -1048,6 +1050,8 @@ Apache 2.0. Forever. Endpoint-resident. Cognitively governed. Bias-displaced by 
 
     **Single-author bias caveat.** This roadmap revision was authored by Claude Opus 4.7. Two of three sources cited above are by Anthropic researchers; the third is by an Anthropic co-founder. The author cannot self-audit the bias surface created by citing one's own model family's research as evidence for the substrate's framing. The [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) heterogeneous evaluator panel methodology is the structural mechanism by which this bias surface becomes visible. Evaluators from non-Anthropic model families should explicitly flag whether the framing over-weights Anthropic-authored evidence relative to comparable work from OpenAI, xAI, DeepMind, or academic interpretability groups. If the panel concludes the framing is Anthropic-leaning in ways the author could not see, citations should be broadened or weighting adjusted.
 
+[^2]: Sumers, T. R., Yao, S., Narasimhan, K., & Griffiths, T. L. (2024). Cognitive Architectures for Language Agents. *Transactions on Machine Learning Research*. arXiv:2309.02427. Cited in §2 for the narrow purpose of acknowledging prior art on cognitive-architecture organization of language agents. The substrate's seven properties derive from the moonshot synthesis; CoALA is a retrospective organizing lens, not a constraint. The full mapping is documented at [`docs/strategy/coala-mapping.md`](docs/strategy/coala-mapping.md). The mapping carries no commitments and does not modify the §3 scope test.
+
 ---
 
 *Cleared hot. Stack is laid. Ship the OSS. Forever.*
@@ -1058,5 +1062,6 @@ Apache 2.0. Forever. Endpoint-resident. Cognitively governed. Bias-displaced by 
 - *2026-04-29 (initial): consolidated charter-set roadmap.*
 - *2026-05-21 (consolidation): ROADMAP2.md retired into ROADMAP.md per operator directive.*
 - *2026-05-25 (moonshot-aligned): full-spectrum revision aligning every section with [`docs/strategy/moonshot-synthesis.md`](docs/strategy/moonshot-synthesis.md). Added §0 anchor, §1 moonshot, §2 seven properties, §3 scope test, §4 substrate-is-not, §5 open structural gap, §6 trajectory. Re-evaluated v0.8 §11.4 against scope test; relocated §11.4.F WebSocket viewer + §11.4.G schema-change methodology to sibling repos (§13). Upgraded §11.4.C vLLM and §11.4.D model attestation to load-bearing. Added per-release §2 property contributions throughout §11. Added §13 sibling repositories. Added §15 OSS permanence clause 5 (no frontier-lab acquisition). Updated §17 quality gates with §2 property declaration discipline + heterogeneous AI NHI panel review for major versions. Added footnote [^1] with external evidence and single-author bias caveat. Renumbered all sections.*
+- *2026-05-27 (CoALA prior-art citation): added one paragraph in §2 introduction and footnote [^2] citing Sumers et al. 2024. Created [`docs/strategy/coala-mapping.md`](docs/strategy/coala-mapping.md) as the authoritative mapping document. Updated [`docs/positioning.md`](docs/positioning.md) with a "Relationship to CoALA" section. No substrate code changes. No commitments added or modified. No §2 properties changed. No §3 scope test modifications. The §3 scope test rejected three larger proposals (full §2.8 subsection, inline release-notes reframing at §11.4.D and §22, `coala` block in capabilities-v3) for failing to strengthen any §2 property; this minimal citation-only change is the disposition that passes scope test.*
 
 *End of roadmap.*
