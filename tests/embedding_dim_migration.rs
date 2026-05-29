@@ -43,23 +43,33 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
 mod common;
+use common::postgres_env::PublicSchemaLock;
 use common::postgres_url;
 
-/// Process-wide async mutex serializing the 3 dim-migration tests in
-/// this binary against a shared postgres scratch DB.
-///
-/// v0.7.0 ship-hardening (2026-05-19): the tests each call
-/// `reset_schema` then bootstrap the schema at their target dim.
-/// Without serialization they race: test A drops tables, test B drops
-/// (no-op), test B bootstraps at 768, test A bootstraps at 384 — but
-/// `connect_with_dim` is a NO-OP on an existing schema, so test A sees
-/// 768 from test B's bootstrap and asserts fail. The race was
-/// observable but uncommon until the connect-time advisory lock
-/// (`MIGRATION_ADVISORY_LOCK_KEY`) introduced a small queueing delay
-/// that widened the interleaving window. Holding this mutex from
-/// `reset_schema` through the assertion keeps each test's
-/// (reset → bootstrap → verify) sequence atomic relative to peers.
-static SUITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Issue #1381 (2026-05-28): the three tests in this file exercise
+// substrate paths that are HARDCODED to probe + mutate
+// `public.memories` (see `current_embedding_dim` at
+// `src/store/postgres.rs:2782` — the `n.nspname = 'public'` filter
+// is intentional). Per-test schema isolation via `PostgresTestEnv`
+// does NOT fit this file, because the substrate's auto-migrate
+// path would still target `public.memories` regardless of the
+// test's `search_path`.
+//
+// Instead, every `#[tokio::test]` here acquires the cross-process
+// `PublicSchemaLock` (defined in `tests/common/postgres_env.rs`) at
+// the top of the body. The lock serialises ownership of
+// `public.memories` across every parallel test binary in the same
+// `cargo test --features sal,sal-postgres` invocation, not just
+// the three tests in this file — that is the actual race the
+// pre-#1381 in-process `tokio::sync::Mutex` could not close,
+// because a sibling test binary (e.g. `migrate_links_roundtrip`)
+// running in parallel would still race us on `public.memories`.
+//
+// `current_dim` is ALSO scoped to `n.nspname = 'public'` so a
+// stale `memories` relation in `ic_alice`/`ic_bob`/etc on the
+// LAN-parity stack does NOT shadow our reset → bootstrap sequence
+// (the pre-#1381 unscoped probe surfaced whichever schema's
+// row Postgres picked first by oid, often the wrong one).
 
 /// Drop ai-memory tables so each test gets a fresh schema. The postgres
 /// fixture is shared across tests in the suite, so we tear down the
@@ -103,10 +113,17 @@ async fn inspection_pool(url: &str) -> PgPool {
 }
 
 async fn current_dim(pool: &PgPool) -> Option<i32> {
+    // Issue #1381: scope to `public.memories` so a sibling
+    // `<other_schema>.memories` (e.g. the LAN-parity stack's
+    // long-lived `ic_alice`/`ic_bob` daemon schemas or any other
+    // test binary's residual schema) does NOT shadow the dim we
+    // just bootstrapped into `public`. Mirrors the substrate's own
+    // probe at `src/store/postgres.rs:2787` (`current_embedding_dim`).
     sqlx::query_scalar::<_, i32>(
         "SELECT atttypmod FROM pg_attribute a
          JOIN pg_class c ON c.oid = a.attrelid
-         WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public' AND c.relname = 'memories' AND a.attname = 'embedding'",
     )
     .fetch_optional(pool)
     .await
@@ -122,7 +139,11 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
-    let _guard = SUITE_LOCK.lock().await;
+    // Issue #1381: cross-process serialise on `public.memories`
+    // ownership so a sibling test binary's bootstrap can't race us.
+    let _public_lock = PublicSchemaLock::acquire()
+        .await
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let inspect = inspection_pool(&url).await;
     reset_schema(&inspect).await;
@@ -179,7 +200,9 @@ async fn auto_migrate_no_op_when_fresh_schema_already_matches() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
-    let _guard = SUITE_LOCK.lock().await;
+    let _public_lock = PublicSchemaLock::acquire()
+        .await
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let inspect = inspection_pool(&url).await;
     reset_schema(&inspect).await;
@@ -210,7 +233,9 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
-    let _guard = SUITE_LOCK.lock().await;
+    let _public_lock = PublicSchemaLock::acquire()
+        .await
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let inspect = inspection_pool(&url).await;
     reset_schema(&inspect).await;
