@@ -17,7 +17,9 @@ See [`prompt.md`](./prompt.md) §0 for the full heterogeneity-as-design argument
 
 | Evaluator | Provider | Report | Status |
 |---|---|---|---|
-| Claude Opus 4.7 | Anthropic | [`report-claude-opus-4-7.md`](./report-claude-opus-4-7.md) | **Phase 1 in progress** (begins immediately upon issue open) |
+| Claude Opus 4.7 (v1) | Anthropic | [`report-claude-opus-4-7.md`](./report-claude-opus-4-7.md) | Phase 1 initial — 2026-05-24 |
+| Claude Opus 4.7 (v2) | Anthropic | [`report-claude-opus-4-7-v2.md`](./report-claude-opus-4-7-v2.md) | Phase 1 re-run — 2026-05-25 (isolated DB, curator LIVE) |
+| Claude Opus 4.7 (v3) | Anthropic | [`report-claude-opus-4-7-v3.md`](./report-claude-opus-4-7-v3.md) | **2026-05-28 re-run post-FX-12/FX-C3/ARCH-2 + ship-gate fixes, HEAD `be3347d70`; SHIP verdict; 22 probes, 15 LIVE; filed D-v3-1/2/3 + observation O-v3-1 (historical chain-break at seq=28 — substrate-correct)** |
 | GPT 5.5 | OpenAI | [`report-gpt-5-5.md`](./report-gpt-5-5.md) | Awaiting independent execution |
 | Grok 4.3 | xAI | [`report-grok-4-3.md`](./report-grok-4-3.md) | Awaiting independent execution |
 
