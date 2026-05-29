@@ -621,7 +621,7 @@ sig+nonce, permissions enforce, SSRF DNS-fail-CLOSED, governance
 fail-CLOSED, passphrase strict-perms) with their staged-rollout
 opt-out env vars.
 
-Schema migrations (sqlite v20 → v50, postgres v15 → v50 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 50` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration files are [`migrations/sqlite/0042_v50_per_namespace_quota.sql`](../migrations/sqlite/0042_v50_per_namespace_quota.sql) (sqlite splits per-bump, file-name counter ≠ logical version) and the postgres in-process `migrate_v50()` arm (postgres runs a single greenfield+upgrade pair, with v34 → v50 deltas applied through in-process `migrate_v34()` … `migrate_v50()` async functions).
+Schema migrations (sqlite v20 → v51, postgres v15 → v51 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 51` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration files are [`migrations/sqlite/0043_v51_federation_nonce_cache.sql`](../migrations/sqlite/0043_v51_federation_nonce_cache.sql) (sqlite splits per-bump, file-name counter ≠ logical version) and the postgres in-process `migrate_v51()` arm (postgres runs a single greenfield+upgrade pair, with v34 → v51 deltas applied through in-process `migrate_v34()` … `migrate_v51()` async functions).
 
 **Per-bump narrative for the post-v34 sqlite ladder (every operator MUST back up to a sibling `.bak` before `ai-memory serve` first-touches the DB, because the daemon will silently traverse all 15 of these bumps on first open):**
 
@@ -642,6 +642,7 @@ Schema migrations (sqlite v20 → v50, postgres v15 → v50 logical) run automat
 - **v48** — `federation_push_dlq` table + dispatch indices (#933).
 - **v49** — `archived_memories` full v0.7.0 column carry: 14 nullable columns added so archive → restore is lossless for the full v0.7.0 Memory shape on both backends (`reflection_depth`, `atomised_into`, `atom_of`, `memory_kind`, `entity_id`, `persona_version`, `citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`, `confidence_decayed_at`, `mentioned_entity_id`, `version`; #1025).
 - **v50** — per-namespace K8 quota dimension extension (#1156): `agent_quotas` PRIMARY KEY extended from `(agent_id)` to `(agent_id, namespace)` so per-namespace quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel namespace, preserving pre-v50 row accounting verbatim. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Postgres mirror via `migrate_v50()` runs `ALTER TABLE agent_quotas ADD COLUMN namespace TEXT NOT NULL DEFAULT '_global'` + PK swap + supporting index.
+- **v51** — federation nonce cache persistence (#1255 / PR #1296): adds the `federation_nonces` table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so a daemon restart re-opened a replay window equal to the maximum `X-Memory-Nonce` age tolerated by `AI_MEMORY_FED_REQUIRE_NONCE`. v51 persists the LRU to disk so the replay window collapses to zero across restarts. Postgres mirror via `migrate_v51()` runs the equivalent `CREATE TABLE federation_nonces` + indices.
 
 **Operator advisory.** Before the first `ai-memory serve` against a v0.6.4-era DB, run:
 
@@ -651,7 +652,7 @@ sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 'PRAGMA schema_version
   > /dev/null && echo "backup verified readable"
 ```
 
-The ladder is idempotent on restart but not reversible — once `schema_version` reaches 49, you cannot downgrade to v34 in place; restore from the `.bak` file if you need to roll back to v0.6.4.
+The ladder is idempotent on restart but not reversible — once `schema_version` reaches 51, you cannot downgrade to v34 in place; restore from the `.bak` file if you need to roll back to v0.6.4.
 
 ---
 

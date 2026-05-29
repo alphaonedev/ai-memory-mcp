@@ -118,7 +118,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   -d '{"title":"hello","content":"first HTTP memory","tier":"mid"}'</code></pre>
 
   <h3>CLI &mdash; clap subcommands</h3>
-  <div class="if-tabs"><span class="if-tab cli">57 subcommands at --features sal-postgres (55 default-build), all support --json</span></div>
+  <div class="if-tabs"><span class="if-tab cli">79 subcommands in default build (81 with --features sal or --features sal-postgres), all support --json</span></div>
   <pre><code>ai-memory store --title hello --content "first CLI memory" --tier mid
 ai-memory recall "hello"
 ai-memory stats --json | jq .</code></pre>
@@ -264,7 +264,7 @@ ai-memory serve</code></pre>
     <a href="../DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Full reference</span></a>
     <a href="../USER_GUIDE.md"><strong>MCP tool reference</strong><span class="desc">73 entries at --profile full</span></a>
     <a href="../API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">87 routes (73 unique paths)</span></a>
-    <a href="../CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">58 subcommands</span></a>
+    <a href="../CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">79 subcommands</span></a>
     <a href="../agent-identity.html"><strong>Agent identity</strong><span class="desc">NHI semantics</span></a>
     <a href="../hook-pipeline.md"><strong>Hook pipeline</strong><span class="desc">20 events</span></a>
     <a href="../knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links + temporal validity</span></a>

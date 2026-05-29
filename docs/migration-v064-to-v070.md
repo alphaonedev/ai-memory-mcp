@@ -18,7 +18,7 @@
 
 ## 1. TL;DR migration verdict
 
-- **What changes.** The sqlite schema jumps from **v15 → v50** — 11 new columns
+- **What changes.** The sqlite schema jumps from **v15 → v51** — 11 new columns
   on the `memories` table (citations, source URIs, byte-range spans, memory
   kind, entity id, persona version, confidence provenance + signals + decay
   stamp, optimistic-concurrency `version`, plus the QW-2 `auto_persona_entity_id`
@@ -136,7 +136,7 @@ ai-memory start
 ```
 
 That's it. The first `ai-memory start` after the upgrade walks the schema
-ladder v15 → v50 against your DB in place. It's idempotent — if you Ctrl-C
+ladder v15 → v51 against your DB in place. It's idempotent — if you Ctrl-C
 during the migration, restart and the unfinished bumps resume from where they
 stopped.
 
@@ -226,7 +226,9 @@ Expected log lines, in rough order:
 [INFO] migration v42 applied (auto_persona_entity_id: 89 rows scanned, 17 backfilled)
 …
 [INFO] migration v49 applied (archived_memories full carry)
-[INFO] schema_version=49 — ladder complete
+[INFO] migration v50 applied (agent_quotas per-namespace PK)
+[INFO] migration v51 applied (federation_nonces persistence)
+[INFO] schema_version=51 — ladder complete
 [INFO] HTTP API listening on 127.0.0.1:9077
 [INFO] MCP stdio dispatch ready
 ```
@@ -306,7 +308,7 @@ upgrade path differs because schema bumps land via the `ai-memory schema-init
 --upgrade` command rather than via the daemon's first-boot ladder.
 
 **Read [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) for the
-full runbook.** It covers schema-init upgrades, the v15→v28→v49 paths, the
+full runbook.** It covers schema-init upgrades, the v15→v28→v51 paths, the
 AGE projection prime, and the cutover dance.
 
 ### 5.1 Executive summary (do not skip the full doc)
@@ -325,7 +327,7 @@ AGE projection prime, and the cutover dance.
      --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory \
      --upgrade
    ```
-   This walks the postgres ladder up to schema v50 idempotently, preserving
+   This walks the postgres ladder up to schema v51 idempotently, preserving
    data.
 5. **Verify schema parity:**
    ```bash
@@ -346,7 +348,7 @@ AGE projection prime, and the cutover dance.
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
 Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
-the SAL boundary is byte-stable across both backends at schema v50.
+the SAL boundary is byte-stable across both backends at schema v51.
 
 ---
 
@@ -356,7 +358,7 @@ This section walks the 11 new columns on the `memories` table and the WHY
 behind each. The detailed call-out paragraphs follow the summary table.
 Schema-deep readers, see
 [`MIGRATION_v0.7.md` §"Per-bump narrative"](MIGRATION_v0.7.md) for the v34 →
-v49 ladder.
+v51 ladder.
 
 ### Summary table
 
@@ -406,7 +408,7 @@ And new tables (opt-in / empty if you never use the feature): `signed_events` (V
 
 **6.11 `version`** (v45, Provenance Gap 1 / #884). Optimistic-concurrency counter. Bumped on every `memory_update`. Two callers writing against the same `expected_version` race one winner; the loser receives a typed CONFLICT envelope naming the current version. v0.6.4 was last-writer-wins and quietly destroyed concurrent edits.
 
-The bump-by-bump v34 → v50 narrative lives in
+The bump-by-bump v34 → v51 narrative lives in
 [`MIGRATION_v0.7.md` §"Upgrade steps"](MIGRATION_v0.7.md).
 
 ---
@@ -415,7 +417,7 @@ The bump-by-bump v34 → v50 narrative lives in
 
 > **Rollback loses every memory you wrote while on v0.7.0.** The pre-upgrade
 > backup is the only readable v0.6.4-shaped database you have; once v0.7.0
-> migrates the original, the original is at v49 and v0.6.4 can't open it.
+> migrates the original, the original is at v51 and v0.6.4 can't open it.
 > Plan for this — don't migrate until you have a backup and a stop-the-world
 > plan.
 
@@ -601,7 +603,7 @@ directly) fails because it expects a v0.7.0 column that isn't there.
 
 **Cause:** The schema migration didn't run. Most likely you copied the
 v0.7.0 binary in place but never started it against the DB, OR the
-migration aborted partway and the daemon never reached v49.
+migration aborted partway and the daemon never reached v51.
 
 **Fix:**
 ```bash
@@ -789,7 +791,7 @@ If you relied on the v0.6.4 default-permissive posture, opt back in via
 **Yes.** v0.7.0 ships a bidirectional migration tool (`ai-memory migrate
 --from sqlite:///… --to postgres://…`). The recommended order is: upgrade
 the sqlite-backed daemon to v0.7.0 first (so both sides converge on schema
-v49), then run the cross-backend migration. The postgres guide has the
+v51), then run the cross-backend migration. The postgres guide has the
 full runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md).
 
 ### Q8. The first boot is taking forever. Is it stuck?
@@ -809,7 +811,7 @@ bump is atomic.
 ## See also
 
 - [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) — the deep technical migration
-  guide (per-form notes, every env var, the v34→v49 ladder narrative).
+  guide (per-form notes, every env var, the v34→v51 ladder narrative).
 - [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — the
   sqlite → postgres + Apache AGE runbook.
 - [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md) — full release notes

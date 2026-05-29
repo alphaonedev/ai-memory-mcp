@@ -35,24 +35,25 @@ identically on either backend.
 ## Schema parity status (v0.7.0)
 
 As of v0.7.0 release (post Wave 2 + ship-readiness cascade), both
-backends sit at **schema_version=50**. The full v16 → v50 ladder
+backends sit at **schema_version=51**. The full v16 → v51 ladder
 on the postgres side covers: governance inheritance, webhook
 subscriptions, audit chain, transcripts, signed events with the
 V-4 cross-row hash chain (#698), agent quotas, link `attest_level`,
 A2A correlation, smart-load veto, KG temporal-index v2,
 tier-promotion metadata, subscription DLQ, `consolidated_from_agents`
-array, plus the v34 → v50 deltas (recursive-learning depth
+array, plus the v34 → v51 deltas (recursive-learning depth
 columns, Batman Form-4/5 provenance + confidence-calibration
 columns, optimistic-concurrency `version` column at v45,
 `federation_push_dlq` table at v48, archive_memories +14
-columns at v49, per-namespace K8 quota dimension at v50 #1156).
-The v34 → v50 deltas land via in-process
-`migrate_v34() … migrate_v50()` async functions invoked by
+columns at v49, per-namespace K8 quota dimension at v50 #1156,
+`federation_nonces` persistence table at v51 #1255 / PR #1296).
+The v34 → v51 deltas land via in-process
+`migrate_v34() … migrate_v51()` async functions invoked by
 `schema-init --upgrade`; they are NOT separate `.sql` files.
 
 If you migrated from sqlite to postgres on v0.7-alpha, your
 postgres db is at v15. Run `ai-memory schema-init --upgrade`
-against v0.7.0 (see "In-place v15 → v50" below) before
+against v0.7.0 (see "In-place v15 → v51" below) before
 pointing a v0.7.0 daemon at it.
 
 ## Pre-flight checklist
@@ -74,8 +75,8 @@ Before you start:
   sqlite3 ~/.local/share/ai-memory/memory.db \
     "SELECT user_version FROM pragma_user_version;"
   ```
-  If this is **less than 49**, upgrade first: start `ai-memory serve`
-  briefly against the sqlite db (it auto-migrates on connect to v49),
+  If this is **less than 51**, upgrade first: start `ai-memory serve`
+  briefly against the sqlite db (it auto-migrates on connect to v51),
   then stop it. The postgres side won't accept a partial migration.
 
 ## Step 1 — Bootstrap the postgres schema
@@ -86,7 +87,7 @@ ai-memory schema-init \
 ```
 
 Idempotent on rerun. Exit code 0 + `schema-init complete:
-schema_version=49, kg_backend=AGE` is the success signal.
+schema_version=51, kg_backend=AGE` is the success signal.
 
 ## Step 2 — Dry-run the migration
 
@@ -105,7 +106,7 @@ The dry-run reports:
 - Estimated migration time (back-of-envelope: ~5k rows / sec on a
   modern dev laptop; pgvector HNSW build time scales with corpus
   size, dominates the post-import phase).
-- Schema parity check — confirms both sides are at v49.
+- Schema parity check — confirms both sides are at v51.
 
 Read the report. Investigate any "WARN" line before proceeding.
 
@@ -229,10 +230,10 @@ Same dry-run / verify dance. Useful for:
   surfaces (the migration is lossless either direction at v0.7.0
   schema parity).
 
-## In-place v15 → v50 (postgres → postgres on the same host)
+## In-place v15 → v51 (postgres → postgres on the same host)
 
 If you're upgrading an existing v0.7-alpha postgres db (schema v15)
-to v0.7.0.s v49 parity:
+to v0.7.0's v51 parity:
 
 ```bash
 ai-memory schema-init \
@@ -240,7 +241,7 @@ ai-memory schema-init \
   --upgrade
 ```
 
-`schema-init --upgrade` walks the v15 → v50 deltas idempotently (the v34 → v50 layer lands via in-process `migrate_v34()…migrate_v50()` async functions invoked by `--upgrade`).
+`schema-init --upgrade` walks the v15 → v51 deltas idempotently (the v34 → v51 layer lands via in-process `migrate_v34()…migrate_v51()` async functions invoked by `--upgrade`).
 Existing data is preserved; only DDL changes. The migration tool's
 `--in-place` mode is the moral equivalent — pick whichever fits your
 workflow.

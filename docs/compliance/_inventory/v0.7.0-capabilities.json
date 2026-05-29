@@ -5,9 +5,9 @@
   "verification_commit_sha": "4add7a8528d4c16d696b391ec6e2890269669a84",
   "verification_branch": "release/v0.7.0",
   "schema_version_sqlite": 50,
-  "schema_version_postgres": 50,
+  "schema_version_postgres": 51,
   "parity_test": "tests/postgres_schema_parity.rs::schema_versions_match_across_adapters",
-  "schema_authority_source": "src/storage/migrations.rs — const CURRENT_SCHEMA_VERSION: i64 = 50",
+  "schema_authority_source": "src/storage/migrations.rs:532 — const CURRENT_SCHEMA_VERSION: i64 = 51",
   "test_counts": {
     "total_test_attributes": 6961,
     "lib_tests": 4830,
@@ -446,7 +446,7 @@
         "src/validate.rs:852 (validate_update free fn)"
       ],
       "issue_references": ["#966"],
-      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 87 HTTP routes, 74 MCP tools, and 58 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
+      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 87 HTTP routes, 74 MCP tools, and 79 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
       "verified_in_v0_7_0": true,
       "verified_by_grep": "grep -nE 'pub struct RequestValidator|validate_create|validate_update|validate_memory' src/validate.rs → 11 hits"
     },
@@ -547,7 +547,7 @@
     "partial_or_honesty_capabilities": ["chaos_tested_convergence", "dos_multi_layer_defense"],
     "originating_brief_corrections_applied": 4,
     "corrections": [
-      "Schema version v48 → v49 (CURRENT_SCHEMA_VERSION at src/storage/migrations.rs:516)",
+      "Schema version v48 → v49 (Task I correction; final SHIP state at v51 per #1255, CURRENT_SCHEMA_VERSION at src/storage/migrations.rs:532)",
       "Field name atom_span → source_span (Memory.source_span at src/models/memory.rs:482)",
       "Test count 13k+ → 6,961 (#[test] attribute count)",
       "Memory Portability Spec v1.1 → v1 (per document's own version stamp)"

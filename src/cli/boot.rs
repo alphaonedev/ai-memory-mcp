@@ -61,8 +61,12 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// own migration ladder produces; the next schema bump therefore moves
 /// this bound automatically with no edit here. Both the sqlite and
 /// postgres ladders land at the same version in lockstep — see
-/// `MIGRATION_LADDER.md` for the per-version column inventory and
-/// `migrations/{sqlite,postgres}/` for the SQL.
+/// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
+/// `migrations/{sqlite,postgres}/` for the SQL. Current value at v0.7.0
+/// is 51 per the v48 → v51 chain: v48 added `federation_push_dlq`
+/// (#933), v49 added 14 nullable `archived_memories` columns (#1025),
+/// v50 extended `agent_quotas` PK with `namespace` (#1156), v51 added
+/// `federation_nonces` (#1255 / PR #1296).
 ///
 /// When a DB's `schema_version` exceeds this, the binary is too old
 /// for a newer DB and we surface a `warn-schema-unsupported` manifest
