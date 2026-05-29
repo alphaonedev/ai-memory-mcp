@@ -154,15 +154,7 @@ fn audit_emit_for_mcp_dispatch(
         // Read-only / metadata tools — no audit event.
         _ => return,
     };
-    let agent_id = arguments
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            mcp_client
-                .map(|c| format!("ai:{c}"))
-                .unwrap_or_else(|| "anonymous".into())
-        });
+    let agent_id = resolve_mcp_agent_id(arguments, mcp_client);
     let namespace = arguments
         .get("namespace")
         .and_then(Value::as_str)
@@ -192,6 +184,103 @@ fn audit_emit_for_mcp_dispatch(
     if let Err(e) = result {
         builder = builder.error(e.clone());
     }
+    crate::audit::emit(builder);
+}
+
+/// Resolve the caller's agent_id for an MCP `tools/call` from the
+/// request `arguments` and the handshake-detected `mcp_client` name.
+/// Resolution order: explicit `arguments.agent_id` > `ai:<mcp_client>`
+/// > `"anonymous"`. Shared by the dispatch-level audit emitter and the
+/// L1 capture-nag observer so both key on the same identity.
+fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
+    arguments
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            mcp_client
+                .map(|c| format!("ai:{c}"))
+                .unwrap_or_else(|| "anonymous".into())
+        })
+}
+
+/// L1 (#1389 / #1398) — observe one `tools/call` against the
+/// capture-nag watcher and, on a threshold crossing, emit a single
+/// stderr WARN plus a `capture_lag` signed audit event for the session.
+/// Returns the [`NagAction`] so the dispatch loop (and tests) can see
+/// what fired. A `None` watcher (layer disabled / not constructed) is a
+/// no-op returning [`NagAction::None`]. Observation-only: it never
+/// blocks or alters the dispatch path.
+fn observe_capture_nag(
+    nag_watcher: Option<&crate::recover::nag::CaptureNagWatcher>,
+    session_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+    mcp_client: Option<&str>,
+) -> crate::recover::nag::NagAction {
+    use crate::recover::nag::{NagAction, classify_tool};
+    let Some(watcher) = nag_watcher else {
+        return NagAction::None;
+    };
+    let agent_id = resolve_mcp_agent_id(arguments, mcp_client);
+    let action = watcher.observe_tool_call(&agent_id, session_id, classify_tool(tool_name));
+    match action {
+        NagAction::None => {}
+        NagAction::Warn => emit_capture_lag(
+            &agent_id,
+            session_id,
+            watcher.streak_for(&agent_id, session_id),
+            watcher.primary_threshold(),
+            false,
+        ),
+        NagAction::WarnAndEscalate => emit_capture_lag(
+            &agent_id,
+            session_id,
+            watcher.streak_for(&agent_id, session_id),
+            watcher.escalation_threshold(),
+            true,
+        ),
+    }
+    action
+}
+
+/// Emit the L1 `capture_lag` signal: a stderr WARN (MCP convention —
+/// stdout owns JSON-RPC framing, diagnostics go to stderr) plus a
+/// hash-chained `capture_lag` audit event when auditing is enabled. The
+/// streak + threshold ride the audit target's `title` advisory slot;
+/// `memory.content` is never involved, so there is no content-leak risk.
+fn emit_capture_lag(
+    agent_id: &str,
+    session_id: &str,
+    streak: u32,
+    threshold: u32,
+    escalated: bool,
+) {
+    let tier = if escalated { "escalation" } else { "warn" };
+    eprintln!(
+        "ai-memory capture_lag [{tier}]: agent={agent_id} session={session_id} — \
+         {streak} consecutive non-capture tool calls (threshold {threshold}); \
+         call memory_store or memory_capture_turn to record progress"
+    );
+    if !crate::audit::is_enabled() {
+        return;
+    }
+    let title = format!(
+        "capture_lag: {streak} non-capture tool calls (threshold {threshold}{})",
+        if escalated { ", escalation" } else { "" }
+    );
+    let mut builder = crate::audit::EventBuilder::new(
+        crate::audit::AuditAction::CaptureLag,
+        crate::audit::actor(agent_id.to_string(), "mcp_client_info", None),
+        crate::audit::AuditTarget {
+            memory_id: "*".to_string(),
+            namespace: crate::DEFAULT_NAMESPACE.to_string(),
+            title: Some(title),
+            tier: None,
+            scope: None,
+        },
+    );
+    builder.session_id = Some(session_id.to_string());
     crate::audit::emit(builder);
 }
 
@@ -1823,6 +1912,17 @@ fn handle_request(
     // bundle. `Some` when an LLM is wired; `None` collapses to the
     // tier-locked advisory.
     ingest_multistep_handler: Option<&ingest_multistep::IngestMultistepHandler>,
+    // v0.7.0 #1389 / #1398 L1 — capture-nag watcher singleton, owned by
+    // `run_mcp_server` for the lifetime of the stdio session. `Some`
+    // wires the dispatch loop to observe non-capture tool-call streaks
+    // and emit `capture_lag` WARN + signed events past the configured
+    // threshold; `None` disables the layer (tests that don't exercise
+    // L1, and any future transport that opts out).
+    nag_watcher: Option<&crate::recover::nag::CaptureNagWatcher>,
+    // Per-session key for the nag watcher's `(agent_id, session_id)`
+    // counter. In the stdio path this is a process-lifetime id minted
+    // once in `run_mcp_server`.
+    nag_session_id: &str,
 ) -> RpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -1962,6 +2062,20 @@ fn handle_request(
             } else {
                 &empty_obj
             };
+
+            // v0.7.0 #1389 / #1398 L1 — observe this call against the
+            // capture-nag watcher BEFORE dispatch. Emits a `capture_lag`
+            // WARN + signed event when the agent crosses the
+            // consecutive-non-capture-tool-call threshold. Strictly
+            // observation-only: the returned action does not gate or
+            // alter the dispatch below.
+            observe_capture_nag(
+                nag_watcher,
+                nag_session_id,
+                tool_name,
+                arguments,
+                mcp_client,
+            );
 
             // #867 — registry-driven dispatch. The legacy per-tool match
             // is gone; every tool now resolves through
@@ -2735,6 +2849,18 @@ pub fn run_mcp_server(
     // itself meaningful — absence means "we don't know").
     let mut detected_harness: Option<crate::harness::Harness> = None;
 
+    // v0.7.0 #1389 / #1398 L1 — capture-nag watcher for this stdio
+    // session. One stdio connection == one `run_mcp_server` invocation,
+    // so we mint a stable session id once and key the per-(agent_id,
+    // session_id) streak counter on it for the process lifetime. The
+    // watcher is dropped when this function returns (process exit), so
+    // no explicit `drop_session` is needed on the stdio path. Thresholds
+    // come from `AI_MEMORY_CAPTURE_NAG_THRESHOLD` /
+    // `AI_MEMORY_CAPTURE_NAG_ESCALATE_THRESHOLD` (set either to 0 to
+    // disable that tier).
+    let nag_watcher = crate::recover::nag::CaptureNagWatcher::new_from_env();
+    let nag_session_id = format!("mcp-{}", uuid::Uuid::new_v4());
+
     // #1249 — DoS guard on the stdio JSON-RPC parser. The pre-#1249 loop
     // (`for line in stdin.lock().lines()`) had no per-line cap; a peer
     // that streamed an unbounded sequence of non-newline bytes drove
@@ -2887,6 +3013,8 @@ pub fn run_mcp_server(
             resolved_recall_scope,
             atomise_handler.as_deref(),
             ingest_multistep_handler.as_deref(),
+            Some(&nag_watcher),
+            &nag_session_id,
         );
         let out = serde_json::to_string(&resp)?;
         writeln!(stdout, "{out}")?;
@@ -2985,6 +3113,8 @@ mod tests {
             Option<&crate::config::RecallScope>,
             Option<&atomise::AtomiseToolHandler>,
             Option<&ingest_multistep::IngestMultistepHandler>,
+            Option<&crate::recover::nag::CaptureNagWatcher>,
+            &str,
         ) -> RpcResponse = handle_request;
     }
 
@@ -3037,13 +3167,15 @@ mod tests {
                 false, // autonomous_hooks
                 None,  // mcp_client
                 &profile,
-                None, // mcp_config
-                None, // active_keypair
-                None, // harness
-                None, // federation_forward_url
-                None, // recall_scope
-                None, // atomise_handler
-                None, // ingest_multistep_handler
+                None,           // mcp_config
+                None,           // active_keypair
+                None,           // harness
+                None,           // federation_forward_url
+                None,           // recall_scope
+                None,           // atomise_handler
+                None,           // ingest_multistep_handler
+                None,           // nag_watcher (#1389/#1398 L1)
+                "test-session", // nag_session_id (#1389/#1398 L1)
             );
             assert!(
                 resp.error.is_none(),
@@ -3928,10 +4060,12 @@ mod tests {
                 None,
                 None,
                 None,
-                None, // federation_forward_url (#318)
-                None, // recall_scope (#518)
-                None, // atomise_handler (WT-1-C)
-                None, // ingest_multistep_handler (Form 3 / #756)
+                None,           // federation_forward_url (#318)
+                None,           // recall_scope (#518)
+                None,           // atomise_handler (WT-1-C)
+                None,           // ingest_multistep_handler (Form 3 / #756)
+                None,           // nag_watcher (#1389/#1398 L1)
+                "test-session", // nag_session_id (#1389/#1398 L1)
             );
             assert!(resp.error.is_none(), "expected ok rpc response");
         });
@@ -3987,10 +4121,12 @@ mod tests {
                 None,
                 None,
                 None,
-                None, // federation_forward_url (#318)
-                None, // recall_scope (#518)
-                None, // atomise_handler (WT-1-C)
-                None, // ingest_multistep_handler (Form 3 / #756)
+                None,           // federation_forward_url (#318)
+                None,           // recall_scope (#518)
+                None,           // atomise_handler (WT-1-C)
+                None,           // ingest_multistep_handler (Form 3 / #756)
+                None,           // nag_watcher (#1389/#1398 L1)
+                "test-session", // nag_session_id (#1389/#1398 L1)
             );
             // Handler errs are returned as ok_response with isError=true,
             // not RpcError, by design (the JSON-RPC layer is reserved for
@@ -4362,10 +4498,12 @@ mod tests {
                 None,
                 None,
                 None,
-                None, // federation_forward_url (#318)
-                None, // recall_scope (#518)
-                None, // atomise_handler (WT-1-C)
-                None, // ingest_multistep_handler (Form 3 / #756)
+                None,           // federation_forward_url (#318)
+                None,           // recall_scope (#518)
+                None,           // atomise_handler (WT-1-C)
+                None,           // ingest_multistep_handler (Form 3 / #756)
+                None,           // nag_watcher (#1389/#1398 L1)
+                "test-session", // nag_session_id (#1389/#1398 L1)
             );
             assert!(
                 resp.error.is_none(),
@@ -4407,10 +4545,12 @@ mod tests {
                     None,
                     None,
                     None,
-                    None, // federation_forward_url (#318)
-                    None, // recall_scope (#518)
-                    None, // atomise_handler (WT-1-C)
-                    None, // ingest_multistep_handler (Form 3 / #756)
+                    None,           // federation_forward_url (#318)
+                    None,           // recall_scope (#518)
+                    None,           // atomise_handler (WT-1-C)
+                    None,           // ingest_multistep_handler (Form 3 / #756)
+                    None,           // nag_watcher (#1389/#1398 L1)
+                    "test-session", // nag_session_id (#1389/#1398 L1)
                 );
 
                 // Missing required args should produce an error response (handler returns Err)
@@ -4469,11 +4609,182 @@ mod tests {
             None,
             None,
             None,
+            None,           // federation_forward_url (#318)
+            None,           // recall_scope (#518)
+            None,           // atomise_handler (WT-1-C)
+            None,           // ingest_multistep_handler (Form 3 / #756)
+            None,           // nag_watcher (#1389/#1398 L1) — disabled in this helper
+            "test-session", // nag_session_id (#1389/#1398 L1)
+        )
+    }
+
+    /// Like [`invoke_handle_request`] but threads a live capture-nag
+    /// watcher + session id through to the dispatch loop, exercising the
+    /// #1389/#1398 L1 wiring end to end.
+    fn invoke_handle_request_with_nag(
+        conn: &rusqlite::Connection,
+        req: &RpcRequest,
+        nag_watcher: &crate::recover::nag::CaptureNagWatcher,
+        nag_session_id: &str,
+        mcp_client: Option<&str>,
+    ) -> RpcResponse {
+        let tier_config = FeatureTier::Keyword.config();
+        let resolved_ttl = crate::config::ResolvedTtl::default();
+        let resolved_scoring = crate::config::ResolvedScoring::default();
+        handle_request(
+            conn,
+            std::path::Path::new(":memory:"),
+            req,
+            None,
+            None,
+            None,
+            &tier_config,
+            &crate::config::ResolvedModels::from_tier_preset(&tier_config),
+            None,
+            &resolved_ttl,
+            &resolved_scoring,
+            true,
+            false,
+            mcp_client,
+            &crate::profile::Profile::full(),
+            None,
+            None,
+            None,
             None, // federation_forward_url (#318)
             None, // recall_scope (#518)
             None, // atomise_handler (WT-1-C)
             None, // ingest_multistep_handler (Form 3 / #756)
+            Some(nag_watcher),
+            nag_session_id,
         )
+    }
+
+    /// Count the `capture_lag` lines captured by an in-memory audit sink
+    /// buffer. Each emitted audit event is one NDJSON line carrying
+    /// `"action":"capture_lag"`.
+    fn count_capture_lag_lines(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> usize {
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"action\":\"capture_lag\""))
+            .count()
+    }
+
+    // ----- #1389 / #1398 L1 — capture-nag dispatch wiring -----
+
+    /// A `None` watcher is a no-op: `observe_capture_nag` returns
+    /// `NagAction::None` and never touches the audit sink. Guards the
+    /// "L1 disabled" path that the test helpers + opt-out transports take.
+    #[test]
+    fn observe_capture_nag_none_watcher_is_noop() {
+        use crate::recover::nag::NagAction;
+        let action = observe_capture_nag(None, "s", "memory_recall", &json!({}), Some("c"));
+        assert_eq!(action, NagAction::None);
+    }
+
+    /// The dispatch loop honours the watcher: N consecutive non-capture
+    /// `tools/call`s cross the threshold and emit exactly one
+    /// `capture_lag` audit event; a `memory_store`-class call resets the
+    /// streak so a later drift re-arms the WARN. Drives the real
+    /// `handle_request` path, proving the wiring (not just the watcher).
+    #[test]
+    fn dispatch_loop_emits_capture_lag_past_threshold_and_resets_on_write() {
+        let _g = crate::audit::sink_test_lock();
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::audit::init_for_test(buf.clone());
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Primary threshold 3, escalation disabled so we isolate the
+        // primary tier. `memory_capabilities` is always loaded under the
+        // full profile, needs no DB rows, and classifies as `Other`.
+        let watcher = crate::recover::nag::CaptureNagWatcher::new(3, 0);
+        let session = "sess-1398";
+        let client = Some("testclient");
+
+        let cap = make_tools_call("memory_capabilities", json!({}));
+        // Two non-capture calls — under threshold, no event yet.
+        for _ in 0..2 {
+            let resp = invoke_handle_request_with_nag(&conn, &cap, &watcher, session, client);
+            assert!(resp.error.is_none());
+        }
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            0,
+            "no capture_lag before the threshold is crossed"
+        );
+
+        // Third call crosses threshold 3 → exactly one capture_lag event.
+        let resp = invoke_handle_request_with_nag(&conn, &cap, &watcher, session, client);
+        assert!(resp.error.is_none());
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            1,
+            "primary threshold crossing emits exactly one capture_lag event"
+        );
+
+        // Fourth call must NOT re-emit (idempotent per session/tier).
+        invoke_handle_request_with_nag(&conn, &cap, &watcher, session, client);
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            1,
+            "no duplicate capture_lag while still in the same warned tier"
+        );
+
+        // A write-class capture resets the streak, then a fresh run of
+        // non-capture calls re-arms and fires a second, distinct event.
+        let store = make_tools_call(
+            "memory_store",
+            json!({"title": "t", "content": "c", "tier": "short", "agent_id": "ai:testclient"}),
+        );
+        let store_resp = invoke_handle_request_with_nag(&conn, &store, &watcher, session, client);
+        assert!(
+            store_resp.error.is_none(),
+            "store should succeed: {store_resp:?}"
+        );
+        for _ in 0..3 {
+            invoke_handle_request_with_nag(&conn, &cap, &watcher, session, client);
+        }
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            2,
+            "re-armed WARN after a write reset fires a second capture_lag"
+        );
+
+        crate::audit::shutdown_for_test();
+    }
+
+    /// The audit chain stays intact across `capture_lag` emissions — the
+    /// new action is a first-class hash-chained event, not a side-channel.
+    #[test]
+    fn capture_lag_events_are_chained() {
+        let _g = crate::audit::sink_test_lock();
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::audit::init_for_test(buf.clone());
+
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let watcher = crate::recover::nag::CaptureNagWatcher::new(1, 2);
+        let cap = make_tools_call("memory_capabilities", json!({}));
+        // Two calls: first crosses primary (1), second crosses escalation (2).
+        invoke_handle_request_with_nag(&conn, &cap, &watcher, "s", Some("c"));
+        invoke_handle_request_with_nag(&conn, &cap, &watcher, "s", Some("c"));
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            2,
+            "primary + escalation each emit a capture_lag event"
+        );
+
+        let bytes = buf.lock().unwrap().clone();
+        let report = crate::audit::verify_chain_from_reader(bytes.as_slice()).unwrap();
+        assert!(
+            report.first_failure.is_none(),
+            "capture_lag emissions must keep the hash chain intact: {:?}",
+            report.first_failure
+        );
+
+        crate::audit::shutdown_for_test();
     }
 
     /// Test-only helper that mirrors the parse-then-dispatch portion of
@@ -4874,10 +5185,12 @@ mod tests {
             None,
             Some(&kp),
             None,
-            None, // federation_forward_url (#318)
-            None, // recall_scope (#518)
-            None, // atomise_handler (WT-1-C)
-            None, // ingest_multistep_handler (Form 3 / #756)
+            None,           // federation_forward_url (#318)
+            None,           // recall_scope (#518)
+            None,           // atomise_handler (WT-1-C)
+            None,           // ingest_multistep_handler (Form 3 / #756)
+            None,           // nag_watcher (#1389/#1398 L1)
+            "test-session", // nag_session_id (#1389/#1398 L1)
         );
         assert!(resp.error.is_none(), "MCP error: {:?}", resp.error);
         let text = resp.result.unwrap()["content"][0]["text"]
@@ -4990,10 +5303,12 @@ mod tests {
             None,
             Some(&kp),
             None,
-            None, // federation_forward_url (#318)
-            None, // recall_scope (#518)
-            None, // atomise_handler (WT-1-C)
-            None, // ingest_multistep_handler (Form 3 / #756)
+            None,           // federation_forward_url (#318)
+            None,           // recall_scope (#518)
+            None,           // atomise_handler (WT-1-C)
+            None,           // ingest_multistep_handler (Form 3 / #756)
+            None,           // nag_watcher (#1389/#1398 L1)
+            "test-session", // nag_session_id (#1389/#1398 L1)
         );
         assert!(resp.error.is_none(), "MCP error: {:?}", resp.error);
         let text = resp.result.unwrap()["content"][0]["text"]
@@ -5649,6 +5964,8 @@ mod tests {
             None,
             None,
             None,
+            None,           // nag_watcher (#1389/#1398 L1)
+            "test-session", // nag_session_id (#1389/#1398 L1)
         );
         let err_default = resp_default
             .error
@@ -5710,6 +6027,8 @@ mod tests {
             None,
             None,
             None,
+            None,           // nag_watcher (#1389/#1398 L1)
+            "test-session", // nag_session_id (#1389/#1398 L1)
         );
         let err_hint = resp_hint
             .error

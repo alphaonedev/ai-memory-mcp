@@ -287,6 +287,28 @@ pub fn fresh_conn() -> Connection {
     ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 
+/// SSOT-derived `(loaded, unloaded)` substantive-tool counts for a
+/// profile — mirrors the loaded/unloaded partition in
+/// `build_capabilities_describe_to_user` (loaded-family tools vs
+/// unloaded-family tools, both with the always-on `memory_capabilities`
+/// bootstrap stripped). Tests that pin the canonical describe sentence
+/// derive their counts from this so a new tool landing in any family
+/// floats them automatically — no hardcoded tool-count literal to drift
+/// (per the no-hardcoded-literals directive + L4-lockstep discipline).
+#[must_use]
+pub fn describe_counts(profile: &ai_memory::profile::Profile) -> (usize, usize) {
+    use ai_memory::profile::{ALWAYS_ON_TOOLS, Family};
+    let count_substantive = |loaded: bool| {
+        Family::all()
+            .iter()
+            .filter(|f| profile.includes(**f) == loaded)
+            .flat_map(|f| f.tool_names().iter().copied())
+            .filter(|name| !ALWAYS_ON_TOOLS.contains(name))
+            .count()
+    };
+    (count_substantive(true), count_substantive(false))
+}
+
 /// `(NamedTempFile, PathBuf)` factory: create a tempfile, open the DB
 /// once so migrations land, drop the connection so the caller can
 /// re-open the path. The returned tempfile must be kept alive for the

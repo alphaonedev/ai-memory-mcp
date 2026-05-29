@@ -27,7 +27,7 @@ use rusqlite::Connection;
 use serde_json::json;
 
 mod common;
-use common::fresh_db_tempfile_path as fresh_db;
+use common::{describe_counts, fresh_db_tempfile_path as fresh_db};
 
 #[test]
 fn k8_quota_status_registered_under_power_family() {
@@ -52,14 +52,16 @@ fn k8_quota_status_loaded_under_full_profile() {
         Profile::full().loads("memory_quota_status"),
         "full profile must load memory_quota_status (K8 cascade 50 -> 51 post-B2)"
     );
+    // The full advertised count = the substantive memory-tool surface
+    // (SSOT-derived from Family::tool_names) + the always-on
+    // memory_capabilities bootstrap. No hardcoded literal — adding a
+    // tool to any family floats both sides in lockstep.
+    let (n_full_substantive, _) = describe_counts(&Profile::full());
     assert_eq!(
         Profile::full().expected_tool_count(),
-        73,
-        "tool count cascade must advance to 73 with v0.7.0 Gap 3 (#886) \
-         memory_recall_observations on top of issues #224 + #311 \
-         memory_share (Phase 3 Memory Sharing & Sync RFC) + the prior \
-         v0.7.0 cascade (Form 5, Form 3, QW-2, WT-1-C, QW-3 follow-up, \
-         QW-1, L1-5, #691, L2-2 through L2-7)"
+        n_full_substantive + ai_memory::profile::ALWAYS_ON_TOOLS.len(),
+        "full advertised count must equal the substantive surface plus the \
+         always-on bootstrap (both SSOT-derived)"
     );
 }
 
