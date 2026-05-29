@@ -494,7 +494,9 @@ mod handler_tests {
                 "an_unknown_extra_field": "tolerated and ignored"
             }),
         )
-        .expect("unknown extra fields are tolerated at runtime (post-#1052 wire-truthful contract)");
+        .expect(
+            "unknown extra fields are tolerated at runtime (post-#1052 wire-truthful contract)",
+        );
         assert_eq!(resp["layer"].as_str(), Some("L4"));
         assert_eq!(resp["dedup_hit"].as_bool(), Some(false));
     }
