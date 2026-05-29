@@ -616,6 +616,94 @@
       "name": "memory_capabilities"
     },
     {
+      "description": "L4 host-volunteered turn",
+      "inputSchema": {
+        "definitions": {
+          "ToolCallSummary": {
+            "properties": {
+              "brief": {
+                "type": "string"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "brief",
+              "tool"
+            ],
+            "type": "object"
+          }
+        },
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "host_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_pubkey_b64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_session_id": {
+            "type": "string"
+          },
+          "host_signature_b64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_turn_index": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "host_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "timestamp_iso": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_calls": {
+            "items": {
+              "$ref": "#/definitions/ToolCallSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "content",
+          "host_session_id",
+          "host_turn_index",
+          "role"
+        ],
+        "type": "object"
+      },
+      "name": "memory_capture_turn"
+    },
+    {
       "description": "Trigger garbage collection on",
       "inputSchema": {
         "properties": {
