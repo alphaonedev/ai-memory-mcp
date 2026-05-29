@@ -237,7 +237,7 @@ command: ai-memory
 args:    ["mcp"]
 # optionally:
 #   ["--db", "/path/to/ai-memory.db", "mcp", "--tier", "semantic"]
-#   ["mcp", "--profile", "full"]  # advertise all 73 tools
+#   ["mcp", "--profile", "full"]  # advertise all 74 tools
 ```
 
 That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 7

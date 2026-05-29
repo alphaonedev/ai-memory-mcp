@@ -47,7 +47,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 mod common;
-use common::fresh_conn;
+use common::{describe_counts, fresh_conn};
 
 /// v0.7.0 A3 — build a minimal `[mcp.allowlist]` table for tests.
 fn allowlist(rows: &[(&str, &[&str])]) -> McpConfig {
@@ -183,18 +183,17 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
     // memory tool). Total memory tools = 61 - 1 = 60 (60 substantive;
     // bumped via v0.7.0 L1-5 5×memory_skill_* + v0.7.0 L2-7
     // memory_skill_compositional_context).
+    let (n_core, n_core_unloaded) = describe_counts(&Profile::core());
+    let (n_full, _) = describe_counts(&Profile::full());
     assert!(
-        summary.starts_with("7 of 72 memory tools"),
-        "core profile summary should open with \"7 of 72 memory tools\" (Round-2 F13; \
-         v0.7.0 issues #224 + #311 added memory_share to Family::Power, \
-         pulled forward from v0.8 Phase 3 Memory Sharing & Sync RFC per \
-         operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9` — \
-         bumping the substantive total to 71); got: {summary}"
+        summary.starts_with(&format!("{n_core} of {n_full} memory tools")),
+        "core profile summary should open with \"{n_core} of {n_full} memory tools\" \
+         (Round-2 F13; counts SSOT-derived from Family::tool_names); got: {summary}"
     );
     assert!(summary.contains("(core)"), "must label the profile as core");
     assert!(
-        summary.contains("65 are listed in this manifest"),
-        "core profile must report 65 unloaded (72 - 7); got: {summary}"
+        summary.contains(&format!("{n_core_unloaded} are listed in this manifest")),
+        "core profile must report {n_core_unloaded} unloaded ({n_full} - {n_core}); got: {summary}"
     );
 
     // Three named recovery paths must all appear (verbatim names — these
@@ -230,11 +229,12 @@ fn cap_v3_summary_full_profile_reports_all_visible() {
     // match the user-facing string). v0.7.0 L1-5 added
     // 5 memory_skill_* tools to Family::Other, bumping the substantive
     // total from 51 to 56.
+    let (n_full, n_full_unloaded) = describe_counts(&Profile::full());
+    assert_eq!(n_full_unloaded, 0, "full profile must load every family");
     assert!(
-        summary.starts_with("72 of 72 memory tools"),
-        "full profile summary should open with \"72 of 72 memory tools\" (Round-2 F13; \
-         v0.7.0 issues #224 + #311 added memory_share to Family::Power, \
-         pulled forward from v0.8 Phase 3 RFC); got: {summary}"
+        summary.starts_with(&format!("{n_full} of {n_full} memory tools")),
+        "full profile summary should open with \"{n_full} of {n_full} memory tools\" \
+         (Round-2 F13; counts SSOT-derived from Family::tool_names); got: {summary}"
     );
     assert!(summary.contains("(full)"));
     assert!(
@@ -260,15 +260,16 @@ fn cap_v3_summary_graph_profile_counts() {
     // Graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18
     // memory tools. Total = 55 (56 - bootstrap; v0.7.0 L1-5 added 5
     // memory_skill_* tools to Family::Other, bumping total from 51 to 56).
+    let (n_graph, n_graph_unloaded) = describe_counts(&Profile::graph());
+    let (n_full, _) = describe_counts(&Profile::full());
     assert!(
-        summary.starts_with("18 of 72 memory tools"),
-        "graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18 memory tools \
-         (Round-2 F13: bootstrap excluded; v0.7.0 issues #224 + #311 added \
-         memory_share + Gap 3 #886 added memory_recall_observations, \
-         bumping the substantive total to 73); got: {summary}"
+        summary.starts_with(&format!("{n_graph} of {n_full} memory tools")),
+        "graph profile summary should open with \"{n_graph} of {n_full} memory tools\" \
+         (Round-2 F13: bootstrap excluded; counts SSOT-derived from \
+         Family::tool_names); got: {summary}"
     );
     assert!(summary.contains("(graph)"));
-    assert!(summary.contains("54 are listed in this manifest"));
+    assert!(summary.contains(&format!("{n_graph_unloaded} are listed in this manifest")));
 }
 
 // ---------------------------------------------------------------------------
@@ -350,32 +351,27 @@ fn cap_v3_response_carries_to_describe_to_user() {
 #[test]
 fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
     let describe = build_capabilities_describe_to_user(&Profile::core());
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::core());
 
     // Opens with the canonical "I can directly use N memory tool(s)"
-    // form. v0.7 B1 + B2 — Core gained memory_load_family +
-    // memory_smart_load so loaded count is now 7, and the preview
-    // overflows the 5-name cap (ends in ", ...").
+    // form. Core's loaded count (original 5 + B1 memory_load_family +
+    // B2 memory_smart_load) overflows the 5-name preview cap, so the
+    // preview ends in ", ...". The count is SSOT-derived, not literal.
     assert!(
-        describe.starts_with("I can directly use 7 memory tools right now ("),
+        describe.starts_with(&format!(
+            "I can directly use {n_loaded} memory tools right now ("
+        )),
         "core profile describe must open canonically; got: {describe}"
     );
     // Loaded preview lists the first 5 core tool names with the
     // memory_ prefix STRIPPED (no MCP jargon for end users), followed
-    // by ", ..." since core now ships 7 tools (v0.7 B1 + B2).
+    // by ", ..." since core ships more than the 5-name preview cap.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    // Reports the unloaded count. 64 = 71 user-relevant tools − 7
-    // core. (71 = 72 total tools − 1 always-on bootstrap.) The
-    // bootstrap (`memory_capabilities`) is excluded from both sides
-    // for honest user-facing counting. Total bumped to 71 in v0.7.0
-    // issues #224 + #311 (Family::Power gained memory_share, pulled
-    // forward from v0.8 Phase 3 Memory Sharing & Sync RFC per operator
-    // directive `28860423-d12c-4959-bc8b-8fa9a94a33d9`).
+    // Reports the SSOT-derived unloaded count (every non-core family's
+    // tools minus the always-on bootstrap).
     assert!(
-        describe.contains("65 more"),
-        "core profile must report 65 unloaded (72 - 7); v0.7.0 issues \
-         #224 + #311 added memory_share + Gap 3 #886 added \
-         memory_recall_observations, bumping the substantive total to 72; \
-         got: {describe}"
+        describe.contains(&format!("{n_unloaded} more")),
+        "core profile must report {n_unloaded} unloaded (SSOT total - loaded); got: {describe}"
     );
     // Sample of unloaded tools is plain (no memory_ prefix). The first
     // four unloaded under core are lifecycle's update/delete/forget/gc.
@@ -413,13 +409,15 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 #[test]
 fn cap_v3_describe_full_profile_uses_nothing_more_form() {
     let describe = build_capabilities_describe_to_user(&Profile::full());
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::full());
 
-    // 72 = 73 total - 1 always-on bootstrap excluded from describe.
-    // Bumped to 71 in v0.7.0 issues #224 + #311 (memory_share, Family::Power);
-    // bumped to 72 in v0.7.0 Gap 3 #886 (memory_recall_observations,
-    // Family::Meta).
+    // "all N" = the full substantive surface (every family's tools
+    // minus the always-on bootstrap); SSOT-derived, not literal.
+    assert_eq!(n_unloaded, 0, "full profile must load every family");
     assert!(
-        describe.starts_with("I can directly use all 72 memory tools right now ("),
+        describe.starts_with(&format!(
+            "I can directly use all {n_loaded} memory tools right now ("
+        )),
         "full profile describe must open with all-loaded form; got: {describe}"
     );
     assert!(describe.contains("Nothing more to load"));
@@ -436,16 +434,17 @@ fn cap_v3_describe_full_profile_uses_nothing_more_form() {
 #[test]
 fn cap_v3_describe_graph_profile_uses_preview_ellipsis() {
     let describe = build_capabilities_describe_to_user(&Profile::graph());
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::graph());
     assert!(
-        describe.starts_with("I can directly use 18 memory tools right now ("),
-        "graph profile describe should open with 18 loaded; got: {describe}"
+        describe.starts_with(&format!(
+            "I can directly use {n_loaded} memory tools right now ("
+        )),
+        "graph profile describe should open with {n_loaded} loaded; got: {describe}"
     );
-    // Preview is the first 5 of the 18 loaded — the first 5 core tools.
+    // Preview is the first 5 of the loaded set — the first 5 core tools.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    // 54 more = 72 substantive - 18 loaded. Issues #224 + #311 added
-    // memory_share to Family::Power (52 → 53) + Gap 3 #886 added
-    // memory_recall_observations to Family::Meta (53 → 54).
-    assert!(describe.contains("54 more"));
+    // "N more" = SSOT substantive total - loaded.
+    assert!(describe.contains(&format!("{n_unloaded} more")));
 }
 
 // ---------------------------------------------------------------------------
@@ -634,9 +633,8 @@ fn cap_v3_response_carries_tools_array_with_73_entries() {
         tools.len(),
         Profile::full().expected_tool_count(),
         "v3 must surface every tool regardless of profile; canonical \
-         count is `Profile::full().expected_tool_count()` = 73 at v0.7.0 \
-         (issues #224 + #311 pulled memory_share forward; Gap 3 #886 added \
-         memory_recall_observations under Family::Meta); got {}",
+         count is `Profile::full().expected_tool_count()` (SSOT-derived \
+         from the per-family tool_names slices); got {}",
         tools.len()
     );
 

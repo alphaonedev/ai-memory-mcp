@@ -178,7 +178,7 @@ pub enum Command {
         /// `core,graph,archive`). Default `core` (5 tools). Resolution
         /// order: this CLI flag > `AI_MEMORY_PROFILE` env > `[mcp].profile`
         /// in config.toml > `core`. Set `--profile full` to expose
-        /// every family (73 advertised entries at v0.7.0 — 72 callable
+        /// every family (74 advertised entries at v0.7.0 — 72 callable
         /// "memory tools" + the always-on `memory_capabilities` bootstrap;
         /// `Profile::full().expected_tool_count()` returns 73, while
         /// `memory_capabilities` summary reports the 72-memory-tool count
@@ -394,6 +394,16 @@ pub enum Command {
     /// synthesised without learning SQL. The on-disk artefact is
     /// derived; the SQL row stays canonical.
     ExportReflections(crate::cli::commands::export_reflections::ExportReflectionsArgs),
+    /// v0.7.0 (issue #1389) — fail-safe recovery of agent context
+    /// from a host's per-turn transcript file when the previous
+    /// session terminated ungracefully (SIGKILL, tmux lockup, host
+    /// crash) between turns. Closes the #1388 substrate failure
+    /// mode. Designed for SessionStart-hook chaining after
+    /// `ai-memory boot`; the in-session counterpart is the
+    /// `memory_recover_previous_session` MCP tool.
+    RecoverPreviousSession(
+        crate::cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
+    ),
     /// v0.7.0 WT-1-F — operator-side wrapper over the atomisation
     /// engine ([`crate::atomisation::Atomiser`]). Decomposes one
     /// long-form memory into atomic propositions; surfaces every
@@ -1411,6 +1421,21 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::commands::export_reflections::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::RecoverPreviousSession(a) => {
+            // Issue #1389 — fail-safe recovery from host transcripts.
+            // Graceful by design: the SessionStart-hook chain MUST
+            // NOT wedge the agent boot, so per-line parse errors
+            // surface in the report rather than as Err.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::recover_previous_session::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }

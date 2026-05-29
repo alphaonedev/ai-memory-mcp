@@ -15,7 +15,7 @@
 #   (A) Vendor-monoculture gate. Every `"claude" | "openai" | "xai" |
 #       "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
 #       "grok" | "mistral" | "cohere" | "huggingface"` literal outside
-#       the 7-file substrate allowlist is a HARD-BLOCK. Vendor strings
+#       the 9-file substrate allowlist is a HARD-BLOCK. Vendor strings
 #       are legitimate only in:
 #         - `src/llm.rs`           (canonical alias tables, default URLs)
 #         - `src/config.rs`        (per-vendor URL/key/model defaults)
@@ -24,6 +24,8 @@
 #         - `src/cli/wrap.rs`      (CLI-binary-name → WrapStrategy picker)
 #         - `src/llm_cli_wrap.rs`  (per-vendor CLI-binary WrapStrategy table; #1183 split from src/cli/wrap.rs)
 #         - `src/harness.rs`       (harness vendor-variant enum)
+#         - `src/recover/transcript_paths.rs`              (per-AI-host transcript dir router; #1389 L2)
+#         - `src/cli/commands/recover_previous_session.rs` (per-AI-host CLI dispatcher; #1389 L2)
 #
 #   (B) SECS_PER_* regression gate. PR3 (#1188 lineage) extracted
 #       named constants `SECS_PER_HOUR` / `SECS_PER_DAY` / `SECS_PER_WEEK`
@@ -60,7 +62,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# 7-file allowlist. Repo-root-relative paths.
+# 9-file allowlist. Repo-root-relative paths.
+# Two new entries for #1389 L2 host-adapter surface (transcript paths
+# differ per AI host: claude/codex/gemini/opencode/grok-cli — vendor
+# identifier IS the routing key, so the carve-out matches the
+# `src/mine.rs::Format::Claude` precedent for vendor-keyed enums).
 ALLOWED_FILES=(
     "src/llm.rs"
     "src/config.rs"
@@ -69,6 +75,8 @@ ALLOWED_FILES=(
     "src/cli/wrap.rs"
     "src/llm_cli_wrap.rs"
     "src/harness.rs"
+    "src/recover/transcript_paths.rs"
+    "src/cli/commands/recover_previous_session.rs"
 )
 
 # Vendor identifiers to gate. Keep this list narrow — over-broad gates
@@ -221,6 +229,8 @@ if [[ -n "${vendor_violations//[[:space:]]/}" ]]; then
         echo "  - src/cli/wrap.rs      (CLI-binary-name → WrapStrategy picker)"
         echo "  - src/llm_cli_wrap.rs  (per-vendor CLI-binary WrapStrategy table; #1183)"
         echo "  - src/harness.rs       (harness vendor-variant enum)"
+        echo "  - src/recover/transcript_paths.rs       (per-AI-host transcript dir router; #1389 L2)"
+        echo "  - src/cli/commands/recover_previous_session.rs  (per-AI-host CLI dispatcher; #1389 L2)"
         echo ""
         echo "Per pm-v3.1 (ai-memory global/policies memory f5334545-c1f5-4f5c-9efb-a0ec3a0c1fcd):"
         echo "vendor identifiers in substrate/wire code violate the heterogeneous-NHI design."

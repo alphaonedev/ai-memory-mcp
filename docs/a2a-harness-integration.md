@@ -22,7 +22,7 @@ exercising this repo's binary.
 
 ## v0.7.0 substrate guarantees the harness can rely on
 
-- 73 MCP tools at `--profile full`; 7 at `--profile core` + always-on
+- 74 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
 - 87 production HTTP routes (73 unique URL paths) registered.
 - Schema v49 (single logical version across sqlite + postgres at v0.7.0

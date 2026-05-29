@@ -31,6 +31,9 @@ use ai_memory::mcp::{
 use ai_memory::profile::Profile;
 use serde_json::{Value, json};
 
+mod common;
+use common::describe_counts;
+
 // ---------------------------------------------------------------------------
 // 1. memory_capabilities inputSchema declares accept/family/include_schema/verbose.
 // ---------------------------------------------------------------------------
@@ -94,19 +97,17 @@ fn f13_summary_and_describe_to_user_agree_on_count_full_profile() {
     let summary = build_capabilities_summary(&Profile::full());
     let describe = build_capabilities_describe_to_user(&Profile::full());
 
-    // Both must report "71" for the full profile (substantive memory
-    // tools, excluding the always-on `memory_capabilities` bootstrap).
-    // v0.7.0 issues #224 + #311 added memory_share to Family::Power,
-    // pulled forward from v0.8 Phase 3 Memory Sharing & Sync RFC per
-    // operator directive `28860423-d12c-4959-bc8b-8fa9a94a33d9` —
-    // bumping the substantive total to 71.
+    // Under full, summary and describe must agree on the substantive
+    // total (every family's tools minus the always-on bootstrap). The
+    // count is SSOT-derived, not literal.
+    let (n_full, _) = describe_counts(&Profile::full());
     assert!(
-        summary.contains("72 of 72 memory tools"),
-        "summary must report 72 of 72 memory tools; got: {summary}"
+        summary.contains(&format!("{n_full} of {n_full} memory tools")),
+        "summary must report {n_full} of {n_full} memory tools; got: {summary}"
     );
     assert!(
-        describe.contains("all 72 memory tools"),
-        "describe_to_user must report all 72 memory tools; got: {describe}"
+        describe.contains(&format!("all {n_full} memory tools")),
+        "describe_to_user must report all {n_full} memory tools; got: {describe}"
     );
 }
 
@@ -115,18 +116,18 @@ fn f13_summary_and_describe_to_user_agree_on_count_core_profile() {
     let summary = build_capabilities_summary(&Profile::core());
     let describe = build_capabilities_describe_to_user(&Profile::core());
 
-    // Core profile loads `Family::Core` (7 tools). Bootstrap excluded.
-    // Total memory tools = 71 (72 - bootstrap). v0.7.0 issues #224 +
-    // #311 added memory_share to Family::Power, pulled forward from
-    // v0.8 Phase 3 Memory Sharing & Sync RFC per operator directive
-    // `28860423-d12c-4959-bc8b-8fa9a94a33d9`.
+    // Core loads `Family::Core` only; the bootstrap is excluded from
+    // both the visible and the total. Visible = core's substantive
+    // surface; total = the full substantive surface. Both SSOT-derived.
+    let (n_core, _) = describe_counts(&Profile::core());
+    let (n_full, _) = describe_counts(&Profile::full());
     assert!(
-        summary.contains("7 of 72 memory tools"),
-        "summary must report 7 of 72 memory tools; got: {summary}"
+        summary.contains(&format!("{n_core} of {n_full} memory tools")),
+        "summary must report {n_core} of {n_full} memory tools; got: {summary}"
     );
     assert!(
-        describe.contains("7 memory tools"),
-        "describe_to_user must report 7 memory tools; got: {describe}"
+        describe.contains(&format!("{n_core} memory tools")),
+        "describe_to_user must report {n_core} memory tools; got: {describe}"
     );
 }
 

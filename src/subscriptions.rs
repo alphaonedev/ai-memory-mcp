@@ -777,6 +777,16 @@ pub fn dispatch_event_to_subs(
     if matching.is_empty() {
         return;
     }
+    // PERF — warm the reqwest::blocking TLS connector once per process,
+    // off the delivery critical path, so the first webhook does not pay
+    // the cold root-cert init inside its ACK_TIMEOUT retry budget. See
+    // `prewarm_dispatch_tls`.
+    {
+        static KICK: std::sync::Once = std::sync::Once::new();
+        KICK.call_once(|| {
+            std::thread::spawn(prewarm_dispatch_tls);
+        });
+    }
     // Timestamp is part of the canonical string the signature is
     // computed over. Receivers SHOULD reject requests whose timestamp
     // differs from their clock by more than 5 minutes (replay window).
@@ -1160,6 +1170,51 @@ impl DeliveryOutcome {
 /// the receiver's ACK body — a 2xx response with no ACK or a
 /// mismatched correlation_id counts as failure and triggers the next
 /// retry. Returns the cumulative [`DeliveryOutcome`].
+/// One-time process-global warm-up of the `reqwest::blocking` TLS
+/// connector used by webhook delivery.
+///
+/// The first `reqwest::blocking::Client` constructed in a process
+/// builds the TLS connector, which loads the system root-certificate
+/// store. On some platforms (notably macOS, where the load goes
+/// through Security.framework) that first load can take several
+/// seconds and is process-cached thereafter. Because webhook delivery
+/// rebuilds a fresh client per attempt (the #1082 per-call
+/// `.resolve()` DNS pin precludes a fully process-shared client), a
+/// cold first delivery would otherwise pay that init on attempt 1 — and
+/// when it exceeds [`ACK_TIMEOUT`] the K6 retry budget is consumed by
+/// the cold init rather than by real delivery failures, delaying (or,
+/// under a short receiver poll window, failing) the first webhook of a
+/// process by tens of seconds.
+///
+/// Calling this is idempotent via an internal [`std::sync::Once`].
+/// [`dispatch_event_to_subs`] kicks it on a background thread the first
+/// time it has work to deliver, so a long-lived daemon warms its
+/// connector ahead of real load. Integration tests that assert delivery
+/// latency call it synchronously during setup so the one-time cost
+/// lands before the timed assertion window.
+pub fn prewarm_dispatch_tls() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        // Build on a dedicated OS thread, then join. `reqwest::blocking`'s
+        // client constructor blocks waiting for its internal runtime
+        // thread to spin up, which panics if invoked directly on a thread
+        // that is currently driving a Tokio runtime (an async test, or a
+        // daemon runtime worker). A freshly-spawned `std::thread` has no
+        // ambient runtime, so blocking there is always allowed. Joining
+        // makes the warm-up synchronous for the caller (tests rely on the
+        // connector being warm once this returns).
+        let _ = std::thread::spawn(|| {
+            if let Err(e) = reqwest::blocking::Client::builder()
+                .timeout(ACK_TIMEOUT)
+                .build()
+            {
+                tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
+            }
+        })
+        .join();
+    });
+}
+
 fn deliver_with_retry(
     url: &str,
     body: &str,
