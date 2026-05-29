@@ -27,6 +27,9 @@ use ai_memory::models::{Memory, MemoryLink, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 
+#[cfg(feature = "sal-postgres")]
+mod common;
+
 fn ctx() -> CallerContext {
     CallerContext::for_agent("ai:migrate-roundtrip")
 }
@@ -265,11 +268,22 @@ async fn migrate_links_sqlite_to_postgres_to_sqlite_roundtrip() {
     // be identical, proving the link set survives a full cross-backend
     // round trip.
     use ai_memory::store::postgres::PostgresStore;
+    use common::postgres_env::PostgresTestEnv;
 
-    let Ok(pg_url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+    // #1381: per-test schema isolation via search_path. Pre-#1381 the
+    // test connected to the bare base URL which bootstrapped into
+    // `public.memories`; a sibling test (e.g. `issue_1213_*`) leaving
+    // `public.memories` in a partially-migrated state (only `(id,
+    // embedding)` columns) caused this test's bootstrap-time
+    // `CREATE UNIQUE INDEX ... ON memories (title, namespace)` to fail
+    // with `column "title" does not exist`. Per-test schema isolation
+    // sidesteps the shared-state race entirely: the bootstrap creates
+    // a fresh `memories` table inside the test's own schema.
+    let Some(env) = PostgresTestEnv::new("migrate_links_roundtrip").await else {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let pg_url = env.url().to_string();
 
     let src_tmp = tempfile::NamedTempFile::new().unwrap();
     let dst_tmp = tempfile::NamedTempFile::new().unwrap();
@@ -279,7 +293,10 @@ async fn migrate_links_sqlite_to_postgres_to_sqlite_roundtrip() {
 
     // Pre-clean the live PG so a previous run's seed corpus doesn't
     // leak into this run's count assertions. We delete only memories
-    // in our test namespace; cascade drops the linked rows.
+    // in our test namespace; cascade drops the linked rows. With #1381
+    // schema isolation this is also defence-in-depth — a fresh
+    // per-test schema starts empty, but the cleanup keeps the test
+    // robust if `PostgresTestEnv::new` ever reused a leftover schema.
     sqlx_cleanup_namespace(&pg_url, "roundtrip").await;
 
     seed_corpus(&src).await;

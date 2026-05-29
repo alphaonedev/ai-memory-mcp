@@ -43,6 +43,9 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod common;
+use common::postgres_env::PublicSchemaLock;
+
 fn postgres_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
 }
@@ -171,6 +174,13 @@ async fn issue_1213_atttypmod_probe_scopes_to_public_schema() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    // #1381: cross-process serialise on `public.memories` ownership
+    // so a sibling test binary's bootstrap of `public.memories`
+    // doesn't conflict with this test's `CREATE TABLE public.memories`
+    // staging.
+    let _public_lock = PublicSchemaLock::acquire()
+        .await
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     // pgvector is required for `vector(N)` columns; refuse to run if
     // the extension isn't enrolled so the failure mode is "skip"
@@ -212,14 +222,26 @@ async fn issue_1213_atttypmod_probe_scopes_to_public_schema() {
     // Step 3: confirm BOTH tables exist with their respective dims
     // (this is a sanity check; failure here would mean the test
     // staging is wrong, not the production bug).
+    //
+    // #1381: filter to only the schemas this test OWNS (public +
+    // `other_schema`). The LAN-parity shared-container path leaves
+    // long-lived `ic_alice`/`ic_bob` daemon schemas (each with their
+    // own `memories` table) in `pg_class` — an unfiltered probe sees
+    // 5+ rows on that stack, breaking the `dims.len() == 2`
+    // staging-sanity check even though the test's OWN staging is
+    // correct. The post-#1381 filter scopes the assertion to the
+    // test's surface so the staging-sanity check stays
+    // load-bearing without false-positives on shared infra.
     let dims: Vec<(String, i32)> = sqlx::query_as(
         "SELECT n.nspname::text, a.atttypmod
          FROM pg_attribute a
          JOIN pg_class c ON c.oid = a.attrelid
          JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relname = 'memories' AND a.attname = 'embedding'
+         AND n.nspname IN ('public', $1)
          ORDER BY n.nspname",
     )
+    .bind(other_schema)
     .fetch_all(&pool)
     .await
     .expect("inspect both memories tables");
@@ -292,6 +314,10 @@ async fn issue_1213_unscoped_probe_demonstrates_root_cause() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    // #1381: see sibling test for rationale on PublicSchemaLock.
+    let _public_lock = PublicSchemaLock::acquire()
+        .await
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let pool = inspect_pool(&url).await;
     let pgvector_present: Option<(i32,)> =
@@ -331,11 +357,25 @@ async fn issue_1213_unscoped_probe_demonstrates_root_cause() {
     // Pre-fix probe — `fetch_all` so the test is deterministic on
     // either oid-order outcome; we then assert the scoped probe
     // disagrees with at-least-one of the unscoped rows.
+    //
+    // #1381: filter to only the schemas this test OWNS (public +
+    // `other_schema`). Same rationale as the sibling test: the
+    // LAN-parity shared container has long-lived `ic_alice`/`ic_bob`
+    // daemon schemas whose `memories` rows shadow the test's own
+    // staging when the probe is unfiltered. The pre-#1381 "unscoped"
+    // semantics being demonstrated here is "no `n.nspname=…public`
+    // filter against the test's OWN staging surface", not "no
+    // `nspname IN (…)` filter at all" — the latter has nothing to
+    // do with #1213's root cause and only exists as test-rig
+    // staging.
     let unscoped: Vec<(i32,)> = sqlx::query_as(
         "SELECT atttypmod FROM pg_attribute a
          JOIN pg_class c ON c.oid = a.attrelid
-         WHERE c.relname = 'memories' AND a.attname = 'embedding'",
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relname = 'memories' AND a.attname = 'embedding'
+         AND n.nspname IN ('public', $1)",
     )
+    .bind(other_schema)
     .fetch_all(&pool)
     .await
     .expect("unscoped probe");
