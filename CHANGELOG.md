@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### v0.7.0 #1389 layered-capture architecture — L1+L2+L4 production-shipped (2026-05-28→2026-05-30)
+
+The substrate's first-line answer to the #1388 RCA — operator-agent test-plan dialog lost on tmux lockup + SIGKILL. Layered-defense capture architecture canonical in `global/policies` memory `f62cb182`:
+
+- **L1 — Agent discipline.** New `src/recover/nag.rs` `CaptureNagWatcher` with two-tier thresholds (primary 5 turns, escalation 20 turns) emits stderr WARN + `capture_lag` signed events when an agent goes N turns without a `memory_store` call after a substantive user prompt. Wired into MCP `handle_request` dispatch loop per **[#1398](https://github.com/alphaonedev/ai-memory-mcp/issues/1398)**. CLAUDE.md §"Hard rule — `memory_store` FIRST" block (commit `7e98485`) is the agent-side enforcement; the watcher is the substrate-side enforcement. 10 unit tests pin the contract.
+- **L2 — Recover-on-boot.** New `src/recover/{mod,parsers/*,transcript_paths}.rs` + `src/cli/commands/recover_previous_session.rs` provides cross-session context rehydration from host transcripts. Resolves per-host transcript paths (Claude Code / Codex / Gemini / auto), parses JSONL turn streams, gap-replays missing turns into ai-memory through the shared `transcript_line_dedup` table (v52). New CLI subcommand: `ai-memory recover-previous-session` — CLI count grew **79 → 80** (default build) / **81 → 82** (`--features sal` or `--features sal-postgres`).
+- **L4 — Protocol fix.** New `memory_capture_turn` MCP tool (`src/mcp/tools/capture_turn.rs`) gives hosts a wire-stable turn-boundary persistence API per RFC-0001 (`docs/rfc/RFC-0001-mcp-turn-capture.md`). MCP `--profile full` tool count grew accordingly; the tool count drift gate at `.github/workflows/tool-count-drift.yml` pins the new total. Reference host-adapter shims under `clients/host-adapter-shim/{bash,node,python}/`.
+- **L3 — Substrate watcher.** DEFERRED to v0.7.x pending operator dep approval per CLAUDE.md sole-authority (the `notify` crate needs operator-reviewed introduction per `b5461c1e`). Tracked under **[#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389)** EPIC.
+
+### v0.7.0 #1389 schema v52 — `transcript_line_dedup` table (2026-05-28)
+
+New table backing RFC-0001 idempotency: composite key `(host_pubkey_b64, line_sha256)` with a `memory_id` FK into `memories(id)`. Both L4 `memory_capture_turn` and L2 `recover_from_transcript` share this dedup row to ensure a SIGKILL between turns never produces a duplicate memory on subsequent rehydration. Lockstep sqlite + postgres migration: `migrations/sqlite/0044_v52_transcript_line_dedup.sql` + `src/store/postgres.rs::migrate_v52` (additive table-create + 2 indexes). Schema constant `CURRENT_SCHEMA_VERSION` bumped 51 → 52 in both adapters; the substrate-doc tests (`current_schema_version_for_tests` SSOT accessor) re-pin the value.
+
+### v0.7.0 substrate hardening — v3 NHI assessment defects + Form-4 wire-truthfulness (2026-05-30)
+
+- **[#1383](https://github.com/alphaonedev/ai-memory-mcp/issues/1383)** (D-v3-1) — persona `mentioned_entity_id` extraction was incomplete on the metadata-only ingest path; postgres branch now denormalises the entity ref on every insert path (commit `0d9b129c`).
+- **[#1384](https://github.com/alphaonedev/ai-memory-mcp/issues/1384)** (D-v3-2) — namespace-standard parser silently dropped unknown enum values; now emits a WARN on silent fallback so operator-facing audit picks up the drift (commit `7c19ef0c`).
+- **[#1385](https://github.com/alphaonedev/ai-memory-mcp/issues/1385)** (D-v3-3) — HTTP POST `/api/v1/memories` silently dropped the caller-supplied `kind`; both branches of `create_memory` now thread `body.kind` through to the Memory row (commit `28a16f69`). 24/24 Form 6 vocab tests still pass.
+- **[#1411](https://github.com/alphaonedev/ai-memory-mcp/issues/1411)** (sister to #1385, discovered while fixing it) — HTTP POST `/api/v1/memories` ALSO silently dropped the caller-supplied `citations` / `source_uri` / `source_span` (Form 4 fact-provenance). Both branches now thread the validated body fields through; new `tests/http_create_memory_form4_provenance_round_trips.rs` (248 LOC, 2 tests) pins the wire-truthfulness contract (commit `615bf5e92`).
+
 ### v0.7.0 ship-gate CI-flake closure sweep (2026-05-27)
 
 Closes the three CI flakes filed after the 2026-05-22 SHIP-RECOMMENDED dossier so the integrated `release/v0.7.0` HEAD returns to all-platform-green:
