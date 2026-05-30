@@ -433,6 +433,21 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
         reversible: true,
         data_loss_risk: DataLossRisk::None,
     },
+    // v0.7.0 #1418 + #1419 — sqlite scopes the `memories_au` FTS5
+    // trigger from `AFTER UPDATE ON memories` to `AFTER UPDATE OF
+    // title, content, tags`. Reversible (DROP TRIGGER + recreate at
+    // the prior form). Idempotent via the `IF NOT EXISTS` guard on
+    // the recreate. No data loss — the trigger only governs how
+    // FTS5 stays in sync with row updates. Postgres is a no-op
+    // (no equivalent FTS5 trigger surface; same lockstep precedent
+    // as v51 federation_nonce_cache).
+    MigrationMeta {
+        version: 53,
+        name: "SCOPE_MEMORIES_AU_TRIGGER_TO_FTS_COLUMNS",
+        idempotent: true,
+        reversible: true,
+        data_loss_risk: DataLossRisk::None,
+    },
 ];
 
 /// Look up the metadata for a target schema version.
