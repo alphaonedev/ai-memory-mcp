@@ -7745,9 +7745,11 @@ impl MemoryStore for PostgresStore {
         .bind(patch.confidence)
         .bind(patch.metadata)
         .bind(patch.source_uri)
-        // v0.7.0 #1423 — bind expires_at COALESCE slot ($11). NULL
-        // leaves stored value untouched; Some(RFC3339-string) rewrites.
-        .bind(patch.expires_at)
+        // v0.7.0 #1423 — bind expires_at COALESCE slot ($11). The
+        // postgres column is `TIMESTAMPTZ`; parse the RFC3339 string
+        // into a DateTime so sqlx binds the right type. None → NULL
+        // → COALESCE leaves stored value untouched.
+        .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("update", e))?
