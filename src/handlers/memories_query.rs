@@ -559,6 +559,19 @@ pub async fn bulk_create(
                     serde_json::Value::String(caller.clone()),
                 );
             }
+            // v0.7.0 #1422 — sister to #1385 (kind) + #1411 (Form-4)
+            // single-create fixes. Pre-fix the bulk_create postgres
+            // branch validated these fields via RequestValidator above
+            // but hardcoded defaults on insert. Resolve here so the
+            // struct literal threads the validated values through.
+            let memory_kind = body
+                .kind
+                .as_deref()
+                .and_then(crate::models::MemoryKind::from_str)
+                .unwrap_or_default();
+            let citations = body.citations;
+            let source_uri = body.source_uri;
+            let source_span = body.source_span;
             let mem = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
@@ -576,12 +589,12 @@ pub async fn bulk_create(
                 expires_at,
                 metadata: metadata_stamped,
                 reflection_depth: 0,
-                memory_kind: crate::models::MemoryKind::Observation,
+                memory_kind,
                 entity_id: None,
                 persona_version: None,
-                citations: Vec::new(),
-                source_uri: None,
-                source_span: None,
+                citations,
+                source_uri,
+                source_span,
                 confidence_source: ConfidenceSource::CallerProvided,
                 confidence_signals: None,
                 confidence_decayed_at: None,
@@ -689,6 +702,18 @@ pub async fn bulk_create(
                     serde_json::Value::String(caller.clone()),
                 );
             }
+            // v0.7.0 #1422 — sister to #1385 + #1411 fix on the sqlite
+            // bulk_create branch. Resolve before the struct literal so
+            // body's owned fields aren't partial-moved before the kind
+            // parse runs.
+            let memory_kind = body
+                .kind
+                .as_deref()
+                .and_then(crate::models::MemoryKind::from_str)
+                .unwrap_or_default();
+            let citations = body.citations;
+            let source_uri = body.source_uri;
+            let source_span = body.source_span;
             let mem = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
@@ -706,12 +731,12 @@ pub async fn bulk_create(
                 expires_at,
                 metadata: metadata_stamped,
                 reflection_depth: 0,
-                memory_kind: crate::models::MemoryKind::Observation,
+                memory_kind,
                 entity_id: None,
                 persona_version: None,
-                citations: Vec::new(),
-                source_uri: None,
-                source_span: None,
+                citations,
+                source_uri,
+                source_span,
                 confidence_source: ConfidenceSource::CallerProvided,
                 confidence_signals: None,
                 confidence_decayed_at: None,
