@@ -421,7 +421,16 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       postgres ladder version-bumps to keep the SQLite/postgres
 //       CURRENT_SCHEMA_VERSION pinned in lockstep — this migration
 //       is a no-op DDL stub recording the version reach.
-const CURRENT_SCHEMA_VERSION: i32 = 52;
+// v53 = R5.F5.2 (#1418, HIGH, 2026-05-30) — scope the `memories_au`
+//       FTS5 sync trigger to (title, content, tags) on sqlite.
+//       Postgres has no equivalent FTS5 trigger (the postgres
+//       backend uses pgvector + tsvector primitives directly with
+//       no AFTER-UPDATE sync trigger on the `memories` table), so
+//       the postgres twin is a no-op DDL stub that only records
+//       the schema-version reach — the SQLite/postgres
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep so a
+//       single logical schema number tracks both adapters.
+const CURRENT_SCHEMA_VERSION: i32 = 53;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1157,6 +1166,9 @@ impl PostgresStore {
         }
         if current_version < 52 {
             self.migrate_v52().await?;
+        }
+        if current_version < 53 {
+            self.migrate_v53().await?;
         }
 
         Ok(())
@@ -2154,6 +2166,53 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v52 applied (#1389: transcript_line_dedup table + indexes for layered-capture idempotency)"
+        );
+        Ok(())
+    }
+
+    /// v53 (R5.F5.2, #1418) — postgres no-op twin of the SQLite
+    /// `memories_au` FTS5 trigger column-scoping fix.
+    ///
+    /// The SQLite ladder narrows the `memories_au` `AFTER UPDATE`
+    /// FTS5 sync trigger to the three FTS-mirrored columns
+    /// (`title`, `content`, `tags`) so hot-path UPDATEs against
+    /// non-FTS columns (`embedding`, `access_count`,
+    /// `last_accessed_at`, `confidence_decayed_at`, `version`) no
+    /// longer pay 2 unnecessary FTS5 row ops per UPDATE.
+    ///
+    /// **Why this is a no-op on postgres.** The postgres backend
+    /// has no equivalent FTS5 trigger — the SAL adapter uses
+    /// pgvector for embeddings + tsvector primitives for full-text
+    /// search, with no `AFTER UPDATE` sync trigger on the
+    /// `memories` table that mirrors the SQLite `memories_au`
+    /// shape. The postgres write path either writes directly to
+    /// the indexed tsvector column inline or relies on the
+    /// generated-column mechanism, neither of which carries the
+    /// "fire on every column" failure mode this fix closes.
+    ///
+    /// The SQLite/postgres `CURRENT_SCHEMA_VERSION` is pinned in
+    /// lockstep so a single logical schema number tracks both
+    /// adapters (per the existing v51 federation_nonce_cache
+    /// precedent — that migration was sqlite-only too, with the
+    /// postgres twin being a version-stamp). This function
+    /// records the version-reach via `record_schema_version(53)`
+    /// inside a transaction and returns.
+    async fn migrate_v53(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v53 tx", e))?;
+
+        record_schema_version(&mut tx, 53).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v53 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v53 applied (#1418: memories_au column-scope is sqlite-only; no-op postgres DDL)"
         );
         Ok(())
     }

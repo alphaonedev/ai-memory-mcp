@@ -284,10 +284,12 @@ fn seed_watermark_in_future(db_path: &std::path::Path, agent_id: &str) {
         updated_at: future.to_rfc3339(),
         last_accessed_at: None,
         expires_at: None,
-        // The recover_from_transcript watermark query is:
-        //   SELECT MAX(created_at) FROM memories
-        //   WHERE json_extract(metadata, '$.agent_id') = ?1
-        // The agent_id MUST land in metadata for the query to match.
+        // The recover_from_transcript watermark query is (post-R5.F5.3, #1419):
+        //   SELECT MAX(created_at) FROM memories WHERE agent_id_idx = ?1
+        // `agent_id_idx` is the VIRTUAL column added in the v14 migration
+        // that projects `json_extract(metadata, '$.agent_id')` from the
+        // metadata JSON, so the agent_id MUST land in metadata for the
+        // query to match.
         metadata: serde_json::json!({ "agent_id": agent_id }),
         reflection_depth: 0,
         memory_kind: MemoryKind::Observation,
