@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 52).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 53).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -228,7 +228,14 @@ CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
     VALUES ('delete', old.rowid, old.title, old.content, old.tags);
 END;
 
-CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+-- v0.7.0 R5.F5.2 (#1418) — column-scoped to (title, content, tags)
+-- so the hot-path UPDATEs that touch `embedding` / `access_count` /
+-- `last_accessed_at` / `confidence_decayed_at` / `version` skip the
+-- FTS5 sync entirely. `apply_migrations` at the v53 arm performs the
+-- swap (DROP + recreate) on legacy DBs that still carry the
+-- un-scoped trigger from earlier `SCHEMA` boots.
+CREATE TRIGGER IF NOT EXISTS memories_au
+    AFTER UPDATE OF title, content, tags ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, title, content, tags)
     VALUES ('delete', old.rowid, old.title, old.content, old.tags);
     INSERT INTO memories_fts(rowid, title, content, tags)
@@ -534,7 +541,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       column in the migration arm. NSA CSI mapping: recommendation
 //       (c) — defense-in-depth blast-radius controls on a compromised
 //       or misbehaving agent.
-const CURRENT_SCHEMA_VERSION: i64 = 52;
+//
+//   * v53 — R5.F5.2 (#1418), 2026-05-30 perf-audit closeout. Scope the
+//       `memories_au` FTS5 sync trigger to (title, content, tags) so
+//       hot-path UPDATEs that touch non-FTS columns (`embedding`,
+//       `access_count`, `last_accessed_at`, `confidence_decayed_at`,
+//       `version`) no longer pay 2 unnecessary FTS5 row ops per
+//       UPDATE. 100k-row embed-backfill = 200k spurious FTS5 row ops
+//       eliminated; `touch_many` for K=10 recalls drops 5-10x wall
+//       cost. Pure DDL — DROP TRIGGER + recreate with `AFTER UPDATE
+//       OF title, content, tags` column scope. Idempotent.
+const CURRENT_SCHEMA_VERSION: i64 = 53;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -901,6 +918,13 @@ const MIGRATION_V51_SQLITE: &str =
 // `CREATE TABLE IF NOT EXISTS` + two indexes — fully idempotent.
 const MIGRATION_V52_SQLITE: &str =
     include_str!("../../migrations/sqlite/0044_v52_transcript_line_dedup.sql");
+// v0.7.0 R5.F5.2 (#1418) — scope the `memories_au` FTS5 sync trigger
+// to (title, content, tags). DROP TRIGGER IF EXISTS + CREATE TRIGGER
+// with the new column scope. Idempotent via `DROP ... IF EXISTS` and
+// `AFTER UPDATE OF title, content, tags` resolving to byte-identical
+// DDL on every re-apply.
+const MIGRATION_V53_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0045_v53_memories_au_trigger_columns.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2154,6 +2178,51 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // the storage layer. `CREATE TABLE IF NOT EXISTS` so
             // the migration is replay-safe.
             conn.execute_batch(MIGRATION_V52_SQLITE)?;
+        }
+        if version < 53 {
+            // v0.7.0 R5.F5.2 (#1418) — scope the `memories_au` FTS5
+            // sync trigger to (title, content, tags) so non-FTS
+            // column UPDATEs (`embedding`, `access_count`,
+            // `last_accessed_at`, `confidence_decayed_at`,
+            // `version`) no longer churn `memories_fts` with
+            // unnecessary DELETE+INSERT pairs.
+            //
+            // Gate the trigger swap on `memories_fts` actually
+            // existing. The trigger body references `memories_fts`
+            // and SQLite 3.25+'s schema-rewriting `ALTER TABLE`
+            // revalidates every trigger body in the schema on
+            // subsequent DDL (RENAME / DROP / etc.) — so if we
+            // install `memories_au` here while `memories_fts` is
+            // absent, a downstream same-transaction RENAME in
+            // ANOTHER migration arm can blow up because SQLite
+            // revalidates this trigger's body and fails to resolve
+            // `memories_fts`. Real production paths always go
+            // through `db::open` → embedded `SCHEMA` (which
+            // creates `memories_fts`) → `migrate`, so `memories_fts`
+            // is always present at v53 in deployed code. Test
+            // fixtures that stamp `schema_version` past v0 without
+            // running `SCHEMA` are the only callers that hit the
+            // gate. On those, the un-scoped trigger never existed
+            // either (it was created by `SCHEMA`, not by any
+            // migration arm), so skipping the swap is a no-op
+            // structural-correctness pin rather than a functional
+            // regression. The next `db::open` against the upgraded
+            // file installs the column-scoped trigger via
+            // `CREATE TRIGGER IF NOT EXISTS` in `SCHEMA`.
+            //
+            // Idempotent — `DROP TRIGGER IF EXISTS` + recreate is
+            // byte-identical on every re-apply.
+            let memories_fts_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'memories_fts')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if memories_fts_exists {
+                conn.execute_batch(MIGRATION_V53_SQLITE)?;
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

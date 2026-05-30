@@ -309,10 +309,20 @@ pub fn recover_from_transcript(
     // L1 stores included). When the transcript has not been modified
     // since the agent last wrote a memory there is nothing to recover,
     // so we skip the parse + write phases entirely.
+    // v0.7.0 R5.F5.3 (#1419) — route through the indexed VIRTUAL
+    // `agent_id_idx` column added in the v14 migration
+    // (`src/storage/migrations.rs:1174-1209`). The previous query
+    // used `json_extract(metadata, '$.agent_id') = ?1` which SQLite
+    // cannot index — degenerating to a full table scan on populated
+    // DBs (100k+ rows → blows the L2 fast-path <100 ms budget pinned
+    // by #1394). The VIRTUAL column has identical extraction
+    // semantics (CASE WHEN json_valid(metadata) THEN
+    // json_extract(metadata, '$.agent_id') ELSE NULL END) so this
+    // is a pure plan rewrite — same rows return, only the access
+    // path changes from SCAN to SEARCH via `idx_memories_agent_id`.
     let watermark: Option<String> = conn
         .query_row(
-            "SELECT MAX(created_at) FROM memories \
-             WHERE json_extract(metadata, '$.agent_id') = ?1",
+            "SELECT MAX(created_at) FROM memories WHERE agent_id_idx = ?1",
             rusqlite::params![&opts.agent_id],
             |row| row.get::<_, Option<String>>(0),
         )
