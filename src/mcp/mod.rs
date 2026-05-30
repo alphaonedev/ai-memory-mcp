@@ -1445,7 +1445,11 @@ fn dispatch_memory_gc(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_session_start(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_session_start(ctx.conn, ctx.arguments, ctx.llm)
+    // v0.7.0 #1420 — thread the MCP-handshake-captured caller
+    // identity (`initialize.clientInfo.name` → `ctx.mcp_client`) so
+    // the post-list visibility filter at handle_session_start drops
+    // cross-agent `scope=private` rows before they reach the wire.
+    handle_session_start(ctx.conn, ctx.arguments, ctx.llm, ctx.mcp_client)
 }
 
 fn dispatch_memory_namespace_set_standard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

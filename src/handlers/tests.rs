@@ -7913,7 +7913,11 @@ async fn h8b_session_start_namespace_filter() {
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
         .with_state(state);
-    let body = serde_json::json!({"namespace": "target-ns", "limit": 5});
+    // v0.7.0 #1420 — pass agent_id=alice so the post-list visibility
+    // filter admits the seeded alice-owned rows. Pre-#1420 the test
+    // ran without a caller and the un-filtered db::list returned
+    // everyone's rows.
+    let body = serde_json::json!({"namespace": "target-ns", "limit": 5, "agent_id": "alice"});
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -8011,7 +8015,9 @@ async fn h8b_session_start_preloads_recent_context() {
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
         .with_state(state);
-    let body = serde_json::json!({"limit": 50});
+    // v0.7.0 #1420 — pass agent_id=alice so the post-list visibility
+    // filter admits the seeded alice-owned row.
+    let body = serde_json::json!({"limit": 50, "agent_id": "alice"});
     let resp = app
         .oneshot(
             axum::http::Request::builder()
