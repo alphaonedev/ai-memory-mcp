@@ -5918,13 +5918,25 @@ impl PostgresStore {
             .await
             .map_err(|e| ReflectError::Database(format!("begin reflect tx: {e}")))?;
 
+        // #1383 — extract the `mentioned_entity_id` denormalisation
+        // from the candidate row (`metadata.entity_id` or `[entity:X]`
+        // title marker, per `extract_mentioned_entity_id`). Pre-#1383
+        // the postgres reflection insert dropped this column entirely
+        // so `memory_persona_generate`'s `WHERE mentioned_entity_id = ?`
+        // query returned zero reflections against the alice lan-parity
+        // postgres-backed daemon — even when the caller correctly
+        // passed `metadata.entity_id` through `memory_reflect`. SQLite
+        // populates it at `src/storage/mod.rs:616`; this brings the
+        // postgres adapter to parity.
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(&candidate);
+
         // Insert the reflection memory inside the tx.
         let actual_id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15)
+                expires_at, metadata, reflection_depth, memory_kind, mentioned_entity_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15, $16)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -5947,7 +5959,11 @@ impl PostgresStore {
                 END,
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   ELSE EXCLUDED.memory_kind END
+                                   ELSE EXCLUDED.memory_kind END,
+                -- #1383 — mirror the sqlite ON CONFLICT clause: preserve
+                -- a previously-extracted attribution if EXCLUDED is NULL
+                -- (e.g. a re-store that lost the metadata key by accident).
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
             RETURNING id",
         )
         .bind(&new_id)
@@ -5965,6 +5981,7 @@ impl PostgresStore {
         .bind(&metadata_value)
         .bind(new_depth_i32)
         .bind("reflection")
+        .bind(mentioned_entity_id.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
@@ -7281,16 +7298,31 @@ impl MemoryStore for PostgresStore {
             ),
             None => None,
         };
+        // #1383 — denormalise `mentioned_entity_id` from the row's
+        // `metadata.entity_id` / `[entity:X]` title marker so that
+        // postgres-backed reflection rows are reachable via the
+        // `memory_persona_generate` matcher (which queries
+        // `WHERE mentioned_entity_id = ?` on the partial index from
+        // schema v32). Pre-#1383 the postgres `store()` path dropped
+        // this column entirely so every postgres reflection was
+        // invisible to persona generation despite the caller passing
+        // the entity attribution correctly. Mirrors sqlite at
+        // `src/storage/mod.rs:616`. Non-reflection rows return None
+        // here, matching the sqlite behaviour.
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+
         let id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
-                confidence_source, confidence_signals, confidence_decayed_at
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
-                      $21, $22, $23)
+                      $21, $22, $23,
+                      $24)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -7326,7 +7358,11 @@ impl MemoryStore for PostgresStore {
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
                 confidence_source = EXCLUDED.confidence_source,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
-                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at)
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                -- #1383 — preserve a previously-extracted attribution if
+                -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
+                -- at `src/storage/mod.rs:689`).
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -7352,6 +7388,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.confidence_source.as_str())
         .bind(confidence_signals_json.as_deref())
         .bind(memory.confidence_decayed_at.as_deref())
+        .bind(mentioned_entity_id.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -7409,12 +7446,19 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin store tx", e))?;
 
+        // #1383 — same denormalisation rationale as the regular
+        // `store()` path above. Reflection-kind rows passed through
+        // `store_with_embedding` (the recall-hybrid hot path) must
+        // still light up the `mentioned_entity_id` partial index.
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+
         let id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind, embedding
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                expires_at, metadata, reflection_depth, memory_kind, embedding,
+                mentioned_entity_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -7440,7 +7484,10 @@ impl MemoryStore for PostgresStore {
                 -- L1-1 — kind is sticky.
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    ELSE EXCLUDED.memory_kind END,
-                embedding = COALESCE(EXCLUDED.embedding, memories.embedding)
+                embedding = COALESCE(EXCLUDED.embedding, memories.embedding),
+                -- #1383 — preserve a previously-extracted attribution
+                -- if EXCLUDED is NULL (sqlite parity).
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -7461,6 +7508,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
         .bind(emb_pgvec)
+        .bind(mentioned_entity_id.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -8109,6 +8157,15 @@ impl MemoryStore for PostgresStore {
             None => None,
         };
         let confidence_decayed_at = parse_rfc3339_opt(memory.confidence_decayed_at.as_deref());
+        // #1383 — federation `apply_remote_memory` parity. When a peer
+        // pushes a reflection row, the receiver must populate
+        // `mentioned_entity_id` from the row's own metadata so that
+        // post-replication `memory_persona_generate` queries against
+        // the receiver also reach the synced reflection. Pre-#1383 a
+        // federated reflection landed invisible to the matcher on the
+        // receiver — a silent loss of persona-generation coverage on
+        // multi-peer deployments.
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
         let row = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -8116,10 +8173,12 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                entity_id, persona_version, version
+                entity_id, persona_version, version,
+                mentioned_entity_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24, $25, $26
+                $18, $19, $20, $21, $22, $23, $24, $25, $26,
+                $27
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = CASE
@@ -8218,7 +8277,17 @@ impl MemoryStore for PostgresStore {
                 -- version is newer-wins; advance to MAX so an out-of-order
                 -- federation push doesn't roll a peer back to a stale
                 -- version.
-                version = GREATEST(memories.version, EXCLUDED.version)
+                version = GREATEST(memories.version, EXCLUDED.version),
+                -- #1383 — newer-wins for the denormalised attribution
+                -- column. Matches the metadata / citations / etc.
+                -- merge shape above (a newer remote write that drops
+                -- the attribution shouldn't clobber the local one;
+                -- a newer remote write that ADDS one replaces it).
+                mentioned_entity_id = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                        THEN COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+                    ELSE memories.mentioned_entity_id
+                END
             RETURNING id",
         )
         .bind(&memory.id)
@@ -8247,6 +8316,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.entity_id.as_ref())
         .bind(memory.persona_version)
         .bind(memory.version)
+        .bind(mentioned_entity_id.as_deref())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
