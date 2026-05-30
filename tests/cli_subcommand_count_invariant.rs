@@ -26,8 +26,8 @@
 
 use std::fs;
 
-/// Returns (default_count, sal_count_total) — sal_count_total is
-/// the FULL count when `--features sal` (or `sal-postgres`) is
+/// Returns (`default_count`, `sal_count_total`) — `sal_count_total`
+/// is the FULL count when `--features sal` (or `sal-postgres`) is
 /// active (default variants + sal-gated variants).
 ///
 /// Matches the canonical CLAUDE.md §"Architecture" recipe:
@@ -63,7 +63,7 @@ fn count_command_variants() -> (usize, usize) {
     // continuation lines (which start with deeper indent or `(`).
     let is_variant_line = |line: &str| -> bool {
         let bytes = line.as_bytes();
-        bytes.len() >= 5 && &bytes[..4] == b"    " && (b'A'..=b'Z').contains(&bytes[4])
+        bytes.len() >= 5 && &bytes[..4] == b"    " && bytes[4].is_ascii_uppercase()
     };
 
     let lines: Vec<&str> = body.lines().collect();

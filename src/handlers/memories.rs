@@ -56,7 +56,9 @@ pub async fn get_memory(
         // `anonymous:req-…` id and see only non-private rows. Bound
         // inside the cfg block so default-features builds don't flag
         // it as unused.
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
         let ctx = crate::store::CallerContext::for_agent(&caller);
@@ -91,7 +93,9 @@ pub async fn get_memory(
     // single-record GET surface didn't extract X-Agent-Id and didn't
     // gate on ownership. Mirrors the postgres SAL branch above which
     // routes through `app.store.get(&ctx, &id)` with caller context.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
 
@@ -525,7 +529,9 @@ pub async fn delete_memory(
     // The existing `audit::emit(AuditAction::Delete)` further down writes
     // the SIEM-shaped enterprise audit row AFTER the delete commits;
     // these two channels are intentionally complementary.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller_for_forensic = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(
@@ -550,7 +556,9 @@ pub async fn delete_memory(
         // Resolve the target memory before delete so the audit emit
         // captures namespace + title metadata (Phase 9 — audit emit
         // parity on postgres).
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| "ai:http".to_string());
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
@@ -695,7 +703,9 @@ pub async fn delete_memory(
     // Task 1.9: governance enforcement (delete-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
             Ok(a) => a,
             Err(e) => {
@@ -839,7 +849,7 @@ pub async fn delete_memory(
                 .map(str::to_string)
                 .unwrap_or_else(|| {
                     headers
-                        .get("x-agent-id")
+                        .get(crate::HEADER_AGENT_ID)
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("anonymous")
                         .to_string()
@@ -894,7 +904,9 @@ pub async fn promote_memory(
     // reset) and returns 404 — the documented Wave 4 R2 flake.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
             Ok(a) => a,
             Err(e) => {
@@ -1093,7 +1105,9 @@ pub async fn promote_memory(
     // Task 1.9: governance enforcement (promote-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
             Ok(a) => a,
             Err(e) => {

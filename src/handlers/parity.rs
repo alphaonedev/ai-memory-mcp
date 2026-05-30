@@ -115,7 +115,9 @@ pub(crate) fn resolve_caller_agent_id(
 ) -> Result<String, String> {
     // 1. Header (or anonymous fallback) is authoritative. Delegate to
     //    the identity primitive so the body-match check there runs once.
-    let header_val = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_val = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let resolved = crate::identity::resolve_http_agent_id(body, header_val)
         .map_err(|e| format!("invalid agent_id: {e}"))?;
 

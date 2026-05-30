@@ -221,7 +221,9 @@ pub async fn detect_contradictions(
     // contradiction candidates across tenants. Admin callers bypass
     // the filter (matches the cross-cutting admin posture).
     let caller = {
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
     };
@@ -805,7 +807,9 @@ pub async fn check_duplicate(
     // attacker could probe whether their input matches another
     // tenant's private memory. Admin bypasses the filter.
     let caller = {
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
     };

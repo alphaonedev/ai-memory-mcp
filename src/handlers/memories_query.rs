@@ -69,7 +69,9 @@ pub async fn list_memories(
     // agents by listing their namespace. Header-only authentication
     // (no body field on this GET path); anonymous callers get a
     // per-request `anonymous:req-…` id and see only non-private rows.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -272,7 +274,9 @@ pub async fn search_memories(
         // as the same synthetic principal, so the visibility filter
         // only filtered out rows owned by other-than-"ai:http" —
         // effectively no filter for tenant-facing reads.
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
         let ctx = crate::store::CallerContext {
@@ -297,7 +301,9 @@ pub async fn search_memories(
     // (agent_id IS the agent's namespace prefix per
     // src/identity/mod.rs); `compute_visibility_prefixes` walks
     // ancestors from there.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let effective_as_agent: Option<String> = p
         .as_agent
         .clone()
@@ -511,7 +517,9 @@ pub async fn bulk_create(
     // agent_id and the subsequent list/get round-trip via the
     // scope=private filter dropped every one of them. Header-only
     // authentication; anonymous callers stamp `anonymous:req-<uuid>`.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
 

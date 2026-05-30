@@ -101,7 +101,7 @@ pub(super) fn forward_store_to_http(
     // and let the HTTP handler do all validation, governance, quota,
     // dedup, embedding, audit, and federation broadcast.
     let body = params.clone();
-    let headers: &[(&str, String)] = &[("X-Agent-Id", agent_id)];
+    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
 
     forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
 }

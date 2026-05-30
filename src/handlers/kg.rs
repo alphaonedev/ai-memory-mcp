@@ -96,7 +96,11 @@ pub async fn entity_register(
     let agent_id = body
         .agent_id
         .as_deref()
-        .or_else(|| headers.get("x-agent-id").and_then(|v| v.to_str().ok()))
+        .or_else(|| {
+            headers
+                .get(crate::HEADER_AGENT_ID)
+                .and_then(|v| v.to_str().ok())
+        })
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
@@ -331,7 +335,9 @@ pub async fn entity_get_by_alias(
                 // Apply the post-fix visibility mask: hide the entity
                 // if the caller cannot see the underlying memory row.
                 let caller = {
-                    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+                    let header_agent_id = headers
+                        .get(crate::HEADER_AGENT_ID)
+                        .and_then(|v| v.to_str().ok());
                     crate::identity::resolve_http_agent_id(None, header_agent_id)
                         .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
                 };
@@ -427,7 +433,9 @@ pub async fn entity_get_by_alias(
     // any caller could resolve a private entity by alias in the sqlite
     // branch. Admin bypasses the filter.
     let caller = {
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
     };
@@ -996,7 +1004,9 @@ pub async fn kg_find_paths(
     // visibility filter (path-traversal flavour) sees the right
     // principal. Header-only authentication on this POST surface;
     // anonymous callers get a per-request `anonymous:req-…` id.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -1170,7 +1180,9 @@ pub async fn kg_query(
     // agents by walking from a public source row. Anonymous callers
     // get a per-request `anonymous:req-…` id and see only
     // non-private targets.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(id) => id,
         Err(e) => {

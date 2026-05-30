@@ -688,7 +688,9 @@ pub async fn delete_link(
     // action audit. Link delete mutates the graph topology; emit the
     // forensic-chain entry BEFORE the storage write so the audit trail
     // captures intent regardless of downstream success.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(
@@ -835,7 +837,9 @@ pub async fn get_links(
     // whether either endpoint memory was scope=private owned by a
     // different agent. Admin callers bypass the filter.
     let caller = {
-        let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
     };

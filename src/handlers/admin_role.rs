@@ -139,7 +139,9 @@ pub fn require_admin(
     headers: &HeaderMap,
     endpoint: &'static str,
 ) -> Result<String, Response> {
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     // v0.7.0 #984 — surface `resolve_http_agent_id` errors as 400
     // BAD_REQUEST instead of papering them with the
     // `"anonymous:invalid"` sentinel. Pre-#984 a wire caller who
