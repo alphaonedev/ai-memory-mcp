@@ -408,9 +408,40 @@ fn merge_governance_for_response(metadata: &Value) -> Value {
     // Step 1: typed-struct base. Resolves to defaults when no
     // governance metadata is present (matches pre-#1326 behaviour
     // for the well-known-fields surface).
-    let base = GovernancePolicy::from_metadata(metadata)
-        .map(Result::unwrap_or_default)
-        .unwrap_or_default();
+    //
+    // #1384 — observability for stored-corruption on the GET path.
+    // `from_metadata` returns three shapes: `None` (no governance
+    // metadata, fall through to default), `Some(Ok(policy))` (typed
+    // parse succeeded), or `Some(Err(parse_err))` (governance JSON
+    // present but malformed — e.g. an unknown enum variant landed via
+    // direct SQL update or a stale binary). Pre-#1384 the
+    // `.map(Result::unwrap_or_default)` collapsed the `Err` arm
+    // silently into `GovernancePolicy::default()`, so the get-standard
+    // response showed `write: "any"` (the default) even when the
+    // stored row carried `write: "approval"` (an invalid variant the
+    // operator typo'd). Surface the drift via a tracing WARN so the
+    // silent fallback is observable in operator logs; preserve the
+    // backward-compat default-on-failure shape because the response
+    // body must always include a typed policy block.
+    let base = match GovernancePolicy::from_metadata(metadata) {
+        None => GovernancePolicy::default(),
+        Some(Ok(p)) => p,
+        Some(Err(parse_err)) => {
+            tracing::warn!(
+                target: "ai_memory::governance::policy_read",
+                error = %parse_err,
+                "stored metadata.governance failed typed deserialise on \
+                 the get-standard read path — the response will fall \
+                 back to GovernancePolicy::default() (write=any, \
+                 delete=owner, approver=human). Likely cause: direct \
+                 SQL update, older binary, or a typo'd enum variant \
+                 that bypassed the set-standard typed gate. Operator \
+                 should re-run `memory_namespace_set_standard` to \
+                 restore the typed shape."
+            );
+            GovernancePolicy::default()
+        }
+    };
     let mut merged = serde_json::to_value(&base)
         .ok()
         .and_then(|v| v.as_object().cloned())

@@ -8220,7 +8220,37 @@ fn read_namespace_policy(conn: &Connection, namespace: &str) -> Option<Governanc
     let mem = get(conn, &standard_id).ok()??;
     match GovernancePolicy::from_metadata(&mem.metadata) {
         Some(Ok(p)) => Some(p),
-        _ => None,
+        // #1384 — observability for stored-corruption. The write path
+        // (`memory_namespace_set_standard` → typed `GovernancePolicy`
+        // deserialise) rejects unknown enum variants and malformed
+        // structures (verified live against alice: `write: "approval"`
+        // returns a typed 400 error). A parse error here therefore
+        // means the stored JSON drifted out-of-band: direct SQL update,
+        // migration corruption, older binary writing newer schema,
+        // etc. Pre-#1384 this arm silently returned `None` and the
+        // inheritance walk continued to the parent — which may be
+        // totally permissive, silently downgrading the operator's
+        // intent. Surface the drift via tracing WARN so operators
+        // can grep `ai_memory::governance::policy_read` for the lag.
+        // We still return `None` (don't fail-CLOSED at the read site
+        // — that could lock callers out of unrelated namespaces) but
+        // operators now have a structured signal to investigate.
+        Some(Err(parse_err)) => {
+            tracing::warn!(
+                target: "ai_memory::governance::policy_read",
+                namespace = %namespace,
+                standard_id = %standard_id,
+                error = %parse_err,
+                "stored metadata.governance failed typed deserialise — \
+                 inheritance walk will continue past this namespace as \
+                 if no policy were set. Likely cause: direct SQL update, \
+                 older binary, or corrupted migration. Operator should \
+                 re-run `memory_namespace_set_standard` to restore the \
+                 typed shape."
+            );
+            None
+        }
+        None => None,
     }
 }
 
