@@ -58,6 +58,8 @@
 
 use std::time::Instant;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64_STD;
 use rusqlite::OptionalExtension;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -66,6 +68,19 @@ use sha2::{Digest, Sha256};
 
 use crate::mcp::registry::McpTool;
 use crate::models::{Memory, MemoryKind, Tier};
+use crate::signed_events::{self, SignedEvent};
+
+/// Env var carrying the operator's per-host Ed25519 pubkey allowlist
+/// for L4 `memory_capture_turn` signature verification (#1414).
+/// Comma-separated base64-encoded 32-byte pubkeys. Unset / empty =
+/// no host signatures accepted (every `host_signature_b64` +
+/// `host_pubkey_b64` payload errors with `HOST_PUBKEY_NOT_ENROLLED`).
+///
+/// Mirrors the `AI_MEMORY_ADMIN_AGENT_IDS` shape — an operator-
+/// curated allowlist read at call time, no daemon-restart required
+/// for enrollment changes (each call re-reads the env). Documented
+/// in CLAUDE.md §"Environment Variables".
+pub(crate) const L4_HOST_PUBKEY_ALLOWLIST_ENV: &str = "AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST";
 
 /// `memory_capture_turn` request body per RFC-0001 §"Tool input schema".
 ///
@@ -83,8 +98,6 @@ use crate::models::{Memory, MemoryKind, Tier};
 // ignored; missing REQUIRED fields still error via serde. Arbitrary
 // host-specific data belongs in `metadata`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[allow(dead_code)] // Skeleton phase — fields read by the storage
-// transaction landing in the follow-up slice.
 pub struct MemoryCaptureTurnRequest {
     /// Opaque identifier the host issues per conversation session.
     /// Stable across turns within a session; distinct across
@@ -125,8 +138,11 @@ pub struct MemoryCaptureTurnRequest {
     /// Optional summary of tool invocations within this assistant
     /// turn. Each entry is `{tool: string, brief: string}`. The
     /// substrate preserves the list verbatim but does not (at v0.7.0)
-    /// classify or index per-tool-call.
+    /// classify or index per-tool-call. Reserved for v0.7.x atom-
+    /// per-tool indexing; the field is wire-stable today so hosts
+    /// can already populate it without breakage.
     #[serde(default)]
+    #[allow(dead_code)]
     pub tool_calls: Vec<ToolCallSummary>,
 
     /// RFC3339 instant the host emitted the turn. Used as the
@@ -248,22 +264,98 @@ impl McpTool for MemoryCaptureTurnTool {
 ///   INSERT failed; transaction rolled back, no row written.
 /// - `TX_BEGIN_FAILED: <detail>` / `TX_COMMIT_FAILED: <detail>` —
 ///   transaction lifecycle errors.
-/// - `HOST_PUBKEY_NOT_ENROLLED: <pubkey>` — placeholder for the
-///   signed-path enforcement (RFC-0001 §"Signature + attestation");
-///   not yet wired in v0.7.0 ship slice.
-pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+/// - `HOST_PUBKEY_NOT_ENROLLED: <pubkey>` — `host_pubkey_b64` is not
+///   on the operator's L4 host-pubkey allowlist
+///   (`AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` env). Per #1414.
+/// - `SIGNED_EVENTS_APPEND_FAILED: <detail>` — substrate failed to
+///   write the L4 audit row. Per #1415.
+///
+/// # Security (post-#1413 critical fix)
+///
+/// - **agent_id agreement** — when `req.metadata.agent_id` is present
+///   it MUST equal the resolved `caller_agent_id` (mirroring
+///   `resolve_http_agent_id`'s body-header agreement contract).
+///   Mismatch returns `INVALID_INPUT` and refuses the write.
+/// - **Signature verification** — when `host_signature_b64` and
+///   `host_pubkey_b64` are present, the pubkey is checked against the
+///   `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` env-var allowlist
+///   (`HOST_PUBKEY_NOT_ENROLLED` on miss) and the signature is verified
+///   via Ed25519 over the canonical-bytes encoding
+///   `host_session_id || 0x00 || host_turn_index || 0x00 || role ||
+///   0x00 || content` (`INVALID_INPUT: signature_verification_failed`
+///   on mismatch). On success the L4 audit row carries
+///   `attest_level = "signed_by_peer"`; absent both fields yields
+///   `attest_level = "self_signed"`; exactly one of the two fields
+///   present errors with `INVALID_INPUT`.
+/// - **`signed_events` chain row** — the substrate writes one row per
+///   successful capture inside the BEGIN IMMEDIATE transaction with
+///   `event_type = "memory_capture_turn"`, the resolved `attest_level`,
+///   and `payload_hash = sha256(canonical bytes)` so audit can prove
+///   which layer caught each turn (#1415).
+pub fn handle_capture_turn(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller_agent_id: Option<&str>,
+) -> Result<Value, String> {
     let start = Instant::now();
     let req: MemoryCaptureTurnRequest =
         serde_json::from_value(params.clone()).map_err(|e| format!("INVALID_INPUT: {e}"))?;
 
+    // v0.7.0 #1413 — resolve effective caller for the agent_id agreement
+    // check + signed_events row attribution. MCP stdio captures the host
+    // identity at `initialize.clientInfo.name`; when present, the
+    // dispatcher threads it via `ctx.mcp_client`. When absent, we still
+    // mint a per-request fallback so audit attribution is never empty.
+    let caller = caller_agent_id.unwrap_or("anonymous:mcp-unknown");
+
+    // v0.7.0 #1413 — agent_id agreement check. If the caller stamped a
+    // `metadata.agent_id` it MUST equal the resolved caller — otherwise
+    // an attacker with MCP-stdio access could forge memories attributed
+    // to other identities. Mirrors `resolve_http_agent_id`'s body-header
+    // agreement contract.
+    if let Some(meta_agent) = req
+        .metadata
+        .as_ref()
+        .and_then(|v| v.get("agent_id"))
+        .and_then(|v| v.as_str())
+        && meta_agent != caller
+    {
+        return Err(format!(
+            "INVALID_INPUT: metadata.agent_id ({meta_agent:?}) does not match resolved caller ({caller:?})"
+        ));
+    }
+
+    // v0.7.0 #1414 — host-signature verification. The wire schema
+    // advertises a signed-by-peer path; the handler must actually
+    // enforce it. Cases:
+    //   (sig, pubkey) both Some → check allowlist + verify Ed25519
+    //   exactly one Some → INVALID_INPUT (paired-fields contract)
+    //   both None → unsigned ("self_signed") capture path
+    let canonical = format!(
+        "{}\0{}\0{}\0{}",
+        &req.host_session_id, req.host_turn_index, &req.role, &req.content
+    );
+    let sha_vec = {
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        hasher.finalize().to_vec()
+    };
+
+    let (sig_bytes_opt, attest_level): (Option<Vec<u8>>, String) =
+        verify_host_signature(&req, canonical.as_bytes())?;
+
     // Step 1 — dedup-lookup by the canonical (host_session_id,
     // host_turn_index) key. The partial index
-    // idx_transcript_line_dedup_host_turn (created in schema v52)
-    // serves this query.
+    // idx_transcript_line_dedup_host_turn (created in schema v52) is
+    // gated `WHERE host_session_id IS NOT NULL`; adding the explicit
+    // IS NOT NULL predicate to the SELECT guarantees the planner
+    // hits the partial index across SQLite versions (#1394 / R5.F5.1).
     let existing: Option<String> = conn
         .query_row(
             "SELECT memory_id FROM transcript_line_dedup \
-             WHERE host_session_id = ?1 AND host_turn_index = ?2",
+             WHERE host_session_id IS NOT NULL \
+               AND host_session_id = ?1 \
+               AND host_turn_index = ?2",
             rusqlite::params![&req.host_session_id, req.host_turn_index],
             |row| row.get(0),
         )
@@ -280,24 +372,10 @@ pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Resul
         }));
     }
 
-    // Step 2 — compute sha256 of canonical bytes per RFC-0001's
-    // signature canonicalisation contract. The same encoding is
-    // what host_signature_b64 (when present) signs over, so the
-    // substrate's secondary dedup key is byte-equivalent to the
-    // signature's plaintext.
-    let canonical = format!(
-        "{}\0{}\0{}\0{}",
-        &req.host_session_id, req.host_turn_index, &req.role, &req.content
-    );
-    let sha_vec = {
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
-        hasher.finalize().to_vec()
-    };
-
-    // Step 3 — atomic INSERT both rows under one BEGIN IMMEDIATE
-    // transaction. Failure rolls back so an orphaned memory cannot
-    // exist without its dedup row.
+    // Step 3 — atomic INSERT both rows + signed_events chain row
+    // under one BEGIN IMMEDIATE transaction. Failure rolls back so an
+    // orphaned memory cannot exist without its dedup row OR its audit
+    // row.
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
@@ -310,6 +388,7 @@ pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Resul
             "captured-via-l4".to_string(),
             format!("host:{host_kind}"),
             format!("role:{}", req.role),
+            format!("attest:{attest_level}"),
         ];
         if let Some(hv) = req.host_version.as_deref() {
             tags.push(format!("host-version:{hv}"));
@@ -319,16 +398,27 @@ pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Resul
         // because the substrate's `storage::insert` upserts on
         // `(title, namespace)`; without host_session_id in the title,
         // two distinct sessions whose turn N has the same role would
-        // collide on the same memory row. Including the dedup key in
-        // the title makes the upsert behaviour align with the L4
-        // idempotency contract — the only "same-title" case is a true
-        // re-delivery of the same (session, turn).
+        // collide on the same memory row.
         let title = format!(
             "L4 capture {} {} turn {} ({})",
             host_kind, req.host_session_id, req.host_turn_index, req.role
         );
 
-        let metadata = req.metadata.clone().unwrap_or_else(|| json!({}));
+        // v0.7.0 #1413 — stamp `metadata.agent_id` with the resolved
+        // caller so the inserted memory carries the authenticated-via-
+        // MCP-handshake identity. If the caller did not supply metadata
+        // we synthesize an object with just the agent_id. If they did
+        // supply metadata WITHOUT agent_id we patch it in. If they
+        // supplied WITH a matching agent_id (verified by the agreement
+        // check above) we preserve it verbatim.
+        let metadata = {
+            let mut m = req.metadata.clone().unwrap_or_else(|| json!({}));
+            if let Some(obj) = m.as_object_mut() {
+                obj.entry("agent_id".to_string())
+                    .or_insert_with(|| Value::String(caller.to_string()));
+            }
+            m
+        };
 
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
@@ -371,6 +461,24 @@ pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Resul
         )
         .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
 
+        // v0.7.0 #1415 — emit signed_events chain row inside the same
+        // tx so audit can prove L4 caught the turn. attest_level reflects
+        // whether the host provided a verified Ed25519 signature
+        // (#1414). Failure aborts the tx so memory/dedup rows are
+        // rolled back atomically — the audit chain never lags the data.
+        let signed_event = SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: caller.to_string(),
+            event_type: "memory_capture_turn".to_string(),
+            payload_hash: sha_vec.clone(),
+            signature: sig_bytes_opt.clone(),
+            attest_level: attest_level.clone(),
+            timestamp: now_iso.clone(),
+            ..SignedEvent::default()
+        };
+        signed_events::append_signed_event_no_tx(conn, &signed_event)
+            .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
+
         Ok(inserted_id)
     })();
 
@@ -383,6 +491,7 @@ pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Resul
                 "memory_id": memory_id,
                 "dedup_hit": false,
                 "layer": "L4",
+                "attest_level": attest_level,
                 "elapsed_ms": elapsed_ms,
             }))
         }
@@ -391,6 +500,80 @@ pub fn handle_capture_turn(conn: &rusqlite::Connection, params: &Value) -> Resul
             Err(e)
         }
     }
+}
+
+/// v0.7.0 #1414 — parse + verify the host signature pair, returning
+/// `(sig_bytes_opt, attest_level)` for downstream use in the
+/// signed_events row.
+///
+/// Contract:
+/// - both `host_signature_b64` and `host_pubkey_b64` present →
+///   pubkey allowlist check → Ed25519 verify → ("signed_by_peer")
+/// - exactly one of the two present → `INVALID_INPUT` (paired-fields)
+/// - both absent → (`None`, "self_signed")
+fn verify_host_signature(
+    req: &MemoryCaptureTurnRequest,
+    canonical_bytes: &[u8],
+) -> Result<(Option<Vec<u8>>, String), String> {
+    match (req.host_signature_b64.as_deref(), req.host_pubkey_b64.as_deref()) {
+        (None, None) => Ok((None, "self_signed".to_string())),
+        (Some(_), None) | (None, Some(_)) => Err(
+            "INVALID_INPUT: host_signature_b64 and host_pubkey_b64 must both be present or both absent"
+                .to_string(),
+        ),
+        (Some(sig_b64), Some(pubkey_b64)) => {
+            let pubkey_bytes = B64_STD
+                .decode(pubkey_b64)
+                .map_err(|e| format!("INVALID_INPUT: host_pubkey_b64 not valid base64: {e}"))?;
+            let pubkey_arr: [u8; 32] = pubkey_bytes.try_into().map_err(|_| {
+                "INVALID_INPUT: host_pubkey_b64 must decode to 32 bytes (Ed25519)".to_string()
+            })?;
+
+            if !is_host_pubkey_enrolled(&pubkey_arr) {
+                return Err(format!("HOST_PUBKEY_NOT_ENROLLED: {pubkey_b64}"));
+            }
+
+            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_arr).map_err(
+                |e| format!("INVALID_INPUT: host_pubkey_b64 not a valid Ed25519 key: {e}"),
+            )?;
+
+            let sig_bytes = B64_STD
+                .decode(sig_b64)
+                .map_err(|e| format!("INVALID_INPUT: host_signature_b64 not valid base64: {e}"))?;
+            let sig_arr: [u8; 64] = sig_bytes.clone().try_into().map_err(|_| {
+                "INVALID_INPUT: host_signature_b64 must decode to 64 bytes (Ed25519)".to_string()
+            })?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+            verifying_key
+                .verify_strict(canonical_bytes, &signature)
+                .map_err(|e| {
+                    format!("INVALID_INPUT: signature_verification_failed: {e}")
+                })?;
+
+            Ok((Some(sig_bytes), "signed_by_peer".to_string()))
+        }
+    }
+}
+
+/// Check the env-var allowlist for a host pubkey. Re-reads the env
+/// on every call so operators can adjust enrollment without daemon
+/// restart. An unset / empty env means no host signatures are
+/// accepted (every signed-path call yields `HOST_PUBKEY_NOT_ENROLLED`)
+/// — the conservative default per the v0.7.0 sole-authority rule.
+fn is_host_pubkey_enrolled(pubkey: &[u8; 32]) -> bool {
+    let Ok(raw) = std::env::var(L4_HOST_PUBKEY_ALLOWLIST_ENV) else {
+        return false;
+    };
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(bytes) = B64_STD.decode(entry)
+            && bytes.len() == 32
+            && bytes.as_slice() == pubkey
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -447,10 +630,18 @@ mod handler_tests {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
     }
 
+    /// Test helper — calls the handler with no MCP-handshake caller
+    /// (`None`). The agent_id agreement check at #1413 is a no-op
+    /// when the request body carries no `metadata.agent_id`, so
+    /// every legacy test continues to pass under the new signature.
+    fn call_handler(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+        handle_capture_turn(conn, params, None)
+    }
+
     #[test]
     fn handler_accepts_minimal_request() {
         let conn = fresh_conn();
-        let resp = handle_capture_turn(
+        let resp = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-a",
@@ -468,7 +659,7 @@ mod handler_tests {
     #[test]
     fn handler_rejects_missing_required_fields() {
         let conn = fresh_conn();
-        let resp = handle_capture_turn(&conn, &json!({ "host_session_id": "x" }));
+        let resp = call_handler(&conn, &json!({ "host_session_id": "x" }));
         let err = resp.expect_err("missing required fields must error");
         assert!(
             err.starts_with("INVALID_INPUT"),
@@ -484,7 +675,7 @@ mod handler_tests {
         // Wider host compat — a host with a newer field set must not
         // have its turns dropped wholesale.
         let conn = fresh_conn();
-        let resp = handle_capture_turn(
+        let resp = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-a",
@@ -507,7 +698,7 @@ mod handler_tests {
         // enforced by serde (no `#[serde(default)]`). A turn missing
         // `content` must error rather than silently store an empty turn.
         let conn = fresh_conn();
-        let err = handle_capture_turn(
+        let err = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-a",
@@ -522,7 +713,7 @@ mod handler_tests {
     #[test]
     fn handler_accepts_full_request_with_tool_calls() {
         let conn = fresh_conn();
-        let resp = handle_capture_turn(
+        let resp = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-a",
@@ -554,7 +745,7 @@ mod handler_tests {
         // one memory. The second call returns dedup_hit:true and
         // the existing memory_id.
         let conn = fresh_conn();
-        let first = handle_capture_turn(
+        let first = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-idem",
@@ -567,7 +758,7 @@ mod handler_tests {
         assert_eq!(first["dedup_hit"].as_bool(), Some(false));
         let first_id = first["memory_id"].as_str().unwrap().to_string();
 
-        let second = handle_capture_turn(
+        let second = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-idem",
@@ -592,7 +783,7 @@ mod handler_tests {
     #[test]
     fn handler_distinct_session_turn_creates_separate_memories() {
         let conn = fresh_conn();
-        let a = handle_capture_turn(
+        let a = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-a",
@@ -602,7 +793,7 @@ mod handler_tests {
             }),
         )
         .expect("a ok");
-        let b = handle_capture_turn(
+        let b = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-b",
@@ -612,7 +803,7 @@ mod handler_tests {
             }),
         )
         .expect("b ok");
-        let c = handle_capture_turn(
+        let c = call_handler(
             &conn,
             &json!({
                 "host_session_id": "session-a",
