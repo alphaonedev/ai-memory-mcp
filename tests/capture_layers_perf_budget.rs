@@ -69,6 +69,10 @@ const L1_BUDGET_NS_MEAN: u128 = 5_000; // 5 µs
 
 #[test]
 fn l1_observe_tool_call_mean_cost_under_budget() {
+    // Measurement: 10k iterations. Mean across the full run — the
+    // operator budget is about steady-state throughput, not p99 tail.
+    const N: usize = 10_000;
+
     // Pre-warm: classify_tool + the HashMap entry allocation should
     // be in cache by the time we start measuring. The watcher is
     // re-used across iterations so the (agent_id, session_id) key
@@ -84,9 +88,6 @@ fn l1_observe_tool_call_mean_cost_under_budget() {
         let _ = watcher.observe_tool_call(agent_id, session_id, ToolKind::Other);
     }
 
-    // Measurement: 10k iterations. Mean across the full run — the
-    // operator budget is about steady-state throughput, not p99 tail.
-    const N: usize = 10_000;
     let start = Instant::now();
     for _ in 0..N {
         let _ = watcher.observe_tool_call(agent_id, session_id, ToolKind::Other);
@@ -108,6 +109,8 @@ fn l1_observe_tool_call_mean_cost_under_budget() {
 
 #[test]
 fn l1_observe_tool_call_memory_write_reset_cost_under_budget() {
+    const N: usize = 10_000;
+
     // The MemoryWrite branch takes a different path
     // (`*entry = SessionCounter::default()` instead of saturating_add),
     // so pin its cost separately to catch a regression that only the
@@ -120,7 +123,6 @@ fn l1_observe_tool_call_memory_write_reset_cost_under_budget() {
         let _ = watcher.observe_tool_call(agent_id, session_id, ToolKind::MemoryWrite);
     }
 
-    const N: usize = 10_000;
     let start = Instant::now();
     for _ in 0..N {
         let _ = watcher.observe_tool_call(agent_id, session_id, ToolKind::MemoryWrite);
@@ -137,14 +139,15 @@ fn l1_observe_tool_call_memory_write_reset_cost_under_budget() {
 
 #[test]
 fn l1_per_session_independence_does_not_inflate_mean_cost() {
+    const SESSIONS: usize = 100;
+    const PER_SESSION: usize = 100;
+
     // Real-world dispatch sees many distinct (agent_id, session_id)
     // tuples — a slow lookup grows linearly with HashMap size, which
     // would be a different bug than the per-call cost. Pin the
     // multi-session case to catch a `O(N)` regression in the inner
     // lookup (e.g. switch from HashMap to Vec by mistake).
     let watcher = CaptureNagWatcher::new(0, 0);
-    const SESSIONS: usize = 100;
-    const PER_SESSION: usize = 100;
     let agents: Vec<String> = (0..SESSIONS).map(|i| format!("ai:perf-l1-{i}")).collect();
     let session_ids: Vec<String> = (0..SESSIONS).map(|i| format!("perf-l1-sess-{i}")).collect();
 
