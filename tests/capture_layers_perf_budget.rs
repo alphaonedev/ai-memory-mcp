@@ -450,6 +450,7 @@ fn l4_capture_turn_p95_under_budget() {
                 "content": format!("warm-up turn {i}: lorem ipsum"),
                 "host_kind": "claude-code",
             }),
+            None,
         )
         .expect("warm-up turn");
         assert_eq!(resp["layer"].as_str(), Some("L4"));
@@ -464,7 +465,7 @@ fn l4_capture_turn_p95_under_budget() {
             "host_kind": "claude-code",
         });
         let start = Instant::now();
-        let resp = handle_capture_turn(&conn, &params).expect("capture turn");
+        let resp = handle_capture_turn(&conn, &params, None).expect("capture turn");
         samples.push(start.elapsed().as_millis());
         assert_eq!(
             resp["dedup_hit"].as_bool(),
@@ -510,6 +511,7 @@ fn l4_capture_turn_dedup_hit_is_faster_than_full_path() {
                 "content": format!("priming turn {i}"),
                 "host_kind": "claude-code",
             }),
+            None,
         )
         .expect("prime turn");
     }
@@ -523,7 +525,7 @@ fn l4_capture_turn_dedup_hit_is_faster_than_full_path() {
             "host_kind": "claude-code",
         });
         let start = Instant::now();
-        let resp = handle_capture_turn(&conn, &params).expect("dedup hit");
+        let resp = handle_capture_turn(&conn, &params, None).expect("dedup hit");
         dedup_samples.push(start.elapsed().as_millis());
         assert_eq!(
             resp["dedup_hit"].as_bool(),
