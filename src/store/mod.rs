@@ -1901,6 +1901,16 @@ pub struct UpdatePatch {
     /// before reaching the storage layer; the storage layer trusts the
     /// patch as already-validated.
     pub source_uri: Option<String>,
+    /// v0.7.0 #1423 — opt-in expires_at patch. Pre-#1423 the postgres
+    /// PUT handler silently dropped `body.expires_at` because this
+    /// field didn't exist on the patch — `UpdateMemory.expires_at`
+    /// flowed in from the wire, the postgres `app.store.update`
+    /// branch built an `UpdatePatch` without it, and the SQL UPDATE
+    /// never touched the `expires_at` column. `None` leaves stored
+    /// value untouched (COALESCE semantics on the SQL layer);
+    /// `Some(s)` where `s` is an RFC3339 timestamp string rewrites
+    /// it. Validated by the handler / caller before reaching storage.
+    pub expires_at: Option<String>,
 }
 
 /// Report produced by `verify`.

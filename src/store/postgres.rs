@@ -7722,6 +7722,7 @@ impl MemoryStore for PostgresStore {
                     ELSE $9::JSONB
                 END,
                 source_uri = COALESCE($10, source_uri),
+                expires_at = COALESCE($11, expires_at),
                 version = version + 1,
                 updated_at = NOW()
              WHERE id = $1",
@@ -7744,6 +7745,9 @@ impl MemoryStore for PostgresStore {
         .bind(patch.confidence)
         .bind(patch.metadata)
         .bind(patch.source_uri)
+        // v0.7.0 #1423 — bind expires_at COALESCE slot ($11). NULL
+        // leaves stored value untouched; Some(RFC3339-string) rewrites.
+        .bind(patch.expires_at)
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("update", e))?

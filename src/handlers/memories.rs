@@ -238,6 +238,14 @@ pub async fn update_memory(
             metadata: body.metadata.clone(),
             // v0.7.0 Provenance Gap 2 (#906) — thread source_uri patch.
             source_uri: body.source_uri.clone(),
+            // v0.7.0 #1423 — thread expires_at patch. Pre-#1423 the
+            // postgres branch built UpdatePatch without expires_at so
+            // PUT /memories/{id} silently dropped body.expires_at on
+            // a postgres-backed daemon. The sqlite branch never went
+            // through UpdatePatch (it builds its own arg list against
+            // db::update_with_expected_version) so this was a
+            // postgres-only data drop.
+            expires_at: body.expires_at.clone(),
         };
         // v0.7.0 ship-hardening (2026-05-19): resolve caller from
         // X-Agent-Id header so update() can authorize against the
