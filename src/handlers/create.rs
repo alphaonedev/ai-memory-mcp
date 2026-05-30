@@ -77,7 +77,9 @@ fn resolve_create_agent_id(
     headers: &HeaderMap,
     body: &CreateMemory,
 ) -> Result<(String, serde_json::Value), axum::response::Response> {
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let metadata_agent_id = body
         .metadata
         .get("agent_id")

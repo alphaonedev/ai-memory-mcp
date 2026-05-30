@@ -280,7 +280,9 @@ pub async fn consolidate_memories(
     // breaks the cross-tenant tracking the K9 governance walk leans
     // on. Header-only authentication now; body.agent_id (if present)
     // must match the authenticated caller else 403.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let consolidator_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id)
     {
         Ok(id) => id,

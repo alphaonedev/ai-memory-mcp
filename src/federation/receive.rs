@@ -162,7 +162,7 @@ pub(super) async fn catchup_once_with_store(
         let mut req = config
             .client
             .get(&url)
-            .header("x-agent-id", local_id.as_str())
+            .header(crate::HEADER_AGENT_ID, local_id.as_str())
             .header(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_id.as_str(),
@@ -346,7 +346,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         let mut req = config
             .client
             .get(&url)
-            .header("x-agent-id", local_id.as_str())
+            .header(crate::HEADER_AGENT_ID, local_id.as_str())
             .header(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_id.as_str(),
@@ -467,7 +467,7 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
         let mut req = config
             .client
             .get(&url)
-            .header("x-agent-id", local_id.as_str())
+            .header(crate::HEADER_AGENT_ID, local_id.as_str())
             .header(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_id.as_str(),

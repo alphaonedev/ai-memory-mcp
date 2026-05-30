@@ -4122,7 +4122,7 @@ pub async fn sync_cycle_once(
     // attestation + scope-allowlist substrate sees our self-claim.
     let mut req = client
         .get(&pull_url)
-        .header("x-agent-id", local_agent_id)
+        .header(crate::HEADER_AGENT_ID, local_agent_id)
         .header(
             crate::federation::peer_attestation::PEER_ID_HEADER,
             local_agent_id,
@@ -4173,7 +4173,7 @@ pub async fn sync_cycle_once(
         // body.sender_agent_id against our wire-level peer identity.
         let mut req = client
             .post(format!("{peer_url}/api/v1/sync/push"))
-            .header("x-agent-id", local_agent_id)
+            .header(crate::HEADER_AGENT_ID, local_agent_id)
             .header(
                 crate::federation::peer_attestation::PEER_ID_HEADER,
                 local_agent_id,

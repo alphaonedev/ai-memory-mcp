@@ -237,7 +237,9 @@ pub async fn approval_decide(
         )
             .into_response();
     }
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(a) => a,
         Err(e) => {
@@ -514,7 +516,7 @@ pub async fn approvals_sse(
     // client passing `X-Agent-Id: host:…` is treated as anonymous
     // (empty subscriber_agent → fail-closed).
     let subscriber_agent = headers
-        .get("x-agent-id")
+        .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.starts_with("host:"))

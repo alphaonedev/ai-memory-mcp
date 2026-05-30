@@ -108,7 +108,7 @@ pub async fn sync_since(
         .filter(|s| !s.is_empty())
         .or_else(|| {
             headers
-                .get("x-agent-id")
+                .get(crate::HEADER_AGENT_ID)
                 .and_then(|v| v.to_str().ok())
                 .filter(|s| !s.is_empty())
         })
@@ -299,7 +299,9 @@ pub async fn sync_since(
     // Record the puller as a peer so subsequent incremental push/pull
     // pairs have a durable clock entry. Best-effort; don't fail the
     // response if the side-effect write fails.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     if let (Some(peer), Ok(local_agent_id)) = (
         q.peer.as_deref(),
         crate::identity::resolve_http_agent_id(None, header_agent_id),

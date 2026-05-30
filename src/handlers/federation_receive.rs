@@ -507,7 +507,9 @@ pub async fn sync_push(
     }
     // Receiver's local identity — default to the caller-supplied header,
     // fall back to the anonymous placeholder. Recorded in sync_state rows.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let local_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(id) => id,
         Err(e) => {

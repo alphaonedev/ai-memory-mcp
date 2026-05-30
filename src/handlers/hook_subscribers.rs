@@ -275,7 +275,8 @@ async fn set_namespace_standard_inner(
     // emitted BEFORE the storage write so the audit trail survives a
     // failed downstream write. Mirrors the #911 pattern in
     // `register_agent` / `archive_purge`.
-    let header_agent_id = headers.and_then(|h| h.get("x-agent-id").and_then(|v| v.to_str().ok()));
+    let header_agent_id =
+        headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(
@@ -1015,7 +1016,8 @@ async fn clear_namespace_standard_inner(
     // Clearing a namespace standard removes the governance policy that
     // gates downstream writes; the chain entry MUST land before the
     // storage write so the audit trail captures intent.
-    let header_agent_id = headers.and_then(|h| h.get("x-agent-id").and_then(|v| v.to_str().ok()));
+    let header_agent_id =
+        headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(
@@ -1112,7 +1114,9 @@ pub async fn session_start(
         )
             .into_response();
     }
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     // v0.7.0 #1420 — resolve the caller for the post-list visibility
     // filter. Pre-fix, `header_agent_id` was dropped ("identity
     // currently informational") and `handle_session_start(..., None)`

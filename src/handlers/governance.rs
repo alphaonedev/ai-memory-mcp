@@ -74,7 +74,9 @@ pub async fn list_pending(
     // legitimate operator queue-view surface. Non-admin callers see
     // only their OWN pending rows; cross-tenant rows are silently
     // dropped (no enumeration / count leak).
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
     let is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
@@ -199,7 +201,9 @@ pub async fn approve_pending(
         )
             .into_response();
     }
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(a) => a,
         Err(e) => {
@@ -423,7 +427,9 @@ pub async fn reject_pending(
         )
             .into_response();
     }
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(a) => a,
         Err(e) => {

@@ -78,7 +78,9 @@ pub async fn register_agent(
     // actor so the chain entry pins the unattested call. Emitted
     // BEFORE any storage write to preserve the audit trail even if
     // the storage layer fails downstream.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| "anonymous:invalid".to_string());
     crate::governance::audit::record_decision(
@@ -308,7 +310,9 @@ pub async fn quota_status_handler(
     // Authenticate via `X-Agent-Id` header; when `body.agent_id` is
     // supplied it must MATCH the authenticated caller else 403. The
     // operator-facing list path (body.agent_id absent) is preserved.
-    let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
     let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
         Ok(id) => id,
         Err(e) => {
