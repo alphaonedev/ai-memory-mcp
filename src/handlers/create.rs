@@ -706,7 +706,21 @@ async fn create_memory_postgres(
         expires_at: body.expires_at.clone(),
         metadata,
         reflection_depth: 0,
-        memory_kind: crate::models::MemoryKind::Observation,
+        // #1385 — honour caller-supplied `kind` instead of the prior
+        // hardcoded `Observation`. Pre-#1385 the HTTP POST path
+        // dropped `body.kind` (the field didn't even exist on
+        // `CreateMemory`), so every HTTP-created row landed as
+        // `Observation` and the Form 6 recall `kinds` filter returned
+        // zero rows even when the caller had clearly stored a
+        // `claim` / `decision` / etc. Matches the MCP `memory_store`
+        // contract at `src/mcp/tools/store/validation.rs:207-240`:
+        // unknown / absent → silently fall through to `Observation`
+        // (forward-compat with future variants).
+        memory_kind: body
+            .kind
+            .as_deref()
+            .and_then(crate::models::MemoryKind::from_str)
+            .unwrap_or_default(),
         entity_id: None,
         persona_version: None,
         citations: Vec::new(),
@@ -995,7 +1009,15 @@ pub async fn create_memory(
         expires_at,
         metadata,
         reflection_depth: 0,
-        memory_kind: crate::models::MemoryKind::Observation,
+        // #1385 — sqlite branch parity. See the postgres branch above
+        // for the wire-truthfulness rationale: pre-#1385 every HTTP-
+        // created row landed as `Observation` regardless of the
+        // caller's `kind`. Same MCP-mirroring parse + fallback.
+        memory_kind: body
+            .kind
+            .as_deref()
+            .and_then(crate::models::MemoryKind::from_str)
+            .unwrap_or_default(),
         entity_id: None,
         persona_version: None,
         citations: Vec::new(),
@@ -1135,6 +1157,7 @@ mod tests {
             citations: Vec::new(),
             source_uri: None,
             source_span: None,
+            kind: None,
         }
     }
 
