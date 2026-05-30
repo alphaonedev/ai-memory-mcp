@@ -7624,7 +7624,57 @@ impl MemoryStore for PostgresStore {
         }
     }
 
-    async fn update(&self, _ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
+    async fn update(&self, ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
+        // v0.7.0 #1412 (CRITICAL, 2026-05-30) — SAL-side caller-owns
+        // gate. Pre-fix `PostgresStore::update` discarded `_ctx` and
+        // let any authenticated HTTP/MCP caller rewrite any tenant's
+        // memory row by id; the sqlite HTTP handler enforced the gate
+        // via `require_caller_owns_memory(existing, &caller, false)`
+        // but the postgres handler routed through `app.store.update`
+        // which bypassed the check entirely. The mirror gate lives on
+        // the SAL layer so EVERY caller (HTTP / MCP / CLI / federation
+        // / future surfaces) is owner-checked uniformly.
+        //
+        // Admin paths (`bypass_visibility = true`) skip the gate, same
+        // as the SAL-level scope=private read filter — operator-mode
+        // surfaces (migrate, federation catchup, GC sweeps) round-trip
+        // every row regardless of ownership. Tenant-facing handlers
+        // MUST NOT pass a bypass context.
+        if !ctx.bypass_visibility {
+            let owner: Option<Option<String>> =
+                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("update: pre-fetch owner", e))?;
+            match owner {
+                None => return Err(StoreError::NotFound { id: id.to_string() }),
+                Some(None) => {
+                    // Row exists but has no agent_id stamp (legacy / migrated
+                    // pre-v0.6.3 row). Block tenant writes — the conservative
+                    // posture lets the operator clean up via admin path.
+                    return Err(StoreError::PermissionDenied {
+                        action: "update".to_string(),
+                        target: id.to_string(),
+                        reason:
+                            "memory has no agent_id stamp; tenant writes refused (use admin path)"
+                                .to_string(),
+                    });
+                }
+                Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
+                    return Err(StoreError::PermissionDenied {
+                        action: "update".to_string(),
+                        target: id.to_string(),
+                        reason: format!(
+                            "caller {:?} does not own memory (owner: {existing_owner:?})",
+                            ctx.effective_principal()
+                        ),
+                    });
+                }
+                Some(Some(_)) => {} // owner matches; proceed
+            }
+        }
+
         // One-shot COALESCE update — each patch field overrides only if
         // Some, otherwise falls through to the existing value.
         //
@@ -7706,7 +7756,44 @@ impl MemoryStore for PostgresStore {
         }
     }
 
-    async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
+    async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
+        // v0.7.0 #1412 (CRITICAL, 2026-05-30) — SAL-side caller-owns
+        // gate. Sister fix to `PostgresStore::update` above; same
+        // threat model (cross-tenant write hijack on postgres-backed
+        // daemons) and same gate semantics (admin paths skip via
+        // `bypass_visibility`, tenant-facing handlers MUST NOT bypass).
+        if !ctx.bypass_visibility {
+            let owner: Option<Option<String>> =
+                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("delete: pre-fetch owner", e))?;
+            match owner {
+                None => return Err(StoreError::NotFound { id: id.to_string() }),
+                Some(None) => {
+                    return Err(StoreError::PermissionDenied {
+                        action: "delete".to_string(),
+                        target: id.to_string(),
+                        reason:
+                            "memory has no agent_id stamp; tenant deletes refused (use admin path)"
+                                .to_string(),
+                    });
+                }
+                Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
+                    return Err(StoreError::PermissionDenied {
+                        action: "delete".to_string(),
+                        target: id.to_string(),
+                        reason: format!(
+                            "caller {:?} does not own memory (owner: {existing_owner:?})",
+                            ctx.effective_principal()
+                        ),
+                    });
+                }
+                Some(Some(_)) => {} // owner matches; proceed
+            }
+        }
+
         let rows_affected = sqlx::query("DELETE FROM memories WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
