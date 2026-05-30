@@ -6,11 +6,28 @@
 use crate::db;
 use crate::llm::OllamaClient;
 use crate::validate;
+use crate::visibility::is_visible_to_caller;
 use serde_json::{Value, json};
+
+/// MCP / HTTP entry point for `memory_session_start`.
+///
+/// `caller` is the resolved caller's agent_id (HTTP: via
+/// `resolve_http_agent_id(body.agent_id, header_agent_id)`; MCP: via
+/// `ctx.mcp_client` captured from `initialize.clientInfo.name`). When
+/// `Some`, the post-list result set is filtered through
+/// [`is_visible_to_caller`] so `scope=private` rows owned by OTHER
+/// agents are dropped before the caller sees them — closing the
+/// v0.7.0 #1420 cross-agent visibility leak (6-agent review
+/// reviewer 3 finding F3.3, memory `cd28329a`). When `None`, the
+/// post-filter is skipped — this preserves the single-tenant MCP
+/// stdio posture where no caller identity was captured at handshake;
+/// HTTP always synthesizes a caller (`anonymous:req-…`) so the HTTP
+/// surface is never in the `None` branch.
 pub(crate) fn handle_session_start(
     conn: &rusqlite::Connection,
     params: &Value,
     llm: Option<&OllamaClient>,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     // B4 (R2-LOW) — every MCP entry point that accepts a `namespace`
@@ -25,7 +42,7 @@ pub(crate) fn handle_session_start(
     }
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(usize::MAX);
 
-    let results = db::list(
+    let raw_results = db::list(
         conn,
         namespace,
         None,
@@ -38,6 +55,22 @@ pub(crate) fn handle_session_start(
         None,
     )
     .map_err(|e| e.to_string())?;
+
+    // v0.7.0 #1420 — apply scope=private visibility filter. Pre-fix,
+    // `handle_session_start` forwarded `db::list`'s un-filtered result
+    // to the caller, leaking cross-agent `scope=private` rows. Mirrors
+    // the post-filter shape at `src/handlers/memories_query.rs:181-185`
+    // (HTTP `list_memories`). When caller is None (single-tenant MCP
+    // stdio with no handshake identity), the filter is skipped —
+    // legacy behavior preserved for that narrow case.
+    let results = if let Some(caller_id) = caller {
+        raw_results
+            .into_iter()
+            .filter(|m| is_visible_to_caller(m, caller_id))
+            .collect::<Vec<_>>()
+    } else {
+        raw_results
+    };
 
     let memories: Vec<Value> = results
         .iter()
@@ -207,7 +240,8 @@ mod tests {
     fn no_llm_returns_memories_and_count() {
         let (conn, _tmp) = fresh_db();
         let _ = seed_memory(&conn, "ss-ns", "hi");
-        let resp = handle_session_start(&conn, &json!({"namespace": "ss-ns"}), None).expect("ok");
+        let resp =
+            handle_session_start(&conn, &json!({"namespace": "ss-ns"}), None, None).expect("ok");
         assert_eq!(resp["mode"], "session_start");
         assert_eq!(resp["count"].as_u64(), Some(1));
         let mems = resp["memories"].as_array().unwrap();
@@ -219,8 +253,8 @@ mod tests {
     #[test]
     fn invalid_namespace_rejected() {
         let (conn, _tmp) = fresh_db();
-        let err =
-            handle_session_start(&conn, &json!({"namespace": "has spaces"}), None).unwrap_err();
+        let err = handle_session_start(&conn, &json!({"namespace": "has spaces"}), None, None)
+            .unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -229,9 +263,13 @@ mod tests {
     fn large_limit_does_not_explode() {
         let (conn, _tmp) = fresh_db();
         let _ = seed_memory(&conn, "lim-ns", "a");
-        let resp =
-            handle_session_start(&conn, &json!({"namespace": "lim-ns", "limit": 1000}), None)
-                .expect("ok");
+        let resp = handle_session_start(
+            &conn,
+            &json!({"namespace": "lim-ns", "limit": 1000}),
+            None,
+            None,
+        )
+        .expect("ok");
         // Only seeded one row.
         assert_eq!(resp["count"].as_u64(), Some(1));
     }
@@ -242,7 +280,7 @@ mod tests {
         let (conn, _tmp) = fresh_db();
         let _ = seed_memory(&conn, "ns-a", "a");
         let _ = seed_memory(&conn, "ns-b", "b");
-        let resp = handle_session_start(&conn, &json!({}), None).expect("ok");
+        let resp = handle_session_start(&conn, &json!({}), None, None).expect("ok");
         assert!(resp["count"].as_u64().unwrap() >= 2);
     }
 
@@ -270,7 +308,8 @@ mod tests {
             let (conn, _tmp) = fresh_db();
             let _ = seed_memory(&conn, "llm-ns", "title-1");
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_session_start(&conn, &json!({"namespace": "llm-ns"}), Some(&client)).expect("ok")
+            handle_session_start(&conn, &json!({"namespace": "llm-ns"}), Some(&client), None)
+                .expect("ok")
         })
         .await
         .unwrap();
@@ -297,8 +336,13 @@ mod tests {
             let (conn, _tmp) = fresh_db();
             let _ = seed_memory(&conn, "errllm-ns", "title-2");
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_session_start(&conn, &json!({"namespace": "errllm-ns"}), Some(&client))
-                .expect("ok")
+            handle_session_start(
+                &conn,
+                &json!({"namespace": "errllm-ns"}),
+                Some(&client),
+                None,
+            )
+            .expect("ok")
         })
         .await
         .unwrap();
@@ -321,8 +365,13 @@ mod tests {
         let resp = tokio::task::spawn_blocking(move || {
             let (conn, _tmp) = fresh_db();
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
-            handle_session_start(&conn, &json!({"namespace": "empty-ns"}), Some(&client))
-                .expect("ok")
+            handle_session_start(
+                &conn,
+                &json!({"namespace": "empty-ns"}),
+                Some(&client),
+                None,
+            )
+            .expect("ok")
         })
         .await
         .unwrap();

@@ -1113,7 +1113,31 @@ pub async fn session_start(
             .into_response();
     }
     let header_agent_id = headers.get("x-agent-id").and_then(|v| v.to_str().ok());
-    let _ = header_agent_id; // identity currently informational for session_start
+    // v0.7.0 #1420 — resolve the caller for the post-list visibility
+    // filter. Pre-fix, `header_agent_id` was dropped ("identity
+    // currently informational") and `handle_session_start(..., None)`
+    // skipped the filter, leaking cross-agent `scope=private` rows.
+    //
+    // session_start historically accepted `agent_id` from EITHER body
+    // OR header (both optional), so we preserve that contract instead
+    // of using the stricter `resolve_http_agent_id` (which demands a
+    // header for write surfaces). Precedence: header → body →
+    // synthesized `anonymous:req-<uuid>`. When both header + body are
+    // supplied and disagree, return 400 — same mismatch posture as
+    // every other write surface (#910 norm).
+    if let (Some(h), Some(b)) = (header_agent_id, body.agent_id.as_deref())
+        && h != b
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "agent_id body parameter does not match X-Agent-Id header"})),
+        )
+            .into_response();
+    }
+    let caller = header_agent_id
+        .map(str::to_string)
+        .or_else(|| body.agent_id.clone())
+        .unwrap_or_else(|| format!("anonymous:req-{}", &Uuid::new_v4().to_string()[..8]));
     let mut params = json!({});
     if let Some(ref n) = body.namespace {
         params["namespace"] = json!(n);
@@ -1122,7 +1146,7 @@ pub async fn session_start(
         params["limit"] = json!(l);
     }
     let lock = state.lock().await;
-    let result = crate::mcp::handle_session_start(&lock.0, &params, None);
+    let result = crate::mcp::handle_session_start(&lock.0, &params, None, Some(&caller));
     drop(lock);
     match result {
         Ok(mut v) => {
