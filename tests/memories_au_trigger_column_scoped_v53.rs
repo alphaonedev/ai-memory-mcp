@@ -47,10 +47,15 @@
 
 use rusqlite::Connection;
 
-/// Bring a fresh in-memory DB up to the v53 schema by going through
-/// the canonical `ai_memory::storage::open` path. The substrate's
-/// `open()` runs the embedded SCHEMA bootstrap + the version-bumped
-/// migration ladder, ending at `CURRENT_SCHEMA_VERSION = 53`.
+/// Bring a fresh in-memory DB up to the substrate's
+/// `CURRENT_SCHEMA_VERSION` (the SSOT live in
+/// `src/storage/migrations.rs`) by going through the canonical
+/// `ai_memory::storage::open` path. The substrate's `open()` runs
+/// the embedded SCHEMA bootstrap + the version-bumped migration
+/// ladder; the v53 migration this binary regresses is one arm in
+/// that ladder. We do NOT hardcode the live schema-version literal
+/// here — that lives in exactly one place (the constant) and is
+/// pinned by the lib tests at `current_schema_version_*`.
 fn fresh_v53_db() -> Connection {
     // Use a tempfile under .local-runs/ rather than `:memory:` so
     // the path-based `ai_memory::storage::open` API works
@@ -310,14 +315,29 @@ fn update_to_fts_column_does_refresh_fts() {
 }
 
 #[test]
-fn current_schema_version_is_v53() {
-    // Composition pin — the fix surfaces through the published
-    // SSOT helper. If this trips, either the constant or the
-    // helper diverged. The helper lives in `src/storage/migrations.rs`
-    // alongside the bumped constant.
-    assert_eq!(
-        ai_memory::storage::current_schema_version_for_tests(),
-        53,
-        "v53 migration MUST advance CURRENT_SCHEMA_VERSION to 53"
+fn v53_migration_is_part_of_the_live_ladder() {
+    // Composition pin — assert via the SSOT helper that the live
+    // schema is at LEAST v53 (the migration this binary regresses
+    // has run). Using `>=` (not `==`) keeps this test future-proof
+    // across the next schema bump: when v54 / v55 land, the v53
+    // migration is still required to have run, so this pin stays
+    // valid without manual edits. Per the operator-set
+    // "no hardcoded version literal" discipline — the only literal
+    // here is the historical marker `53` itself (the migration this
+    // file regresses), NOT the current live version.
+    //
+    // The constant-vs-helper equality invariant is pinned by
+    // `current_schema_version_for_tests_matches_constant` in
+    // `src/storage/migrations.rs::tests`; the constant-vs-ladder
+    // invariant by `arch_8_ladder_terminates_at_current_schema_version`
+    // in `src/storage/migration_meta.rs::tests`. This binary's pin
+    // is the per-migration regression complement.
+    let live = ai_memory::storage::current_schema_version_for_tests();
+    assert!(
+        live >= 53,
+        "v53 migration must be applied (live schema = {live}, expected >= 53). \
+         If this fires, either the v53 migration arm was dropped from \
+         `src/storage/migrations.rs::apply_migrations` or the SSOT helper \
+         regressed; check the lib's `current_schema_version_matches_*` tests."
     );
 }
