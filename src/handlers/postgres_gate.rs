@@ -277,6 +277,204 @@ fn links_id_path(p: &str) -> bool {
     !rest.is_empty() && !rest.contains('/')
 }
 
+/// v0.7.0 #1410 — registered-route table.
+///
+/// Returns `true` if the given (method, path) tuple has a
+/// corresponding `.route(...)` registration in
+/// [`crate::build_router_with_timeout`]. Used by
+/// [`postgres_route_gate`] to distinguish "no such route" (let Axum
+/// fire its default 404) from "route exists but postgres-unimplemented"
+/// (emit the 501 envelope).
+///
+/// **Why this exists.** The postgres route-gate middleware runs
+/// BEFORE Axum's router resolves the request to a handler. Without
+/// this table the middleware can't tell `GET /api/v1/nope` (no route
+/// registered anywhere) from `GET /api/v1/some_postgres_unsupported_path`
+/// (route exists but the postgres adapter has no impl). Pre-#1410 both
+/// fell through to the same 501 "not yet implemented" envelope which
+/// is a wire-truthfulness violation — a 501 implies a planned-but-pending
+/// impl; an unknown URL is a typo or a wrong-version client and must
+/// be a 404 per the #1052 wire-truthfulness contract.
+///
+/// **Maintenance contract.** Every `.route(<path>, get|post|put|delete(...))`
+/// registration in [`crate::build_router_with_timeout`] (currently
+/// `src/lib.rs` lines ~442-686) MUST have a corresponding entry below.
+/// When adding a new route to `build_router_with_timeout`, add an
+/// entry here AND extend the matching test under the
+/// `transport_postgres_gate_tests` module so the table stays in lockstep
+/// with the router. The static `&'static [(&str, &[Method])]` slice for
+/// fixed paths is constant-time scanned; path-parameter routes
+/// (`/{id}` style) reuse the existing `memory_id_path()` /
+/// `links_id_path()` / etc. helpers that already underpin the
+/// postgres-supported allowlist.
+#[cfg(feature = "sal")]
+#[must_use]
+pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool {
+    // Fixed-path routes — exact (method, path) equality. Order mirrors
+    // `crate::build_router_with_timeout` for easy line-by-line
+    // verification when a new route lands.
+    #[allow(clippy::match_same_arms)]
+    let fixed_match = match (method.as_str(), path) {
+        // Core health + metadata.
+        ("GET", "/api/v1/health") => true,
+        ("GET", "/metrics") => true,
+        ("GET", "/api/v1/metrics") => true,
+        ("GET", "/api/v1/capabilities") => true,
+        // Memories CRUD + bulk.
+        ("GET", "/api/v1/memories") => true,
+        ("POST", "/api/v1/memories") => true,
+        ("POST", "/api/v1/memories/bulk") => true,
+        // Search + recall.
+        ("GET", "/api/v1/search") => true,
+        ("GET", "/api/v1/recall") => true,
+        ("POST", "/api/v1/recall") => true,
+        // Lifecycle.
+        ("POST", "/api/v1/forget") => true,
+        ("POST", "/api/v1/consolidate") => true,
+        ("GET", "/api/v1/contradictions") => true,
+        // L6 autonomous-tier.
+        ("POST", "/api/v1/auto_tag") => true,
+        ("POST", "/api/v1/expand_query") => true,
+        // L9 / L10 — tools/list + load_family.
+        ("GET", "/api/v1/tools/list") => true,
+        ("POST", "/api/v1/memory_load_family") => true,
+        // Links.
+        ("POST", "/api/v1/links") => true,
+        ("DELETE", "/api/v1/links") => true,
+        // Namespaces (qs form).
+        ("GET", "/api/v1/namespaces") => true,
+        ("POST", "/api/v1/namespaces") => true,
+        ("DELETE", "/api/v1/namespaces") => true,
+        // Pillar 1 / Stream A — taxonomy.
+        ("GET", "/api/v1/taxonomy") => true,
+        // Pillar 2 / Stream D — check_duplicate.
+        ("POST", "/api/v1/check_duplicate") => true,
+        // Pillar 2 / Stream B — entities.
+        ("POST", "/api/v1/entities") => true,
+        ("GET", "/api/v1/entities/by_alias") => true,
+        // Pillar 2 / Stream C — KG endpoints.
+        ("GET", "/api/v1/kg/timeline") => true,
+        ("POST", "/api/v1/kg/invalidate") => true,
+        ("POST", "/api/v1/kg/query") => true,
+        ("POST", "/api/v1/kg/find_paths") => true,
+        // #934 — bare /find_paths alias.
+        ("POST", "/api/v1/find_paths") => true,
+        // Continuation 6 — link verify + quota status.
+        ("POST", "/api/v1/links/verify") => true,
+        ("POST", "/api/v1/quota/status") => true,
+        // Admin / stats / GC.
+        ("GET", "/api/v1/stats") => true,
+        ("POST", "/api/v1/gc") => true,
+        ("GET", "/api/v1/export") => true,
+        ("POST", "/api/v1/import") => true,
+        // Archive surface.
+        ("GET", "/api/v1/archive") => true,
+        ("POST", "/api/v1/archive") => true,
+        ("DELETE", "/api/v1/archive") => true,
+        ("GET", "/api/v1/archive/stats") => true,
+        // Agents.
+        ("GET", "/api/v1/agents") => true,
+        ("POST", "/api/v1/agents") => true,
+        // Pending governance.
+        ("GET", "/api/v1/pending") => true,
+        // Approvals SSE stream (path form not parameterised).
+        ("GET", "/api/v1/approvals/stream") => true,
+        // Federation sync.
+        ("POST", "/api/v1/sync/push") => true,
+        ("GET", "/api/v1/sync/since") => true,
+        // Notify / inbox / subscriptions.
+        ("POST", "/api/v1/notify") => true,
+        ("GET", "/api/v1/inbox") => true,
+        ("POST", "/api/v1/subscriptions") => true,
+        ("DELETE", "/api/v1/subscriptions") => true,
+        ("GET", "/api/v1/subscriptions") => true,
+        ("POST", "/api/v1/session/start") => true,
+        // Cluster E API-2 — Agent Skills (parameterless variants).
+        ("POST", "/api/v1/skill/register") => true,
+        ("GET", "/api/v1/skill/list") => true,
+        // #1095 — share.
+        ("POST", "/api/v1/share") => true,
+        // #1111 — 14 MCP-tool parity routes.
+        ("POST", "/api/v1/memory_smart_load") => true,
+        ("POST", "/api/v1/memory_reflect") => true,
+        ("POST", "/api/v1/memory_recall_observations") => true,
+        ("POST", "/api/v1/memory_reflection_origin") => true,
+        ("POST", "/api/v1/memory_dependents_of_invalidated") => true,
+        ("POST", "/api/v1/memory_export_reflection") => true,
+        ("POST", "/api/v1/memory_atomise") => true,
+        ("POST", "/api/v1/memory_calibrate_confidence") => true,
+        ("POST", "/api/v1/memory_verify") => true,
+        ("POST", "/api/v1/memory_replay") => true,
+        ("POST", "/api/v1/memory_subscription_replay") => true,
+        ("POST", "/api/v1/memory_subscription_dlq_list") => true,
+        ("POST", "/api/v1/memory_rule_list") => true,
+        ("POST", "/api/v1/memory_check_agent_action") => true,
+        _ => false,
+    };
+
+    if fixed_match {
+        return true;
+    }
+
+    // Path-parameter routes — reuse the helpers that already power the
+    // postgres-supported allowlist (memory_id_path, links_id_path, etc.)
+    // so the two tables can't drift on the {id} shape.
+    match (method.as_str(), path) {
+        // /api/v1/memories/{id}
+        ("GET" | "PUT" | "DELETE", p) if memory_id_path(p) => true,
+        // /api/v1/memories/{id}/promote
+        ("POST", p) if memory_promote_path(p) => true,
+        // /api/v1/links/{id}
+        ("GET", p) if links_id_path(p) => true,
+        // /api/v1/namespaces/{ns}/standard (GET/POST/DELETE all registered)
+        ("GET" | "POST" | "DELETE", p) if namespace_standard_post_path(p) => true,
+        // /api/v1/archive/{id}/restore
+        ("POST", p) if archive_restore_path(p) => true,
+        // /api/v1/pending/{id}/approve|reject
+        ("POST", p) if pending_decide_path(p) => true,
+        // /api/v1/approvals/{pending_id}
+        ("POST", p) if approvals_decide_path(p) => true,
+        // /api/v1/skill/{id} (GET)
+        ("GET", p) if skill_id_path(p) => true,
+        // /api/v1/skill/{id}/resource (GET)
+        ("GET", p) if skill_id_sub_path(p, "resource") => true,
+        // /api/v1/skill/{id}/export | /promote | /compose (POST)
+        ("POST", p)
+            if skill_id_sub_path(p, "export")
+                || skill_id_sub_path(p, "promote")
+                || skill_id_sub_path(p, "compose") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Path matcher for `/api/v1/skill/{id}` (no further sub-segment).
+#[cfg(feature = "sal")]
+fn skill_id_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/skill/") else {
+        return false;
+    };
+    // Reject the bare list path and any further sub-segments.
+    if rest == "list" || rest == "register" || rest.is_empty() {
+        return false;
+    }
+    !rest.contains('/')
+}
+
+/// Path matcher for `/api/v1/skill/{id}/<suffix>` (exactly two segments).
+#[cfg(feature = "sal")]
+fn skill_id_sub_path(p: &str, suffix: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/skill/") else {
+        return false;
+    };
+    let Some((id, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    !id.is_empty() && tail == suffix
+}
+
 /// v0.7.0 Wave-3 Continuation — middleware that gates un-migrated
 /// handlers when the daemon is postgres-backed.
 ///
@@ -294,6 +492,20 @@ fn links_id_path(p: &str) -> bool {
 /// opens against the `--db` path (which is unused on postgres) and
 /// either return empty results (read paths) or write to the wrong
 /// database (write paths). The gate makes that impossible.
+///
+/// **#1410 (2026-05-29) — wire-truthfulness fix.** Pre-#1410 this
+/// middleware emitted 501 NOT IMPLEMENTED for ANY (method, path) tuple
+/// not in the [`postgres_endpoint_supported`] allowlist — including
+/// paths that have no `.route(...)` registration anywhere in
+/// [`crate::build_router_with_timeout`]. That fabricated a "deferred
+/// implementation" wire signal for typos and wrong-version clients,
+/// violating the #1052 wire-truthfulness contract (a 501 implies
+/// "planned but pending"; an unknown URL must be a 404). Post-#1410
+/// the middleware first consults [`path_is_registered_route`]: if the
+/// path has no route registration at all, the request falls through
+/// to Axum's default handler (which returns 404); only if the route
+/// IS registered but is NOT in the postgres allowlist does the 501
+/// envelope land.
 #[cfg(feature = "sal")]
 pub async fn postgres_route_gate(
     State(app): State<AppState>,
@@ -308,6 +520,21 @@ pub async fn postgres_route_gate(
     let path = req.uri().path().to_string();
 
     if postgres_endpoint_supported(&method, &path) {
+        return next.run(req).await;
+    }
+
+    // #1410 — distinguish "no route registered" (404) from "route
+    // registered but postgres-unimplemented" (501). Pre-#1410 the
+    // middleware fabricated a 501 for both, which is a wire-truthfulness
+    // violation per the #1052 contract. When the path has no route
+    // registration anywhere in the router, fall through so Axum's
+    // default 404 fires.
+    if !path_is_registered_route(&method, &path) {
+        tracing::debug!(
+            method = %method,
+            path = %path,
+            "postgres-backed daemon: passing unrouted path to Axum 404 handler (#1410)"
+        );
         return next.run(req).await;
     }
 
@@ -861,6 +1088,237 @@ mod transport_postgres_gate_tests {
         assert!(!postgres_endpoint_supported(
             &Method::POST,
             "/api/v1/unknown"
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // #1410 — `path_is_registered_route` regression tests.
+    //
+    // These pin the wire-truthfulness contract: an unknown URL is a
+    // 404 (no route registered anywhere) and a registered-but-
+    // postgres-unimplemented URL is a 501. Pre-#1410 both fell through
+    // to the same fabricated 501 envelope.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn unknown_path_not_a_registered_route_1410() {
+        // The original campaign-finding probe: `/api/v1/this-does-not-exist`
+        // (no `.route(...)` registration anywhere in
+        // `build_router_with_timeout`). Must return false so the
+        // middleware falls through to Axum's default 404 handler.
+        assert!(!path_is_registered_route(
+            &Method::GET,
+            "/api/v1/this-does-not-exist"
+        ));
+        assert!(!path_is_registered_route(
+            &Method::POST,
+            "/api/v1/federation/peers"
+        ));
+        assert!(!path_is_registered_route(
+            &Method::POST,
+            "/api/v1/totally/fake/path"
+        ));
+        // Wrong method on a registered path is also "not a registered
+        // route" — Axum's router considers (method, path) as the key,
+        // and unmatched methods on a real path get 405 from Axum
+        // proper. Letting it pass through here lets Axum's typed 405
+        // surface instead of a fabricated 501.
+        assert!(!path_is_registered_route(
+            &Method::PATCH,
+            "/api/v1/memories"
+        ));
+    }
+
+    #[test]
+    fn registered_route_table_covers_every_router_registration_1410() {
+        // Spot-check that every meaningfully distinct registered
+        // route shape resolves through `path_is_registered_route`.
+        // This is the maintenance contract for #1410: when a new
+        // `.route(...)` lands in `build_router_with_timeout`, this
+        // test (or its sibling fixed-table tests above) must pin it.
+
+        // Fixed paths.
+        assert!(path_is_registered_route(&Method::GET, "/api/v1/health"));
+        assert!(path_is_registered_route(&Method::GET, "/metrics"));
+        assert!(path_is_registered_route(&Method::POST, "/api/v1/memories"));
+        assert!(path_is_registered_route(&Method::GET, "/api/v1/memories"));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/memories/bulk"
+        ));
+        assert!(path_is_registered_route(&Method::GET, "/api/v1/search"));
+        assert!(path_is_registered_route(&Method::POST, "/api/v1/forget"));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/consolidate"
+        ));
+        assert!(path_is_registered_route(&Method::POST, "/api/v1/share"));
+        // route_1111 family — POST-only.
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/memory_smart_load"
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/memory_reflect"
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/memory_atomise"
+        ));
+        // KG endpoints.
+        assert!(path_is_registered_route(
+            &Method::GET,
+            "/api/v1/kg/timeline"
+        ));
+        assert!(path_is_registered_route(&Method::POST, "/api/v1/kg/query"));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/kg/find_paths"
+        ));
+        // #934 alias.
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/find_paths"
+        ));
+        // Namespaces (qs form + path form).
+        assert!(path_is_registered_route(&Method::GET, "/api/v1/namespaces"));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/namespaces"
+        ));
+        assert!(path_is_registered_route(
+            &Method::DELETE,
+            "/api/v1/namespaces"
+        ));
+
+        // Path-parameter routes.
+        // /api/v1/memories/{id}
+        assert!(path_is_registered_route(
+            &Method::GET,
+            "/api/v1/memories/abc-123"
+        ));
+        assert!(path_is_registered_route(
+            &Method::PUT,
+            "/api/v1/memories/abc-123"
+        ));
+        assert!(path_is_registered_route(
+            &Method::DELETE,
+            "/api/v1/memories/abc-123"
+        ));
+        // /api/v1/memories/{id}/promote
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/memories/abc-123/promote"
+        ));
+        // /api/v1/links/{id}
+        assert!(path_is_registered_route(
+            &Method::GET,
+            "/api/v1/links/link-1"
+        ));
+        // /api/v1/namespaces/{ns}/standard
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/namespaces/proj/standard"
+        ));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            "/api/v1/namespaces/proj/standard"
+        ));
+        assert!(path_is_registered_route(
+            &Method::DELETE,
+            "/api/v1/namespaces/proj/standard"
+        ));
+        // /api/v1/archive/{id}/restore
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/archive/abc/restore"
+        ));
+        // /api/v1/pending/{id}/approve|reject
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/pending/p1/approve"
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/pending/p1/reject"
+        ));
+        // /api/v1/approvals/{pending_id}
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/approvals/pa-1"
+        ));
+        // /api/v1/skill/{id}
+        assert!(path_is_registered_route(
+            &Method::GET,
+            "/api/v1/skill/skill-1"
+        ));
+        // /api/v1/skill/{id}/<sub>
+        assert!(path_is_registered_route(
+            &Method::GET,
+            "/api/v1/skill/skill-1/resource"
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/skill/skill-1/export"
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/skill/skill-1/promote"
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/skill/skill-1/compose"
+        ));
+
+        // `/api/v1/skill/list` IS a real registered route (fixed
+        // path, line ~600 of `src/lib.rs`), so it MUST match via
+        // the fixed-table arm above. The `skill_id_path` helper
+        // specifically excludes `list` / `register` so the {id}
+        // path-parameter arm doesn't double-match, but the fixed
+        // table covers it independently. This pin makes sure we
+        // don't regress into "list is treated as an {id}" or
+        // "list is not registered at all".
+        assert!(path_is_registered_route(&Method::GET, "/api/v1/skill/list"));
+        // Trailing extras must not match.
+        assert!(!path_is_registered_route(
+            &Method::POST,
+            "/api/v1/skill/skill-1/export/extra"
+        ));
+        assert!(!path_is_registered_route(
+            &Method::POST,
+            "/api/v1/archive/abc/restore/extra"
+        ));
+    }
+
+    #[test]
+    fn registered_route_not_in_postgres_allowlist_1410() {
+        // `/api/v1/share` (POST) IS a registered route per
+        // `build_router_with_timeout` (lines ~624 in `src/lib.rs`),
+        // but it is NOT in `postgres_endpoint_supported`. The pre-#1410
+        // gate emitted a fabricated 501 for unknown paths AND for this
+        // case; post-#1410 the wire surface MUST emit 501 for THIS
+        // case (route exists, postgres-unimplemented) AND 404 for the
+        // unknown case (no route at all). This test pins the "501
+        // case" half of the contract; `unknown_path_not_a_registered_route_1410`
+        // pins the "404 case" half.
+        assert!(path_is_registered_route(&Method::POST, "/api/v1/share"));
+        assert!(!postgres_endpoint_supported(&Method::POST, "/api/v1/share"));
+        // Same shape — route_1111 family is registered but not
+        // postgres-allowlisted.
+        assert!(path_is_registered_route(
+            &Method::POST,
+            "/api/v1/memory_smart_load"
+        ));
+        assert!(!postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_smart_load"
+        ));
+        // Skill surface — registered but not postgres-allowlisted.
+        assert!(path_is_registered_route(&Method::GET, "/api/v1/skill/list"));
+        assert!(!postgres_endpoint_supported(
+            &Method::GET,
+            "/api/v1/skill/list"
         ));
     }
 
