@@ -880,6 +880,27 @@ pub struct CreateMemory {
     /// body. Must satisfy `validate::validate_source_span` when set.
     #[serde(default)]
     pub source_span: Option<SourceSpan>,
+    /// v0.7.x Form 6 (#1385) — Batman-taxonomy memory-kind selector for
+    /// the new row. Accepts any [`MemoryKind`] wire token
+    /// (`observation` | `reflection` | `persona` | `concept` | `entity`
+    /// | `claim` | `relation` | `event` | `conversation` | `decision`).
+    /// Unknown values are silently ignored (treated as omission) for
+    /// forward-compat with future variants, mirroring the MCP
+    /// `memory_store` `params["kind"]` contract at
+    /// `src/mcp/tools/store/validation.rs:207-213`. Absent / unknown
+    /// → handler defaults to `MemoryKind::Observation`. Stored as
+    /// `Option<String>` (not `Option<MemoryKind>`) so unknown future
+    /// tokens deserialise without breaking the request envelope.
+    ///
+    /// Pre-#1385 this field did not exist on `CreateMemory`, so HTTP
+    /// `POST /api/v1/memories` silently dropped the caller's `kind`
+    /// and every HTTP-created row landed as `Observation`. The Form 6
+    /// recall `kinds` filter then returned zero rows against HTTP-
+    /// written data even when the caller had stored `kind: "claim"`
+    /// (the v3 NHI assessment defect D-v3-3 reproducible against the
+    /// alice lan-parity postgres-backed daemon).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 fn default_tier() -> Tier {
@@ -1946,5 +1967,98 @@ mod tests {
         assert_eq!(cm.citations.len(), 1);
         assert_eq!(cm.source_uri.as_deref(), Some("uri:https://example.com"));
         assert_eq!(cm.source_span, Some(SourceSpan { start: 0, end: 5 }));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1385 — CreateMemory now honours caller-supplied `kind`. Pre-fix
+    // the field did not exist on the struct, so HTTP `POST
+    // /api/v1/memories` silently dropped it and every HTTP-created row
+    // landed as `Observation`. That made the Form 6 recall `kinds`
+    // filter useless against the HTTP write surface (a v3 NHI
+    // assessment defect; live alice repro returned 0 rows for
+    // kinds=["claim","decision"] against rows the caller had stored
+    // with those exact kind tokens).
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn create_memory_kind_field_deserialises_known_tokens() {
+        for token in [
+            "observation",
+            "reflection",
+            "persona",
+            "concept",
+            "entity",
+            "claim",
+            "relation",
+            "event",
+            "conversation",
+            "decision",
+        ] {
+            let cm: CreateMemory = serde_json::from_value(serde_json::json!({
+                "title": "t",
+                "content": "c",
+                "kind": token,
+            }))
+            .unwrap();
+            assert_eq!(
+                cm.kind.as_deref(),
+                Some(token),
+                "kind={token} must round-trip on the wire"
+            );
+            // And the handler parses it back into the typed enum on
+            // assembly. Mirror the exact pattern the handler uses.
+            let parsed = cm.kind.as_deref().and_then(MemoryKind::from_str);
+            assert_eq!(
+                parsed.map(|k| k.as_str()),
+                Some(token),
+                "kind={token} must parse back into MemoryKind",
+            );
+        }
+    }
+
+    #[test]
+    fn create_memory_kind_field_absent_defaults_to_none() {
+        let cm: CreateMemory = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "content": "c",
+        }))
+        .unwrap();
+        assert_eq!(cm.kind, None);
+        // Handler-side: absent → falls through to `Observation`.
+        let resolved = cm
+            .kind
+            .as_deref()
+            .and_then(MemoryKind::from_str)
+            .unwrap_or_default();
+        assert_eq!(resolved, MemoryKind::Observation);
+    }
+
+    #[test]
+    fn create_memory_kind_field_unknown_token_silently_falls_through_to_observation() {
+        // Matches MCP `memory_store` forward-compat posture
+        // (`src/mcp/tools/store/validation.rs:207-213`): an unknown
+        // kind token is treated as omission so a newer-client variant
+        // landing on an older daemon still writes, just without the
+        // typed discriminator. Distinct from the COR-4 invariant on
+        // recall `kinds` filters where an explicit zero-match filter
+        // must NOT collapse into "match all".
+        let cm: CreateMemory = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "content": "c",
+            "kind": "future_variant_v100",
+        }))
+        .unwrap();
+        assert_eq!(cm.kind.as_deref(), Some("future_variant_v100"));
+        let resolved = cm
+            .kind
+            .as_deref()
+            .and_then(MemoryKind::from_str)
+            .unwrap_or_default();
+        assert_eq!(
+            resolved,
+            MemoryKind::Observation,
+            "unknown kind token must silently fall through to Observation \
+             for forward-compat with future-variant clients",
+        );
     }
 }
