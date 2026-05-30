@@ -220,6 +220,33 @@ pub(super) fn parse_and_build_memory(
         _ => None,
     };
 
+    // v0.7.0 #1421 — sister fix to #1411 (HTTP Form-4 wire-truthfulness).
+    // Pre-fix the MCP store path declared `citations: Vec::new()` and
+    // `source_span: None` even when the caller supplied them in the
+    // request — silently dropping the validated Form-4 provenance
+    // fields. Parse, validate, then thread through.
+    let citations: Vec<crate::models::Citation> = match params.get("citations") {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| {
+            format!(
+                "invalid `citations` (expected array of {{uri, accessed_at, hash?, span?}}): {e}"
+            )
+        })?,
+        _ => Vec::new(),
+    };
+    if !citations.is_empty() {
+        crate::validate::validate_citations(&citations).map_err(|e| e.to_string())?;
+    }
+    let source_span: Option<crate::models::SourceSpan> = match params.get("source_span") {
+        Some(v) if !v.is_null() => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|e| format!("invalid `source_span` (expected {{start, end}}): {e}"))?,
+        ),
+        _ => None,
+    };
+    if let Some(span) = source_span.as_ref() {
+        crate::validate::validate_source_span(span).map_err(|e| e.to_string())?;
+    }
+
     let mem = Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
@@ -240,9 +267,9 @@ pub(super) fn parse_and_build_memory(
         memory_kind: caller_kind.unwrap_or(crate::models::MemoryKind::Observation),
         entity_id: None,
         persona_version: None,
-        citations: Vec::new(),
+        citations,
         source_uri,
-        source_span: None,
+        source_span,
         confidence_source: ConfidenceSource::CallerProvided,
         confidence_signals: None,
         confidence_decayed_at: None,
