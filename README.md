@@ -150,7 +150,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (87 route registrations / 73 unique URL paths on localhost at v0.7.0) and the **CLI** (82 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 80 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration)) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (87 route registrations / 73 unique URL paths on localhost at v0.7.0) and the **CLI** (80 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 78 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -652,7 +652,7 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, ai-memory also exposes a full HTTP REST API (87 route registrations / 73 unique URL paths on port 9077 at v0.7.0) and a complete CLI (82 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 80 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration)) for direct interaction, scripting, and integration with any AI platform or tool.
+Beyond MCP, ai-memory also exposes a full HTTP REST API (87 route registrations / 73 unique URL paths on port 9077 at v0.7.0) and a complete CLI (80 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 78 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 

@@ -26,6 +26,7 @@
 // preserved either way.
 // ---------------------------------------------------------------------------
 
+pub const SECS_PER_MINUTE: i64 = 60;
 pub const SECS_PER_HOUR: i64 = 3_600;
 pub const SECS_PER_DAY: i64 = 86_400;
 pub const SECS_PER_WEEK: i64 = 604_800;
@@ -54,6 +55,23 @@ pub const HEADER_CONTENT_TYPE: &str = "content-type";
 pub const MIME_JSON: &str = "application/json";
 
 // ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (operator directive `4f1f258b`,
+// scanners C+F) — canonical HTTP header constants for the most-
+// trafficked custom header that previously had NO centralised
+// declaration. `X-Agent-Id` is the substrate's identity-resolution
+// header per CLAUDE.md §"Agent Identity"; pre-sweep it appeared
+// hardcoded in 140+ production + test sites with a case-mismatch
+// (`X-Agent-Id` vs `x-agent-id`) already in tree. axum lowercases
+// header names server-side, so the canonical wire form is lowercase
+// — this matches the existing `HEADER_CONTENT_TYPE` (`"content-type"`),
+// `SIGNATURE_HEADER` (`"x-memory-sig"` in `federation/signing.rs`),
+// `NONCE_HEADER` (`"x-memory-nonce"`), and `PEER_ID_HEADER`
+// (`"x-peer-id"` in `federation/peer_attestation.rs`).
+// ---------------------------------------------------------------------------
+
+pub const HEADER_AGENT_ID: &str = "x-agent-id";
+
+// ---------------------------------------------------------------------------
 // ARCH-14 (FX-C4-batch2, 2026-05-26) — canonical route-count constant.
 //
 // The daemon's `build_router_with_timeout` registers exactly this
@@ -70,6 +88,44 @@ pub const MIME_JSON: &str = "application/json";
 
 pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 87;
 pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
+
+/// Number of distinct URL paths (multi-line-aware) registered by the
+/// production router. Derived via
+/// `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u | wc -l`
+/// excluding the `#[cfg(test)]`-gated `/slow` slowloris route. Pinned
+/// by `tests/route_count_invariant.rs` so the docs surface count
+/// cannot drift silently. v0.7.0 multi-agent literal-sweep (scanner
+/// A, finding F-A4.1) — previously the `73 unique URL paths` count
+/// was cited in 30+ doc sites with no const.
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 73;
+
+// ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
+// canonical CLI subcommand counts. The default build's `pub enum
+// Command` in `src/daemon_runtime.rs` carries 80 variants; building
+// with `--features sal` OR `--features sal-postgres` unlocks
+// `Migrate` + `SchemaInit` for 82 total. Pre-sweep, the count was
+// cited in 24+ doc surfaces with zero machine-checkable anchor —
+// CLAUDE.md alone had 7 different historical counts (40, 57, 58, 63,
+// 79, 80, 82). Pinned by `tests/cli_subcommand_count_invariant.rs`.
+// ---------------------------------------------------------------------------
+
+/// Variants in `pub enum Command` (src/daemon_runtime.rs) that
+/// COMPILE under the default build. The source file declares 80
+/// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
+/// "sal")]`-gated and excluded from default builds, leaving 78.
+///
+/// The CLAUDE.md narrative pre-sweep cited `80 default / 82 sal`,
+/// which double-counted the sal-gated pair (the awk-canonical count
+/// of 80 already includes them). The pinned-by-test count uses the
+/// post-cfg actual compile total.
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 78;
+
+/// Variants in `pub enum Command` that COMPILE under `--features sal`
+/// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
+/// awk-canonical source-file count: every variant declared in the
+/// enum body (including `Migrate` + `SchemaInit`).
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 80;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
