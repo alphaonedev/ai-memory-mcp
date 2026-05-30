@@ -142,6 +142,38 @@ jobs:
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.os }} matrix is a no-op"
 
+      # #1407 / #1405 / #1387 — free disk BEFORE Install Rust +
+      # Swatinem/rust-cache + Run tests. The runner image ships with
+      # ~14 GiB free; doctest linking under `cargo test` blows past
+      # the tmpfs ceiling once libai_memory's dep closure grew
+      # (PR #1397 L1-L4 capture work added ~80 files), producing
+      # `collect2: fatal error: ld terminated with signal 7
+      # [Bus error]` deterministically (#1407). Pruning ~35 GiB of
+      # unused runner tooling (.NET / CodeQL / Android SDK / GHC)
+      # here — BEFORE any cargo step — also keeps the partition
+      # where the actions-runner writes its own _diag/Worker_*.log
+      # tracing well clear of ENOSPC (#1405). Same root partition
+      # serves both, so one early cleanup closes both surfaces.
+      # Pure-shell fix per project no-external-code-injection rule
+      # (CLAUDE.md §"Sole-authority operator"). Each `rm -rf` is
+      # best-effort — runner image contents may shift between
+      # versions, and a missing path is benign.
+      - name: Free disk before tests (ubuntu-latest, #1407/#1405/#1387 fix)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
+        run: |
+          set -eu
+          echo "::group::Disk usage before cleanup"
+          df -h /
+          echo "::endgroup::"
+          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
+          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
+          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
+          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          sudo apt-get clean
+          echo "::group::Disk usage after cleanup"
+          df -h /
+          echo "::endgroup::"
+
       - name: Install Rust stable
         if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
@@ -161,41 +193,22 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit
 
-      # Issue #1372 — ubuntu-latest Check ran out of disk during the
-      # release link step (`libai_memory.rlib`: No space left on
-      # device (os error 28)). The runner image ships with ~14 GiB
-      # free; after `cargo test` (target/debug ~6-9 GiB) plus
-      # `cargo install cargo-audit --locked` (~1-2 GiB), the
-      # subsequent `cargo build --release` (~6-9 GiB more) hits the
-      # ceiling at link time. Pure-shell fix per project no-external-
-      # code-injection rule (CLAUDE.md §"Sole-authority operator"):
-      # we prune known-large unused tooling from the runner image
-      # (~35 GiB recoverable across .NET / CodeQL / Android SDK)
-      # AND drop the now-redundant dev-profile target tree before
-      # release link begins. Diagnostic `df -h` + `du -sh` bracket
-      # the cleanup so a future ceiling regression is visible in
-      # the workflow log.
-      - name: Free disk before release build (ubuntu-latest)
+      # Drop dev-profile artefacts now that the test step is complete
+      # so the subsequent `cargo build --release` link has headroom on
+      # the ubuntu-latest tmpfs. Keeps the dep cache (proc-macros,
+      # build-scripts) so the release build doesn't recompile from
+      # scratch. The big runner-image cleanup ran earlier (see
+      # 'Free disk before tests' step above, #1407/#1405).
+      - name: Trim target/debug before release build (ubuntu-latest)
         if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
         run: |
           set -eu
-          echo "::group::Disk usage before cleanup"
+          echo "::group::Disk usage before cargo clean"
           df -h /
           du -sh target 2>/dev/null || true
           echo "::endgroup::"
-          # Prune large unused tooling from the ubuntu-latest runner
-          # image. Each `rm -rf` is best-effort — runner image
-          # contents may shift between versions, and a missing path
-          # is benign (the disk we wanted to free wasn't there).
-          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
-          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
-          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
-          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
-          # Drop dev-profile artefacts now that the test step is
-          # complete. Keeps the dep cache (proc-macros, build-scripts)
-          # so the release build doesn't recompile from scratch.
           cargo clean --profile dev || true
-          echo "::group::Disk usage after cleanup"
+          echo "::group::Disk usage after cargo clean"
           df -h /
           du -sh target 2>/dev/null || true
           echo "::endgroup::"
@@ -466,6 +479,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # #1405 — the sal-feature release build (`cargo build --release
+      # --features sal`) is heavy enough to risk both rust-lld tmpfs
+      # exhaustion and runner _diag-log ENOSPC. Prune unused runner
+      # tooling early so neither surface trips this job. Same recipe as
+      # the `check` and `coverage` jobs.
+      - name: Free disk (ubuntu-latest, #1405 fix)
+        run: |
+          set -eu
+          echo "::group::Disk usage before cleanup"
+          df -h /
+          echo "::endgroup::"
+          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
+          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
+          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
+          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          sudo apt-get clean
+          echo "::group::Disk usage after cleanup"
+          df -h /
+          echo "::endgroup::"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
