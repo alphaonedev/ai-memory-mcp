@@ -723,9 +723,16 @@ async fn create_memory_postgres(
             .unwrap_or_default(),
         entity_id: None,
         persona_version: None,
-        citations: Vec::new(),
-        source_uri: None,
-        source_span: None,
+        // #1411 — Form 4 wire-truthfulness on the postgres branch.
+        // Pre-#1411 these were hardcoded `Vec::new()` / `None` /
+        // `None`, so HTTP POST /api/v1/memories validated the
+        // caller's `citations` / `source_uri` / `source_span` via
+        // `validate::validate_create` then silently dropped them
+        // on insert. Same shape as the #1385 `kind` drop; thread
+        // the validated body fields through to the inserted row.
+        citations: body.citations.clone(),
+        source_uri: body.source_uri.clone(),
+        source_span: body.source_span.clone(),
         confidence_source: ConfidenceSource::CallerProvided,
         confidence_signals: None,
         confidence_decayed_at: None,
@@ -1020,9 +1027,15 @@ pub async fn create_memory(
             .unwrap_or_default(),
         entity_id: None,
         persona_version: None,
-        citations: Vec::new(),
-        source_uri: None,
-        source_span: None,
+        // #1411 — Form 4 wire-truthfulness on the sqlite branch.
+        // See the postgres branch above for the full rationale:
+        // pre-#1411 every HTTP-created row landed with empty
+        // citations + null source_uri + null source_span even
+        // when the caller supplied them in the request body and
+        // `validate_create` accepted them.
+        citations: body.citations.clone(),
+        source_uri: body.source_uri.clone(),
+        source_span: body.source_span.clone(),
         confidence_source: ConfidenceSource::CallerProvided,
         confidence_signals: None,
         confidence_decayed_at: None,
