@@ -388,10 +388,24 @@ pub(crate) fn latest_link_attest_level(
 }
 
 const fn attest_rank(level: AttestLevel) -> u8 {
+    // v0.7.0 #1430 fix: new SignedByPeer (L4 capture_turn) + DaemonSigned
+    // (governance audit) variants ranked alongside the original 3.
+    // Ranking semantics:
+    //   - Unsigned     (0) — no signature, lowest trust
+    //   - SelfSigned   (1) — writer-local signature
+    //   - DaemonSigned (1) — substrate-self signature on its own
+    //                        audit emission (semantically equivalent
+    //                        rank to SelfSigned — daemon writing about
+    //                        its own actions)
+    //   - SignedByPeer (2) — host-supplied signature, allowlist-verified
+    //                        (equivalent rank to PeerAttested: both
+    //                        require an external pubkey enrollment +
+    //                        signature verification)
+    //   - PeerAttested (2) — federation H3 inbound, allowlist-verified
     match level {
         AttestLevel::Unsigned => 0,
-        AttestLevel::SelfSigned => 1,
-        AttestLevel::PeerAttested => 2,
+        AttestLevel::SelfSigned | AttestLevel::DaemonSigned => 1,
+        AttestLevel::PeerAttested | AttestLevel::SignedByPeer => 2,
     }
 }
 

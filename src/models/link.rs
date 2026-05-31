@@ -30,33 +30,59 @@ pub enum AttestLevel {
     /// the enrolled `observed_by` public key on this host (H3 inbound
     /// path).
     PeerAttested,
+    /// v0.7.0 #1389 L4 / RFC-0001 — capture_turn host-signed memory.
+    /// Distinct from `PeerAttested` (which is federation H3 inbound):
+    /// `SignedByPeer` means an out-of-process HOST supplied a
+    /// `host_signature_b64` + `host_pubkey_b64`; the substrate
+    /// verified the signature against
+    /// `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` and the canonical-bytes
+    /// encoding. Used at `src/mcp/tools/capture_turn.rs::556`.
+    /// Closes F-C9 spec-drift (#1430).
+    SignedByPeer,
+    /// v0.7.0 — daemon-signed governance-audit row. Used by
+    /// `crate::governance::audit::sign_with_daemon_key` when a daemon
+    /// keypair is installed and the substrate emits a Custom-action
+    /// refusal row to the signed_events chain. Distinct from
+    /// `SelfSigned` (H2 link-write outbound) — this variant is the
+    /// substrate's OWN signature on its OWN audit emissions, not on
+    /// content the substrate received from a caller. Closes F-C9
+    /// spec-drift (#1430).
+    DaemonSigned,
 }
 
 impl AttestLevel {
-    /// Parse the string form stored in `memory_links.attest_level`.
+    /// Parse the string form stored in `memory_links.attest_level` /
+    /// `signed_events.attest_level`.
     ///
     /// Returns `None` for unknown values so callers can decide whether
     /// to treat the column as legacy/`unsigned` or surface an error.
     /// Keeps the unit-of-truth on the database column shape — H2/H3
     /// already write the canonical lowercase snake_case strings.
+    /// v0.7.0 #1389 L4 + governance-audit additions parse via the
+    /// `signed_by_peer` and `daemon_signed` arms.
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "unsigned" => Some(Self::Unsigned),
             "self_signed" => Some(Self::SelfSigned),
             "peer_attested" => Some(Self::PeerAttested),
+            "signed_by_peer" => Some(Self::SignedByPeer),
+            "daemon_signed" => Some(Self::DaemonSigned),
             _ => None,
         }
     }
 
     /// Canonical wire string for this variant. Mirrors the `serde`
-    /// rename_all and the literals H2/H3 already write to the DB.
+    /// rename_all and the literals every writer (H2/H3/L4/governance-
+    /// audit) already writes to the DB.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Unsigned => "unsigned",
             Self::SelfSigned => "self_signed",
             Self::PeerAttested => "peer_attested",
+            Self::SignedByPeer => "signed_by_peer",
+            Self::DaemonSigned => "daemon_signed",
         }
     }
 }
