@@ -7087,4 +7087,170 @@ decision = "allow"
             "whitespace-only env MUST be treated as unset"
         );
     }
+
+    // ===========================================================================
+    // FX-F2 (coverage, #1432) — close the daemon_runtime.rs floor regression
+    // observed on the Per-Module Coverage Thresholds CI gate after the
+    // post-FX-F1 churn (HEADER_AGENT_ID SSOT migration #19eddac9, L1-L4
+    // capture-turn #49e04daf, etc.) shifted branch-hit counts and dropped
+    // measured coverage from 85.00% (pinned by 197640745) to 84.89% (-0.11pp).
+    // These tests cover the `build_store_handle` URL-scheme dispatch arms
+    // and `resolve_configured_embedding_dim` resolution-ladder arms — every
+    // branch in both helpers is exercised under `cfg(feature = "sal")` test
+    // builds with no live Postgres needed.
+    // ===========================================================================
+
+    /// FX-F2 — `build_store_handle` accepts a `sqlite:///path` URL and
+    /// routes through the SqliteStore adapter (not the `--db` fallback).
+    /// Pins the `strip_prefix("sqlite://")` arm + the SqliteStore
+    /// `Ok(...)` tail at lines 2691-2701.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn fx_f2_build_store_handle_sqlite_url_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("scheme.db");
+        let url = format!("sqlite:///{}", db.display());
+        let (backend, store) = build_store_handle(Some(&url), &db, None, None)
+            .await
+            .expect("sqlite:// URL must dispatch to SqliteStore");
+        // Backend tag must reflect the SQLite path.
+        assert!(
+            matches!(backend, crate::handlers::StorageBackend::Sqlite),
+            "sqlite:// URL MUST resolve to StorageBackend::Sqlite"
+        );
+        // Smoke-check that the store is usable (the SAL trait `Arc` is live).
+        drop(store);
+    }
+
+    /// FX-F2 — `build_store_handle` rejects an unrecognised URL scheme
+    /// with the canonical bail message. Pins the `else { bail!(...) }`
+    /// arm at lines 2702-2706 — the lone uncovered Err path on the
+    /// sal-feature build.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn fx_f2_build_store_handle_unknown_scheme_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ignored.db");
+        let result = build_store_handle(Some("mysql://host/db"), &db, None, None).await;
+        let err = match result {
+            Ok(_) => panic!("unrecognised scheme MUST bail; got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unrecognised --store-url"),
+            "bail message MUST include the canonical prefix; got: {msg}"
+        );
+    }
+
+    /// FX-F2 — `build_store_handle` defaults to SqliteStore at the
+    /// `--db` path when `--store-url` is absent. Pins the `None` arm
+    /// at lines 2708-2715.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn fx_f2_build_store_handle_no_url_falls_through_to_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fallthrough.db");
+        let (backend, _store) = build_store_handle(None, &db, None, None)
+            .await
+            .expect("absent --store-url MUST resolve to SqliteStore via --db");
+        assert!(matches!(backend, crate::handlers::StorageBackend::Sqlite));
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` returns the canonical
+    /// dim from the resolver when the model id is in
+    /// `KNOWN_EMBEDDING_DIMS`. Pins the first arm of the resolution
+    /// ladder (line 2615-2616).
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_canonical_lookup_wins() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        // `nomic-embed-text-v1.5` is in KNOWN_EMBEDDING_DIMS at 768.
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        assert!(
+            matches!(dim, Some(d) if d == 768),
+            "canonical lookup MUST return 768 for nomic-embed-text-v1.5; got: {dim:?}"
+        );
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` falls through to the
+    /// legacy flat-field arm when the resolver yields no dim. Pins the
+    /// `or_else(|| app_config.embedding_model...)` arm (line 2617-2623).
+    /// The legacy `EmbeddingModel::from_str` accepts the underscore
+    /// variant `mini_lm_l6_v2`; canonical lookup goes through the
+    /// `[embeddings]` section, which we omit here so the resolver
+    /// returns `embedding_dim = None` and the legacy parse arm fires.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_legacy_flat_field_path() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        // No [embeddings] section → resolver returns None for dim.
+        // Legacy flat-field `embedding_model` parses as the 2-family enum.
+        cfg.embedding_model = Some("mini_lm_l6_v2".to_string());
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        assert!(
+            matches!(dim, Some(d) if d == 384),
+            "legacy flat-field path MUST resolve mini_lm_l6_v2 to 384; got: {dim:?}"
+        );
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` falls all the way
+    /// through to the tier-preset arm when neither resolver nor legacy
+    /// flat-field yields a dim. Pins the final `or_else(|| preset...)`
+    /// arm (line 2624).
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_preset_fallback() {
+        let _g = env_var_lock();
+        let cfg = AppConfig::default();
+        // Default config: no [embeddings] section + no legacy
+        // embedding_model field. Semantic tier preset HAS an embedding
+        // model so the preset arm fires (Some(_)). Keyword tier preset
+        // is None so we'd get None — but Semantic is the load-bearing
+        // case for the postgres-schema-bootstrap path documented at the
+        // function comment.
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        assert!(
+            dim.is_some(),
+            "Semantic tier preset MUST yield a dim via the fallback arm"
+        );
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` passes a parse-error
+    /// in the legacy flat-field arm through to the next arm
+    /// (`.and_then(|raw| raw.parse(...).ok())`). The function returns
+    /// the resolver-supplied dim (whatever
+    /// `AppConfig::resolve_embeddings()` produced from defaults) when
+    /// the operator's malformed flat-field is dropped. Pins the
+    /// `.and_then(..., .ok())` None-on-parse-fail arm at line 2621.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_malformed_legacy_drops_silently() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        // Unparseable value — `EmbeddingModel::from_str` rejects it
+        // and the `.ok()` swallows the error, falling through to the
+        // preset arm.
+        cfg.embedding_model = Some("not-a-real-model".to_string());
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        // The resolver+preset combination still yields a Some (default
+        // semantic tier has an embedding model preset). The test pins
+        // the silent-drop behaviour: the function does NOT panic /
+        // bail on an unparseable legacy override.
+        assert!(
+            dim.is_some(),
+            "unparseable legacy embedding_model MUST be dropped silently \
+             (the .ok() arm), preset fallback fires"
+        );
+    }
 }
