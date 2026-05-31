@@ -23,7 +23,12 @@ use crate::offload::sweep_expired;
 /// Cadence between sweeps. Daily — matches the prompt's "daily task"
 /// directive. Operators that want a shorter cadence (testing,
 /// disaster-recovery exercises) call [`spawn`] with an override.
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Sourced from the substrate-wide `SECS_PER_DAY` SSOT
+/// (`src/lib.rs`) so the canonical time-window magnitudes are pinned
+/// in one place and the vendor-literals gate's SECS_PER_*
+/// drift-block recipe applies here automatically.
+#[allow(clippy::cast_sign_loss)]
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(crate::SECS_PER_DAY as u64);
 
 /// Maximum number of rows deleted per sweep pass. 1000 keeps the
 /// outer loop bounded in pathological backlog scenarios (a thousand
