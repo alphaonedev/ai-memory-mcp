@@ -474,7 +474,9 @@ impl<'a> PersonaGenerator<'a> {
             // the two labels (`peer_attested` beats `self_signed`).
             match link_attest.as_str() {
                 s if s == crate::models::AttestLevel::PeerAttested.as_str() => {
-                    crate::models::AttestLevel::PeerAttested.as_str().to_string()
+                    crate::models::AttestLevel::PeerAttested
+                        .as_str()
+                        .to_string()
                 }
                 _ => crate::models::AttestLevel::SelfSigned.as_str().to_string(),
             }
