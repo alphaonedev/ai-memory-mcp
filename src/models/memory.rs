@@ -555,6 +555,21 @@ pub struct Memory {
     pub version: i64,
 }
 
+impl Memory {
+    /// Total number of declared `pub <name>: <type>` fields on the
+    /// `Memory` struct at v0.7.0. SSOT for the "26-field struct at
+    /// v0.7.0 (was 15 at v0.6.x)" narrative in CLAUDE.md / README.md /
+    /// ROADMAP.md / release-notes. Adding or removing a field requires
+    /// bumping this const in the same commit, OR the parity test pin
+    /// at `tests/memory_field_count_invariant.rs` fails the build.
+    ///
+    /// Multi-agent literal-sweep reference: scanner B finding F-B1.x
+    /// (Memory shape drift), mirrors the
+    /// `MemoryLinkRelation::COUNT` + `EXPECTED_CLI_SUBCOMMANDS_*`
+    /// drift-blocker pattern landed in commits 960578cfd + 233e8a247.
+    pub const FIELD_COUNT: usize = 26;
+}
+
 /// Default for [`Memory::version`] on rows that pre-date schema v45
 /// (or JSON payloads from clients that haven't learned about the
 /// column yet). Matches the SQL DEFAULT clause on the column.
