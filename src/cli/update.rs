@@ -29,6 +29,22 @@ pub struct UpdateArgs {
     /// Expiry timestamp (RFC3339), or empty string to clear
     #[arg(long)]
     pub expires_at: Option<String>,
+    /// v0.7.0 F2.4 (#1428) — JSON metadata patch (object). Replaces the
+    /// existing `metadata` blob field-by-field. Pass `'{"agent_id":"...",
+    /// "scope":"team"}'`. Validates as a JSON object.
+    #[arg(long)]
+    pub metadata: Option<String>,
+    /// v0.7.0 F2.4 (#1428) — Form-4 first-class URI pointer. Accepted
+    /// schemes: `uri:` / `doc:` / `file:`. Validates through
+    /// `crate::validate::validate_source_uri`.
+    #[arg(long)]
+    pub source_uri: Option<String>,
+    /// v0.7.0 F2.4 (#1428) — optimistic-concurrency gate per #884.
+    /// When set, the update only proceeds if the row's current
+    /// `version` field matches; mismatch returns VERSION_CONFLICT.
+    /// Unset (legacy CLI behaviour) skips the gate.
+    #[arg(long)]
+    pub expected_version: Option<i64>,
 }
 
 /// `update` handler.
@@ -79,7 +95,30 @@ pub fn run(
     {
         validate::validate_expires_at_format(ts)?;
     }
-    let (found, _content_changed) = db::update(
+    // v0.7.0 F2.4 (#1428) — validate the new metadata / source_uri /
+    // expected_version flags before issuing the update.
+    let metadata_patch: Option<serde_json::Value> = match args.metadata.as_deref() {
+        None => None,
+        Some(s) => {
+            let v: serde_json::Value = serde_json::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid --metadata JSON: {e}"))?;
+            if !v.is_object() {
+                return Err(anyhow::anyhow!(
+                    "--metadata must be a JSON object (got {v})"
+                ));
+            }
+            Some(v)
+        }
+    };
+    if let Some(ref s) = args.source_uri {
+        validate::validate_source_uri(s)
+            .map_err(|e| anyhow::anyhow!("invalid --source-uri: {e}"))?;
+    }
+    // Route through `db::update_with_expected_version` so the #884
+    // optimistic-concurrency gate is reachable from CLI when the
+    // operator passes `--expected-version`. Legacy behaviour (no
+    // expected_version) preserved by passing `None`.
+    let (found, _content_changed) = db::update_with_expected_version(
         &conn,
         &resolved_id,
         args.title.as_deref(),
@@ -90,7 +129,9 @@ pub fn run(
         args.priority,
         args.confidence,
         args.expires_at.as_deref(),
-        None,
+        metadata_patch.as_ref(),
+        args.source_uri.as_deref(),
+        args.expected_version,
     )?;
     if !found {
         writeln!(out.stderr, "not found: {}", args.id)?;
@@ -141,6 +182,10 @@ mod tests {
             priority: None,
             confidence: None,
             expires_at: None,
+            // v0.7.0 F2.4 (#1428) — new CLI flags
+            metadata: None,
+            source_uri: None,
+            expected_version: None,
         }
     }
 
