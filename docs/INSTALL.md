@@ -170,6 +170,8 @@
 
    Export `XAI_API_KEY` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) so the parent process inherits it; the MCP-spawned subprocess inherits from the AI client which inherits from your login shell. **Inline keys in `config.toml` are rejected at parse time** — use `api_key_env` (process-env reference) or `api_key_file` (file path; mode 0400 enforced).
 
+   > **Service-manager daemons don't inherit shell-rc exports.** The above works for an MCP server spawned by your AI client. A `serve` or `curator --daemon` started by **launchd (macOS) or systemd (Linux)** does NOT see a key you `export` from `.zshrc`/`.bashrc` — its env comes only from the unit/plist. For those, prefer `api_key_file` (env-independent across platforms) or declare the key inside the unit's `Environment=` / plist `EnvironmentVariables` dict. See [`production-deployment.md` § 7b](production-deployment.md#7b-llm-backend-wiring-smart--autonomous-tier).
+
    Full canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
 
    ### Override path — `env:` block in the MCP config

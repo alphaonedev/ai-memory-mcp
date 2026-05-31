@@ -149,6 +149,29 @@ discoverability stories** for the env vars:
   the `env:` keys declared in the MCP server config. Shell exports
   from `.zshrc` / `.bashrc` / `.profile` are NOT visible. This was the
   operator paper-cut behind [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144).
+- **Curator daemon (`ai-memory curator --daemon`).** A long-running
+  background tagger, almost always started by a service manager
+  (launchd LaunchAgent on macOS, systemd unit on Linux). Like `serve`,
+  it inherits ONLY the unit/plist env — **not** your login-shell
+  exports. A curator that can't resolve its key fails open: it reports
+  `key_source=error`, disables the LLM client, and logs `tagged=0`
+  every cycle with no louder error. Wire its key the same way as
+  `serve` (below).
+
+**Env-independent option (recommended for service daemons).** Rather
+than threading the key through each launcher's env contract, point
+`[llm].api_key_file` at a `0400` key file in `config.toml`:
+
+```
+# ~/.config/ai-memory/config.toml
+[llm]
+backend = "openrouter"
+api_key_file = "/etc/ai-memory/openrouter-api.key"  # mode 0400
+```
+
+This resolves identically under launchd, systemd, Docker, and an
+interactive shell — no per-platform `Environment=` / `EnvironmentVariables`
+plumbing required.
 
 For MCP usage, the LLM env vars MUST live inside the MCP server
 config's `env:` block. Copy-pasteable per-backend recipes (Ollama,
@@ -179,6 +202,23 @@ For fleet deployments managed via Ansible / Chef / Puppet / Salt / Nix,
 render `/etc/ai-memory/llm.env` from a template and pull the secret
 from your vault. Rotation = vault rotate + `systemctl restart
 ai-memory`.
+
+macOS launchd (curator daemon) pattern:
+
+```
+<!-- ~/Library/LaunchAgents/dev.alphaone.ai-memory.curator.plist -->
+<!-- The GUI launchd domain does NOT inherit a shell `export
+     OPENROUTER_API_KEY`. Either use [llm].api_key_file (above), or
+     declare the key var inside this EnvironmentVariables dict: -->
+<key>EnvironmentVariables</key>
+<dict>
+  <key>OPENROUTER_API_KEY</key>
+  <string>sk-or-...</string>
+</dict>
+```
+
+The full curator plist (ProgramArguments, KeepAlive, ProcessType) lives
+in [`batman-active-mode.md` § Making it permanent](batman-active-mode.md#making-it-permanent).
 
 For multi-DC deployments with regional cloud LLM endpoints, override
 the per-alias default URL with `AI_MEMORY_LLM_BASE_URL`. See
