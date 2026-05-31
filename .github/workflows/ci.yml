@@ -200,6 +200,26 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 
+  # MSRV gate — ai-memory standardizes on Rust 1.96, declared in
+  # Cargo.toml `rust-version`. CI's other jobs build on `@stable` (which
+  # floats forward), so without this pin the declared floor is never
+  # actually exercised: a stray use of a >1.96 API would only surface
+  # downstream. This job installs exactly 1.96.0 and `cargo check`s the
+  # whole crate against it, failing CI if the real minimum drifts above
+  # the declared one. Advisory until added to branch protection.
+  msrv:
+    name: MSRV (Rust 1.96)
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.96.0 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check on MSRV
+        run: cargo check --all-targets
+
   # Cross-platform correctness matrix. These job names are required by
   # branch protection on main/develop/release/**, so the jobs MUST run
   # and complete SUCCESS even on docs-only PRs. Per-step `if:` makes the

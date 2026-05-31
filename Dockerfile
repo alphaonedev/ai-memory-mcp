@@ -3,11 +3,11 @@
 # ---- Build stage ----
 # Pin to bookworm so the produced binary's glibc matches the runtime
 # stage (debian:bookworm-slim, glibc 2.36). Without the explicit
-# bookworm tag, rust:1.94-slim resolves to a trixie-based image
+# bookworm tag, rust:1.96-slim resolves to a trixie-based image
 # (glibc 2.41) and the binary fails at startup with
 # `version GLIBC_2.39 not found` — caught by the dockerfile-validate
 # CI job (PR #465 retrospective; v0.6.5 bake).
-FROM rust:1.94-slim-bookworm AS builder
+FROM rust:1.96-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \

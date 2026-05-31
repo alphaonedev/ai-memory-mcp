@@ -141,7 +141,7 @@ done
     // stderr piping in well under a minute. Anything close to this
     // bound suggests the drain task is missing or under-buffering.
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < Duration::from_mins(1),
         "5 fires of 1 MiB stderr each took {elapsed:?}; suggests drain task is missing",
     );
 

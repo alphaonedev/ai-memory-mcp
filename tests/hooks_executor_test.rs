@@ -179,7 +179,7 @@ done
     }
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < Duration::from_mins(1),
         "1000 daemon fires took {elapsed:?}; expected <60s"
     );
 
