@@ -34,6 +34,13 @@ pub(super) mod registry;
 // model + canonical-bytes discipline.
 pub mod server_identity;
 
+// v0.7.0 Fix #5 closure — SSOT for MCP tool-call parameter field
+// names (canonical snake_case JSON keys). Closes the deferred-item
+// "MCP tool-call param field names (~98 sites)" from the literal
+// sweep: every `.get("X")` / `["X"]` extraction-site literal under
+// `src/mcp/` is allowlist-pinned by `tests/mcp_param_names_invariant.rs`.
+pub mod param_names;
+
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
 // `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
