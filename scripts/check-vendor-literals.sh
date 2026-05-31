@@ -62,11 +62,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# 9-file allowlist. Repo-root-relative paths.
-# Two new entries for #1389 L2 host-adapter surface (transcript paths
+# 10-file allowlist. Repo-root-relative paths.
+# Two entries for #1389 L2 host-adapter surface (transcript paths
 # differ per AI host: claude/codex/gemini/opencode/grok-cli — vendor
 # identifier IS the routing key, so the carve-out matches the
 # `src/mine.rs::Format::Claude` precedent for vendor-keyed enums).
+# One entry for tools/t0-orchestrate/ which is publish=false test-
+# harness binary that legitimately needs vendor-identifying literals
+# for routing across heterogeneous-NHI surfaces (per F-D1 closure;
+# operator directive 2026-05-31 "FIX IT NOW" withdrew the prior
+# AI-NHI defer).
 ALLOWED_FILES=(
     "src/llm.rs"
     "src/config.rs"
@@ -77,6 +82,7 @@ ALLOWED_FILES=(
     "src/harness.rs"
     "src/recover/transcript_paths.rs"
     "src/cli/commands/recover_previous_session.rs"
+    "tools/t0-orchestrate/src/main.rs"
 )
 
 # Vendor identifiers to gate. Keep this list narrow — over-broad gates
@@ -210,7 +216,14 @@ while IFS= read -r -d '' f; do
     if [[ -n "$s" ]]; then
         secs_violations+="$s"$'\n'
     fi
-done < <(find "${ROOT}/src" -type f -name '*.rs' -print0)
+done < <(
+    # v0.7.0 F-D1 fix (operator directive 2026-05-31 "FIX IT NOW"):
+    # extend gate scope to also walk tools/*/src/** so the t0-orchestrate
+    # vendor-routing literals get gated. tools/t0-orchestrate/src/main.rs
+    # is carved out as the 10th allowlist entry above (publish=false
+    # test-harness binary, vendor IS the routing key).
+    find "${ROOT}/src" "${ROOT}/tools" -type f -name '*.rs' -print0 2>/dev/null
+)
 
 violations=0
 
