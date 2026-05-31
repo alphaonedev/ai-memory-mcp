@@ -90,10 +90,16 @@ jobs:
           # doesn't carry stale numerics. Pre-fix this checked for a
           # specific stale claim (43); now derives the canonical from
           # the workflow's own ssot extraction.
-          if grep -nE 'profile full.*[0-9]+ tools' src/daemon_runtime.rs \
+          # Capture every 'profile full ... N tools' narrative line that
+          # doesn't match the canonical EXPECTED_FULL_COUNT / EXPECTED_CALLABLE_COUNT
+          # phrasing — write to a scratch file so the downstream existence
+          # check can react. `set -e` is on (`-eo pipefail` for this step's
+          # shell), so empty grep pipelines would normally abort the step;
+          # the `|| true` keeps the step alive when no narrative lines exist.
+          grep -nE 'profile full.*[0-9]+ tools' src/daemon_runtime.rs \
             | grep -vE "profile full.*\*\*${EXPECTED_FULL_COUNT}( advertised| MCP)" \
             | grep -vE "${EXPECTED_CALLABLE_COUNT} callable" \
-            | head -5 > /tmp/daemon_drift.txt
+            | head -5 > /tmp/daemon_drift.txt || true
           if [ -s /tmp/daemon_drift.txt ]; then
             echo "::warning::src/daemon_runtime.rs has 'profile full' tool-count narrative lines; verify they match $EXPECTED_FULL_COUNT / $EXPECTED_CALLABLE_COUNT"
             cat /tmp/daemon_drift.txt
