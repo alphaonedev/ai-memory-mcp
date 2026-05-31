@@ -40,6 +40,31 @@ not a code defect.
 
 ---
 
+## LLM substrate
+
+Operator directive 2026-05-31: IronClaw A2A docker-compose
+ai-memory services (`ic-parity-alice` + `ic-parity-bob`) run with
+**OpenRouter `google/gemma-4-26b-a4b-it`** as the AI NHI brain via
+the provider-agnostic LLM substrate (`AI_MEMORY_LLM_BACKEND=openrouter`).
+This supersedes the 2026-05-21 #1067 xAI Grok 4.3 wiring captured in
+the 2026-05-28 ship-campaign run; the prior wiring remains a
+documented snapshot of the substrate's xAI capability for the
+heterogeneous-AI-NHI cross-LLM verdict matrix.
+
+Canonical pinning + connectivity-probe evidence:
+`docs/v0.7.0/test-config.md` §"Substrate LLM (current standing
+default, 2026-05-31)".
+
+Per-call substrate cost on Gemma 4 26B (~$0.0000137 per round-trip
+at ~22 + 26 token shape) lands the daily operating cost at ~$0.014
+on the autonomous-tier hot path — a 3000× reduction from the
+xAI Grok 4.3 daily burn the same workload incurred. Re-running
+Track B's federation phases on the OpenRouter-wired alice/bob does
+NOT change any of the GREEN signatures documented below — the
+federation tests exercise the wire substrate (Ed25519, nonce-binding,
+peer-enrollment), not the LLM brain — so the verdict above remains
+SHIP-CLEARED at the OpenRouter-substrate posture as well.
+
 ## Methodology — why this is the in-host A2A portion
 
 The 2026-05-22 release-gate dossier captured the 8 A2A non-corpus

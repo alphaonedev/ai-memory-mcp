@@ -121,30 +121,37 @@ services:
       AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=disable"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
-      # Operator directive 2026-05-21 (#1067): IronClaw containers run
-      # with xAI Grok 4.3 as the AI NHI brain via the provider-agnostic
-      # LLM substrate. `XAI_API_KEY` comes from `~/.env` on this node;
+      # Operator directive 2026-05-31 (supersedes 2026-05-21 #1067 xAI
+      # Grok 4.3 wiring): IronClaw containers run with OpenRouter
+      # google/gemma-4-26b-a4b-it as the AI NHI brain. Cost+context
+      # rationale: $0.06/M-in + $0.33/M-out (vs $3 + $15 on xAI Grok 4.3,
+      # a 50-95× cost reduction); 262144-token context; 26B sparse-MoE
+      # quality is materially stronger than local 8B gemma4:e4b for
+      # long-context atomise/reflect/calibrate paths. Connectivity
+      # verified 2026-05-31 ~11:23 ET (HTTP 200, 2.2s latency).
+      # `OPENROUTER_API_KEY` comes from `~/.env` on this node;
       # `:?` syntax fails compose with a clear error if the shell env
       # hasn't sourced ~/.env first. Production operators run:
       #   set -a; source ~/.env; set +a
       #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d
-      AI_MEMORY_LLM_BACKEND: "xai"
-      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4.3}"
-      # auto_tag uses a separate model (historically fast/cheap
-      # gemma3:4b on Ollama). On the xAI backend that's invalid;
-      # set explicitly to a Grok model. Operators with cost concerns
-      # can override to a smaller/cheaper model variant via env.
-      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-grok-4.3}"
+      AI_MEMORY_LLM_BACKEND: "openrouter"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-google/gemma-4-26b-a4b-it}"
+      # auto_tag historically used a separate fast/cheap model
+      # (gemma3:4b on Ollama, then grok-4.3 mini on xAI). On OpenRouter
+      # the same paid Gemma 4 26B model is cheap enough to use uniformly;
+      # operators with extreme cost concerns can override via env to
+      # google/gemma-4-26b-a4b-it:free (rate-limited) or any other model.
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-google/gemma-4-26b-a4b-it}"
       # Kept for backward compat with anything that still reads OLLAMA_BASE_URL
       # directly (e.g., tier-default fallback when AI_MEMORY_LLM_BACKEND unset
-      # in some future config path). Harmless when AI_MEMORY_LLM_BACKEND=xai.
+      # in some future config path). Harmless when AI_MEMORY_LLM_BACKEND=openrouter.
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
-      XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
-      # Daemon HTTP X-API-Key auth secret. Reuses the xAI key as the
-      # high-entropy HTTP token (84-char random string is suitable as
-      # an API key). Operators wanting separate secrets set both
-      # XAI_API_KEY (LLM) and AI_MEMORY_API_KEY (HTTP) explicitly.
-      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${XAI_API_KEY}}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
+      # Daemon HTTP X-API-Key auth secret. Reuses the OpenRouter key as
+      # the high-entropy HTTP token (73-char random string is suitable
+      # as an API key). Operators wanting separate secrets set both
+      # OPENROUTER_API_KEY (LLM) and AI_MEMORY_API_KEY (HTTP) explicitly.
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
     volumes:
       - ic-parity-alice-keys:/root/.config/ai-memory/keys
@@ -191,17 +198,14 @@ services:
       AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=disable"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
-      # See alice's block for the #1067 rationale.
-      AI_MEMORY_LLM_BACKEND: "xai"
-      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-grok-4.3}"
-      # auto_tag uses a separate model (historically fast/cheap
-      # gemma3:4b on Ollama). On the xAI backend that's invalid;
-      # set explicitly to a Grok model. Operators with cost concerns
-      # can override to a smaller/cheaper model variant via env.
-      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-grok-4.3}"
+      # See alice's block for the 2026-05-31 OpenRouter Gemma 4 26B
+      # rationale (supersedes the #1067 xAI Grok 4.3 wiring).
+      AI_MEMORY_LLM_BACKEND: "openrouter"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-google/gemma-4-26b-a4b-it}"
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-google/gemma-4-26b-a4b-it}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
-      XAI_API_KEY: "${XAI_API_KEY:?XAI_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
-      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${XAI_API_KEY}}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
     volumes:
       - ic-parity-bob-keys:/root/.config/ai-memory/keys
