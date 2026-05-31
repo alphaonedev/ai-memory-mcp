@@ -31,8 +31,21 @@ on:
 # Frees runner-pool capacity and prevents the older "stale" run from
 # noising up the PR status with outdated results from before the latest
 # fix push.
+#
+# v0.7.0 (2026-05-31, operator directive "fix it all 100%") — extended
+# the concurrency-group key so a `push` event AND a `pull_request`
+# (synchronize) event for the SAME branch coalesce into one group.
+# Pre-fix, both triggers fired concurrently on every push to a branch
+# with an open PR (e.g. release/v0.7.0 → main), producing 2 CI runs
+# per push (~2x CI cost). The fix unifies the key via the branch name:
+#   - on `push`: `github.ref_name` = "release/v0.7.0" (no refs/ prefix)
+#   - on `pull_request`: `github.event.pull_request.head.ref` =
+#     "release/v0.7.0" (the PR's head branch, NOT the merge ref)
+# Both events produce the same group key, so `cancel-in-progress: true`
+# guarantees only one CI run per branch-head SHA. The cancelled run's
+# validation result is preserved on the in-flight run (same SHA).
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
