@@ -38,6 +38,13 @@ use std::path::Path;
 
 use self::validation::OnConflict;
 
+/// Re-export of the canonical `OnConflict` enum (formerly `pub(super)`)
+/// so external consumers — most notably the HTTP handler at
+/// `src/handlers/create.rs` — can route through the single
+/// `OnConflict::parse` SSOT instead of carrying duplicated string
+/// allowlist matches. Multi-agent sweep ref: scanner B finding F-B3.x.
+pub use self::validation::OnConflict as OnConflictMode;
+
 // --- D1.3 (#984): per-tool McpTool impl for `memory_store` ---
 
 /// v0.7.0 #972 D1.3 (#984) — request body for `memory_store`.

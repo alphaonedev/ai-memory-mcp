@@ -19,7 +19,7 @@
 /// * `Version` — auto-suffix the title with `(2)`, `(3)`, ... to write
 ///               a distinct row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OnConflict {
+pub enum OnConflict {
     Error,
     Merge,
     Version,
@@ -31,7 +31,14 @@ impl OnConflict {
     /// Returns the wire-compatible `"invalid on_conflict '...'..."`
     /// error string surfaced to MCP callers when an unknown value
     /// appears in the params.
-    pub(super) fn parse(s: &str) -> Result<Self, String> {
+    ///
+    /// v0.7.0 (multi-agent literal-sweep scanner B finding F-B3.x):
+    /// promoted from `pub(super)` to `pub` so the HTTP handler
+    /// (`src/handlers/create.rs`) can reuse this single parse path
+    /// instead of the prior duplicated `matches!(... "error" | "merge"
+    /// | "version")` + per-mode dispatch. Single SSOT for the on-
+    /// conflict closed set.
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "error" => Ok(Self::Error),
             "merge" => Ok(Self::Merge),

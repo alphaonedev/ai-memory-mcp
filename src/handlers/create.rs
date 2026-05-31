@@ -183,41 +183,45 @@ fn embed_create_before_lock(
 fn resolve_create_conflict_title(
     conn: &rusqlite::Connection,
     body: &CreateMemory,
-    on_conflict_mode: &str,
+    on_conflict_mode: crate::mcp::tools::OnConflictMode,
 ) -> Result<String, axum::response::Response> {
+    use crate::mcp::tools::OnConflictMode;
     match on_conflict_mode {
-        "error" => match db::find_by_title_namespace(conn, &body.title, &body.namespace) {
-            Ok(Some(existing_id)) => Err((
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "code": "CONFLICT",
-                    "error": format!(
-                        "memory with title '{}' already exists in namespace '{}'",
-                        body.title, body.namespace
-                    ),
-                    "existing_id": existing_id,
-                })),
-            )
-                .into_response()),
-            Ok(None) => Ok(body.title.clone()),
-            Err(e) => {
-                tracing::error!("on_conflict lookup failed: {e}");
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "conflict check failed"})),
+        OnConflictMode::Error => {
+            match db::find_by_title_namespace(conn, &body.title, &body.namespace) {
+                Ok(Some(existing_id)) => Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "code": "CONFLICT",
+                        "error": format!(
+                            "memory with title '{}' already exists in namespace '{}'",
+                            body.title, body.namespace
+                        ),
+                        "existing_id": existing_id,
+                    })),
                 )
-                    .into_response())
+                    .into_response()),
+                Ok(None) => Ok(body.title.clone()),
+                Err(e) => {
+                    tracing::error!("on_conflict lookup failed: {e}");
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "conflict check failed"})),
+                    )
+                        .into_response())
+                }
             }
-        },
-        "version" => db::next_versioned_title(conn, &body.title, &body.namespace).map_err(|e| {
-            tracing::error!("on_conflict=version failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "could not pick a versioned title"})),
-            )
-                .into_response()
-        }),
-        _ => Ok(body.title.clone()),
+        }
+        OnConflictMode::Version => db::next_versioned_title(conn, &body.title, &body.namespace)
+            .map_err(|e| {
+                tracing::error!("on_conflict=version failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not pick a versioned title"})),
+                )
+                    .into_response()
+            }),
+        OnConflictMode::Merge => Ok(body.title.clone()),
     }
 }
 
@@ -961,19 +965,16 @@ pub async fn create_memory(
 
     // v0.6.3.1 P2 (G6) — resolve `on_conflict` policy. HTTP defaults to
     // 'error'; callers that want the v0.6.3 silent-merge behaviour must
-    // pass on_conflict='merge'.
-    let on_conflict_mode = body.on_conflict.as_deref().unwrap_or("error");
-    if !matches!(on_conflict_mode, "error" | "merge" | "version") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!(
-                    "invalid on_conflict '{on_conflict_mode}' (expected error|merge|version)"
-                )
-            })),
-        )
-            .into_response();
-    }
+    // pass on_conflict='merge'. v0.7.0 (sweep F-B3.x): routes through
+    // the single OnConflict::parse SSOT instead of the prior duplicated
+    // inline string-allowlist match.
+    let on_conflict_str = body.on_conflict.as_deref().unwrap_or("error");
+    let on_conflict_mode = match crate::mcp::tools::OnConflictMode::parse(on_conflict_str) {
+        Ok(m) => m,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    };
 
     let state = app.db.clone();
     let now = Utc::now();
@@ -1275,8 +1276,9 @@ mod tests {
         db::insert(&conn, &seed).expect("seed insert ok");
         let mut body = make_body("dup-title");
         body.namespace = "ns-x".to_string();
-        let err =
-            resolve_create_conflict_title(&conn, &body, "error").expect_err("must return CONFLICT");
+        use crate::mcp::tools::OnConflictMode;
+        let err = resolve_create_conflict_title(&conn, &body, OnConflictMode::Error)
+            .expect_err("must return CONFLICT");
         assert_eq!(err.status(), StatusCode::CONFLICT);
     }
 
@@ -1294,7 +1296,8 @@ mod tests {
         db::insert(&conn, &seed).expect("seed insert ok");
         let mut body = make_body("vers-title");
         body.namespace = "ns-v".to_string();
-        let resolved = resolve_create_conflict_title(&conn, &body, "version")
+        use crate::mcp::tools::OnConflictMode;
+        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Version)
             .expect("version path returns Ok");
         // `next_versioned_title` appends a free numeric suffix when the
         // base name is taken (`vers-title (2)`-style). The exact suffix
@@ -1315,8 +1318,9 @@ mod tests {
         // No seed row — even when the title is unique, the `merge`
         // path is documented as a no-op (UPSERT happens inside
         // `db::insert`).
-        let resolved =
-            resolve_create_conflict_title(&conn, &body, "merge").expect("merge path returns Ok");
+        use crate::mcp::tools::OnConflictMode;
+        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Merge)
+            .expect("merge path returns Ok");
         assert_eq!(resolved, "merge-title");
     }
 
