@@ -131,7 +131,7 @@ fn b3_precompute_does_not_block_serve_health() {
     // Per-Module Coverage Thresholds CI job failed deterministically
     // on this test even though it is GREEN under normal execution.
     let budget = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     } else {
         Duration::from_secs(10)
     };

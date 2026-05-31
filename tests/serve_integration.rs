@@ -33,7 +33,7 @@ use common::free_port;
 // instrumentation, which inflates startup time by 3-5x. 60s gives
 // enough headroom on every supported CI surface (Linux/macOS/Windows)
 // regardless of instrumentation overhead.
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
+const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// RAII guard for the spawned daemon. Drops kill the child on test
 /// exit so leaked test processes don't accumulate on flaky failures.

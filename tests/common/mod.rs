@@ -549,7 +549,7 @@ mod hmac_fixture_tests {
 /// runner-load variance on postgres-container startup doesn't surface
 /// as a "never became ready" assertion. A daemon that's genuinely
 /// broken will still fail well inside the CI job's 6 h budget.
-pub const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Probe the in-process HTTP daemon's `/api/v1/health` endpoint until
 /// it returns 200 OK or the overall `timeout` elapses.
