@@ -194,8 +194,11 @@ impl<'a> std::fmt::Debug for ReflectHooks<'a> {
 /// Input bundle for [`reflect`]. Holds every caller-tunable field of the
 /// new reflection memory plus the source-id list. Defaults mirror the
 /// MCP tool schema (`tier=mid`, `priority=5`, `confidence=1.0`,
-/// `source="claude"`) so the dispatch layer can build this from the
-/// raw JSON arguments without further fixup.
+/// `source=DEFAULT_NHI_SOURCE` per `crate::validate::DEFAULT_NHI_SOURCE`
+/// = `"nhi"` post-#1175 — pre-#1175 this defaulted to `"claude"`, a
+/// heterogeneous-NHI monoculture defect that #1175 closed) so the
+/// dispatch layer can build this from the raw JSON arguments without
+/// further fixup.
 #[derive(Debug, Clone)]
 pub struct ReflectInput {
     pub source_ids: Vec<String>,
