@@ -17,7 +17,7 @@ main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now li
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (26 fields at v0.7.0), MemoryLink (6 relations at v0.7.0), MemoryKind (Batman Form-6 vocab), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs); Axum extractors + JSON responses; error sanitization
-storage/           -- SAL trait + sqlite path; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 43)
+storage/           -- SAL trait + sqlite path; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 53)
 store/             -- SAL adapter implementations (sqlite + postgres + AGE feature gates)
 mcp/               -- MCP server over stdio JSON-RPC; tool registry (registry.rs), per-tool handlers under tools/, notification handling
 validate.rs        -- Input validation for all write paths
