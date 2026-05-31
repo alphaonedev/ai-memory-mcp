@@ -4,6 +4,7 @@
 use serde_json::Value;
 
 pub mod audit;
+pub mod capture_turn;
 pub mod link;
 pub mod memory;
 pub mod namespace;
@@ -14,6 +15,7 @@ pub mod tag;
 
 #[allow(unused_imports)]
 pub use audit::*;
+pub use capture_turn::*;
 pub use link::*;
 pub use memory::*;
 pub use namespace::*;

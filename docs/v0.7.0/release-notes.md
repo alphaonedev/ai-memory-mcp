@@ -261,7 +261,7 @@ removed in v0.8.0.**
 
 **HTTP / CLI surface additions.** The `Config` subcommand and the
 `/api/v1/config/*` HTTP routes are new at v0.7.x; the count change is
-captured in [`CLAUDE.md`](../../CLAUDE.md) §Architecture (87 HTTP
+captured in [`CLAUDE.md`](../../CLAUDE.md) §Architecture (88 HTTP
 routes, 78 CLI subcommands in default build / 80 under --features sal —
 SSOT: `ai_memory::EXPECTED_PRODUCTION_ROUTES_COUNT` and
 `EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` in `src/lib.rs`).
@@ -1444,7 +1444,7 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
   (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 74 MCP tools at
   release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
-  vars, 87 production HTTP route registrations (73 unique URL paths), 33+ sqlite migrations on disk + the in-
+  vars, 88 production HTTP route registrations (74 unique URL paths), 33+ sqlite migrations on disk + the in-
   process arms that converge sqlite + postgres on the single
   logical `CURRENT_SCHEMA_VERSION = 53`).
 

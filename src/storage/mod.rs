@@ -781,6 +781,96 @@ impl std::fmt::Display for ConflictError {
 
 impl std::error::Error for ConflictError {}
 
+/// v0.7.0 #1416 / RFC-0001 — sqlite SSOT for the L4 layered-capture
+/// idempotent write. Both the MCP `memory_capture_turn` handler (which
+/// holds a raw `&rusqlite::Connection`) and `SqliteStore::
+/// capture_turn_idempotent` (the SAL trait surface) call through here,
+/// so the dedup-lookup + atomic three-row insert exists in exactly one
+/// place on the sqlite path.
+///
+/// Mirrors the original inline handler transaction verbatim:
+/// 1. dedup SELECT on `(host_session_id, host_turn_index)` (the
+///    `IS NOT NULL` predicate pins the partial index from schema v52).
+/// 2. On hit → return the existing id with `dedup_hit: true`, no write.
+/// 3. On miss → `BEGIN IMMEDIATE` → `insert` (merge upsert) →
+///    `transcript_line_dedup` INSERT → `signed_events` chain row →
+///    COMMIT; any failure rolls all three rows back atomically.
+///
+/// # Errors
+///
+/// String-stable codes per the MCP error convention: `DEDUP_QUERY_FAILED`,
+/// `TX_BEGIN_FAILED`, `MEMORY_INSERT_FAILED`, `DEDUP_INSERT_FAILED`,
+/// `SIGNED_EVENTS_APPEND_FAILED`, `TX_COMMIT_FAILED`.
+pub fn capture_turn_idempotent(
+    conn: &Connection,
+    write: &crate::models::CaptureTurnWrite,
+) -> std::result::Result<crate::models::CaptureTurnResult, String> {
+    use rusqlite::OptionalExtension;
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT memory_id FROM transcript_line_dedup \
+             WHERE host_session_id IS NOT NULL \
+               AND host_session_id = ?1 \
+               AND host_turn_index = ?2",
+            params![&write.host_session_id, write.host_turn_index],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+
+    if let Some(memory_id) = existing {
+        return Ok(crate::models::CaptureTurnResult {
+            memory_id,
+            dedup_hit: true,
+        });
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+
+    let tx_result = (|| -> std::result::Result<String, String> {
+        let inserted_id =
+            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+
+        conn.execute(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            params![
+                write.sha256,
+                inserted_id,
+                write.host_kind,
+                write.host_session_id,
+                write.host_turn_index,
+                write.recovered_at_ms,
+            ],
+        )
+        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+
+        crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
+            .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
+
+        Ok(inserted_id)
+    })();
+
+    match tx_result {
+        Ok(memory_id) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+            Ok(crate::models::CaptureTurnResult {
+                memory_id,
+                dedup_hit: false,
+            })
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// v0.7.0 fix campaign R1-M3 (#690) — insert a memory under an
 /// explicit [`ConflictMode`].
 ///

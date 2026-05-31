@@ -223,7 +223,7 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // counted by `EXPECTED_TEST_ROUTES_COUNT` below.
 // ---------------------------------------------------------------------------
 
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 87;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 88;
 pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
 
 /// Number of distinct URL paths (multi-line-aware) registered by the
@@ -234,7 +234,7 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
 /// cannot drift silently. v0.7.0 multi-agent literal-sweep (scanner
 /// A, finding F-A4.1) — previously the `73 unique URL paths` count
 /// was cited in 30+ doc sites with no const.
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 73;
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 74;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -568,7 +568,7 @@ pub mod store;
 /// state and the composite app state.
 ///
 /// This is the single source of truth for the daemon's HTTP route
-/// table (87 production routes / 73 unique URL paths at v0.7.0). It is
+/// table (88 production routes / 74 unique URL paths at v0.7.0). It is
 /// exposed through the lib crate so the integration test suite can
 /// construct an in-process `axum::Router` and exercise endpoints via
 /// `Router::oneshot()` instead of spawning a subprocess + curl, which:
@@ -670,6 +670,12 @@ pub fn build_router_with_timeout(
             "/api/v1/memories/{id}/promote",
             post(handlers::promote_memory),
         )
+        // v0.7.0 #1416 — L4 layered-capture HTTP surface. Mirrors the
+        // MCP `memory_capture_turn` tool so postgres-backed daemons gain
+        // a callable L4 turn-capture path (the MCP tool only ever runs
+        // against a local sqlite connection). Routes through the SAL
+        // `MemoryStore::capture_turn_idempotent` trait method.
+        .route("/api/v1/capture_turn", post(handlers::capture_turn))
         .route("/api/v1/search", get(handlers::search_memories))
         .route("/api/v1/recall", get(handlers::recall_memories_get))
         .route("/api/v1/recall", post(handlers::recall_memories_post))

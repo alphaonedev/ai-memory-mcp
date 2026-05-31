@@ -60,7 +60,6 @@ use std::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64_STD;
-use rusqlite::OptionalExtension;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -308,11 +307,55 @@ pub fn handle_capture_turn(
     // mint a per-request fallback so audit attribution is never empty.
     let caller = caller_agent_id.unwrap_or("anonymous:mcp-unknown");
 
-    // v0.7.0 #1413 — agent_id agreement check. If the caller stamped a
-    // `metadata.agent_id` it MUST equal the resolved caller — otherwise
-    // an attacker with MCP-stdio access could forge memories attributed
-    // to other identities. Mirrors `resolve_http_agent_id`'s body-header
-    // agreement contract.
+    // v0.7.0 #1416 — all validation (agent_id agreement #1413,
+    // signature verification #1414) + Memory/SignedEvent construction
+    // is backend-agnostic and lives in `prepare_capture_turn`; the
+    // dedup-lookup + atomic three-row transaction is the sqlite SSOT
+    // `crate::storage::capture_turn_idempotent` (also reached by
+    // `SqliteStore::capture_turn_idempotent` through the SAL trait).
+    let write = prepare_capture_turn(&req, caller)?;
+    let attest_level = write.signed_event.attest_level.clone();
+
+    let result = crate::storage::capture_turn_idempotent(conn, &write)?;
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if result.dedup_hit {
+        Ok(json!({
+            "memory_id": result.memory_id,
+            "dedup_hit": true,
+            "layer": "L4",
+            "elapsed_ms": elapsed_ms,
+        }))
+    } else {
+        Ok(json!({
+            "memory_id": result.memory_id,
+            "dedup_hit": false,
+            "layer": "L4",
+            "attest_level": attest_level,
+            "elapsed_ms": elapsed_ms,
+        }))
+    }
+}
+
+/// v0.7.0 #1416 — backend-agnostic preparation of an L4 capture write.
+///
+/// Performs every step that does NOT touch the database — agent_id
+/// agreement (#1413), canonical-bytes hashing, host-signature
+/// verification (#1414), and construction of the [`Memory`] plus the
+/// [`SignedEvent`] audit row (#1415) — and returns a ready-to-write
+/// [`crate::models::CaptureTurnWrite`]. Both surfaces hand the bundle to
+/// the dedup-keyed transaction: the MCP sqlite handler via
+/// `crate::storage::capture_turn_idempotent`, the HTTP route via
+/// `app.store.capture_turn_idempotent` (sqlite OR postgres). Keeping the
+/// verification here means it is enforced identically across both
+/// surfaces and both backends — no adapter can skip it.
+pub(crate) fn prepare_capture_turn(
+    req: &MemoryCaptureTurnRequest,
+    caller: &str,
+) -> Result<crate::models::CaptureTurnWrite, String> {
+    // #1413 — agent_id agreement. A caller-stamped `metadata.agent_id`
+    // MUST equal the resolved caller, else an attacker with access to
+    // the surface could forge memories attributed to other identities.
     if let Some(meta_agent) = req
         .metadata
         .as_ref()
@@ -325,9 +368,7 @@ pub fn handle_capture_turn(
         ));
     }
 
-    // v0.7.0 #1414 — host-signature verification. The wire schema
-    // advertises a signed-by-peer path; the handler must actually
-    // enforce it. Cases:
+    // #1414 — canonical-bytes + host-signature verification. Cases:
     //   (sig, pubkey) both Some → check allowlist + verify Ed25519
     //   exactly one Some → INVALID_INPUT (paired-fields contract)
     //   both None → unsigned ("self_signed") capture path
@@ -342,166 +383,92 @@ pub fn handle_capture_turn(
     };
 
     let (sig_bytes_opt, attest_level): (Option<Vec<u8>>, String) =
-        verify_host_signature(&req, canonical.as_bytes())?;
+        verify_host_signature(req, canonical.as_bytes())?;
 
-    // Step 1 — dedup-lookup by the canonical (host_session_id,
-    // host_turn_index) key. The partial index
-    // idx_transcript_line_dedup_host_turn (created in schema v52) is
-    // gated `WHERE host_session_id IS NOT NULL`; adding the explicit
-    // IS NOT NULL predicate to the SELECT guarantees the planner
-    // hits the partial index across SQLite versions (#1394 / R5.F5.1).
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT memory_id FROM transcript_line_dedup \
-             WHERE host_session_id IS NOT NULL \
-               AND host_session_id = ?1 \
-               AND host_turn_index = ?2",
-            rusqlite::params![&req.host_session_id, req.host_turn_index],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
+    let host_kind = req.host_kind.as_deref().unwrap_or("unknown").to_string();
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let created_at = req.timestamp_iso.clone().unwrap_or_else(|| now_iso.clone());
 
-    if let Some(memory_id) = existing {
-        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        return Ok(json!({
-            "memory_id": memory_id,
-            "dedup_hit": true,
-            "layer": "L4",
-            "elapsed_ms": elapsed_ms,
-        }));
+    let mut tags = vec![
+        "captured-via-l4".to_string(),
+        format!("host:{host_kind}"),
+        format!("role:{}", req.role),
+        format!("attest:{attest_level}"),
+    ];
+    if let Some(hv) = req.host_version.as_deref() {
+        tags.push(format!("host-version:{hv}"));
     }
 
-    // Step 3 — atomic INSERT both rows + signed_events chain row
-    // under one BEGIN IMMEDIATE transaction. Failure rolls back so an
-    // orphaned memory cannot exist without its dedup row OR its audit
-    // row.
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+    // Title MUST be unique per (host_session_id, host_turn_index)
+    // because the substrate's `storage::insert` upserts on
+    // `(title, namespace)`; without host_session_id in the title,
+    // two distinct sessions whose turn N has the same role would
+    // collide on the same memory row.
+    let title = format!(
+        "L4 capture {} {} turn {} ({})",
+        host_kind, req.host_session_id, req.host_turn_index, req.role
+    );
 
-    let tx_result = (|| -> Result<String, String> {
-        let host_kind = req.host_kind.as_deref().unwrap_or("unknown").to_string();
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        let created_at = req.timestamp_iso.clone().unwrap_or_else(|| now_iso.clone());
-
-        let mut tags = vec![
-            "captured-via-l4".to_string(),
-            format!("host:{host_kind}"),
-            format!("role:{}", req.role),
-            format!("attest:{attest_level}"),
-        ];
-        if let Some(hv) = req.host_version.as_deref() {
-            tags.push(format!("host-version:{hv}"));
+    // #1413 — stamp `metadata.agent_id` with the resolved caller so the
+    // inserted memory carries the authenticated identity. Synthesize an
+    // object when absent; patch when present without agent_id; preserve
+    // verbatim when present with a matching agent_id (checked above).
+    let metadata = {
+        let mut m = req.metadata.clone().unwrap_or_else(|| json!({}));
+        if let Some(obj) = m.as_object_mut() {
+            obj.entry("agent_id".to_string())
+                .or_insert_with(|| Value::String(caller.to_string()));
         }
+        m
+    };
 
-        // Title MUST be unique per (host_session_id, host_turn_index)
-        // because the substrate's `storage::insert` upserts on
-        // `(title, namespace)`; without host_session_id in the title,
-        // two distinct sessions whose turn N has the same role would
-        // collide on the same memory row.
-        let title = format!(
-            "L4 capture {} {} turn {} ({})",
-            host_kind, req.host_session_id, req.host_turn_index, req.role
-        );
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        // v0.7.0 F-E4 fix (#1436): route through DEFAULT_NAMESPACE
+        // SSOT at src/lib.rs:266 instead of the bare literal.
+        namespace: req
+            .namespace
+            .clone()
+            .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string()),
+        title,
+        content: req.content.clone(),
+        tags,
+        priority: 5,
+        confidence: 1.0,
+        source: "host".to_string(),
+        metadata,
+        created_at,
+        updated_at: now_iso.clone(),
+        last_accessed_at: Some(now_iso.clone()),
+        memory_kind: MemoryKind::Observation,
+        ..Memory::default()
+    };
 
-        // v0.7.0 #1413 — stamp `metadata.agent_id` with the resolved
-        // caller so the inserted memory carries the authenticated-via-
-        // MCP-handshake identity. If the caller did not supply metadata
-        // we synthesize an object with just the agent_id. If they did
-        // supply metadata WITHOUT agent_id we patch it in. If they
-        // supplied WITH a matching agent_id (verified by the agreement
-        // check above) we preserve it verbatim.
-        let metadata = {
-            let mut m = req.metadata.clone().unwrap_or_else(|| json!({}));
-            if let Some(obj) = m.as_object_mut() {
-                obj.entry("agent_id".to_string())
-                    .or_insert_with(|| Value::String(caller.to_string()));
-            }
-            m
-        };
+    // v0.7.0 #1415 — audit-chain row appended inside the same tx as the
+    // data rows (by the store method) so audit can prove L4 caught the
+    // turn; attest_level reflects whether the host provided a verified
+    // Ed25519 signature (#1414).
+    let signed_event = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: caller.to_string(),
+        event_type: signed_events::event_types::MEMORY_CAPTURE_TURN.to_string(),
+        payload_hash: sha_vec.clone(),
+        signature: sig_bytes_opt,
+        attest_level,
+        timestamp: now_iso,
+        ..SignedEvent::default()
+    };
 
-        let mem = Memory {
-            id: uuid::Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            // v0.7.0 F-E4 fix (#1436): route through DEFAULT_NAMESPACE
-            // SSOT at src/lib.rs:266 instead of the bare literal.
-            namespace: req
-                .namespace
-                .clone()
-                .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string()),
-            title,
-            content: req.content.clone(),
-            tags,
-            priority: 5,
-            confidence: 1.0,
-            source: "host".to_string(),
-            metadata,
-            created_at: created_at.clone(),
-            updated_at: now_iso.clone(),
-            last_accessed_at: Some(now_iso.clone()),
-            memory_kind: MemoryKind::Observation,
-            ..Memory::default()
-        };
-
-        let inserted_id =
-            crate::storage::insert(conn, &mem).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
-
-        let recovered_at_ms = chrono::Utc::now().timestamp_millis();
-        conn.execute(
-            "INSERT INTO transcript_line_dedup \
-             (sha256, memory_id, host_kind, transcript_path, \
-              host_session_id, host_turn_index, recovered_at) \
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
-            rusqlite::params![
-                sha_vec,
-                inserted_id,
-                host_kind,
-                req.host_session_id,
-                req.host_turn_index,
-                recovered_at_ms,
-            ],
-        )
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
-
-        // v0.7.0 #1415 — emit signed_events chain row inside the same
-        // tx so audit can prove L4 caught the turn. attest_level reflects
-        // whether the host provided a verified Ed25519 signature
-        // (#1414). Failure aborts the tx so memory/dedup rows are
-        // rolled back atomically — the audit chain never lags the data.
-        let signed_event = SignedEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            agent_id: caller.to_string(),
-            event_type: crate::signed_events::event_types::MEMORY_CAPTURE_TURN.to_string(),
-            payload_hash: sha_vec.clone(),
-            signature: sig_bytes_opt.clone(),
-            attest_level: attest_level.clone(),
-            timestamp: now_iso.clone(),
-            ..SignedEvent::default()
-        };
-        signed_events::append_signed_event_no_tx(conn, &signed_event)
-            .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
-
-        Ok(inserted_id)
-    })();
-
-    match tx_result {
-        Ok(memory_id) => {
-            conn.execute_batch("COMMIT")
-                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Ok(json!({
-                "memory_id": memory_id,
-                "dedup_hit": false,
-                "layer": "L4",
-                "attest_level": attest_level,
-                "elapsed_ms": elapsed_ms,
-            }))
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
-        }
-    }
+    Ok(crate::models::CaptureTurnWrite {
+        memory: mem,
+        sha256: sha_vec,
+        host_kind,
+        host_session_id: req.host_session_id.clone(),
+        host_turn_index: req.host_turn_index,
+        recovered_at_ms: chrono::Utc::now().timestamp_millis(),
+        signed_event,
+    })
 }
 
 /// v0.7.0 #1414 — parse + verify the host signature pair, returning
