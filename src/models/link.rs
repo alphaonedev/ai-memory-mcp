@@ -153,6 +153,33 @@ impl MemoryLinkRelation {
     pub const fn default_relation() -> Self {
         Self::RelatedTo
     }
+
+    /// Total number of `MemoryLinkRelation` variants. SSOT for the
+    /// "ai-memory supports N typed link relations at v0.7.0" narrative
+    /// in CLAUDE.md / README.md / ROADMAP.md / release-notes — adding
+    /// a new variant requires bumping this const AND the [`all()`]
+    /// slice in the same commit, or the parity test pin in
+    /// `tests/memory_link_relation_count_invariant.rs` fails the build.
+    pub const COUNT: usize = 6;
+
+    /// Canonical enumeration of every variant in declaration order
+    /// (`related_to`, `supersedes`, `contradicts`, `derived_from`,
+    /// `reflects_on`, `derives_from`). Use this anywhere external code
+    /// would otherwise hand-roll the list — kg traversal, federation
+    /// peer-handshake, capability advertisement, parity tests. The
+    /// `length == COUNT` invariant is pinned by
+    /// `tests/memory_link_relation_count_invariant.rs`.
+    #[must_use]
+    pub const fn all() -> &'static [Self; Self::COUNT] {
+        &[
+            Self::RelatedTo,
+            Self::Supersedes,
+            Self::Contradicts,
+            Self::DerivedFrom,
+            Self::ReflectsOn,
+            Self::DerivesFrom,
+        ]
+    }
 }
 
 impl std::fmt::Display for MemoryLinkRelation {
