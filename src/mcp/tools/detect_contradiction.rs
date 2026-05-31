@@ -403,7 +403,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string("oops not json")
-                    .insert_header("content-type", "application/json"),
+                    .insert_header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON),
             )
             .mount(&server)
             .await;
