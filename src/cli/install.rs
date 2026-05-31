@@ -276,6 +276,13 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
     // config (the user might have made a typo we can help them fix).
     let (before_text, before_value) = read_config_or_empty(&config_path)?;
 
+    // v0.7.0 #1378 — config format detected early so the
+    // apply/remove paths can use the right MCP-servers key shape
+    // (`mcpServers` camelCase for JSON, `mcp_servers` snake_case for
+    // TOML per Codex convention) AND so the eventual serializer
+    // matches the input format.
+    let config_format = ConfigFormat::detect(&config_path);
+
     // Compute the desired after-state.
     let after_value = if let Some(hook_kind) = t_args.hook {
         if t_args.uninstall {
@@ -284,18 +291,44 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
             apply_hook_block(target, hook_kind, before_value.clone(), t_args.force, out)?
         }
     } else if t_args.uninstall {
-        remove_managed_block(target, before_value.clone())?
+        remove_managed_block(target, before_value.clone(), config_format)?
     } else {
-        apply_managed_block(target, before_value.clone(), &binary)?
+        apply_managed_block(target, before_value.clone(), &binary, config_format)?
     };
 
-    // Pretty-print both for diff display and for the eventual write.
-    let after_text = serde_json::to_string_pretty(&after_value)? + "\n";
+    // v0.7.0 #1378 — pretty-print in the format the input file used.
+    // Codex config is TOML at ~/.codex/config.toml; other MCP-standard
+    // harnesses use JSON. The format-aware serializer keeps the wire
+    // shape canonical to the surface.
+    let config_format = ConfigFormat::detect(&config_path);
+    let after_text = match config_format {
+        ConfigFormat::Json => serde_json::to_string_pretty(&after_value)? + "\n",
+        ConfigFormat::Toml => {
+            // Round-trip through toml::Value via serde so the TOML
+            // emitter can render. The toml crate's `to_string_pretty`
+            // emits table-with-named-keys shape.
+            let toml_value: toml::Value = toml::Value::try_from(&after_value).map_err(|e| {
+                anyhow!("internal error: cannot convert JSON Value into toml::Value ({e})")
+            })?;
+            toml::to_string_pretty(&toml_value)
+                .map_err(|e| anyhow!("internal error: cannot serialize TOML Value: {e}"))?
+        }
+    };
 
     // Round-trip check: re-parse what we serialized so we never write
     // bytes we couldn't read back.
-    let _: Value = serde_json::from_str(&after_text)
-        .context("internal error: serialised config did not round-trip through JSON parser")?;
+    match config_format {
+        ConfigFormat::Json => {
+            let _: Value = serde_json::from_str(&after_text).context(
+                "internal error: serialised config did not round-trip through JSON parser",
+            )?;
+        }
+        ConfigFormat::Toml => {
+            let _: toml::Value = toml::from_str(&after_text).context(
+                "internal error: serialised config did not round-trip through TOML parser",
+            )?;
+        }
+    }
 
     let action_label = if t_args.uninstall {
         "uninstall"
@@ -703,9 +736,45 @@ fn which_ai_memory() -> Option<PathBuf> {
 // Read / parse
 // ---------------------------------------------------------------------------
 
-/// Read `path` and parse as JSON. Returns `("", {})` if the file does
-/// not exist (a fresh install on a host that's never run the agent).
-/// Errors clearly when the file exists but is not valid JSON.
+/// v0.7.0 #1378 — config-file format discriminator. Real-world Codex
+/// CLI configs are TOML (`~/.codex/config.toml`); the other MCP-
+/// standard harnesses (claude-desktop, grok-cli, gemini-cli, plus the
+/// IDE plugins) use JSON. The installer routes through the right
+/// parser based on the file extension to surface a TOML-shaped error
+/// message when an operator passes a TOML file to a JSON-only target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfigFormat {
+    Json,
+    Toml,
+}
+
+impl ConfigFormat {
+    /// Detect format from the file extension. `.toml` → TOML; anything
+    /// else → JSON (the historical default + every other MCP-standard
+    /// surface).
+    fn detect(path: &Path) -> Self {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
+            Self::Toml
+        } else {
+            Self::Json
+        }
+    }
+}
+
+/// Read `path` and parse as JSON OR TOML depending on the file
+/// extension. Returns `("", {})` if the file does not exist (a fresh
+/// install on a host that's never run the agent). Errors clearly when
+/// the file exists but is not valid in the expected format.
+///
+/// v0.7.0 #1378 — TOML branch added for Codex CLI parity. The TOML
+/// content is parsed into a `toml::Value` then converted into a
+/// `serde_json::Value` for downstream mutation; the canonical
+/// MCP-standard shape (`mcpServers.<name>.{command,args,env}`)
+/// round-trips cleanly across both formats.
 fn read_config_or_empty(path: &Path) -> Result<(String, Value)> {
     if !path.exists() {
         return Ok((String::new(), Value::Object(Map::new())));
@@ -715,15 +784,53 @@ fn read_config_or_empty(path: &Path) -> Result<(String, Value)> {
     if text.trim().is_empty() {
         return Ok((text, Value::Object(Map::new())));
     }
-    let value: Value = serde_json::from_str(&text).map_err(|e| {
-        anyhow!(
-            "existing config at {} is not valid JSON ({e}). \
-             Refusing to overwrite — fix the file by hand or remove it, \
-             then re-run `ai-memory install`.",
-            path.display()
-        )
-    })?;
-    Ok((text, value))
+    match ConfigFormat::detect(path) {
+        ConfigFormat::Json => {
+            let value: Value = serde_json::from_str(&text).map_err(|e| {
+                anyhow!(
+                    "existing config at {} is not valid JSON ({e}). \
+                     Refusing to overwrite — fix the file by hand or remove it, \
+                     then re-run `ai-memory install`.",
+                    path.display()
+                )
+            })?;
+            Ok((text, value))
+        }
+        ConfigFormat::Toml => {
+            // Parse TOML → toml::Value, then serialize through serde
+            // into serde_json::Value. The MCP-standard shape (string
+            // maps + arrays of strings) round-trips cleanly; TOML
+            // datetimes / heterogeneous arrays would NOT round-trip
+            // (those don't appear in the MCP shape).
+            let toml_value: toml::Value = toml::from_str(&text).map_err(|e| {
+                anyhow!(
+                    "existing config at {} is not valid TOML ({e}). \
+                     Refusing to overwrite — fix the file by hand or remove it, \
+                     then re-run `ai-memory install`.",
+                    path.display()
+                )
+            })?;
+            let value: Value = serde_json::to_value(&toml_value).map_err(|e| {
+                anyhow!(
+                    "existing TOML at {} contains a shape that cannot \
+                     round-trip through JSON ({e}). Refusing to overwrite.",
+                    path.display()
+                )
+            })?;
+            // Ensure the top-level is an object (the MCP-standard
+            // mutation routines assume `Value::Object`).
+            let value = if value.is_object() {
+                value
+            } else {
+                anyhow::bail!(
+                    "existing TOML at {} top-level must be a table; \
+                     got {value:?}",
+                    path.display()
+                );
+            };
+            Ok((text, value))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +838,16 @@ fn read_config_or_empty(path: &Path) -> Result<(String, Value)> {
 // ---------------------------------------------------------------------------
 
 /// Insert or replace the managed block for `target` inside `cfg`.
-fn apply_managed_block(target: Target, mut cfg: Value, binary: &str) -> Result<Value> {
+///
+/// v0.7.0 #1378 — `format` parameter routes Codex TOML configs to the
+/// snake_case `mcp_servers` key; everything else uses the camelCase
+/// `mcpServers` key per MCP-spec JSON convention.
+fn apply_managed_block(
+    target: Target,
+    mut cfg: Value,
+    binary: &str,
+    format: ConfigFormat,
+) -> Result<Value> {
     let obj = ensure_object(&mut cfg)?;
     match target {
         Target::ClaudeCode => apply_claude_code(obj, binary),
@@ -743,14 +859,30 @@ fn apply_managed_block(target: Target, mut cfg: Value, binary: &str) -> Result<V
         // v0.6.4-010 — these four harnesses use the canonical
         // `mcpServers.ai-memory.{command, args, env}` shape.
         Target::ClaudeDesktop | Target::Codex | Target::GrokCli | Target::GeminiCli => {
-            apply_mcp_standard(obj, binary);
+            apply_mcp_standard(obj, binary, mcp_servers_key(target, format));
         }
     }
     Ok(cfg)
 }
 
+/// v0.7.0 #1378 — resolve the MCP-servers key name for the given
+/// target × format combination. Codex TOML uses snake_case
+/// `mcp_servers`; every other surface uses the MCP-spec camelCase
+/// `mcpServers`. Centralised here so the apply/remove paths agree on
+/// the key.
+fn mcp_servers_key(target: Target, format: ConfigFormat) -> &'static str {
+    match (target, format) {
+        (Target::Codex, ConfigFormat::Toml) => "mcp_servers",
+        _ => "mcpServers",
+    }
+}
+
 /// Remove the managed block for `target` from `cfg` (if present).
-fn remove_managed_block(target: Target, mut cfg: Value) -> Result<Value> {
+///
+/// v0.7.0 #1378 — `format` parameter routes Codex TOML to the
+/// snake_case `mcp_servers` key; every other surface uses
+/// `mcpServers`. See [`mcp_servers_key`].
+fn remove_managed_block(target: Target, mut cfg: Value, format: ConfigFormat) -> Result<Value> {
     let obj = match cfg.as_object_mut() {
         Some(o) => o,
         None => return Ok(cfg),
@@ -765,7 +897,7 @@ fn remove_managed_block(target: Target, mut cfg: Value) -> Result<Value> {
         // v0.6.4-010 — shared mcpServers.ai-memory shape (claude-desktop,
         // codex, grok-cli, gemini-cli).
         Target::ClaudeDesktop | Target::Codex | Target::GrokCli | Target::GeminiCli => {
-            remove_mcp_standard(obj);
+            remove_mcp_standard(obj, mcp_servers_key(target, format));
         }
     }
     Ok(cfg)
@@ -781,9 +913,9 @@ fn remove_managed_block(target: Target, mut cfg: Value) -> Result<Value> {
 // args to `["mcp", "--profile", "full"]`; the install dry-run + diff
 // makes that change visible before they apply it.
 
-fn apply_mcp_standard(obj: &mut Map<String, Value>, binary: &str) {
+fn apply_mcp_standard(obj: &mut Map<String, Value>, binary: &str, mcp_key: &str) {
     let mcp_servers = obj
-        .entry("mcpServers".to_string())
+        .entry(mcp_key.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if !mcp_servers.is_object() {
         *mcp_servers = Value::Object(Map::new());
@@ -806,11 +938,11 @@ fn apply_mcp_standard(obj: &mut Map<String, Value>, binary: &str) {
     );
 }
 
-fn remove_mcp_standard(obj: &mut Map<String, Value>) {
-    if let Some(mcp_servers) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+fn remove_mcp_standard(obj: &mut Map<String, Value>, mcp_key: &str) {
+    if let Some(mcp_servers) = obj.get_mut(mcp_key).and_then(|v| v.as_object_mut()) {
         mcp_servers.remove("ai-memory");
         if mcp_servers.is_empty() {
-            obj.remove("mcpServers");
+            obj.remove(mcp_key);
         }
     }
 }
