@@ -132,6 +132,12 @@ pub const META_KEY_CONSOLIDATED_FROM_AGENTS: &str = "consolidated_from_agents";
 /// "Special metadata keys".
 pub const META_KEY_MINED_FROM: &str = "mined_from";
 
+/// `metadata.target_agent_id` — recipient NHI for memories that
+/// represent agent-to-agent shares / notifications. Read by the
+/// canonical visibility predicate `is_visible_to_caller` to permit
+/// the named target to see otherwise-private rows alongside the owner.
+pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
+
 // ---------------------------------------------------------------------------
 // ARCH-14 (FX-C4-batch2, 2026-05-26) — canonical route-count constant.
 //
@@ -708,8 +714,10 @@ pub fn build_router_with_timeout(
         // v0.7.0 Cluster E API-2 (issue #767) — Agent Skills HTTP parity.
         // Seven routes mirroring the seven L1-5 `memory_skill_*` MCP
         // tools so HTTP-daemon operators can drive skills without
-        // dropping back to stdio JSON-RPC. No new MCP tools land —
-        // tool count stays at 71/70/Power 22.
+        // dropping back to stdio JSON-RPC. No new MCP tools land here —
+        // the MCP surface stays at whatever `Profile::full().
+        // expected_tool_count()` reports (canonical SSOT in
+        // `src/profile.rs`; pinned by `profile_full_matches_registry_all`).
         .route(
             "/api/v1/skill/register",
             post(handlers::skill_register_route),
