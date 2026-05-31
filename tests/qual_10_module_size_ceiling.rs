@@ -56,7 +56,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // helpers (no new production surface); the FX-F1 dispatch raised
     // the file's coverage floor from 83.83% → 85%. 7100 = 7050 actual
     // + 50-line headroom; well under QUAL-10's aspirational 1.5x cap.
-    ("src/daemon_runtime.rs", 7_100),
+    //
+    // 2026-05-31 — bumped 7_100 → 7_300 by FX-F2 (commit 094abe811) to
+    // accommodate +7 unit tests covering `build_store_handle` and
+    // `resolve_configured_embedding_dim` that lifted daemon_runtime.rs
+    // coverage 84.89% → 85.26% per the Per-Module Coverage Thresholds
+    // floor (issue #1424). Actual LOC at the bump: 7256. Growth is
+    // justified: each new test pins a previously-uncovered branch on
+    // existing production helpers (zero new production surface). The
+    // lockstep ceiling bump was missed in 094abe811 — fixing here so
+    // the Per-Module Coverage Thresholds workflow (which runs the
+    // full integration suite under llvm-cov) stops tripping qual_10
+    // on every push.
+    ("src/daemon_runtime.rs", 7_300),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     ("src/storage/migrations.rs", 3_500),
