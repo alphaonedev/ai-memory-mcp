@@ -173,22 +173,32 @@ fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityPrefixes {
 /// via `get()`). Returns `true` when `as_agent` is unset (no filter) or
 /// when the memory's scope + namespace grant visibility to the caller.
 fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes) -> bool {
+    // v0.7.0 multi-agent literal-sweep (scanner B finding F-B8.x):
+    // typed-enum exhaustive match via `MemoryScope` + `META_KEY_SCOPE`
+    // SSOT. Adding a new scope variant from here forward is a
+    // compile-time error in this match (was a silent `_ => false`
+    // fall-through pre-refactor — masked drift). Unknown-scope
+    // strings still degrade to `false` via the `from_str` → `None`
+    // arm, preserving pre-refactor semantics byte-for-byte.
+    use crate::models::namespace::MemoryScope;
     let (p, t, u, o) = prefixes;
     if p.is_none() {
         return true;
     }
-    let scope = mem
+    let Some(scope) = mem
         .metadata
-        .get("scope")
+        .get(crate::META_KEY_SCOPE)
         .and_then(|v| v.as_str())
-        .unwrap_or("private");
+        .map_or(Some(MemoryScope::default()), MemoryScope::from_str)
+    else {
+        return false;
+    };
     match scope {
-        "collective" => true,
-        "private" => p.as_ref().is_some_and(|ns| &mem.namespace == ns),
-        "team" => matches_subtree(&mem.namespace, t.as_deref()),
-        "unit" => matches_subtree(&mem.namespace, u.as_deref()),
-        "org" => matches_subtree(&mem.namespace, o.as_deref()),
-        _ => false,
+        MemoryScope::Collective => true,
+        MemoryScope::Private => p.as_ref().is_some_and(|ns| &mem.namespace == ns),
+        MemoryScope::Team => matches_subtree(&mem.namespace, t.as_deref()),
+        MemoryScope::Unit => matches_subtree(&mem.namespace, u.as_deref()),
+        MemoryScope::Org => matches_subtree(&mem.namespace, o.as_deref()),
     }
 }
 
