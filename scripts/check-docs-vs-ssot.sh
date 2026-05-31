@@ -103,6 +103,13 @@ CANONICAL_SCOPE_COUNT=$(extract_const_value src/models/namespace.rs COUNT 'usize
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
 CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
 
+# Profile::core().expected_tool_count() — count of tn::* refs in the
+# `Self::Core => &[ ... ]` arm of Profile::tool_names(). 7 at v0.7.0.
+CANONICAL_CORE_TOOL_COUNT=$(
+    awk '/Self::Core => &\[/,/\]/' src/profile.rs 2>/dev/null \
+        | grep -cE '^\s+tn::'
+)
+
 # HookEvent variants — count `pub enum HookEvent` body lines
 CANONICAL_HOOK_EVENTS=$(
     awk '/^pub enum HookEvent/,/^}/' src/hooks/events.rs 2>/dev/null \
@@ -241,6 +248,11 @@ run_all_rules() {
         "Profile::full().expected_tool_count() (registry tools)" \
         "$CANONICAL_FULL_TOOL_COUNT" \
         '\*\*([0-9]+) MCP tools at `--profile full`\*\*|([0-9]+) advertised entries at `--profile full`|\(([0-9]+) at `full`, [0-9]+ at `core`\)|Tool count remains ([0-9]+) at full|([0-9]+) MCP tools at `--profile full`;'
+    # MCP tool count at --profile core
+    check_narrative_count_rule \
+        "Profile::core().expected_tool_count()" \
+        "$CANONICAL_CORE_TOOL_COUNT" \
+        '([0-9]+) at `--profile core`|\([0-9]+ at `full`, ([0-9]+) at `core`\)|Tool count remains [0-9]+ at full / ([0-9]+) at core'
     # Memory::FIELD_COUNT
     check_narrative_count_rule \
         "Memory::FIELD_COUNT" \
@@ -292,9 +304,10 @@ run_all_rules() {
         exit 1
     fi
     printf '✅ docs-vs-SSOT drift gate: PASS\n'
-    printf '   Canonical values: schema=%s, full_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s\n' \
+    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s\n' \
         "$CANONICAL_SCHEMA_VERSION" \
         "$CANONICAL_FULL_TOOL_COUNT" \
+        "$CANONICAL_CORE_TOOL_COUNT" \
         "$CANONICAL_ROUTES_COUNT" \
         "$CANONICAL_UNIQUE_PATHS_COUNT" \
         "$CANONICAL_CLI_DEFAULT" \
