@@ -9747,7 +9747,7 @@ impl MemoryStore for PostgresStore {
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: resolved_tier,
-            namespace: format!("_inbox/{target_agent}"),
+            namespace: crate::inbox_namespace(target_agent),
             title: title.to_string(),
             content: payload.to_string(),
             tags: vec!["notify".to_string()],

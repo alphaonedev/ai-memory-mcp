@@ -147,7 +147,7 @@ pub async fn notify(
             Json(json!({
                 "id": new_id,
                 "target_agent_id": body.target_agent_id,
-                "namespace": format!("_inbox/{}", body.target_agent_id),
+                "namespace": crate::inbox_namespace(&body.target_agent_id),
                 "storage_backend": "postgres",
             })),
         )
