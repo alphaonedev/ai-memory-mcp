@@ -62,11 +62,26 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// this bound automatically with no edit here. Both the sqlite and
 /// postgres ladders land at the same version in lockstep — see
 /// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
-/// `migrations/{sqlite,postgres}/` for the SQL. Current value at v0.7.0
-/// is 51 per the v48 → v51 chain: v48 added `federation_push_dlq`
-/// (#933), v49 added 14 nullable `archived_memories` columns (#1025),
-/// v50 extended `agent_quotas` PK with `namespace` (#1156), v51 added
-/// `federation_nonces` (#1255 / PR #1296).
+/// `migrations/{sqlite,postgres}/` for the SQL.
+///
+/// **Current value: tracks `current_schema_version()` (v53 at v0.7.0
+/// release).** The const auto-resolves from the SSOT at
+/// `crate::storage::migrations::CURRENT_SCHEMA_VERSION`; this docstring
+/// names the v0.7.0-release tip for narrative continuity but the value
+/// will move on every schema bump WITHOUT requiring a docstring edit.
+/// For the canonical current value at any HEAD, run
+/// `ai-memory --version` (boot manifest prints the resolved schema)
+/// or grep `CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`. The
+/// `scripts/check-docs-vs-ssot.sh` drift gate keeps narrative anchors
+/// honest across operator-facing docs.
+///
+/// v0.7.0 ladder summary (v48 → v53):
+/// v48 added `federation_push_dlq` (#933); v49 added 14 nullable
+/// `archived_memories` columns (#1025); v50 extended `agent_quotas`
+/// PK with `namespace` (#1156); v51 added `federation_nonces` (#1255
+/// / PR #1296); v52 added `transcript_line_dedup` backing #1389
+/// L4/RFC-0001 capture_turn; v53 scoped the `memories_au` FTS5 trigger
+/// to `(title, content, tags)` only (R5.F5.2 / #1418).
 ///
 /// When a DB's `schema_version` exceeds this, the binary is too old
 /// for a newer DB and we surface a `warn-schema-unsupported` manifest
