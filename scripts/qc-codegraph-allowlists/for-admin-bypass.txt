@@ -8,7 +8,6 @@ src/federation/receive.rs:federation-catchup
 src/handlers/admin.rs:daemon
 src/handlers/hook_subscribers.rs:ai:http-internal
 src/handlers/http.rs:ai:http-internal
-src/handlers/power.rs:ai:http-internal
 src/handlers/subscriptions.rs:subscription-dispatch
 src/migrate.rs:ai:migrate
 src/store/postgres.rs:export-internal
