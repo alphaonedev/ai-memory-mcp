@@ -760,7 +760,7 @@ agent-identity headers documented above. Wire-shape source of truth is
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; Cypher on AGE / recursive-CTE on SQLite. |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
-| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (73 at `full`, 7 at `core`). |
+| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (74 at `full`, 7 at `core` — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`). |
 
 > Total HTTP surface at v0.7.0: **73 distinct route paths** on the
 > sqlite-backed daemon (and the postgres-backed daemon under
