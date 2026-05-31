@@ -3320,9 +3320,13 @@ pub fn create_link_signed(
                     valid_until: None,
                 };
                 let sig = crate::identity::sign::sign(kp, &link)?;
-                (Some(sig), "self_signed", Some(kp.agent_id.as_str()))
+                (
+                    Some(sig),
+                    crate::models::AttestLevel::SelfSigned.as_str(),
+                    Some(kp.agent_id.as_str()),
+                )
             }
-            _ => (None, "unsigned", None),
+            _ => (None, crate::models::AttestLevel::Unsigned.as_str(), None),
         };
 
     let inserted = conn.execute(
@@ -3434,13 +3438,17 @@ pub fn strongest_attest_level_for_source(conn: &Connection, source_id: &str) -> 
          WHERE source_id = ?1",
     )?;
     let rows = stmt.query_map(params![source_id], |r| r.get::<_, String>(0))?;
-    let mut strongest = "unsigned";
+    let unsigned = crate::models::AttestLevel::Unsigned.as_str();
+    let self_signed = crate::models::AttestLevel::SelfSigned.as_str();
+    let peer_attested = crate::models::AttestLevel::PeerAttested.as_str();
+    let mut strongest = unsigned;
     for row in rows {
         let level = row?;
-        match level.as_str() {
-            "peer_attested" => return Ok("peer_attested".to_string()),
-            "self_signed" if strongest == "unsigned" => strongest = "self_signed",
-            _ => {}
+        if level == peer_attested {
+            return Ok(peer_attested.to_string());
+        }
+        if level == self_signed && strongest == unsigned {
+            strongest = self_signed;
         }
     }
     Ok(strongest.to_string())
@@ -5258,7 +5266,7 @@ pub fn invalidate_link(
                         .to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),
                     signature: prior_signature,
-                    attest_level: "unsigned".to_string(),
+                    attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
                     timestamp: Utc::now().to_rfc3339(),
                     ..crate::signed_events::SignedEvent::default()
                 };

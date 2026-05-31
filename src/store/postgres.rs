@@ -5458,9 +5458,13 @@ impl PostgresStore {
                         detail: format!("sign link: {e}"),
                     }
                 })?;
-                (Some(sig), "self_signed", Some(kp.agent_id.clone()))
+                (
+                    Some(sig),
+                    crate::models::AttestLevel::SelfSigned.as_str(),
+                    Some(kp.agent_id.clone()),
+                )
             }
-            _ => (None, "unsigned", None),
+            _ => (None, crate::models::AttestLevel::Unsigned.as_str(), None),
         };
 
         // v0.7.0.1 G4 — wrap the SQL `INSERT INTO memory_links` write
@@ -6157,7 +6161,7 @@ impl PostgresStore {
             event_type,
             payload_hash: &payload_hash,
             signature: None,
-            attest_level: "unsigned",
+            attest_level: crate::models::AttestLevel::Unsigned.as_str(),
             timestamp: created_at_dt,
         };
         if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {

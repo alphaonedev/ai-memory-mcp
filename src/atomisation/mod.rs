@@ -933,9 +933,12 @@ fn emit_atomisation_complete_event(
         let signing = kp.private.as_ref().expect("can_sign() checked");
         use ed25519_dalek::Signer;
         let sig = signing.sign(&bytes);
-        (Some(sig.to_bytes().to_vec()), "self_signed")
+        (
+            Some(sig.to_bytes().to_vec()),
+            crate::models::AttestLevel::SelfSigned.as_str(),
+        )
     } else {
-        (None, "unsigned")
+        (None, crate::models::AttestLevel::Unsigned.as_str())
     };
     let event = SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),

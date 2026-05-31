@@ -473,8 +473,10 @@ impl<'a> PersonaGenerator<'a> {
             // The persona body itself is signed. Prefer the stronger of
             // the two labels (`peer_attested` beats `self_signed`).
             match link_attest.as_str() {
-                "peer_attested" => "peer_attested".to_string(),
-                _ => "self_signed".to_string(),
+                s if s == crate::models::AttestLevel::PeerAttested.as_str() => {
+                    crate::models::AttestLevel::PeerAttested.as_str().to_string()
+                }
+                _ => crate::models::AttestLevel::SelfSigned.as_str().to_string(),
             }
         } else {
             link_attest
@@ -599,7 +601,7 @@ pub fn get_latest_persona(
     let attest_level = envelope
         .get("attest_level")
         .and_then(|v| v.as_str())
-        .unwrap_or("unsigned")
+        .unwrap_or(crate::models::AttestLevel::Unsigned.as_str())
         .to_string();
     Ok(Some(Persona {
         id,
