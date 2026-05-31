@@ -244,7 +244,7 @@ pub fn handle_skill_export(
         event_type: crate::signed_events::event_types::SKILL_EXPORTED.to_string(),
         payload_hash: ev_hash,
         signature: None,
-        attest_level: "unsigned".to_string(),
+        attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..SignedEvent::default()
     };

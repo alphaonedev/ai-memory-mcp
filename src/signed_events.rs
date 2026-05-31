@@ -808,7 +808,7 @@ mod tests {
             event_type: event_type.to_string(),
             payload_hash: payload_hash(b"test-payload"),
             signature: None,
-            attest_level: "unsigned".to_string(),
+            attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
             timestamp: Utc::now().to_rfc3339(),
             // prev_hash + sequence are overwritten by
             // append_signed_event; the caller-side values here are

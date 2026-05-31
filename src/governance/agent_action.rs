@@ -1047,7 +1047,7 @@ mod tests {
                 created_at: 0,
                 enabled,
                 signature: None,
-                attest_level: "unsigned".to_string(),
+                attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
             },
         )
         .unwrap();
@@ -1422,7 +1422,7 @@ mod tests {
             created_at: 0,
             enabled: true,
             signature: None,
-            attest_level: "unsigned".to_string(),
+            attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
         };
         let action = AgentAction::FilesystemWrite {
             path: "/x".into(),
