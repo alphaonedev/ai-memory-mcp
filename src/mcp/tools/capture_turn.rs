@@ -423,10 +423,12 @@ pub fn handle_capture_turn(
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
+            // v0.7.0 F-E4 fix (#1436): route through DEFAULT_NAMESPACE
+            // SSOT at src/lib.rs:266 instead of the bare literal.
             namespace: req
                 .namespace
                 .clone()
-                .unwrap_or_else(|| "global".to_string()),
+                .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string()),
             title,
             content: req.content.clone(),
             tags,

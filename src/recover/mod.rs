@@ -368,7 +368,9 @@ pub fn recover_from_transcript(
     let namespace = opts
         .namespace
         .clone()
-        .unwrap_or_else(|| "global".to_string());
+        // v0.7.0 F-E4 fix (#1436): route through DEFAULT_NAMESPACE
+        // SSOT at src/lib.rs:266 instead of the bare literal.
+        .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
     let host_kind = opts.host.as_str().to_string();
 
     for turn in turns {
