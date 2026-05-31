@@ -70,7 +70,7 @@ pub async fn get_inbox(
     // `_inbox/<target>` and the inbox is a straight namespace read.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ns = format!("_inbox/{owner}");
+        let ns = crate::inbox_namespace(&owner);
         let ctx = crate::store::CallerContext::for_agent(&owner);
         let cap = q
             .limit

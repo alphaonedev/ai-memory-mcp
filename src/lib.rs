@@ -272,6 +272,28 @@ pub const DEFAULT_NAMESPACE: &str = "global";
 /// doc-comment for the disambiguation.
 pub use crate::quotas::GLOBAL_NAMESPACE;
 
+/// `_inbox/` namespace prefix for agent-to-agent notification routing.
+/// Reserved-namespace convention; the recipient's `target_agent` id
+/// is appended to form the canonical inbox namespace
+/// (`_inbox/<target>`).
+///
+/// v0.7.0 multi-agent literal-sweep (scanner E finding F-E5 / #1436):
+/// pre-fix 4 production sites hand-formatted the string
+/// (`format!("_inbox/{target}")`); see [`inbox_namespace`] for the
+/// canonical helper.
+pub const INBOX_NAMESPACE_PREFIX: &str = "_inbox/";
+
+/// Build the canonical inbox namespace for a target agent id.
+/// Returns `"_inbox/<target>"` formatted via the
+/// [`INBOX_NAMESPACE_PREFIX`] const. Use this in place of inline
+/// `format!("_inbox/{target}")` so a future rename of the prefix
+/// (or addition of validation, normalization, etc.) touches one
+/// place. Closes scanner E finding F-E5 (#1436).
+#[must_use]
+pub fn inbox_namespace(target_agent: &str) -> String {
+    format!("{INBOX_NAMESPACE_PREFIX}{target_agent}")
+}
+
 pub mod approvals;
 // v0.7.0 WT-1-B — substrate-level atomisation engine. Decomposes
 // long-form memories into atomic propositions with full provenance
