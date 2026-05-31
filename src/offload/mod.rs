@@ -570,7 +570,7 @@ fn append_audit_row(
     let attest_level = if signature_bytes.is_some() {
         "signed"
     } else {
-        "unsigned"
+        crate::models::AttestLevel::Unsigned.as_str()
     };
     let event = SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),

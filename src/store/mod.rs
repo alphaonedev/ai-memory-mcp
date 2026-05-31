@@ -629,7 +629,7 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<&'static str> {
         let _ = keypair;
         self.link(ctx, link).await?;
-        Ok("unsigned")
+        Ok(crate::models::AttestLevel::Unsigned.as_str())
     }
 
     /// Enumerate every link in the store, optionally narrowed to a
