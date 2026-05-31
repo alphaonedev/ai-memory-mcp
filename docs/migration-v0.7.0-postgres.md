@@ -35,7 +35,7 @@ identically on either backend.
 ## Schema parity status (v0.7.0)
 
 As of v0.7.0 release (post Wave 2 + ship-readiness cascade), both
-backends sit at **schema_version=51**. The full v16 → v51 ladder
+backends sit at **schema_version=53**. The full v16 → v53 ladder
 on the postgres side covers: governance inheritance, webhook
 subscriptions, audit chain, transcripts, signed events with the
 V-4 cross-row hash chain (#698), agent quotas, link `attest_level`,

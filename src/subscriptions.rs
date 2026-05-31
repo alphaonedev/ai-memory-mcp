@@ -86,22 +86,55 @@ pub struct NewSubscription<'a> {
 /// `valid_until` is set, regardless of which KG backend handled the
 /// SET).
 // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the three
-// entries that ARE MCP tool names (`memory_store`, `memory_promote`,
-// `memory_delete`) reference the canonical `tool_names` consts. The
-// remaining four entries (`memory_link_created`,
-// `memory_link_invalidated`, `memory_consolidated`,
-// `approval_requested`) are subscription-event types, NOT MCP tool
-// names — they stay as raw literals because they live in a different
-// namespace (webhook events vs. JSON-RPC method names).
+// entries that ARE MCP tool names reference the canonical
+// `tool_names` consts.
+//
+// v0.7.0 multi-agent literal-sweep (scanner B finding F-B10.x): the
+// remaining four entries — subscription-event types distinct from
+// MCP method names — now also consume named consts in
+// [`webhook_events`] below. Pre-sweep these were the last raw-literal
+// holdouts in this array; centralising them closes the drift class.
 pub const WEBHOOK_EVENT_TYPES: &[&str] = &[
     crate::mcp::registry::tool_names::MEMORY_STORE,
     crate::mcp::registry::tool_names::MEMORY_PROMOTE,
     crate::mcp::registry::tool_names::MEMORY_DELETE,
-    "memory_link_created",
-    "memory_link_invalidated",
-    "memory_consolidated",
-    "approval_requested",
+    webhook_events::MEMORY_LINK_CREATED,
+    webhook_events::MEMORY_LINK_INVALIDATED,
+    webhook_events::MEMORY_CONSOLIDATED,
+    webhook_events::APPROVAL_REQUESTED,
 ];
+
+/// v0.7.0 multi-agent literal-sweep (scanner B finding F-B10.x) —
+/// canonical webhook-event-type slugs that are NOT MCP tool names.
+///
+/// Distinct from `signed_events::event_types` (audit-chain slugs use
+/// dot-separated names like `"memory_link.created"`); webhook events
+/// use underscore-separated names matching the v0.6.x wire contract
+/// (`"memory_link_created"`). A rename or schema-evolution that adds
+/// new webhook events touches this mod + the [`WEBHOOK_EVENT_TYPES`]
+/// array (which is statically-asserted to contain every const here
+/// via the unit test `webhook_event_consts_appear_in_array`).
+pub mod webhook_events {
+    /// Fired by `memory_link.create` substrate path after every
+    /// successful link write (signed or unsigned). Subscribers consume
+    /// via the K10 / J4 webhook fan-out.
+    pub const MEMORY_LINK_CREATED: &str = "memory_link_created";
+
+    /// Fired by `memory_kg_invalidate` after `valid_until` is set,
+    /// regardless of which KG backend handled the SET. Joined the
+    /// webhook set at v0.7 J4 / G14 so subscribers can replay the
+    /// audit-edge timeline.
+    pub const MEMORY_LINK_INVALIDATED: &str = "memory_link_invalidated";
+
+    /// Fired by `memory_consolidate` after a successful consolidation
+    /// write (post-#867 W6 consolidation primitive).
+    pub const MEMORY_CONSOLIDATED: &str = "memory_consolidated";
+
+    /// Fired by the K10 Approval API after a governance `Pending`
+    /// decision queues a pending action. Consumed directly by the
+    /// K10 Approval HTTP+SSE handler.
+    pub const APPROVAL_REQUESTED: &str = "approval_requested";
+}
 
 /// Insert a subscription, hashing any secret before persisting.
 ///
