@@ -132,7 +132,7 @@ fi
 # ---------------------------------------------------------------
 copr_block=$(jq -n '{ status: "live (dnf copr enable alphaonedev/ai-memory)" }')
 docker_block=$(jq -n '{ status: "live (ghcr.io/alphaonedev/ai-memory)" }')
-apt_block=$(jq -n    '{ status: "live (Jim Bridger PPA)" }')
+apt_block=$(jq -n    '{ status: "live (.deb from GitHub Releases)" }')
 
 # ---------------------------------------------------------------
 # Activity signals (rolling 30 days)

@@ -1,7 +1,7 @@
 # ai-memory systemd units
 
 Drop-in systemd units for operators running ai-memory as a hardened
-single-node deployment. Shipped by the Debian PPA and Fedora COPR
+single-node deployment. Shipped by the Debian (.deb) and Fedora COPR
 packages; also usable standalone on any systemd distro.
 
 ## Units
@@ -16,7 +16,7 @@ packages; also usable standalone on any systemd distro.
 ## Install — manual
 
 ```sh
-# 1. System user + state dir. The Debian PPA postinst and Fedora COPR
+# 1. System user + state dir. The Debian (.deb) postinst and Fedora COPR
 #    %post scriptlet do this automatically.
 sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
