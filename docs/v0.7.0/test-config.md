@@ -3,6 +3,97 @@
 > **Status:** living doc. Operator-stamped configuration for future
 > test runs against the v0.7.0 substrate.
 
+## Substrate LLM (current standing default, 2026-05-31)
+
+**Canonical model id:** `google/gemma-4-26b-a4b-it`
+**Provider:** OpenRouter (`https://openrouter.ai/api/v1`, OpenAI-compatible wire shape)
+**API key env var:** `OPENROUTER_API_KEY` (lives in `~/.env` on the .50.100 node, sourced via `set -a; source ~/.env; set +a`)
+**ai-memory backend alias:** `openrouter` (per `src/llm.rs::alias_default_base_url`; recognized at `AI_MEMORY_LLM_BACKEND=openrouter`)
+
+Operator directive 2026-05-31 (supersedes the 2026-05-21 #1067 xAI
+Grok 4.3 and 2026-05-31-morning Ollama gemma4:e4b configs):
+
+- **Local ai-memory daemon** (the daemon serving this node's Claude
+  Code MCP at `~/.claude/ai-memory.db`) — wired via
+  `~/.config/ai-memory/config.toml` `[llm]` section. Backups of the
+  prior xAI and Ollama configs preserved as
+  `~/.config/ai-memory/config.toml.bak.20260531-105716` (xAI/grok-4.3)
+  and `~/.config/ai-memory/config.toml.bak.20260531-openrouter`
+  (Ollama/gemma4:e4b) for reversion-without-reconstruction.
+- **IronClaw A2A docker-compose** (Track B's `ic-parity-alice` +
+  `ic-parity-bob` ai-memory services on the lan-parity-test fleet) —
+  wired via `infra/lan-parity-test/docker-compose.yml`. The same
+  model and env-var conventions apply.
+
+**Connectivity probe (2026-05-31 11:23 ET):**
+
+```
+$ curl https://openrouter.ai/api/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+    -d '{ "model": "google/gemma-4-26b-a4b-it",
+          "messages": [{"role":"user","content":"How many rs are in strawberry?"}] }'
+
+HTTP 200, 2.197s latency
+Response: "There are **3** \"r\"s in the word strawberry (st**r**awbe**rr**y)."
+Cost: $0.0000137 per call (prompt 22 tok + completion 26 tok)
+Provider: NextBit (vllm-0.20.2rc1.dev49+g9b4e83934-tp4-ep)
+```
+
+**Cost + latency baseline (vs prior substrate choices):**
+
+| Choice | $/M prompt | $/M completion | Probe call cost | Context window |
+|---|---|---|---|---|
+| xAI grok-4.3 (pre-2026-05-31) | $3.00 | $15.00 | ~$0.0015 | ~256K |
+| Local Ollama gemma4:e4b (interim) | $0 | $0 | $0 | ~8K |
+| **OpenRouter google/gemma-4-26b-a4b-it (now)** | **$0.06** | **$0.33** | **~$0.0000137** | **262,144** |
+
+50-95× cheaper than xAI Grok 4.3 at the per-token unit. Effectively
+free at the substrate's operating volume (autonomous-tier hot path
+firing on every `memory_store` / `memory_recall`; ~1000 calls/day
+estimate → ~$0.014/day operating cost vs $44+/day on Grok 4.3).
+262144-token context is a material upgrade over the 8K local Ollama
+window for long reflect / atomise / calibrate prompts.
+
+**Reasoning + parameter posture.** `google/gemma-4-26b-a4b-it` accepts
+OpenAI-compatible `reasoning.enabled: true` extension (per OpenRouter's
+docs and confirmed via the connectivity probe payload above). For
+substrate AI NHI workloads (auto_tag, query_expansion,
+contradiction_detection, atomise, persona, reflect, calibrate) the
+default `reasoning.enabled` posture is **left UNSET** — Gemma 4 26B
+ships its strongest output by default; the reasoning toggle is
+reserved for the cross-LLM evaluation track (xAI Grok 4.3 + future
+benchmark engagements), not the substrate's day-to-day operation.
+
+**What this choice covers in the campaign reports:**
+
+- Track A build-install — N/A (no LLM in build path)
+- Track B IronClaw A2A — **OpenRouter Gemma 4 26B** is the LLM substrate
+  for both `ic-parity-alice` and `ic-parity-bob` (canonical heterogeneous
+  AI NHI dialog). Prior campaign runs that recorded "xAI Grok 4.3" or
+  "Ollama gemma4:e4b" as the substrate model reflect the historical
+  daemon snapshot at the time of those runs; this section is the
+  forward-going truth.
+- Track C postgres+AGE — N/A
+- Track D docs-pages drift — N/A
+- Track E COALA citation — LLM substrate is OpenRouter Gemma 4 26B
+- Track F AI NHI assessment v3 — heterogeneous-AI-NHI v1 evaluation
+  CONTINUES to use the operator-stamped cross-LLM matrix (xAI Grok 4.3,
+  Claude Opus 4.7, etc.) for the verdict — the substrate's day-to-day
+  LLM (Gemma 4 26B) is a SUBJECT of that evaluation, not a participant
+  in the verdict-issuing committee.
+
+**Future re-evaluation triggers.** Switch the default again when ANY
+of these become true:
+- OpenRouter Gemma 4 26B becomes rate-limited or pricing-changed in a
+  way that materially affects the daily-operating-cost line above
+- A materially stronger Gemma / open-weights model lands on OpenRouter
+  at comparable or lower cost
+- The substrate's privacy posture changes (e.g., a customer engagement
+  requires on-host inference; switch back to the local Ollama config
+  preserved in the `~/.config/ai-memory/config.toml.bak.20260531-openrouter`
+  snapshot)
+
 ## xAI model id for cross-LLM AI NHI evaluation
 
 **Canonical model id:** `grok-4.3`
