@@ -85,6 +85,16 @@ fn install_federation_legacy_bypass() {
 }
 
 fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+    build_router_fixture_with_llm(Arc::new(None))
+}
+
+/// #1445 — variant injecting a (mock-backed) LLM so the success-path
+/// envelope of the LLM-bound endpoints (e.g. `POST /api/v1/expand_query`)
+/// can be pinned for three-surface envelope parity. The default
+/// [`build_router_fixture`] delegates here with `Arc::new(None)`.
+fn build_router_fixture_with_llm(
+    llm: Arc<Option<ai_memory::llm::OllamaClient>>,
+) -> (axum::Router, NamedTempFile) {
     install_federation_legacy_bypass();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -113,7 +123,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
         storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store,
-        llm: Arc::new(None),
+        llm,
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -1065,6 +1075,52 @@ async fn http_expand_query_no_llm_returns_503() {
     let body = json!({"query": "expand me"});
     let (status, _payload) = post_json(&router, "/api/v1/expand_query", body).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// #1445 — three-surface envelope parity. The HTTP success envelope must
+/// carry the same `expanded_terms` key as the MCP `memory_expand_query`
+/// tool (`crate::mcp::handle_expand_query`) and the `ai-memory expand`
+/// CLI surface — NOT the legacy `expansions` key.
+#[tokio::test]
+async fn http_expand_query_success_envelope_uses_expanded_terms_key() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {"content": "vec-search\nsemantic\nrecall"},
+        })))
+        .mount(&server)
+        .await;
+    let client =
+        ai_memory::llm::OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model")
+            .expect("construct mock LLM client");
+    let (router, _f) = build_router_fixture_with_llm(Arc::new(Some(client)));
+
+    let (status, payload) = post_json(
+        &router,
+        "/api/v1/expand_query",
+        json!({"query": "memory recall"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "got {status}: {payload}");
+    assert!(
+        payload.get("expanded_terms").is_some(),
+        "HTTP expand_query success envelope must carry `expanded_terms` \
+         (MCP/CLI parity), got {payload}"
+    );
+    assert!(
+        payload.get("expansions").is_none(),
+        "HTTP must not emit the legacy `expansions` key, got {payload}"
+    );
+    assert_eq!(payload["original"], "memory recall");
+    assert_eq!(
+        payload["expanded_terms"],
+        json!(["vec-search", "semantic", "recall"])
+    );
 }
 
 // ---------------------------------------------------------------------------
