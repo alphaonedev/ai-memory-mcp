@@ -605,8 +605,11 @@ pub struct ExpandQueryBody {
 ///
 /// Wire shape:
 /// - request: `{query, namespace?}`
-/// - response 200: `{expansions: [..], original: <q>}`
+/// - response 200: `{original: <q>, expanded_terms: [..]}` — same envelope
+///   key as the MCP `memory_expand_query` tool and the `ai-memory expand`
+///   CLI surface (three-surface envelope parity; #1445)
 /// - response 503: `{error: "LLM not configured"}` when no LLM is wired
+/// - response 502: `{error: "LLM expand_query failed: ..."}` on upstream error
 /// - response 400: empty / missing query
 pub async fn expand_query_handler(
     State(app): State<AppState>,
@@ -643,7 +646,7 @@ pub async fn expand_query_handler(
     })
     .await;
 
-    let expansions = match join {
+    let expanded_terms = match join {
         Ok(Ok(terms)) => terms,
         Ok(Err(e)) => {
             tracing::warn!("L6: expand_query LLM call failed: {e}");
@@ -665,8 +668,8 @@ pub async fn expand_query_handler(
     (
         StatusCode::OK,
         Json(json!({
-            "expansions": expansions,
             "original": query,
+            "expanded_terms": expanded_terms,
         })),
     )
         .into_response()

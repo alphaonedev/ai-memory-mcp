@@ -14,10 +14,17 @@
 //! ## DRY contract
 //!
 //! No expansion logic lives here — this module is a clap arg-parser plus
-//! an output formatter. The actual `llm.expand_query` call lives in
-//! [`crate::mcp::handle_expand_query`]; the MCP, HTTP, and CLI surfaces
-//! all share that one implementation, so the expanded-terms set is
-//! byte-equal across the three.
+//! an output formatter. The term-generation primitive
+//! ([`crate::llm::OllamaClient::expand_query`] — whose sync form is a
+//! `block_on` of `expand_query_async`) is the single source of expanded
+//! terms for every surface, so the term set is byte-equal across MCP,
+//! HTTP, and CLI. MCP (`memory_expand_query`) and this CLI surface
+//! additionally share the envelope-shaping helper
+//! [`crate::mcp::handle_expand_query`] (`{original, expanded_terms}`); the
+//! HTTP route (`POST /api/v1/expand_query`) keeps its own async handler
+//! for the Axum runtime + H8 timeout + 503/502/400 status granularity but
+//! emits the same `{original, expanded_terms}` envelope (parity pinned by
+//! `tests/l07_3_chunk_d_http_surface.rs`; #1445).
 //!
 //! ## LLM resolution
 //!
