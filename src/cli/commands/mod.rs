@@ -33,6 +33,8 @@ pub mod skill;
 // wire envelope parity across MCP / HTTP / CLI. See
 // `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md` for the full audit.
 pub mod check_duplicate;
+// v0.7.0 #1443 — `ai-memory expand` CLI parity for `memory_expand_query`.
+pub mod expand;
 pub mod find_paths;
 pub mod kg_query;
 pub mod recall_observations;

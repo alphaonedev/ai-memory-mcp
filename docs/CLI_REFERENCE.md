@@ -627,6 +627,41 @@ Backs `memory_persona` / `memory_persona_generate`.
 Move a large blob out of the agent context window. Pairs with the
 background `offload_ttl_sweep` worker.
 
+### `expand` — LLM query expansion (#1443)
+
+Expand a free-text query into semantic reformulations via the
+configured LLM. Closes the three-surface-parity gap: the same
+expansion primitive backs the MCP `memory_expand_query` tool, the
+HTTP `POST /api/v1/expand_query` route, and this CLI subcommand — the
+expanded-terms set is byte-equal across all three because they share
+one code path (`crate::mcp::handle_expand_query`).
+
+```bash
+ai-memory expand "neural nets"          # human-readable summary
+ai-memory expand --json "neural nets"   # {query, expanded_terms, elapsed_ms, key_source}
+```
+
+| Flag | Notes |
+|---|---|
+| `<QUERY>` | Positional free-text query to expand. |
+| `--json` | Emit the raw JSON envelope on stdout (harness consumption). The no-LLM error envelope also lands on stdout under `--json`. |
+
+**Exit codes.** `0` success; `2` no LLM backend configured
+(503-equivalent — the expansion primitive is unreachable); `3` an LLM
+backend is configured but the call failed (502-equivalent — upstream
+error).
+
+**No-Ollama operation.** Query expansion is LLM-backend-agnostic
+(post-#1067). An entirely Ollama-free configuration drives expansion
+against a cloud backend — e.g. `AI_MEMORY_LLM_BACKEND=openrouter` plus
+`AI_MEMORY_LLM_API_KEY` (or the `OPENROUTER_API_KEY` fallback). This is
+the no-Ollama path the v0.7.0 LongMemEval reproduction exercised; the
+in-process one-shot lets `benchmarks/longmemeval/harness.py` inject LLM
+query-expansion without standing up an MCP stdio server or HTTP daemon
+per call. The `key_source` field in the envelope echoes which
+precedence layer supplied the key (`env` / `config` / `none`) for
+harness observability.
+
 ### `identity` — Ed25519 keypair management (H-track)
 
 | Subcommand | Notes |

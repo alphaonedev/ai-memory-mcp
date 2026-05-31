@@ -549,6 +549,12 @@ pub use find_paths::handle_find_paths;
 // dispatch into the same substrate primitives the MCP tools consume,
 // guaranteeing wire envelope parity across the three surfaces.
 pub use check_duplicate::handle_check_duplicate;
+// v0.7.0 #1443 — CLI parity export for `ai-memory expand`. The
+// subcommand under `src/cli/commands/expand.rs` dispatches into this
+// same substrate primitive the MCP `memory_expand_query` tool consumes,
+// guaranteeing the expanded-terms set is byte-equal across the three
+// surfaces.
+pub use expand_query::handle_expand_query;
 pub use kg_query::handle_kg_query;
 pub use load_family::{handle_load_family, handle_smart_load};
 pub(crate) use namespace::handle_namespace_clear_standard;
@@ -863,11 +869,9 @@ use delete::handle_delete;
 // v0.7.0 #1111 — `handle_dependents_of_invalidated` is `pub use`-
 // exported above; dispatch resolves via the crate path.
 use detect_contradiction::handle_detect_contradiction;
-// v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_entity_get_by_alias`
-// and `handle_entity_register` are `pub use`-exported above so the
-// CLI subcommands can dispatch into them; dispatch in this module
-// resolves them via the crate path.
-use expand_query::handle_expand_query;
+// v0.7.0 #1443 — `handle_expand_query` is `pub use`-exported above so
+// the `ai-memory expand` CLI subcommand can dispatch into it; dispatch
+// in this module resolves it via the crate path.
 // v0.7.0 #1111 — `handle_export_reflection` is `pub use`-exported above.
 use forget::{handle_forget, handle_stats};
 use get::handle_get;

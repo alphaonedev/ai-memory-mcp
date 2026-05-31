@@ -449,6 +449,14 @@ pub enum Command {
     /// subcommand. List rows from the recall-consumption ledger
     /// (#886). CLI parity for `memory_recall_observations`.
     RecallObservations(crate::cli::commands::recall_observations::RecallObservationsArgs),
+    /// v0.7.0 #1443 — `ai-memory expand` subcommand. LLM query-expansion
+    /// over a free-text query. CLI parity for the MCP
+    /// `memory_expand_query` tool + the `POST /api/v1/expand_query` HTTP
+    /// route — all three share [`crate::mcp::handle_expand_query`]. Lets
+    /// a harness inject expansion as a one-shot without an MCP stdio
+    /// server or HTTP daemon. Requires a configured LLM (any tier via
+    /// `AI_MEMORY_LLM_BACKEND`, or smart/autonomous preset).
+    Expand(crate::cli::commands::expand::ExpandArgs),
     /// v0.7.0 ARCH-3 / FX-12 — `ai-memory check-duplicate`
     /// subcommand. Pre-write near-duplicate check via cosine over
     /// stored embeddings. CLI parity for `memory_check_duplicate`.
@@ -1565,6 +1573,17 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::check_duplicate::cmd_check_duplicate(&db_path, &a, app_config, &mut out)
                 .await
+        }
+        Command::Expand(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::expand::cmd_expand(&a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::Replay(a) => {
             let stdout = std::io::stdout();

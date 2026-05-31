@@ -238,31 +238,30 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 74;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
-// canonical CLI subcommand counts. The default build's `pub enum
-// Command` in `src/daemon_runtime.rs` carries 80 variants; building
-// with `--features sal` OR `--features sal-postgres` unlocks
-// `Migrate` + `SchemaInit` for 82 total. Pre-sweep, the count was
-// cited in 24+ doc surfaces with zero machine-checkable anchor —
-// CLAUDE.md alone had 7 different historical counts (40, 57, 58, 63,
-// 79, 80, 82). Pinned by `tests/cli_subcommand_count_invariant.rs`.
+// canonical CLI subcommand counts. The source `pub enum Command` in
+// `src/daemon_runtime.rs` declares 81 variants; two (`Migrate`,
+// `SchemaInit`) are `#[cfg(feature = "sal")]`-gated, so the default
+// build compiles 79 and `--features sal` OR `--features sal-postgres`
+// unlocks the full 81. Pre-sweep, the count was cited in 24+ doc
+// surfaces with zero machine-checkable anchor — CLAUDE.md alone had 7
+// different historical counts (40, 57, 58, 63, 79, 80, 82). Pinned by
+// `tests/cli_subcommand_count_invariant.rs`.
 // ---------------------------------------------------------------------------
 
 /// Variants in `pub enum Command` (src/daemon_runtime.rs) that
-/// COMPILE under the default build. The source file declares 80
+/// COMPILE under the default build. The source file declares 81
 /// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
-/// "sal")]`-gated and excluded from default builds, leaving 78.
-///
-/// The CLAUDE.md narrative pre-sweep cited `80 default / 82 sal`,
-/// which double-counted the sal-gated pair (the awk-canonical count
-/// of 80 already includes them). The pinned-by-test count uses the
-/// post-cfg actual compile total.
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 78;
+/// "sal")]`-gated and excluded from default builds, leaving 79.
+/// (v0.7.0 #1443 added `Expand` for the `ai-memory expand` CLI parity
+/// surface, bumping 78 → 79.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 79;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
 /// awk-canonical source-file count: every variant declared in the
-/// enum body (including `Migrate` + `SchemaInit`).
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 80;
+/// enum body (including `Migrate` + `SchemaInit`). v0.7.0 #1443 added
+/// `Expand`, bumping 80 → 81.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 81;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
