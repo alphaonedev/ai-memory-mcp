@@ -54,6 +54,32 @@ pub struct StoreArgs {
     /// when queries use `--as-agent`.
     #[arg(long)]
     pub scope: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-6 typed memory kind. One of:
+    /// observation (default), reflection, persona, concept, entity,
+    /// claim, relation, event, conversation, decision. Maps to
+    /// `Memory::memory_kind` (canonical: `crate::models::MemoryKind`).
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-4 fact-provenance citations array.
+    /// JSON array of `{uri, accessed_at, hash?, span?}` entries. Maps
+    /// to `Memory::citations` (validated via `validate::validate_citation`).
+    /// Pass `--citations '[{"uri":"https://example.com","accessed_at":"2026-05-31T00:00:00Z"}]'`.
+    #[arg(long)]
+    pub citations: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-4 first-class source URI pointer.
+    /// Accepted schemes: `uri:` / `doc:` / `file:`. Maps to
+    /// `Memory::source_uri` (validated via `validate::validate_source_uri`).
+    #[arg(long)]
+    pub source_uri: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-4 byte-range pin into the source body.
+    /// JSON `{start: <usize>, end: <usize>}`. Maps to `Memory::source_span`
+    /// (validated via `validate::validate_source_span`).
+    #[arg(long)]
+    pub source_span: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — QW-2 persona artefact entity binding.
+    /// Required when `--kind persona`. Maps to `Memory::entity_id`.
+    #[arg(long)]
+    pub entity_id: Option<String>,
 }
 
 /// Resolve the content payload: literal `-` means read stdin via the
@@ -138,6 +164,50 @@ pub fn run(
         }
     }
 
+    // v0.7.0 F2.3 (#1427) — Form-4 + Form-6 caller-supplied fields.
+    // Validate each before constructing the Memory; clap-side validation
+    // is permissive (Option<String>) and the validator carries the
+    // canonical wire-shape error messages (see validate::validate_*).
+    let memory_kind = match args.kind.as_deref() {
+        None => crate::models::MemoryKind::Observation,
+        Some(s) => crate::models::MemoryKind::from_str(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --kind '{s}' (expected one of: observation, reflection, persona, \
+                 concept, entity, claim, relation, event, conversation, decision)"
+            )
+        })?,
+    };
+    let citations: Vec<crate::models::Citation> = match args.citations.as_deref() {
+        None => Vec::new(),
+        Some(s) => {
+            let parsed: Vec<crate::models::Citation> = serde_json::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid --citations JSON: {e}"))?;
+            for c in &parsed {
+                validate::validate_citation(c)
+                    .map_err(|e| anyhow::anyhow!("invalid --citations entry: {e}"))?;
+            }
+            parsed
+        }
+    };
+    let source_uri = match args.source_uri.as_deref() {
+        None => None,
+        Some(s) => {
+            validate::validate_source_uri(s)
+                .map_err(|e| anyhow::anyhow!("invalid --source-uri: {e}"))?;
+            Some(s.to_string())
+        }
+    };
+    let source_span: Option<crate::models::SourceSpan> = match args.source_span.as_deref() {
+        None => None,
+        Some(s) => {
+            let parsed: crate::models::SourceSpan = serde_json::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid --source-span JSON: {e}"))?;
+            validate::validate_source_span(&parsed)
+                .map_err(|e| anyhow::anyhow!("invalid --source-span: {e}"))?;
+            Some(parsed)
+        }
+    };
+
     let mem = models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
@@ -155,12 +225,12 @@ pub fn run(
         expires_at,
         metadata,
         reflection_depth: 0,
-        memory_kind: crate::models::MemoryKind::Observation,
-        entity_id: None,
+        memory_kind,
+        entity_id: args.entity_id,
         persona_version: None,
-        citations: Vec::new(),
-        source_uri: None,
-        source_span: None,
+        citations,
+        source_uri,
+        source_span,
         confidence_source: ConfidenceSource::CallerProvided,
         confidence_signals: None,
         confidence_decayed_at: None,
@@ -265,6 +335,12 @@ mod tests {
             expires_at: None,
             ttl_secs: None,
             scope: None,
+            // v0.7.0 F2.3 (#1427) — Form-4 + Form-6 CLI flag additions.
+            kind: None,
+            citations: None,
+            source_uri: None,
+            source_span: None,
+            entity_id: None,
         }
     }
 
