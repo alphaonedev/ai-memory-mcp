@@ -567,8 +567,12 @@ fn append_audit_row(
                 .context("decode signature_b64 for audit row")?,
         )
     };
+    // #1438 fix: prior code wrote orphan attest_level="signed" — not a valid
+    // AttestLevel variant, leaking a fourth-shape that AttestLevel::from_str
+    // silently downgraded to None. The offload audit row is signed locally
+    // by the daemon, so the canonical variant is SelfSigned.
     let attest_level = if signature_bytes.is_some() {
-        "signed"
+        crate::models::AttestLevel::SelfSigned.as_str()
     } else {
         crate::models::AttestLevel::Unsigned.as_str()
     };
