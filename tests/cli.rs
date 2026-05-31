@@ -16,3 +16,7 @@ mod export_reflections;
 // v0.7.0 WT-1-F — `ai-memory atomise` CLI tests.
 #[path = "cli/atomise.rs"]
 mod atomise;
+
+// v0.7.0 #1443 — `ai-memory expand` CLI parity tests.
+#[path = "cli/expand.rs"]
+mod expand;

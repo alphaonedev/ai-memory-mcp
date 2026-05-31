@@ -14,10 +14,7 @@
 
 use crate::llm::OllamaClient;
 use serde_json::{Value, json};
-pub(super) fn handle_expand_query(
-    llm: Option<&OllamaClient>,
-    params: &Value,
-) -> Result<Value, String> {
+pub fn handle_expand_query(llm: Option<&OllamaClient>, params: &Value) -> Result<Value, String> {
     let llm = llm.ok_or("query expansion requires smart or autonomous tier (Ollama LLM)")?;
     let query = params["query"].as_str().ok_or("query is required")?;
     // COVERAGE: LLM response variability. The call below produces a
