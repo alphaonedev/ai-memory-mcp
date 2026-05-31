@@ -44,6 +44,64 @@ pub const MIB: usize = KIB * KIB;
 pub const GIB: usize = MIB * KIB;
 
 // ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
+// canonical HTTP route-path consts. The substrate's HTTP router
+// (`build_router_with_timeout` in `src/lib.rs`) registers ~87
+// `.route(...)` calls at `/api/v1/`; pre-sweep, callers / tests built
+// these path strings via `format!("/api/v1/...")` or inline `"/api/v1/..."`
+// literals at thousands of sites. The consts below carve out the
+// stable surfaces so a future rename (or a hypothetical `/api/v2/`
+// transition) is a const edit instead of a substrate-wide grep.
+//
+// Naming: `ROUTE_<DOMAIN>_<VERB?>` for static paths; templates with
+// `{id}`-style axum placeholders kept as separate `_TEMPLATE` const
+// to make the template-vs-concrete distinction explicit.
+//
+// Operator directive 2026-05-31 (FIX IT NOW — no AI NHI defers) per
+// memory `f57da43e`: F-F-ROUTE-1 was previously deferred for design
+// review; this commit lands the minimum viable subset (the 19
+// highest-traffic surfaces from the audit) leaving the
+// `format!("/api/v1/memories/{id}", ...)` consumer-side helper as a
+// follow-up surface refactor.
+// ---------------------------------------------------------------------------
+
+pub const ROUTE_HEALTH: &str = "/api/v1/health";
+pub const ROUTE_METRICS: &str = "/metrics";
+pub const ROUTE_METRICS_V1: &str = "/api/v1/metrics";
+pub const ROUTE_CAPABILITIES: &str = "/api/v1/capabilities";
+pub const ROUTE_MEMORIES: &str = "/api/v1/memories";
+pub const ROUTE_MEMORIES_BULK: &str = "/api/v1/memories/bulk";
+pub const ROUTE_MEMORY_BY_ID_TEMPLATE: &str = "/api/v1/memories/{id}";
+pub const ROUTE_RECALL: &str = "/api/v1/recall";
+pub const ROUTE_SEARCH: &str = "/api/v1/search";
+pub const ROUTE_SESSION_START: &str = "/api/v1/session/start";
+pub const ROUTE_SYNC_PUSH: &str = "/api/v1/sync/push";
+pub const ROUTE_SYNC_SINCE: &str = "/api/v1/sync/since";
+pub const ROUTE_NOTIFY: &str = "/api/v1/notify";
+pub const ROUTE_INBOX: &str = "/api/v1/inbox";
+pub const ROUTE_SUBSCRIPTIONS: &str = "/api/v1/subscriptions";
+pub const ROUTE_NAMESPACES: &str = "/api/v1/namespaces";
+pub const ROUTE_ARCHIVE: &str = "/api/v1/archive";
+pub const ROUTE_PROMOTE_TEMPLATE: &str = "/api/v1/memories/{id}/promote";
+pub const ROUTE_LINKS: &str = "/api/v1/links";
+
+// ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner F finding F-F-METHOD-1) —
+// canonical MCP JSON-RPC method names. Pre-sweep, 13+ sites in
+// `src/mcp/mod.rs` hardcoded the method names; a future MCP spec bump
+// would touch every match arm. Centralised here so the dispatch
+// loop's match arms point at named consts.
+// ---------------------------------------------------------------------------
+
+pub const METHOD_INITIALIZE: &str = "initialize";
+pub const METHOD_TOOLS_LIST: &str = "tools/list";
+pub const METHOD_TOOLS_CALL: &str = "tools/call";
+pub const METHOD_PROMPTS_LIST: &str = "prompts/list";
+pub const METHOD_PROMPTS_GET: &str = "prompts/get";
+pub const METHOD_RESOURCES_LIST: &str = "resources/list";
+pub const METHOD_RESOURCES_READ: &str = "resources/read";
+
+// ---------------------------------------------------------------------------
 // v0.7.x (issue #1174 PR2 — pm-v3.1 HTTP const sweep) — canonical
 // constants for the most-used HTTP header / MIME literals. Replaces
 // ~210 inline string literals across handler tests, federation
