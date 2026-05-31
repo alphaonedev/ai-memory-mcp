@@ -7820,6 +7820,62 @@ legacy_scoring = false
     }
 
     #[test]
+    fn resolve_llm_1146_tier_model_override_clobbers_config_model_1440() {
+        // #1440 regression: the pre-fix curator `--daemon` path passed
+        // the feature-tier's default Ollama model id
+        // (`FeatureTier::Autonomous` -> `gemma4:e4b`) as the CLI-arm
+        // model override. Because the CLI arm is highest precedence,
+        // it clobbered the operator's configured `[llm].model`,
+        // sending `gemma4:e4b` to OpenRouter -> fast HTTP 400 on every
+        // curator call. This test pins BOTH halves of the RCA so the
+        // bug can't silently return:
+        //   1. With no override (the `--once` / fixed `--daemon` path),
+        //      the configured model wins.
+        //   2. Passing the tier-default id as the override DOES clobber
+        //      it — which is exactly why the daemon must never do so.
+        let _g = env_var_lock();
+        scrub_llm_env();
+
+        // Each value is bound once to a named variable (no repeated
+        // literals, no magic strings in assertions). The tier-default
+        // model is derived from the enum so the test tracks the single
+        // source of truth rather than asserting against a copy.
+        let configured_backend = "openrouter";
+        let configured_model = "google/gemma-4-26b-a4b-it";
+        let tier_default_model = crate::config::FeatureTier::Autonomous
+            .config()
+            .llm_model
+            .map(|m| m.ollama_model_id().to_string());
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some(configured_backend.into()),
+            model: Some(configured_model.into()),
+            ..LlmSection::default()
+        });
+
+        // 1. No override -> configured model is honored.
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, configured_backend);
+        assert_eq!(resolved.model, configured_model);
+
+        // 2. Tier-default id as CLI-arm override clobbers it (the bug):
+        //    the override wins over the configured model, which is
+        //    exactly why the daemon must never manufacture one.
+        let tier_override = tier_default_model.expect("autonomous tier has a default llm_model");
+        let clobbered = cfg.resolve_llm(None, Some(tier_override.as_str()), None);
+        assert_eq!(
+            clobbered.model, tier_override,
+            "tier-default override wins over configured model — the #1440 daemon defect"
+        );
+        assert_ne!(
+            clobbered.model, configured_model,
+            "the override must differ from the configured model for this regression to be meaningful"
+        );
+        scrub_llm_env();
+    }
+
+    #[test]
     fn resolve_llm_1146_alias_fallback_key_for_xai() {
         let _g = env_var_lock();
         scrub_llm_env();

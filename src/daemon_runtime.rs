@@ -4329,8 +4329,10 @@ pub async fn run_curator_daemon_with_shutdown(
 
 /// Curator-daemon loop body, primitive-arg flavour for the binary.
 ///
-/// `ollama_model` of `None` disables the LLM (matching the pre-tiered
-/// keyword-only path in `build_curator_llm`).
+/// The caller supplies the already-resolved LLM client (built via
+/// `build_curator_llm` so the `--daemon` path shares the identical
+/// #1146-resolver result with the `--once` path — see #1440). `None`
+/// disables the LLM, leaving keyword-only curation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_curator_daemon_with_primitives(
     db_path: PathBuf,
@@ -4339,7 +4341,7 @@ pub async fn run_curator_daemon_with_primitives(
     dry_run: bool,
     include_namespaces: Vec<String>,
     exclude_namespaces: Vec<String>,
-    ollama_model: Option<String>,
+    llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let cfg = crate::curator::CuratorConfig {
@@ -4349,37 +4351,6 @@ pub async fn run_curator_daemon_with_primitives(
         include_namespaces,
         exclude_namespaces,
         compaction: crate::curator::CompactionConfig::default(),
-    };
-    // v0.7.x (#1146) — route through the canonical resolver.
-    // `ollama_model` retained as a CLI/test override for the model
-    // field only; backend / base_url / api_key still flow through the
-    // resolver. If the caller passed an explicit `ollama_model`, the
-    // resolver honors it via the CLI-flag arm of the precedence ladder.
-    //
-    // No-construct short-circuit (mirrors `build_curator_llm` +
-    // `build_llm_client`): when the caller didn't supply
-    // `ollama_model` AND the resolver's source lands on
-    // `CompiledDefault` (no env, no [llm] section, no legacy field
-    // anywhere), don't pull a client into existence. Avoids paying a
-    // blocking reqwest call to a (likely-absent) Ollama under tokio
-    // test contexts and matches pre-#1146 v0.6.x behaviour where the
-    // ollama_model-None caller path produced no client.
-    let llm: Option<Arc<crate::llm::OllamaClient>> = {
-        let app_config = AppConfig::load();
-        let resolved = app_config.resolve_llm(None, ollama_model.as_deref(), None);
-        if ollama_model.is_none()
-            && matches!(
-                resolved.source,
-                crate::config::ConfigSource::CompiledDefault
-            )
-        {
-            None
-        } else {
-            crate::llm::OllamaClient::build_from_resolved(&resolved)
-                .ok()
-                .flatten()
-                .map(Arc::new)
-        }
     };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
