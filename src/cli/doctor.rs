@@ -1901,7 +1901,7 @@ mod tests {
         let event = crate::signed_events::SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: "test-agent".to_string(),
-            event_type: "reflection.depth_exceeded".to_string(),
+            event_type: crate::signed_events::event_types::REFLECTION_DEPTH_EXCEEDED.to_string(),
             payload_hash: vec![0xaa],
             signature: None,
             attest_level: "unsigned".to_string(),

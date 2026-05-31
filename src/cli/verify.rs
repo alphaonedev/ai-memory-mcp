@@ -811,7 +811,7 @@ mod tests {
         let event = crate::signed_events::SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
-            event_type: "memory_link.created".to_string(),
+            event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
             payload_hash: crate::signed_events::payload_hash(payload),
             signature: Some(vec![0xab; 64]),
             attest_level: "self_signed".to_string(),
@@ -930,7 +930,7 @@ mod tests {
             signed_events: vec![SignedEventSummary {
                 memory_id: "agent-x".to_string(),
                 event_id: "ev-1".to_string(),
-                event_type: "memory.stored".to_string(),
+                event_type: crate::signed_events::event_types::MEMORY_STORED.to_string(),
                 attest_level: "self_signed".to_string(),
                 timestamp: "2026-05-13T00:00:00Z".to_string(),
                 signature_present: true,
@@ -967,7 +967,7 @@ mod tests {
             signed_events: vec![SignedEventSummary {
                 memory_id: "agent-y".to_string(),
                 event_id: "ev-2".to_string(),
-                event_type: "memory.touch".to_string(),
+                event_type: crate::signed_events::event_types::MEMORY_TOUCH.to_string(),
                 attest_level: "unsigned".to_string(),
                 timestamp: "2026-05-13T01:00:00Z".to_string(),
                 signature_present: false,

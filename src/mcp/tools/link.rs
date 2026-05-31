@@ -196,7 +196,8 @@ pub(super) fn handle_link(
                     .as_str()
                     .unwrap_or("anonymous")
                     .to_string(),
-                event_type: "reflects_on.cycle_refused".to_string(),
+                event_type: crate::signed_events::event_types::REFLECTS_ON_CYCLE_REFUSED
+                    .to_string(),
                 payload_hash: crate::signed_events::payload_hash(&cbor_bytes),
                 signature: None,
                 attest_level: "unsigned".to_string(),

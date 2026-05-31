@@ -275,7 +275,7 @@ fn write_notification(
     let event = crate::signed_events::SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: signing_agent_id.to_string(),
-        event_type: "reflection.invalidation_notified".to_string(),
+        event_type: crate::signed_events::event_types::REFLECTION_INVALIDATION_NOTIFIED.to_string(),
         payload_hash: crate::signed_events::payload_hash(&payload_bytes),
         signature: None,
         attest_level: "unsigned".to_string(),

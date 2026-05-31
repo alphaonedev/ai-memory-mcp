@@ -940,7 +940,7 @@ fn emit_atomisation_complete_event(
     let event = SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: calling_agent_id.to_string(),
-        event_type: "atomisation_complete".to_string(),
+        event_type: crate::signed_events::event_types::ATOMISATION_COMPLETE.to_string(),
         payload_hash: payload_hash(&bytes),
         signature,
         attest_level: attest_level.to_string(),

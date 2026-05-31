@@ -108,6 +108,90 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+// ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner B finding F-B9.x) —
+// canonical signed_events event-type slugs.
+//
+// Pre-sweep, `event_type` strings were scattered across ~14
+// production sites as inline literals:
+//   - "memory_link.created"               (storage::create_link x2, cli::verify, cli::verify_signed_events)
+//   - "memory_link.invalidated"           (storage::reflection invalidation)
+//   - "memory.stored"                     (cli::verify substrate writer)
+//   - "memory.touch"                      (cli::verify touch path)
+//   - "reflection.invalidation_notified"  (notification::invalidation)
+//   - "reflection.depth_exceeded"         (cli::doctor)
+//   - "reflects_on.cycle_refused"         (mcp::link)
+//   - "skill.exported"                    (mcp::skill_export)
+//   - "skill.registered"                  (mcp::skill_register)
+//   - "memory_capture_turn"               (mcp::capture_turn, RFC-0001 L4)
+//   - "persona_generated"                 (persona::generate)
+//   - "atomisation_complete"              (atomisation::run)
+//
+// Renaming any slug — or adding a new one without grep-ing every
+// candidate writer site — was a substrate-wide search. The
+// `event_types` module below centralises every slug as a `&'static
+// str` const so a rename is one edit + the writer + downstream
+// auditor + replay-tool callsites get the new value mechanically.
+// Mirrors the `errors::error_codes` pattern (ARCH-9 / FX-C4-batch2).
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub mod event_types {
+    /// `signed_events.event_type` for `db::create_link` /
+    /// `db::create_link_signed` writes (the canonical link-write audit
+    /// emission). 4 production callsites pre-sweep: 2 in
+    /// `src/storage/mod.rs` + 1 in `src/cli/verify.rs` + 1 in
+    /// `src/cli/verify_signed_events.rs`.
+    pub const MEMORY_LINK_CREATED: &str = "memory_link.created";
+
+    /// `signed_events.event_type` for link invalidation via the L2-3
+    /// reflection-invalidation walker (`src/storage/mod.rs::5257`).
+    pub const MEMORY_LINK_INVALIDATED: &str = "memory_link.invalidated";
+
+    /// `signed_events.event_type` for substrate-side memory inserts
+    /// (`src/cli/verify.rs::933`).
+    pub const MEMORY_STORED: &str = "memory.stored";
+
+    /// `signed_events.event_type` for substrate-side touch path
+    /// (`src/cli/verify.rs::970`).
+    pub const MEMORY_TOUCH: &str = "memory.touch";
+
+    /// `signed_events.event_type` for notification fan-out by the L2-3
+    /// reflection-invalidation walker
+    /// (`src/notification/invalidation.rs::278`).
+    pub const REFLECTION_INVALIDATION_NOTIFIED: &str = "reflection.invalidation_notified";
+
+    /// `signed_events.event_type` for the recursive-learning depth-cap
+    /// trip (`src/cli/doctor.rs::1904`). v0.7.0 #655 Task 1/8.
+    pub const REFLECTION_DEPTH_EXCEEDED: &str = "reflection.depth_exceeded";
+
+    /// `signed_events.event_type` for the `reflects_on` cycle refusal
+    /// at `src/mcp/tools/link.rs::199` (v0.7.0 #655 Task 1/8 — cycle
+    /// detection on reflection chain).
+    pub const REFLECTS_ON_CYCLE_REFUSED: &str = "reflects_on.cycle_refused";
+
+    /// `signed_events.event_type` for skill-export emission
+    /// (`src/mcp/tools/skill_export.rs::244`).
+    pub const SKILL_EXPORTED: &str = "skill.exported";
+
+    /// `signed_events.event_type` for skill-register emission
+    /// (`src/mcp/tools/skill_register.rs::226`).
+    pub const SKILL_REGISTERED: &str = "skill.registered";
+
+    /// `signed_events.event_type` for the L4 `memory_capture_turn`
+    /// MCP tool emission per RFC-0001 (`src/mcp/tools/capture_turn.rs::472`).
+    pub const MEMORY_CAPTURE_TURN: &str = "memory_capture_turn";
+
+    /// `signed_events.event_type` for persona regeneration
+    /// (`src/persona/mod.rs::787`). v0.7.0 QW-2 persona-as-artifact.
+    pub const PERSONA_GENERATED: &str = "persona_generated";
+
+    /// `signed_events.event_type` for WT-1-C atomisation completion
+    /// (`src/atomisation/mod.rs::943`). v0.7.0 Batman Form 1-4
+    /// atomisation engine.
+    pub const ATOMISATION_COMPLETE: &str = "atomisation_complete";
+}
+
 /// One row of the `signed_events` audit table.
 ///
 /// `id` is a UUIDv4 minted by the writer; `payload_hash` is the
