@@ -120,6 +120,9 @@ DOC_FILES=(
     docs/MIGRATION_v0.7.md
     docs/migration-v0.7.0-postgres.md
     docs/migration-v064-to-v070.md
+    docs/API_REFERENCE.md
+    docs/a2a-harness-integration.md
+    docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md
 )
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
@@ -232,7 +235,7 @@ run_all_rules() {
     check_narrative_count_rule \
         "Profile::full().expected_tool_count() (registry tools)" \
         "$CANONICAL_FULL_TOOL_COUNT" \
-        '\*\*([0-9]+) MCP tools at `--profile full`\*\*|([0-9]+) advertised entries at `--profile full`'
+        '\*\*([0-9]+) MCP tools at `--profile full`\*\*|([0-9]+) advertised entries at `--profile full`|\(([0-9]+) at `full`, [0-9]+ at `core`\)|Tool count remains ([0-9]+) at full|([0-9]+) MCP tools at `--profile full`;'
     # Memory::FIELD_COUNT
     check_narrative_count_rule \
         "Memory::FIELD_COUNT" \
