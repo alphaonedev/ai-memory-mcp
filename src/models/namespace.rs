@@ -1547,4 +1547,105 @@ mod tests {
         let res = GovernancePolicy::from_metadata(&meta).unwrap();
         assert!(res.is_err());
     }
+
+    // ---- MemoryScope coverage tests (FX-F3, 2026-05-31) ---------------------
+    //
+    // Closes the 98.73% < 99% per-module coverage floor regression
+    // introduced by 6f7a00963 (MemoryScope enum + parity test). The
+    // external parity test at tests/memory_scope_count_invariant.rs
+    // exercises round-trip + the trait FromStr error path, but those
+    // run as a separate test binary and are NOT measured by `cargo
+    // llvm-cov --lib` which the Per-Module Coverage Thresholds
+    // workflow uses for per-module coverage. Mirroring the tests
+    // inline into the lib unit suite below brings the new code paths
+    // into the per-module measurement.
+
+    use super::MemoryScope;
+    use std::str::FromStr;
+
+    #[test]
+    fn memory_scope_inherent_from_str_known_variants() {
+        assert_eq!(MemoryScope::from_str("private"), Some(MemoryScope::Private));
+        assert_eq!(MemoryScope::from_str("team"), Some(MemoryScope::Team));
+        assert_eq!(MemoryScope::from_str("unit"), Some(MemoryScope::Unit));
+        assert_eq!(MemoryScope::from_str("org"), Some(MemoryScope::Org));
+        assert_eq!(
+            MemoryScope::from_str("collective"),
+            Some(MemoryScope::Collective)
+        );
+    }
+
+    #[test]
+    fn memory_scope_inherent_from_str_unknown_returns_none() {
+        assert_eq!(MemoryScope::from_str("bogus"), None);
+        assert_eq!(MemoryScope::from_str(""), None);
+        assert_eq!(MemoryScope::from_str("Private"), None); // case-sensitive
+    }
+
+    #[test]
+    fn memory_scope_as_str_canonical_strings() {
+        assert_eq!(MemoryScope::Private.as_str(), "private");
+        assert_eq!(MemoryScope::Team.as_str(), "team");
+        assert_eq!(MemoryScope::Unit.as_str(), "unit");
+        assert_eq!(MemoryScope::Org.as_str(), "org");
+        assert_eq!(MemoryScope::Collective.as_str(), "collective");
+    }
+
+    #[test]
+    fn memory_scope_display_matches_as_str() {
+        // Display impl delegates to as_str; tested explicitly so the
+        // fmt branch shows up in coverage.
+        assert_eq!(format!("{}", MemoryScope::Private), "private");
+        assert_eq!(format!("{}", MemoryScope::Collective), "collective");
+    }
+
+    #[test]
+    fn memory_scope_default_is_private() {
+        assert_eq!(MemoryScope::default(), MemoryScope::Private);
+    }
+
+    #[test]
+    fn memory_scope_fromstr_trait_round_trips_known() {
+        // The trait FromStr (vs the inherent from_str) wraps the None
+        // case in a helpful error string. Exercises BOTH the Ok arm
+        // and the Err arm.
+        assert_eq!(
+            <MemoryScope as FromStr>::from_str("team").unwrap(),
+            MemoryScope::Team
+        );
+    }
+
+    #[test]
+    fn memory_scope_fromstr_trait_error_message_lists_valid_scopes() {
+        let err = <MemoryScope as FromStr>::from_str("unknown_scope")
+            .expect_err("unknown scope must error");
+        assert!(
+            err.contains("'unknown_scope'"),
+            "error names the input: {err}"
+        );
+        // Error message names the canonical set so callers know what's valid.
+        assert!(err.contains("private"), "error lists private: {err}");
+        assert!(err.contains("collective"), "error lists collective: {err}");
+    }
+
+    #[test]
+    fn memory_scope_all_strs_matches_valid_scopes_const() {
+        // VALID_SCOPES is the byte-canonical string slice; assert
+        // MemoryScope::all_strs() returns the same sequence in the
+        // same declaration order.
+        let enum_strs: &[&str] = MemoryScope::all_strs();
+        assert_eq!(enum_strs, VALID_SCOPES, "all_strs must match VALID_SCOPES");
+    }
+
+    #[test]
+    fn memory_scope_all_round_trips_through_serde() {
+        // Each variant serialises to the snake_case string and
+        // deserialises back to the same variant. Exercises serde
+        // rename_all = "snake_case" on both directions.
+        for variant in MemoryScope::all() {
+            let json = serde_json::to_string(variant).unwrap();
+            let parsed: MemoryScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, *variant, "serde round-trip for {variant:?}");
+        }
+    }
 }
