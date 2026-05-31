@@ -241,7 +241,7 @@ pub fn handle_skill_export(
     let event = SignedEvent {
         id: Uuid::new_v4().to_string(),
         agent_id: agent_id.clone(),
-        event_type: "skill.exported".to_string(),
+        event_type: crate::signed_events::event_types::SKILL_EXPORTED.to_string(),
         payload_hash: ev_hash,
         signature: None,
         attest_level: "unsigned".to_string(),

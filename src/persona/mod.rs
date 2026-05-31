@@ -784,7 +784,7 @@ fn emit_persona_generated_event(
     let event = SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
-        event_type: "persona_generated".to_string(),
+        event_type: crate::signed_events::event_types::PERSONA_GENERATED.to_string(),
         payload_hash,
         signature: signature.map(<[u8]>::to_vec),
         attest_level: attest_level.to_string(),

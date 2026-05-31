@@ -132,7 +132,7 @@ mod tests {
         SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: "alice".to_string(),
-            event_type: "memory_link.created".to_string(),
+            event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
             payload_hash: payload_hash(payload),
             signature: None,
             attest_level: "unsigned".to_string(),

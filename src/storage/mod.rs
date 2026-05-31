@@ -3377,7 +3377,7 @@ pub fn create_link_signed(
                 let event = crate::signed_events::SignedEvent {
                     id: uuid::Uuid::new_v4().to_string(),
                     agent_id: agent_for_event,
-                    event_type: "memory_link.created".to_string(),
+                    event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),
                     signature: signature.clone(),
                     attest_level: attest_level.to_string(),
@@ -3604,7 +3604,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
                 let event = crate::signed_events::SignedEvent {
                     id: uuid::Uuid::new_v4().to_string(),
                     agent_id: agent_for_event,
-                    event_type: "memory_link.created".to_string(),
+                    event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),
                     signature: link.signature.clone(),
                     attest_level: attest_level.to_string(),
@@ -5254,7 +5254,8 @@ pub fn invalidate_link(
                     // rows since H2 always populates the column on
                     // self-signed inserts.
                     agent_id: observed_by.clone().unwrap_or_else(|| "unknown".to_string()),
-                    event_type: "memory_link.invalidated".to_string(),
+                    event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED
+                        .to_string(),
                     payload_hash: crate::signed_events::payload_hash(&cbor),
                     signature: prior_signature,
                     attest_level: "unsigned".to_string(),

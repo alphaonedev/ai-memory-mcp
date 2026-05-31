@@ -469,7 +469,7 @@ pub fn handle_capture_turn(
         let signed_event = SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: caller.to_string(),
-            event_type: "memory_capture_turn".to_string(),
+            event_type: crate::signed_events::event_types::MEMORY_CAPTURE_TURN.to_string(),
             payload_hash: sha_vec.clone(),
             signature: sig_bytes_opt.clone(),
             attest_level: attest_level.clone(),

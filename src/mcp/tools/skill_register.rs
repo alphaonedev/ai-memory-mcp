@@ -223,7 +223,7 @@ pub(super) fn register_core(
         agent_id: signing_agent_str
             .clone()
             .unwrap_or_else(|| "anonymous".to_string()),
-        event_type: "skill.registered".to_string(),
+        event_type: crate::signed_events::event_types::SKILL_REGISTERED.to_string(),
         payload_hash: ev_hash,
         signature: signature_bytes.clone(),
         attest_level: attest.to_string(),
