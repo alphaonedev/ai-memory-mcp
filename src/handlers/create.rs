@@ -192,7 +192,7 @@ fn resolve_create_conflict_title(
                 Ok(Some(existing_id)) => Err((
                     StatusCode::CONFLICT,
                     Json(json!({
-                        "code": "CONFLICT",
+                        "code": crate::errors::error_codes::CONFLICT,
                         "error": format!(
                             "memory with title '{}' already exists in namespace '{}'",
                             body.title, body.namespace
@@ -448,7 +448,7 @@ fn insert_create_with_quota(
                 crate::quotas::QuotaCheckError::Quota(qe) => (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(json!({
-                        "code": "QUOTA_EXCEEDED",
+                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
                         "error": qe.to_string(),
                         "limit": qe.limit.as_str(),
                         "current": qe.current,
@@ -527,7 +527,7 @@ fn insert_create_with_quota(
                 return Err((
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "code": "GOVERNANCE_REFUSED",
+                        "code": crate::errors::error_codes::GOVERNANCE_REFUSED,
                         "error": refusal.reason,
                     })),
                 )
@@ -1094,7 +1094,7 @@ pub async fn create_memory(
                             "near-duplicate of existing memory in namespace '{}'",
                             mem.namespace,
                         ),
-                        "code": "CONFLICT",
+                        "code": crate::errors::error_codes::CONFLICT,
                         "existing_id": conflict.existing_id,
                         "existing_title": conflict.existing_title,
                         "similarity": conflict.similarity,

@@ -34,6 +34,14 @@ pub mod error_codes {
     pub const SYNTHESIS_DEPTH_EXCEEDED: &str = "SYNTHESIS_DEPTH_EXCEEDED";
     pub const REFLECTION_CYCLE_DETECTED: &str = "REFLECTION_CYCLE_DETECTED";
     pub const GOVERNANCE_REFUSED: &str = "GOVERNANCE_REFUSED";
+    /// v0.7.0 multi-agent literal-sweep (scanner B finding F-B5.x) —
+    /// per-agent / per-namespace K8 quota exceeded. Emitted by the
+    /// HTTP create-handler (`src/handlers/create.rs`) and the
+    /// equivalent MCP store path when `agent_quotas` enforcement
+    /// trips before the canonical `db::insert` write. Was previously
+    /// a scattered string literal at 4 production sites; centralised
+    /// here as the canonical shared slug.
+    pub const QUOTA_EXCEEDED: &str = "QUOTA_EXCEEDED";
 
     // ---- StorageError-side (substrate-facing) -------------------------------
     pub const PENDING_ACTION_NOT_FOUND: &str = "PENDING_ACTION_NOT_FOUND";
