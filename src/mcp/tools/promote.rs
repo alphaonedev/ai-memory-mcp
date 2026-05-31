@@ -199,20 +199,27 @@ pub(super) fn handle_promote(
     // because it consumes caller-supplied wire input — anywhere else
     // that *constructs* a tier wire value routes through
     // `Tier::<X>.as_str()`.
+    // v0.7.0 F-C6 fix (issue #1432): route the tier wire string through
+    // the canonical `Tier::from_str` SSOT instead of an inline match
+    // that duplicates the parser body. The promote-specific guard
+    // (reject Short as a downgrade target) stays explicit; the
+    // unrecognized-tier and missing-value paths preserve byte-equal
+    // error messages.
     let target_tier = match params["target_tier"].as_str() {
         None => Tier::Long,
-        Some("long") => Tier::Long,
-        Some("mid") => Tier::Mid,
         Some("short") => {
             return Err(
                 "target_tier 'short' is not a valid promote target (would be a downgrade)".into(),
             );
         }
-        Some(other) => {
-            return Err(format!(
-                "target_tier must be one of 'mid' or 'long' (got '{other}')"
-            ));
-        }
+        Some(other) => match Tier::from_str(other) {
+            Some(t) => t,
+            None => {
+                return Err(format!(
+                    "target_tier must be one of 'mid' or 'long' (got '{other}')"
+                ));
+            }
+        },
     };
     // Mid-tier promotions must KEEP a live expires_at (mid is a
     // 7-day-TTL bucket, not permanent). `db::update`'s expires_at

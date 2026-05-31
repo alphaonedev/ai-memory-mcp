@@ -100,16 +100,11 @@ pub async fn notify(
         let priority_i32 = body.priority.and_then(|p| i32::try_from(p).ok());
         // Canonical wire deserializer for the HTTP `tier` field — the
         // raw string literals here pair byte-for-byte with
-        // `Tier::as_str` outputs and are intentionally kept in this
-        // form per pm-v3.1 PR6 (#1174) because the input is a caller-
-        // supplied wire string. Construction sites elsewhere route
-        // through `Tier::<X>.as_str()`.
-        let resolved_tier = match body.tier.as_deref() {
-            Some("short") => Some(Tier::Short),
-            Some("mid") => Some(Tier::Mid),
-            Some("long") => Some(Tier::Long),
-            _ => None,
-        };
+        // v0.7.0 F-C6 fix (issue #1432): route through the canonical
+        // `Tier::from_str` SSOT at `src/models/memory.rs:395`. The prior
+        // inline parser duplicated the match body; routing through the
+        // const SSOT means future Tier variants land in one place.
+        let resolved_tier = body.tier.as_deref().and_then(Tier::from_str);
         let ctx = crate::store::CallerContext::for_agent(&sender);
         let new_id = match app
             .store
