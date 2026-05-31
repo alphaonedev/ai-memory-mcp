@@ -72,6 +72,67 @@ pub const MIME_JSON: &str = "application/json";
 pub const HEADER_AGENT_ID: &str = "x-agent-id";
 
 // ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner B finding F-B7.x) —
+// canonical metadata-JSON-key consts.
+//
+// `Memory::metadata` is a free-form `serde_json::Value` blob; the
+// substrate INTERPRETS specific keys to enforce identity, visibility,
+// and provenance. Pre-sweep, these load-bearing key names appeared as
+// scattered string literals across handlers / MCP tools / federation /
+// CLI / storage — 100+ sites for `"agent_id"` alone. The consts below
+// centralise ONLY the keys that carry substrate semantics (NHI
+// attribution, visibility scope, governance policy, provenance edge
+// labels). Bare JSON field-name literals used for wire-protocol
+// shaping (e.g. `"name"`, `"description"`, `"properties"` in MCP
+// tool-schema JSON) are intentionally left as inline string literals
+// — those are protocol-driven, not substrate semantics, and changing
+// the key would be a wire break.
+//
+// A rename of any const below is a single-line edit + a multi-call-
+// site `grep` + replace; pre-sweep it was a substrate-wide search.
+// ---------------------------------------------------------------------------
+
+/// `metadata.agent_id` — the NHI identity stamp written on every
+/// substrate row per CLAUDE.md §"Agent Identity". Read by visibility
+/// predicates, governance rule evaluator, federation peer attestation,
+/// audit chain. Immutable post-write (preserved across update / dedup
+/// / import / sync / consolidate per `identity::preserve_agent_id`).
+pub const META_KEY_AGENT_ID: &str = "agent_id";
+
+/// `metadata.scope` — visibility marker (one of [`MemoryScope::all_strs`]
+/// at `crate::models::namespace::MemoryScope`). Controls which agents
+/// can see a memory via hierarchical namespace matching per Task 1.5.
+/// Memories without this key are treated as `"private"` by the query
+/// layer (see `crate::models::namespace::MemoryScope::default()`).
+pub const META_KEY_SCOPE: &str = "scope";
+
+/// `metadata.governance` — embedded governance policy blob
+/// (`GovernancePolicy::from_metadata`). Read by the substrate
+/// governance engine (`db::enforce_governance`) to evaluate rules
+/// before the canonical write path; honoured by Allow / Deny / Pending
+/// decision tree.
+pub const META_KEY_GOVERNANCE: &str = "governance";
+
+/// `metadata.imported_from_agent_id` — original NHI claim preserved
+/// when `ai-memory import` restamps `agent_id` with the importing
+/// caller's id (absent when `--trust-source` is passed). Documented at
+/// CLAUDE.md §"Agent Identity (NHI)" → "Special metadata keys".
+pub const META_KEY_IMPORTED_FROM_AGENT_ID: &str = "imported_from_agent_id";
+
+/// `metadata.consolidated_from_agents` — array of source authors,
+/// preserved on `memory_consolidate` (the consolidator's id becomes
+/// `agent_id`; the original authors stay readable from this array).
+/// Documented at CLAUDE.md §"Agent Identity (NHI)" → "Special metadata
+/// keys".
+pub const META_KEY_CONSOLIDATED_FROM_AGENTS: &str = "consolidated_from_agents";
+
+/// `metadata.mined_from` — source-format tag (`claude` / `chatgpt` /
+/// `slack`) stamped by `ai-memory mine` alongside the caller's
+/// `agent_id`. Documented at CLAUDE.md §"Agent Identity (NHI)" →
+/// "Special metadata keys".
+pub const META_KEY_MINED_FROM: &str = "mined_from";
+
+// ---------------------------------------------------------------------------
 // ARCH-14 (FX-C4-batch2, 2026-05-26) — canonical route-count constant.
 //
 // The daemon's `build_router_with_timeout` registers exactly this
