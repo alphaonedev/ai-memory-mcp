@@ -346,9 +346,9 @@ CI guard: `bench --baseline performance/baseline.json` fails any PR that exceeds
 
 ### 9.7 Surface area shipped (v0.7.0 grand-slam)
 
-- **73 MCP tools at `--profile full`** (72 callable + always-on `memory_capabilities` bootstrap; pinned by `Profile::full().expected_tool_count()` in `src/profile.rs`). 7 at `--profile core`.
+- **74 MCP tools at `--profile full`** (73 callable + always-on `memory_capabilities` bootstrap; pinned by `Profile::full().expected_tool_count()` in `src/profile.rs`). 7 at `--profile core`.
 - **87 production HTTP route registrations** / 73 unique URL paths.
-- **81 CLI subcommands** under `--features sal`/`sal-postgres`; 79 in default build.
+- **80 CLI subcommands** under `--features sal`/`sal-postgres`; 78 in default build (pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` + `tests/cli_subcommand_count_invariant.rs`).
 - **25 hook lifecycle events** (20 baseline + 5 v0.7.0 additions: `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`, `OnCompactionRollback` per `src/hooks/events.rs::HookEvent`).
 - **7 Agent Skills tools** (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`) — **load-bearing for §2.4 (improvable across model generations)**.
 - **4 feature tiers:** keyword · semantic · smart · autonomous.

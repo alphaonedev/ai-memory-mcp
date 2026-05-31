@@ -70,3 +70,27 @@ jobs:
         # regression in the gate's detection logic (e.g. an over-broad
         # allowlist, a broken test-boundary heuristic) trips here.
         run: bash scripts/check-vendor-literals.sh --self-test
+
+  docs-vs-ssot-drift:
+    # v0.7.0 (operator directive 2026-05-31: "can we use variables in
+    # documentation for versions instead of literals?") — Markdown has
+    # no native variables; this gate is the minimal-infra answer.
+    # Parses the canonical Rust SSOTs (CURRENT_SCHEMA_VERSION,
+    # EXPECTED_*, Profile::full().expected_tool_count(), etc.) + walks
+    # the operator-facing .md files for known narrative-count patterns
+    # + fails CI if any cited value drifts from the canonical. New
+    # schema bumps / SSOT-const changes now fail loudly here when
+    # narrative isn't updated in lockstep.
+    name: Docs vs SSOT drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run docs-vs-SSOT drift gate
+        run: bash scripts/check-docs-vs-ssot.sh
+      - name: Self-test the gate (regression evidence)
+        # Mirrors the vendor-literal self-test discipline. The
+        # --self-test mode stages a contrived stale-claim CLAUDE.md
+        # in a tmpdir + invokes the gate against AI_MEMORY_DOCS_GATE_ROOT
+        # = tmpdir; the gate must catch the drift.
+        run: bash scripts/check-docs-vs-ssot.sh --self-test
