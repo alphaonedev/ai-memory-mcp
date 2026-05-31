@@ -31,8 +31,11 @@ on:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
 
 # v0.7.x (#1148) — cancel stale runs on a PR when a new push lands.
+# Fork-PR-safe concurrency key: coalesces push + same-branch internal
+# PR events; isolates fork PRs by PR number. See ci.yml for full
+# rationale + the prior unsafe-key incident that motivated this shape.
 concurrency:
-  group: cov-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: cov-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 env:

@@ -36,6 +36,13 @@ on:
   pull_request:
     branches: [main, develop, "release/**"]
 
+# Fork-PR-safe concurrency key: coalesces push + same-branch internal
+# PR events; isolates fork PRs by PR number. See ci.yml for full
+# rationale.
+concurrency:
+  group: c8-precheck-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   c8-precheck:
     name: C8 caller-context allowlist check

@@ -73,6 +73,13 @@ on:
     - cron: "0 8 * * *"  # 08:00 UTC daily
   workflow_dispatch:
 
+# Fork-PR-safe concurrency key: coalesces push + same-branch internal
+# PR events; isolates fork PRs by PR number so they cannot collide
+# with protected-branch keys. See ci.yml for full rationale.
+concurrency:
+  group: batman-mode-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
