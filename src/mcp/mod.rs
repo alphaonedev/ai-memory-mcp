@@ -716,6 +716,14 @@ pub mod schema_handler_parity_test_exports {
 pub mod tools {
     pub use super::atomise::{AtomiseToolHandler, handle_atomise};
 
+    /// v0.7.0 multi-agent literal-sweep (scanner B finding F-B3.x) —
+    /// re-export the canonical on-conflict enum so external consumers
+    /// (HTTP handler at `src/handlers/create.rs`) can route through
+    /// `OnConflictMode::parse` as a single SSOT instead of carrying
+    /// their own inline string-allowlist match for the closed set
+    /// `error | merge | version`.
+    pub use super::store::OnConflictMode;
+
     // v0.7.0 #1325 — re-export the canonical `tool_examples`
     // catalog so the regression test at
     // `tests/issue_1325_reflect_caller_depth.rs` and

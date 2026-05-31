@@ -437,7 +437,15 @@ pub struct Memory {
     pub priority: i32,
     /// 0.0-1.0 — how certain is this memory
     pub confidence: f64,
-    /// Who/what created this: "user", "nhi", "hook", "api", "import" (v0.7.x DEFAULT_NHI_SOURCE; "claude" retained for back-compat per src/validate.rs::VALID_SOURCES)
+    /// Who/what created this row. Role-categorical, not vendor-specific.
+    /// Canonical closed set lives in [`crate::validate::VALID_SOURCES`]
+    /// at v0.7.0:
+    ///   `user`, `nhi` ([`crate::validate::DEFAULT_NHI_SOURCE`] — the
+    ///   vendor-neutral substrate default for AI-NHI-minted writes per
+    ///   #1175), `claude` (deprecated; back-compat only, removal in
+    ///   v0.8.x), `hook`, `api`, `cli`, `import`, `consolidation`,
+    ///   `system`, `chaos`, `notify` (S32 inbox replication path).
+    /// Validator surface: [`crate::validate::validate_source`].
     pub source: String,
     pub access_count: i64,
     pub created_at: String,
