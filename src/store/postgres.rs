@@ -10653,20 +10653,32 @@ impl MemoryStore for PostgresStore {
                         .fetch_optional(&self.pool)
                         .await
                         .map_err(|e| to_store_err("find_paths visibility fetch", e))?;
+                    // v0.7.0 F-E3 fix (#1436): route through the
+                    // canonical predicate via META_KEY_* + MemoryScope
+                    // SSOTs. The string compare against
+                    // `MemoryScope::Private.as_str()` preserves the
+                    // pre-refactor permissive semantics (any non-private
+                    // scope is visible, matching
+                    // `is_visible_to_caller`). We can't call
+                    // `crate::visibility::is_visible_to_caller` directly
+                    // here because we only have the metadata blob (not
+                    // a full Memory struct), but we route through the
+                    // SAME META_KEY_* / MemoryScope::Private.as_str()
+                    // SSOTs so a future rename touches one place.
                     let v = match row {
                         Some(r) => {
                             let meta: serde_json::Value = r
                                 .try_get("metadata")
                                 .map_err(|e| to_store_err("read metadata", e))?;
                             let scope = meta
-                                .get("scope")
+                                .get(crate::META_KEY_SCOPE)
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or("private");
-                            if scope != "private" {
+                                .unwrap_or(crate::models::namespace::MemoryScope::Private.as_str());
+                            if scope != crate::models::namespace::MemoryScope::Private.as_str() {
                                 true
                             } else {
                                 let owner = meta
-                                    .get("agent_id")
+                                    .get(crate::META_KEY_AGENT_ID)
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("");
                                 owner == caller
