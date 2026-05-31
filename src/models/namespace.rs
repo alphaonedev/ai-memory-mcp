@@ -7,7 +7,131 @@ use serde_json::Value;
 /// Closed set of visibility scopes stamped into `metadata.scope` (Task 1.5).
 /// Controls which agents can see a memory via hierarchical namespace matching.
 /// Memories without a `scope` field are treated as `private` by the query layer.
+///
+/// **Migration in progress:** new call sites should construct
+/// [`MemoryScope`] directly and serialise via [`MemoryScope::as_str`].
+/// The const stays as the canonical string-validation surface for back-compat;
+/// the enum's [`MemoryScope::all_strs`] returns this exact slice so the two
+/// SSOTs stay in lockstep, pinned by
+/// `tests/memory_scope_count_invariant.rs`.
 pub const VALID_SCOPES: &[&str] = &["private", "team", "unit", "org", "collective"];
+
+/// v0.7.0 multi-agent literal-sweep (scanner B, finding F-B2.x) — typed
+/// closed-set discriminator for `memory.metadata.scope` (Task 1.5).
+/// Paired with the [`VALID_SCOPES`] string allowlist + the validator
+/// at `crate::validate::validate_scope`; the parity test
+/// `tests/memory_scope_count_invariant.rs` asserts both stay in
+/// lockstep.
+///
+/// `#[serde(rename_all = "snake_case")]` keeps the wire shape and the
+/// existing `metadata.scope` JSON column byte-identical to what every
+/// v0.6.x / v0.7.x writer already emits (`"private"`, `"team"`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    /// Memory is visible only to its owning agent within its own
+    /// namespace. The default for unmarked rows (per the query layer).
+    Private,
+    /// Memory is visible to every agent whose namespace falls within
+    /// the same team subtree. Subtree matching honours
+    /// `MAX_NAMESPACE_DEPTH`.
+    Team,
+    /// Memory is visible to every agent within the same unit subtree.
+    Unit,
+    /// Memory is visible to every agent within the same org subtree.
+    Org,
+    /// Memory is visible to every authenticated caller, regardless of
+    /// namespace.
+    Collective,
+}
+
+impl MemoryScope {
+    /// Total number of `MemoryScope` variants. SSOT for the
+    /// "5 visibility scopes at v0.7.0" narrative across docs.
+    /// Adding a new variant requires bumping this const, the
+    /// `VALID_SCOPES` slice, the [`Self::as_str`] / [`Self::from_str`]
+    /// match arms, and the visibility-policy dispatch in
+    /// `src/storage/mod.rs::is_visible`.
+    pub const COUNT: usize = 5;
+
+    /// Canonical enumeration in declaration order
+    /// (`private`, `team`, `unit`, `org`, `collective`). Use this
+    /// anywhere external code would otherwise hand-roll the list —
+    /// federation handshake, capability advertisement, parity tests.
+    #[must_use]
+    pub const fn all() -> &'static [Self; Self::COUNT] {
+        &[
+            Self::Private,
+            Self::Team,
+            Self::Unit,
+            Self::Org,
+            Self::Collective,
+        ]
+    }
+
+    /// String enumeration matching [`VALID_SCOPES`] byte-for-byte.
+    /// Parity-test-asserted against the `VALID_SCOPES` const.
+    #[must_use]
+    pub const fn all_strs() -> &'static [&'static str; Self::COUNT] {
+        &["private", "team", "unit", "org", "collective"]
+    }
+
+    /// Parse the string form stored in `metadata.scope`.
+    ///
+    /// Returns `None` for unknown values so callers can decide whether
+    /// to default to [`Self::Private`] (the query-layer convention for
+    /// unmarked rows) or surface a typed error.
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "private" => Some(Self::Private),
+            "team" => Some(Self::Team),
+            "unit" => Some(Self::Unit),
+            "org" => Some(Self::Org),
+            "collective" => Some(Self::Collective),
+            _ => None,
+        }
+    }
+
+    /// Canonical wire string for this variant. Mirrors the `serde`
+    /// rename_all + the literals every existing call site already
+    /// writes to `metadata.scope`.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Team => "team",
+            Self::Unit => "unit",
+            Self::Org => "org",
+            Self::Collective => "collective",
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Default for MemoryScope {
+    fn default() -> Self {
+        Self::Private
+    }
+}
+
+impl std::str::FromStr for MemoryScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_str(s).ok_or_else(|| {
+            format!(
+                "invalid memory scope '{s}' (expected one of: {})",
+                VALID_SCOPES.join(", ")
+            )
+        })
+    }
+}
 
 /// Closed set of agent types. Extend carefully — values are persisted.
 pub const VALID_AGENT_TYPES: &[&str] = &[
