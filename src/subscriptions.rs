@@ -2026,11 +2026,15 @@ fn dlq_row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<DlqEntry> {
 /// since `since_rfc3339`. Returns the audit rows ordered by
 /// `delivered_at` ascending (so cursor-by-time scans are stable).
 ///
-/// **MCP gating:** the companion `memory_subscription_replay` MCP
-/// tool is **not** registered in the dispatch table yet — that wiring
-/// lives in K7 (subscription reliability) so we don't bump the v0.7
-/// tool count cascade while Track B1 is in flight. The handler
-/// surface is exposed here so K7's MCP wiring is a one-line patch.
+/// **MCP wiring (v0.7 K7, landed):** the companion
+/// `memory_subscription_replay` MCP tool IS registered in the
+/// dispatch table — see `MEMORY_SUBSCRIPTION_REPLAY` in
+/// `src/mcp/registry.rs` (entry in `tool_names::ALL`) and the
+/// `handle_subscription_replay` handler in
+/// `src/mcp/tools/subscribe.rs`. The "K6 deferred to K7" gating
+/// noted in the original comment is closed; this docstring was
+/// stale per the v0.7.0 multi-agent literal-sweep (scanner B
+/// finding F-B6.x).
 pub fn replay_subscription_events(
     conn: &Connection,
     subscription_id: &str,
@@ -2060,11 +2064,14 @@ pub fn replay_subscription_events(
     Ok(out)
 }
 
-/// v0.7.0 K6 — handler for `memory_subscription_replay`. Registered in
-/// K7 (subscription reliability) — DO NOT add to the MCP dispatch
-/// table during K6 because the v0.7 tool count cascade collides with
-/// Track B1 in flight. K7 will wire this into `mcp::dispatch_tool`
-/// behind the existing `memory_subscription_*` family.
+/// v0.7.0 K6 — handler for `memory_subscription_replay`. K7 wired
+/// this into the MCP dispatch table behind the existing
+/// `memory_subscription_*` family — see
+/// `src/mcp/tools/subscribe.rs::handle_subscription_replay` for the
+/// thin MCP wrapper that delegates here. The K6-vintage "DO NOT add
+/// to MCP dispatch table" warning in the prior docstring was stale
+/// per the v0.7.0 multi-agent literal-sweep (scanner B finding
+/// F-B6.x); registration has been in tree since K7.
 pub fn memory_subscription_replay(
     conn: &Connection,
     subscription_id: &str,

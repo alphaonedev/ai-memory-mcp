@@ -175,14 +175,19 @@ pub enum Command {
         tier: String,
         /// v0.6.4 — Tool surface profile. One of `core`, `graph`, `admin`,
         /// `power`, `full`, or a comma-separated custom list (e.g.,
-        /// `core,graph,archive`). Default `core` (5 tools). Resolution
-        /// order: this CLI flag > `AI_MEMORY_PROFILE` env > `[mcp].profile`
-        /// in config.toml > `core`. Set `--profile full` to expose
-        /// every family (74 advertised entries at v0.7.0 — 72 callable
-        /// "memory tools" + the always-on `memory_capabilities` bootstrap;
-        /// `Profile::full().expected_tool_count()` returns 73, while
-        /// `memory_capabilities` summary reports the 72-memory-tool count
-        /// — both numbers are intentional, the +1 is the always-on entry).
+        /// `core,graph,archive`). Default `core` (7 tools at v0.7.0:
+        /// the original 5 + `memory_load_family` + `memory_smart_load`).
+        /// Resolution order: this CLI flag > `AI_MEMORY_PROFILE` env >
+        /// `[mcp].profile` in config.toml > `core`. Set `--profile full`
+        /// to expose every family — at v0.7.0,
+        /// `Profile::full().expected_tool_count()` returns 74 (canonical
+        /// SSOT; pinned by `profile_full_matches_registry_all` against
+        /// `crate::mcp::registry::tool_names::ALL.len()`). The 74
+        /// advertised entries decompose as 73 callable "memory tools"
+        /// plus the always-on `memory_capabilities` bootstrap; the
+        /// `build_capabilities_summary` "{n} memory tools" phrasing
+        /// reports the 73 memory-tool count to reconcile with the
+        /// user-facing summary (see issue #862 for the disambiguation).
         #[arg(long, env = "AI_MEMORY_PROFILE")]
         profile: Option<String>,
     },
