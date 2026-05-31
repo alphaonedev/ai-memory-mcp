@@ -89,11 +89,33 @@ jobs:
         with: { fetch-depth: 2 }
       - id: cls
         shell: bash
+        env:
+          # github.* contexts come in through env: per security-guidance
+          # plugin best practice. SHA fields are still validated via
+          # `git rev-parse` downstream before any use; this just keeps
+          # the values out of run: interpolation reach.
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_ACTION: ${{ github.event.action }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            base="${{ github.event.before }}"
+          # For test-impact selection we want the SMALLEST defensible
+          # diff base — i.e. the previous head, not the merge base —
+          # so per-push impact selection stays effective.
+          # Event-by-event base resolution:
+          #   - push: $EVENT_BEFORE = previous branch tip (small)
+          #   - pull_request synchronize: $PR_BEFORE = previous PR head
+          #     (small — only the just-pushed commits) when present;
+          #     fall back to $PR_BASE_SHA (main tip) for opened /
+          #     reopened where $PR_BEFORE is absent.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ -n "$PR_BEFORE" ] && [ "$PR_BEFORE" != "0000000000000000000000000000000000000000" ] && [ "$PR_ACTION" = "synchronize" ]; then
+              base="$PR_BEFORE"
+            else
+              base="$PR_BASE_SHA"
+            fi
+          elif [ "$EVENT_NAME" = "push" ]; then
+            base="$PR_BEFORE"
           else
             base=""
           fi
