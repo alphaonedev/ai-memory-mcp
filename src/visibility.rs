@@ -44,17 +44,26 @@ use crate::models::Memory;
 /// inbox row hit a list+filter path).
 #[must_use]
 pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
+    // v0.7.0 multi-agent literal-sweep (scanner B finding F-B8.x):
+    // route through `META_KEY_*` + `MemoryScope::Private.as_str()`
+    // SSOTs instead of raw string literals. String comparison (vs.
+    // typed-enum parsing) is INTENTIONAL — the pre-refactor semantics
+    // treat ANY non-"private" scope string as visible (including
+    // legacy values like "shared", custom org scopes, typos).
+    // Tightening to typed-enum parse would deny unknown scopes and
+    // break the `shared_scope_anyone_can_see` test contract below.
+    use crate::models::namespace::MemoryScope;
     let scope = mem
         .metadata
-        .get("scope")
+        .get(crate::META_KEY_SCOPE)
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("private");
-    if scope != "private" {
+        .unwrap_or(MemoryScope::Private.as_str());
+    if scope != MemoryScope::Private.as_str() {
         return true;
     }
     let owner = mem
         .metadata
-        .get("agent_id")
+        .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     if owner == caller {
@@ -62,7 +71,7 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
     }
     let target = mem
         .metadata
-        .get("target_agent_id")
+        .get(crate::META_KEY_TARGET_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     target == caller
