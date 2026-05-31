@@ -118,11 +118,16 @@ DOC_FILES=(
     README.md
     ROADMAP.md
     docs/MIGRATION_v0.7.md
+    docs/MIGRATION_QUICKSTART.md
     docs/migration-v0.7.0-postgres.md
     docs/migration-v064-to-v070.md
     docs/API_REFERENCE.md
+    docs/DEVELOPER_GUIDE.md
     docs/a2a-harness-integration.md
     docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md
+    docs/compliance/nsa-csi-mcp-security-mapping.md
+    docs/integrations/README.md
+    docs/integrations/claude-code.md
 )
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
