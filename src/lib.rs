@@ -32,6 +32,18 @@ pub const SECS_PER_DAY: i64 = 86_400;
 pub const SECS_PER_WEEK: i64 = 604_800;
 
 // ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner B finding F-B7) — byte-unit
+// consts so substrate-wide size math is grep-able and refactor-safe.
+// Pre-sweep ~10 production sites used bare `1024` / `1024 * 1024`
+// arithmetic; named consts make memory-cap intents explicit at the
+// callsite.
+// ---------------------------------------------------------------------------
+
+pub const KIB: usize = 1024;
+pub const MIB: usize = KIB * KIB;
+pub const GIB: usize = MIB * KIB;
+
+// ---------------------------------------------------------------------------
 // v0.7.x (issue #1174 PR2 — pm-v3.1 HTTP const sweep) — canonical
 // constants for the most-used HTTP header / MIME literals. Replaces
 // ~210 inline string literals across handler tests, federation
