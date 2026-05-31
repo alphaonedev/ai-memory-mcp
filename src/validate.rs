@@ -1002,7 +1002,11 @@ pub fn validate_consolidate(
 // Pre-#966 every wire surface duplicated the same "validate id +
 // validate namespace + validate agent_id + ..." sequence in its own
 // handler entry. The mechanical-line duplication grew alongside the
-// 50+ HTTP routes / 73 MCP tools / 55 CLI subcommands. Refactoring
+// substrate's wire surface (at v0.7.0:
+// `EXPECTED_PRODUCTION_ROUTES_COUNT=87` HTTP routes +
+// `Profile::full().expected_tool_count()=74` MCP tools +
+// `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=78` / `_SAL=80` CLI subcommands —
+// see SSOT consts in `src/lib.rs`). Refactoring
 // per-call validation chains to a single fluent surface lets all
 // three caller layers (HTTP handlers, MCP tools, CLI subcommands)
 // route field-level + cross-field checks through one canonical entry
@@ -1088,8 +1092,12 @@ impl std::error::Error for ValidationError {}
 /// (real-world issue) and implementation of **NSA recommendation (c)
 /// Validate parameters** per the NSA Cybersecurity Information document
 /// on MCP security (U/OO/6030316-26 \| PP-26-1834, May 2026, Version
-/// 1.0). Every wire-entry layer — 87 production HTTP routes, 73 MCP
-/// tools, 58 CLI subcommands — routes DTO-bundling validation through
+/// 1.0). Every wire-entry layer — HTTP routes
+/// (`EXPECTED_PRODUCTION_ROUTES_COUNT=87` in `src/lib.rs`), MCP
+/// tools (`Profile::full().expected_tool_count()=74` per
+/// `src/profile.rs`), CLI subcommands
+/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT=78` / `_SAL=80` in `src/lib.rs`)
+/// — routes DTO-bundling validation through
 /// `RequestValidator` so adding a new cross-field invariant is one
 /// struct-method edit rather than 3+ audited per-surface edits. The
 /// typed `ValidationError { field, reason }` carries explicit field

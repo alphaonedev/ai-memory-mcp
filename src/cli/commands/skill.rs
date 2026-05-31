@@ -27,8 +27,10 @@
 //!   * `ai-memory skill promote`     → `memory_skill_promote_from_reflection`
 //!   * `ai-memory skill compose`     → `memory_skill_compositional_context`
 //!
-//! All seven mirror the MCP tool surface 1:1. No new MCP tools land —
-//! the tool count stays at 71/70/Power 22.
+//! All seven mirror the MCP tool surface 1:1. No new MCP tools land
+//! here — the MCP surface stays at whatever
+//! `Profile::full().expected_tool_count()` reports (canonical SSOT in
+//! `src/profile.rs`; pinned by `profile_full_matches_registry_all`).
 
 use std::path::{Path, PathBuf};
 
