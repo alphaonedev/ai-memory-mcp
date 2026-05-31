@@ -189,11 +189,12 @@ pub async fn run(
         shutdown_for_signal.notify_one();
     });
 
-    let ollama_model = feature_tier
-        .config()
-        .llm_model
-        .map(|m| m.ollama_model_id().to_string());
-
+    // #1440 — hand the daemon the SAME resolver-built client the
+    // `--once` path uses (built at the top of `run` via
+    // `build_curator_llm`). The pre-#1440 code re-derived a model
+    // string from the tier default (`gemma4:e4b`) and injected it as a
+    // CLI-arm model override, clobbering the operator's configured
+    // `[llm].model` and 400-ing every call on non-Ollama backends.
     crate::daemon_runtime::run_curator_daemon_with_primitives(
         db_path.to_path_buf(),
         args.interval_secs,
@@ -201,7 +202,7 @@ pub async fn run(
         args.dry_run,
         args.include_namespaces.clone(),
         args.exclude_namespaces.clone(),
-        ollama_model,
+        llm.map(std::sync::Arc::new),
         shutdown,
     )
     .await
