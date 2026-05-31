@@ -256,7 +256,10 @@ impl SignedEvent {
         let (signature, attest_level) =
             match crate::governance::audit::try_sign_audit_payload(&payload_hash) {
                 Some((sig_bytes, tag)) => (Some(sig_bytes), tag.to_string()),
-                None => (None, "unsigned".to_string()),
+                None => (
+                    None,
+                    crate::models::AttestLevel::Unsigned.as_str().to_string(),
+                ),
             };
         SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),

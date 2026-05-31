@@ -321,7 +321,7 @@ pub fn build_chain_report_at(
             let attest_level = row
                 .attest_level
                 .clone()
-                .unwrap_or_else(|| "unsigned".to_string());
+                .unwrap_or_else(|| crate::models::AttestLevel::Unsigned.as_str().to_string());
 
             let (verified, failure_reason, signature_hex) = verify_edge(
                 &current_id,
