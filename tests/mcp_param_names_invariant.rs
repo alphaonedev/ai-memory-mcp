@@ -76,11 +76,7 @@ fn extract_param_literals(line: &str) -> Vec<String> {
         return out;
     }
     // `.get("X")` form
-    for marker in [
-        "params.get(\"",
-        "args.get(\"",
-        "arguments.get(\"",
-    ] {
+    for marker in ["params.get(\"", "args.get(\"", "arguments.get(\""] {
         let mut rest = line;
         while let Some(idx) = rest.find(marker) {
             let after = &rest[idx + marker.len()..];
@@ -96,11 +92,7 @@ fn extract_param_literals(line: &str) -> Vec<String> {
         }
     }
     // `["X"]` indexing form
-    for marker in [
-        "params[\"",
-        "args[\"",
-        "arguments[\"",
-    ] {
+    for marker in ["params[\"", "args[\"", "arguments[\""] {
         let mut rest = line;
         while let Some(idx) = rest.find(marker) {
             let after = &rest[idx + marker.len()..];
