@@ -14287,3 +14287,130 @@ async fn quorum_not_met_response_timeout_branch() {
         "response body must be a typed object, got {v}"
     );
 }
+
+// --- #1416 — L4 `POST /api/v1/capture_turn` HTTP route tests ---
+//
+// The new route mirrors the MCP `memory_capture_turn` tool so
+// postgres-backed daemons gain a callable L4 turn-capture surface
+// (the MCP tool only ever runs against a local sqlite connection).
+// These tests exercise the route end to end via `oneshot`, asserting
+// the wire envelope + the RFC-0001 idempotency contract. They are
+// backend-agnostic: both calls in the idempotency test share one
+// `AppState` (and therefore one backing store under `--features sal`
+// OR one `app.db` connection under the default build), so the
+// dedup-hit assertion holds on either path.
+
+fn capture_turn_test_router(state: Db) -> Router {
+    Router::new()
+        .route("/api/v1/capture_turn", axum_post(capture_turn))
+        .with_state(test_app_state(state))
+}
+
+async fn post_capture_turn(
+    app: &Router,
+    agent_id: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/capture_turn")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", agent_id)
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    (status, payload)
+}
+
+#[tokio::test]
+async fn http_capture_turn_creates_then_dedups_1416() {
+    let state = test_state();
+    let app = capture_turn_test_router(state);
+    let body = json!({
+        "host_session_id": "http-sess-1416",
+        "host_turn_index": 0,
+        "role": "user",
+        "content": "operator directive captured via HTTP L4"
+    });
+
+    // First call writes the row → 201 CREATED, dedup_hit:false,
+    // attest_level:self_signed (no host signature supplied).
+    let (status, payload) = post_capture_turn(&app, "alice", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "fresh capture must be 201, got {payload}"
+    );
+    assert_eq!(payload["dedup_hit"].as_bool(), Some(false));
+    assert_eq!(payload["layer"].as_str(), Some("L4"));
+    assert_eq!(payload["attest_level"].as_str(), Some("self_signed"));
+    let first_id = payload["memory_id"]
+        .as_str()
+        .expect("memory_id present")
+        .to_string();
+    assert!(!first_id.is_empty(), "memory_id must be non-empty");
+
+    // Second identical call is an idempotent replay → 200 OK,
+    // dedup_hit:true, same memory_id, and NO attest_level (no fresh
+    // write happened) per the shared envelope contract.
+    let (status2, payload2) = post_capture_turn(&app, "alice", &body).await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "idempotent replay must be 200, got {payload2}"
+    );
+    assert_eq!(payload2["dedup_hit"].as_bool(), Some(true));
+    assert_eq!(payload2["memory_id"].as_str(), Some(first_id.as_str()));
+    assert!(
+        payload2.get("attest_level").is_none(),
+        "replay envelope omits attest_level, got {payload2}"
+    );
+}
+
+#[tokio::test]
+async fn http_capture_turn_rejects_missing_required_field_1416() {
+    // `content` is a required, no-`#[serde(default)]` field. A body
+    // that omits it must be refused by the `JsonOrBadRequest`
+    // extractor with 400 rather than storing an empty turn.
+    let state = test_state();
+    let app = capture_turn_test_router(state);
+    let (status, _payload) = post_capture_turn(
+        &app,
+        "alice",
+        &json!({ "host_session_id": "x", "host_turn_index": 0, "role": "user" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_capture_turn_rejects_agent_id_mismatch_1413() {
+    // #1413 — a body `metadata.agent_id` that disagrees with the
+    // authenticated `X-Agent-Id` header must be refused (400) so a
+    // caller cannot forge memories attributed to another identity.
+    let state = test_state();
+    let app = capture_turn_test_router(state);
+    let (status, _payload) = post_capture_turn(
+        &app,
+        "alice",
+        &json!({
+            "host_session_id": "sess-mismatch",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "forged",
+            "metadata": { "agent_id": "mallory" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

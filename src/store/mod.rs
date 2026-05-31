@@ -58,6 +58,11 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+// L4 layered-capture DTOs live in `models` (always compiled) so the MCP
+// tool, the sqlite SSOT free function, and the HTTP route handler can
+// reach them in standard (non-`sal`) builds; re-export here so the SAL
+// trait + both adapters keep referencing `crate::store::CaptureTurn*`.
+pub use crate::models::{CaptureTurnResult, CaptureTurnWrite};
 use crate::quotas::QuotaStatus;
 
 /// Knowledge-graph backend resolved at adapter init.
@@ -550,6 +555,33 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<Option<String>> {
         Err(StoreError::UnsupportedCapability {
             capability: "GOVERNANCE_EXECUTE_PENDING".to_string(),
+        })
+    }
+
+    /// Perform the L4 layered-capture idempotent write (#1416 /
+    /// RFC-0001 §"Idempotency contract").
+    ///
+    /// Atomic contract — given a prepared [`CaptureTurnWrite`]:
+    /// 1. SELECT `memory_id` FROM `transcript_line_dedup` on the
+    ///    canonical `(host_session_id, host_turn_index)` key.
+    /// 2. On hit: return `{memory_id, dedup_hit: true}` with NO write.
+    /// 3. On miss: INSERT the memory + the `transcript_line_dedup` row +
+    ///    the `signed_events` chain row inside ONE transaction; any
+    ///    failure rolls all three back so an orphaned memory can never
+    ///    exist without its dedup row OR its audit row.
+    ///
+    /// This is the single SSOT routing the L4 transaction through the
+    /// SAL so postgres-backed daemons gain a callable L4 surface — the
+    /// sqlite MCP handler and the HTTP `memory_capture_turn` route both
+    /// reach it via `app.store`. Default returns `UnsupportedCapability`
+    /// so a future test/in-memory adapter round-trips cleanly.
+    async fn capture_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        _write: &CaptureTurnWrite,
+    ) -> StoreResult<CaptureTurnResult> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "L4_CAPTURE_TURN".to_string(),
         })
     }
 

@@ -567,7 +567,14 @@ pub use namespace::{handle_namespace_get_standard, handle_namespace_set_standard
 pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
-pub use capture_turn::handle_capture_turn;
+// #1416 — `prepare_capture_turn` + the request type are re-exported so
+// the HTTP `POST /api/v1/capture_turn` route reuses the exact same
+// validation + Memory/SignedEvent construction as the MCP tool.
+pub use capture_turn::{MemoryCaptureTurnRequest, handle_capture_turn};
+// `prepare_capture_turn` is `pub(crate)` — re-export at crate visibility so
+// the HTTP handler (`crate::handlers::capture_turn`) can reach it without
+// widening the MCP tool's surface to the public API.
+pub(crate) use capture_turn::prepare_capture_turn;
 pub use quota_status::handle_quota_status;
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 pub use check_agent_action::handle_check_agent_action;

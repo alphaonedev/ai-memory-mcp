@@ -18,8 +18,9 @@ use crate::db;
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
 use super::{
-    BoxBackendError, CallerContext, Capabilities, Filter, MemoryStore, StoreError, StoreResult,
-    Transaction, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
+    BoxBackendError, CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter,
+    MemoryStore, StoreError, StoreResult, Transaction, UpdatePatch, VerifyFilter, VerifyLinkReport,
+    VerifyReport, is_visible_to_caller,
 };
 use crate::quotas::{self, QuotaStatus};
 
@@ -90,6 +91,19 @@ impl MemoryStore for SqliteStore {
     async fn store(&self, _ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
         let conn = self.state.lock().await;
         db::insert(&conn, memory).map_err(box_err)
+    }
+
+    /// v0.7.0 #1416 — L4 layered-capture idempotent write. Delegates to
+    /// the sqlite SSOT `db::capture_turn_idempotent`, which the MCP
+    /// `memory_capture_turn` handler also calls, so the dedup-lookup +
+    /// atomic three-row transaction lives in exactly one place.
+    async fn capture_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        write: &CaptureTurnWrite,
+    ) -> StoreResult<CaptureTurnResult> {
+        let conn = self.state.lock().await;
+        db::capture_turn_idempotent(&conn, write).map_err(box_err)
     }
 
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {

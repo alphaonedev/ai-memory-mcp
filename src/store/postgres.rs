@@ -53,9 +53,9 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
 use super::{
-    CallerContext, Capabilities, Filter, KgBackend, KgInvalidateRow, KgQueryRow, KgTimelineRow,
-    MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport,
-    VerifyReport, is_visible_to_caller,
+    CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter, KgBackend,
+    KgInvalidateRow, KgQueryRow, KgTimelineRow, MemoryStore, StoreError, StoreResult, UpdatePatch,
+    VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 use crate::quotas::{
@@ -6204,6 +6204,22 @@ async fn pg_append_signed_event_with_chain(
     pool: &PgPool,
     row: PgSignedEventInsert<'_>,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    pg_append_signed_event_with_chain_in_tx(&mut tx, row).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Transaction-scoped twin of [`pg_append_signed_event_with_chain`].
+/// Computes the chain head and INSERTs the new `signed_events` row
+/// against a caller-owned transaction so multi-row writes (e.g. the L4
+/// `capture_turn_idempotent` path, #1416) can append the audit row in
+/// the SAME transaction as the data rows — the chain never lags the
+/// data, and a rollback discards both. The caller owns BEGIN/COMMIT.
+async fn pg_append_signed_event_with_chain_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: PgSignedEventInsert<'_>,
+) -> Result<(), sqlx::Error> {
     let PgSignedEventInsert {
         id,
         agent_id,
@@ -6215,8 +6231,6 @@ async fn pg_append_signed_event_with_chain(
     } = row;
     use crate::signed_events::{ZERO_HASH, canonical_chain_bytes};
     use sha2::{Digest, Sha256};
-
-    let mut tx = pool.begin().await?;
 
     // Read the chain head.
     let head: Option<(
@@ -6235,7 +6249,7 @@ async fn pg_append_signed_event_with_chain(
          ORDER BY COALESCE(sequence, 0) DESC, ctid DESC \
          LIMIT 1",
     )
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     let (next_seq, prev_hash) = match head {
@@ -6277,10 +6291,9 @@ async fn pg_append_signed_event_with_chain(
     .bind(timestamp)
     .bind(&prev_hash)
     .bind(next_seq)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
-    tx.commit().await?;
     Ok(())
 }
 
@@ -7471,6 +7484,223 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("commit store tx", e))?;
         Ok(id)
+    }
+
+    /// v0.7.0 #1416 / RFC-0001 — L4 layered-capture idempotent write on
+    /// the postgres backend. Twin of the sqlite SSOT
+    /// `crate::storage::capture_turn_idempotent`; closes the capability
+    /// gap that left postgres-backed daemons with no callable L4
+    /// surface despite carrying the v52 `transcript_line_dedup` table.
+    ///
+    /// Contract (matches the sqlite path byte-for-byte at the row level):
+    /// 1. Dedup SELECT on `(host_session_id, host_turn_index)` — the
+    ///    `IS NOT NULL` predicate pins the v52 partial index. On hit,
+    ///    return the existing id with NO write.
+    /// 2. On miss, in ONE transaction: INSERT the memory (same
+    ///    `(title, namespace)` upsert as `store`), INSERT the
+    ///    `transcript_line_dedup` row, and append the `signed_events`
+    ///    chain row (#1415). Any failure rolls all three back.
+    ///
+    /// Mirrors `store`'s memory INSERT verbatim (the inline-per-tx
+    /// pattern used by the reflection-insert path) rather than reusing
+    /// `store`, because the audit + dedup rows MUST land in the same
+    /// transaction as the memory — `store` owns its own BEGIN/COMMIT.
+    /// Unlike `store`, the L4 path does NOT record quota usage, matching
+    /// the sqlite path (which routes through `storage::insert`, not the
+    /// quota-recording `store` method).
+    async fn capture_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        write: &CaptureTurnWrite,
+    ) -> StoreResult<CaptureTurnResult> {
+        // Step 1 — dedup fast-path (no transaction needed for the read).
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT memory_id FROM transcript_line_dedup \
+             WHERE host_session_id IS NOT NULL \
+               AND host_session_id = $1 \
+               AND host_turn_index = $2",
+        )
+        .bind(&write.host_session_id)
+        .bind(write.host_turn_index)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("capture_turn dedup query", e))?;
+
+        if let Some(memory_id) = existing {
+            return Ok(CaptureTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+
+        // ARCH-1 — substrate governance pre-write parity with the sqlite
+        // L4 path (`storage::capture_turn_idempotent` → `storage::insert`
+        // → `consult_governance_pre_write`).
+        let memory = &write.memory;
+        consult_governance_pre_write_pg(memory)?;
+
+        let created_at = parse_rfc3339_required(&memory.created_at)?;
+        let updated_at = parse_rfc3339_required(&memory.updated_at)?;
+        let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
+        let expires_at = parse_rfc3339_opt(memory.expires_at.as_deref());
+        let tags_json =
+            serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize tags: {e}"),
+            })?;
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("serialize citations: {e}"),
+            })?;
+        let source_span_json = match memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: format!("serialize source_span: {e}"),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("serialize confidence_signals: {e}"),
+                })?,
+            ),
+            None => None,
+        };
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+        let event_ts = parse_rfc3339_required(&write.signed_event.timestamp)?;
+
+        // Step 2 — atomic three-row write.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin capture_turn tx", e))?;
+
+        let inserted_id: String = sqlx::query(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                      $18, $19, $20,
+                      $21, $22, $23,
+                      $24)
+            ON CONFLICT (title, namespace) DO UPDATE SET
+                content = EXCLUDED.content,
+                tier = CASE
+                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                        THEN EXCLUDED.tier
+                    ELSE memories.tier
+                END,
+                tags = EXCLUDED.tags,
+                priority = EXCLUDED.priority,
+                confidence = EXCLUDED.confidence,
+                updated_at = EXCLUDED.updated_at,
+                metadata = CASE
+                    WHEN memories.metadata ? 'agent_id'
+                        THEN jsonb_set(
+                            EXCLUDED.metadata,
+                            '{agent_id}',
+                            memories.metadata -> 'agent_id'
+                        )
+                    ELSE EXCLUDED.metadata
+                END,
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   ELSE EXCLUDED.memory_kind END,
+                citations = EXCLUDED.citations,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = EXCLUDED.confidence_source,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+            RETURNING id",
+        )
+        .bind(&memory.id)
+        .bind(memory.tier.as_str())
+        .bind(&memory.namespace)
+        .bind(&memory.title)
+        .bind(&memory.content)
+        .bind(&tags_json)
+        .bind(memory.priority)
+        .bind(memory.confidence)
+        .bind(&memory.source)
+        .bind(memory.access_count)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(last_accessed_at)
+        .bind(expires_at)
+        .bind(&memory.metadata)
+        .bind(memory.reflection_depth)
+        .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_deref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(memory.confidence_decayed_at.as_deref())
+        .bind(mentioned_entity_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("capture_turn insert memory", e))?
+        .try_get::<String, _>("id")
+        .map_err(|e| to_store_err("capture_turn read returned id", e))?;
+
+        // `transcript_line_dedup` row. `ON CONFLICT (sha256) DO NOTHING`
+        // guards the rare concurrent-duplicate race that READ COMMITTED
+        // would otherwise let through (the sqlite path serializes via
+        // BEGIN IMMEDIATE); the memory upsert keyed on (title, namespace)
+        // already makes the returned memory_id idempotent.
+        sqlx::query(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES ($1, $2, $3, NULL, $4, $5, $6) \
+             ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(&write.sha256)
+        .bind(&inserted_id)
+        .bind(&write.host_kind)
+        .bind(&write.host_session_id)
+        .bind(write.host_turn_index)
+        .bind(write.recovered_at_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("capture_turn insert dedup row", e))?;
+
+        // signed_events chain row in the SAME tx (#1415) so audit can
+        // prove L4 caught the turn and never lags the data.
+        let ev = &write.signed_event;
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &ev.id,
+                agent_id: &ev.agent_id,
+                event_type: &ev.event_type,
+                payload_hash: &ev.payload_hash,
+                signature: ev.signature.as_deref(),
+                attest_level: &ev.attest_level,
+                timestamp: event_ts,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("capture_turn append signed_event", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit capture_turn tx", e))?;
+
+        Ok(CaptureTurnResult {
+            memory_id: inserted_id,
+            dedup_hit: false,
+        })
     }
 
     async fn store_with_embedding(
