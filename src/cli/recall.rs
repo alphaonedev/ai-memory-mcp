@@ -188,25 +188,39 @@ pub fn run(
     // Initialize embedder if tier supports it. Use the shared builder so
     // recall and the HTTP daemon agree on tier→embedder semantics
     // (embed_url, model selection, error fallback). The shared builder
-    // is async; we drive it on a small inline runtime to keep `run()`
-    // sync. Tier=Keyword short-circuits inside the builder before any
-    // tokio work happens, so the runtime's only cost is the keyword path.
+    // is async; we drive it on a dedicated OS thread that owns a fresh
+    // current-thread runtime. Tier=Keyword short-circuits inside the
+    // builder before any tokio work happens, so the thread's only cost
+    // is the keyword path.
     let embedder = {
-        // Bridge sync→async: build a single-threaded runtime just for
-        // this call. Cheap on the Keyword path (no tasks spawned), and
-        // safe because `run()` is itself called from `main.rs` which is
-        // already inside `#[tokio::main]` only when invoked through
-        // `daemon_runtime::run` — the inner runtime is never nested
-        // because we use `Handle::try_current()` to detect that case.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| {
-                handle.block_on(daemon_runtime::build_embedder(feature_tier, app_config))
-            })
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(daemon_runtime::build_embedder(feature_tier, app_config))
+        // #1182: `build_embedder` internally `.await`s a `spawn_blocking`
+        // for the candle / HF-Hub model load. Driving it via
+        // `block_in_place(|| handle.block_on(..))` on the ambient
+        // multi-thread runtime (the case when `run()` is reached through
+        // `#[tokio::main]`) can deadlock under a scheduling race: the
+        // main thread parks inside `block_on` while every worker is idle
+        // and no thread is left to drive the blocking task to completion.
+        // A standalone `std::thread` is never a tokio runtime worker, so
+        // creating a fresh current-thread runtime and `block_on`-ing it
+        // there is always safe regardless of whether `run()` was invoked
+        // from inside `#[tokio::main]` (the CLI) or a sync `#[test]`. This
+        // unifies both prior branches into one deadlock-free path.
+        let built = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map(|rt| {
+                            rt.block_on(daemon_runtime::build_embedder(feature_tier, app_config))
+                        })
+                })
+                .join()
+        });
+        match built {
+            Ok(Ok(embedder)) => embedder,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("embedder build thread panicked"),
         }
     };
     // Delegate to the embedder-injected helper so test code can reach
