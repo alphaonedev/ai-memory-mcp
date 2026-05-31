@@ -200,7 +200,7 @@ footer a{color:var(--text-muted)}
         <tr><td>Subscription dispatch</td><td class="num">HMAC mandatory</td><td class="src">Unsigned dispatch DISABLED post-R3-S1.HMAC (fix campaign 2026-05-13). See <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/subscriptions.rs">src/subscriptions.rs</a></td></tr>
         <tr><td>TTL on access</td><td class="num">sliding replacement</td><td class="src">Touch sets <code>expires_at = now + per-tier-TTL</code> — replacement, not max-of-old-and-new extend. Create-time backstop (6h short / 7d mid) applies only until first access. See recall pipeline docs in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CLAUDE.md">CLAUDE.md</a></td></tr>
         <tr><td>CI matrix platforms</td><td class="num">3</td><td class="src">ubuntu-latest · macos-latest · windows-latest — see <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/.github/workflows/ci.yml"><code>.github/workflows/ci.yml</code></a></td></tr>
-        <tr><td>LongMemEval Recall@5</td><td class="num">97.8%</td><td class="src">489/500 questions · ICLR 2025 benchmark · pure SQLite FTS5+BM25 · zero cloud — see <a href="performance.html">performance.html</a></td></tr>
+        <tr><td>LongMemEval Recall@5</td><td class="num">96.4–97.8%</td><td class="src">LongMemEval-S, 500 questions. <strong>v0.7.0 binary-faithful</strong> (<code>harness.py</code> drives the shipped <code>ai-memory recall</code>): keyword/pure-FTS5 96.4%, semantic 96.8%, autonomous 95.8% (measured 2026-05-31). The historical <strong>97.8%</strong> headline (489-question <em>shadow</em> harness, <code>harness_99.py</code>) used <strong>LLM query-expansion</strong> over FTS5 — not pure BM25 — and is reproduced at <strong>97.2%</strong> R@5 on an OpenRouter cloud backend (Ollama-free, 0 failures). Full cross-harness matrix + per-category provenance: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md"><code>benchmarks/longmemeval/results.md</code></a>.</td></tr>
       </tbody>
     </table>
     <div class="callout">
@@ -225,7 +225,7 @@ footer a{color:var(--text-muted)}
       <div class="status-card production">
         <span class="tag">Production-ready</span>
         <h3>Hybrid recall (FTS5 + semantic)</h3>
-        <p>Adaptive blend, cross-encoder rerank, recency decay, tier boost. 97.8% Recall@5 on LongMemEval (ICLR 2025).</p>
+        <p>Adaptive blend, cross-encoder rerank, recency decay, tier boost. On LongMemEval-S (ICLR 2025, 500 questions), v0.7.0 binary-faithful R@5 measures keyword 96.4% / semantic 96.8% / autonomous (rerank) 95.8%; the 97.8% headline came from an FTS5 + LLM query-expansion path (shadow harness), reproduced at 97.2% on an OpenRouter backend. See <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md"><code>benchmarks/longmemeval/results.md</code></a>.</p>
       </div>
 
       <div class="status-card production">
