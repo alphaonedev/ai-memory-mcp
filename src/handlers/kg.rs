@@ -1137,22 +1137,19 @@ async fn kg_query_filter_visible(
     caller: &str,
     target_ids: Vec<String>,
 ) -> std::collections::HashSet<String> {
+    // v0.7.0 F-E3 fix (issue #1436): route through the canonical
+    // `crate::visibility::is_visible_to_caller` helper instead of
+    // reimplementing the predicate inline. The pre-fix copy was missing
+    // the `target_agent_id` inbox carve-out (the same defect class #951
+    // closed at the SAL layer — the kg post-filter pre-dated that fix
+    // and silently dropped inbox rows the recipient was entitled to
+    // see).
     use std::collections::HashSet;
     let mut visible: HashSet<String> = HashSet::with_capacity(target_ids.len());
     let ctx = crate::store::CallerContext::for_agent(caller);
     for id in target_ids {
         if let Ok(mem) = app.store.get(&ctx, &id).await {
-            let scope = mem
-                .metadata
-                .get("scope")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("private");
-            let owner = mem
-                .metadata
-                .get("agent_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if scope != "private" || owner == caller {
+            if crate::visibility::is_visible_to_caller(&mem, caller) {
                 visible.insert(id);
             }
         }
@@ -1351,21 +1348,16 @@ pub async fn kg_query(
     );
     let nodes_opt = match &kg_res {
         Ok(nodes) => {
+            // v0.7.0 F-E3 fix (#1436): route through the canonical
+            // `is_visible_to_caller` helper. Pre-fix the predicate was
+            // inlined here missing the inbox carve-out
+            // (`target_agent_id` short-circuit) — the same defect class
+            // #951 closed at the SAL layer.
             let mut visible: std::collections::HashSet<String> =
                 std::collections::HashSet::with_capacity(nodes.len());
             for n in nodes {
                 if let Ok(Some(mem)) = db::get(&lock.0, &n.target_id) {
-                    let scope = mem
-                        .metadata
-                        .get("scope")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("private");
-                    let owner = mem
-                        .metadata
-                        .get("agent_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    if scope != "private" || owner == caller {
+                    if crate::visibility::is_visible_to_caller(&mem, &caller) {
                         visible.insert(n.target_id.clone());
                     }
                 }
