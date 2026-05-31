@@ -1,171 +1,156 @@
-# LongMemEval Results — v0.6.3.1 Variant Disclosure (P8)
+# LongMemEval Results — v0.7.0 Full-500 Disclosure
 
 > Methodology and reproducibility pins live in
-> [`methodology.md`](./methodology.md). Re-run via
-> [`run_variants.sh`](./run_variants.sh).
-> See also [`README.md`](./README.md) for harness descriptions.
+> [`methodology.md`](./methodology.md). See [`README.md`](./README.md) for
+> harness descriptions. Raw per-run CSVs + logs for the v0.7.0 runs below
+> are captured under `.local-runs/bench-v070-20260531-151813/` for audit
+> provenance (results-keyword / results-semantic / results-autonomous /
+> expand-openrouter).
 
-This document publishes **four variant rows** for ai-memory's recall pipeline
-on LongMemEval-S (cleaned), 500 questions. Until v0.6.3.1, only the
-keyword-only baseline (R@5 = 97.8%) was published. P8 closes that gap by
-disclosing the semantic and autonomous variants on the same harness, the same
-hardware, and the same dataset checkout.
+This document publishes ai-memory's recall numbers on **LongMemEval-S
+(cleaned), 500 questions**. The v0.6.3.1 matrix carried `PENDING-RUN`
+cells; this revision fills them with **real, measured v0.7.0 runs** and
+labels each row with the harness that produced it, because two harnesses
+with different fidelity are in play and conflating them would be
+dishonest.
+
+---
+
+## Two harnesses — read this first
+
+| Harness | What it drives | Fidelity | Used for |
+|---|---|---|---|
+| `harness.py` | spawns the real `ai-memory recall` subprocess per question | **binary-faithful** (the shipped recall pipeline: embed + HNSW ANN + FTS5 fusion + optional cross-encoder rerank) | keyword / semantic / autonomous rows |
+| `harness_99.py` | in-process SQLite FTS5 with a hand-written BM25-ish scoring SQL + threaded LLM query-expansion | **shadow** (re-implements scoring outside the binary) | the published 97.8% anchor + the OpenRouter-expansion reproduction |
+
+The shadow harness is faster and was how the original 97.8% R@5 headline
+was produced, but it is **not** the shipped code path. The binary-faithful
+rows are the stricter, more honest measure of what an operator actually
+gets from `ai-memory recall`. Numbers are only comparable **within** a
+harness, never across.
 
 ---
 
 ## Headline matrix
 
-| # | Variant | Tier | Embedder | Reranker | Curator | LLM expand | R@1 | R@5 | R@10 | R@20 | Status |
-|--:|---|---|---|---|---|---|---:|---:|---:|---:|---|
-| 1 | **keyword-baseline** (published) | `keyword` | — | — | — | gemma3:4b | 86.8% | **97.8%** | 99.0% | 99.8% | Anchored (v0.6.3) |
-| 2 | semantic-rerank-off | `semantic` | MiniLM-L6 384d | off | — | no | PENDING-RUN | PENDING-RUN | PENDING-RUN | PENDING-RUN | Methodology pinned |
-| 3 | semantic-rerank-on | `semantic` | MiniLM-L6 384d | ms-marco MiniLM | — | no | PENDING-RUN | PENDING-RUN | PENDING-RUN | PENDING-RUN | Methodology pinned |
-| 4 | autonomous-curator-on | `autonomous` | nomic-embed 768d | ms-marco MiniLM | gemma3:4b | yes | PENDING-RUN | PENDING-RUN | PENDING-RUN | PENDING-RUN | Methodology pinned |
+### Binary-faithful (`harness.py`, drives the shipped binary)
 
-> **PENDING-RUN** = methodology fully pinned in `methodology.md`, runner
-> in `run_variants.sh`. Compute deferred to a reference-hardware operator
-> session (Apple M2 16GB, 5 min cool-down between variants × 4 variants ×
-> 8 passes = approx 4–6h wall-clock total). Cells will be filled in by a
-> follow-up PR that touches only this file. The keyword-baseline row is
-> anchored from the published v0.6.3 evidence page (489/500 questions).
+| # | Variant | Tier | Embedder | Reranker | LLM expand | R@1 | R@5 | R@10 | R@20 |
+|--:|---|---|---|---|---|---:|---:|---:|---:|
+| 1 | keyword-baseline | `keyword` | — (FTS5 only) | — | no | 86.6% | 96.4% | 98.4% | 99.4% |
+| 2 | semantic | `semantic` | MiniLM-L6 384d (local Candle) | off | no | **88.2%** | 96.8% | 99.0% | 99.8% |
+| 3 | autonomous | `autonomous` | nomic-embed 768d (Ollama) | ms-marco MiniLM cross-encoder | no | 86.2% | 95.8% | 98.2% | 99.2% |
 
----
+All three: full 500 questions, R@K = fraction where the correct source
+session id appears in the top-K returned memories. Run 2026-05-31 against
+the installed v0.7.0 binary (schema v53).
 
-## How to read this matrix
+### Shadow harness (`harness_99.py`, LLM query-expansion + FTS5)
 
-- **Tier** is the ai-memory feature tier (`keyword` → `semantic` →
-  `smart` → `autonomous`). Each tier adds capability and inference cost.
-- **Embedder** column tells you which vector model produced the
-  embeddings stored in the SQLite `embedding` BLOB.
-- **Reranker** column says whether cross-encoder rerank ran on the top-K
-  candidates. When off, the score is the adaptive blend
-  `semantic_weight*cosine + (1-semantic_weight)*norm_fts`.
-- **Curator** column says whether the autonomous-tier curator (small LLM
-  that filters / synthesizes a final answer set) ran.
-- **LLM expand** column says whether the *query* was expanded into
-  multiple search variants by an LLM before being sent to the recall
-  pipeline. The published v0.6.3 number used LLM expansion.
-- **R@K** is the fraction of questions where the correct source session id
-  appears in the top K returned memories. Higher K is more lenient.
+| # | Variant | Recall path | LLM expand backend | R@1 | R@5 | R@10 | R@20 |
+|--:|---|---|---|---:|---:|---:|---:|
+| 4 | keyword + expansion (published anchor) | shadow FTS5 | Ollama `gemma3:4b` | 86.8% | **97.8%** | 99.0% | 99.8% |
+| 5 | keyword + expansion (OpenRouter reproduction) | shadow FTS5 | OpenRouter `google/gemma-4-26b-a4b-it` | 86.0% | **97.2%** | 99.6% | 99.8% |
+
+Row 5 was run 2026-05-31 (500 questions, 0 expansion failures, 57,501
+OpenRouter tokens, 138.8s expansion + 1.7s recall). It reproduces the
+published anchor **within 0.6pp R@5** using a cloud LLM backend in place
+of local Ollama — confirming the expansion methodology is LLM-portable and
+the 97.8% headline holds with an entirely Ollama-free configuration.
 
 ---
 
-## Floor and ceiling — interpreting the spread
+## What the numbers say (honest reading)
 
-The keyword baseline is the **floor of useful recall** (no embedding cost,
-no LLM cost beyond query expansion). Variants that sit at or below the
-floor on R@5 are not worth their compute budget for this dataset.
+**1. On LongMemEval-S, the cross-encoder reranker does not help.** The
+autonomous tier (embed + rerank, row 3) scores **below** both the semantic
+tier (row 2) and the keyword baseline at every K (R@5 95.8% vs 96.8% vs
+96.4%). The 0.6×original + 0.4×ce_score blend reorders a candidate set
+that FTS5 already ranks well for this lexical-match-dominated dataset, and
+the reranker's reordering net-loses a few questions (notably
+`single-session-preference` R@5: 90.0% semantic → 83.3% autonomous). This
+is the expected "narrow spread" the v0.6.3.1 disclosure predicted, now
+measured: **paying for embeddings + rerank buys nothing on this dataset.**
 
-The autonomous-curator-on row is the **ceiling** — it spends the most
-inference time per query (embedding + rerank + curator LLM). On
-LongMemEval-S the spread is expected to be narrow because the dataset is
-dominated by lexical-match questions; the embedding wins are larger on
-out-of-distribution paraphrase-heavy datasets which we will benchmark at
-v0.7.
+**2. Query expansion is the only lever that beats the FTS5 floor.** The
+sole configuration that clears the keyword baseline's R@5 is LLM
+query-expansion (rows 4–5: 97.8% / 97.2% vs 96.4% binary-faithful keyword,
++1.4 / +0.8pp). Expansion broadens lexical coverage before recall — which
+is exactly where this dataset rewards effort.
 
-This honest disclosure lets a reader pick the cheapest tier that meets
-their R@5 target, rather than buying autonomous because it's at the top
-of a marketing chart.
+**3. The cheapest tier that meets a 96%+ R@5 target is `keyword`.** A
+reader budgeting compute should pick `keyword` (no embedding cost, no
+Ollama) and add LLM expansion if they want the last point of R@5, rather
+than buying `autonomous` for a number that is actually lower here.
+
+> Caveat: LongMemEval-S is lexical-match-heavy. Embedding + rerank wins are
+> expected to be larger on paraphrase-heavy / out-of-distribution corpora.
+> These rows disclose the LongMemEval-S range honestly; they are not a
+> claim about all workloads.
 
 ---
 
-## Anchored row — keyword-baseline (v0.6.3)
+## Per-category breakdown — binary-faithful tiers
 
-Source: `docs/evidence.html` row "LongMemEval Recall@5 = 97.8% (489/500
-questions, ICLR 2025 benchmark, pure SQLite FTS5+BM25, zero cloud)" and
-`benchmarks/longmemeval/README.md` "LLM-expanded + parallel FTS5".
+### keyword (`harness.py`)
 
 | Category | R@1 | R@5 | R@10 | R@20 |
 |---|---:|---:|---:|---:|
-| **Overall** | **86.8%** | **97.8%** | **99.0%** | **99.8%** |
-| knowledge-update | — | 100.0% | — | 100.0% |
-| multi-session | — | 97.7% | — | 100.0% |
-| single-session-assistant | — | 100.0% | — | 100.0% |
-| single-session-preference | — | 93.3% | — | 100.0% |
-| single-session-user | — | 98.6% | — | 100.0% |
-| temporal-reasoning | — | 96.2% | — | 99.2% |
+| **Overall** | **86.6%** | **96.4%** | **98.4%** | **99.4%** |
+| knowledge-update | 96.2% | 100.0% | 100.0% | 100.0% |
+| multi-session | 86.5% | 96.2% | 97.7% | 99.2% |
+| single-session-assistant | 100.0% | 100.0% | 100.0% | 100.0% |
+| single-session-preference | 50.0% | 90.0% | 96.7% | 100.0% |
+| single-session-user | 90.0% | 98.6% | 100.0% | 100.0% |
+| temporal-reasoning | 82.0% | 93.2% | 97.0% | 98.5% |
 
-Throughput: 142 q/s (parallel, 10 cores), 3.5s end-to-end recall over
-500 questions.
+### semantic (`harness.py`)
 
----
+| Category | R@1 | R@5 | R@10 | R@20 |
+|---|---:|---:|---:|---:|
+| **Overall** | **88.2%** | **96.8%** | **99.0%** | **99.8%** |
+| knowledge-update | 97.4% | 100.0% | 100.0% | 100.0% |
+| multi-session | 88.7% | 97.0% | 99.2% | 100.0% |
+| single-session-assistant | 100.0% | 100.0% | 100.0% | 100.0% |
+| single-session-preference | 50.0% | 90.0% | 100.0% | 100.0% |
+| single-session-user | 91.4% | 98.6% | 100.0% | 100.0% |
+| temporal-reasoning | 84.2% | 94.0% | 97.0% | 99.2% |
 
-## Variant rows — execution checklist
+### autonomous (`harness.py`)
 
-A reference-hardware operator should:
+| Category | R@1 | R@5 | R@10 | R@20 |
+|---|---:|---:|---:|---:|
+| **Overall** | **86.2%** | **95.8%** | **98.2%** | **99.2%** |
+| knowledge-update | 94.9% | 100.0% | 100.0% | 100.0% |
+| multi-session | 87.2% | 96.2% | 98.5% | 99.2% |
+| single-session-assistant | 100.0% | 100.0% | 100.0% | 100.0% |
+| single-session-preference | 50.0% | 83.3% | 96.7% | 96.7% |
+| single-session-user | 88.6% | 98.6% | 100.0% | 100.0% |
+| temporal-reasoning | 81.2% | 92.5% | 95.5% | 98.5% |
 
-```bash
-# 1. Reproduce the keyword baseline as a sanity check
-./run_variants.sh keyword
+### keyword + OpenRouter expansion (`harness_99.py`, shadow)
 
-# 2. Run each new variant
-./run_variants.sh semantic-rerank-off
-./run_variants.sh semantic-rerank-on
-./run_variants.sh autonomous-curator-on
-
-# 3. Update the matrix above from results/summary.csv
-```
-
-Each variant takes approximately:
-
-| Variant | Setup | Per-pass | Total (3 warmup + 5 measure + 5min cooldown) |
-|---|---|---|---|
-| keyword | <1 min | ~3.5s | ~6 min |
-| semantic-rerank-off | ~3 min embed | ~30s | ~10 min |
-| semantic-rerank-on | ~3 min embed | ~90s | ~20 min |
-| autonomous-curator-on | ~5 min embed + curator load | ~3 min | ~30 min |
-
-Sum: approximately **66 min wall-clock** for all four including cooldowns
-on Apple M2 16GB.
-
----
-
-## Why this matters for the v0.6.3.1 release
-
-The published 97.8% R@5 number reflects ai-memory at its **simplest tier**.
-It is honest, but it is not the complete story:
-
-- A reader comparing against systems that publish `autonomous` numbers
-  needs to see ai-memory's `autonomous` number to compare apples-to-apples.
-- A reader budgeting compute needs to know the **floor** to decide if
-  paying for embeddings is worth it on their workload.
-- A reader trying to reproduce the result needs the **exact model
-  digests, tokenizer, and harness invocation** — those live in
-  `methodology.md` and `run_variants.sh`.
-
-All three needs are now served. The four-row matrix replaces the
-single-number marketing chart.
+| Category | R@1 | R@5 | R@10 | R@20 |
+|---|---:|---:|---:|---:|
+| **Overall** | **86.0%** | **97.2%** | **99.6%** | **99.8%** |
+| knowledge-update | 93.6% | 100.0% | 100.0% | 100.0% |
+| multi-session | 87.2% | 98.5% | 99.2% | 100.0% |
+| single-session-assistant | 98.2% | 100.0% | 100.0% | 100.0% |
+| single-session-preference | 70.0% | 100.0% | 100.0% | 100.0% |
+| single-session-user | 85.7% | 100.0% | 100.0% | 100.0% |
+| temporal-reasoning | 78.9% | 91.0% | 99.2% | 99.2% |
 
 ---
 
 ## Anti-goals reaffirmed
 
-- We do **not** modify recall scoring to chase a higher number for this
-  disclosure. Variants disclose the existing range honestly.
-- We do **not** claim a variant exceeds the published 97.8% before the
-  PENDING-RUN cells are filled in. The matrix is the truth, including
-  the gaps.
-- We do **not** average across passes to hide regression — the median
-  across 5 measurement passes is reported, and per-pass CSVs are kept
-  for audit.
+- We do **not** modify recall scoring to chase a higher number. The rows
+  disclose the existing range, including the finding that the reranker
+  net-loses on this dataset.
+- We do **not** present the shadow-harness 97.8% as the binary-faithful
+  number — it is explicitly labelled as the shadow path, sitting beside the
+  binary-faithful keyword 96.4%.
 - We do **not** publish an oracle row. The harness never sees the
   ground-truth session id during recall.
-
----
-
-## Schedule for finalization
-
-The PENDING-RUN cells are scheduled to be filled by a single
-operator-driven session on the reference Mac mini. The session will:
-
-1. Build `cargo build --release` at the v0.6.3.1 tag.
-2. Pull / verify the four model digests (see methodology §2).
-3. Run `./run_variants.sh` end-to-end.
-4. Open a follow-up PR titled
-   `bench(longmemeval): fill variant matrix from reference-machine run`
-   that touches only this file plus `results/`.
-
-If the operator finds a variant within 0.5% R@5 of the keyword baseline,
-this file should call that out in the **Floor and ceiling** section so
-readers know the embedding cost did not buy a meaningful improvement on
-LongMemEval-S.
+- Raw per-question CSVs + run logs are retained under `.local-runs/` for
+  audit; the headline cells are reproducible from them.
