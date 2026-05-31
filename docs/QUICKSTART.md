@@ -31,8 +31,8 @@ ai-memory --version
 # ai-memory 0.6.3+patch.1   (release tag: v0.6.3.1; +patch.N is the crates.io-compatible encoding)
 ```
 
-Full install reference including Windows, Docker, Fedora COPR, Ubuntu
-PPA, and Homebrew tap: `docs/INSTALL.md`.
+Full install reference including Windows, Docker, Fedora COPR, Debian
+.deb, and Homebrew tap: `docs/INSTALL.md`.
 
 ## Path A — CLI (fastest, 60 seconds)
 

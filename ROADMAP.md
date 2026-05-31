@@ -39,7 +39,7 @@ The end state is a civilization-scale infrastructure layer that:
 5. Provides humanity (and other cognitive entities) with cryptographic insight into what any cognition did at any endpoint at any time, with audit chains that survive the agents and models that produced them.
 6. Persists as relevant and used through AI → AGI → ASI → whatever follows, by being constructed from principles that scale rather than from features that obsolete.
 
-**ai-memory is portable in a way most substrates are not.** Rust-compiled, SQLite-default, LLVM-portable. Installs and runs on iOS, Android, Linux, Windows, BSD/Unix, IoT controllers, and cellphones. Five distribution channels live (crates.io · Homebrew · Fedora COPR · Docker GHCR · APT PPA). Mobile cross-compile lane in CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068)). Scales from a single endpoint with minimal resources to a Hive of agents on the same substrate type. The portability is not a deployment story — it is the structural property that makes endpoint governance possible at all.
+**ai-memory is portable in a way most substrates are not.** Rust-compiled, SQLite-default, LLVM-portable. Installs and runs on iOS, Android, Linux, Windows, BSD/Unix, IoT controllers, and cellphones. Five distribution channels live (crates.io · Homebrew · Fedora COPR · Docker GHCR · APT .deb). Mobile cross-compile lane in CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068)). Scales from a single endpoint with minimal resources to a Hive of agents on the same substrate type. The portability is not a deployment story — it is the structural property that makes endpoint governance possible at all.
 
 ---
 
@@ -306,7 +306,7 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 
 ### 9.4 Distribution channels (5 of 5 live + mobile cross-compile)
 
-- crates.io · Homebrew · Fedora COPR · Docker GHCR · APT PPA — all five published smoke-tested.
+- crates.io · Homebrew · Fedora COPR · Docker GHCR · APT .deb — all five published smoke-tested.
 - Mobile cross-compile lane: `aarch64-apple-ios` + `aarch64-linux-android` cargo-check on every PR; iOS `.xcframework` + Android `jniLibs/`-layout `.so` bundle as release artifacts; scoped ~50-test subset on iOS Simulator + Android emulator on `release/**` push. **Endpoint property (§2.1) maintained in CI.**
 
 ### 9.5 LongMemEval — published
@@ -920,7 +920,7 @@ Plus per-release:
 - **Homebrew** — `brew install ai-memory`
 - **Fedora COPR** — `dnf copr enable alphaonedev/ai-memory && dnf install ai-memory`
 - **Docker GHCR** — `docker pull ghcr.io/alphaonedev/ai-memory:latest`
-- **APT PPA** — Ubuntu/Debian
+- **APT (.deb)** — Debian/Ubuntu via GitHub Releases
 - **Mobile cross-compile** — iOS `.xcframework` + Android `jniLibs/`-layout `.so` bundle as release artifacts; runtime emulator subset on `release/**`
 
 Pre-built binaries via `cargo binstall ai-memory` or direct download from GitHub Releases.
