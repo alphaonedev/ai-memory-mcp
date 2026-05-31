@@ -99,7 +99,7 @@ fn every_production_attest_level_literal_parses_via_from_str() {
                 break;
             }
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("*") || trimmed.starts_with("///")
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("///")
             {
                 continue;
             }
