@@ -750,7 +750,10 @@ fn emit_check_event(
     // `None` and we fall through to the legacy unsigned posture.
     let (signature, attest_level) = match crate::governance::audit::try_sign_audit_payload(&hash) {
         Some((sig, level)) => (Some(sig), level.to_string()),
-        None => (None, "unsigned".to_string()),
+        None => (
+            None,
+            crate::models::AttestLevel::Unsigned.as_str().to_string(),
+        ),
     };
     let event = crate::signed_events::SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),

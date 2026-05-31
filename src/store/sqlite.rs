@@ -933,7 +933,8 @@ impl MemoryStore for SqliteStore {
             });
         };
 
-        let attest_level = attest.unwrap_or_else(|| "unsigned".to_string());
+        let attest_level =
+            attest.unwrap_or_else(|| crate::models::AttestLevel::Unsigned.as_str().to_string());
         let signature_present = sig.is_some();
         let mut findings: Vec<String> = Vec::new();
 

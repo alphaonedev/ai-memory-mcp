@@ -777,7 +777,7 @@ fn fetch_edges_for(conn: &Connection, chain_ids: &[String]) -> Result<Vec<EdgeEn
             signature_hex: r.get::<_, Option<Vec<u8>>>(7)?.map(|b| bytes_to_hex(&b)),
             attest_level: r
                 .get::<_, Option<String>>(8)?
-                .unwrap_or_else(|| "unsigned".to_string()),
+                .unwrap_or_else(|| crate::models::AttestLevel::Unsigned.as_str().to_string()),
         })
     })?;
     for r in rows {
