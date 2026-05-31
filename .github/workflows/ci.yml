@@ -48,6 +48,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
+      # v0.7.0 Task #12 (#1399) — test-impact selection output.
+      # Possible values:
+      #   __SKIP__   docs-only diff (no Rust pipeline)
+      #   __ALL__    foundational change OR fallback (full integration suite)
+      #   <names>    space-separated tests/*.rs binary names to dispatch
+      # Consumed by the `Run tests` steps in `check` + `postgres-feature`.
+      # The consumer ALWAYS runs `cargo test --lib` regardless of this
+      # value; impact selection optimises only the slow tests/*.rs
+      # integration binaries (~5-15s setup per binary).
+      test_impact: ${{ steps.cls.outputs.test_impact }}
+      test_impact_count: ${{ steps.cls.outputs.test_impact_count }}
+      test_impact_total: ${{ steps.cls.outputs.test_impact_total }}
+      test_impact_reason: ${{ steps.cls.outputs.test_impact_reason }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 2 }
@@ -63,6 +76,10 @@ jobs:
           fi
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git rev-parse "$base" >/dev/null 2>&1; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=base-unreachable" >> "$GITHUB_OUTPUT"
             echo "::notice::cannot resolve base commit ($base) — running full pipeline"
             exit 0
           fi
@@ -81,12 +98,20 @@ jobs:
           fi
           if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=base-fetch-failed" >> "$GITHUB_OUTPUT"
             echo "::notice::cannot fetch base tree ($base) after retry — running full pipeline"
             exit 0
           fi
           changed=$(git diff --name-only "$base" HEAD)
           if [ -z "$changed" ]; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "test_impact=__SKIP__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=0" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=0" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=empty-diff" >> "$GITHUB_OUTPUT"
             echo "::notice::no diff vs base — treating as docs-only no-op"
             exit 0
           fi
@@ -100,6 +125,14 @@ jobs:
           fi
           echo "--- Changed files ($(echo "$changed" | wc -l) files) ---"
           echo "$changed"
+
+          # v0.7.0 Task #12 (#1399) — compute test-impact set.
+          # Always runs; the consumer steps decide whether to honor
+          # the output based on docs_only. The script is self-contained
+          # POSIX-compatible bash; full discipline + foundational list
+          # documented inline in scripts/ci-test-impact.sh.
+          chmod +x scripts/ci-test-impact.sh
+          scripts/ci-test-impact.sh "$base" "HEAD"
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS/Windows where it just duplicates work and burns
@@ -181,11 +214,59 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: needs.classify.outputs.docs_only != 'true'
 
-      - name: Run tests
+      # v0.7.0 Task #12 (#1399) — test-impact-aware test dispatch.
+      # ALWAYS runs `cargo test --lib` so every inline `#[cfg(test)] mod
+      # tests` in `src/` exercises on every push (huge surface, one
+      # compile-once / link-once pass). Then dispatches the slow
+      # `tests/*.rs` integration binaries selectively:
+      #   __ALL__   → `cargo test` (full suite, the v0.6.x posture)
+      #   __SKIP__  → no-op (docs-only diff)
+      #   <names>   → `cargo test --lib --test t1 --test t2 ...`
+      # The `classify` job's foundational-fallback list (in
+      # scripts/ci-test-impact.sh) HARD-FORCES __ALL__ on any change
+      # to a cross-cutting surface (Cargo.toml, src/lib.rs, schema
+      # migrations, SAL trait, MCP dispatch, etc.) — false-positive
+      # is always preferred over false-negative per discipline rule.
+      # Parity-test invariants (route_count_invariant,
+      # cli_subcommand_count_invariant, memory_link_relation_count_invariant,
+      # etc.) are always-on in the impact set so cross-cutting drift
+      # the heuristic might otherwise miss still fails the build.
+      - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test
+          TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}
+          TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
+          TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
+          TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::test-impact decision"
+          echo "reason: ${TEST_IMPACT_REASON:-unset}"
+          echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
+          echo "impact: ${TEST_IMPACT:-unset}"
+          echo "::endgroup::"
+          case "${TEST_IMPACT:-__ALL__}" in
+            __SKIP__)
+              echo "::notice::docs-only diff — test step is a no-op"
+              ;;
+            __ALL__|"")
+              echo "::notice::running FULL test suite"
+              cargo test
+              ;;
+            *)
+              # Always run --lib first (catches every inline unit test)
+              echo "::notice::running cargo test --lib + impact-selected integration binaries"
+              cargo test --lib
+              # Dispatch each impacted tests/*.rs binary
+              ARGS=()
+              for t in $TEST_IMPACT; do
+                ARGS+=(--test "$t")
+              done
+              cargo test "${ARGS[@]}"
+              ;;
+          esac
 
       - name: Security audit
         if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
@@ -336,7 +417,7 @@ jobs:
       - name: Clippy (sal-postgres feature, lib + tests)
         run: cargo clippy --features sal-postgres --tests -- -D warnings -D clippy::all -D clippy::pedantic
 
-      - name: Run lib + integration tests (sal-postgres feature)
+      - name: Run lib + integration tests (sal-postgres feature, impact-aware)
         env:
           AI_MEMORY_NO_CONFIG: "1"
           # Soft-skip pattern: postgres-gated integration tests check
@@ -345,26 +426,50 @@ jobs:
           # available those tests log a skip and exit 0 (see
           # `tests/age_cte_equivalence.rs` for the gating logic).
           AI_MEMORY_TEST_POSTGRES_URL: postgres://ai_memory:ai_memory_ci@localhost:5432/ai_memory_ci
-        # Combined v0.7.0 ship-readiness fixes (issue #767):
-        #
-        # 1. Cluster-I (COV-1): drop `--lib` so the 17 postgres
-        #    integration binaries (~56 `#[tokio::test]` cases) actually
-        #    run under the feature gate. Before this change they compiled
-        #    but never executed in CI — a massive coverage hole.
-        # 2. Concurrent-init serialisation (`-- --test-threads=1`): the
-        #    30+ `live_*` postgres tests concurrently call
-        #    `PostgresStore::connect()` which runs `CREATE EXTENSION` and
-        #    `CREATE INDEX` DDLs against the same postgres service
-        #    container. Postgres' catalog serialises EXTENSION + TYPE +
-        #    INDEX installs at a lower layer than `IF NOT EXISTS`, so
-        #    parallel callers collide on `pg_extension_name_index` /
-        #    `pg_type_typname_nsp_index` / deadlock-detected /
-        #    tuple-concurrently-updated despite the DDL being idempotent.
-        #    Per-call retry (added in postgres.rs init path) handles the
-        #    init_sql collision; serialising the test workers eliminates
-        #    the deeper `migrate_vN()` races at the cost of slightly
-        #    longer wallclock.
-        run: cargo test --features sal-postgres -- --test-threads=1
+          TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}
+          TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
+          TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
+          TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
+        shell: bash
+        # v0.7.0 Task #12 (#1399) — test-impact-aware dispatch over the
+        # sal-postgres feature gate. Same triage tree as the default
+        # `check` job's test step plus:
+        # 1. The `--features sal-postgres` flag is non-negotiable —
+        #    that's the entire point of this gate (lib + 17 postgres
+        #    integration binaries that the default build doesn't
+        #    compile).
+        # 2. `-- --test-threads=1` serialises postgres-init DDL across
+        #    workers. Cluster-I (COV-1, issue #767): dropping `--lib`
+        #    so integration binaries actually run; pre-#767 only the
+        #    lib unit suite executed under this gate.
+        # 3. The impact-selected branch ALSO passes
+        #    `-- --test-threads=1` for the same per-DDL serialisation
+        #    discipline.
+        run: |
+          set -euo pipefail
+          echo "::group::sal-postgres test-impact decision"
+          echo "reason: ${TEST_IMPACT_REASON:-unset}"
+          echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
+          echo "impact: ${TEST_IMPACT:-unset}"
+          echo "::endgroup::"
+          case "${TEST_IMPACT:-__ALL__}" in
+            __SKIP__)
+              echo "::notice::docs-only diff — sal-postgres test step is a no-op"
+              ;;
+            __ALL__|"")
+              echo "::notice::running FULL sal-postgres test suite"
+              cargo test --features sal-postgres -- --test-threads=1
+              ;;
+            *)
+              echo "::notice::running --lib + impact-selected sal-postgres integration binaries"
+              cargo test --features sal-postgres --lib -- --test-threads=1
+              ARGS=()
+              for t in $TEST_IMPACT; do
+                ARGS+=(--test "$t")
+              done
+              cargo test --features sal-postgres "${ARGS[@]}" -- --test-threads=1
+              ;;
+          esac
 
   # v0.7.0 Posture-1a (issue #1068) — mobile cross-compile gate.
   # Verifies that the `--features sqlite-bundled --lib` build cross-compiles
