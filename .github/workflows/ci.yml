@@ -27,25 +27,35 @@ on:
   pull_request:
     branches: [main, develop, "release/**"]
 
-# v0.7.x (#1148) — cancel stale runs on a PR when a new push lands.
-# Frees runner-pool capacity and prevents the older "stale" run from
-# noising up the PR status with outdated results from before the latest
-# fix push.
+# Concurrency: coalesces `push` + same-branch internal `pull_request`
+# events while keeping fork PRs isolated.
 #
-# v0.7.0 (2026-05-31, operator directive "fix it all 100%") — extended
-# the concurrency-group key so a `push` event AND a `pull_request`
-# (synchronize) event for the SAME branch coalesce into one group.
-# Pre-fix, both triggers fired concurrently on every push to a branch
-# with an open PR (e.g. release/v0.7.0 → main), producing 2 CI runs
-# per push (~2x CI cost). The fix unifies the key via the branch name:
-#   - on `push`: `github.ref_name` = "release/v0.7.0" (no refs/ prefix)
-#   - on `pull_request`: `github.event.pull_request.head.ref` =
-#     "release/v0.7.0" (the PR's head branch, NOT the merge ref)
-# Both events produce the same group key, so `cancel-in-progress: true`
-# guarantees only one CI run per branch-head SHA. The cancelled run's
-# validation result is preserved on the in-flight run (same SHA).
+# Expression chain (evaluated left-to-right via && / ||):
+#   - INTERNAL PR (head.repo == upstream): key = head.ref
+#     → SAME branch name as the push event → coalesces correctly.
+#       Example: push to release/v0.7.0 AND the PR #N (release/v0.7.0
+#       → main) synchronize event both produce key
+#       "ci-CI-release/v0.7.0".
+#   - FORK PR (head.repo != upstream): key = pull_request.number
+#     → unique integer, cannot collide with protected-branch refs.
+#       Example: fork PR with head.ref="release/v0.7.0" gets key
+#       "ci-CI-<PR#>", which never matches an upstream push.
+#   - PUSH event: key = github.ref_name (branch name, no refs/ prefix).
+#
+# v0.7.0 (2026-05-31, operator directive "fix it all 100%") —
+# Pre-fix, both push and pull_request triggers fired concurrently on
+# every push to a branch with an open PR (release/v0.7.0 → main),
+# producing 2 CI runs per push (~2x CI cost).
+#
+# Earlier "head.ref || ref_name" key (2b83bc6ea) coalesced correctly
+# for same-branch events but enabled a fork-PR DoS: an attacker could
+# open a fork PR with head.ref="release/v0.7.0" to share the upstream
+# branch's group, then trigger cancel-in-progress against the
+# protected-branch CI. The chained key below restricts the coalescing
+# to head.repo==github.repository (internal-PR / maintainer paths) so
+# fork PRs cannot collide with branch keys.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 env:

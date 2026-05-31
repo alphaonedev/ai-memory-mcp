@@ -49,8 +49,11 @@ on:
 # Cancel in-flight runs on the same branch/PR if a new push lands.
 # Mobile-runtime is the slowest workflow we have; superseded runs
 # burn $0.30+ on average if we let them complete.
+# Fork-PR-safe concurrency key: coalesces push + same-branch internal
+# PR events; isolates fork PRs by PR number. See ci.yml for full
+# rationale.
 concurrency:
-  group: mobile-runtime-${{ github.ref }}
+  group: mobile-runtime-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 permissions:

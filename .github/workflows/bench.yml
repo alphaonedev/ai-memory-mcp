@@ -32,7 +32,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: bench-${{ github.workflow }}-${{ github.ref }}
+  # Fork-PR-safe concurrency key. Coalesces push + same-branch internal
+  # PR events; isolates fork PRs by PR number so they cannot collide
+  # with protected-branch keys. See ci.yml for full rationale.
+  group: bench-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 env:
