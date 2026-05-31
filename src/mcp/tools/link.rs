@@ -200,7 +200,7 @@ pub(super) fn handle_link(
                     .to_string(),
                 payload_hash: crate::signed_events::payload_hash(&cbor_bytes),
                 signature: None,
-                attest_level: "unsigned".to_string(),
+                attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 ..crate::signed_events::SignedEvent::default()
             };

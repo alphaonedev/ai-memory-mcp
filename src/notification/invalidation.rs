@@ -278,7 +278,7 @@ fn write_notification(
         event_type: crate::signed_events::event_types::REFLECTION_INVALIDATION_NOTIFIED.to_string(),
         payload_hash: crate::signed_events::payload_hash(&payload_bytes),
         signature: None,
-        attest_level: "unsigned".to_string(),
+        attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
         timestamp: pending.timestamp.clone(),
         ..crate::signed_events::SignedEvent::default()
     };

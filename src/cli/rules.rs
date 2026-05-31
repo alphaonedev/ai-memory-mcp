@@ -278,7 +278,7 @@ pub fn run(
                 created_at,
                 enabled: !disabled,
                 signature: None,
-                attest_level: "unsigned".to_string(),
+                attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
             };
             // v0.7.0 issue #800 / Form 7 critical fix: sign the
             // canonical bytes that `verify_rule_signature` will read

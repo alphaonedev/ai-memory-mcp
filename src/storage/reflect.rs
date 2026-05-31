@@ -754,7 +754,7 @@ pub(crate) fn emit_reflection_depth_exceeded_audit(
         event_type: event_type.to_string(),
         payload_hash: crate::signed_events::payload_hash(&cbor),
         signature: None,
-        attest_level: "unsigned".to_string(),
+        attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
         timestamp: created_at,
         ..crate::signed_events::SignedEvent::default()
     };
