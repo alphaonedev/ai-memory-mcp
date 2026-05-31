@@ -279,6 +279,18 @@ variables to the `EnvironmentVariables` dict in the plist (macOS) or
 the `Environment=` lines of the unit (Linux) — see
 [§"Making it permanent"](#making-it-permanent).
 
+> **LLM key wiring (cloud-LLM curator daemons).** If `[llm]` points at a
+> cloud backend (OpenRouter, xAI, OpenAI, …), the curator daemon needs the
+> API key too — otherwise it resolves `key_source=error`, the LLM client is
+> disabled, and every cycle reports `tagged=0` **silently**. A service
+> manager does **not** inherit your login-shell exports: launchd's GUI
+> domain and systemd service units never see an `OPENROUTER_API_KEY` /
+> `XAI_API_KEY` you `export` from `~/.zshrc` or `~/.bashrc`. Use one of:
+> - **`[llm].api_key_file = "…/openrouter-api.key"` (mode `0400`)** —
+>   recommended; env-independent and identical across launchd/systemd.
+> - the key var inside the plist `EnvironmentVariables` dict / unit
+>   `Environment=` line (shown below), which the daemon *does* inherit.
+
 **Forms 2 and 6 — namespace standard memory with `GovernancePolicy`**
 
 A namespace standard is a regular memory whose `metadata.governance`
@@ -423,6 +435,12 @@ reboot. The curator daemon does not — it needs the OS service manager.
     <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
     <string>/Users/YOU</string>
+    <!-- Cloud-LLM curator: the GUI launchd domain does NOT inherit a shell
+         `export OPENROUTER_API_KEY` / `XAI_API_KEY`. Prefer pointing
+         [llm].api_key_file at a 0400 key file in config.toml (env-free); or,
+         if you must use an env var, declare it HERE so the daemon inherits it:
+    <key>OPENROUTER_API_KEY</key>
+    <string>sk-or-…</string>  -->
   </dict>
 
   <key>RunAtLoad</key><true/>

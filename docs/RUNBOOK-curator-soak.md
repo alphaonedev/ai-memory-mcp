@@ -45,6 +45,11 @@ ai-memory restore --from ./corpus-snapshot.db --skip-verify  # verify yourself f
 ai-memory serve --host 127.0.0.1 --port 9077 --tls-cert … &
 
 # 3. Start the curator in daemon mode.
+# NOTE: this starts from an interactive shell, so a cloud-LLM key exported
+# in your rc IS inherited here. If you instead run the soak under launchd/
+# systemd, the service domain does NOT inherit shell exports — wire the key
+# via [llm].api_key_file (mode 0400) or the unit/plist env. See
+# production-deployment.md §7b and batman-active-mode.md § Making it permanent.
 AI_MEMORY_AUTONOMOUS_HOOKS=1 \
 ai-memory curator --daemon \
     --interval-secs 3600 \

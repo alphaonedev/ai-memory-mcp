@@ -416,6 +416,7 @@ sqlite3 "$AI_MEMORY_DB" "SELECT namespace, shadow_mode_enabled, \
         <p><code>New-ScheduledTask -Trigger AtLogOn</code> with <code>-RestartCount 3</code>, <code>-RestartInterval 1m</code>, <code>-StartWhenAvailable</code>.</p>
       </div>
     </div>
+    <p class="lede" style="margin-top:1.25rem"><strong>Cloud-LLM key wiring.</strong> A service manager does <strong>not</strong> inherit your login-shell exports: launchd's GUI domain and systemd service units never see an <code>OPENROUTER_API_KEY</code> / <code>XAI_API_KEY</code> you <code>export</code> from <code>~/.zshrc</code>. A curator daemon that can't resolve its key reports <code>key_source=error</code> and every cycle silently logs <code>tagged=0</code>. Prefer <code>[llm].api_key_file = "&hellip;/openrouter-api.key"</code> (mode <code>0400</code>) in <code>config.toml</code> — env-independent and identical across launchd/systemd — or declare the key var inside the plist <code>EnvironmentVariables</code> dict / unit <code>Environment=</code> line.</p>
   </div>
 </section>
 
