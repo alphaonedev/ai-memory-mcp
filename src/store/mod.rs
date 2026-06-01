@@ -760,6 +760,24 @@ pub trait MemoryStore: Send + Sync {
         Ok(None)
     }
 
+    /// Revoke the Ed25519 public key bound to `agent_id` (#626 Layer-3,
+    /// Task 1.3 / C5).
+    ///
+    /// Clears the bound key so the agent reverts to the permissive
+    /// *claimed* posture until a fresh key is bound. The agent must
+    /// already be registered; revoking an agent that never bound a key
+    /// is a no-op success (idempotent).
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors
+    /// `bind_agent_pubkey`) so an adapter without key provisioning fails
+    /// loudly rather than silently leaving a key an operator believes
+    /// is revoked.
+    async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, _agent_id: &str) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REVOKE_AGENT_PUBKEY".to_string(),
+        })
+    }
+
     /// v0.7.0 Wave-3 Continuation — adapter-specific downcast hatch.
     ///
     /// Returns the adapter as `&dyn Any` so that downstream callers

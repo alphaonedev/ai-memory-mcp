@@ -1660,7 +1660,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_validate_governance_policy_default_ok() {
         let p = crate::models::GovernancePolicy::default();

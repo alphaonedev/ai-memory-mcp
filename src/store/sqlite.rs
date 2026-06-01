@@ -395,6 +395,11 @@ impl MemoryStore for SqliteStore {
         db::agent_pubkey(&conn, agent_id).map_err(box_err)
     }
 
+    async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        db::revoke_agent_pubkey(&conn, agent_id).map_err(box_err)
+    }
+
     // ----- v0.7.0 Wave-3 Continuation 2 — federation surface ---------
 
     async fn list_memories_updated_since(
