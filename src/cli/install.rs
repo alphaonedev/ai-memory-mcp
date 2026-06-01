@@ -2397,6 +2397,67 @@ mod tests {
         assert!(parsed["mcpServers"]["ai-memory"].is_object());
     }
 
+    // v0.7.0 #1378 — Codex TOML config coverage.
+
+    #[test]
+    fn config_format_detect_distinguishes_toml_and_json() {
+        assert_eq!(
+            ConfigFormat::detect(Path::new("/x/config.toml")),
+            ConfigFormat::Toml
+        );
+        assert_eq!(
+            ConfigFormat::detect(Path::new("/x/config.TOML")),
+            ConfigFormat::Toml
+        );
+        assert_eq!(
+            ConfigFormat::detect(Path::new("/x/config.json")),
+            ConfigFormat::Json
+        );
+        assert_eq!(
+            ConfigFormat::detect(Path::new("/x/noext")),
+            ConfigFormat::Json
+        );
+    }
+
+    #[test]
+    fn codex_apply_toml_roundtrips_and_preserves_user_keys() {
+        // End-to-end TOML path: read TOML → mutate → serialise TOML →
+        // round-trip-verify. Exercises the serialize_config + round-trip
+        // TOML arms and read_config_or_empty's TOML success branch.
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "config.toml");
+        seed(
+            &path,
+            "unrelated = 42\n\n[mcp_servers.other-mcp]\ncommand = \"x\"\nargs = []\n",
+        );
+        run(
+            &args_for_apply(Target::Codex, path.clone()),
+            &mut env.output(),
+        )
+        .unwrap();
+        let txt = fs::read_to_string(&path).unwrap();
+        let tv: toml::Value = toml::from_str(&txt).expect("output must be valid TOML");
+        let jv: Value = serde_json::to_value(&tv).unwrap();
+        // Codex TOML uses the snake_case `mcp_servers` key.
+        assert!(jv["mcp_servers"]["ai-memory"].is_object());
+        assert_eq!(
+            jv["mcp_servers"]["ai-memory"]["command"],
+            "/usr/local/bin/ai-memory"
+        );
+        // Sibling server + top-level key preserved across the round-trip.
+        assert_eq!(jv["mcp_servers"]["other-mcp"]["command"], "x");
+        assert_eq!(jv["unrelated"], 42);
+    }
+
+    #[test]
+    fn read_config_or_empty_rejects_invalid_toml() {
+        let env = TestEnv::fresh();
+        let path = config_path(&env, "broken.toml");
+        seed(&path, "this is = = not valid toml\n");
+        let err = read_config_or_empty(&path).unwrap_err();
+        assert!(err.to_string().contains("is not valid TOML"), "got: {err}");
+    }
+
     // --------------------------------------------------------------
     // v0.7-D3 — install-time system-prompt snippet
     //

@@ -478,22 +478,37 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
-        // Seed a memory with the SAME title in the SAME namespace; the
-        // contradiction-detect query should fire a warning on the
-        // second insert.
-        let _ =
-            crate::cli::test_utils::seed_memory(&db, "test-ns", "shared title", "first content");
+        // Seed a memory with a SIMILAR (not identical) title in the same
+        // namespace. A distinct title avoids the `(title, namespace)`
+        // upsert — if the titles matched exactly, `db::insert` would merge
+        // onto the seeded row, making `actual_id == seeded.id`, and the
+        // contradiction would be filtered out (line: `c.id != actual_id`)
+        // so the warning would never fire. The two titles share
+        // `{kubernetes, deployment}` of `{kubernetes, deployment, guide}` /
+        // `{kubernetes, deployment, notes}` → Jaccard 2/4 = 0.5 ≥ 0.30
+        // floor, so the seeded row surfaces as a potential contradiction.
+        let _ = crate::cli::test_utils::seed_memory(
+            &db,
+            "test-ns",
+            "kubernetes deployment guide",
+            "first content",
+        );
         let mut args = default_args();
-        args.title = "shared title".to_string();
+        args.title = "kubernetes deployment notes".to_string();
         args.content = "second content".to_string();
         {
             let mut out = env.output();
             run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap();
         }
-        // stderr may or may not contain the warning depending on the
-        // contradiction detector's heuristic; assert that at minimum
-        // the happy path stored the row without erroring.
+        // Happy path stored the new (distinct-title) row on stdout.
         assert!(env.stdout_str().contains("stored: "));
+        // And the similar seeded row fired the contradiction warning on
+        // stderr (exercises the non-json `if !filtered.is_empty()` branch).
+        let stderr = env.stderr_str();
+        assert!(
+            stderr.contains("potential contradictions"),
+            "expected contradiction warning on stderr, got: {stderr}"
+        );
     }
 
     #[test]
@@ -531,5 +546,129 @@ mod tests {
         let tags = v["tags"].as_array().unwrap();
         let strs: Vec<&str> = tags.iter().map(|t| t.as_str().unwrap()).collect();
         assert_eq!(strs, vec!["a", "b", "c"]);
+    }
+
+    // v0.7.0 F2.3 (#1427) — coverage for the Form-4 / Form-6 flag arms.
+
+    #[test]
+    fn test_store_form4_form6_flags_valid_roundtrip() {
+        // Exercises every Some(_) success arm (kind/citations/source_uri/
+        // source_span/entity_id) in a single store call.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.kind = Some("reflection".to_string());
+        args.citations = Some(
+            r#"[{"uri":"uri:https://example.com/a","accessed_at":"2026-05-31T00:00:00Z"}]"#
+                .to_string(),
+        );
+        args.source_uri = Some("uri:https://example.com/src".to_string());
+        args.source_span = Some(r#"{"start":0,"end":5}"#.to_string());
+        args.entity_id = Some("ent-123".to_string());
+        {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("test-agent"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["memory_kind"].as_str().unwrap(), "reflection");
+        assert_eq!(
+            v["source_uri"].as_str().unwrap(),
+            "uri:https://example.com/src"
+        );
+        assert_eq!(v["entity_id"].as_str().unwrap(), "ent-123");
+        assert_eq!(v["citations"].as_array().unwrap().len(), 1);
+        assert_eq!(v["source_span"]["end"].as_u64().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_store_invalid_kind_errors() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.kind = Some("ginormous".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(err.to_string().contains("invalid --kind"), "got: {err}");
+    }
+
+    #[test]
+    fn test_store_invalid_citations_json_errors() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.citations = Some("not-json".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --citations JSON"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_citations_entry_errors() {
+        // Well-formed JSON, but the entry fails validate_citation
+        // (bare URI without a uri:/doc:/file: scheme).
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.citations =
+            Some(r#"[{"uri":"example.com","accessed_at":"2026-05-31T00:00:00Z"}]"#.to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --citations entry"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_source_uri_errors() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.source_uri = Some("bareword-no-scheme".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-uri"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_source_span_json_errors() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.source_span = Some("not-json".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-span JSON"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_source_span_range_errors() {
+        // Valid JSON, but start >= end fails validate_source_span.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.source_span = Some(r#"{"start":5,"end":5}"#.to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-span"),
+            "got: {err}"
+        );
     }
 }
