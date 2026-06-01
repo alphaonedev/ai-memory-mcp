@@ -139,7 +139,7 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
 | `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
-| `autonomous` | full 73-tool surface (v0.7.0) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
+| `autonomous` | full 74-entry surface (v0.7.0) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
 Set the tier when starting the MCP server or running per-invocation
 subcommands (`mcp`, `store`, `recall`, etc.):

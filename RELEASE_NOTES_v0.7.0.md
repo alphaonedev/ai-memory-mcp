@@ -2,7 +2,7 @@
 
 **Tagged:** pending operator gate (post-merge of PR #820 ship-hardening bundle, 2026-05-20).
 **Theme:** attested cortex + Batman 7-form closeout + postgres+AGE first-class + 7-level provenance framework + visibility-gate cluster + typed refusal envelopes.
-**One-line summary:** v0.7.0 ships **73 MCP tools at `--profile full`** (was 43 at v0.6.3, 60 at the original `attested-cortex` cut, 71 at the post-grand-slam wave, 73 after the Provenance Gap 3 + Gap 4 surfaces landed), **7 always-on tools** at `--profile core` (the original 5 + `memory_load_family` + `memory_smart_load`), **88 production HTTP route registrations (74 unique URL paths)** on `127.0.0.1:9077` (canonical via [`src/lib.rs::build_router`](src/lib.rs)), all 7 Batman write-time-investment forms IMPLEMENTED, postgres + Apache AGE as a first-class storage backend, schema **v50** sqlite + v50 postgres in lockstep (canonical anchors: `CURRENT_SCHEMA_VERSION = 50` in [`src/storage/migrations.rs`](src/storage/migrations.rs) + [`src/store/postgres.rs`](src/store/postgres.rs); v50 = per-namespace K8 quota dimension extension #1156), per-agent Ed25519 attestation with a V-4 cross-row signed-events hash chain, the 7-level provenance framework (#884-#890), and a v0.7.0-wide visibility-gate cluster + typed refusal envelopes (#962/#963).
+**One-line summary:** v0.7.0 ships **74 MCP entries at `--profile full`** (73 callable memory tools + the always-on `memory_capabilities` bootstrap; was 43 at v0.6.3, 60 at the original `attested-cortex` cut, 71 at the post-grand-slam wave, 73 callable after the Provenance Gap 3 + Gap 4 surfaces landed), **7 always-on tools** at `--profile core` (the original 5 + `memory_load_family` + `memory_smart_load`), **88 production HTTP route registrations (74 unique URL paths)** on `127.0.0.1:9077` (canonical via [`src/lib.rs::build_router`](src/lib.rs)), all 7 Batman write-time-investment forms IMPLEMENTED, postgres + Apache AGE as a first-class storage backend, schema **v53** sqlite + v53 postgres in lockstep (canonical anchors: `CURRENT_SCHEMA_VERSION = 53` in [`src/storage/migrations.rs`](src/storage/migrations.rs) + [`src/store/postgres.rs`](src/store/postgres.rs); v50 = per-namespace K8 quota dimension extension #1156, advanced to v53 via the #1389 L4 transcript-dedup + #1418 FTS5 trigger-scoping migrations), per-agent Ed25519 attestation with a V-4 cross-row signed-events hash chain, the 7-level provenance framework (#884-#890), and a v0.7.0-wide visibility-gate cluster + typed refusal envelopes (#962/#963).
 
 ---
 
@@ -59,9 +59,10 @@ into `release/v0.7.0` ahead of the tag cut.
 
 ## Headline highlights
 
-- **73 MCP tools at `--profile full`** (verified against
+- **74 MCP entries at `--profile full`** (73 callable memory tools + the
+  always-on `memory_capabilities` bootstrap; verified against
   `Profile::full().expected_tool_count()` in [`src/profile.rs`](src/profile.rs);
-  rose from 71 at the post-grand-slam wave to 73 after the Provenance
+  rose from 71 at the post-grand-slam wave to 73 callable after the Provenance
   Gap 3 `memory_recall_observations` (#886) + Gap 4 `confidence_tier`
   surfacing (#887) landed). **7 always-on at `--profile core`** (the
   original 5 + the v0.7 B1/B2 loader pair). Default tool surface is
@@ -71,18 +72,20 @@ into `release/v0.7.0` ahead of the tag cut.
   [`src/lib.rs::build_router`](src/lib.rs); includes the
   `/api/v1/find_paths` route alias added under #934 + the visibility
   cluster's new admin / federation paths. Verified via codegraph
-  `codegraph_search kind=route`; the 88th `.route(` at `src/lib.rs:582`
+  `codegraph_search kind=route`; the 89th `.route(` at `src/lib.rs:995`
   is `/slow` under `#[cfg(test)]` and is not counted production-side).
-- **Schema v50 sqlite + v50 postgres in lockstep**
-  (`CURRENT_SCHEMA_VERSION = 50`; canonical anchors:
+- **Schema v53 sqlite + v53 postgres in lockstep**
+  (`CURRENT_SCHEMA_VERSION = 53`; canonical anchors:
   [`src/storage/migrations.rs`](src/storage/migrations.rs) for sqlite,
   [`src/store/postgres.rs`](src/store/postgres.rs) for postgres; latest
   on-disk migrations include the v48 federation_push_dlq table from #933,
   the v49 archived_memories 14-column carry from #1025 so archive →
-  restore is lossless for the full v0.7.0 26-field Memory shape, and the
+  restore is lossless for the full v0.7.0 26-field Memory shape, the
   v50 per-namespace K8 quota dimension extension from #1156 — `agent_quotas`
-  PRIMARY KEY extended from `(agent_id)` to `(agent_id, namespace)`;
-  pre-v50 rows backfill to the `_global` sentinel namespace).
+  PRIMARY KEY extended from `(agent_id)` to `(agent_id, namespace)`,
+  pre-v50 rows backfill to the `_global` sentinel namespace — then the
+  v52 transcript-line dedup carry from #1389 L4 and the v53 FTS5
+  trigger-scoping fix from #1418).
 - **Batman 6-form audit + Forms 1-6 + 7th-form (Option-B foundation)
   closeout.** All 7 forms IMPLEMENTED at HEAD `c9472c1`. See
   [`docs/internal/batman-framework-audit.md`](docs/internal/batman-framework-audit.md)
