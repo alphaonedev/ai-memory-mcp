@@ -39,7 +39,7 @@ action required for the database itself.
 | **DB schema** | v33 | v49 (16 migrations bridge the gap, auto-applied on first open) |
 | **Memory struct** | 15 fields | 26 fields (added reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, version) |
 | **MemoryLink variants** | 4 (related_to, supersedes, contradicts, derived_from) | 6 (+ reflects_on, derives_from) |
-| **MCP tools at `--profile full`** | ~60 | **73** (72 callable + memory_capabilities bootstrap) |
+| **MCP tools at `--profile full`** | ~60 | **74** (73 callable + memory_capabilities bootstrap) |
 | **MCP tools at `--profile core`** | 5 | **7** (added memory_load_family + memory_smart_load) |
 | **CLI subcommands** | 40 | **58** (added `config migrate`, `atomise`, `persona`, `skill <…>`, `verify-signed-events-chain`, …) |
 | **`ai-memory doctor`** | 7 sections | **9 sections** (+ Reflection Health + LLM Reachability) |
@@ -198,7 +198,7 @@ for H in $FLEET; do ssh "$H" 'ai-memory restart && ai-memory doctor'; done
 If you run `ai-memory serve --store-url postgres://…` with the
 `sal-postgres` feature, the schema upgrade happens via
 `ai-memory schema-init --upgrade` walking the in-process
-`migrate_v34()…migrate_v50()` async ladder. Apache AGE
+`migrate_v34()…migrate_v53()` async ladder. Apache AGE
 (`memory_graph`) is provisioned by the same command if missing.
 See [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
 for the postgres-specific recipe.
@@ -214,7 +214,7 @@ for the postgres-specific recipe.
   clients that hardcode the 5-tool surface and refuse unknown
   tools will need an update. The new tools (`memory_load_family`,
   `memory_smart_load`) are read-only loaders.
-- **`tools/list` returns 73 entries** at `--profile full` (was ~60
+- **`tools/list` returns 74 entries** at `--profile full` (was ~60
   at v0.6.4, 43 at v0.6.3). Operator scripts using
   `jq '.tools | length == 60'` will diverge.
 

@@ -53,8 +53,8 @@
         "description": "Autonomy + observation: memory_reflect / memory_replay / memory_quota_status / memory_atomise / memory_verify plus core."
       },
       "full": {
-        "tool_count": 73,
-        "description": "Every advertised tool. 72 callable memory tools + always-on memory_capabilities bootstrap. Asserted by Profile::full().expected_tool_count() == 73 in src/profile.rs."
+        "tool_count": 74,
+        "description": "Every advertised tool. 73 callable memory tools + always-on memory_capabilities bootstrap. Asserted by Profile::full().expected_tool_count() == 74 in src/profile.rs."
       }
     },
     "prompts": ["recall-first", "memory-workflow"],
