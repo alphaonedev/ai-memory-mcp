@@ -293,7 +293,7 @@ of scope here), so we use the substrate-visible signals — `access_count`,
 `last_accessed_at`, `created_at` proximity — that approximate it."* The proxy
 is admitted as approximate.
 
-**Required for v1.0.** `recall_events` table (schema v51):
+**Required for v1.0.** `recall_events` table (new schema migration above the v0.7.0 v53 baseline):
 `(recall_id UUIDv4, namespace, candidate_id, score, surfaced bool, rank,
 observed_at)`. `ReflectionPass` cluster signal switches from access-count
 proxy to real co-recall via JOIN on `recall_events` grouped by `recall_id`.
@@ -388,7 +388,7 @@ another 0.x increment:
 Week 1-2  ─ 4.1.2 reflector LLM provenance (3d)
             4.1.3 hook circuit breaker (5d)
             GA discipline — legacy v0.6.x config removal
-Week 2-3  ─ 4.1.4 recall-event log (7d, schema v51)
+Week 2-3  ─ 4.1.4 recall-event log (7d, new schema migration)
 Week 3-4  ─ 4.1.1 reflection rollback + verify auto-trigger (8d)
 Week 4-5  ─ 4.2.1 adversarial detection (6d)
             4.2.2 persona invalidation cascade (4d)

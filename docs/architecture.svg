@@ -130,7 +130,7 @@
     <!-- DB -->
     <text x="220" y="355" text-anchor="middle" class="title">SQLite + FTS5</text>
     <text x="220" y="372" text-anchor="middle" class="subtitle">WAL mode · 3 tables</text>
-    <text x="220" y="398" text-anchor="middle" class="subtitle">storage/ · schema v50</text>
+    <text x="220" y="398" text-anchor="middle" class="subtitle">storage/ · schema v53</text>
 
     <!-- Divider -->
     <line x1="330" y1="340" x2="330" y2="400" class="line" style="opacity:0.3"/>
