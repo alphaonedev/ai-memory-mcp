@@ -13,7 +13,7 @@
 All three interfaces share the same database layer (`db.rs`) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (57 subcommands at v0.7.0 with --features sal-postgres, 55 in the default build)
+main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (81 subcommands at v0.7.0 with --features sal-postgres, 79 in the default build)
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (26 fields at v0.7.0), MemoryLink (6 relations at v0.7.0), MemoryKind (Batman Form-6 vocab), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs); Axum extractors + JSON responses; error sanitization

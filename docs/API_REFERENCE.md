@@ -769,7 +769,7 @@ agent-identity headers documented above. Wire-shape source of truth is
 
 ### v0.7.0 net-new MCP tools
 
-The 28 MCP tools added since v0.6.4 are documented inline in
+The 31 MCP tools added since v0.6.4 are documented inline in
 `src/mcp/registry.rs` and enumerated in
 [`docs/MIGRATION_v0.7.md` §"New MCP tools"](MIGRATION_v0.7.md#new-mcp-tools).
 Highlights for HTTP-equivalent surfaces:
