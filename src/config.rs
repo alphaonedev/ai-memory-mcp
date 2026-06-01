@@ -2533,7 +2533,7 @@ const CONFIG_FILE: &str = "config.toml";
 ///
 /// All fields are optional — CLI flags override file values, which override
 /// compiled defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Feature tier: keyword, semantic, smart, autonomous
     pub tier: Option<String>,
@@ -2625,8 +2625,15 @@ pub struct AppConfig {
     /// #1262 — `skip_serializing` prevents the secret from being
     /// echoed back through any `serde_json::to_string(&AppConfig)`
     /// path (capabilities overlays, debug dumps, audit traces).
-    /// #1258 — the manual `Drop` impl on `AppConfig` zeroizes this
-    /// buffer on scope exit.
+    /// #1454 — the manual `Debug` impl on `AppConfig` (just below the
+    /// struct) renders this field as `<redacted>`, so a `{:?}` of the
+    /// config never leaks the secret either (`skip_serializing` only
+    /// guards the serde JSON path, not `Debug`).
+    /// #1258 — [`AppConfig::zeroize_secrets`] (a free helper method,
+    /// NOT a blanket `Drop` impl) zeroizes this buffer; callers invoke
+    /// it immediately before scope-exit. A blanket `Drop` is
+    /// deliberately avoided so the `..AppConfig::default()`
+    /// struct-update spread used across ~20 test sites still compiles.
     #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     /// Maximum archive age in days for automatic purge during GC (default: disabled)
@@ -2853,6 +2860,64 @@ pub struct AppConfig {
     pub storage: Option<StorageSection>,
 }
 
+// #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
+// `<redacted>` instead of leaking through a `{:?}` of the whole config
+// (mirrors the `ResolvedLlm` redaction model further down this file).
+// Every other field is rendered verbatim. KEEP IN SYNC: a new field on
+// `AppConfig` must be mirrored here or it silently drops from Debug.
+#[allow(deprecated)] // legacy flat fields are deprecated but still debugged
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("tier", &self.tier)
+            .field("db", &self.db)
+            .field("ollama_url", &self.ollama_url)
+            .field("embed_url", &self.embed_url)
+            .field("embedding_model", &self.embedding_model)
+            .field("llm_model", &self.llm_model)
+            .field("auto_tag_model", &self.auto_tag_model)
+            .field("cross_encoder", &self.cross_encoder)
+            .field("default_namespace", &self.default_namespace)
+            .field("max_memory_mb", &self.max_memory_mb)
+            .field("ttl", &self.ttl)
+            .field("archive_on_gc", &self.archive_on_gc)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("archive_max_days", &self.archive_max_days)
+            .field("identity", &self.identity)
+            .field("scoring", &self.scoring)
+            .field("autonomous_hooks", &self.autonomous_hooks)
+            .field("logging", &self.logging)
+            .field("audit", &self.audit)
+            .field("boot", &self.boot)
+            .field("mcp", &self.mcp)
+            .field("permissions", &self.permissions)
+            .field("transcripts", &self.transcripts)
+            .field("hooks", &self.hooks)
+            .field("subscriptions", &self.subscriptions)
+            .field("verify", &self.verify)
+            .field(
+                "postgres_statement_timeout_secs",
+                &self.postgres_statement_timeout_secs,
+            )
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("llm_call_timeout_secs", &self.llm_call_timeout_secs)
+            .field(
+                "mcp_federation_forward_url",
+                &self.mcp_federation_forward_url,
+            )
+            .field("agents", &self.agents)
+            .field("governance", &self.governance)
+            .field("confidence", &self.confidence)
+            .field("admin", &self.admin)
+            .field("schema_version", &self.schema_version)
+            .field("llm", &self.llm)
+            .field("embeddings", &self.embeddings)
+            .field("reranker", &self.reranker)
+            .field("storage", &self.storage)
+            .finish()
+    }
+}
+
 impl AppConfig {
     /// #1258 — manually zeroize the `api_key` buffer. Callers that hold
     /// the only owner of an `AppConfig` and are about to drop it
@@ -3014,7 +3079,7 @@ impl AdminConfig {
 /// `[llm]` section > legacy flat fields (`llm_model`, `ollama_url`) >
 /// compiled default (warn-logged once on the resolver's `CompiledDefault`
 /// arm).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSection {
     /// Backend selector. One of: `ollama` (native `/api/chat` +
     /// `/api/embed`, no auth), `openai-compatible` (generic; requires
@@ -3067,6 +3132,25 @@ pub struct LlmSection {
     /// fields fall back to the parent.
     #[serde(default)]
     pub auto_tag: Option<LlmAutoTagSection>,
+}
+
+// #1454 (SEC, LOW) — manual `Debug` redacts the parse-time-rejected
+// inline `api_key` so a `{:?}` of an `LlmSection` never echoes a secret
+// (mirrors `ResolvedLlm`). `api_key_env` / `api_key_file` are env-var
+// names / file paths (config, not secret) and stay verbatim. KEEP IN
+// SYNC: a new field must be mirrored here or it drops from Debug.
+impl std::fmt::Debug for LlmSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmSection")
+            .field("backend", &self.backend)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key_file", &self.api_key_file)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("auto_tag", &self.auto_tag)
+            .finish()
+    }
 }
 
 /// v0.7.x (#1146) — `[llm.auto_tag]` sub-table. Fast structured-output
@@ -8097,6 +8181,60 @@ legacy_scoring = false
         assert!(
             dbg.contains("<redacted>"),
             "Debug impl must show <redacted> placeholder: {dbg}"
+        );
+    }
+
+    /// #1454 (SEC, LOW) — a `{:?}` of an `AppConfig` carrying the HTTP
+    /// `api_key` MUST NOT echo the secret. `skip_serializing` only
+    /// guarded the serde JSON path; the derived `Debug` leaked it. The
+    /// manual `Debug` impl redacts the field while preserving the rest.
+    #[test]
+    fn app_config_1454_debug_redacts_api_key() {
+        let cfg = AppConfig {
+            tier: Some("autonomous".into()),
+            api_key: Some("HTTP-BEARER-SUPER-SECRET".into()),
+            ..AppConfig::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("HTTP-BEARER-SUPER-SECRET"),
+            "AppConfig Debug must redact api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "AppConfig Debug must show <redacted> placeholder: {dbg}"
+        );
+        // Non-secret fields still render so the impl stays useful.
+        assert!(
+            dbg.contains("autonomous"),
+            "AppConfig Debug must still render non-secret fields: {dbg}"
+        );
+    }
+
+    /// #1454 (SEC, LOW) — a `{:?}` of an `LlmSection` carrying an
+    /// inline (parse-time-rejected, but still constructable in-memory)
+    /// `api_key` MUST redact it; the env-var-name / file-path reference
+    /// fields stay verbatim because they are not secrets.
+    #[test]
+    fn llm_section_1454_debug_redacts_api_key() {
+        let section = LlmSection {
+            backend: Some("xai".into()),
+            api_key: Some("LLM-INLINE-SUPER-SECRET".into()),
+            api_key_env: Some("XAI_API_KEY".into()),
+            ..LlmSection::default()
+        };
+        let dbg = format!("{section:?}");
+        assert!(
+            !dbg.contains("LLM-INLINE-SUPER-SECRET"),
+            "LlmSection Debug must redact api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "LlmSection Debug must show <redacted> placeholder: {dbg}"
+        );
+        assert!(
+            dbg.contains("XAI_API_KEY"),
+            "api_key_env (a name, not a secret) must stay verbatim: {dbg}"
         );
     }
 }
