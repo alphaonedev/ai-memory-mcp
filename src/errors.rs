@@ -42,6 +42,14 @@ pub mod error_codes {
     /// a scattered string literal at 4 production sites; centralised
     /// here as the canonical shared slug.
     pub const QUOTA_EXCEEDED: &str = "QUOTA_EXCEEDED";
+    /// #626 Layer-3 (C7) — agent-attestation gate rejection on the write
+    /// path. Emitted (403 FORBIDDEN) by the HTTP create-handler
+    /// (`src/handlers/create.rs`) when a presented Ed25519 signature fails
+    /// to verify against the agent's bound public key, or when
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set and the write is
+    /// unsigned / the agent has no bound key. The MCP store path surfaces
+    /// the same condition as a plain error string.
+    pub const ATTESTATION_FAILED: &str = "ATTESTATION_FAILED";
 
     // ---- StorageError-side (substrate-facing) -------------------------------
     pub const PENDING_ACTION_NOT_FOUND: &str = "PENDING_ACTION_NOT_FOUND";

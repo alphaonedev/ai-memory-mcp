@@ -78,17 +78,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Known property gaps at v0.7.0 (named, not elided)
 
-- **§2.2 capture vs §2.5 attestation.** L4 `memory_capture_turn` is the
-  first surface that captures coherently *and* offers an optional
-  attestation path — but `metadata.agent_id` remains a *claimed*, not
-  *attested*, identity (the allowlist is empty by default, so the default
-  capture lands unsigned). The signed path is verified
-  ([#1414](https://github.com/alphaonedev/ai-memory-mcp/issues/1414));
-  closing the claimed→attested gap end-to-end is agent-registration work
-  tracked alongside the heterogeneous-panel adjudication
-  ([#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171)).
+- **§2.2 capture vs §2.5 attestation.** The claimed→attested *join* on
+  the store write path is now **closed** by #626 Layer-3: a caller may
+  present a detached Ed25519 `signature` (+ signed `created_at`) on the
+  MCP `memory_store`, HTTP `POST /api/v1/memories` (sqlite + postgres),
+  and CLI store paths; a valid signature against the agent's bound
+  pubkey lands `attest_level = "agent_attested"`, a forged one is
+  rejected `403 ATTESTATION_FAILED`, and operators can require
+  attestation fail-closed via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
+  ([#626](https://github.com/alphaonedev/ai-memory-mcp/issues/626)).
+  The remaining open edge is the *default-path* identity: when no
+  signature is presented (and require-attestation is off),
+  `metadata.agent_id` is still a *claimed*, not *attested*, identity —
+  e.g. the default L4 `memory_capture_turn` capture lands unsigned
+  because its host allowlist is empty by default
+  ([#1414](https://github.com/alphaonedev/ai-memory-mcp/issues/1414)).
+  Driving attestation to the default across every surface is the
+  agent-registration work tracked alongside the heterogeneous-panel
+  adjudication ([#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171)).
   This is a tracked gap, not a regression: §2.2 and §2.5 are both
-  advanced this cycle; the *join* between them is the open edge.
+  advanced this cycle and the write-path join is now closed.
 - **§2.6 bias-displaced — policy, not architecture.** Per ROADMAP §5,
   producer/reflector decorrelation (e.g. a Claude-family producing agent
   with a non-Claude curator backend) is currently a deployment-policy
@@ -114,6 +123,67 @@ Full-spectrum multi-agent security review of the v0.7.0 substrate. Each finding 
 #### Docs
 
 - **[#1456](https://github.com/alphaonedev/ai-memory-mcp/issues/1456)** — document the `SAFETY` invariant for the cross-encoder `mmap` load in `reranker.rs` (commit `3085c6f54`).
+
+### #626 Layer-3 — claimed→attested agent_id closure on the store write path (2026-06-01)
+
+Closes the §2.2-↔-§2.5 *join* on the write path named in the "Known
+property gaps" note above: a remote caller can now cryptographically
+attest a memory write at store time, and the substrate verifies it
+fail-closed rather than trusting the claimed `metadata.agent_id`.
+Parent epic **[#626](https://github.com/alphaonedev/ai-memory-mcp/issues/626)**;
+decorrelation theme cross-referenced from
+**[#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171)**.
+
+The bounded architecture lift landed across C1–C8: C1 `SignableWrite`
+signing + C2 pubkey wire validator (`cb6ecdd51`), C3 bind/fetch agent
+pubkey in registration metadata (`bd173cf81`), C4 `verify_write` +
+`attest_write` gate + helpers (`8e6d29c39`, `7e290f981`, `46a49e409`),
+C5 CLI `bind-key`/`revoke-key` + `--sign` (`c58fea751`, `44ec4a4e0`).
+This batch completes the surface with C6 + C7:
+
+#### Added
+
+- **C7 — store-path signature wire across all three surfaces.** A caller
+  may present a standard-base64 detached Ed25519 `signature` over the
+  canonical `SignableWrite` envelope (`agent_id` + `namespace` + `title`
+  + `kind` + `created_at` + `sha256(content)`) plus the `created_at` it
+  signed. On the MCP `memory_store` tool, the HTTP `POST /api/v1/memories`
+  route (both the sqlite and the postgres SAL paths), and the CLI store
+  path, the daemon verifies the signature against the agent's bound
+  public key and stamps `metadata.attest_level = "agent_attested"` on
+  success (adopting the signed `created_at` verbatim). A forged signature
+  is rejected with `403 ATTESTATION_FAILED`; a presented signature
+  without a paired `created_at`, or with a malformed / stale / post-dated
+  `created_at`, is rejected with `400`. New `signature` + `created_at`
+  optional fields on the MCP `StoreRequest` and the HTTP `CreateMemory`
+  DTOs; new `ATTESTATION_FAILED` error code.
+- **`AI_MEMORY_REQUIRE_AGENT_ATTESTATION`** (env table row #48) — a
+  fail-CLOSED opt-in. When truthy (`1`/`true`), any store write lacking a
+  caller-presented signature is rejected with `403 ATTESTATION_FAILED`
+  instead of landing `attest_level = "claimed"`; default `false`
+  preserves the v0.6.x permissive posture. Mirrors the federation
+  `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` secure-opt-in convention.
+- **`prepare_signed_store` shared helper** (`src/identity/attest.rs`) —
+  single decode + freshness-window (±`ATTEST_CREATED_AT_SKEW_SECS` =
+  300s) validator shared by every write surface so the 400/403 wire
+  wording stays byte-identical across MCP, HTTP, and CLI.
+
+#### Tests (C6)
+
+- **`tests/agent_attestation_integrity.rs`** — end-to-end HTTP
+  integration over `POST /api/v1/memories` (sqlite): signed write stamps
+  `agent_attested` + adopts `created_at`; forged signature → `403`
+  `ATTESTATION_FAILED`; signature without `created_at` → `400`; required
+  attestation rejects an unsigned write → `403`.
+- **`tests/agent_attestation_postgres.rs`** — the same matrix over the
+  postgres SAL create path (`create_memory_postgres`) via the fake-PG
+  harness (`StorageBackend::Postgres` + `SqliteStore`), covering the
+  async `stamp_attestation_async` gate that the sqlite suite never
+  reaches.
+- MCP `memory_store` unit tests (signed → attested, forged → reject,
+  missing/stale `created_at` → error) and `prepare_signed_store` unit
+  tests; new `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` truthy-parse pin in
+  `tests/config_precedence.rs`.
 
 ### v0.7.0 three-surface parity + AttestLevel + SSOT batch (2026-05-30/31)
 

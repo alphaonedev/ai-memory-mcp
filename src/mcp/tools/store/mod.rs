@@ -116,6 +116,28 @@ pub struct StoreRequest {
     #[serde(default)]
     #[schemars(description = "#885 Source URI (doc:/uri:/file:); indexed for #889.")]
     pub source_uri: Option<String>,
+
+    /// #626 Layer-3 (C7) — detached Ed25519 agent-attestation signature,
+    /// standard base64, over the `SignableWrite` envelope
+    /// (agent_id+namespace+title+kind+created_at+sha256(content)). When
+    /// present, `created_at` MUST also be supplied (the signer cannot
+    /// predict the server clock). A signature that fails to verify against
+    /// the agent's bound public key is always rejected.
+    #[serde(default)]
+    #[schemars(
+        description = "#626 Ed25519 attestation signature (std base64); pair with created_at."
+    )]
+    pub signature: Option<String>,
+
+    /// #626 Layer-3 (C7) — RFC3339 timestamp the caller signed. Required
+    /// when `signature` is present; the server validates it against a
+    /// ±300s freshness window and then adopts it verbatim so the verifier
+    /// re-derives the identical signed envelope.
+    #[serde(default)]
+    #[schemars(
+        description = "#626 RFC3339 created_at the caller signed (required with signature)."
+    )]
+    pub created_at: Option<String>,
 }
 
 /// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_store`.
@@ -283,6 +305,45 @@ pub(crate) fn handle_store(
     let auto_classify_policy = db::resolve_governance_policy(conn, &mem.namespace)
         .and_then(|p| p.kind_class.auto_classify_kind);
     crate::hooks::pre_store::maybe_auto_classify(&mut mem, auto_classify_policy);
+
+    // #626 Layer-3 (C7) — agent-attestation gate on the MCP store path.
+    // A remote caller signs the `SignableWrite` envelope
+    // (agent_id+namespace+title+kind+created_at+sha256(content)) and
+    // presents the detached Ed25519 signature (standard base64) plus the
+    // `created_at` it signed. Because the signed surface commits to
+    // `created_at` — which the server normally stamps with `now()` — the
+    // remote signer must supply the timestamp it used; the server validates
+    // it against a bounded freshness window (replay / post-dating guard)
+    // and then adopts it verbatim so the verifier re-derives the identical
+    // envelope. With no signature the path is byte-equal to the legacy
+    // build unless the operator set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`,
+    // in which case the unsigned write is rejected by the gate.
+    {
+        let presented_sig = params["signature"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(sig_b64) = presented_sig {
+            let (sig_bytes, signed_created_at) = crate::identity::attest::prepare_signed_store(
+                sig_b64,
+                params["created_at"].as_str(),
+            )?;
+            // Adopt the signed timestamp verbatim so the verifier rebuilds
+            // the identical envelope. `created_at` is the only signed time
+            // field; `updated_at` stays at the server's persist time.
+            mem.created_at = signed_created_at.to_string();
+            crate::identity::attest::stamp_attestation_sync(
+                conn,
+                &mut mem,
+                &agent_id,
+                Some(&sig_bytes),
+            )
+            .map_err(|e| e.to_string())?;
+        } else if crate::identity::attest::require_agent_attestation_enabled() {
+            crate::identity::attest::stamp_attestation_sync(conn, &mut mem, &agent_id, None)
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     // #969 — single `to_value(&mem)` shared across the K9 permission
     // gate and the K3 governance gate below. Pre-fix the two scoped

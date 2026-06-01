@@ -4,7 +4,7 @@
 //! Wave 2 Tier-A7 (issue #855) — pin the canonical environment-variable
 //! precedence ladder + secret-classification invariant.
 //!
-//! CLAUDE.md §"Environment Variables" enumerates all 28 production
+//! CLAUDE.md §"Environment Variables" enumerates the production
 //! `AI_MEMORY_*` env vars and asserts the ladder:
 //!
 //! ```text
@@ -36,6 +36,15 @@
 //!    against a future refactor that absent-mindedly piped env state
 //!    into the capabilities document (e.g. via a generic
 //!    `env::vars()` walk).
+//!
+//! 4. **`test_require_agent_attestation_env_parsing`** (#626 Layer-3
+//!    C7) — the `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` gate flag
+//!    (table row #48) is a fail-CLOSED opt-in: `1`/`true`
+//!    (case-insensitive) enable it, anything else (including unset)
+//!    leaves the permissive default. Pins the truthy-parse semantics
+//!    of `require_agent_attestation_enabled()` so a regression that
+//!    flipped the default to fail-CLOSED, or that broadened the truthy
+//!    set, surfaces here.
 //!
 //! All three tests serialize env mutation through the shared
 //! `EnvVarGuard` (process-wide `ENV_LOCK`) so parallel test execution
@@ -220,5 +229,54 @@ fn test_secret_not_in_capabilities() {
         !response_v3_str.contains("AI_MEMORY_DB_PASSPHRASE"),
         "v3 memory_capabilities response MUST NOT mention the secret env-var \
          name either; got: {response_v3_str}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. AI_MEMORY_REQUIRE_AGENT_ATTESTATION (#626 Layer-3 C7) truthy parsing.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_require_agent_attestation_env_parsing() {
+    use ai_memory::identity::attest::require_agent_attestation_enabled;
+
+    // ---- Default (unset) → permissive ----
+    let guard = EnvVarGuard::remove("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+    assert!(
+        !require_agent_attestation_enabled(),
+        "unset AI_MEMORY_REQUIRE_AGENT_ATTESTATION MUST resolve permissive (false)",
+    );
+    drop(guard);
+
+    // ---- "1" → enabled ----
+    let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1".to_string());
+    assert!(
+        require_agent_attestation_enabled(),
+        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 MUST enable strict attestation",
+    );
+    drop(guard);
+
+    // ---- "true"/"TRUE" → enabled (case-insensitive) ----
+    let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "TRUE".to_string());
+    assert!(
+        require_agent_attestation_enabled(),
+        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=TRUE MUST enable strict attestation (case-insensitive)",
+    );
+    drop(guard);
+
+    // ---- Any other value → permissive (no broad truthiness) ----
+    let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0".to_string());
+    assert!(
+        !require_agent_attestation_enabled(),
+        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 MUST stay permissive",
+    );
+    drop(guard);
+
+    let _guard = EnvVarGuard::set(
+        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+        "yes-please".to_string(),
+    );
+    assert!(
+        !require_agent_attestation_enabled(),
+        "a non-1/true value MUST NOT be treated as truthy",
     );
 }
