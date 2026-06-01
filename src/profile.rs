@@ -579,9 +579,11 @@ impl Profile {
         }
     }
 
-    /// `admin` — core + lifecycle + governance. 20 tools (v0.7 B1
-    /// added `memory_load_family` to core; v0.7 B2 added
-    /// `memory_smart_load` to core).
+    /// `admin` — core + lifecycle + governance. 21 tools
+    /// (core 7 + lifecycle 6 + governance 8; v0.7 B1 added
+    /// `memory_load_family` to core; v0.7 B2 added
+    /// `memory_smart_load` to core; #1389 L4 added
+    /// `memory_capture_turn` to lifecycle, 20 → 21).
     #[must_use]
     pub fn admin() -> Self {
         Self {
@@ -589,8 +591,8 @@ impl Profile {
         }
     }
 
-    /// `power` — core + power. 15 tools (v0.7 B1 added
-    /// `memory_load_family` to core; v0.7 B2 added `memory_smart_load`
+    /// `power` — core + power. 30 tools (core 7 + power 23; v0.7 B1
+    /// added `memory_load_family` to core; v0.7 B2 added `memory_smart_load`
     /// to core; v0.7 K7 added the two subscription-reliability tools
     /// to `Family::Power`).
     #[must_use]
