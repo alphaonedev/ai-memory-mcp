@@ -18,7 +18,7 @@
 
 ## 1. TL;DR migration verdict
 
-- **What changes.** The sqlite schema jumps from **v15 → v51** — 11 new columns
+- **What changes.** The sqlite schema jumps from **v15 → v53** — 11 new columns
   on the `memories` table (citations, source URIs, byte-range spans, memory
   kind, entity id, persona version, confidence provenance + signals + decay
   stamp, optimistic-concurrency `version`, plus the QW-2 `auto_persona_entity_id`
@@ -35,7 +35,7 @@
   because of the QW-2 `auto_persona_entity_id` backfill scan.
 - **Rollback supported?** **Yes — via file restore from the pre-upgrade
   backup.** The schema ladder is idempotent on replay but NOT reversible in
-  place; once `schema_version` reaches 49, you cannot ALTER the columns away.
+  place; once `schema_version` reaches 53, you cannot ALTER the columns away.
   Rollback means stopping the v0.7.0 binary, restoring the `.bak.pre-v07` file
   you took in step 2 of §4, and reinstalling the v0.6.4 binary. Data written
   while you were on v0.7.0 is lost in that rollback — see §7.
@@ -67,7 +67,7 @@ one you're in until it's too late.
   sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 'PRAGMA integrity_check;'
   # Expected output: ok
   sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 \
-    'SELECT user_version FROM pragma_user_version;'
+    'SELECT MAX(version) FROM schema_version;'
   # Expected output for v0.6.4 installs: 15 (or whatever your version is — note it)
   ```
 - [ ] **Config file.** Copy your config too:
@@ -87,7 +87,7 @@ one you're in until it's too late.
   > permission-tightening sweep can render them unreadable.
 - [ ] **Note your current schema version** for the rollback path:
   ```bash
-  sqlite3 ~/.local/share/ai-memory/ai-memory.db 'PRAGMA user_version;'
+  sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
   # On v0.6.4 you should see 15. Write this down.
   ```
 - [ ] **Disk space.** The schema migration creates several new tables and
@@ -136,7 +136,7 @@ ai-memory start
 ```
 
 That's it. The first `ai-memory start` after the upgrade walks the schema
-ladder v15 → v51 against your DB in place. It's idempotent — if you Ctrl-C
+ladder v15 → v53 against your DB in place. It's idempotent — if you Ctrl-C
 during the migration, restart and the unfinished bumps resume from where they
 stopped.
 
@@ -145,8 +145,8 @@ To confirm you landed cleanly:
 ```bash
 ai-memory doctor --tokens                                       # general health
 ai-memory recall "anything"                                     # smoke recall
-sqlite3 ~/.local/share/ai-memory/ai-memory.db 'PRAGMA user_version;'
-# Expected: 49
+sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
+# Expected: 53
 ```
 
 If any of those go sideways, jump to §9 (Troubleshooting).
@@ -203,8 +203,8 @@ ai-memory --version
 
 ### 4.4 First-boot schema migration
 
-Start the daemon. The first boot detects `user_version=15` (your v0.6.4 state)
-and walks the ladder up to 49.
+Start the daemon. The first boot detects `schema_version=15` (your v0.6.4 state)
+and walks the ladder up to 53.
 
 ```bash
 ai-memory serve --foreground 2>&1 | tee ~/.local/share/ai-memory/migrate.log
@@ -217,8 +217,8 @@ Expected log lines, in rough order:
 
 ```
 [INFO] opening sqlite db at ~/.local/share/ai-memory/ai-memory.db
-[INFO] current schema_version=15, target schema_version=49
-[INFO] applying migration 0015..0049 idempotent ladder
+[INFO] current schema_version=15, target schema_version=53
+[INFO] applying migration 0015..0053 idempotent ladder
 [INFO] migration v16 applied (pending_action_timeouts)
 [INFO] migration v17 applied (transcripts)
 …
@@ -256,8 +256,8 @@ clean signals:
 
 ```bash
 # Schema is at the v0.7.0 target.
-sqlite3 ~/.local/share/ai-memory/ai-memory.db 'PRAGMA user_version;'
-# Expected: 49
+sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
+# Expected: 53
 
 # Row counts match your pre-upgrade backup.
 sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 \
@@ -310,7 +310,7 @@ upgrade path differs because schema bumps land via the `ai-memory schema-init
 --upgrade` command rather than via the daemon's first-boot ladder.
 
 **Read [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) for the
-full runbook.** It covers schema-init upgrades, the v15→v28→v51 paths, the
+full runbook.** It covers schema-init upgrades, the v15→v28→v53 paths, the
 AGE projection prime, and the cutover dance.
 
 ### 5.1 Executive summary (do not skip the full doc)
@@ -329,13 +329,13 @@ AGE projection prime, and the cutover dance.
      --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory \
      --upgrade
    ```
-   This walks the postgres ladder up to schema v51 idempotently, preserving
+   This walks the postgres ladder up to schema v53 idempotently, preserving
    data.
 5. **Verify schema parity:**
    ```bash
    psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
      -tAc "SELECT version FROM _ai_memory_schema_version ORDER BY version DESC LIMIT 1;"
-   # → 50
+   # → 53
    ```
 6. **Restart and validate:**
    ```bash
@@ -350,7 +350,7 @@ AGE projection prime, and the cutover dance.
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
 Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
-the SAL boundary is byte-stable across both backends at schema v51.
+the SAL boundary is byte-stable across both backends at schema v53.
 
 ---
 
@@ -360,7 +360,7 @@ This section walks the 11 new columns on the `memories` table and the WHY
 behind each. The detailed call-out paragraphs follow the summary table.
 Schema-deep readers, see
 [`MIGRATION_v0.7.md` §"Per-bump narrative"](MIGRATION_v0.7.md) for the v34 →
-v51 ladder.
+v53 ladder.
 
 ### Summary table
 
@@ -410,7 +410,7 @@ And new tables (opt-in / empty if you never use the feature): `signed_events` (V
 
 **6.11 `version`** (v45, Provenance Gap 1 / #884). Optimistic-concurrency counter. Bumped on every `memory_update`. Two callers writing against the same `expected_version` race one winner; the loser receives a typed CONFLICT envelope naming the current version. v0.6.4 was last-writer-wins and quietly destroyed concurrent edits.
 
-The bump-by-bump v34 → v51 narrative lives in
+The bump-by-bump v34 → v53 narrative lives in
 [`MIGRATION_v0.7.md` §"Upgrade steps"](MIGRATION_v0.7.md).
 
 ---
@@ -419,7 +419,7 @@ The bump-by-bump v34 → v51 narrative lives in
 
 > **Rollback loses every memory you wrote while on v0.7.0.** The pre-upgrade
 > backup is the only readable v0.6.4-shaped database you have; once v0.7.0
-> migrates the original, the original is at v51 and v0.6.4 can't open it.
+> migrates the original, the original is at v53 and v0.6.4 can't open it.
 > Plan for this — don't migrate until you have a backup and a stop-the-world
 > plan.
 
@@ -468,7 +468,7 @@ ai-memory --version                                             # confirm 0.6.4
 
 ```bash
 ai-memory start
-sqlite3 ~/.local/share/ai-memory/ai-memory.db 'PRAGMA user_version;'
+sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
 # Expected: 15 (your pre-v0.7.0 version)
 ai-memory recall "a memory you knew was there pre-upgrade"
 ```
@@ -605,19 +605,19 @@ directly) fails because it expects a v0.7.0 column that isn't there.
 
 **Cause:** The schema migration didn't run. Most likely you copied the
 v0.7.0 binary in place but never started it against the DB, OR the
-migration aborted partway and the daemon never reached v51.
+migration aborted partway and the daemon never reached v53.
 
 **Fix:**
 ```bash
-sqlite3 ~/.local/share/ai-memory/ai-memory.db 'PRAGMA user_version;'
-# If <49: rerun:
+sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
+# If <53: rerun:
 ai-memory serve --foreground 2>&1 | tee ~/.local/share/ai-memory/migrate.log
-# Watch the log for migration completion; halt only after schema_version=49.
+# Watch the log for migration completion; halt only after schema_version=53.
 ```
 
-### 9.3 "schema_version=49 but column missing" (very rare)
+### 9.3 "schema_version=53 but column missing" (very rare)
 
-**Symptom:** `PRAGMA user_version;` reports `49` but a SELECT against one of
+**Symptom:** `SELECT MAX(version) FROM schema_version;` reports `53` but a SELECT against one of
 the new columns errors out.
 
 **Cause:** A migration crash between the column ADD and the version-bump
@@ -628,7 +628,7 @@ memories` and your migration log.
 **Workaround:** Reduce the recorded version to before the failing bump
 manually, then restart:
 ```bash
-sqlite3 ~/.local/share/ai-memory/ai-memory.db 'PRAGMA user_version = <last-good-version>;'
+sqlite3 ~/.local/share/ai-memory/ai-memory.db 'UPDATE schema_version SET version = <last-good-version>;'
 ai-memory serve --foreground
 ```
 
@@ -753,7 +753,7 @@ require v0.7.0.
 ### Q2. Is the migration reversible?
 
 **Yes, via file restore.** The schema ladder is idempotent on replay but
-not in-place reversible — once you reach `schema_version=49`, the columns
+not in-place reversible — once you reach `schema_version=53`, the columns
 exist and the data has been backfilled. Rollback means restoring the
 pre-upgrade `.bak.pre-v07` file (per §7). Don't delete the backup until
 you've soaked v0.7.0 for at least a week.
@@ -793,7 +793,7 @@ If you relied on the v0.6.4 default-permissive posture, opt back in via
 **Yes.** v0.7.0 ships a bidirectional migration tool (`ai-memory migrate
 --from sqlite:///… --to postgres://…`). The recommended order is: upgrade
 the sqlite-backed daemon to v0.7.0 first (so both sides converge on schema
-v51), then run the cross-backend migration. The postgres guide has the
+v53), then run the cross-backend migration. The postgres guide has the
 full runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md).
 
 ### Q8. The first boot is taking forever. Is it stuck?
@@ -813,7 +813,7 @@ bump is atomic.
 ## See also
 
 - [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) — the deep technical migration
-  guide (per-form notes, every env var, the v34→v51 ladder narrative).
+  guide (per-form notes, every env var, the v34→v53 ladder narrative).
 - [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — the
   sqlite → postgres + Apache AGE runbook.
 - [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md) — full release notes
