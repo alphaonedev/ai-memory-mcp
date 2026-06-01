@@ -121,9 +121,13 @@ pub fn stamp_attestation_sync(
 /// [`crate::store::MemoryStore::agent_pubkey`] and stamp the attestation
 /// on `mem`.
 ///
+/// Gated on the `sal` feature because the `MemoryStore` trait lives
+/// under the SAL boundary (`#[cfg(feature = "sal")] pub mod store`).
+///
 /// # Errors
 ///
 /// Propagates a key-lookup failure or a gate rejection.
+#[cfg(feature = "sal")]
 pub async fn stamp_attestation_async(
     store: &dyn crate::store::MemoryStore,
     mem: &mut Memory,
