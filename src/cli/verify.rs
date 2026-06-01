@@ -703,6 +703,12 @@ mod tests {
 
     #[test]
     fn tampered_sig_edge_marked_failed() {
+        // Serialise the `AI_MEMORY_KEY_DIR` mutation on the crate-global env
+        // lock so it cannot race keypair/cli::store/governance tests that
+        // also stomp this process-wide var. #626 Layer-3.
+        let _g = kp_mod::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = TempDir::new().unwrap();
         let keys_tmp = TempDir::new().unwrap();
         let (conn, _) = open_test_db(&tmp);
@@ -875,6 +881,11 @@ mod tests {
     fn verify_edge_signed_with_unknown_agent_fails() {
         // Force `lookup_peer_public_key` to return None by pointing the
         // key dir at a fresh empty tempdir.
+        // Serialise on the crate-global env lock so the `AI_MEMORY_KEY_DIR`
+        // mutation cannot race sibling tests that share this var. #626 Layer-3.
+        let _g = kp_mod::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let keys_tmp = TempDir::new().unwrap();
         // SAFETY: this test mutates a process-wide env var; the helper
         // chain assumes no concurrent test relies on the previous value

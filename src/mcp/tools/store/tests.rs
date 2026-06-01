@@ -1968,3 +1968,206 @@ async fn legacy_classifier_handles_no_and_error_responses() {
         "Err in detect_contradiction must NOT surface a confirmed_contradictions entry, got: {resp_err}"
     );
 }
+
+// ----------------------------------------------------------------------
+// #626 Layer-3 (C7) — agent-attestation gate on the MCP store path.
+//
+// These exercise the signature/created_at wire fields added to the
+// `memory_store` request. None set the process-global
+// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` env var — the strict-require
+// rejection path is covered in the dedicated, env-serialised integration
+// binary (`tests/agent_attestation_integrity.rs`) so the parallel lib-test
+// binary never observes a leaked require flag.
+// ----------------------------------------------------------------------
+
+/// Build the standard-base64 Ed25519 signature over the SAME
+/// `SignableWrite` envelope the handler re-derives, for the canonical
+/// happy-path inputs (`namespace=test-ns`, kind=observation).
+fn sign_store_envelope(
+    kp: &crate::identity::keypair::AgentKeypair,
+    agent_id: &str,
+    title: &str,
+    content: &str,
+    created_at: &str,
+) -> String {
+    use base64::Engine as _;
+    let content_hash = crate::identity::attest::content_sha256(content);
+    let write = crate::identity::sign::SignableWrite {
+        agent_id,
+        namespace: "test-ns",
+        title,
+        kind: crate::models::MemoryKind::Observation.as_str(),
+        created_at,
+        content_sha256: &content_hash,
+    };
+    let sig = crate::identity::sign::sign_write(kp, &write).expect("sign");
+    base64::engine::general_purpose::STANDARD.encode(sig)
+}
+
+#[test]
+fn mcp_store_signed_with_bound_key_stamps_agent_attested() {
+    let conn = fresh_conn();
+    let kp = crate::identity::keypair::generate("ai:alice").expect("keypair");
+    db::register_agent(&conn, "ai:alice", "nhi", &[]).expect("register");
+    db::bind_agent_pubkey(&conn, "ai:alice", &kp.public_base64()).expect("bind");
+
+    let title = "signed-mem";
+    let content = "This is the body of signed-mem, long enough to be meaningful prose.";
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let sig_b64 = sign_store_envelope(&kp, "ai:alice", title, content, &created_at);
+
+    let params = json!({
+        "title": title,
+        "content": content,
+        "namespace": "test-ns",
+        "agent_id": "ai:alice",
+        "signature": sig_b64,
+        "created_at": created_at,
+    });
+    let ttl = ResolvedTtl::default();
+    let resp = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("signed store ok");
+    let id = resp["id"].as_str().expect("id");
+
+    let stored = db::get(&conn, id).expect("get").expect("row");
+    assert_eq!(
+        stored.metadata["attest_level"].as_str(),
+        Some("agent_attested"),
+        "a valid signature against the bound key must stamp agent_attested"
+    );
+    assert_eq!(
+        stored.created_at, created_at,
+        "the server must adopt the caller-signed created_at verbatim"
+    );
+}
+
+#[test]
+fn mcp_store_forged_signature_is_rejected() {
+    let conn = fresh_conn();
+    let bound = crate::identity::keypair::generate("ai:alice").expect("kp1");
+    let attacker = crate::identity::keypair::generate("ai:alice").expect("kp2");
+    db::register_agent(&conn, "ai:alice", "nhi", &[]).expect("register");
+    // Bind the legitimate key; sign with a DIFFERENT key → forgery.
+    db::bind_agent_pubkey(&conn, "ai:alice", &bound.public_base64()).expect("bind");
+
+    let title = "forged-mem";
+    let content = "This is the body of forged-mem, long enough to be meaningful prose.";
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let sig_b64 = sign_store_envelope(&attacker, "ai:alice", title, content, &created_at);
+
+    let params = json!({
+        "title": title,
+        "content": content,
+        "namespace": "test-ns",
+        "agent_id": "ai:alice",
+        "signature": sig_b64,
+        "created_at": created_at,
+    });
+    let ttl = ResolvedTtl::default();
+    let err = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("forged signature must be rejected");
+    assert!(
+        err.contains("attestation") || err.contains("verify"),
+        "forged-signature rejection should mention attestation/verification, got: {err}"
+    );
+    // Hard-reject: nothing persisted.
+    assert!(
+        db::find_by_title_namespace(&conn, title, "test-ns")
+            .expect("lookup")
+            .is_none(),
+        "a forged write must not persist"
+    );
+}
+
+#[test]
+fn mcp_store_signature_without_created_at_errors() {
+    use base64::Engine as _;
+    let conn = fresh_conn();
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+    let params = json!({
+        "title": "no-ts",
+        "content": "This is the body of no-ts, long enough to be meaningful prose.",
+        "namespace": "test-ns",
+        "agent_id": "ai:alice",
+        "signature": sig_b64,
+    });
+    let ttl = ResolvedTtl::default();
+    let err = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("signature without created_at must error");
+    assert!(
+        err.contains("created_at"),
+        "missing-created_at error should name the field, got: {err}"
+    );
+}
+
+#[test]
+fn mcp_store_stale_created_at_is_rejected() {
+    use base64::Engine as _;
+    let conn = fresh_conn();
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+    // Far outside the ±300s freshness window.
+    let stale = (chrono::Utc::now() - chrono::Duration::seconds(86_400)).to_rfc3339();
+    let params = json!({
+        "title": "stale",
+        "content": "This is the body of stale, long enough to be meaningful prose.",
+        "namespace": "test-ns",
+        "agent_id": "ai:alice",
+        "signature": sig_b64,
+        "created_at": stale,
+    });
+    let ttl = ResolvedTtl::default();
+    let err = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("stale created_at must be rejected");
+    assert!(
+        err.contains("freshness window"),
+        "stale-timestamp rejection should mention the freshness window, got: {err}"
+    );
+}

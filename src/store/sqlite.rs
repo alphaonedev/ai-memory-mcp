@@ -1938,7 +1938,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await
     async fn apply_remote_link_attest_threading() {
+        // Serialise against the a3 governance tests that flip the global
+        // permissions mode to Enforce + install a deny-all link rule, whose
+        // window would otherwise race this apply_remote_link call. #626 QC.
+        let _gate = crate::config::lock_permissions_mode_for_test();
         let store = fresh_store();
         let ctx = CallerContext::for_agent("alice");
         let a = test_memory("rl-a", "content rl a");

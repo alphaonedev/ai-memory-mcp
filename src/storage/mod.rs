@@ -15730,6 +15730,12 @@ mod tests {
     #[test]
     fn strongest_attest_picks_self_signed_over_unsigned() {
         use crate::identity::keypair;
+        // Serialise against the a3 tests that flip the *global* permissions
+        // mode to Enforce + install a deny-all link rule; without this gate
+        // their Enforce window can race this create_link_signed call and
+        // surface a spurious "link denied by permission rule". See the
+        // governance-mode test-isolation tracking issue. #626 Layer-3 QC.
+        let _gate = crate::config::lock_permissions_mode_for_test();
         let conn = test_db();
         let src = make_memory("attest-src", "test", Tier::Long, 5);
         let a = make_memory("attest-a", "test", Tier::Long, 5);

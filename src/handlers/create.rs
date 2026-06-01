@@ -695,7 +695,7 @@ async fn create_memory_postgres(
             final_tags.push(t.clone());
         }
     }
-    let mem = Memory {
+    let mut mem = Memory {
         id: Uuid::new_v4().to_string(),
         tier: body.tier.clone(),
         namespace: body.namespace.clone(),
@@ -744,6 +744,65 @@ async fn create_memory_postgres(
         confidence_decayed_at: None,
         version: 1,
     };
+    // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
+    // Same contract as the sqlite path, but the bound-key lookup goes
+    // through the async `MemoryStore::agent_pubkey`. 400 for a malformed
+    // transport field; 403 when a presented signature fails to verify or
+    // required-attestation rejects an unsigned write.
+    {
+        let presented_sig = body
+            .signature
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(sig_b64) = presented_sig {
+            let (sig_bytes, signed_created_at) = match crate::identity::attest::prepare_signed_store(
+                sig_b64,
+                body.created_at.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(msg) => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+                }
+            };
+            mem.created_at = signed_created_at.to_string();
+            if let Err(e) = crate::identity::attest::stamp_attestation_async(
+                app.store.as_ref(),
+                &mut mem,
+                agent_id,
+                Some(&sig_bytes),
+            )
+            .await
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                        "error": e.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        } else if crate::identity::attest::require_agent_attestation_enabled()
+            && let Err(e) = crate::identity::attest::stamp_attestation_async(
+                app.store.as_ref(),
+                &mut mem,
+                agent_id,
+                None,
+            )
+            .await
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let ctx = crate::store::CallerContext::for_agent(agent_id.to_string());
 
     // v0.7.0 Wave-3 Continuation 5 (S18 / semantic recall) — embed
@@ -929,11 +988,9 @@ pub async fn create_memory(
     }
 
     // Stage 1 — agent_id resolution (consumes `body.metadata`, returns
-    // canonical metadata). The `_agent_id` underscore-prefix silences
-    // the `unused_variables` warning on builds without `feature = "sal"`;
-    // the postgres branch below is the only consumer that needs the
-    // local binding — the sqlite path reads it back out of `metadata`.
-    let (_agent_id, metadata) = match resolve_create_agent_id(&headers, &body) {
+    // canonical metadata). Consumed by the postgres SAL branch and, since
+    // #626 Layer-3 (C7), by the sqlite-path agent-attestation gate below.
+    let (agent_id, metadata) = match resolve_create_agent_id(&headers, &body) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -942,7 +999,7 @@ pub async fn create_memory(
     // sqlite stages below stay focused.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return create_memory_postgres(&app, &body, &_agent_id, metadata).await;
+        return create_memory_postgres(&app, &body, &agent_id, metadata).await;
     }
 
     // v0.7.0 L5 — fire the LLM `auto_tag` autonomy hook BEFORE the
@@ -1002,7 +1059,7 @@ pub async fn create_memory(
         }
     }
 
-    let mem = Memory {
+    let mut mem = Memory {
         id: Uuid::new_v4().to_string(),
         tier: body.tier.clone(),
         namespace: body.namespace.clone(),
@@ -1044,6 +1101,64 @@ pub async fn create_memory(
         confidence_decayed_at: None,
         version: 1,
     };
+
+    // #626 Layer-3 (C7) — agent-attestation gate on the HTTP store path.
+    // Mirrors the MCP `handle_store` gate: a remote caller signs the
+    // `SignableWrite` envelope and presents the detached Ed25519
+    // signature (standard base64) plus the `created_at` it signed. The
+    // signed surface commits to `created_at` (server-stamped to `now()`
+    // by default), so the remote signer supplies the timestamp it used;
+    // the server validates the freshness window then adopts it verbatim.
+    // A presented signature that fails to verify against the agent's
+    // bound key is a 403; with no signature the path is unchanged unless
+    // the operator set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`, which
+    // rejects unsigned writes.
+    {
+        let presented_sig = body
+            .signature
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(sig_b64) = presented_sig {
+            let (sig_bytes, signed_created_at) = match crate::identity::attest::prepare_signed_store(
+                sig_b64,
+                body.created_at.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(msg) => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+                }
+            };
+            mem.created_at = signed_created_at.to_string();
+            if let Err(e) = crate::identity::attest::stamp_attestation_sync(
+                &lock.0,
+                &mut mem,
+                &agent_id,
+                Some(&sig_bytes),
+            ) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                        "error": e.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        } else if crate::identity::attest::require_agent_attestation_enabled()
+            && let Err(e) =
+                crate::identity::attest::stamp_attestation_sync(&lock.0, &mut mem, &agent_id, None)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // Stage 4 — governance pre-write hook. The helper either returns
     // the original lock guard (Allow) or short-circuits with an error
@@ -1174,6 +1289,8 @@ mod tests {
             source_uri: None,
             source_span: None,
             kind: None,
+            signature: None,
+            created_at: None,
         }
     }
 

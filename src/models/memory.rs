@@ -924,6 +924,23 @@ pub struct CreateMemory {
     /// alice lan-parity postgres-backed daemon).
     #[serde(default)]
     pub kind: Option<String>,
+    /// #626 Layer-3 (C7) — detached Ed25519 agent-attestation signature,
+    /// standard base64, over the `SignableWrite` envelope
+    /// (`agent_id + namespace + title + kind + created_at +
+    /// sha256(content)`). When present, `created_at` MUST also be supplied
+    /// (the signer cannot predict the server clock); a signature that
+    /// fails to verify against the agent's bound public key is rejected
+    /// with 403. Absent ⇒ legacy unsigned write unless the operator set
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`, in which case the gate
+    /// rejects the unsigned store.
+    #[serde(default)]
+    pub signature: Option<String>,
+    /// #626 Layer-3 (C7) — RFC3339 timestamp the caller signed. Required
+    /// when `signature` is present; the server validates it against the
+    /// ±300s attestation freshness window and then adopts it verbatim so
+    /// the verifier re-derives the identical signed envelope.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 fn default_tier() -> Tier {

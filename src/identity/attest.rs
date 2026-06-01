@@ -32,6 +32,17 @@ use crate::identity::sign::SignableWrite;
 use crate::identity::verify::AttestLevel;
 use crate::models::Memory;
 
+/// Bounded freshness window (seconds) for a remote-caller-supplied
+/// `created_at` on a *signed* store (#626 Layer-3, C7).
+///
+/// The signed [`SignableWrite`] envelope commits to `created_at`, which the
+/// server normally stamps with `now()`. A remote signer therefore cannot
+/// predict it and must supply the timestamp it actually signed. The server
+/// adopts that value verbatim only when it falls within ±this many seconds
+/// of `now()` — bounding both replay (a stale timestamp) and post-dating (a
+/// future timestamp) while leaving room for ordinary clock skew + transit.
+pub const ATTEST_CREATED_AT_SKEW_SECS: i64 = 300;
+
 /// `true` when the operator has opted into strict agent attestation by
 /// setting `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (or `=true`). Default
 /// `false` (permissive). Mirrors the federation
@@ -41,6 +52,52 @@ pub fn require_agent_attestation_enabled() -> bool {
     std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// Validate the transport fields of a *signed* remote store (#626
+/// Layer-3, C7) — shared by every write surface that accepts a
+/// caller-presented signature (MCP `memory_store`, HTTP
+/// `POST /api/v1/memories`, …).
+///
+/// Decodes the standard-base64 `signature_b64` and checks the paired
+/// `created_at` (the signer cannot predict the server clock, so it must
+/// supply the timestamp it signed) against the [`ATTEST_CREATED_AT_SKEW_SECS`]
+/// freshness window — bounding both replay (a stale timestamp) and
+/// post-dating (a future one). On success returns the decoded signature
+/// bytes plus the verbatim `created_at` the caller must adopt so the
+/// verifier re-derives the identical [`SignableWrite`] envelope.
+///
+/// # Errors
+///
+/// Returns a human-readable string (suitable for a 4xx wire envelope)
+/// when the signature is not valid base64, `created_at` is absent /
+/// not RFC3339, or the timestamp falls outside the freshness window.
+pub fn prepare_signed_store<'a>(
+    signature_b64: &str,
+    created_at: Option<&'a str>,
+) -> std::result::Result<(Vec<u8>, &'a str), String> {
+    use base64::Engine as _;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64.trim())
+        .map_err(|e| format!("invalid `signature` (expected standard base64): {e}"))?;
+    let created_at = created_at
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "`signature` requires the matching `created_at` (RFC3339) the caller signed".to_string()
+        })?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(created_at)
+        .map_err(|e| format!("invalid `created_at` (expected RFC3339): {e}"))?;
+    let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .abs();
+    if skew > ATTEST_CREATED_AT_SKEW_SECS {
+        return Err(format!(
+            "`created_at` is outside the ±{ATTEST_CREATED_AT_SKEW_SECS}s attestation freshness \
+             window (skew {skew}s); refusing to attest a stale or post-dated write"
+        ));
+    }
+    Ok((sig_bytes, created_at))
 }
 
 /// SHA-256 over the UTF-8 bytes of `content` — the bounded body commitment
@@ -326,6 +383,58 @@ mod tests {
                 !(v == "1" || v.eq_ignore_ascii_case("true")),
                 "{v} must read as disabled"
             );
+        }
+    }
+
+    #[test]
+    fn prepare_signed_store_accepts_fresh_envelope() {
+        use base64::Engine as _;
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let (bytes, ts) =
+            prepare_signed_store(&sig_b64, Some(&created_at)).expect("fresh envelope ok");
+        assert_eq!(bytes, vec![7u8; 64]);
+        assert_eq!(ts, created_at.trim());
+    }
+
+    #[test]
+    fn prepare_signed_store_rejects_bad_base64() {
+        let err = prepare_signed_store("not base64!!!", Some("2026-06-01T12:00:00+00:00"))
+            .expect_err("malformed base64 must error");
+        assert!(err.contains("base64"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_signed_store_requires_created_at() {
+        use base64::Engine as _;
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let err = prepare_signed_store(&sig_b64, None).expect_err("missing created_at must error");
+        assert!(err.contains("created_at"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_signed_store_rejects_non_rfc3339_created_at() {
+        use base64::Engine as _;
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let err = prepare_signed_store(&sig_b64, Some("2026-06-01 noon"))
+            .expect_err("non-RFC3339 created_at must error");
+        assert!(err.contains("RFC3339"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_signed_store_rejects_stale_and_postdated_created_at() {
+        use base64::Engine as _;
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        let stale = (chrono::Utc::now()
+            - chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS + 60))
+        .to_rfc3339();
+        let future = (chrono::Utc::now()
+            + chrono::Duration::seconds(ATTEST_CREATED_AT_SKEW_SECS + 60))
+        .to_rfc3339();
+        for ts in [stale, future] {
+            let err = prepare_signed_store(&sig_b64, Some(&ts))
+                .expect_err("out-of-window created_at must error");
+            assert!(err.contains("freshness window"), "got: {err}");
         }
     }
 }
