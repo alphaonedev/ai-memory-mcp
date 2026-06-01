@@ -76,7 +76,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the Per-Module Coverage Thresholds workflow (which runs the
     // full integration suite under llvm-cov) stops tripping qual_10
     // on every push.
-    ("src/daemon_runtime.rs", 7_300),
+    // 2026-05-31 — bumped 7_300 → 7_600 by the v0.7.0 security-review
+    // epic (#1450) findings #1455 + #1458. #1455 added the shared
+    // fail-CLOSED `governance_consultation_unavailable[_inner]` helpers
+    // + `governance_fail_open_on_error` + 2 regression tests; #1458
+    // extracted `api_key_bind_guard` + `require_api_key_strict` out of
+    // `bootstrap_serve` and added 5 regression tests. Actual LOC at the
+    // bump: 7528. Growth is justified: each change hardens an existing
+    // startup path plus its regression coverage (no speculative
+    // surface). 7600 = 7528 + ~72 headroom; well under the 1.5x cap.
+    ("src/daemon_runtime.rs", 7_600),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     ("src/storage/migrations.rs", 3_500),
