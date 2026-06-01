@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_store_happy_path_text_output() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_store_json_output() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_store_explicit_expires_at_overrides_tier() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_store_ttl_secs_overrides_tier() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_store_with_scope_in_metadata() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_tier_validation_error() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_priority_validation_error() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_store_contradiction_warning_in_stderr() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_store_governance_pending_writes_pending_status() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         // Covered indirectly by the happy-path test (no governance rules
         // configured -> Allow branch). The Pending/Deny branches require
         // governance-rule rows that aren't part of the default schema; a
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_store_tag_parsing() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_store_form4_form6_flags_valid_roundtrip() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         // Exercises every Some(_) success arm (kind/citations/source_uri/
         // source_span/entity_id) in a single store call.
         let mut env = TestEnv::fresh();
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_kind_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_citations_json_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_citations_entry_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         // Well-formed JSON, but the entry fails validate_citation
         // (bare URI without a uri:/doc:/file: scheme).
         let mut env = TestEnv::fresh();
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_source_uri_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_source_span_json_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_source_span_range_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         // Valid JSON, but start >= end fails validate_source_span.
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
@@ -738,6 +738,17 @@ mod tests {
         crate::identity::keypair::key_dir_env_lock()
     }
 
+    /// Poison-resilient acquire of the shared env lock. Centralises the
+    /// `into_inner` recovery in one place (via the `PoisonError::into_inner`
+    /// fn-pointer, not a per-call-site closure) so the never-firing-in-green
+    /// poison branch is a single covered instantiation rather than one
+    /// uncovered closure per test.
+    fn locked_env() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// RAII restore of an env var to its pre-test value.
     struct EnvVarGuard {
         key: &'static str,
@@ -766,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_store_sign_with_bound_key_stamps_agent_attested() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
         let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
@@ -801,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_store_sign_without_local_keypair_errors() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         // Empty key dir — no `<agent_id>.priv` to load.
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
@@ -822,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_store_require_attestation_rejects_unsigned() {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = locked_env();
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
             std::ffi::OsStr::new("1"),
@@ -837,5 +848,28 @@ mod tests {
         let mut out = env.output();
         let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
         assert!(err.to_string().contains("attestation"), "got: {err}");
+    }
+
+    // EnvVarGuard Drop with a pre-existing value → Some-arm restore (set_var)
+    // rather than the None-arm remove. Pins the RAII restore contract.
+    #[test]
+    fn env_var_guard_restores_previous_value_on_drop() {
+        let _lock = locked_env();
+        let prior = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AI_MEMORY_KEY_DIR", prior.path().as_os_str()) };
+        {
+            let other = tempfile::tempdir().unwrap();
+            let _g = EnvVarGuard::set("AI_MEMORY_KEY_DIR", other.path().as_os_str());
+            assert_eq!(
+                std::env::var_os("AI_MEMORY_KEY_DIR").as_deref(),
+                Some(other.path().as_os_str())
+            );
+            // _g drops here → Some-arm restore of `prior`.
+        }
+        assert_eq!(
+            std::env::var_os("AI_MEMORY_KEY_DIR").as_deref(),
+            Some(prior.path().as_os_str())
+        );
+        unsafe { std::env::remove_var("AI_MEMORY_KEY_DIR") };
     }
 }

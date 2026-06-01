@@ -294,3 +294,107 @@ async fn http_require_attestation_rejects_unsigned_403() {
         "403 envelope must carry the ATTESTATION_FAILED code; got {resp}"
     );
 }
+
+/// #626 Layer-3 — the synchronous MCP `handle_store` gate, distinct from the
+/// async HTTP handler exercised above. With `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
+/// set and no `signature` in the params, the require-branch
+/// (`src/mcp/tools/store/mod.rs` `else if require_agent_attestation_enabled()`)
+/// calls `stamp_attestation_sync(.., None)`, which rejects the unsigned write.
+/// The HTTP test cannot reach this branch — it drives `post_memory`, not the
+/// in-process `handle_store` entry point — so this pins the MCP path directly.
+#[test]
+fn mcp_require_attestation_rejects_unsigned_store() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: edition-2024 env mutation; serialised by ENV_LOCK above.
+    unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1") };
+
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+    let ttl = ResolvedTtl::default();
+    let params = json!({
+        "title": "mcp-unsigned",
+        "content": "Body of the unsigned MCP write, long enough to read as real prose.",
+        "namespace": "attest-mcp",
+        "tier": "mid",
+        "agent_id": "ai:alice",
+    });
+
+    let result = ai_memory::mcp::tools::handle_store_for_tests(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+    );
+
+    // Restore BEFORE asserting so a panic can't leak the var into siblings.
+    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
+
+    let err = result.expect_err("required attestation must reject an unsigned MCP write");
+    assert!(
+        err.contains("attestation"),
+        "rejection must name the attestation gate; got: {err}"
+    );
+
+    // Defence-in-depth: the rejected write must not have landed.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = 'attest-mcp'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count query");
+    assert_eq!(count, 0, "rejected unsigned write must not persist a row");
+}
+
+/// #626 Layer-3 — the *signed* arm of the same MCP `handle_store` gate. A
+/// caller presents a valid detached signature over the canonical envelope
+/// plus the matching `created_at`; the gate adopts the timestamp, re-derives
+/// the envelope, verifies against the agent's bound key, and upgrades the
+/// write to `agent_attested`. Exercises the `if let Some(sig_b64)` branch
+/// (`prepare_signed_store` + `stamp_attestation_sync(.., Some(sig))`) that the
+/// unsigned/require tests never reach. No env mutation, so no `ENV_LOCK`.
+#[test]
+fn mcp_signed_store_upgrades_to_agent_attested() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+
+    let kp = ai_memory::identity::keypair::generate("ai:alice").expect("keypair");
+    provision_agent(&db_path, "ai:alice", &kp.public_base64());
+
+    let title = "mcp-signed";
+    let content = "Body of the signed MCP write, long enough to read as real prose.";
+    let namespace = "attest-mcp-signed";
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let sig_b64 = sign_envelope(&kp, "ai:alice", namespace, title, content, &created_at);
+
+    let ttl = ResolvedTtl::default();
+    let params = json!({
+        "title": title,
+        "content": content,
+        "namespace": namespace,
+        "tier": "mid",
+        "agent_id": "ai:alice",
+        "signature": sig_b64,
+        "created_at": created_at,
+    });
+
+    let resp = ai_memory::mcp::tools::handle_store_for_tests(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+    )
+    .expect("valid signed write must be accepted");
+
+    let attest: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(metadata, '$.attest_level') FROM memories \
+             WHERE namespace = ?1 AND title = ?2",
+            rusqlite::params![namespace, title],
+            |r| r.get(0),
+        )
+        .expect("read persisted attest_level");
+    assert_eq!(
+        attest.as_deref(),
+        Some("agent_attested"),
+        "valid signature must upgrade the persisted row to agent_attested; resp={resp}"
+    );
+}
