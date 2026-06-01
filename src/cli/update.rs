@@ -404,4 +404,103 @@ mod tests {
         }
         assert!(env.stdout_str().contains("updated:"));
     }
+
+    // v0.7.0 F2.4 (#1428) — coverage for the metadata / source_uri /
+    // expected_version flag arms.
+
+    #[test]
+    fn test_update_metadata_and_source_uri_valid_roundtrip() {
+        // Covers the metadata Some(object) arm + source_uri Some(valid) arm.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.metadata = Some(r#"{"scope":"team"}"#.to_string());
+        args.source_uri = Some("uri:https://example.com/doc".to_string());
+        {
+            let mut out = env.output();
+            run(&db, &args, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["metadata"]["scope"].as_str().unwrap(), "team");
+        assert_eq!(
+            v["source_uri"].as_str().unwrap(),
+            "uri:https://example.com/doc"
+        );
+    }
+
+    #[test]
+    fn test_update_invalid_metadata_json_errors() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.metadata = Some("not-json".to_string());
+        let mut out = env.output();
+        let err = run(&db, &args, false, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --metadata JSON"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_update_metadata_non_object_errors() {
+        // Well-formed JSON but not an object — hits the is_object() guard.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.metadata = Some("[1,2,3]".to_string());
+        let mut out = env.output();
+        let err = run(&db, &args, false, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("--metadata must be a JSON object"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_update_invalid_source_uri_errors() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.source_uri = Some("bareword-no-scheme".to_string());
+        let mut out = env.output();
+        let err = run(&db, &args, false, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-uri"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_update_expected_version_match_succeeds() {
+        // Seeded rows start at version 1, so expected_version=1 matches.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.title = Some("v-gated".to_string());
+        args.expected_version = Some(1);
+        {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap();
+        }
+        assert!(env.stdout_str().contains("updated:"));
+    }
+
+    #[test]
+    fn test_update_expected_version_mismatch_conflicts() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.title = Some("should-not-apply".to_string());
+        args.expected_version = Some(999);
+        let mut out = env.output();
+        let err = run(&db, &args, false, &mut out).unwrap_err();
+        assert!(err.to_string().contains("CONFLICT"), "got: {err}");
+    }
 }
