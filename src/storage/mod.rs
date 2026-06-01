@@ -5960,6 +5960,76 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
     Ok(agents)
 }
 
+/// Bind (or rotate) an agent's Ed25519 public key into its `_agents`
+/// registration row metadata (#626 Layer-3, Task 1.3 / C3).
+///
+/// The pubkey is the anchor the write-path attestation gate verifies
+/// against: a signed write claiming `agent_id` is upgraded from *claimed*
+/// to *attested* only when its signature verifies under the key bound
+/// here. Stored under `metadata.agent_pubkey` (URL-safe-no-pad base64)
+/// alongside a `pubkey_bound_at` RFC3339 timestamp for rotation
+/// provenance.
+///
+/// Migration-free: the key rides in the existing registration row's
+/// JSON metadata (no schema bump). `json_set` updates `metadata` and the
+/// mirrored `content` column atomically so `list_agents` / the verifier
+/// observe a consistent row.
+///
+/// The agent MUST already be registered (`register_agent`) — binding a
+/// key to an unregistered id is rejected so a stray pubkey can never
+/// shadow a future legitimate registration. Re-binding overwrites the
+/// previous key (key rotation / revoke-then-rebind).
+///
+/// # Errors
+///
+/// - the agent is not registered (no `_agents` row for `agent_id`)
+/// - the underlying `UPDATE` fails
+pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) -> Result<()> {
+    let title = format!("agent:{agent_id}");
+    let now = Utc::now().to_rfc3339();
+    let affected = conn.execute(
+        "UPDATE memories SET
+            metadata = json_set(metadata, '$.agent_pubkey', ?3, '$.pubkey_bound_at', ?4),
+            content  = json_set(content,  '$.agent_pubkey', ?3, '$.pubkey_bound_at', ?4),
+            updated_at = ?4
+         WHERE namespace = ?1 AND title = ?2",
+        params![AGENTS_NAMESPACE, &title, pubkey_b64, &now],
+    )?;
+    if affected == 0 {
+        anyhow::bail!(
+            "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
+        );
+    }
+    Ok(())
+}
+
+/// Fetch the Ed25519 public key bound to `agent_id`, if any (#626
+/// Layer-3, Task 1.3 / C3).
+///
+/// Returns `Ok(None)` when the agent is registered but has no bound key
+/// (the permissive-default attestation posture: such an agent can still
+/// write *claimed* rows), and also when the agent is not registered at
+/// all — both collapse to "no key to verify against". The verifier
+/// distinguishes the two only when `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
+/// is set, where a missing key on a required write is a hard reject.
+///
+/// # Errors
+///
+/// Surfaces only underlying query failures.
+pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>> {
+    let title = format!("agent:{agent_id}");
+    let pubkey = conn
+        .query_row(
+            "SELECT json_extract(metadata, '$.agent_pubkey') FROM memories
+             WHERE namespace = ?1 AND title = ?2",
+            params![AGENTS_NAMESPACE, &title],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    Ok(pubkey)
+}
+
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     let total: usize = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
 
@@ -15756,5 +15826,87 @@ mod tests {
         // confirm it still works under the new trigger.
         create_link_signed(&conn, &s.id, &t.id, "related_to", None)
             .expect("unsigned create must still succeed under the new CHECK trigger");
+    }
+
+    // -----------------------------------------------------------------
+    // #626 Layer-3 (Task 1.3 / C3) — bind_agent_pubkey + agent_pubkey
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn agent_pubkey_none_before_bind_and_some_after() {
+        let conn = test_db();
+        register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
+        // Registered but unbound → permissive None.
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
+
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let b64 = kp.public_base64();
+        bind_agent_pubkey(&conn, "ai:curator", &b64).expect("bind");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(b64));
+    }
+
+    #[test]
+    fn agent_pubkey_none_for_unregistered_agent() {
+        let conn = test_db();
+        // Never registered → None (collapses to "no key to verify").
+        assert_eq!(agent_pubkey(&conn, "ai:ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn bind_agent_pubkey_rejects_unregistered_agent() {
+        let conn = test_db();
+        let err = bind_agent_pubkey(&conn, "ai:ghost", "AAAA").unwrap_err();
+        assert!(
+            err.to_string().contains("not registered"),
+            "binding to an unregistered agent must be rejected; got: {err}",
+        );
+    }
+
+    #[test]
+    fn bind_agent_pubkey_rotates_key_in_place() {
+        let conn = test_db();
+        register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
+        let k1 = crate::identity::keypair::generate("ai:curator")
+            .unwrap()
+            .public_base64();
+        let k2 = crate::identity::keypair::generate("ai:curator")
+            .unwrap()
+            .public_base64();
+        assert_ne!(k1, k2, "two fresh keys differ");
+        bind_agent_pubkey(&conn, "ai:curator", &k1).expect("bind k1");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k1));
+        // Rotation overwrites in place.
+        bind_agent_pubkey(&conn, "ai:curator", &k2).expect("rotate to k2");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+    }
+
+    #[test]
+    fn bind_agent_pubkey_preserves_registration_fields() {
+        // Binding a key must not clobber agent_type / capabilities /
+        // registered_at — list_agents must still see the full row.
+        let conn = test_db();
+        register_agent(
+            &conn,
+            "ai:curator",
+            "ai:claude-opus",
+            &["recall".to_string(), "write".to_string()],
+        )
+        .expect("register");
+        let before = list_agents(&conn).expect("list before");
+        let kp = crate::identity::keypair::generate("ai:curator").unwrap();
+        bind_agent_pubkey(&conn, "ai:curator", &kp.public_base64()).expect("bind");
+        let after = list_agents(&conn).expect("list after");
+
+        let a_before = before
+            .iter()
+            .find(|a| a.agent_id == "ai:curator")
+            .expect("present before");
+        let a_after = after
+            .iter()
+            .find(|a| a.agent_id == "ai:curator")
+            .expect("present after");
+        assert_eq!(a_after.agent_type, a_before.agent_type);
+        assert_eq!(a_after.capabilities, a_before.capabilities);
+        assert_eq!(a_after.registered_at, a_before.registered_at);
     }
 }

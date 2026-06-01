@@ -723,6 +723,43 @@ pub trait MemoryStore: Send + Sync {
         agent: &AgentRegistration,
     ) -> StoreResult<()>;
 
+    /// Bind (or rotate) an agent's Ed25519 public key into its
+    /// registration metadata (#626 Layer-3, Task 1.3 / C3).
+    ///
+    /// The bound key is the anchor the write-path attestation gate
+    /// verifies a signed write against — upgrading the write's
+    /// `agent_id` from *claimed* to *attested*. The agent must already
+    /// be registered; re-binding rotates the key.
+    ///
+    /// Default returns `UnsupportedCapability` so an adapter that has
+    /// not wired key provisioning fails loudly rather than silently
+    /// dropping a key an operator believes is bound.
+    async fn bind_agent_pubkey(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _pubkey_b64: &str,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "BIND_AGENT_PUBKEY".to_string(),
+        })
+    }
+
+    /// Fetch the Ed25519 public key bound to `agent_id`, if any (#626
+    /// Layer-3, Task 1.3 / C3).
+    ///
+    /// `Ok(None)` means "no key to verify against" — the agent is
+    /// registered without a key (permissive-default posture) OR is not
+    /// registered at all. The verifier treats both alike unless
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set.
+    ///
+    /// Default returns `Ok(None)` (permissive): an adapter without key
+    /// provisioning behaves as "no agent has an attestable key", so
+    /// every write stays at the *claimed* level rather than erroring.
+    async fn agent_pubkey(&self, _agent_id: &str) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
+
     /// v0.7.0 Wave-3 Continuation — adapter-specific downcast hatch.
     ///
     /// Returns the adapter as `&dyn Any` so that downstream callers
