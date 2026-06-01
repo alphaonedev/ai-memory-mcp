@@ -19,6 +19,10 @@
             "description": "Memory content",
             "type": "string"
           },
+          "created_at": {
+            "description": "#626 RFC3339 created_at the caller signed (required with signature).",
+            "type": "string"
+          },
           "force": {
             "default": false,
             "description": "#519 bypass proactive contradiction detection.",
@@ -73,6 +77,10 @@
               "org",
               "collective"
             ],
+            "type": "string"
+          },
+          "signature": {
+            "description": "#626 Ed25519 attestation signature (std base64); pair with created_at.",
             "type": "string"
           },
           "source": {
