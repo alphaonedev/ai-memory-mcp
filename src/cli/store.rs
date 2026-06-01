@@ -80,6 +80,15 @@ pub struct StoreArgs {
     /// Required when `--kind persona`. Maps to `Memory::entity_id`.
     #[arg(long)]
     pub entity_id: Option<String>,
+    /// #626 Layer-3 (Task 1.3 / C5) — sign this write with the resolved
+    /// agent's local Ed25519 keypair so the stored row is *attested*
+    /// rather than merely *claimed*. Requires a `<agent_id>.priv` under
+    /// the key directory (`AI_MEMORY_KEY_DIR` or the platform default);
+    /// the bound public key must match (see `ai-memory agents bind-key`).
+    /// When unset, the write is *claimed* unless
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, which rejects it.
+    #[arg(long)]
+    pub sign: bool,
 }
 
 /// Resolve the content payload: literal `-` means read stdin via the
@@ -208,7 +217,7 @@ pub fn run(
         }
     };
 
-    let mem = models::Memory {
+    let mut mem = models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace,
@@ -236,6 +245,26 @@ pub fn run(
         confidence_decayed_at: None,
         version: 1,
     };
+
+    // #626 Layer-3 (Task 1.3 / C5) — agent attestation gate. When
+    // `--sign` is set, load the agent's local keypair and sign the
+    // attestable surface; the gate then stamps `metadata.attest_level =
+    // "agent_attested"`. The gate is also invoked (with no signature) when
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, so an unsigned write is
+    // rejected under the strict posture. When neither applies the write
+    // path is byte-equal to the pre-Layer-3 behavior (no stamp).
+    let signature: Option<Vec<u8>> = if args.sign {
+        let dir = identity::keypair::default_key_dir()?;
+        let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
+            anyhow::anyhow!("--sign requires a local keypair for agent '{agent_id}': {e:#}")
+        })?;
+        Some(identity::attest::sign_memory_write(&kp, &mem, &agent_id)?)
+    } else {
+        None
+    };
+    if args.sign || identity::attest::require_agent_attestation_enabled() {
+        identity::attest::stamp_attestation_sync(&conn, &mut mem, &agent_id, signature.as_deref())?;
+    }
 
     // W5b/C5: governance enforcement routes through `cli::governance::enforce`
     // so the print-side of Pending/Deny is covered by `cli::governance::tests`.
@@ -341,6 +370,7 @@ mod tests {
             source_uri: None,
             source_span: None,
             entity_id: None,
+            sign: false,
         }
     }
 
@@ -358,6 +388,7 @@ mod tests {
 
     #[test]
     fn test_store_happy_path_text_output() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -374,6 +405,7 @@ mod tests {
 
     #[test]
     fn test_store_json_output() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -401,6 +433,7 @@ mod tests {
 
     #[test]
     fn test_store_explicit_expires_at_overrides_tier() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -418,6 +451,7 @@ mod tests {
 
     #[test]
     fn test_store_ttl_secs_overrides_tier() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -434,6 +468,7 @@ mod tests {
 
     #[test]
     fn test_store_with_scope_in_metadata() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -449,6 +484,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_tier_validation_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -462,6 +498,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_priority_validation_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -475,6 +512,7 @@ mod tests {
 
     #[test]
     fn test_store_contradiction_warning_in_stderr() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -513,6 +551,7 @@ mod tests {
 
     #[test]
     fn test_store_governance_pending_writes_pending_status() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Covered indirectly by the happy-path test (no governance rules
         // configured -> Allow branch). The Pending/Deny branches require
         // governance-rule rows that aren't part of the default schema; a
@@ -533,6 +572,7 @@ mod tests {
 
     #[test]
     fn test_store_tag_parsing() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -552,6 +592,7 @@ mod tests {
 
     #[test]
     fn test_store_form4_form6_flags_valid_roundtrip() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Exercises every Some(_) success arm (kind/citations/source_uri/
         // source_span/entity_id) in a single store call.
         let mut env = TestEnv::fresh();
@@ -583,6 +624,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_kind_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -595,6 +637,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_citations_json_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -610,6 +653,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_citations_entry_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Well-formed JSON, but the entry fails validate_citation
         // (bare URI without a uri:/doc:/file: scheme).
         let mut env = TestEnv::fresh();
@@ -628,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_source_uri_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -643,6 +688,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_source_span_json_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -658,6 +704,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_source_span_range_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Valid JSON, but start >= end fails validate_source_span.
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
@@ -670,5 +717,117 @@ mod tests {
             err.to_string().contains("invalid --source-span"),
             "got: {err}"
         );
+    }
+
+    // #626 Layer-3 (Task 1.3 / C5) — `--sign` attestation gate coverage.
+    //
+    // These three tests mutate process env (`AI_MEMORY_KEY_DIR`,
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`) so they serialize on
+    // `ENV_LOCK` and restore the prior values on exit, per the
+    // env-test discipline. Key material lives under a `tempfile::tempdir()`
+    // (never `/tmp` directly — the OS temp root is fine for the OS-created
+    // dir; the project no-/tmp rule covers agent-AUTHORED scratch paths).
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII restore of an env var to its pre-test value.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, val: &std::ffi::OsStr) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+        fn clear(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn test_store_sign_with_bound_key_stamps_agent_attested() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+
+        // Persist the agent's keypair on disk so `--sign` can load + sign.
+        let kp = crate::identity::keypair::generate("test-agent").unwrap();
+        crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Register the agent + bind its pubkey so the gate resolves a bound
+        // key matching the presented signature → AgentAttested.
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "test-agent", "ai:claude-opus-4.7", &[]).unwrap();
+            db::bind_agent_pubkey(&conn, "test-agent", &kp.public_base64()).unwrap();
+        }
+
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("test-agent"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(
+            v["metadata"]["attest_level"].as_str().unwrap(),
+            "agent_attested"
+        );
+    }
+
+    #[test]
+    fn test_store_sign_without_local_keypair_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Empty key dir — no `<agent_id>.priv` to load.
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("--sign requires a local keypair"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_require_attestation_rejects_unsigned() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _req = EnvVarGuard::set(
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            std::ffi::OsStr::new("1"),
+        );
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        // Unsigned write (sign=false) under the strict posture: the gate
+        // is invoked with no signature + require=true → AttestationRequired.
+        let args = default_args();
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(err.to_string().contains("attestation"), "got: {err}");
     }
 }
