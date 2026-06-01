@@ -46,7 +46,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // postgres-backed daemons. Refactor-split into
     // `src/store/postgres/{mod,kg,governance,storage,...}.rs` is
     // tracked as a separate v0.7.x post-ship ARCH cleanup.
-    ("src/store/postgres.rs", 15_200),
+    //
+    // 2026-05-31 — bumped 15_200 → 15_300 by the v0.7.0 security-review
+    // epic (#1450) finding #1451: the optimistic-update PG path now
+    // pre-reads the governance-relevant columns and consults
+    // GOVERNANCE_PRE_WRITE on the post-merge row (parity with SQLite and
+    // the insert/supersede PG paths), closing the update-evasion gap.
+    // Actual LOC at the bump: 15216. Growth is a security gate on an
+    // existing write path, not new surface.
+    ("src/store/postgres.rs", 15_300),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /

@@ -1354,6 +1354,31 @@ pub fn update_with_expected_version(
         None => existing.expires_at.as_deref(),
     };
     let metadata = metadata.unwrap_or(&existing.metadata);
+
+    // #1451 (SEC, HIGH) — substrate governance pre-write gate on the
+    // optimistic-update path. The insert/supersede/consolidate/restore
+    // paths all consult GOVERNANCE_PRE_WRITE; update was the lone gap,
+    // so a refuse rule could be evaded by storing benign content then
+    // updating it into the refused namespace/tier/title. Build the
+    // post-merge row and consult BEFORE any SQL touches the DB; a
+    // refusal returns the typed GovernanceRefusal with no row mutated.
+    let governed = Memory {
+        tier: effective_tier.clone(),
+        namespace: namespace.to_string(),
+        title: new_title.to_string(),
+        content: new_content.to_string(),
+        tags: tags.clone(),
+        priority,
+        confidence,
+        expires_at: expires_at.map(str::to_string),
+        metadata: metadata.clone(),
+        source_uri: source_uri
+            .map(str::to_string)
+            .or_else(|| existing.source_uri.clone()),
+        ..existing.clone()
+    };
+    consult_governance_pre_write(&governed)?;
+
     let tags_json = serde_json::to_string(tags)?;
     let metadata_json = serde_json::to_string(metadata)?;
     let now = Utc::now().to_rfc3339();
