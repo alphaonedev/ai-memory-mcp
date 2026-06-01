@@ -594,18 +594,36 @@ pub fn verify_chain(
         // `signature_failures` and continue the walk — a signature
         // failure is disjoint from a chain break by design (per-row
         // forgery vs. across-row substrate tamper).
-        if let (Some(vk), Some(sig_bytes)) = (verifier.as_ref(), event.signature.as_ref()) {
-            let sig_array: Option<[u8; 64]> = sig_bytes.as_slice().try_into().ok();
-            match sig_array {
-                Some(arr) => {
-                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                    if vk.verify_strict(&event.payload_hash, &sig).is_err() {
-                        signature_failures.push(event.sequence);
+        if let Some(vk) = verifier.as_ref() {
+            match event.signature.as_ref() {
+                Some(sig_bytes) if !sig_bytes.is_empty() => {
+                    let sig_array: Option<[u8; 64]> = sig_bytes.as_slice().try_into().ok();
+                    match sig_array {
+                        Some(arr) => {
+                            let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                            if vk.verify_strict(&event.payload_hash, &sig).is_err() {
+                                signature_failures.push(event.sequence);
+                            }
+                        }
+                        None => {
+                            // Malformed signature length — record as failure.
+                            signature_failures.push(event.sequence);
+                        }
                     }
                 }
-                None => {
-                    // Malformed signature length — record as failure.
-                    signature_failures.push(event.sequence);
+                // #1452 (SEC, HIGH) — fail-closed on a missing signature
+                // when a verifier IS installed. A row whose `attest_level`
+                // is anything other than the by-design legacy `"unsigned"`
+                // marker, but which carries no signature blob (None or an
+                // empty vec), is a stripped / never-signed row on a daemon
+                // that is supposed to be signing — record it as a
+                // signature failure rather than silently skipping it.
+                // Legitimately-unsigned (`attest_level == "unsigned"`)
+                // legacy rows remain skip-by-design.
+                _ => {
+                    if event.attest_level != "unsigned" {
+                        signature_failures.push(event.sequence);
+                    }
                 }
             }
         }
