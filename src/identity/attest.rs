@@ -52,6 +52,37 @@ pub fn content_sha256(content: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Sign the attestable surface of `mem` with `keypair`, producing the
+/// detached Ed25519 signature the write path presents to the gate (#626
+/// Layer-3, Task 1.3 / C5).
+///
+/// Builds the *same* [`SignableWrite`] envelope that [`stamp_attestation`]
+/// re-derives — `agent_id + namespace + title + kind + created_at +
+/// sha256(content)` — so the signer and the verifier never drift. The
+/// caller passes the resolved `agent_id` explicitly (it already has it)
+/// rather than re-reading it from metadata.
+///
+/// # Errors
+///
+/// Surfaces a signing failure (e.g. the keypair is public-only) from
+/// [`crate::identity::sign::sign_write`].
+pub fn sign_memory_write(
+    keypair: &crate::identity::keypair::AgentKeypair,
+    mem: &Memory,
+    agent_id: &str,
+) -> Result<Vec<u8>> {
+    let content_hash = content_sha256(&mem.content);
+    let write = SignableWrite {
+        agent_id,
+        namespace: &mem.namespace,
+        title: &mem.title,
+        kind: mem.memory_kind.as_str(),
+        created_at: &mem.created_at,
+        content_sha256: &content_hash,
+    };
+    crate::identity::sign::sign_write(keypair, &write)
+}
+
 /// I/O-free core: resolve the [`AttestLevel`] for `mem` written by
 /// `agent_id` (given the agent's bound key + an optional presented
 /// signature) and, on success, stamp `metadata.attest_level`.
