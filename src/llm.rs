@@ -318,6 +318,71 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 /// the breaker. Single transient failure does not flip the switch.
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
+/// #1459 (SEC, LOW) — hard cap on the number of bytes buffered from an
+/// LLM/embedder HTTP response before it is parsed. A hostile or
+/// misbehaving endpoint (or a compromised proxy in front of one) could
+/// otherwise stream an unbounded body and exhaust process memory, since
+/// `reqwest::Response::json`/`text` buffer the *entire* body with no
+/// ceiling. 16 MiB comfortably covers the largest legitimate completion
+/// or embedding response (a 4096-dim f32 vector serialised as JSON is
+/// well under 100 KiB; a 30s-timeout text completion is a few hundred
+/// KiB at most).
+const MAX_LLM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Buffer a response body, aborting as soon as the accumulated length
+/// would exceed [`MAX_LLM_RESPONSE_BYTES`]. Streams chunk-by-chunk so an
+/// oversize body is rejected *without* first being fully buffered (an
+/// honest `Content-Length` is rejected before a single byte is read).
+async fn read_capped_bytes(resp: reqwest::Response) -> Result<Vec<u8>> {
+    read_capped_bytes_inner(resp, MAX_LLM_RESPONSE_BYTES).await
+}
+
+/// Cap-parameterised core of [`read_capped_bytes`], split out so tests
+/// can exercise the rejection logic against a tiny `cap` without having
+/// to stream a real 16 MiB body.
+async fn read_capped_bytes_inner(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(anyhow!(
+                "LLM response too large: Content-Length {len} exceeds cap of {cap} bytes"
+            ));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("Failed to read LLM response chunk")?
+    {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(anyhow!(
+                "LLM response exceeded cap of {cap} bytes while streaming"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Buffer a response body under [`MAX_LLM_RESPONSE_BYTES`] and parse it
+/// as JSON. Drop-in replacement for `resp.json().await` that bounds
+/// memory.
+async fn read_capped_json(resp: reqwest::Response) -> Result<Value> {
+    let bytes = read_capped_bytes(resp).await?;
+    serde_json::from_slice(&bytes).context("Failed to parse LLM response body as JSON")
+}
+
+/// Buffer a response body under [`MAX_LLM_RESPONSE_BYTES`] and decode it
+/// as UTF-8 (lossy). Drop-in replacement for `resp.text().await` used on
+/// error paths so a hostile endpoint cannot blow memory through an
+/// oversize *error* body either.
+async fn read_capped_text(resp: reqwest::Response) -> String {
+    match read_capped_bytes(resp).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => format!("<error body unavailable: {e}>"),
+    }
+}
+
 const QUERY_EXPANSION_PROMPT: &str = r"You are a search query expander. Given a search query, generate 5-8 additional search terms that are semantically related. Return ONLY the terms, one per line, no numbering or explanation.
 
 Query: {query}";
@@ -935,8 +1000,7 @@ impl OllamaClient {
             .await
             .context("Failed to list Ollama models")?;
 
-        let body: Value = resp
-            .json()
+        let body: Value = read_capped_json(resp)
             .await
             .context("Failed to parse /api/tags response")?;
 
@@ -975,7 +1039,7 @@ impl OllamaClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(anyhow!("Ollama pull failed ({status}): {text}"));
         }
 
@@ -1084,15 +1148,15 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(anyhow!("Chat generate failed ({status}): {text}"));
         }
 
-        let body: Value = match resp.json().await {
+        let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to parse chat response"));
+                return Err(e.context("Failed to parse chat response"));
             }
         };
 
@@ -1304,15 +1368,15 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(anyhow!("Generate failed ({status}): {text}"));
         }
 
-        let body: Value = match resp.json().await {
+        let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to parse chat response"));
+                return Err(e.context("Failed to parse chat response"));
             }
         };
 
@@ -1428,15 +1492,15 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(anyhow!("Generate failed ({status}): {text}"));
         }
 
-        let parsed: Value = match resp.json().await {
+        let parsed: Value = match read_capped_json(resp).await {
             Ok(v) => v,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to parse generate response"));
+                return Err(e.context("Failed to parse generate response"));
             }
         };
 
@@ -1518,15 +1582,15 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(anyhow!("Embed failed ({status}): {text}"));
         }
 
-        let body: Value = match resp.json().await {
+        let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to parse embed response"));
+                return Err(e.context("Failed to parse embed response"));
             }
         };
 
@@ -1589,8 +1653,7 @@ impl OllamaClient {
             .await
             .context("Failed to list Ollama models")?;
 
-        let body: Value = resp
-            .json()
+        let body: Value = read_capped_json(resp)
             .await
             .context("Failed to parse /api/tags response")?;
         let model_exists = body["models"].as_array().is_some_and(|models| {
@@ -1621,7 +1684,7 @@ impl OllamaClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_capped_text(resp).await;
             return Err(anyhow!("Ollama embed model pull failed ({status}): {text}"));
         }
 
@@ -2535,6 +2598,47 @@ mod wiremock_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(models))
             .mount(server)
             .await;
+    }
+
+    // ---------------- #1459 response-byte cap ----------------
+
+    /// A body whose declared length exceeds the cap is rejected before
+    /// it is buffered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_capped_bytes_rejects_oversize_1459() {
+        use super::read_capped_bytes_inner;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+            .mount(&server)
+            .await;
+        let url = format!("{}/big", server.uri());
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let err = read_capped_bytes_inner(resp, 64)
+            .await
+            .expect_err("oversize body MUST be rejected by the cap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds cap") || msg.contains("exceeded cap"),
+            "rejection must name the cap: {msg}"
+        );
+    }
+
+    /// A small JSON body under the cap parses normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_capped_json_parses_small_body_1459() {
+        use super::read_capped_json;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"hello": "world"})))
+            .mount(&server)
+            .await;
+        let url = format!("{}/ok", server.uri());
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let v = read_capped_json(resp).await.unwrap();
+        assert_eq!(v["hello"], "world");
     }
 
     // ---------------- PERF-12 lazy-health-check ----------------
