@@ -266,7 +266,7 @@ impl Severity {
 /// | `FilesystemWrite`    | `{"glob":"/tmp/**"}` — tiny glob over `path`                            |
 /// | `NetworkRequest`     | `{"host":"evil.example.com"}` — exact host match                        |
 /// | `ProcessSpawn`       | `{"binary":"cargo","disk_free_min_gib":20,"args_contain":"..."}` — binary + disk + optional argv substring |
-/// | `Custom`             | `{"kind":"<kind>"}` plus optional caller-specific fields                |
+/// | `Custom`             | `{"kind":"<kind>","namespace_glob":"secure/**","tier":"long","title_contains":"..."}` — kind + optional payload predicates (ANDed) |
 ///
 /// # Bash field naming (SEC-12 / COR-10, Cluster D, issue #767)
 ///
@@ -423,11 +423,60 @@ fn match_process_spawn(matcher: &serde_json::Value, binary: &str, args: &[String
     true
 }
 
-fn match_custom(matcher: &serde_json::Value, kind: &str, _payload: &serde_json::Value) -> bool {
+fn match_custom(matcher: &serde_json::Value, kind: &str, payload: &serde_json::Value) -> bool {
     let Some(target_kind) = matcher.get("kind").and_then(|v| v.as_str()) else {
         return false;
     };
-    target_kind == kind
+    if target_kind != kind {
+        return false;
+    }
+    // #1457 (SEC, MED-HIGH) — optional payload predicates. Before this
+    // change a `custom` rule could only key off the opaque `kind`
+    // string, so an operator could not write a governance rule that
+    // refuses, e.g., long-tier writes into a protected namespace even
+    // though the substrate pre-write hook already publishes
+    // `namespace`/`tier`/`memory_kind`/`title` in the Custom payload
+    // (see `bootstrap_serve`'s GOVERNANCE_PRE_WRITE closure). Each
+    // predicate below is ANDed with the others; an absent predicate is
+    // simply not constraining. All predicates must match for the rule
+    // to fire. A predicate that references a field missing from the
+    // payload makes the rule NOT match (fail-safe: the rule can only
+    // *refuse* a write it can positively identify).
+
+    // `namespace_glob`: glob over the payload `namespace` string,
+    // reusing the same engine as the FilesystemWrite `glob` matcher.
+    if let Some(ns_glob) = matcher.get("namespace_glob").and_then(|v| v.as_str()) {
+        let Some(ns) = payload.get("namespace").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if !crate::governance::glob_matches(ns_glob, ns) {
+            return false;
+        }
+    }
+
+    // `tier`: exact match on the payload `tier` string (e.g. "long").
+    if let Some(target_tier) = matcher.get("tier").and_then(|v| v.as_str()) {
+        let Some(tier) = payload.get("tier").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if target_tier != tier {
+            return false;
+        }
+    }
+
+    // `title_contains`: literal substring over the payload `title`,
+    // same contract as the bash/process-spawn substring matchers (no
+    // regex by design).
+    if let Some(needle) = matcher.get("title_contains").and_then(|v| v.as_str()) {
+        let Some(title) = payload.get("title").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if !title.contains(needle) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Probe free disk space at `/` in GiB. Returns `None` when the
@@ -1327,6 +1376,138 @@ mod tests {
         };
         let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
         assert!(decision.is_refusal());
+    }
+
+    // ---- #1457 (SEC, MED-HIGH): custom payload predicates ------------------
+
+    /// A `namespace_glob` predicate refuses a matching memory_write and
+    /// leaves non-matching namespaces alone.
+    #[test]
+    fn custom_namespace_glob_predicate_scopes_refusal() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-ns",
+            "custom",
+            r#"{"kind":"memory_write","namespace_glob":"secure/**"}"#,
+            "refuse",
+            true,
+        );
+        let inside = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"namespace": "secure/keys", "tier": "long"}),
+        };
+        assert!(
+            check_agent_action(&conn, "agent:t", &inside)
+                .unwrap()
+                .is_refusal()
+        );
+        let outside = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"namespace": "public/notes", "tier": "long"}),
+        };
+        assert_eq!(
+            check_agent_action(&conn, "agent:t", &outside).unwrap(),
+            Decision::Allow
+        );
+    }
+
+    /// `tier` and `title_contains` predicates AND together: the rule
+    /// fires only when BOTH match.
+    #[test]
+    fn custom_tier_and_title_predicates_and_together() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-tt",
+            "custom",
+            r#"{"kind":"memory_write","tier":"long","title_contains":"SECRET"}"#,
+            "refuse",
+            true,
+        );
+        let both = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"tier": "long", "title": "the SECRET plan"}),
+        };
+        assert!(
+            check_agent_action(&conn, "agent:t", &both)
+                .unwrap()
+                .is_refusal()
+        );
+        // Right title, wrong tier ⇒ no match.
+        let wrong_tier = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"tier": "mid", "title": "the SECRET plan"}),
+        };
+        assert_eq!(
+            check_agent_action(&conn, "agent:t", &wrong_tier).unwrap(),
+            Decision::Allow
+        );
+        // Right tier, title lacks needle ⇒ no match.
+        let wrong_title = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"tier": "long", "title": "harmless note"}),
+        };
+        assert_eq!(
+            check_agent_action(&conn, "agent:t", &wrong_title).unwrap(),
+            Decision::Allow
+        );
+    }
+
+    /// A predicate referencing a payload field that is absent makes the
+    /// rule NOT match (fail-safe — a refusal must positively identify
+    /// its target).
+    #[test]
+    fn custom_predicate_missing_payload_field_does_not_match() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-miss",
+            "custom",
+            r#"{"kind":"memory_write","namespace_glob":"secure/**"}"#,
+            "refuse",
+            true,
+        );
+        let no_ns = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"tier": "long"}),
+        };
+        assert_eq!(
+            check_agent_action(&conn, "agent:t", &no_ns).unwrap(),
+            Decision::Allow
+        );
+    }
+
+    /// Backwards-compat: a kind-only `custom` rule still fires
+    /// regardless of payload contents.
+    #[test]
+    fn custom_kind_only_rule_ignores_payload() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-kindonly",
+            "custom",
+            r#"{"kind":"memory_write"}"#,
+            "refuse",
+            true,
+        );
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"namespace": "anything", "tier": "short"}),
+        };
+        assert!(
+            check_agent_action(&conn, "agent:t", &action)
+                .unwrap()
+                .is_refusal()
+        );
     }
 
     #[test]
