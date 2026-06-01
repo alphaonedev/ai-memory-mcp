@@ -117,22 +117,26 @@ pub struct StoreRequest {
     #[schemars(description = "#885 Source URI (doc:/uri:/file:); indexed for #889.")]
     pub source_uri: Option<String>,
 
-    /// #626 Layer-3 (C7) — detached Ed25519 agent-attestation signature,
-    /// standard base64, over the `SignableWrite` envelope
-    /// (agent_id+namespace+title+kind+created_at+sha256(content)). When
-    /// present, `created_at` MUST also be supplied (the signer cannot
-    /// predict the server clock). A signature that fails to verify against
-    /// the agent's bound public key is always rejected.
+    // #626 Layer-3 (C7) — detached Ed25519 agent-attestation signature,
+    // standard base64, over the `SignableWrite` envelope
+    // (agent_id+namespace+title+kind+created_at+sha256(content)). When
+    // present, `created_at` MUST also be supplied (the signer cannot
+    // predict the server clock). A signature that fails to verify against
+    // the agent's bound public key is always rejected. Plain `//` (not a
+    // `///` doc comment) so schemars emits only the concise attribute
+    // `description` — a `///` summary line would also leak as a schema
+    // `title`, inconsistent with every sibling field.
     #[serde(default)]
     #[schemars(
         description = "#626 Ed25519 attestation signature (std base64); pair with created_at."
     )]
     pub signature: Option<String>,
 
-    /// #626 Layer-3 (C7) — RFC3339 timestamp the caller signed. Required
-    /// when `signature` is present; the server validates it against a
-    /// ±300s freshness window and then adopts it verbatim so the verifier
-    /// re-derives the identical signed envelope.
+    // #626 Layer-3 (C7) — RFC3339 timestamp the caller signed. Required
+    // when `signature` is present; the server validates it against a
+    // ±300s freshness window and then adopts it verbatim so the verifier
+    // re-derives the identical signed envelope. Plain `//` for the same
+    // schema-`title` reason documented on `signature` above.
     #[serde(default)]
     #[schemars(
         description = "#626 RFC3339 created_at the caller signed (required with signature)."
