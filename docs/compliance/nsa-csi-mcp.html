@@ -736,14 +736,14 @@ git checkout 4add7a8528d4c16d696b391ec6e2890269669a84</pre>
 
     <h3>2. Verify the schema version anchor</h3>
 <pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION' src/storage/migrations.rs
-<span class="com"># Expected: line 532: const CURRENT_SCHEMA_VERSION: i64 = 51;</span></pre>
+<span class="com"># Expected: line 554: const CURRENT_SCHEMA_VERSION: i64 = 53;</span></pre>
 
     <h3>3. Verify the MCP tool count anchors</h3>
-<pre class="codeblock">cargo test --lib profile::tests::profile_full_has_seventy_three_tools
-cargo test --lib profile::tests::profile_core_has_seven_tools
-cargo test --lib profile::tests::profile_graph_has_eighteen_tools
-cargo test --lib profile::tests::profile_admin_has_twenty_tools
-cargo test --lib profile::tests::profile_power_has_sixteen_tools</pre>
+<pre class="codeblock">cargo test --lib profile::tests::profile_full_matches_registry_all
+cargo test --lib profile::tests::profile_core_loads_only_core_family
+cargo test --lib profile::tests::profile_graph_loads_core_plus_graph
+cargo test --lib profile::tests::profile_admin_loads_core_lifecycle_governance
+cargo test --lib profile::tests::profile_power_loads_core_plus_power</pre>
 
     <h3>4. Verify the HookEvent variant count (25)</h3>
 <pre class="codeblock"><span class="com"># Codegraph approach (preferred)</span>
