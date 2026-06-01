@@ -383,23 +383,46 @@ fn dedup_hit_does_not_emit_a_second_signed_events_row() {
 // Test helpers — env-var guard so the allowlist tests don't leak.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Serializes every `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` mutation in
+/// this binary. `cargo test` runs the integration tests in ONE binary
+/// with all `#[test]` fns on parallel threads by default — the prior
+/// "single-threaded by default" assumption was false, so three tests
+/// (`rejects_unenrolled_host_pubkey`, `rejects_tampered_signature_*`,
+/// `accepts_verified_signature_*`) raced on the same process-global
+/// env var. A loser saw a peer's allowlist value and got
+/// `HOST_PUBKEY_NOT_ENROLLED` where it expected
+/// `signature_verification_failed`. The guard holds this lock for its
+/// whole lifetime so the set → read(handle_capture_turn) → restore
+/// window is atomic across tests.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct EnvVarGuard {
     name: &'static str,
     previous: Option<String>,
+    // Dropped LAST (declaration order), so the env var is restored by
+    // the `Drop` impl while the lock is still held, then released.
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvVarGuard {
     fn set(name: &'static str, value: &str) -> Self {
+        // Poisoning is irrelevant — the lock guards a `()`; recover the
+        // guard so one panicking test does not cascade-fail the rest.
+        let lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var(name).ok();
-        // SAFETY: We are in a #[cfg(test)] context. set_var/remove_var
-        // become unsafe on Edition 2024 / Rust 1.83+ because of
-        // multi-thread soundness concerns. Tests in this binary run
-        // single-threaded by default for the env-var-dependent paths.
-        // The guard restores on drop.
+        // SAFETY: set_var/remove_var are unsafe on Edition 2024 / Rust
+        // 1.83+ for multi-thread soundness. ENV_LOCK serializes every
+        // mutation + dependent read in this binary, so no other thread
+        // touches the environment inside the critical section. The
+        // guard restores on drop.
         unsafe {
             std::env::set_var(name, value);
         }
-        EnvVarGuard { name, previous }
+        EnvVarGuard {
+            name,
+            previous,
+            _lock: lock,
+        }
     }
 }
 
