@@ -70,8 +70,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable + iOS-sim target
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 + iOS-sim target (matches rust-toolchain.toml pin)
+        # MUST be @1.96.0, not @stable: the repo's rust-toolchain.toml
+        # pins channel = "1.96.0", so the actual `cargo` build runs under
+        # 1.96.0. A @stable step adds the ios-sim std component to the
+        # *stable* toolchain, leaving 1.96.0 without it → the build fails
+        # with `E0463: can't find crate for core`. Pinning here installs
+        # the target onto the same toolchain that builds (the ci.yml
+        # pattern).
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           # `aarch64-apple-ios-sim` matches the Apple-silicon GH macOS
           # runner (macos-latest is M1 / M2). Intel-sim would need
@@ -209,8 +216,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable + Android x86_64 target
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 + Android x86_64 target (matches rust-toolchain.toml pin)
+        # @1.96.0 (not @stable): same rust-toolchain.toml pin reasoning as
+        # the ios-simulator job — the target must be added to the 1.96.0
+        # toolchain that actually builds, else `E0463: can't find crate
+        # for core`.
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-linux-android
 
