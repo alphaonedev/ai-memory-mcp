@@ -2740,6 +2740,156 @@ async fn build_store_handle(
     }
 }
 
+/// v0.7.0 #1455 — `true` when the operator opted into the legacy
+/// permissive governance posture via
+/// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (`1` / `true`). Default
+/// `false` keeps the fail-CLOSED secure default. Shared by the storage
+/// pre-write hook and the wire-check hook so the two read the same
+/// override identically.
+fn governance_fail_open_on_error() -> bool {
+    std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
+/// where a governance hook's rule-consultation connection could not be
+/// opened at install time. Chain-logs a synthetic
+/// `governance:consultation_unavailable` refusal, then returns the
+/// fail-CLOSED verdict (`Err`) unless the operator opted into the
+/// legacy permissive posture. Reads the env override exactly once and
+/// delegates the verdict to [`governance_consultation_unavailable_inner`]
+/// so the decision is unit-testable without env mutation.
+fn governance_consultation_unavailable(
+    queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    agent_id: &str,
+    action: &crate::governance::agent_action::AgentAction,
+    rules_db_path: &Path,
+    surface: &str,
+) -> std::result::Result<(), String> {
+    governance_consultation_unavailable_inner(
+        queue,
+        agent_id,
+        action,
+        rules_db_path,
+        surface,
+        governance_fail_open_on_error(),
+    )
+}
+
+/// Pure inner of [`governance_consultation_unavailable`] — `fail_open`
+/// is passed explicitly so tests can pin both the secure default
+/// (`fail_open = false` ⇒ `Err`, the security contract) and the
+/// operator-override path (`fail_open = true` ⇒ `Ok`) without touching
+/// process env.
+fn governance_consultation_unavailable_inner(
+    queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    agent_id: &str,
+    action: &crate::governance::agent_action::AgentAction,
+    rules_db_path: &Path,
+    surface: &str,
+    fail_open: bool,
+) -> std::result::Result<(), String> {
+    use crate::governance::agent_action::Decision as RuleDecision;
+    let reason = format!(
+        "governance:consultation_unavailable: rules DB at {} could not be opened at hook install",
+        rules_db_path.display(),
+    );
+    // Chain-log the consultation failure regardless of the open/closed
+    // decision so an audit can detect that the gate ran degraded.
+    let synthetic_refusal = RuleDecision::Refuse {
+        rule_id: "governance:consultation_unavailable".to_string(),
+        reason: reason.clone(),
+    };
+    queue.submit_refusal(agent_id, action, &synthetic_refusal);
+    if fail_open {
+        tracing::warn!(
+            "{surface}: hook consultation connection unavailable (rules DB at {}); \
+             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — degrading to ALLOW (UNSAFE, legacy posture)",
+            rules_db_path.display(),
+        );
+        Ok(())
+    } else {
+        tracing::warn!(
+            "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
+             (#1455 secure default — set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+            rules_db_path.display(),
+        );
+        Err(reason)
+    }
+}
+
+/// #1458 (SEC, MED) — operator opt-in: when `AI_MEMORY_REQUIRE_API_KEY`
+/// is truthy, the daemon hard-refuses to start without an `api_key` on
+/// ANY bind host (including loopback). This is the hardened posture for
+/// deployments that front the daemon with a reverse proxy /
+/// `--network=host` container / `socat` forward — the loopback host
+/// string the daemon sees does not reflect off-host reachability, so the
+/// string-match loopback guard alone cannot protect them.
+fn require_api_key_strict() -> bool {
+    std::env::var("AI_MEMORY_REQUIRE_API_KEY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// #1458 (SEC, MED) — decide whether the daemon may bind given the
+/// configured api_key, the bind `host`, and the `strict` opt-in.
+///
+/// Returns:
+///   - `Ok(None)` — safe to bind silently (api_key is set);
+///   - `Ok(Some(warning))` — bind permitted but emit `warning` (keyless
+///     loopback, default single-tenant posture);
+///   - `Err(reason)` — refuse to bind (keyless non-loopback, or keyless
+///     under the `strict` opt-in).
+///
+/// Pulled out of `bootstrap_serve` so all three outcomes are unit
+/// testable without standing up a daemon.
+fn api_key_bind_guard(
+    api_key_present: bool,
+    host: &str,
+    strict: bool,
+) -> std::result::Result<Option<String>, String> {
+    if api_key_present {
+        return Ok(None);
+    }
+    if strict {
+        return Err(format!(
+            "refusing to start without an API key: AI_MEMORY_REQUIRE_API_KEY is set, which \
+             mandates `api_key` on every bind (requested host {host:?}). A reverse proxy, \
+             --network=host container, or socat forward can present loopback to the daemon \
+             while exposing it off-host, so the loopback guard alone is insufficient. \
+             Set top-level `api_key = \"...\"` in config (or --api-key on the CLI), or unset \
+             AI_MEMORY_REQUIRE_API_KEY to fall back to the loopback-only default. (#1458)"
+        ));
+    }
+    let is_loopback = host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host == "0:0:0:0:0:0:0:1"
+        || host == "[::1]";
+    if !is_loopback {
+        return Err(format!(
+            "refusing to bind to non-loopback address {host:?} without an API key: \
+             the daemon's api_key is unset (default-off auth would expose every \
+             privileged endpoint to any caller that can reach the bind address). \
+             Either set top-level `api_key = \"...\"` in config (or --api-key on the CLI) and rebind, \
+             or rebind to 127.0.0.1 / ::1 / localhost for a single-tenant deployment. \
+             (v0.7.0 fix campaign S5-C1, 2026-05-13. Note: api_key is a TOP-LEVEL \
+             AppConfig field per src/config.rs:2283; [api] subsection is silently ignored by serde.)"
+        ));
+    }
+    Ok(Some(format!(
+        "API key NOT configured — daemon bound to loopback {host:?}. \
+         Privileged endpoints (POST /memories, /links, /agents, /subscriptions) \
+         accept any caller that reaches this listener. #1458: a reverse proxy, \
+         --network=host container, or socat forward presents loopback to the daemon \
+         while exposing it off-host, re-opening this keyless write surface — set \
+         top-level `api_key = \"...\"` (or AI_MEMORY_REQUIRE_API_KEY=1 to hard-require it) \
+         for any deployment that is not strictly single-tenant on this host. \
+         /approve and /reject remain HMAC-gated regardless."
+    )))
+}
+
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
 ///
@@ -2767,30 +2917,14 @@ pub async fn bootstrap_serve(
     // address with no API key configured is the safe default;
     // operators who *intentionally* run a public daemon must set
     // `[api] api_key` (or `--api-key` on the CLI) explicitly.
-    if app_config.api_key.is_none() {
-        let host = args.host.as_str();
-        let is_loopback = host == "127.0.0.1"
-            || host == "::1"
-            || host == "localhost"
-            || host == "0:0:0:0:0:0:0:1"
-            || host == "[::1]";
-        if !is_loopback {
-            anyhow::bail!(
-                "refusing to bind to non-loopback address {host:?} without an API key: \
-                 the daemon's api_key is unset (default-off auth would expose every \
-                 privileged endpoint to any caller that can reach the bind address). \
-                 Either set top-level `api_key = \"...\"` in config (or --api-key on the CLI) and rebind, \
-                 or rebind to 127.0.0.1 / ::1 / localhost for a single-tenant deployment. \
-                 (v0.7.0 fix campaign S5-C1, 2026-05-13. Note: api_key is a TOP-LEVEL \
-                 AppConfig field per src/config.rs:2283; [api] subsection is silently ignored by serde.)"
-            );
-        }
-        tracing::warn!(
-            "API key NOT configured — daemon bound to loopback {host:?}. \
-             Privileged endpoints (POST /memories, /links, /agents, /subscriptions) \
-             accept any local caller. Set top-level `api_key = \"...\"` for production. \
-             /approve and /reject remain HMAC-gated regardless."
-        );
+    match api_key_bind_guard(
+        app_config.api_key.is_some(),
+        args.host.as_str(),
+        require_api_key_strict(),
+    ) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Err(reason) => anyhow::bail!("{reason}"),
     }
 
     let resolved_ttl = app_config.effective_ttl();
@@ -2931,25 +3065,6 @@ pub async fn bootstrap_serve(
         let conn_for_hook = hook_consultation_conn.clone();
         let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
             move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
-                let Some(conn_arc) = conn_for_hook.as_ref() else {
-                    tracing::warn!(
-                        "L1-6 governance pre-write: hook consultation connection unavailable (rules DB at {}); \
-                         degrading to ALLOW for this write",
-                        rules_db_path.display(),
-                    );
-                    return Ok(());
-                };
-                let conn_guard = match conn_arc.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "L1-6 governance pre-write: consultation connection mutex poisoned; \
-                             recovering inner connection and continuing"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let conn_for_check: &rusqlite::Connection = &conn_guard;
                 let action = AgentAction::Custom {
                     custom_kind: "memory_write".to_string(),
                     payload: serde_json::json!({
@@ -2971,6 +3086,38 @@ pub async fn bootstrap_serve(
                     .and_then(|v| v.as_str())
                     .unwrap_or("substrate:pre_write_hook")
                     .to_string();
+                let Some(conn_arc) = conn_for_hook.as_ref() else {
+                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the hook
+                    // consultation connection could not be opened at
+                    // install time. The pre-#1455 posture degraded to
+                    // ALLOW, which meant a daemon that lost its rules DB
+                    // at boot (permissions flip, disk pressure, an
+                    // attacker who can make `db::open` fail) silently
+                    // disabled the entire substrate write-gate while
+                    // continuing to accept writes. That is the same
+                    // bypass class #1054 closed for consultation ERRORS;
+                    // an unavailable connection is just a permanent
+                    // consultation failure and gets the same secure
+                    // default + the same operator escape hatch.
+                    return governance_consultation_unavailable(
+                        &queue_for_hook,
+                        &agent_id,
+                        &action,
+                        &rules_db_path,
+                        "L1-6 governance pre-write",
+                    );
+                };
+                let conn_guard = match conn_arc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
+                        );
+                        poisoned.into_inner()
+                    }
+                };
+                let conn_for_check: &rusqlite::Connection = &conn_guard;
                 match check_agent_action_deferred_cached(
                     conn_for_check,
                     Some(&cache_for_hook),
@@ -3010,14 +3157,10 @@ pub async fn bootstrap_serve(
                         // every fire and counts toward the
                         // governance posture surface so an audit can
                         // detect the legacy-permissive mode.
-                        let reason = format!(
-                            "governance:consultation_failed: {e}"
-                        );
-                        let fail_open = std::env::var(
-                            "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR",
-                        )
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
+                        let reason = format!("governance:consultation_failed: {e}");
+                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
                         // Emit a governance.refusal-shaped row to the
                         // deferred audit queue regardless of the
                         // open/closed decision so the audit chain
@@ -3030,11 +3173,7 @@ pub async fn bootstrap_serve(
                             rule_id: "governance:consultation_failed".to_string(),
                             reason: reason.clone(),
                         };
-                        queue_for_hook.submit_refusal(
-                            &agent_id,
-                            &action,
-                            &synthetic_refusal,
-                        );
+                        queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
                         if fail_open {
                             tracing::warn!(
                                 "L1-6 governance pre-write: rule consultation failed: {}; \
@@ -3108,13 +3247,21 @@ pub async fn bootstrap_serve(
         let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
             move |action: &AgentAction| -> std::result::Result<(), String> {
                 let Some(conn_arc) = conn_for_wire_check.as_ref() else {
-                    tracing::warn!(
-                        "wire_check: hook consultation connection unavailable (rules DB at {}); \
-                         degrading to ALLOW for this action ({})",
-                        rules_db_path.display(),
-                        action.kind(),
+                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the
+                    // consultation connection is unavailable, mirroring
+                    // the storage hook above. A daemon-internal wire
+                    // action (federation push, hooks spawn, LLM call,
+                    // skill_export filesystem write) is HIGHER-stakes
+                    // than a storage write, so degrading to ALLOW on a
+                    // missing rules DB would be the worst place to fail
+                    // open. Same secure default + escape hatch.
+                    return governance_consultation_unavailable(
+                        &queue_for_wire_check,
+                        "daemon:wire_action",
+                        action,
+                        &rules_db_path,
+                        "wire_check",
                     );
-                    return Ok(());
                 };
                 let conn_guard = match conn_arc.lock() {
                     Ok(g) => g,
@@ -4450,6 +4597,136 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    /// #1455 (SEC, MED) — when a governance hook's rule-consultation
+    /// connection could not be opened at install time, the gate MUST
+    /// fail CLOSED by default (return `Err`), and only degrade to ALLOW
+    /// when the operator explicitly opts into the legacy permissive
+    /// posture. The pre-#1455 behaviour silently degraded to ALLOW,
+    /// disabling the entire substrate write-gate whenever `db::open`
+    /// failed at boot.
+    #[test]
+    fn governance_consultation_unavailable_fails_closed_by_default_1455() {
+        use crate::governance::agent_action::AgentAction;
+        use crate::governance::deferred_audit::DeferredAuditQueue;
+
+        // Keep the receiver alive so the audit submit doesn't trip the
+        // closed-receiver WARN path (cosmetic; not under test here).
+        let (queue, _rx) = DeferredAuditQueue::new();
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".to_string(),
+            payload: serde_json::json!({ "namespace": "ns", "tier": "long" }),
+        };
+        let path = Path::new("/nonexistent/rules.db");
+
+        // Secure default: no operator override ⇒ fail CLOSED.
+        let closed = governance_consultation_unavailable_inner(
+            &queue,
+            "agent:test",
+            &action,
+            path,
+            "test-surface",
+            false,
+        );
+        let reason = closed.expect_err("missing consultation conn MUST fail CLOSED");
+        assert!(
+            reason.contains("consultation_unavailable"),
+            "fail-closed reason must name the cause: {reason}"
+        );
+
+        // Operator override ⇒ legacy permissive ALLOW.
+        let opened = governance_consultation_unavailable_inner(
+            &queue,
+            "agent:test",
+            &action,
+            path,
+            "test-surface",
+            true,
+        );
+        assert!(
+            opened.is_ok(),
+            "fail_open override MUST degrade to ALLOW (legacy posture)"
+        );
+    }
+
+    /// #1455 — the env-reading wrapper honours the documented
+    /// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` truthy values and
+    /// defaults to `false` (fail-closed) when unset.
+    #[test]
+    fn governance_fail_open_on_error_env_parse_1455() {
+        // Unset → secure default.
+        unsafe { std::env::remove_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR") };
+        assert!(!governance_fail_open_on_error());
+        // Truthy forms → permissive.
+        unsafe { std::env::set_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR", "1") };
+        assert!(governance_fail_open_on_error());
+        unsafe { std::env::set_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR", "TRUE") };
+        assert!(governance_fail_open_on_error());
+        // Falsy / junk → secure default.
+        unsafe { std::env::set_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR", "0") };
+        assert!(!governance_fail_open_on_error());
+        unsafe { std::env::remove_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR") };
+    }
+
+    // ---- #1458 (SEC, MED): api_key bind guard ------------------------------
+
+    /// With an api_key configured the guard permits any bind silently.
+    #[test]
+    fn api_key_bind_guard_present_binds_silently_1458() {
+        assert_eq!(api_key_bind_guard(true, "0.0.0.0", false).unwrap(), None);
+        assert_eq!(api_key_bind_guard(true, "127.0.0.1", true).unwrap(), None);
+    }
+
+    /// Keyless loopback bind is permitted but MUST warn about the
+    /// reverse-proxy/host-network re-exposure hazard.
+    #[test]
+    fn api_key_bind_guard_keyless_loopback_warns_1458() {
+        for host in ["127.0.0.1", "::1", "localhost", "[::1]", "0:0:0:0:0:0:0:1"] {
+            let warning = api_key_bind_guard(false, host, false)
+                .unwrap()
+                .unwrap_or_else(|| panic!("keyless loopback {host} must warn, not bind silently"));
+            assert!(
+                warning.contains("reverse proxy") && warning.contains("off-host"),
+                "warning must name the proxy hazard for {host}: {warning}"
+            );
+        }
+    }
+
+    /// Keyless non-loopback bind is refused outright.
+    #[test]
+    fn api_key_bind_guard_keyless_non_loopback_refuses_1458() {
+        let err = api_key_bind_guard(false, "0.0.0.0", false)
+            .expect_err("keyless non-loopback bind MUST be refused");
+        assert!(err.contains("refusing to bind to non-loopback"), "{err}");
+    }
+
+    /// The strict opt-in refuses a keyless start even on loopback,
+    /// because the loopback host string cannot see a fronting proxy.
+    #[test]
+    fn api_key_bind_guard_strict_refuses_keyless_loopback_1458() {
+        let err = api_key_bind_guard(false, "127.0.0.1", true)
+            .expect_err("strict mode MUST refuse keyless loopback bind");
+        assert!(
+            err.contains("AI_MEMORY_REQUIRE_API_KEY"),
+            "strict refusal must name the knob: {err}"
+        );
+        // Strict is moot when a key IS present.
+        assert_eq!(api_key_bind_guard(true, "127.0.0.1", true).unwrap(), None);
+    }
+
+    /// The strict-mode env parser honours truthy forms and defaults off.
+    #[test]
+    fn require_api_key_strict_env_parse_1458() {
+        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
+        assert!(!require_api_key_strict());
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "1") };
+        assert!(require_api_key_strict());
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "TRUE") };
+        assert!(require_api_key_strict());
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "0") };
+        assert!(!require_api_key_strict());
+        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
+    }
 
     // ----- helpers -------------------------------------------------------
 
