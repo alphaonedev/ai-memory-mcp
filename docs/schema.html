@@ -162,7 +162,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The schema, table by table.</h1>
-  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v50 at v0.7.0</strong> (was v33 at v0.6.4; ladder v34 → v50 includes V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 #1156). Migration is automatic on first daemon start.</p>
+  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v53 at v0.7.0</strong> (was v33 at v0.6.4; ladder v34 → v53 includes V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 #1156, <code>federation_nonces</code> persistence at v51 #1255, <code>transcript_line_dedup</code> idempotency table at v52 #1389, and <code>memories_au</code> FTS5 trigger scoping at v53 #1418). Migration is automatic on first daemon start.</p>
   <div class="pills">
     <span class="pill">17+ tables</span>
     <span class="pill">30+ indexes</span>
@@ -175,7 +175,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Table-relationship map</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">17 first-class tables at v0.7.0.</h2>
-    <p class="lede">Every relation flows from the central <code>memories</code> table. Foreign-key cascade-on-delete protects against orphan rows. <code>memory_links</code> is the KG primitive; <code>pending_actions</code> is the governance queue; <code>sync_state</code> is the federation cursor table; <code>audit_log</code> + <code>signed_events</code> are the V-4 tamper-evident chain; <code>signed_events_dlq</code> + <code>federation_push_dlq</code> are the v0.7.0 reliability DLQs (Track D #933). Table list authoritative against <code>src/storage/migrations.rs</code> CREATE TABLE statements at <code>CURRENT_SCHEMA_VERSION = 50</code>.</p>
+    <p class="lede">Every relation flows from the central <code>memories</code> table. Foreign-key cascade-on-delete protects against orphan rows. <code>memory_links</code> is the KG primitive; <code>pending_actions</code> is the governance queue; <code>sync_state</code> is the federation cursor table; <code>audit_log</code> + <code>signed_events</code> are the V-4 tamper-evident chain; <code>signed_events_dlq</code> + <code>federation_push_dlq</code> are the v0.7.0 reliability DLQs (Track D #933). Table list authoritative against <code>src/storage/migrations.rs</code> CREATE TABLE statements at <code>CURRENT_SCHEMA_VERSION = 53</code>.</p>
 
     <svg class="relations-svg" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg">
       <!-- Central: memories -->
@@ -412,10 +412,10 @@ footer a{color:var(--text-muted)}
         <span class="tbl-name">schema_version</span>
         <span class="tbl-tag">▸ MIGRATION</span>
       </div>
-      <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. <strong>Current version: 50 at v0.7.0</strong> (was 33 at v0.6.4 — the v34 → v50 ladder spans 17 migrations).</div>
+      <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. <strong>Current version: 53 at v0.7.0</strong> (was 33 at v0.6.4 — the v34 → v53 ladder spans 20 migrations).</div>
       <table class="cols">
         <tbody>
-          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 50 (v0.7.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 50</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. v34 → v50 covers V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 (#1156: <code>agent_quotas</code> PK <code>(agent_id)</code> → <code>(agent_id, namespace)</code>; pre-v50 rows backfill to the <code>_global</code> sentinel).</td></tr>
+          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 53 (v0.7.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 53</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. v34 → v53 covers V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 (#1156: <code>agent_quotas</code> PK <code>(agent_id)</code> → <code>(agent_id, namespace)</code>; pre-v50 rows backfill to the <code>_global</code> sentinel), <code>federation_nonces</code> persistence at v51 (#1255), <code>transcript_line_dedup</code> idempotency table at v52 (#1389), and <code>memories_au</code> FTS5 trigger scoping at v53 (#1418).</td></tr>
         </tbody>
       </table>
     </div>

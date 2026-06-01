@@ -411,7 +411,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
       <li><code>src/main.rs</code> + <code>src/daemon_runtime.rs</code> — CLI parsing + daemon setup (79 subcommands at v0.7.0 in the default build (81 under <code>--features sal</code> or <code>--features sal-postgres</code>))</li>
       <li><code>src/mcp/</code> — MCP server (74 advertised entries at <code>--profile full</code>; 7 at <code>--profile core</code>)</li>
       <li><code>src/handlers/</code> — HTTP route handlers (router registers 88 <code>/api/v1/*</code> route bindings / 74 unique URL paths at v0.7.0)</li>
-      <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v51 per v0.7.0 release notes; v51 = federation_nonces persistence #1255 / PR #1296; v50 = per-namespace K8 quota dimension #1156)</li>
+      <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v53 per v0.7.0 release notes; v53 = memories_au FTS5 trigger scoping #1418; v52 = transcript_line_dedup #1389; v51 = federation_nonces persistence #1255 / PR #1296; v50 = per-namespace K8 quota dimension #1156)</li>
       <li><code>src/reranker.rs</code> — adaptive blend semantic + keyword</li>
       <li><code>src/hnsw.rs</code> — in-memory ANN</li>
       <li><code>docs/ARCHITECTURE.md</code> — full module map</li>

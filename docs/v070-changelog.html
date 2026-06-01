@@ -90,7 +90,7 @@ footer a{color:var(--muted)}
   <div class="meta-row">
     <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
     <span>SHIP-RECOMMENDED 2026-05-22</span>
-    <span>schema v33 &rarr; v50</span>
+    <span>schema v33 &rarr; v53</span>
     <span>capabilities v2 &rarr; v3</span>
   </div>
 </header>
@@ -114,7 +114,7 @@ footer a{color:var(--muted)}
   <div class="entry">
     <span class="tag new">NEW</span>
     <h3>Ed25519 attestation + signed-events V-4 chain</h3>
-    <p>Per-agent Ed25519 keypairs (<code>ai-memory identity generate</code>) sign every memory link write. Inbound verification against <code>observed_by</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) shipped at schema v34, part of the v33 &rarr; v50 migration ladder. The audit chain compliance teams have been asking for.</p>
+    <p>Per-agent Ed25519 keypairs (<code>ai-memory identity generate</code>) sign every memory link write. Inbound verification against <code>observed_by</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) shipped at schema v34, part of the v33 &rarr; v53 migration ladder. The audit chain compliance teams have been asking for.</p>
   </div>
 
   <div class="entry">
@@ -227,6 +227,24 @@ footer a{color:var(--muted)}
     <span class="tag changed">CHANGED</span>
     <h3>Per-namespace K8 quota dimension (#1156)</h3>
     <p>Schema v50 extends <code>agent_quotas</code> PRIMARY KEY from <code>(agent_id)</code> to <code>(agent_id, namespace)</code>. Per-namespace K8 quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the <code>_global</code> sentinel namespace.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag added">ADDED</span>
+    <h3>Federation nonce persistence (#1255 / PR #1296)</h3>
+    <p>Schema v51 adds the <code>federation_nonces</code> table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so every restart re-opened a replay window; v51 collapses that window to zero across restarts.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag added">ADDED</span>
+    <h3>Transcript line-dedup persistence (#1389, closes #1388)</h3>
+    <p>Schema v52 adds the <code>transcript_line_dedup</code> table backing the sha256-keyed idempotency layer for the four-layer capture architecture (L2 recover-on-boot + L3 substrate watcher + L4 <code>memory_capture_turn</code>). A crashed or restarted capture pipeline can no longer double-ingest the same transcript line.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>FTS5 update-trigger scoping (#1418)</h3>
+    <p>Schema v53 (R5.F5.2 perf-audit closeout) scopes the <code>memories_au</code> FTS5 sync trigger to <code>AFTER UPDATE OF title, content, tags</code> so hot-path UPDATEs touching only non-FTS columns (<code>embedding</code>, <code>access_count</code>, <code>last_accessed_at</code>, <code>confidence_decayed_at</code>, <code>version</code>) no longer pay 2 spurious FTS5 row ops apiece. A 100k-row embed backfill sheds 200k wasted ops; <code>touch_many</code> for K=10 recalls drops 5&ndash;10&times; wall cost. Pure DDL, idempotent.</p>
   </div>
 
   <div class="entry">
