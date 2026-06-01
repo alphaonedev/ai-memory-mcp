@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### Moonshot-property declaration (ROADMAP §17 quality gate)
+
+> Per ROADMAP §17, every release declares which of the seven §2 moonshot
+> properties it strengthens, with code anchors. v0.7.0 is the **first**
+> release authored under this discipline. The hardening center-of-gravity
+> is **§2.3 stoppable** + **§2.5 attested**; the other five are touched or
+> held. Known gaps are named explicitly below rather than elided.
+
+- **§2.3 stoppable — STRENGTHENED (primary).** The substrate refuses
+  rather than proceeds on every governance / safety boundary it cannot
+  positively clear:
+  - Governance consultation fails CLOSED on transient error
+    ([#1455](https://github.com/alphaonedev/ai-memory-mcp/issues/1455),
+    `src/daemon_runtime.rs` `governance_consultation_unavailable[_inner]`;
+    [#1054](https://github.com/alphaonedev/ai-memory-mcp/issues/1054)),
+    opt-out only via `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (default
+    `false`).
+  - Optimistic `memory_update` now routes through `GOVERNANCE_PRE_WRITE`
+    on both backends so the versioned write path can't bypass policy
+    ([#1451](https://github.com/alphaonedev/ai-memory-mcp/issues/1451)).
+  - `match_custom` evaluates its ANDed payload predicates, closing a
+    custom-action policy-bypass
+    ([#1457](https://github.com/alphaonedev/ai-memory-mcp/issues/1457)).
+  - SSRF webhook/federation dispatch fails CLOSED on DNS failure
+    ([#1053](https://github.com/alphaonedev/ai-memory-mcp/issues/1053),
+    `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` default `false`).
+  - Strict keyless-bind refusal
+    ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458),
+    `AI_MEMORY_REQUIRE_API_KEY`) and the recursive-reflection depth cap
+    (`REFLECTION_DEPTH_EXCEEDED`,
+    [#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655)).
+- **§2.5 attested — STRENGTHENED (primary).** Provenance is verifiable,
+  and the audit chain fails CLOSED:
+  - `signed_events` fails CLOSED on a missing signature when a verifier
+    is installed and the row's `attest_level` is not the by-design
+    `"unsigned"` legacy marker
+    ([#1452](https://github.com/alphaonedev/ai-memory-mcp/issues/1452)),
+    over the V-4 cross-row hash chain.
+  - L4 `memory_capture_turn` verifies host Ed25519 signatures against an
+    operator-managed allowlist and lands `attest_level = "signed_by_peer"`
+    on success
+    ([#1414](https://github.com/alphaonedev/ai-memory-mcp/issues/1414),
+    `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST`).
+  - Daemon `serverInfo` is Ed25519-signed at the MCP `initialize`
+    handshake
+    ([#1154](https://github.com/alphaonedev/ai-memory-mcp/issues/1154));
+    federation requires signatures + per-message nonces by secure default
+    ([#791](https://github.com/alphaonedev/ai-memory-mcp/issues/791),
+    [#922](https://github.com/alphaonedev/ai-memory-mcp/issues/922),
+    [#1088](https://github.com/alphaonedev/ai-memory-mcp/issues/1088)).
+- **§2.2 coherent — STRENGTHENED.** The #1389 layered-capture
+  architecture (L1 store-first rule + L2 transcript recovery + L4
+  idempotent turn capture) plus schema v52 `transcript_line_dedup`
+  guarantee a SIGKILL between turns never loses or duplicates a captured
+  turn
+  ([#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389),
+  [#1416](https://github.com/alphaonedev/ai-memory-mcp/issues/1416)).
+- **§2.7 LLM-agnostic — STRENGTHENED.** Provider-agnostic LLM client over
+  15 vendor aliases; tier no longer dictates vendor
+  ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067),
+  [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)).
+- **§2.1 endpoint-resident — HELD/extended.** iOS + Android cross-compile
+  CI + runtime coverage keep the substrate buildable on-device
+  ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068));
+  no FFI surface ships yet (v0.7.x follow-up).
+- **§2.4 improvable — HELD.** The recursive-learning primitive
+  ([#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655)) is
+  unchanged this cycle beyond the depth-cap stoppability anchor above.
+
+#### Known property gaps at v0.7.0 (named, not elided)
+
+- **§2.2 capture vs §2.5 attestation.** L4 `memory_capture_turn` is the
+  first surface that captures coherently *and* offers an optional
+  attestation path — but `metadata.agent_id` remains a *claimed*, not
+  *attested*, identity (the allowlist is empty by default, so the default
+  capture lands unsigned). The signed path is verified
+  ([#1414](https://github.com/alphaonedev/ai-memory-mcp/issues/1414));
+  closing the claimed→attested gap end-to-end is agent-registration work
+  tracked alongside the heterogeneous-panel adjudication
+  ([#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171)).
+  This is a tracked gap, not a regression: §2.2 and §2.5 are both
+  advanced this cycle; the *join* between them is the open edge.
+- **§2.6 bias-displaced — policy, not architecture.** Per ROADMAP §5,
+  producer/reflector decorrelation (e.g. a Claude-family producing agent
+  with a non-Claude curator backend) is currently a deployment-policy
+  property, not enforced by the substrate; v0.7.0 makes it *expressible*
+  via the LLM-agnostic backend (§2.7) but does not *attest* it. Tracked
+  under [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
+
 ### v0.7.0 security-review epic #1450 — 9-finding hardening sweep (2026-05-31)
 
 Full-spectrum multi-agent security review of the v0.7.0 substrate. Each finding was fixed 1:1 with a regression test, gated (fmt + clippy::pedantic + full suite + audit), and committed to `release/v0.7.0`. Parent epic **[#1450](https://github.com/alphaonedev/ai-memory-mcp/issues/1450)**.
