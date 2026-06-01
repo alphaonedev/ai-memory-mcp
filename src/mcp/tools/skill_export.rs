@@ -180,6 +180,7 @@ pub fn handle_skill_export(
         .map_err(|e| format!("resources prepare: {e}"))?;
 
     let mut exported_resources: Vec<String> = Vec::new();
+    let resources_root = target.join("resources");
     let rows = res_stmt
         .query_map([skill_id], |row| {
             Ok((
@@ -193,9 +194,42 @@ pub fn handle_skill_export(
     for row in rows {
         let (res_path, _kind, content_blob_opt) = row.map_err(|e| format!("row: {e}"))?;
         if let Some(blob) = content_blob_opt {
+            // #1453 (SEC, MED) — `res_path` is attacker-influenceable: it
+            // is persisted verbatim in `skill_resources.resource_path` at
+            // register time, so a poisoned skill row could carry
+            // `../../etc/cron.d/evil` or an absolute path. `Path::join`
+            // with an absolute path REPLACES the base, and `..` traverses
+            // upward — either would let the write below escape the
+            // export's `resources/` subtree. Reject those components
+            // BEFORE decoding, joining, or writing. `CurDir` (`.`) and
+            // `Normal` components are safe and pass through.
+            let rp = Path::new(&res_path);
+            if rp.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
+                return Err(format!(
+                    "refusing resource with unsafe path '{res_path}': \
+                     absolute or parent-directory components are not allowed"
+                ));
+            }
             let content = zstd::decode_all(blob.as_slice())
                 .map_err(|e| format!("decompress resource '{res_path}': {e}"))?;
-            let res_file = target.join("resources").join(&res_path);
+            let res_file = resources_root.join(&res_path);
+            // Defense-in-depth: the lexical join MUST remain inside the
+            // resources root. The component check above is the
+            // load-bearing guard; this `starts_with` assertion catches
+            // any future shape (e.g. an empty / `.`-only path that
+            // normalises oddly) that slips past it.
+            if !res_file.starts_with(&resources_root) {
+                return Err(format!(
+                    "refusing resource '{res_path}': resolved path escapes the resources root"
+                ));
+            }
             // v0.7.0 (issue #691 fold-1) — per-resource FilesystemWrite
             // gate. Same uniform wire_check shape as the SKILL.md write
             // above; a refusal on any resource halts the export at that
@@ -640,6 +674,110 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("decompress resource"));
+    }
+
+    // ---- #1453 path-traversal guard -------------------------------------
+
+    /// #1453 (SEC, MED) — a `skill_resources` row whose `resource_path`
+    /// contains `..` must be refused, and NO file may be written outside
+    /// the export's `resources/` subtree.
+    #[test]
+    fn rejects_resource_path_with_parent_dir_traversal() {
+        let (conn, dir) = open_db();
+        let id = "8hhhh-0000-0000-0000-000000000008";
+        insert_skill_full(&conn, id, "ns", "name", "d", "body");
+        // A *valid* blob so the only thing that can fail is the guard.
+        let blob = zstd::encode_all(b"pwned\n".as_slice(), 3).unwrap();
+        let dig = vec![0u8; 32];
+        conn.execute(
+            "INSERT INTO skill_resources (skill_id, resource_path, resource_kind, content_blob, digest) \
+             VALUES (?1, '../escape.txt', 'asset', ?2, ?3)",
+            params![id, blob, dig],
+        )
+        .unwrap();
+        let target = dir.path().join("export-traversal");
+        let err = handle_skill_export(
+            &conn,
+            &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsafe path") && err.contains("parent-directory"),
+            "expected parent-dir refusal, got: {err}"
+        );
+        // `target/resources/../escape.txt` lexically resolves to
+        // `target/escape.txt` — it must NOT have been written.
+        assert!(
+            !target.join("escape.txt").exists(),
+            "traversal write must not land outside resources/"
+        );
+    }
+
+    /// #1453 (SEC, MED) — an absolute `resource_path` (which `Path::join`
+    /// would treat as a base-replacement) must be refused and nothing
+    /// written at the absolute location.
+    #[test]
+    fn rejects_absolute_resource_path() {
+        let (conn, dir) = open_db();
+        let id = "9iiii-0000-0000-0000-000000000009";
+        insert_skill_full(&conn, id, "ns", "name", "d", "body");
+        let blob = zstd::encode_all(b"pwned\n".as_slice(), 3).unwrap();
+        let dig = vec![0u8; 32];
+        // Absolute path inside the test's own tempdir so even a
+        // hypothetical write would respect the no-/tmp project rule.
+        let abs = dir.path().join("absolute-pwned.txt");
+        let abs_str = abs.to_str().unwrap();
+        conn.execute(
+            "INSERT INTO skill_resources (skill_id, resource_path, resource_kind, content_blob, digest) \
+             VALUES (?1, ?2, 'asset', ?3, ?4)",
+            params![id, abs_str, blob, dig],
+        )
+        .unwrap();
+        let target = dir.path().join("export-absolute");
+        let err = handle_skill_export(
+            &conn,
+            &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("unsafe path"),
+            "expected absolute-path refusal, got: {err}"
+        );
+        assert!(
+            !abs.exists(),
+            "absolute-path write must not have landed: {abs:?}"
+        );
+    }
+
+    /// #1453 (SEC, MED) — the guard must NOT regress the happy path:
+    /// a normal nested `resource_path` still exports cleanly.
+    #[test]
+    fn allows_normal_nested_resource_path() {
+        let (conn, dir) = open_db();
+        let id = "aaaaa-0000-0000-0000-00000000000a";
+        insert_skill_full(&conn, id, "ns", "name", "d", "body");
+        let blob = zstd::encode_all(b"ok\n".as_slice(), 3).unwrap();
+        let dig = vec![0u8; 32];
+        conn.execute(
+            "INSERT INTO skill_resources (skill_id, resource_path, resource_kind, content_blob, digest) \
+             VALUES (?1, 'scripts/run.sh', 'script', ?2, ?3)",
+            params![id, blob, dig],
+        )
+        .unwrap();
+        let target = dir.path().join("export-ok");
+        let v = handle_skill_export(
+            &conn,
+            &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["resources_exported"], json!(1));
+        assert_eq!(
+            std::fs::read(target.join("resources/scripts/run.sh")).unwrap(),
+            b"ok\n"
+        );
     }
 
     // ---- yaml_quote helper ----------------------------------------------
