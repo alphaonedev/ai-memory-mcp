@@ -197,6 +197,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <a href="#mobile">Mobile&nbsp;/&nbsp;IoT</a>
       <a href="#features">Features</a>
       <a href="#install">Install</a>
+      <a href="#migrate">Migrate</a>
       <a href="#integrate">Integrate</a>
       <a href="#architectures">Architectures</a>
       <a href="whats-new-v07.html" style="color:var(--p3)">v0.7.0</a>
@@ -470,6 +471,45 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
   </div>
 </section>
 
+<!-- ============ MIGRATION v0.6.4 → v0.7.0 ============ -->
+<section id="migrate">
+  <div class="container-narrow">
+    <span class="eyebrow">Migrating from v0.6.4</span>
+    <h2>Already running v0.6.4? The upgrade is one boot.</h2>
+    <p class="lede">
+      v0.7.0 migrates your existing database in place. The sqlite schema steps from
+      <strong>v15&nbsp;&rarr;&nbsp;v53</strong> on the first <code>ai-memory serve</code> after the upgrade.
+      It is <strong>non-destructive</strong> &mdash; every existing memory carries forward unchanged and new
+      columns default to safe values for legacy rows. Typical downtime is
+      <strong>30&nbsp;seconds to 2&nbsp;minutes</strong> on a laptop-sized database.
+    </p>
+    <div class="grid-3" style="margin-top:1.25rem">
+      <div class="feat cyan">
+        <span class="tag">Step 1 &middot; Back up</span>
+        <h3>Copy the DB + sidecars</h3>
+        <p>Stop the daemon, then copy <code>ai-memory.db</code> and any <code>-wal</code>&nbsp;/&nbsp;<code>-shm</code> sidecars to a <code>.bak.pre-v07</code> file. Verify it with <code>PRAGMA&nbsp;integrity_check</code>.</p>
+      </div>
+      <div class="feat cyan">
+        <span class="tag">Step 2 &middot; Upgrade</span>
+        <h3>Install v0.7.0 &amp; boot once</h3>
+        <p>Install the new binary, then run <code>ai-memory serve</code>. The schema ladder migrates automatically and you are back online when it finishes.</p>
+      </div>
+      <div class="feat cyan">
+        <span class="tag">Step 3 &middot; Roll back if needed</span>
+        <h3>File restore is the escape hatch</h3>
+        <p>The ladder is idempotent on replay but not reversible in place. To roll back, restore the <code>.bak.pre-v07</code> file and reinstall the v0.6.4 binary.</p>
+      </div>
+    </div>
+    <div style="margin-top:1.5rem">
+      <a class="cta primary" href="migration-v064-to-v070.md">Walk-me-through-it migration guide &rarr;</a>
+      &nbsp;
+      <a class="cta ghost" href="MIGRATION_v0.7.md">Deep technical companion</a>
+      &nbsp;
+      <a class="cta ghost" href="migration-v0.7.0-postgres.md">Postgres migration</a>
+    </div>
+  </div>
+</section>
+
 <!-- ============ INTEGRATION ============ -->
 <section id="integrate" class="dark">
   <div class="container">
@@ -507,7 +547,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.md">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>73 routes at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>88 routes (74 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.md">
