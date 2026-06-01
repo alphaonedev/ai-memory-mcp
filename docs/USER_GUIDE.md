@@ -1353,9 +1353,11 @@ verbatim (±300 s freshness window). A forged signature is rejected with
 Operators who want to *require* attestation can set
 `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy): unsigned writes are then
 rejected rather than landing claimed. The default is permissive (unsigned →
-claimed) to preserve the v0.6.x posture. The one remaining open edge — the
-identity of the unsigned **default-path** capture (L4) — is tracked under
-[#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
+claimed) to preserve the v0.6.x posture. Two edges stay claimed-by-design at
+v0.7.0 — the federation **receive** path (mTLS + the peer allowlist is the
+trust boundary, not a per-write agent signature) and this permissive default
+posture — both tracked for v0.8 hardening under
+[#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464).
 
 ### Default leaks hostname + PID
 
