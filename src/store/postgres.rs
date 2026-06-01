@@ -9330,6 +9330,86 @@ impl MemoryStore for PostgresStore {
         self.store(ctx, &mem).await.map(|_| ())
     }
 
+    async fn bind_agent_pubkey(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        pubkey_b64: &str,
+    ) -> StoreResult<()> {
+        // #626 Layer-3 (Task 1.3 / C3) — parity with
+        // `db::bind_agent_pubkey` on the sqlite path. Read the existing
+        // `_agents` row metadata, augment it with `agent_pubkey` +
+        // `pubkey_bound_at`, and write both `metadata` (jsonb) and the
+        // mirrored `content` (text) so `list_agents` / the verifier
+        // observe a consistent row. The agent must already be
+        // registered; re-binding rotates the key.
+        use crate::models::AGENTS_NAMESPACE;
+
+        let title = format!("agent:{agent_id}");
+        let now = Utc::now().to_rfc3339();
+
+        let existing: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT metadata FROM memories WHERE namespace = $1 AND title = $2")
+                .bind(AGENTS_NAMESPACE)
+                .bind(&title)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read agent metadata for pubkey bind", e))?;
+
+        let Some((mut meta,)) = existing else {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
+                ),
+            });
+        };
+
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert(
+                "agent_pubkey".to_string(),
+                serde_json::Value::String(pubkey_b64.to_string()),
+            );
+            obj.insert(
+                "pubkey_bound_at".to_string(),
+                serde_json::Value::String(now.clone()),
+            );
+        }
+
+        let content = serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
+            detail: format!("serialize agent metadata for pubkey bind: {e}"),
+        })?;
+
+        sqlx::query(
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5
+             WHERE namespace = $1 AND title = $2",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .bind(&meta)
+        .bind(&content)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("bind_agent_pubkey", e))?;
+
+        Ok(())
+    }
+
+    async fn agent_pubkey(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        use crate::models::AGENTS_NAMESPACE;
+        let title = format!("agent:{agent_id}");
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT metadata->>'agent_pubkey' FROM memories
+             WHERE namespace = $1 AND title = $2",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("agent_pubkey", e))?;
+        Ok(row.and_then(|(pk,)| pk))
+    }
+
     // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths on postgres.
 
     async fn forget(
