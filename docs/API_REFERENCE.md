@@ -782,7 +782,7 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_verify` | `POST /api/v1/links/verify` | H4. |
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 
-For the canonical 73-tool full inventory: `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 73 — the `registered_tools()` iterator in `src/mcp/registry.rs:168` is the source of truth.
+For the canonical 74-entry full inventory: `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 74 — the `registered_tools()` iterator in `src/mcp/registry.rs:564` is the source of truth.
 
 ## See also
 
