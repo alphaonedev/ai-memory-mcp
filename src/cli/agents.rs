@@ -36,6 +36,26 @@ pub enum AgentsAction {
         #[arg(long, default_value = "")]
         capabilities: String,
     },
+    /// Bind (or rotate) the Ed25519 public key used to attest an
+    /// agent's signed writes (#626 Layer-3). The agent MUST already be
+    /// registered. Re-binding overwrites the previous key in place.
+    BindKey {
+        /// Agent identifier (must be registered)
+        #[arg(long)]
+        agent_id: String,
+        /// Base64-encoded Ed25519 public key (URL-safe-no-pad or
+        /// standard padding accepted)
+        #[arg(long)]
+        pubkey: String,
+    },
+    /// Revoke the Ed25519 public key bound to an agent (#626 Layer-3).
+    /// The agent reverts to the permissive *claimed* posture until a
+    /// fresh key is bound. Idempotent.
+    RevokeKey {
+        /// Agent identifier (must be registered)
+        #[arg(long)]
+        agent_id: String,
+    },
 }
 
 #[derive(Args)]
@@ -131,6 +151,41 @@ pub fn run_agents(
                         caps.join(",")
                     }
                 )?;
+            }
+        }
+        AgentsAction::BindKey { agent_id, pubkey } => {
+            validate::validate_agent_id(&agent_id)?;
+            validate::validate_agent_pubkey_b64(&pubkey)?;
+            let trimmed = pubkey.trim();
+            db::bind_agent_pubkey(&conn, &agent_id, trimmed)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "bound": true,
+                        "agent_id": agent_id,
+                        "agent_pubkey": trimmed,
+                    })
+                )?;
+            } else {
+                writeln!(out.stdout, "bound pubkey for {agent_id}")?;
+            }
+        }
+        AgentsAction::RevokeKey { agent_id } => {
+            validate::validate_agent_id(&agent_id)?;
+            db::revoke_agent_pubkey(&conn, &agent_id)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "revoked": true,
+                        "agent_id": agent_id,
+                    })
+                )?;
+            } else {
+                writeln!(out.stdout, "revoked pubkey for {agent_id}")?;
             }
         }
     }
@@ -843,6 +898,209 @@ mod tests {
         let mut out = env.output();
         let res = run_pending(&db, args, false, Some("test-agent"), &mut out);
         assert!(res.is_err());
+    }
+
+    // ---- #626 Layer-3 (C5): bind-key / revoke-key CLI commands -----
+
+    /// Register `agent_id` then return a fresh valid base64 Ed25519
+    /// public key for it.
+    fn register_and_key(env: &mut TestEnv, db: &std::path::Path, agent_id: &str) -> String {
+        let reg = AgentsArgs {
+            action: Some(AgentsAction::Register {
+                agent_id: agent_id.to_string(),
+                agent_type: "ai:claude-opus-4.7".to_string(),
+                capabilities: String::new(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(db, reg, false, &mut out).expect("register");
+        }
+        env.stdout.clear();
+        env.stderr.clear();
+        crate::identity::keypair::generate(agent_id)
+            .expect("generate keypair")
+            .public_base64()
+    }
+
+    #[test]
+    fn test_agents_bind_key_happy_text() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pk = register_and_key(&mut env, &db, "ai:curator");
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:curator".to_string(),
+                pubkey: pk.clone(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out).unwrap();
+        }
+        assert!(env.stdout_str().contains("bound pubkey for ai:curator"));
+        // The key is now retrievable via db::agent_pubkey.
+        let conn = db::open(&db).unwrap();
+        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), Some(pk));
+    }
+
+    #[test]
+    fn test_agents_bind_key_happy_json() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pk = register_and_key(&mut env, &db, "ai:curator");
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:curator".to_string(),
+                pubkey: pk.clone(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["bound"].as_bool().unwrap(), true);
+        assert_eq!(v["agent_id"].as_str().unwrap(), "ai:curator");
+        assert_eq!(v["agent_pubkey"].as_str().unwrap(), pk);
+    }
+
+    #[test]
+    fn test_agents_bind_key_rotates_in_place() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let k1 = register_and_key(&mut env, &db, "ai:curator");
+        let k2 = crate::identity::keypair::generate("ai:curator")
+            .unwrap()
+            .public_base64();
+        assert_ne!(k1, k2);
+        for k in [&k1, &k2] {
+            let args = AgentsArgs {
+                action: Some(AgentsAction::BindKey {
+                    agent_id: "ai:curator".to_string(),
+                    pubkey: k.clone(),
+                }),
+            };
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out).unwrap();
+        }
+        let conn = db::open(&db).unwrap();
+        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+    }
+
+    #[test]
+    fn test_agents_bind_key_unregistered_is_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pk = crate::identity::keypair::generate("ai:ghost")
+            .unwrap()
+            .public_base64();
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:ghost".to_string(),
+                pubkey: pk,
+            }),
+        };
+        let mut out = env.output();
+        let res = run_agents(&db, args, false, &mut out);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("not registered"));
+    }
+
+    #[test]
+    fn test_agents_bind_key_malformed_pubkey_is_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        register_and_key(&mut env, &db, "ai:curator");
+        let args = AgentsArgs {
+            action: Some(AgentsAction::BindKey {
+                agent_id: "ai:curator".to_string(),
+                pubkey: "not-a-valid-key".to_string(),
+            }),
+        };
+        let mut out = env.output();
+        let res = run_agents(&db, args, false, &mut out);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_agents_revoke_key_happy_text() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pk = register_and_key(&mut env, &db, "ai:curator");
+        // Bind then revoke.
+        {
+            let conn = db::open(&db).unwrap();
+            db::bind_agent_pubkey(&conn, "ai:curator", &pk).unwrap();
+        }
+        let args = AgentsArgs {
+            action: Some(AgentsAction::RevokeKey {
+                agent_id: "ai:curator".to_string(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out).unwrap();
+        }
+        assert!(env.stdout_str().contains("revoked pubkey for ai:curator"));
+        let conn = db::open(&db).unwrap();
+        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), None);
+    }
+
+    #[test]
+    fn test_agents_revoke_key_happy_json() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let pk = register_and_key(&mut env, &db, "ai:curator");
+        {
+            let conn = db::open(&db).unwrap();
+            db::bind_agent_pubkey(&conn, "ai:curator", &pk).unwrap();
+        }
+        let args = AgentsArgs {
+            action: Some(AgentsAction::RevokeKey {
+                agent_id: "ai:curator".to_string(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["revoked"].as_bool().unwrap(), true);
+        assert_eq!(v["agent_id"].as_str().unwrap(), "ai:curator");
+    }
+
+    #[test]
+    fn test_agents_revoke_key_idempotent_without_bound_key() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        register_and_key(&mut env, &db, "ai:curator");
+        // No key bound — revoke still succeeds.
+        let args = AgentsArgs {
+            action: Some(AgentsAction::RevokeKey {
+                agent_id: "ai:curator".to_string(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out).unwrap();
+        }
+        assert!(env.stdout_str().contains("revoked pubkey for ai:curator"));
+    }
+
+    #[test]
+    fn test_agents_revoke_key_unregistered_is_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = AgentsArgs {
+            action: Some(AgentsAction::RevokeKey {
+                agent_id: "ai:ghost".to_string(),
+            }),
+        };
+        let mut out = env.output();
+        let res = run_agents(&db, args, false, &mut out);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("not registered"));
     }
 
     // Local seed helper — duplicated from cli::test_utils so we can

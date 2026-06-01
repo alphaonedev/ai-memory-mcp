@@ -6030,6 +6030,45 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
     Ok(pubkey)
 }
 
+/// Clear the Ed25519 public key bound to `agent_id` (#626 Layer-3,
+/// Task 1.3 / C5 — key revocation).
+///
+/// Removes the `agent_pubkey` + `pubkey_bound_at` keys from both the
+/// metadata and the mirrored `content` JSON, stamping a
+/// `pubkey_revoked_at` marker so the revocation is auditable. After
+/// revocation the agent reverts to the permissive *claimed* posture
+/// (no key to verify against) until a fresh key is bound.
+///
+/// Idempotent: revoking an agent with no bound key still succeeds (the
+/// `json_remove` is a no-op) as long as the agent is registered.
+///
+/// # Errors
+///
+/// - the agent is not registered (no `_agents` row for `agent_id`)
+/// - the underlying `UPDATE` fails
+pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
+    let title = format!("agent:{agent_id}");
+    let now = Utc::now().to_rfc3339();
+    let affected = conn.execute(
+        "UPDATE memories SET
+            metadata = json_set(
+                json_remove(metadata, '$.agent_pubkey', '$.pubkey_bound_at'),
+                '$.pubkey_revoked_at', ?3),
+            content  = json_set(
+                json_remove(content,  '$.agent_pubkey', '$.pubkey_bound_at'),
+                '$.pubkey_revoked_at', ?3),
+            updated_at = ?3
+         WHERE namespace = ?1 AND title = ?2",
+        params![AGENTS_NAMESPACE, &title, &now],
+    )?;
+    if affected == 0 {
+        anyhow::bail!(
+            "cannot revoke pubkey: agent '{agent_id}' is not registered (register it first)"
+        );
+    }
+    Ok(())
+}
+
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     let total: usize = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
 
@@ -15908,5 +15947,81 @@ mod tests {
         assert_eq!(a_after.agent_type, a_before.agent_type);
         assert_eq!(a_after.capabilities, a_before.capabilities);
         assert_eq!(a_after.registered_at, a_before.registered_at);
+    }
+
+    // -----------------------------------------------------------------
+    // #626 Layer-3 (Task 1.3 / C5) — revoke_agent_pubkey
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn revoke_agent_pubkey_clears_bound_key() {
+        let conn = test_db();
+        register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
+        let kp = crate::identity::keypair::generate("ai:curator").unwrap();
+        bind_agent_pubkey(&conn, "ai:curator", &kp.public_base64()).expect("bind");
+        assert!(agent_pubkey(&conn, "ai:curator").unwrap().is_some());
+        revoke_agent_pubkey(&conn, "ai:curator").expect("revoke");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
+    }
+
+    #[test]
+    fn revoke_agent_pubkey_is_idempotent_without_bound_key() {
+        let conn = test_db();
+        register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
+        // No key ever bound — revoke still succeeds and stays None.
+        revoke_agent_pubkey(&conn, "ai:curator").expect("revoke unbound");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
+    }
+
+    #[test]
+    fn revoke_agent_pubkey_rejects_unregistered_agent() {
+        let conn = test_db();
+        let err = revoke_agent_pubkey(&conn, "ai:ghost").unwrap_err();
+        assert!(
+            err.to_string().contains("not registered"),
+            "revoking an unregistered agent must be rejected; got: {err}",
+        );
+    }
+
+    #[test]
+    fn revoke_agent_pubkey_preserves_registration_fields() {
+        let conn = test_db();
+        register_agent(
+            &conn,
+            "ai:curator",
+            "ai:claude-opus",
+            &["recall".to_string(), "write".to_string()],
+        )
+        .expect("register");
+        let kp = crate::identity::keypair::generate("ai:curator").unwrap();
+        bind_agent_pubkey(&conn, "ai:curator", &kp.public_base64()).expect("bind");
+        revoke_agent_pubkey(&conn, "ai:curator").expect("revoke");
+        let after = list_agents(&conn).expect("list after");
+        let a = after
+            .iter()
+            .find(|a| a.agent_id == "ai:curator")
+            .expect("present after revoke");
+        assert_eq!(a.agent_type, "ai:claude-opus");
+        assert_eq!(
+            a.capabilities,
+            vec!["recall".to_string(), "write".to_string()]
+        );
+    }
+
+    #[test]
+    fn revoke_then_rebind_restores_attestable_key() {
+        let conn = test_db();
+        register_agent(&conn, "ai:curator", "ai:generic", &[]).expect("register");
+        let k1 = crate::identity::keypair::generate("ai:curator")
+            .unwrap()
+            .public_base64();
+        bind_agent_pubkey(&conn, "ai:curator", &k1).expect("bind k1");
+        revoke_agent_pubkey(&conn, "ai:curator").expect("revoke");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), None);
+        let k2 = crate::identity::keypair::generate("ai:curator")
+            .unwrap()
+            .public_base64();
+        bind_agent_pubkey(&conn, "ai:curator", &k2).expect("rebind k2");
+        assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
     }
 }
