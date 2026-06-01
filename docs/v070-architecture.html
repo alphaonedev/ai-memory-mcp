@@ -120,7 +120,7 @@ footer a{color:var(--muted)}
       <p class="body">Top-level <code>Command</code> enum variants in <code>src/daemon_runtime.rs</code> (default build ships 79; <code>--features sal</code>/<code>sal-postgres</code> unlocks 81 by adding <code>migrate</code> + <code>schema-init</code>, both <code>#[cfg(feature = "sal")]</code> &mdash; not postgres-only).</p>
     </div>
   </div>
-  <p>Each count is asserted by a regression test. The architectural North Star (per CLAUDE.md prime directive): long-term codebase manageability. Growth narrative: 70 MCP / 73 HTTP / 40 CLI at v0.6.4 &rarr; 73 / 88 / 79 at v0.7.0 (FX-12/ARCH-3 + FX-C3 batch2 added 16 CLI subcommands closing MCP/CLI parity; v0.7.0 attested-cortex feature surface + #1146 sectioned-config + #1156 per-namespace K8 quota + #1255 federation_nonces persistence drove the HTTP + schema bumps).</p>
+  <p>Each count is asserted by a regression test. The architectural North Star (per CLAUDE.md prime directive): long-term codebase manageability. Growth narrative: 70 MCP / 73 HTTP / 40 CLI at v0.6.4 &rarr; 74 / 88 / 79 at v0.7.0 (FX-12/ARCH-3 + FX-C3 batch2 added 16 CLI subcommands closing MCP/CLI parity; v0.7.0 attested-cortex feature surface + #1146 sectioned-config + #1156 per-namespace K8 quota + #1255 federation_nonces persistence drove the HTTP + schema bumps).</p>
 </section>
 
 <section class="wrap-mid">
