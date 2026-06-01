@@ -2268,13 +2268,20 @@ impl PostgresStore {
         // Pre-read the current version so a CONFLICT carries the
         // observed-current value in the typed error. The UPDATE
         // re-asserts the gate atomically below.
-        let current_row: Option<(i64,)> =
-            sqlx::query_as("SELECT version FROM memories WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("read memories.version", e))?;
-        let Some((current,)) = current_row else {
+        // #1451 (SEC, HIGH) — fetch the governance-relevant columns
+        // alongside `version` so the pre-write hook can evaluate the
+        // POST-MERGE row before the UPDATE (parity with the SQLite
+        // backend and the insert/supersede PG paths).
+        let current_row: Option<(i64, String, String, String, String, serde_json::Value)> =
+            sqlx::query_as(
+                "SELECT version, namespace, tier, title, memory_kind, metadata \
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("read memories row for update gate", e))?;
+        let Some((current, cur_ns, cur_tier, cur_title, cur_kind, cur_meta)) = current_row else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
 
@@ -2289,6 +2296,27 @@ impl PostgresStore {
                 ),
             });
         }
+
+        // #1451 — consult GOVERNANCE_PRE_WRITE on the post-merge row.
+        // Mirror the SQLite tier-downgrade protection so the gate sees
+        // the tier that will actually be written (Long never downgrades;
+        // Mid never downgrades to Short).
+        let existing_tier = Tier::from_str(&cur_tier).unwrap_or(Tier::Long);
+        let effective_tier = match (patch.tier.as_ref(), existing_tier) {
+            (Some(_), Tier::Long) => Tier::Long,
+            (Some(Tier::Short), Tier::Mid) => Tier::Mid,
+            (Some(req), _) => req.clone(),
+            (None, existing) => existing,
+        };
+        let governed = Memory {
+            namespace: patch.namespace.clone().unwrap_or(cur_ns),
+            tier: effective_tier,
+            title: patch.title.clone().unwrap_or(cur_title),
+            memory_kind: crate::models::MemoryKind::from_str(&cur_kind).unwrap_or_default(),
+            metadata: patch.metadata.clone().unwrap_or(cur_meta),
+            ..Memory::default()
+        };
+        consult_governance_pre_write_pg(&governed)?;
 
         let new_version = current + 1;
         // v0.7.0 Provenance Gap 2 (#906) — source_uri ($10) follows
