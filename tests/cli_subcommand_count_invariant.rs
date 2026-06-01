@@ -37,7 +37,7 @@ use std::fs;
 /// are spaces and the 5th column is an uppercase ASCII letter — that
 /// matches the rustfmt-canonical variant-declaration shape (whether
 /// the variant is a unit, tuple, or struct variant). The recipe
-/// returns 80 today; the sal-gate count uses the same shape on the
+/// returns 81 today; the sal-gate count uses the same shape on the
 /// `#[cfg(feature = "sal")]` attribute lines.
 fn count_command_variants() -> (usize, usize) {
     // Normalise CRLF → LF for hermeticity across Windows checkouts.
