@@ -10,7 +10,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>v0.7.0 architecture &mdash; post-#1174 substrate surface</title>
-<meta name="description" content="ai-memory v0.7.0 architecture: 73 MCP tools / 88 HTTP routes / 79 CLI subcommands, schema v51, RuntimeContext cross-surface, lint-gate enforcement, public consts surface (tool_names::*, DEFAULT_NHI_SOURCE, BACKEND_OLLAMA, KNOWN_EMBEDDING_DIMS), 15-vendor LLM substrate.">
+<meta name="description" content="ai-memory v0.7.0 architecture: 74 MCP tools / 88 HTTP routes / 79 CLI subcommands, schema v53, RuntimeContext cross-surface, lint-gate enforcement, public consts surface (tool_names::*, DEFAULT_NHI_SOURCE, BACKEND_OLLAMA, KNOWN_EMBEDDING_DIMS), 15-vendor LLM substrate.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/v070-architecture.html">
 <style>
 :root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--p1:#a78bfa;--p2:#6ee7ff;--p3:#7cd992;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:880px;--w-wide:1080px}
@@ -94,7 +94,7 @@ footer a{color:var(--muted)}
   <div class="meta-row">
     <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
     <span>74 MCP / 88 HTTP / 79 CLI</span>
-    <span>schema v51</span>
+    <span>schema v53</span>
     <span>15-vendor LLM substrate</span>
     <span>lint-gated CI</span>
   </div>
@@ -194,9 +194,9 @@ footer a{color:var(--muted)}
 </section>
 
 <section class="wrap-mid">
-  <div class="eyebrow-h2">Schema v51 ladder</div>
+  <div class="eyebrow-h2">Schema v53 ladder</div>
   <h2>Single logical version, two adapters.</h2>
-  <p>Both adapters carry <code>CURRENT_SCHEMA_VERSION = 51</code>. SQLite ladder ends at the <code>if version &lt; 51</code> arm in <code>src/storage/migrations.rs</code>; postgres ladder ends at <code>migrate_v51()</code> in <code>src/store/postgres.rs</code>. The two adapters share a single logical schema number even though the on-disk file-name counters differ because the sqlite split numbers per-bump while the postgres ladder is a single greenfield+upgrade pair.</p>
+  <p>Both adapters carry <code>CURRENT_SCHEMA_VERSION = 53</code>. SQLite ladder ends at the <code>if version &lt; 53</code> arm in <code>src/storage/migrations.rs</code>; postgres ladder ends at <code>migrate_v53()</code> in <code>src/store/postgres.rs</code>. The two adapters share a single logical schema number even though the on-disk file-name counters differ because the sqlite split numbers per-bump while the postgres ladder is a single greenfield+upgrade pair.</p>
   <ul>
     <li><strong>v48</strong> (#933 Track D) &mdash; <code>federation_push_dlq</code> table.</li>
     <li><strong>v49</strong> (#1025) &mdash; 14 nullable columns on <code>archived_memories</code> so archive&rarr;restore is lossless for the full v0.7.0 Memory shape on both backends.</li>
