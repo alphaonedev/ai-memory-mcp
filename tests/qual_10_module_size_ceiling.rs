@@ -35,7 +35,16 @@ use std::fs;
 /// additions). Bump in lockstep with growth.
 const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // The five 3000+ LOC offenders from QUAL-10.
-    ("src/storage/mod.rs", 16_000),
+    //
+    // 2026-06-01 — bumped 16_000 → 16_100 by the v0.7.0 release QC of
+    // #626 Layer-3 (C7, commit ed2bb7cf6): the store-path signature wire
+    // added the agent-attestation persist branch (+6 LOC) which pushed
+    // the file from 16_027 to 16_033, just over the ceiling; the lockstep
+    // bump was missed in ed2bb7cf6. Actual LOC at the bump: 16_033.
+    // Growth is justified: a new attestation persist branch on an
+    // existing write path, no speculative surface. 16_100 = 16_033 + 67
+    // headroom; far under QUAL-10's 1.5x aspirational cap.
+    ("src/storage/mod.rs", 16_100),
     ("src/mcp/mod.rs", 14_000),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
@@ -54,7 +63,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the insert/supersede PG paths), closing the update-evasion gap.
     // Actual LOC at the bump: 15216. Growth is a security gate on an
     // existing write path, not new surface.
-    ("src/store/postgres.rs", 15_300),
+    //
+    // 2026-06-01 — bumped 15_300 → 15_400 by the v0.7.0 release QC of
+    // #626 Layer-3 (C3, commit bd173cf81): bind/fetch agent pubkey in
+    // registration metadata added the postgres-native SAL methods for
+    // pubkey enrollment/lookup, growing the file to 15_353; the lockstep
+    // bump was missed in bd173cf81. Actual LOC at the bump: 15_353.
+    // Growth is justified: new entries on the canonical SAL trait surface
+    // needed for postgres-backed agent attestation, mirroring the SQLite
+    // path. 15_400 = 15_353 + 47 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 15_400),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
