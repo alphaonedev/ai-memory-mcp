@@ -182,9 +182,9 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
   <div class="container">
     <span class="eyebrow">Definition</span>
     <h2>What <code>agent_id</code> means.</h2>
-    <p><code>agent_id</code> is a <em>claimed</em> identity attached to every memory at write time. It survives every operation that touches the memory: update, dedup, import, sync, consolidate. It's the substrate for filtering, scoping, governance, and (in v0.7) cryptographic attestation.</p>
+    <p><code>agent_id</code> is a <em>claimed</em> identity attached to every memory at write time. It survives every operation that touches the memory: update, dedup, import, sync, consolidate. It's the substrate for filtering, scoping, governance, and — as of v0.7.0 (#626 Layer-3) — cryptographic attestation that upgrades a claimed id to an <em>attested</em> one.</p>
     <blockquote>
-      <strong>Honest framing:</strong> <code>agent_id</code> today is <em>claimed</em>, not <em>attested</em>. Don't make security decisions on it without pairing with agent registration (Task 1.3 — upcoming) or attestation (v0.7+). The schema reservation for cryptographic signatures lives at <code>memory_links.signature</code> (schema v15, v0.6.3) and gets wired in v0.7.
+      <strong>Honest framing:</strong> by default an <em>unsigned</em> <code>agent_id</code> is <em>claimed</em>, not <em>attested</em> — don't make security decisions on it alone. As of <strong>v0.7.0 (#626 Layer-3)</strong> a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> over the canonical <code>SignableWrite</code> envelope on every store surface (CLI <code>--sign</code>, MCP <code>memory_store</code>, HTTP <code>POST /api/v1/memories</code>); the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code> (forged → <code>403 ATTESTATION_FAILED</code>). Operators can require it process-wide with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>. The earlier link-level signature reservation (<code>memory_links.signature</code>, schema v15, v0.6.3) remains the attestation substrate for KG edges. The one open edge — the unsigned default-path (L4) capture identity — is tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1171">#1171</a>.
     </blockquote>
   </div>
 </section>
@@ -299,7 +299,7 @@ ai-memory --agent-id alice store -T "Auth flow notes" -c "..."</code></pre>
       <li>You can answer <em>"who wrote this?"</em> in every recall — instantly.</li>
       <li>You can scope retrieval to <em>"show me what <code>ai:secops-skill@*</code> learned this week."</em></li>
       <li>Per-namespace governance can require approval for writes from specific agents (see <a href="architectures-t2.html" style="color:var(--p1)">Architectures · T2</a> and <a href="architectures-t3.html" style="color:var(--p1)">T3</a>).</li>
-      <li>v0.7 attestation extends <code>agent_id</code> from claimed to cryptographically signed — same field, stronger guarantee.</li>
+      <li>v0.7.0 attestation (#626 Layer-3) extends <code>agent_id</code> from claimed to cryptographically signed (Ed25519 over the <code>SignableWrite</code> envelope) — same field, stronger guarantee.</li>
     </ul>
     <p><code>ai-memory</code> ships provenance on day one.</p>
   </div>

@@ -188,7 +188,9 @@ last GC).
   "expires_at": "2026-05-08T10:30:00Z",
   "metadata": {"custom": "data"},
   "agent_id": "alice",
-  "scope": "private"
+  "scope": "private",
+  "signature": "base64-std-detached-ed25519-sig",
+  "created_at": "2026-05-08T10:30:00Z"
 }
 ```
 
@@ -196,8 +198,35 @@ last GC).
 `expires_at` instead (also accepted on this HTTP endpoint). See the
 HTTP ↔ MCP parameter coverage table at the bottom of this document.
 
+#### Agent attestation (`signature` + `created_at`) — #626 Layer-3
+
+A caller MAY present a detached Ed25519 `signature` to upgrade the write
+from a **claimed** `agent_id` to a cryptographically **attested** one.
+The signature is computed over the canonical `SignableWrite` envelope
+(`agent_id` + `namespace` + `title` + `kind` + `created_at` +
+`sha256(content)`) and encoded as **standard base64**. When `signature`
+is present, `created_at` (RFC 3339) is **required** — it is the exact
+timestamp that was signed.
+
+- The daemon verifies the signature against the agent's bound public key
+  (registered via `memory_agent_register` + bind-key). On success it
+  stamps `metadata.attest_level = "agent_attested"` and **adopts the
+  signed `created_at` verbatim**.
+- A `signature` whose `created_at` is outside a **±300 s** freshness
+  window is rejected.
+- An unsigned write lands `metadata.attest_level = "claimed"` under the
+  default permissive posture. When the operator sets
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy), an unsigned write is
+  **rejected** instead. This flag governs only the unsigned-write
+  disposition; a presented signature is always verified regardless.
+
+This wire is identical across the three store surfaces (MCP
+`memory_store`, this HTTP endpoint, and the CLI `--sign` path).
+
 - **201 Created** with `{ "id": "...", "tier": "mid", "namespace": "...", "title": "...", "agent_id": "..." }`.
 - **202 Accepted** (governance pending) with `{ "status": "pending", "pending_id": "...", "action": "store" }`.
+- **400** when `signature` is present but `created_at` is missing or not RFC 3339.
+- **403** with `{ "code": "ATTESTATION_FAILED" }` when a signature fails verification, or when an unsigned write is rejected under `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`.
 - **400 / 403 / 500** per validation / governance / server error.
 
 ```bash
@@ -735,6 +764,8 @@ authoritative for HTTP.
 |---|---|---|---|---|
 | `memory_store` | `ttl_secs` | ✓ | ✗ | HTTP-only; the MCP tool exposes `expires_at` (also accepted by HTTP). |
 | `memory_store` | `expires_at` | ✓ | (via `update`) | HTTP body accepts; documented in the `POST /api/v1/memories` example. |
+| `memory_store` | `signature` | ✓ | ✓ | #626 Layer-3 — std-base64 detached Ed25519 over the `SignableWrite` envelope; upgrades `agent_id` claimed→`agent_attested`. Same wire on both transports. |
+| `memory_store` | `created_at` | ✓ | ✓ | #626 Layer-3 — RFC 3339; **required when `signature` is present** (the signed timestamp, adopted verbatim; ±300 s freshness window). |
 | `memory_recall` | `format` | ✗ | ✓ | MCP-only; HTTP responses are always JSON. |
 | `memory_recall` | `context_tokens` | ✗ | ✓ | MCP-only (v0.6.0.0 contextual recall). |
 | `memory_search` | `format` | ✗ | ✓ | MCP-only. |

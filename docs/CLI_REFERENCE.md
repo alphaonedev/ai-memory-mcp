@@ -59,11 +59,17 @@ never downgrades.
 | `--expires-at` | RFC3339 | — | Overrides tier default. |
 | `--ttl-secs` | int | — | Overrides tier default. |
 | `--scope` | enum | `private` | Task 1.5 visibility. `private`/`team`/`unit`/`org`/`collective`. |
+| `--sign` | bool | `false` | **#626 Layer-3** — sign the write with the resolved agent's local Ed25519 keypair so the stored row is *attested* (`attest_level = "agent_attested"`) rather than merely *claimed*. Requires a `<agent_id>.priv` under the key directory (`AI_MEMORY_KEY_DIR` or the platform default) and a matching bound public key (`ai-memory agents bind-key`). Without `--sign` the write is *claimed* unless `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set (which then rejects the unsigned write). |
 
 ```bash
 ai-memory store --title "Q2 roadmap" \
   --content "Aligned on microservices cut-over by July" \
   --tier long --namespace planning --tags strategic,quarterly
+
+# Attested write: sign with the agent's bound Ed25519 keypair (#626 Layer-3).
+ai-memory store --title "Prod incident postmortem" \
+  --content "Root cause: connection-pool exhaustion under retry storm" \
+  --tier long --namespace incidents --agent-id ai:claude-opus-4.7 --sign
 ```
 
 ### `recall`

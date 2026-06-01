@@ -22,7 +22,11 @@ capabilities:
    memories under any `agent_id` they claim in the request body.
    Operators should treat the `agent_id` on synced memories as a
    claimed identity, not an attested one, and keep the mTLS peer
-   allowlist tight accordingly.
+   allowlist tight accordingly. (Store-path agent attestation —
+   #626 Layer-3 — upgrades *directly authored* CLI/MCP/HTTP writes to
+   `agent_attested` when a valid Ed25519 signature is presented, but the
+   federation **receive** path here remains claimed-by-default; mTLS +
+   the peer allowlist stay the trust boundary for synced writes.)
 4. **Compromised LLM** (Ollama returning malicious content). Autonomy
    hooks never `exec` or write to disk outside the database. Worst
    case: bad tags, spurious contradiction flags. Reversible via the

@@ -1333,10 +1333,29 @@ These extra keys may appear alongside `agent_id` — they're informational:
 
 ### Trust model
 
-`agent_id` is a **claimed** identity, not an **attested** one. Anyone who can
-invoke `ai-memory` can set any `agent_id` they want (subject to the format
-regex). Use it for provenance and filtering, not for security decisions. True
-attestation via agent registration arrives with Task 1.3.
+By default `agent_id` is a **claimed** identity: anyone who can invoke
+`ai-memory` can set any `agent_id` they want (subject to the format regex), so
+an *unsigned* write's `agent_id` is provenance/filtering metadata, not a
+security assertion. Such writes land `metadata.attest_level = "claimed"`.
+
+**#626 Layer-3 — cryptographic attestation (v0.7.0).** A caller that holds the
+agent's keypair can *upgrade* a write from claimed to **attested** by presenting
+a detached Ed25519 `signature` over the canonical `SignableWrite` envelope
+(`agent_id` + `namespace` + `title` + `kind` + `created_at` +
+`sha256(content)`). On every store surface — CLI (`ai-memory store --sign`),
+MCP (`memory_store`), and HTTP (`POST /api/v1/memories`) — the daemon verifies
+the signature against the agent's **bound public key** (registered via
+`memory_agent_register` + bind-key) and, on success, stamps
+`metadata.attest_level = "agent_attested"` and adopts the signed `created_at`
+verbatim (±300 s freshness window). A forged signature is rejected with
+`403 ATTESTATION_FAILED`.
+
+Operators who want to *require* attestation can set
+`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy): unsigned writes are then
+rejected rather than landing claimed. The default is permissive (unsigned →
+claimed) to preserve the v0.6.x posture. The one remaining open edge — the
+identity of the unsigned **default-path** capture (L4) — is tracked under
+[#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
 
 ### Default leaks hostname + PID
 

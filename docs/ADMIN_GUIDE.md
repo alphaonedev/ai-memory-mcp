@@ -908,11 +908,23 @@ context and the threat model are tracked on issue [#148](https://github.com/alph
 
 ### Trust model
 
-**`metadata.agent_id` is a *claimed* identity, not an *attested* one.** Any
+**By default `metadata.agent_id` is a *claimed* identity, not an *attested* one.** Any
 caller able to invoke the CLI / MCP / HTTP API can set any well-formed
-`agent_id`. Use it for provenance, audit, and filter scoping — **never as an
-authorization gate on its own.** True attestation arrives with agent
-registration (Task 1.3).
+`agent_id` on an *unsigned* write. Use such an id for provenance, audit, and
+filter scoping — **never as an authorization gate on its own.**
+
+**Store-path attestation (#626 Layer-3, v0.7.0).** A caller holding the agent's
+keypair can upgrade a write from claimed to attested by presenting a detached
+Ed25519 `signature` over the canonical `SignableWrite` envelope (`agent_id` +
+`namespace` + `title` + `kind` + `created_at` + `sha256(content)`) on any store
+surface — CLI (`ai-memory store --sign`), MCP (`memory_store`), or HTTP
+(`POST /api/v1/memories`). The daemon verifies it against the agent's bound
+public key (registered via `memory_agent_register` + bind-key) and stamps
+`metadata.attest_level = "agent_attested"`; a forged signature is rejected with
+`403 ATTESTATION_FAILED`. Set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy) to
+**require** attestation — unsigned writes are then rejected rather than landing
+claimed (default is permissive, preserving the v0.6.x posture). Agent
+registration itself landed earlier as Task 1.3.
 
 ### Resolution precedence
 

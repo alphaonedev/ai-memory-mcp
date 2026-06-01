@@ -184,7 +184,7 @@ ai-memory serve</code></pre>
 <section class="wrap-mid">
   <div class="eyebrow-h2">NHI agent_id semantics</div>
   <h2>Every memory carries a claimed identity.</h2>
-  <p><code>metadata.agent_id</code> is the AI Non-Human Identity marker. It is a <strong>claimed</strong> identity, not an attested one &mdash; pair it with agent registration before using it for security decisions.</p>
+  <p><code>metadata.agent_id</code> is the AI Non-Human Identity marker. By default an unsigned write's id is <strong>claimed</strong>, not attested &mdash; don't make security decisions on it alone. As of v0.7.0 (#626 Layer-3) a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> on the CLI (<code>store --sign</code>), MCP (<code>memory_store</code>), or HTTP (<code>POST /api/v1/memories</code>) store path; the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code>. Operators can require it with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>.</p>
 
   <h3>Resolution ladder (CLI + MCP)</h3>
   <ol>
