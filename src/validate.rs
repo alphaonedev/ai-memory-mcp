@@ -19,6 +19,11 @@ const MAX_TAGS_COUNT: usize = 50;
 const MAX_RELATION_LEN: usize = 64;
 const MAX_ID_LEN: usize = 128;
 const MAX_AGENT_ID_LEN: usize = 128;
+/// Max characters in a wire-supplied base64 Ed25519 public key. A raw
+/// 32-byte key is 44 chars padded / 43 unpadded; 128 leaves generous
+/// slack for whitespace and either base64 flavor while bounding the
+/// decode work a hostile caller can force (#626 Layer-3 attestation).
+const MAX_AGENT_PUBKEY_B64_LEN: usize = 128;
 const MAX_METADATA_SIZE: usize = 65_536;
 const MAX_METADATA_DEPTH: usize = 32;
 
@@ -401,6 +406,43 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
              callers"
         );
     }
+    Ok(())
+}
+
+/// Validate a wire-supplied base64-encoded Ed25519 agent public key
+/// (#626 Layer-3, Task 1.3).
+///
+/// This is the WIRE entry-point guard for the `agent_pubkey` field on
+/// agent-registration and key-rotation requests. It bounds the input
+/// length (DoS guard on the base64 decode) and then confirms the value
+/// decodes to a well-formed 32-byte Ed25519 public key — i.e. a valid
+/// Edwards-curve point — by delegating to
+/// [`crate::identity::keypair::decode_public_base64`] (which accepts
+/// URL-safe-no-pad **or** standard-padded base64, the two flavors an
+/// operator might paste).
+///
+/// Validating here means a malformed key is rejected at the boundary —
+/// before it is bound into registration metadata where the attestation
+/// gate would later load it and fail opaquely on every signed write.
+///
+/// # Errors
+///
+/// - empty input
+/// - input longer than [`MAX_AGENT_PUBKEY_B64_LEN`]
+/// - input that does not decode to a 32-byte valid Ed25519 public key
+pub fn validate_agent_pubkey_b64(pubkey_b64: &str) -> Result<()> {
+    let trimmed = pubkey_b64.trim();
+    if trimmed.is_empty() {
+        bail!("agent_pubkey cannot be empty");
+    }
+    if pubkey_b64.len() > MAX_AGENT_PUBKEY_B64_LEN {
+        bail!("agent_pubkey exceeds max length of {MAX_AGENT_PUBKEY_B64_LEN} bytes");
+    }
+    // Delegate the decode + curve-point check to the single audited
+    // decoder so the wire validator and `identity import` agree on what
+    // "a valid pubkey" means. Map the error to a stable wire message.
+    crate::identity::keypair::decode_public_base64(trimmed)
+        .map_err(|e| anyhow::anyhow!("agent_pubkey is not a valid Ed25519 public key: {e:#}"))?;
     Ok(())
 }
 
@@ -1554,6 +1596,70 @@ mod tests {
         assert!(validate_agent_id_shape("spiffe://example.org/ns/prod").is_ok());
         assert!(validate_agent_id_shape("spiffe://a/b").is_ok());
     }
+
+    // -----------------------------------------------------------------
+    // #626 Layer-3 (Task 1.3) — validate_agent_pubkey_b64
+    // -----------------------------------------------------------------
+
+    /// A freshly generated keypair's exported base64 (the URL-safe-no-pad
+    /// flavor) must pass the wire validator — this is the exact string an
+    /// agent-registration request carries.
+    #[test]
+    fn test_agent_pubkey_b64_accepts_generated_key() {
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let b64 = kp.public_base64();
+        assert!(
+            validate_agent_pubkey_b64(&b64).is_ok(),
+            "exported pubkey base64 must validate; got: {b64}",
+        );
+        // Surrounding whitespace (paste artifact) is tolerated.
+        let padded = format!("  {b64}\n");
+        assert!(validate_agent_pubkey_b64(&padded).is_ok());
+    }
+
+    /// Standard-padded base64 (the other flavor an operator might paste)
+    /// must also validate — `decode_public_base64` accepts both.
+    #[test]
+    fn test_agent_pubkey_b64_accepts_standard_padded() {
+        use base64::Engine as _;
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let padded = base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes());
+        assert!(
+            validate_agent_pubkey_b64(&padded).is_ok(),
+            "standard-padded pubkey base64 must validate; got: {padded}",
+        );
+    }
+
+    #[test]
+    fn test_agent_pubkey_b64_rejects_empty() {
+        assert!(validate_agent_pubkey_b64("").is_err());
+        assert!(validate_agent_pubkey_b64("   \n").is_err());
+    }
+
+    #[test]
+    fn test_agent_pubkey_b64_rejects_overlong() {
+        let overlong = "A".repeat(MAX_AGENT_PUBKEY_B64_LEN + 1);
+        let err = validate_agent_pubkey_b64(&overlong).unwrap_err();
+        assert!(
+            err.to_string().contains("max length"),
+            "overlong pubkey must cite the length bound; got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_agent_pubkey_b64_rejects_malformed() {
+        // Not base64 at all.
+        assert!(validate_agent_pubkey_b64("!!!not-base64!!!").is_err());
+        // Valid base64 but wrong length (decodes to != 32 bytes).
+        use base64::Engine as _;
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 16]);
+        let err = validate_agent_pubkey_b64(&short).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Ed25519 public key"),
+            "wrong-length key must surface the dedicated reason; got: {err}",
+        );
+    }
+
 
     #[test]
     fn test_validate_governance_policy_default_ok() {

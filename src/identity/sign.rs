@@ -283,6 +283,128 @@ pub fn sign_persona(keypair: &AgentKeypair, persona: &SignablePersona<'_>) -> Re
     Ok(sig.to_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// v0.7.0 #626 Layer-3 (Task 1.3) — SignableWrite + sign_write
+// ---------------------------------------------------------------------------
+//
+// Closes the claimed→attested agent_id gap on the *store* path. A bare
+// `store` request asserts `agent_id` as a free-text claim — anyone can
+// type any id. Layer-3 lets a holder of the agent's private key sign the
+// write so the verifier can re-derive these bytes from the stored row and
+// confirm the `agent_id` was *attested* (the signer held the key bound to
+// that id), not merely claimed.
+//
+// Mirrors `SignableLink` / `SignablePersona`: a single audited surface for
+// the six fields the write signature commits to, encoded via RFC 8949
+// §4.2.1 deterministic CBOR. The memory body is hashed (SHA-256) BEFORE
+// entering the envelope so the signed payload stays bounded (~200 bytes)
+// regardless of content length — the same bound `SignablePersona` uses.
+
+/// The six fields the store-path write signature commits to.
+///
+/// Decoupled from [`crate::models::Memory`] on purpose: the signed bundle
+/// pins exactly the identity-bearing surface of a write (who, where, what
+/// title, what content, what kind, when) without dragging the full
+/// `Memory` shape — so the verifier can re-derive the bytes directly from
+/// the persisted row, and the canonical encoder has a single, audited
+/// shape to commit to.
+///
+/// `content_sha256` is the SHA-256 of the UTF-8 bytes of the memory
+/// content (the same string that lands in `memories.content`). Hashing it
+/// before signing keeps the canonical payload bounded regardless of body
+/// length — a multi-kilobyte memory would otherwise dominate the signed
+/// envelope and inflate every `signed_events.payload_hash` recomputation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableWrite<'a> {
+    /// The claiming agent's id. This is the field the attestation gate
+    /// exists to bind: the signature proves the signer held the keypair
+    /// registered to this id, upgrading the write from *claimed* to
+    /// *attested*.
+    pub agent_id: &'a str,
+    /// Namespace the write targets.
+    pub namespace: &'a str,
+    /// Memory title (the `(title, namespace)` pair is the upsert key, so
+    /// it is identity-bearing and must be inside the signed surface).
+    pub title: &'a str,
+    /// Memory kind discriminant (e.g. `"fact"`, `"plan"`). Pinned so a
+    /// signature minted for one kind cannot be replayed onto another.
+    pub kind: &'a str,
+    /// RFC3339 creation timestamp pinned at insert time. Inside the
+    /// signed surface so a captured signature cannot be replayed to
+    /// back- or forward-date a write.
+    pub created_at: &'a str,
+    /// SHA-256 (32 bytes) over the rendered memory content's UTF-8 bytes.
+    /// Bounds the signed payload size.
+    pub content_sha256: &'a [u8; 32],
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the six signable write
+/// fields.
+///
+/// The encoded shape is a CBOR map with six entries keyed by the field
+/// names below. Map keys are emitted in sort order (per RFC 8949 §4.2.1
+/// "Core Deterministic Encoding"), the content hash is encoded as CBOR
+/// `bytes`, and all other fields as CBOR `text`. Encoding the same
+/// `SignableWrite` twice (or on a different host) produces identical
+/// bytes — the precondition Ed25519 needs.
+///
+/// # Errors
+///
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, but surfaced as a
+/// `Result` so callers don't have to choose between panicking and
+/// silently signing a truncated payload.
+pub fn canonical_cbor_write(w: &SignableWrite<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("agent_id", ciborium::Value::Text(w.agent_id.to_string()));
+    map.insert("namespace", ciborium::Value::Text(w.namespace.to_string()));
+    map.insert("title", ciborium::Value::Text(w.title.to_string()));
+    map.insert("kind", ciborium::Value::Text(w.kind.to_string()));
+    map.insert(
+        "created_at",
+        ciborium::Value::Text(w.created_at.to_string()),
+    );
+    map.insert(
+        "content_sha256",
+        ciborium::Value::Bytes(w.content_sha256.to_vec()),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableWrite")?;
+    Ok(out)
+}
+
+/// Sign `write` with `keypair`'s private key.
+///
+/// Encodes the write via [`canonical_cbor_write`], then runs Ed25519 over
+/// the resulting bytes. Returns the 64-byte signature, ready to drop into
+/// the store-path signature wire field and the `signed_events` row.
+///
+/// # Errors
+///
+/// - `keypair.private` is `None` (public-only handle — verification
+///   only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_write(keypair: &AgentKeypair, write: &SignableWrite<'_>) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign write",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_write(write)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +774,169 @@ mod tests {
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
         assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.7.0 #626 Layer-3 (Task 1.3) — SignableWrite + sign_write
+    // -----------------------------------------------------------------
+
+    fn write_fixture<'a>(body: &'a [u8; 32]) -> SignableWrite<'a> {
+        SignableWrite {
+            agent_id: "ai:curator",
+            namespace: "team/alpha",
+            title: "kubernetes deployment guide",
+            kind: "fact",
+            created_at: "2026-06-01T12:00:00+00:00",
+            content_sha256: body,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_write_is_deterministic() {
+        // Three distinct permutations of the SignableWrite literal must
+        // collapse to identical bytes because the BTreeMap key-sort runs
+        // at encode time. Catches a regression where a future refactor
+        // swaps the BTreeMap for a HashMap or drops the explicit sort.
+        let body = body_hash_fixture(0x20);
+        let agent_id = "ai:curator";
+        let namespace = "team/alpha";
+        let title = "kubernetes deployment guide";
+        let kind = "fact";
+        let created_at = "2026-06-01T12:00:00+00:00";
+
+        let perm1 = SignableWrite {
+            agent_id,
+            namespace,
+            title,
+            kind,
+            created_at,
+            content_sha256: &body,
+        };
+        let perm2 = SignableWrite {
+            content_sha256: &body,
+            created_at,
+            kind,
+            title,
+            namespace,
+            agent_id,
+        };
+        let perm3 = SignableWrite {
+            title,
+            content_sha256: &body,
+            agent_id,
+            created_at,
+            namespace,
+            kind,
+        };
+
+        let b1 = canonical_cbor_write(&perm1).expect("encode perm1");
+        let b2 = canonical_cbor_write(&perm2).expect("encode perm2");
+        let b3 = canonical_cbor_write(&perm3).expect("encode perm3");
+        assert_eq!(b1, b2);
+        assert_eq!(b2, b3);
+        assert_eq!(b1, canonical_cbor_write(&perm1).expect("re-encode"));
+    }
+
+    #[test]
+    fn canonical_cbor_write_differs_on_field_change() {
+        let body = body_hash_fixture(0x21);
+        let base = write_fixture(&body);
+        // Flip the agent_id — the field the attestation gate binds. A
+        // different claimer must produce different signed bytes.
+        let altered = SignableWrite {
+            agent_id: "ai:impostor",
+            ..base.clone()
+        };
+        let a = canonical_cbor_write(&base).expect("encode base");
+        let b = canonical_cbor_write(&altered).expect("encode altered");
+        assert_ne!(a, b, "different agent_id must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_write_differs_on_content_change() {
+        let body = body_hash_fixture(0x22);
+        let base = write_fixture(&body);
+        let other = body_hash_fixture(0x77);
+        let altered = SignableWrite {
+            content_sha256: &other,
+            ..base.clone()
+        };
+        let a = canonical_cbor_write(&base).expect("encode base");
+        let b = canonical_cbor_write(&altered).expect("encode altered");
+        assert_ne!(a, b, "different content hash must produce different bytes");
+    }
+
+    #[test]
+    fn sign_write_round_trip() {
+        let kp = keypair::generate("ai:curator").expect("generate");
+        let body = body_hash_fixture(0x23);
+        let write = write_fixture(&body);
+        let sig_bytes = sign_write(&kp, &write).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_write(&write).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_write_refuses_public_only_keypair() {
+        let kp = keypair::generate("ai:curator").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "ai:curator".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let body = body_hash_fixture(0x24);
+        let write = write_fixture(&body);
+        let err = sign_write(&pub_only, &write).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_write_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's signature must not verify
+        // under Bob's public key. This is the property the attestation
+        // gate leans on: a write signed by a non-bound key is rejected.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let body = body_hash_fixture(0x25);
+        let write = write_fixture(&body);
+        let sig_bytes = sign_write(&alice, &write).unwrap();
+        let payload = canonical_cbor_write(&write).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    #[test]
+    fn sign_write_differs_for_different_keys() {
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let body = body_hash_fixture(0x26);
+        let write = write_fixture(&body);
+        let sig_a = sign_write(&alice, &write).unwrap();
+        let sig_b = sign_write(&bob, &write).unwrap();
+        assert_ne!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn canonical_cbor_write_kind_change_produces_different_bytes() {
+        // Kind is inside the signed payload so a signature minted for a
+        // "fact" write cannot be replayed onto a "plan" write.
+        let body = body_hash_fixture(0x27);
+        let as_fact = write_fixture(&body);
+        let as_plan = SignableWrite {
+            kind: "plan",
+            ..as_fact.clone()
+        };
+        let a = canonical_cbor_write(&as_fact).expect("encode fact");
+        let b = canonical_cbor_write(&as_plan).expect("encode plan");
+        assert_ne!(a, b);
     }
 
     #[test]
