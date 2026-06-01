@@ -1551,6 +1551,38 @@ pub(crate) fn validate_url_dns_resolved(
     validate_url_dns_with(url, allow_loopback)
 }
 
+/// `true` when the operator opted into the legacy permissive SSRF
+/// posture via `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` (`1` / `true`).
+/// Shared by the resolution-failure branch and the RFC 1035
+/// hostname-shape branch so the two read the override identically.
+fn ssrf_dns_fail_open() -> bool {
+    std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// RFC 1035 §2.3.4 hostname shape check: every dot-separated label
+/// must be 1..=63 octets and the whole name (sans one optional
+/// trailing dot) must be <=253 octets. Returns `true` when the host
+/// VIOLATES the shape.
+///
+/// FX-Fwin (#1053 follow-up) — `getaddrinfo(3)` is documented to
+/// reject an oversized label with `EAI_*`, but Windows' resolver
+/// does NOT enforce the 63-octet ceiling at the API boundary (it
+/// synthesizes a hit / returns `Ok`), so the cross-platform CI
+/// `Check (windows-latest)` job saw the SSRF guard pass an oversized
+/// label that macOS/Linux reject. A portable SSRF guard must
+/// validate the shape itself rather than delegating to libc. IP
+/// literals (no oversized labels) are unaffected.
+fn hostname_shape_invalid(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty() || name.len() > 253 {
+        return true;
+    }
+    name.split('.')
+        .any(|label| label.is_empty() || label.len() > 63)
+}
+
 /// H11 inner helper: takes `allow_loopback` explicitly so tests can
 /// assert both branches without poking the process-wide atomic
 /// (which would race with parallel tests). Production callers go
@@ -1631,12 +1663,33 @@ fn validate_url_dns_with(
     // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`. The unsafe override is
     // logged at WARN on every fire so an audit can detect the
     // legacy-permissive mode.
+    // FX-Fwin (#1053 follow-up) — enforce RFC 1035 hostname shape
+    // IN-GUARD before resolution. Windows' `getaddrinfo` does not
+    // reject an oversized (>63-octet) DNS label at the API boundary,
+    // so relying on the resolver to reject it (as the pre-FX-Fwin code
+    // did) made the guard platform-dependent. A shape violation is
+    // treated identically to a DNS resolution failure: fail-CLOSED
+    // unless the operator opted into the legacy permissive posture.
+    if hostname_shape_invalid(&resolved_host) {
+        if ssrf_dns_fail_open() {
+            tracing::warn!(
+                target: "ai_memory::subscriptions",
+                "SSRF guard: hostname {resolved_host} violates RFC 1035 label/length \
+                 limits for {url}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
+                 ALLOW (UNSAFE, legacy posture)"
+            );
+            return Ok((resolved_host, Vec::new()));
+        }
+        return Err(anyhow!(
+            "SSRF guard: DNS resolution failed for {url}: hostname violates RFC 1035 \
+             label/length limits; failing CLOSED (post-#1053 secure default — set \
+             AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
+        ));
+    }
     let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
         Ok(iter) => iter.collect(),
         Err(e) => {
-            let fail_open = std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            let fail_open = ssrf_dns_fail_open();
             if fail_open {
                 tracing::warn!(
                     target: "ai_memory::subscriptions",
@@ -2141,6 +2194,16 @@ fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, ok: bool) {
 mod tests {
     use super::*;
 
+    /// Serializes the two #1053 tests that mutate the process-global
+    /// `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` env var. Without it they
+    /// race under the default parallel test runner: the fail-open
+    /// test's `set_var` can be observed by the fail-closed test
+    /// mid-flight, flipping its expected `Err` (fail-CLOSED) into an
+    /// `Ok` (legacy permissive) and panicking. Poison-tolerant via
+    /// `into_inner` so one panicking test doesn't cascade-fail the
+    /// other.
+    static SSRF_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn https_allowed() {
         assert!(validate_url("https://example.com/hook").is_ok());
@@ -2576,13 +2639,15 @@ mod tests {
         //     unresolvable name to a "did-you-mean" landing page.
         //
         // To make the test hermetic across every platform we
-        // construct a hostname that the `getaddrinfo(3)` libc call
-        // rejects at the SHAPE level rather than at the DNS-lookup
-        // level: each DNS label has a hard 63-octet ceiling per RFC
-        // 1035 §2.3.4, so a single 70-character label MUST return
-        // `EAI_NONAME` / `EAI_FAIL` regardless of which resolver
-        // is configured. No DNS query is even attempted, so captive
-        // portals / search suffixes / NetBIOS cannot interfere.
+        // construct a hostname that the SSRF guard's RFC 1035 shape
+        // check rejects at the SHAPE level rather than at the
+        // DNS-lookup level: each DNS label has a hard 63-octet ceiling
+        // per RFC 1035 §2.3.4, so a single 70-character label is
+        // rejected in-guard (FX-Fwin #1053 follow-up) regardless of
+        // which resolver is configured — including Windows, whose
+        // `getaddrinfo` does not enforce the ceiling at the API
+        // boundary. No DNS query is even attempted.
+        let _env_guard = SSRF_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let oversized_label = "a".repeat(70);
         let url = format!("https://{oversized_label}.fxf1-test./");
         let res = validate_url_dns(&url);
@@ -2613,9 +2678,10 @@ mod tests {
         // pair brackets the test region.
         // SAFETY: env mutation guarded inside a unit test.
         // The current cargo-test process is the only consumer of
-        // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` and parallel test
-        // workers can race; gate this test with `#[ignore]` if
-        // flakiness surfaces on shared CI.
+        // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL`. Hold SSRF_ENV_GUARD
+        // across the whole set→validate→remove window so the
+        // fail-CLOSED test cannot observe the var mid-flight.
+        let _env_guard = SSRF_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL", "1");
         }

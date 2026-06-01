@@ -68,8 +68,18 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 /// additions. Tighten in lockstep with handler-family migration.
 const QUAL_6_CEILING: usize = 90;
 
-/// QUAL-7 ceiling: 6+ sites at v2-review time + slack.
-const QUAL_7_CEILING: usize = 25;
+/// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
+/// 25 → 26 for the #1455 fail-CLOSED governance pair in
+/// `src/daemon_runtime.rs`
+/// (`governance_consultation_unavailable` + its testable
+/// `_inner`): both return `Result<(), String>` because they feed
+/// the storage / wire-check hook closures whose boundary type IS
+/// `Fn(&_) -> Result<(), String>`. The split is deliberate (the
+/// `_inner` seam lets the secure-default vs. operator-override
+/// verdict be unit-tested without env mutation), so collapsing it
+/// to dodge the ratchet would be a regression. Net acknowledged
+/// addition: +1.
+const QUAL_7_CEILING: usize = 26;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

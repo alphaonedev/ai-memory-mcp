@@ -190,8 +190,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -229,6 +229,15 @@ jobs:
     name: Check (${{ matrix.os }})
     needs: classify
     runs-on: ${{ matrix.os }}
+    env:
+      # #1407/#1405/#1387 — the ubuntu `cargo test` link step OOM'd the
+      # linker (`collect2: ld terminated with signal 7 [Bus error]`).
+      # Downgrade dev-profile debug info from level 2 (full DWARF) to
+      # level 1 (line tables only) to keep peak linker RSS under the
+      # ~7 GB ubuntu ceiling. Cross-OS safe: only narrows debuginfo,
+      # does not affect the `--release` build (debug=0). Mirrors the
+      # postgres-feature / coverage jobs' knob.
+      CARGO_PROFILE_DEV_DEBUG: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -268,13 +277,22 @@ jobs:
           sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
           sudo rm -rf /opt/ghc                       || true  # ~5 GiB
           sudo apt-get clean
-          echo "::group::Disk usage after cleanup"
+          # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
+          # heavy lib-test link step has headroom above the ~7 GB RAM
+          # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
+          # Mirrors the postgres-feature / coverage swap recipe.
+          sudo fallocate -l 8G /mnt/swapfile-1407
+          sudo chmod 600 /mnt/swapfile-1407
+          sudo mkswap /mnt/swapfile-1407
+          sudo swapon /mnt/swapfile-1407
+          echo "::group::Disk + memory after cleanup"
           df -h /
+          free -h
           echo "::endgroup::"
 
-      - name: Install Rust stable
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - uses: Swatinem/rust-cache@v2
         if: needs.classify.outputs.docs_only != 'true'
@@ -454,8 +472,8 @@ jobs:
           df -h /mnt
           echo "::endgroup::"
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
@@ -571,8 +589,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable (target ${{ matrix.target }})
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 (target ${{ matrix.target }}, matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
 
@@ -670,8 +688,8 @@ jobs:
           df -h /
           echo "::endgroup::"
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
 
@@ -783,8 +801,8 @@ jobs:
           df -h /
           echo "::endgroup::"
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy, llvm-tools-preview
 
