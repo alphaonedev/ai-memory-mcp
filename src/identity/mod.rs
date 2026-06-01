@@ -59,6 +59,12 @@ pub mod verify;
 // with 409 Conflict so an attacker cannot replay a captured verify
 // indefinitely. See module docs for the threat model + memory bound.
 pub mod replay;
+// #626 Layer-3 (Task 1.3 / C4) — store-path agent attestation glue.
+// Ties SignableWrite (C1) + bound-key lookup (C3) + the attest_write gate
+// (C4) into stamp_attestation_{sync,async}, which the write surfaces call
+// to resolve metadata.attest_level (claimed / agent_attested) before
+// persisting. Permissive-default; fail-closed on a presented-but-bad sig.
+pub mod attest;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
