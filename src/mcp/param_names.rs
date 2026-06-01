@@ -29,7 +29,7 @@
 // (e.g. `AGENT_ID = "agent_id"`). Future renames touch both this module
 // + the parity-test allowlist in lockstep.
 
-// 98 canonical MCP tool-call parameter field names (v0.7.0 census).
+// 100 canonical MCP tool-call parameter field names (v0.7.0 census).
 // Source: grep of every `.get("X")` / `["X"]` literal in
 // `src/mcp/mod.rs` + `src/mcp/tools/*.rs` production code.
 pub const AGENT_FILTER: &str = "agent_filter";
@@ -50,6 +50,7 @@ pub const CONFIDENCE: &str = "confidence";
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
 pub const CONTEXT: &str = "context";
+pub const CREATED_AT: &str = "created_at";
 pub const DEPTH: &str = "depth";
 pub const DRY_RUN: &str = "dry_run";
 pub const EDIT_SOURCE: &str = "edit_source";
@@ -102,6 +103,7 @@ pub const REMEMBER: &str = "remember";
 pub const RESOURCE_PATH: &str = "resource_path";
 pub const SCOPE: &str = "scope";
 pub const SECRET: &str = "secret";
+pub const SIGNATURE: &str = "signature";
 pub const SINCE: &str = "since";
 pub const SKILL_DESCRIPTION: &str = "skill_description";
 pub const SKILL_ID: &str = "skill_id";
@@ -137,7 +139,7 @@ pub const VALID_UNTIL: &str = "valid_until";
 /// production `.get("X")` / `["X"]` literal under `src/mcp/` matches.
 ///
 /// SSOT pin: this array's length is the v0.7.0 census of unique
-/// param names (98). The parity test compares the grep-extracted
+/// param names (100). The parity test compares the grep-extracted
 /// production-literal set with `ALL_PARAM_NAMES` and fails on either
 /// orphan (literal not in allowlist) OR unused-allowlist (allowlist
 /// const that no production code references — surfaces dead consts
@@ -161,6 +163,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CONSUMED,
     CONTENT,
     CONTEXT,
+    CREATED_AT,
     DEPTH,
     DRY_RUN,
     EDIT_SOURCE,
@@ -213,6 +216,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     RESOURCE_PATH,
     SCOPE,
     SECRET,
+    SIGNATURE,
     SINCE,
     SKILL_DESCRIPTION,
     SKILL_ID,
@@ -257,7 +261,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            98,
+            100,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

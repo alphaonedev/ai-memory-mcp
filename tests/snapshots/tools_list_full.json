@@ -20,6 +20,12 @@
           "content": {
             "type": "string"
           },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "force": {
             "type": [
               "boolean",
@@ -59,6 +65,12 @@
             ]
           },
           "scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
             "type": [
               "string",
               "null"
