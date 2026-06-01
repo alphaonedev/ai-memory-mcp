@@ -368,7 +368,7 @@ CI guard: `bench --baseline performance/baseline.json` fails any PR that exceeds
 - **Ship-Gate internal:** yes (9/9 certifications + 5/5 channels green at v0.7.0 cut).
 - **Third-party compliance held:** none (no SOC 2 / ISO 27001 / FedRAMP / HIPAA).
 - **NSA CSI MCP Security mapping:** 10/10 concerns structurally met at v0.7.0 (codegraph-verified at HEAD `4add7a8`); evidence inventory at `docs/compliance/_inventory/v0.7.0-capabilities.json`. Does not imply NSA endorsement.
-- **Cryptographic agent attestation:** shipped at v0.7.0 (closes G12 from §10.4).
+- **Cryptographic agent attestation:** shipped at v0.7.0 on two surfaces — link-level Ed25519 signatures (`memory_links.signature`, closes G12 from §10.4) and store-path agent attestation (#626 Layer-3: a detached signature over the canonical `SignableWrite` envelope upgrades a directly-authored CLI/MCP/HTTP write from `claimed` to `agent_attested`, verified against the agent's bound key; `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` makes it mandatory). Two edges stay claimed-by-design — the federation receive path (mTLS + peer allowlist is the trust boundary) and the permissive default posture — both tracked for v0.8 hardening under #1464.
 - **Multi-region distributed consensus:** v1.0+ commitment.
 
 ---
@@ -468,7 +468,7 @@ L4 is the architecturally clean removal of the entire problem class: hosts volun
 - §2.2 coherent: AgentKeypair-signed personas, idempotent versioning, `PersonaError::NoReflections` derivation discipline.
 - §2.3 stoppable: HookVeto distinct from DepthExceeded, AskUser with default-on-timeout, partial-failure honesty contracts, TierLocked refusal.
 - §2.4 improvable: 7 Agent Skills MCP tools, recursive learning #655 Tasks 1-8, episodic→semantic→procedural pipeline shipped end-to-end.
-- §2.5 attested: V-4 signed_events chain, prev_hash + sequence cross-row chain (#698), recall_observations audit, kg_invalidate caller-vs-owner gate (#938), ReflectionOrigin peer/signer split, Ed25519 attestation across the matrix.
+- §2.5 attested: V-4 signed_events chain, prev_hash + sequence cross-row chain (#698), recall_observations audit, kg_invalidate caller-vs-owner gate (#938), ReflectionOrigin peer/signer split, Ed25519 attestation across the matrix, store-path agent attestation (#626 Layer-3 — `SignableWrite`-envelope signatures upgrade direct CLI/MCP/HTTP writes `claimed`→`agent_attested`, with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` for fail-closed posture).
 - §2.6 bias-displaced: LLM-agnostic reflection boundary at config layer, foreign-LLM reflector composition (`Opus producer × Grok reflector`), [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) heterogeneous evaluator panel operationalizes the principle at the assessment layer.
 - §2.7 LLM-agnostic: [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) provider-agnostic substrate landed.
 
