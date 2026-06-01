@@ -236,9 +236,14 @@ stripping, returning the un-trimmed schemars schema with every
 
 ## Counts at v0.7.0
 
-- 73 per-tool `McpTool` impls in `src/mcp/tools/*.rs`.
-- 73 entries in `registered_tools()`
-  (`Profile::full().expected_tool_count() == 73`).
+- 74 per-tool `McpTool` impls (73 under `src/mcp/tools/*.rs` +
+  `StoreTool` under `src/mcp/tools/store/mod.rs`).
+- 74 entries in `registered_tools()`
+  (`Profile::full().expected_tool_count() == 74 ==
+  crate::mcp::registry::tool_names::ALL.len()`). 73 of these are
+  callable memory tools; the 74th is the always-on
+  `memory_capabilities` bootstrap — see issue #862 for the canonical
+  73-callable / 74-advertised disambiguation.
 - 4-line iteration over `registered_tools()` is the entire body of
   `tool_definitions()` post-D1.6.
 - 7 always-on tools at the v0.7.0 default profile; additional tools
