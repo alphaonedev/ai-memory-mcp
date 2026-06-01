@@ -408,7 +408,9 @@ impl EnvVarGuard {
     fn set(name: &'static str, value: &str) -> Self {
         // Poisoning is irrelevant — the lock guards a `()`; recover the
         // guard so one panicking test does not cascade-fail the rest.
-        let lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var(name).ok();
         // SAFETY: set_var/remove_var are unsafe on Edition 2024 / Rust
         // 1.83+ for multi-thread soundness. ENV_LOCK serializes every
