@@ -580,7 +580,7 @@ The MCP server's tool surface is selected by `--profile`. Profiles compose tool 
 | `graph` | core + KG family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths`. |
 | `admin` | core + governance + audit | Operator sessions doing `memory_governance_*`, `memory_audit_*`, archive purges. |
 | `power` | core + smart-tier LLM tools | Smart/autonomous tier deployments that want `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction` always available. |
-| `full` | every family — **74 advertised entries at v0.7.0** (72 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
+| `full` | every family — **74 advertised entries at v0.7.0** (73 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
 **v0.7 always-on additions:** `memory_load_family(family)` and `memory_smart_load(intent)` are advertised under every profile. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
 

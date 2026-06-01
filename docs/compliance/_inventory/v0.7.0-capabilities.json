@@ -4,10 +4,10 @@
   "verification_timestamp_utc": "2026-05-23T16:30:22Z",
   "verification_commit_sha": "4add7a8528d4c16d696b391ec6e2890269669a84",
   "verification_branch": "release/v0.7.0",
-  "schema_version_sqlite": 50,
-  "schema_version_postgres": 51,
+  "schema_version_sqlite": 53,
+  "schema_version_postgres": 53,
   "parity_test": "tests/postgres_schema_parity.rs::schema_versions_match_across_adapters",
-  "schema_authority_source": "src/storage/migrations.rs:532 — const CURRENT_SCHEMA_VERSION: i64 = 51",
+  "schema_authority_source": "src/storage/migrations.rs:554 — const CURRENT_SCHEMA_VERSION: i64 = 53",
   "test_counts": {
     "total_test_attributes": 6961,
     "lib_tests": 4830,
@@ -18,24 +18,24 @@
   "mcp_tool_counts": {
     "core_profile": 7,
     "graph_profile": 18,
-    "admin_profile": 20,
-    "power_profile": 16,
-    "full_profile": 73,
-    "authority_source": "src/profile.rs — profile_core_has_seven_tools (line 833), profile_graph_has_eighteen_tools (849), profile_admin_has_twenty_tools (860), profile_power_has_sixteen_tools (870), profile_full_has_seventy_three_tools (898)"
+    "admin_profile": 21,
+    "power_profile": 30,
+    "full_profile": 74,
+    "authority_source": "src/profile.rs — profile_core_loads_only_core_family (line 835), profile_graph_loads_core_plus_graph (850), profile_admin_loads_core_lifecycle_governance (862), profile_power_loads_core_plus_power (877), profile_full_matches_registry_all (889). Per-profile counts derive from Family::tool_names().len() summed over each profile's families: core=[Core:7]; graph=[Core:7,Graph:11]=18; admin=[Core:7,Lifecycle:6,Governance:8]=21; power=[Core:7,Power:23]=30; full=tool_names::ALL.len()=74."
   },
   "http_routes": {
-    "production_route_bindings": 87,
-    "unique_production_url_paths": 73,
+    "production_route_bindings": 88,
+    "unique_production_url_paths": 74,
     "test_only_route_bindings": 1,
-    "test_only_routes": ["/slow (src/lib.rs:582 under #[cfg(test)])"],
+    "test_only_routes": ["/slow (src/lib.rs:995 under #[cfg(test)])"],
     "authority_source": "codegraph_search kind=route limit=100 against src/lib.rs",
     "verification_command": "awk '/\\.route\\(/{in=1}in&&/\"\\/[^\"]*\"/{match($0,/\"\\/[^\"]*\"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u | wc -l"
   },
   "cli_subcommands": {
-    "with_features_sal_postgres": 58,
-    "default_build": 56,
+    "with_features_sal_postgres": 81,
+    "default_build": 79,
     "sal_gated_subcommands": ["Migrate", "SchemaInit"],
-    "authority_source": "codegraph_node Command at src/daemon_runtime.rs:157"
+    "authority_source": "SSOT consts ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=79 + EXPECTED_CLI_SUBCOMMANDS_SAL=81; mechanical parity test tests/cli_subcommand_count_invariant.rs; pub enum Command in src/daemon_runtime.rs (awk-canonical 81 unique variants; Migrate + SchemaInit gated #[cfg(feature = \"sal\")] at src/daemon_runtime.rs:311,322, leaving 79 in the default build)"
   },
   "memory_struct": {
     "field_count": 26,
@@ -446,7 +446,7 @@
         "src/validate.rs:852 (validate_update free fn)"
       ],
       "issue_references": ["#966"],
-      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 87 HTTP routes, 74 MCP tools, and 79 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
+      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator — the canonical fluent surface. Pre-#966 the same validate_id + validate_namespace + validate_agent_id + ... chains were duplicated across 88 HTTP routes, 74 MCP tools, and 79 CLI subcommands; adding a new cross-field invariant required three audited per-surface edits. Post-#966 a single struct method covers all three surfaces with the typed ValidationError { field, reason } envelope. This is the substrate's primary defense against the NSA-enumerated tool-parameter-injection class.",
       "verified_in_v0_7_0": true,
       "verified_by_grep": "grep -nE 'pub struct RequestValidator|validate_create|validate_update|validate_memory' src/validate.rs → 11 hits"
     },
@@ -547,7 +547,7 @@
     "partial_or_honesty_capabilities": ["chaos_tested_convergence", "dos_multi_layer_defense"],
     "originating_brief_corrections_applied": 4,
     "corrections": [
-      "Schema version v48 → v49 (Task I correction; final SHIP state at v51 per #1255, CURRENT_SCHEMA_VERSION at src/storage/migrations.rs:532)",
+      "Schema version v48 → v49 (Task I correction; final SHIP state at v53, CURRENT_SCHEMA_VERSION at src/storage/migrations.rs:554)",
       "Field name atom_span → source_span (Memory.source_span at src/models/memory.rs:482)",
       "Test count 13k+ → 6,961 (#[test] attribute count)",
       "Memory Portability Spec v1.1 → v1 (per document's own version stamp)"

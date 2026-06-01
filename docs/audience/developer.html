@@ -102,7 +102,7 @@ cargo audit</code></pre>
   <p>All three share <code>src/storage/</code> + <code>src/validate.rs</code>. There is no behavioural divergence; whatever the CLI does, the MCP tool and the HTTP endpoint do too. Post-#966 (Wave-2 Tier-C1, May 2026), DTO-bundling validation routes through the shared <code>RequestValidator</code> fluent surface so adding a new cross-field invariant is one impl method on the facade instead of three audited per-surface duplicates.</p>
 
   <h3>MCP &mdash; stdio JSON-RPC 2.0</h3>
-  <div class="if-tabs"><span class="if-tab mcp">73 entries at --profile full, 7 default in --profile core</span></div>
+  <div class="if-tabs"><span class="if-tab mcp">74 entries at --profile full, 7 default in --profile core</span></div>
   <pre><code>printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"demo","version":"0"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"hello","content":"first MCP memory","tier":"mid"}}}' \
@@ -262,7 +262,7 @@ ai-memory serve</code></pre>
   <h2>Where to go from here.</h2>
   <div class="next">
     <a href="../DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Full reference</span></a>
-    <a href="../USER_GUIDE.md"><strong>MCP tool reference</strong><span class="desc">73 entries at --profile full</span></a>
+    <a href="../USER_GUIDE.md"><strong>MCP tool reference</strong><span class="desc">74 entries at --profile full</span></a>
     <a href="../API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">88 routes (74 unique paths)</span></a>
     <a href="../CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">79 subcommands</span></a>
     <a href="../agent-identity.html"><strong>Agent identity</strong><span class="desc">NHI semantics</span></a>

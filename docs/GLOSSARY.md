@@ -136,7 +136,7 @@ embeddings lose information on long text.
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
 an MCP server via `ai-memory mcp` exposing **74 advertised entries at
-`--profile full` at v0.7.0** (72 callable "memory tools" + the always-on
+`--profile full` at v0.7.0** (73 callable "memory tools" + the always-on
 `memory_capabilities` bootstrap — both numbers are intentional; see
 issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
 plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the
