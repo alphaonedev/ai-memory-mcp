@@ -41,7 +41,7 @@ use std::path::Path;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::identity::keypair;
-use crate::identity::sign::{SignableLink, canonical_cbor};
+use crate::identity::sign::{SignableLink, SignableWrite, canonical_cbor, canonical_cbor_write};
 
 /// Length of an Ed25519 signature in bytes. Mirrors the constant
 /// [`ed25519_dalek::SIGNATURE_LENGTH`] but pinned locally so the verify
@@ -130,6 +130,173 @@ pub fn verify(
     public
         .verify(&payload, &sig)
         .map_err(|_| VerifyError::Tampered)
+}
+
+// ---------------------------------------------------------------------------
+// #626 Layer-3 (Task 1.3 / C4) — store-path write attestation
+// ---------------------------------------------------------------------------
+//
+// The link verifier above reads the peer key from the on-disk key store
+// (federation trust root). The WRITE attestation path is different: the
+// trust anchor is the key BOUND into the agent's registration row by C3
+// (`db::bind_agent_pubkey` / `MemoryStore::agent_pubkey`). A write that
+// claims `agent_id` is upgraded from *claimed* to *attested* only when its
+// Ed25519 signature verifies under that bound key.
+
+/// Attestation level resolved for a store-path write.
+///
+/// Stamped into the stored row's metadata so downstream readers can tell a
+/// bare `agent_id` claim apart from one cryptographically attested by a
+/// holder of the agent's bound private key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestLevel {
+    /// The write asserted an `agent_id` with no verified signature — a
+    /// bare claim. The permissive default for unsigned writes (or writes
+    /// whose agent has no bound key) when attestation is not required.
+    Claimed,
+    /// The write carried an Ed25519 signature that verified against the
+    /// `agent_id`'s bound public key — the `agent_id` is attested.
+    AgentAttested,
+}
+
+impl AttestLevel {
+    /// Stable wire string for the `metadata.attest_level` field.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::AgentAttested => "agent_attested",
+        }
+    }
+}
+
+/// Reason a store-path write was refused (or could not be attested) by
+/// [`attest_write`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttestError {
+    /// A signature was presented and a bound key exists, but the signature
+    /// did not verify — tampered payload, flipped signature byte, or a
+    /// signature minted under a different key. ALWAYS a hard reject,
+    /// regardless of the require-attestation posture: a presented-but-bad
+    /// signature is never silently downgraded to a claim.
+    Forged,
+    /// Attestation is required (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION`) but
+    /// the write could not be attested — no signature was presented, or
+    /// the agent has no bound key to verify against.
+    AttestationRequired,
+    /// The agent's bound public key could not be decoded — the
+    /// registration metadata holds a corrupt `agent_pubkey`. Fail-closed
+    /// (we cannot attest against a key we cannot parse).
+    BadBoundKey,
+    /// The presented signature blob was not exactly 64 bytes.
+    MalformedSignature,
+}
+
+impl std::fmt::Display for AttestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forged => f.write_str(
+                "write signature did not verify against the agent's bound public key — \
+                 payload or signature bytes do not match what the agent signed",
+            ),
+            Self::AttestationRequired => f.write_str(
+                "agent attestation is required but this write is unsigned or the agent \
+                 has no bound public key",
+            ),
+            Self::BadBoundKey => f.write_str(
+                "the agent's bound public key is malformed and cannot be used to verify",
+            ),
+            Self::MalformedSignature => f.write_str(
+                "signature is not exactly 64 bytes — not a well-formed Ed25519 signature",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AttestError {}
+
+/// Verify `signature` over the canonical CBOR encoding of `write` using
+/// `public`.
+///
+/// Mirror of [`verify`] for the store path: re-derives the exact bytes
+/// [`crate::identity::sign::sign_write`] signed and checks the 64-byte
+/// Ed25519 signature. Any divergence between the stored write fields and
+/// what the agent signed makes the verify fail.
+///
+/// # Errors
+///
+/// - [`VerifyError::MalformedSignature`] — `signature.len() != 64`.
+/// - [`VerifyError::Tampered`] — signature does not validate against
+///   `public` over the canonical CBOR (wrong key, flipped byte, or mutated
+///   write field).
+pub fn verify_write(
+    public: &VerifyingKey,
+    write: &SignableWrite<'_>,
+    signature: &[u8],
+) -> Result<(), VerifyError> {
+    if signature.len() != SIGNATURE_LEN {
+        return Err(VerifyError::MalformedSignature);
+    }
+    let mut sig_arr = [0u8; SIGNATURE_LEN];
+    sig_arr.copy_from_slice(signature);
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let payload = canonical_cbor_write(write).map_err(|_| VerifyError::Tampered)?;
+    public
+        .verify(&payload, &sig)
+        .map_err(|_| VerifyError::Tampered)
+}
+
+/// Resolve the [`AttestLevel`] for a store-path write — the C4 gate.
+///
+/// Decision table (`require` = `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`):
+///
+/// | signature | bound key | verify | require=false | require=true |
+/// |-----------|-----------|--------|---------------|--------------|
+/// | present   | present   | ok     | `AgentAttested` | `AgentAttested` |
+/// | present   | present   | fail   | `Err(Forged)`   | `Err(Forged)`   |
+/// | present   | absent    | —      | `Claimed`       | `Err(Required)` |
+/// | absent    | any       | —      | `Claimed`       | `Err(Required)` |
+///
+/// The load-bearing invariant: a *presented* signature that fails to
+/// verify is ALWAYS rejected (`Forged`), never downgraded to `Claimed` —
+/// so an attacker cannot strip attestation by sending a deliberately bad
+/// signature. Only the *absence* of a signature (or of a bound key) maps
+/// to the permissive `Claimed` posture, and only when `require` is unset.
+///
+/// # Errors
+///
+/// See the table — [`AttestError::Forged`], [`AttestError::AttestationRequired`],
+/// [`AttestError::BadBoundKey`], or [`AttestError::MalformedSignature`].
+pub fn attest_write(
+    write: &SignableWrite<'_>,
+    bound_pubkey_b64: Option<&str>,
+    signature: Option<&[u8]>,
+    require: bool,
+) -> Result<AttestLevel, AttestError> {
+    match (signature, bound_pubkey_b64) {
+        (Some(sig), Some(pk_b64)) => {
+            let public =
+                keypair::decode_public_base64(pk_b64).map_err(|_| AttestError::BadBoundKey)?;
+            verify_write(&public, write, sig).map_err(|e| match e {
+                VerifyError::MalformedSignature => AttestError::MalformedSignature,
+                // Tampered / wrong-key both collapse to Forged on the
+                // write path — same fail-closed posture as the link verifier.
+                VerifyError::Tampered | VerifyError::NoPublicKey => AttestError::Forged,
+            })?;
+            Ok(AttestLevel::AgentAttested)
+        }
+        // Either no signature, or a signature with no key to check it
+        // against. Both are "cannot attest": permissive → Claimed,
+        // strict → reject.
+        _ => {
+            if require {
+                Err(AttestError::AttestationRequired)
+            } else {
+                Ok(AttestLevel::Claimed)
+            }
+        }
+    }
 }
 
 /// Look up the public key associated with `observed_by` on this host's
@@ -370,5 +537,178 @@ mod tests {
         assert_ne!(m_t, m_n);
         assert_ne!(m_n, m_m);
         assert_ne!(m_t, m_m);
+    }
+
+    // -----------------------------------------------------------------
+    // #626 Layer-3 (Task 1.3 / C4) — verify_write + attest_write gate
+    // -----------------------------------------------------------------
+
+    fn body_hash(seed: u8) -> [u8; 32] {
+        let mut h = [seed; 32];
+        h[0] ^= 0x5A;
+        h
+    }
+
+    fn write_fixture(body: &[u8; 32]) -> SignableWrite<'_> {
+        SignableWrite {
+            agent_id: "ai:curator",
+            namespace: "team/alpha",
+            title: "kubernetes deployment guide",
+            kind: "fact",
+            created_at: "2026-06-01T12:00:00+00:00",
+            content_sha256: body,
+        }
+    }
+
+    #[test]
+    fn verify_write_accepts_valid_signature() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x11);
+        let write = write_fixture(&body);
+        let sig = sign::sign_write(&kp, &write).unwrap();
+        verify_write(&kp.public, &write, &sig).expect("happy-path write verify must succeed");
+    }
+
+    #[test]
+    fn verify_write_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x12);
+        let write = write_fixture(&body);
+        let mut sig = sign::sign_write(&kp, &write).unwrap();
+        sig[0] ^= 0x01;
+        assert_eq!(
+            verify_write(&kp.public, &write, &sig).unwrap_err(),
+            VerifyError::Tampered
+        );
+    }
+
+    #[test]
+    fn verify_write_rejects_mutated_payload() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x13);
+        let original = write_fixture(&body);
+        let sig = sign::sign_write(&kp, &original).unwrap();
+        let mut tampered = original.clone();
+        tampered.agent_id = "ai:impostor";
+        assert_eq!(
+            verify_write(&kp.public, &tampered, &sig).unwrap_err(),
+            VerifyError::Tampered
+        );
+    }
+
+    #[test]
+    fn verify_write_rejects_short_signature() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x14);
+        let write = write_fixture(&body);
+        assert_eq!(
+            verify_write(&kp.public, &write, &[0u8; 32]).unwrap_err(),
+            VerifyError::MalformedSignature
+        );
+    }
+
+    #[test]
+    fn attest_write_signed_with_bound_key_is_attested() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x21);
+        let write = write_fixture(&body);
+        let sig = sign::sign_write(&kp, &write).unwrap();
+        let pk_b64 = kp.public_base64();
+        // Permissive and strict both attest a valid signature.
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), Some(&sig), false).unwrap(),
+            AttestLevel::AgentAttested
+        );
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), Some(&sig), true).unwrap(),
+            AttestLevel::AgentAttested
+        );
+    }
+
+    #[test]
+    fn attest_write_forged_signature_always_rejected() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let other = kp_mod::generate("ai:other").unwrap();
+        let body = body_hash(0x22);
+        let write = write_fixture(&body);
+        // Sign with `other` but present `kp` as the bound key → forged.
+        let sig = sign::sign_write(&other, &write).unwrap();
+        let pk_b64 = kp.public_base64();
+        // Forged rejects in BOTH postures — never downgraded to Claimed.
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), Some(&sig), false).unwrap_err(),
+            AttestError::Forged
+        );
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), Some(&sig), true).unwrap_err(),
+            AttestError::Forged
+        );
+    }
+
+    #[test]
+    fn attest_write_unsigned_is_claimed_when_permissive_rejected_when_required() {
+        let body = body_hash(0x23);
+        let write = write_fixture(&body);
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let pk_b64 = kp.public_base64();
+        // No signature → permissive Claimed.
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), None, false).unwrap(),
+            AttestLevel::Claimed
+        );
+        // No signature, attestation required → reject.
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), None, true).unwrap_err(),
+            AttestError::AttestationRequired
+        );
+    }
+
+    #[test]
+    fn attest_write_signature_without_bound_key_cannot_attest() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x24);
+        let write = write_fixture(&body);
+        let sig = sign::sign_write(&kp, &write).unwrap();
+        // Signature presented but agent has no bound key → cannot verify.
+        // Permissive → Claimed; strict → reject.
+        assert_eq!(
+            attest_write(&write, None, Some(&sig), false).unwrap(),
+            AttestLevel::Claimed
+        );
+        assert_eq!(
+            attest_write(&write, None, Some(&sig), true).unwrap_err(),
+            AttestError::AttestationRequired
+        );
+    }
+
+    #[test]
+    fn attest_write_malformed_signature_is_reported() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x25);
+        let write = write_fixture(&body);
+        let pk_b64 = kp.public_base64();
+        assert_eq!(
+            attest_write(&write, Some(&pk_b64), Some(&[0u8; 10]), false).unwrap_err(),
+            AttestError::MalformedSignature
+        );
+    }
+
+    #[test]
+    fn attest_write_bad_bound_key_fails_closed() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x26);
+        let write = write_fixture(&body);
+        let sig = sign::sign_write(&kp, &write).unwrap();
+        // Corrupt bound key (not decodable) → fail-closed.
+        assert_eq!(
+            attest_write(&write, Some("!!!not-base64!!!"), Some(&sig), false).unwrap_err(),
+            AttestError::BadBoundKey
+        );
+    }
+
+    #[test]
+    fn attest_level_as_str_is_stable() {
+        assert_eq!(AttestLevel::Claimed.as_str(), "claimed");
+        assert_eq!(AttestLevel::AgentAttested.as_str(), "agent_attested");
     }
 }
