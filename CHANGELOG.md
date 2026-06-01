@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### v0.7.0 security-review epic #1450 — 9-finding hardening sweep (2026-05-31)
+
+Full-spectrum multi-agent security review of the v0.7.0 substrate. Each finding was fixed 1:1 with a regression test, gated (fmt + clippy::pedantic + full suite + audit), and committed to `release/v0.7.0`. Parent epic **[#1450](https://github.com/alphaonedev/ai-memory-mcp/issues/1450)**.
+
+#### Security
+
+- **[#1451](https://github.com/alphaonedev/ai-memory-mcp/issues/1451)** — gate the optimistic-update write path through `GOVERNANCE_PRE_WRITE` on both sqlite + postgres so a versioned `memory_update` can no longer bypass governance (parity with the insert/supersede paths). New `tests/governance_update_hook_1451.rs` (commit `2853b43d2`).
+- **[#1452](https://github.com/alphaonedev/ai-memory-mcp/issues/1452)** — `signed_events` now fails CLOSED on a missing signature when a verifier is installed and the row's `attest_level` is not the by-design `"unsigned"` legacy marker, instead of silently accepting it. New `tests/signed_events_fail_closed_1452.rs` (commit `39c05b46b`).
+- **[#1453](https://github.com/alphaonedev/ai-memory-mcp/issues/1453)** — reject path-traversal (`..`, absolute escapes) in `memory_skill_export` resource paths via a canonicalization guard (commit `ed301a4fb`).
+- **[#1454](https://github.com/alphaonedev/ai-memory-mcp/issues/1454)** — manual `Debug` impls for `AppConfig` + `LlmSection` redact `api_key` as `<redacted>` so a `{:?}` print or tracing line can never leak the credential (commit `a9ea69c21`).
+- **[#1455](https://github.com/alphaonedev/ai-memory-mcp/issues/1455)** — shared fail-CLOSED `governance_consultation_unavailable[_inner]` helpers on daemon startup; transient governance-consultation errors block the write unless the operator opts into `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (commit `148a77eef`).
+- **[#1457](https://github.com/alphaonedev/ai-memory-mcp/issues/1457)** — `match_custom` now evaluates the optional ANDed payload predicates (`namespace_glob` / `tier` / `title_contains`) that were previously declared but never checked, closing a custom-action policy-bypass gap; absent referenced payload fields fail safe (no match) (commit `70fed368f`).
+- **[#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)** — extracted a testable `api_key_bind_guard` + `require_api_key_strict` (`AI_MEMORY_REQUIRE_API_KEY`) out of `bootstrap_serve`; a keyless bind to a non-loopback host warns, and strict mode refuses the bind outright (commit `148a77eef`).
+- **[#1459](https://github.com/alphaonedev/ai-memory-mcp/issues/1459)** — cap LLM + embedder HTTP responses at 16 MiB (`read_capped_bytes`/`_json`/`_text`, content-length pre-check then streamed accumulation) so a malicious or runaway backend can't exhaust daemon memory (commit `9876d2ab6`).
+
+#### Docs
+
+- **[#1456](https://github.com/alphaonedev/ai-memory-mcp/issues/1456)** — document the `SAFETY` invariant for the cross-encoder `mmap` load in `reranker.rs` (commit `3085c6f54`).
+
+### v0.7.0 three-surface parity + AttestLevel + SSOT batch (2026-05-30/31)
+
+#### Added
+
+- **[#1443](https://github.com/alphaonedev/ai-memory-mcp/issues/1443)** — `ai-memory expand` CLI subcommand for LLM query-expansion, achieving three-surface parity with the `memory_expand_query` MCP tool + `POST /api/v1/expand_query` HTTP route. CLI count 78→79 (default) / 80→81 (`sal`); SSOT consts + `tests/cli_subcommand_count_invariant.rs` re-pinned (commit `f869eae8c`).
+- **[#1416](https://github.com/alphaonedev/ai-memory-mcp/issues/1416)** — HTTP `POST /api/v1/capture_turn` mirrors the MCP `memory_capture_turn` L4 tool through the SAL `capture_turn_idempotent` method so postgres-backed daemons gain a callable L4 turn-capture surface (HTTP route count → 88).
+- **[#1427](https://github.com/alphaonedev/ai-memory-mcp/issues/1427)** — `ai-memory store` gains `--kind` / `--citations` / `--source-uri` / `--source-span` / `--entity-id` flags for Form-4/Form-6 parity with the MCP store path.
+- **[#1428](https://github.com/alphaonedev/ai-memory-mcp/issues/1428)** — `ai-memory update` gains `--metadata` / `--source-uri` / `--expected-version` flags routed through the optimistic-concurrency gate.
+- **[#1430](https://github.com/alphaonedev/ai-memory-mcp/issues/1430)** — extend the `AttestLevel` enum with `SignedByPeer` + `DaemonSigned` variants.
+- New SSOT const families in `src/lib.rs`: `ROUTE_*` + `METHOD_*` (**[#1437](https://github.com/alphaonedev/ai-memory-mcp/issues/1437)**), `KIB`/`MIB`/`GIB` byte units, `Memory::FIELD_COUNT`, `MemoryScope` enum, `META_KEY_*` substrate-metadata keys, and `inbox_namespace()` / `INBOX_NAMESPACE_PREFIX` helpers; plus an MCP tool-call param-name SSOT with a parity invariant test.
+
+#### Changed
+
+- Standardize on Rust **MSRV 1.96** across the toolchain.
+- **Packaging** — decommission the Ubuntu Launchpad PPA channel; reframe the APT distribution path PPA → `.deb` across docs.
+- **LLM substrate** — switch IronClaw A2A + docs examples to OpenRouter Gemma 4 26B, superseding the prior xAI Grok 4.3 curator wiring (ai-memory product line only).
+- SSOT migrations (no behavior change): `AttestLevel` literals → `AttestLevel::*.as_str()` (**[#1431](https://github.com/alphaonedev/ai-memory-mcp/issues/1431)**, partial — consumer sites still migrating); orphan `attest_level="signed"` offload row → `SelfSigned` (**[#1438](https://github.com/alphaonedev/ai-memory-mcp/issues/1438)**); visibility predicates → `META_KEY_*`/`MemoryScope` helpers (**[#1436](https://github.com/alphaonedev/ai-memory-mcp/issues/1436)**); `Tier` parsers → `Tier::from_str` (**[#1432](https://github.com/alphaonedev/ai-memory-mcp/issues/1432)**); `HEADER_AGENT_ID` / `HEADER_CONTENT_TYPE` / `MIME_JSON` / HTTP error-code literal sweeps.
+
+#### Fixed
+
+- **[#1439](https://github.com/alphaonedev/ai-memory-mcp/issues/1439)** — build the CLI recall embedder on a dedicated std thread to avoid a tokio reactor deadlock.
+- **[#1440](https://github.com/alphaonedev/ai-memory-mcp/issues/1440)** — daemon must not clobber the operator-configured LLM model with the tier-default Ollama id.
+- **[#1442](https://github.com/alphaonedev/ai-memory-mcp/issues/1442)** — service-daemon LLM-key wiring: launchd/systemd units don't inherit shell-rc exports, so the key is now threaded through the unit environment.
+- **[#1445](https://github.com/alphaonedev/ai-memory-mcp/issues/1445)** — align the HTTP `expand_query` response envelope key to `expanded_terms` for three-surface parity.
+- **[#1444](https://github.com/alphaonedev/ai-memory-mcp/issues/1444)** — prune the stale `for_admin` allowlist entry for `power.rs`.
+- **[#1387](https://github.com/alphaonedev/ai-memory-mcp/issues/1387)** — CI `Run tests` (ubuntu-latest) failure root-caused to runner disk exhaustion (`ld` Bus error at the doctest link step), not a flake; fixed by freeing disk before the test step.
+
 ### v0.7.0 #1389 layered-capture architecture — L1+L2+L4 production-shipped (2026-05-28→2026-05-30)
 
 The substrate's first-line answer to the #1388 RCA — operator-agent test-plan dialog lost on tmux lockup + SIGKILL. Layered-defense capture architecture canonical in `global/policies` memory `f62cb182`:
