@@ -462,7 +462,16 @@ impl CrossEncoder {
             .map_err(|e| anyhow::anyhow!("failed to set truncation: {e}"))?;
         tokenizer.with_padding(None);
 
-        // Load model weights
+        // Load model weights.
+        //
+        // SAFETY (#1456): `from_mmaped_safetensors` memory-maps the
+        // weights file. The mmap is unsound only if the backing file is
+        // mutated or truncated by another process while it is mapped.
+        // `weights_path` resolves to a trusted, immutable safetensors
+        // artifact in the daemon-owned HuggingFace cache (downloaded and
+        // not subsequently written by us); it is never a caller-supplied
+        // path at request time. The mapping lives only for the duration
+        // of weight loading below.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
                 .context("failed to load cross-encoder weights")?
