@@ -46,9 +46,24 @@
 //!    flipped the default to fail-CLOSED, or that broadened the truthy
 //!    set, surfaces here.
 //!
-//! All three tests serialize env mutation through the shared
-//! `EnvVarGuard` (process-wide `ENV_LOCK`) so parallel test execution
-//! cannot race them.
+//! 5. **`test_limits_env_overrides_config_and_default`** (#1156
+//!    follow-up) — the `[limits]` knobs (`AI_MEMORY_MAX_*` env vars,
+//!    table rows #49-52) resolve `env > [limits] section > compiled
+//!    default` through `AppConfig::resolve_limits()`. Proves env beats
+//!    config AND config beats default in one fixture.
+//!
+//! 6. **`test_limits_garbage_env_falls_through_to_default`** (#1156
+//!    follow-up) — non-positive / unparseable `AI_MEMORY_MAX_*` values
+//!    are filtered so a stray `0` page-size can never clamp every list
+//!    response to empty; all three garbage values fall through to the
+//!    compiled defaults.
+//!
+//! All tests serialize env mutation through the shared `ENV_LOCK`: the
+//! single-key tests via [`EnvVarGuard`], and the multi-key `[limits]`
+//! tests via [`MultiEnvVarGuard`] (which acquires the non-reentrant
+//! lock exactly once for a batch — stacking single-key guards on one
+//! thread would self-deadlock). Parallel test execution cannot race
+//! them.
 
 use std::path::PathBuf;
 
@@ -61,7 +76,7 @@ use ai_memory::profile::Profile;
 use clap::Parser;
 
 mod common;
-use common::EnvVarGuard;
+use common::{EnvVarGuard, MultiEnvVarGuard};
 
 /// Build the semantic-tier config the capabilities tests need without
 /// pulling the embedder model into scope.
@@ -279,4 +294,94 @@ fn test_require_agent_attestation_env_parsing() {
         !require_agent_attestation_enabled(),
         "a non-1/true value MUST NOT be treated as truthy",
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5. [limits] knobs — AI_MEMORY_MAX_* env vars override the `[limits]`
+//    config section, which overrides the compiled defaults.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_limits_env_overrides_config_and_default() {
+    use ai_memory::config::LimitsSection;
+
+    // Build an AppConfig whose `[limits]` section sets all four knobs,
+    // so we can prove env beats config AND config beats compiled default
+    // in the same fixture.
+    let cfg = AppConfig {
+        limits: Some(LimitsSection {
+            max_memories_per_day: Some(5_000_000),
+            max_storage_bytes: Some(9_000_000_000),
+            max_links_per_day: Some(4_000_000),
+            max_page_size: Some(250_000),
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env unset → config wins over compiled default ----
+    // All four guards must share ONE `ENV_LOCK` acquisition; stacking
+    // single-key `EnvVarGuard`s on one thread self-deadlocks the
+    // non-reentrant lock (see `MultiEnvVarGuard` docs).
+    let guard_a = MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_MAX_MEMORIES_PER_DAY", None),
+        ("AI_MEMORY_MAX_STORAGE_BYTES", None),
+        ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
+        ("AI_MEMORY_MAX_PAGE_SIZE", None),
+    ]);
+    let r_cfg = cfg.resolve_limits();
+    assert_eq!(r_cfg.max_memories_per_day, 5_000_000);
+    assert_eq!(r_cfg.max_page_size, 250_000);
+    drop(guard_a);
+
+    // ---- Branch B: env overrides the two it sets; config fills the
+    //               rest; the resolved source becomes Env ----
+    let _guard_b = MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_MAX_MEMORIES_PER_DAY", Some("7000000")),
+        ("AI_MEMORY_MAX_PAGE_SIZE", Some("1000000")),
+        ("AI_MEMORY_MAX_STORAGE_BYTES", None),
+        ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
+    ]);
+    let r_env = cfg.resolve_limits();
+    assert_eq!(
+        r_env.max_memories_per_day, 7_000_000,
+        "AI_MEMORY_MAX_MEMORIES_PER_DAY env MUST beat [limits] config",
+    );
+    assert_eq!(
+        r_env.max_page_size, 1_000_000,
+        "AI_MEMORY_MAX_PAGE_SIZE env MUST beat [limits] config",
+    );
+    assert_eq!(
+        r_env.max_storage_bytes, 9_000_000_000,
+        "config supplies the storage cap env left unset",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Garbage / non-positive [limits] env values fall through (no panic,
+//    no zero cap that would freeze every write or every list page).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_limits_garbage_env_falls_through_to_default() {
+    let cfg = AppConfig::default();
+
+    // One lock acquisition for all three mutations (see `MultiEnvVarGuard`).
+    let _guard = MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_MAX_MEMORIES_PER_DAY", Some("0")),
+        ("AI_MEMORY_MAX_PAGE_SIZE", Some("-9")),
+        ("AI_MEMORY_MAX_STORAGE_BYTES", Some("lots")),
+        ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
+    ]);
+
+    let r = cfg.resolve_limits();
+    // None of the stray values are honored; all fall through to the
+    // compiled defaults (a 0 page-size would otherwise clamp every list
+    // response to empty).
+    assert!(
+        r.max_memories_per_day > 0,
+        "non-positive env must be ignored"
+    );
+    assert!(
+        r.max_page_size > 0,
+        "non-positive page-size env must be ignored"
+    );
+    assert!(r.max_storage_bytes > 0, "unparseable env must be ignored");
 }

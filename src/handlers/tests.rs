@@ -363,6 +363,7 @@ fn test_app_state(db: Db) -> AppState {
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: crate::handlers::MAX_BULK_SIZE,
     }
 }
 
@@ -1081,6 +1082,7 @@ async fn http_bulk_create_fans_out_with_federation() {
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: crate::handlers::MAX_BULK_SIZE,
     };
     let router = Router::new()
         .route("/api/v1/memories/bulk", axum_post(bulk_create))
@@ -1190,6 +1192,60 @@ async fn http_sync_push_rejects_oversized_batch_redteam_242() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_bulk_create_honors_operator_resolved_max_page_size() {
+    // [limits].max_page_size — the per-request bulk cap is now driven by
+    // the operator-resolved `app.max_page_size`, NOT the compiled
+    // `MAX_BULK_SIZE` constant. Pin that a daemon configured with a
+    // SMALL cap rejects a batch the default 1000-cap would have accepted,
+    // proving the wiring reads the field rather than the constant.
+    const SMALL_CAP: usize = 3;
+    let mut state = test_app_state(test_state());
+    state.max_page_size = SMALL_CAP;
+    let app = Router::new()
+        .route("/api/v1/memories/bulk", axum_post(bulk_create))
+        .with_state(state);
+
+    // SMALL_CAP + 1 bodies — over the configured cap, under the compiled
+    // default. A daemon still keyed on MAX_BULK_SIZE would 200 this.
+    let bodies: Vec<serde_json::Value> = (0..=SMALL_CAP)
+        .map(|i| {
+            serde_json::json!({
+                "title": format!("m{i}"),
+                "content": "x",
+                "namespace": "cap-test",
+            })
+        })
+        .collect();
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/memories/bulk")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .body(Body::from(serde_json::to_vec(&bodies).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "bulk_create must reject a batch above the operator-resolved max_page_size"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&SMALL_CAP.to_string()),
+        "error message must echo the configured cap, got {v:?}"
+    );
 }
 
 #[tokio::test]
@@ -9676,6 +9732,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: crate::handlers::MAX_BULK_SIZE,
     }
 }
 

@@ -231,6 +231,63 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Multi-key sibling of [`EnvVarGuard`] that acquires `ENV_LOCK` exactly
+/// **once** for a batch of env mutations, then restores every key on drop.
+///
+/// `ENV_LOCK` is a plain non-reentrant `std::sync::Mutex`, and each
+/// [`EnvVarGuard`] holds the `MutexGuard` for its whole lifetime. Holding
+/// two single-key guards simultaneously on one thread therefore
+/// **self-deadlocks**: the second `EnvVarGuard::set`/`remove` blocks on a
+/// lock the same thread already owns. Tests that need several env vars set
+/// at the same instant (e.g. proving `resolve_limits` reads all four
+/// `AI_MEMORY_MAX_*` knobs together) must use this batch guard instead of
+/// stacking guards. Each tuple is `(key, Some(value) => set | None =>
+/// remove)`; prior values are snapshotted and restored in reverse order on
+/// drop.
+pub struct MultiEnvVarGuard {
+    restore: Vec<(&'static str, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl MultiEnvVarGuard {
+    /// Acquire `ENV_LOCK` once, apply every mutation, return a guard that
+    /// restores all prior values on drop.
+    pub fn apply(mutations: &[(&'static str, Option<&str>)]) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut restore = Vec::with_capacity(mutations.len());
+        for (key, value) in mutations {
+            restore.push((*key, std::env::var(key).ok()));
+            // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self {
+            restore,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for MultiEnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is serialized by `ENV_LOCK` held in `_lock`.
+        for (key, prev) in self.restore.iter().rev() {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 /// Generate a fresh test keypair and install its verifying key in the
 /// `AI_MEMORY_OPERATOR_PUBKEY` env var so production
 /// `resolve_operator_pubkey()` returns this key (bypasses the host's

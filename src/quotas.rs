@@ -83,6 +83,57 @@ pub const DEFAULT_MAX_STORAGE_BYTES: i64 = 100 * 1024 * 1024;
 /// shape as the memory ceiling; reset to 0 at UTC midnight.
 pub const DEFAULT_MAX_LINKS_PER_DAY: i64 = 5000;
 
+/// Operator-resolved quota defaults stamped at quota-row auto-insert.
+///
+/// The three quota ceilings live per-row in `agent_quotas`, but a row
+/// only materialises on first use — at which point [`ensure_row`] stamps
+/// these values. Pre-this-change the stamp used the compiled
+/// `DEFAULT_MAX_*` constants directly, so the only way to raise a cap was
+/// an out-of-band `UPDATE`. Now the daemon installs operator-resolved
+/// values (from `[limits]` / `AI_MEMORY_MAX_*`) at boot via
+/// [`set_quota_defaults`], and every fresh row inherits the operator's
+/// configured ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaDefaults {
+    /// Per-(agent, namespace) daily memory-write ceiling.
+    pub max_memories_per_day: i64,
+    /// Per-(agent, namespace) lifetime storage cap in bytes.
+    pub max_storage_bytes: i64,
+    /// Per-(agent, namespace) daily link-creation ceiling.
+    pub max_links_per_day: i64,
+}
+
+impl Default for QuotaDefaults {
+    /// The compiled fallback — used in CLI / unit-test contexts where
+    /// the daemon never installed operator overrides.
+    fn default() -> Self {
+        Self {
+            max_memories_per_day: DEFAULT_MAX_MEMORIES_PER_DAY,
+            max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
+            max_links_per_day: DEFAULT_MAX_LINKS_PER_DAY,
+        }
+    }
+}
+
+static QUOTA_DEFAULTS: std::sync::OnceLock<QuotaDefaults> = std::sync::OnceLock::new();
+
+/// Install the operator-resolved quota defaults. Idempotent — the first
+/// successful set wins (subsequent calls are ignored), matching the
+/// once-at-boot lifecycle. Called from `daemon_runtime::run` so serve,
+/// MCP, and CLI write paths all stamp the same operator-configured
+/// ceilings.
+pub fn set_quota_defaults(defaults: QuotaDefaults) {
+    let _ = QUOTA_DEFAULTS.set(defaults);
+}
+
+/// Resolved quota defaults for the auto-insert path. Falls back to
+/// [`QuotaDefaults::default`] (the compiled `DEFAULT_MAX_*` constants)
+/// when the daemon never installed operator overrides.
+#[must_use]
+pub fn quota_defaults() -> QuotaDefaults {
+    QUOTA_DEFAULTS.get().copied().unwrap_or_default()
+}
+
 /// Which write operation to charge against the agent's quota.
 ///
 /// Variants:
@@ -201,6 +252,7 @@ fn ensure_row(conn: &Connection, agent_id: &str, namespace: &str) -> Result<Quot
     }
     let now = chrono::Utc::now().to_rfc3339();
     let day = day_bucket(&now);
+    let defaults = quota_defaults();
     conn.execute(
         "INSERT OR IGNORE INTO agent_quotas
          (agent_id, namespace,
@@ -211,9 +263,9 @@ fn ensure_row(conn: &Connection, agent_id: &str, namespace: &str) -> Result<Quot
         params![
             agent_id,
             namespace,
-            DEFAULT_MAX_MEMORIES_PER_DAY,
-            DEFAULT_MAX_STORAGE_BYTES,
-            DEFAULT_MAX_LINKS_PER_DAY,
+            defaults.max_memories_per_day,
+            defaults.max_storage_bytes,
+            defaults.max_links_per_day,
             day,
             now,
         ],

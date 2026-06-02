@@ -28,11 +28,11 @@ use crate::models::{CreateMemory, ForgetQuery, ListQuery, Memory, SearchQuery};
 use crate::validate;
 
 use super::AppState;
+use super::BULK_FANOUT_CONCURRENCY;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{BULK_FANOUT_CONCURRENCY, MAX_BULK_SIZE};
 
 /// #951 (Track A QC sweep, 2026-05-20) — replaced the local
 /// duplicate of `is_visible_to_caller` with a re-export of the
@@ -105,7 +105,7 @@ pub async fn list_memories(
                 "list_memories on postgres: ?min_priority is unsupported on the SAL trait; ignored"
             );
         }
-        let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
+        let limit = p.limit.unwrap_or(20).min(app.max_page_size);
         let since = p
             .since
             .as_deref()
@@ -153,13 +153,14 @@ pub async fn list_memories(
     }
 
     let lock = app.db.lock().await;
-    // v0.6.2 (S40): raise ceiling from 200 → `MAX_BULK_SIZE` (1000) so bulk
+    // v0.6.2 (S40): raise ceiling from 200 → the operator-resolved
+    // `app.max_page_size` (compiled default `MAX_BULK_SIZE` = 1000) so bulk
     // fanout scenarios that POST 500+ rows to a leader can verify full
     // peer delivery via a single `GET /memories?limit=N` (previously the
     // list silently capped at 200 regardless of whether fanout worked).
     // Default remains 20 — only explicit `?limit=` callers see the
     // higher ceiling.
-    let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
+    let limit = p.limit.unwrap_or(20).min(app.max_page_size);
     match db::list(
         &lock.0,
         p.namespace.as_deref(),
@@ -240,7 +241,7 @@ pub async fn search_memories(
     // legacy `db::search` envelope.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
+        let limit = p.limit.unwrap_or(20).min(app.max_page_size);
         let since = p
             .since
             .as_deref()
@@ -312,7 +313,7 @@ pub async fn search_memories(
     let lock = app.db.lock().await;
     // v0.6.2 (S40): mirror the `list_memories` ceiling raise so search
     // over a bulk-populated namespace isn't also capped at 200.
-    let limit = p.limit.unwrap_or(20).min(MAX_BULK_SIZE);
+    let limit = p.limit.unwrap_or(20).min(app.max_page_size);
     // v0.7.0 Provenance Gap 6 (#889) — `?source_uri=X` reciprocal
     // filter. Composes with `?q=…`; when `q` is empty + `source_uri`
     // is set, routes through the index-only `list_by_source_uri`
@@ -502,10 +503,12 @@ pub async fn bulk_create(
     headers: HeaderMap,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
-    if bodies.len() > MAX_BULK_SIZE {
+    if bodies.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("bulk operations limited to {} items", MAX_BULK_SIZE)})),
+            Json(
+                json!({"error": format!("bulk operations limited to {} items", app.max_page_size)}),
+            ),
         )
             .into_response();
     }
