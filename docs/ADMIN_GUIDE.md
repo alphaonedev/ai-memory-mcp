@@ -943,6 +943,31 @@ registration itself landed earlier as Task 1.3.
 2. `X-Agent-Id` request header
 3. `anonymous:req-<uuid8>` (synthesized per-request, logged at WARN)
 
+### Read-path visibility caller (v0.7.0 #1468 / #1469)
+
+The precedence ladders above resolve the **write-path** identity that gets
+stamped into `metadata.agent_id`. The MCP **read** tools that enforce
+per-row `scope=private` ownership — `memory_session_start`, `memory_list`,
+`memory_search`, `memory_recall` — resolve their *visibility caller*
+through a **separate, narrower** ladder:
+
+1. `AI_MEMORY_AGENT_ID` environment variable (when set + shape-valid)
+2. `None` — trust-all, single-tenant read posture
+
+The pid-synthesized `ai:<client>@<host>:pid-<pid>` clientInfo identity is
+**deliberately NOT** used for the read-path visibility caller: it embeds
+the live PID, so it can never equal the `metadata.agent_id` an *earlier*
+process wrote, which would make every prior-session private row invisible
+to its own owner. When `AI_MEMORY_AGENT_ID` is set, the read tools drop
+cross-agent `scope=private` rows (rows owned by a different agent and not
+shared/targeted at the caller) before they reach the wire; collective and
+caller-owned rows always pass. When it is unset, the read path keeps the
+v0.6.x trust-all behavior and returns every matching row.
+
+Operators running a multi-tenant MCP host therefore MUST set
+`AI_MEMORY_AGENT_ID` per tenant to get private-row isolation on reads;
+leaving it unset is a single-tenant deployment choice, not a leak.
+
 ### Validation
 
 Server-side validator:

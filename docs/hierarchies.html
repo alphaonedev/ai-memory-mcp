@@ -308,6 +308,23 @@ footer a{color:var(--text-muted)}
 <span class="ok">→ sees: scope=unit where namespace prefix matches "alphaone/eng/platform"</span>
 <span class="ok">→ sees: scope=org where namespace prefix matches "alphaone"</span>
 <span class="ok">→ sees: scope=private only when metadata.agent_id == "bob"</span></div>
+    <p style="margin-top:1.25rem;font-size:.9rem;color:var(--text-muted)">
+      <strong>How the daemon knows the caller on MCP reads (v0.7.0 #1468 / #1469).</strong>
+      The <code>private</code> ring above is enforced per row by an
+      <em>ownership</em> filter that is separate from <code>as_agent</code>
+      namespace position. On the MCP read tools — <code>memory_session_start</code>,
+      <code>memory_list</code>, <code>memory_search</code>,
+      <code>memory_recall</code> — the daemon resolves the comparison identity
+      from the <code>AI_MEMORY_AGENT_ID</code> environment variable (not the
+      pid-synthesized <code>clientInfo</code> id, which embeds a live PID and
+      could never match a prior process's <code>metadata.agent_id</code>). When
+      <code>AI_MEMORY_AGENT_ID</code> is set, a <code>private</code> /
+      no-scope row owned by a <em>different</em> agent is dropped before the
+      response is serialized; when it is unset, the read path is trust-all
+      (single-tenant) and returns every matching row. Set
+      <code>AI_MEMORY_AGENT_ID</code> per agent to make the <code>private</code>
+      ring load-bearing on a shared MCP host.
+    </p>
   </div>
 </section>
 

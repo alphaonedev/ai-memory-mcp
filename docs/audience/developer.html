@@ -197,6 +197,9 @@ ai-memory serve</code></pre>
 
   <p>The HTTP daemon is multi-tenant and skips the process-level default: it reads <code>agent_id</code> from the request body, then <code>X-Agent-Id</code>, then assigns <code>anonymous:req-&lt;uuid8&gt;</code> and logs WARN.</p>
 
+  <h3>Read-path visibility caller (#1468 / #1469)</h3>
+  <p>The ladder above resolves the <em>write</em> identity. The MCP read tools that enforce per-row <code>scope=private</code> ownership &mdash; <code>memory_session_start</code>, <code>memory_list</code>, <code>memory_search</code>, <code>memory_recall</code> &mdash; resolve their <em>visibility caller</em> from <code>AI_MEMORY_AGENT_ID</code> only (else <code>None</code>, trust-all). The pid-synthesized <code>clientInfo</code> id is deliberately not used: it embeds the live PID and could never match the <code>metadata.agent_id</code> an earlier process wrote, which would hide every prior-session private row from its owner. Set <code>AI_MEMORY_AGENT_ID</code> to drop cross-agent private rows from read results; leave it unset for single-tenant trust-all reads.</p>
+
   <div class="callout"><strong>Validation regex:</strong> <code>^[A-Za-z0-9_\-:@./]{1,128}$</code>. Permits prefixed forms (<code>ai:</code>, <code>host:</code>), <code>@</code> scope separator, <code>/</code> for future SPIFFE-style ids. Rejects whitespace, null bytes, control chars, shell metacharacters.</div>
 
   <p>Full reference (immutability invariants, special metadata keys, defaults-that-leak warnings): <a href="../agent-identity.html">agent-identity.html</a>.</p>

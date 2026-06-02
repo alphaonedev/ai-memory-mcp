@@ -108,6 +108,7 @@ Store a new memory. Deduplicates by title+namespace -- if a memory with the same
 | `priority` | integer (1-10) | No | `5` | Priority ranking |
 | `confidence` | number (0.0-1.0) | No | `1.0` | Certainty level |
 | `source` | string | No | `"claude"` | Origin: `"user"`, `"claude"`, `"hook"`, `"api"`, `"cli"`, `"import"`, `"consolidation"`, `"system"` |
+| `kind` | string | No | `"observation"` | Memory kind. Omit for the `observation` default; a supplied value MUST be one of the canonical variants (`observation`, `reflection`, `persona`, `concept`, `entity`, `claim`, `relation`, `event`, `conversation`, `decision`) or the write is rejected (#1467). See `docs/memory-kind-vocab.md`. |
 
 **Example request:**
 
@@ -1303,6 +1304,24 @@ For the **HTTP API**, the precedence within a single request is:
 1. `agent_id` field in the POST/PUT JSON body
 2. `X-Agent-Id` request header
 3. Per-request synthesized `anonymous:req-<uuid8>` (logged at WARN)
+
+### Read-path private-row visibility (#1468 / #1469)
+
+The precedence above resolves the **write** identity stamped into
+`metadata.agent_id`. Reads that enforce per-row `scope=private` ownership
+work differently. The MCP tools `memory_session_start`, `memory_list`,
+`memory_search`, and `memory_recall` resolve a *visibility caller* from
+`AI_MEMORY_AGENT_ID` only (or `None` when it is unset) — never from the
+pid-synthesized clientInfo id, because that id embeds the live PID and
+could never match the `metadata.agent_id` an earlier process wrote.
+
+When `AI_MEMORY_AGENT_ID` is set, these tools drop rows owned by a
+*different* agent and marked `scope=private` (or with no scope key, which
+defaults to private) before returning results; rows you own and rows
+marked `scope=collective` always pass. When it is unset, the read path is
+trust-all (single-tenant) and returns every matching row. Set
+`AI_MEMORY_AGENT_ID` per agent to keep another agent's private memories
+out of your `list` / `search` / `recall` results.
 
 ### Format rules
 

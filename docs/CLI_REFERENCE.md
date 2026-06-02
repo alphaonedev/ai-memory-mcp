@@ -742,6 +742,16 @@ For production deployments, always set `--agent-id` or
 `AI_MEMORY_AGENT_ID` to an opaque identity. The default fallback
 leaks hostname + PID.
 
+The ladder above is the **write-path** identity stamped into
+`metadata.agent_id`. The MCP read tools that enforce per-row
+`scope=private` ownership (`memory_session_start`, `memory_list`,
+`memory_search`, `memory_recall`) resolve their *visibility caller*
+separately: `AI_MEMORY_AGENT_ID` if set, else `None` (trust-all). The
+pid-synthesized clientInfo id is **not** used there — it embeds the live
+PID and could never match a prior process's `metadata.agent_id`. Set
+`AI_MEMORY_AGENT_ID` to filter cross-agent private rows out of read
+results (#1468 / #1469); leave it unset for single-tenant trust-all reads.
+
 ## Tiers & TTL at a glance
 
 | Tier | TTL | Typical use |

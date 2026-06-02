@@ -210,6 +210,14 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
       <li><code>X-Agent-Id</code> request header</li>
       <li>Per-request <code>anonymous:req-&lt;uuid8&gt;</code> (logged at WARN)</li>
     </ol>
+
+    <h3>Read-path visibility caller (v0.7.0 #1468 / #1469)</h3>
+    <p>The ladders above resolve the <em>write</em> identity stamped into <code>metadata.agent_id</code>. The MCP read tools that enforce per-row <code>scope=private</code> ownership — <code>memory_session_start</code>, <code>memory_list</code>, <code>memory_search</code>, <code>memory_recall</code> — resolve their <em>visibility caller</em> through a separate, narrower ladder:</p>
+    <ol>
+      <li><code>AI_MEMORY_AGENT_ID</code> environment variable (when set + shape-valid)</li>
+      <li><code>None</code> — trust-all, single-tenant read posture</li>
+    </ol>
+    <p>The pid-synthesized <code>ai:&lt;client&gt;@&lt;host&gt;:pid-&lt;pid&gt;</code> clientInfo id is <strong>deliberately not</strong> used here: it embeds the live PID, so it could never equal the <code>metadata.agent_id</code> an <em>earlier</em> process wrote, which would hide every prior-session private row from its own owner. When <code>AI_MEMORY_AGENT_ID</code> is set, the read tools drop cross-agent <code>scope=private</code> rows (owned by a different agent, not shared/targeted at the caller) before they reach the wire; collective and caller-owned rows always pass. When unset, the read path keeps the trust-all single-tenant behavior. Multi-tenant MCP hosts must set <code>AI_MEMORY_AGENT_ID</code> per tenant to get private-row isolation on reads.</p>
   </div>
 </section>
 
