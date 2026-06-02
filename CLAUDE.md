@@ -586,6 +586,22 @@ sync, and consolidate. Preservation is enforced at both caller layer
 **Filter by agent_id:** `list` and `search` accept `--agent-id <id>` (CLI), the
 `agent_id` property (MCP tool), or `?agent_id=<id>` (HTTP query param).
 
+**Read-path visibility caller (v0.7.0 #1468 / #1469).** The ladders above
+resolve the *write* identity stamped into `metadata.agent_id`. The MCP read
+tools that enforce per-row `scope=private` ownership — `memory_session_start`,
+`memory_list`, `memory_search`, `memory_recall` — resolve their *visibility
+caller* through a separate, narrower ladder (`crate::identity::resolve_read_visibility_caller`):
+`AI_MEMORY_AGENT_ID` if set + shape-valid, else `None` (trust-all). The
+pid-synthesized `ai:<client>@<host>:pid-<pid>` clientInfo id is deliberately
+NOT used here — it embeds the live PID, so it could never equal the
+`metadata.agent_id` an earlier process wrote, which would hide every
+prior-session private row from its own owner (#1469). When the caller is
+`Some`, rows owned by a different agent and marked `scope=private` (or with no
+scope key, which defaults to private) are dropped via
+`crate::visibility::is_visible_to_caller` before serialization (#1468);
+collective and caller-owned rows always pass. `None` preserves single-tenant
+trust-all reads.
+
 **Special metadata keys produced by the system** (do not overwrite):
 
 - `imported_from_agent_id` — original claim preserved when `ai-memory import`

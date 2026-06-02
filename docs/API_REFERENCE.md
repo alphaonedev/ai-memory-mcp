@@ -198,6 +198,14 @@ last GC).
 `expires_at` instead (also accepted on this HTTP endpoint). See the
 HTTP ↔ MCP parameter coverage table at the bottom of this document.
 
+An optional `kind` field is also accepted. Omitting it keeps the
+`observation` default; a supplied value MUST be one of the canonical
+variants (`observation`, `reflection`, `persona`, `concept`, `entity`,
+`claim`, `relation`, `event`, `conversation`, `decision`) or the request
+is rejected with **400** (#1467 — this endpoint previously coerced an
+unknown `kind` to `observation`; it now rejects to match the CLI and MCP
+surfaces). See `docs/memory-kind-vocab.md`.
+
 #### Agent attestation (`signature` + `created_at`) — #626 Layer-3
 
 A caller MAY present a detached Ed25519 `signature` to upgrade the write

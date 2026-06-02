@@ -38,6 +38,27 @@ schema version stays at v37 / v18 respectively. Backward compat:
   to `Observation` — the wire shape stays compatible across version
   drift.
 
+The fallbacks above are **read-path** only (`row_to_memory` widening a
+stored/unknown value). They do NOT apply to the **write path**.
+
+## Write-path validation (#1467)
+
+On every write surface — CLI `store`, MCP `memory_store`, and HTTP
+`POST /api/v1/memories` — a supplied `kind` is validated before the row
+is created:
+
+* Omitting `kind` (absent / `null`) keeps the default `Observation`.
+* A non-empty `kind` MUST be an exact match for one of the canonical
+  lowercase variants in the table above; anything else (unknown token,
+  wrong case, whitespace) is **rejected** with
+  `invalid kind '<value>' (expected one of: …)`.
+
+Prior to #1467 the MCP and HTTP surfaces silently coerced an
+unknown/invalid `kind` to `observation` while the CLI rejected it; all
+three surfaces now reject consistently, so a typo'd kind never lands a
+misclassified row. The canonical accepted set is `MemoryKind::all()`
+(the error message is generated from it, never a hardcoded list).
+
 ## Recall filter
 
 The new `kinds` parameter on `memory_recall` (MCP), `?kinds=…` (HTTP
