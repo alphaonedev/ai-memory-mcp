@@ -58,9 +58,7 @@ use super::{
     VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
-use crate::quotas::{
-    DEFAULT_MAX_LINKS_PER_DAY, DEFAULT_MAX_MEMORIES_PER_DAY, DEFAULT_MAX_STORAGE_BYTES, QuotaStatus,
-};
+use crate::quotas::{QuotaStatus, quota_defaults};
 
 /// Bootstrap schema run at adapter init — idempotent via IF NOT EXISTS.
 const INIT_SCHEMA: &str = include_str!("postgres_schema.sql");
@@ -7346,9 +7344,9 @@ async fn record_memory_quota_in_tx(
     )
     .bind(agent_id)
     .bind(namespace)
-    .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
-    .bind(DEFAULT_MAX_STORAGE_BYTES)
-    .bind(DEFAULT_MAX_LINKS_PER_DAY)
+    .bind(quota_defaults().max_memories_per_day)
+    .bind(quota_defaults().max_storage_bytes)
+    .bind(quota_defaults().max_links_per_day)
     .bind(bytes_added)
     .bind(now)
     .execute(&mut **tx)
@@ -10812,9 +10810,9 @@ impl MemoryStore for PostgresStore {
         )
         .bind(agent_id)
         .bind(crate::quotas::GLOBAL_NAMESPACE)
-        .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
-        .bind(DEFAULT_MAX_STORAGE_BYTES)
-        .bind(DEFAULT_MAX_LINKS_PER_DAY)
+        .bind(quota_defaults().max_memories_per_day)
+        .bind(quota_defaults().max_storage_bytes)
+        .bind(quota_defaults().max_links_per_day)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -10860,9 +10858,9 @@ impl MemoryStore for PostgresStore {
         )
         .bind(agent_id)
         .bind(namespace)
-        .bind(DEFAULT_MAX_MEMORIES_PER_DAY)
-        .bind(DEFAULT_MAX_STORAGE_BYTES)
-        .bind(DEFAULT_MAX_LINKS_PER_DAY)
+        .bind(quota_defaults().max_memories_per_day)
+        .bind(quota_defaults().max_storage_bytes)
+        .bind(quota_defaults().max_links_per_day)
         .bind(now)
         .execute(&self.pool)
         .await

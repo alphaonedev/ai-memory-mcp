@@ -782,6 +782,21 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
         unsafe { std::env::set_var("AI_MEMORY_DB_PASSPHRASE", passphrase) };
     }
     let db_path = app_config.effective_db(&cli.db);
+    // Seed the process-wide per-agent quota defaults from the resolved
+    // `[limits]` config (env `AI_MEMORY_MAX_*` > `[limits]` > compiled
+    // default). `ensure_row` / the Postgres quota-row auto-inserts read
+    // these when stamping a fresh `agent_quotas` row, so every
+    // subcommand path (serve / mcp / CLI writes) charges the same
+    // operator-tuned daily caps. Idempotent — first writer wins; later
+    // calls are no-ops.
+    {
+        let limits = app_config.resolve_limits();
+        crate::quotas::set_quota_defaults(crate::quotas::QuotaDefaults {
+            max_memories_per_day: limits.max_memories_per_day,
+            max_storage_bytes: limits.max_storage_bytes,
+            max_links_per_day: limits.max_links_per_day,
+        });
+    }
     let j = cli.json;
     let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)
@@ -3793,6 +3808,12 @@ pub async fn bootstrap_serve(
         // default precedence and the resulting triple is process-stable.
         resolved_models: Arc::new(app_config.resolve_models()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
+        // Operator-resolved `[limits].max_page_size` (env
+        // `AI_MEMORY_MAX_PAGE_SIZE`) — per-request page / bulk
+        // materialization bound for list / search / bulk-create /
+        // federation-sync handlers. Falls back to the compiled
+        // `MAX_BULK_SIZE` default when unset.
+        max_page_size: app_config.resolve_limits().max_page_size,
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -4793,6 +4814,7 @@ mod tests {
             rule_cache: Arc::new(crate::governance::rule_cache::RuleCache::new()),
             resolved_models: Arc::new(crate::config::ResolvedModels::default()),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: crate::handlers::MAX_BULK_SIZE,
         }
     }
 

@@ -19,7 +19,6 @@ use crate::models::{Memory, MemoryLink};
 use crate::validate;
 
 use super::AppState;
-use super::MAX_BULK_SIZE;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
 #[cfg(feature = "sal")]
@@ -424,82 +423,82 @@ pub async fn sync_push(
     // Cap memories per push, matching the bulk-create limit. Without
     // this a malicious peer with a valid mTLS cert could flood the
     // receiver and bottleneck the shared SQLite Mutex (red-team #242).
-    if body.memories.len() > MAX_BULK_SIZE {
+    if body.memories.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("sync_push limited to {} memories per request", MAX_BULK_SIZE)
+                "error": format!("sync_push limited to {} memories per request", app.max_page_size)
             })),
         )
             .into_response();
     }
-    if body.deletions.len() > MAX_BULK_SIZE {
+    if body.deletions.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("sync_push limited to {} deletions per request", MAX_BULK_SIZE)
+                "error": format!("sync_push limited to {} deletions per request", app.max_page_size)
             })),
         )
             .into_response();
     }
-    if body.archives.len() > MAX_BULK_SIZE {
+    if body.archives.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("sync_push limited to {} archives per request", MAX_BULK_SIZE)
+                "error": format!("sync_push limited to {} archives per request", app.max_page_size)
             })),
         )
             .into_response();
     }
-    if body.restores.len() > MAX_BULK_SIZE {
+    if body.restores.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("sync_push limited to {} restores per request", MAX_BULK_SIZE)
+                "error": format!("sync_push limited to {} restores per request", app.max_page_size)
             })),
         )
             .into_response();
     }
-    if body.pendings.len() > MAX_BULK_SIZE {
+    if body.pendings.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("sync_push limited to {} pendings per request", MAX_BULK_SIZE)
+                "error": format!("sync_push limited to {} pendings per request", app.max_page_size)
             })),
         )
             .into_response();
     }
-    if body.pending_decisions.len() > MAX_BULK_SIZE {
+    if body.pending_decisions.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!(
                     "sync_push limited to {} pending_decisions per request",
-                    MAX_BULK_SIZE
+                    app.max_page_size
                 )
             })),
         )
             .into_response();
     }
-    if body.namespace_meta.len() > MAX_BULK_SIZE {
+    if body.namespace_meta.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!(
                     "sync_push limited to {} namespace_meta per request",
-                    MAX_BULK_SIZE
+                    app.max_page_size
                 )
             })),
         )
             .into_response();
     }
-    if body.namespace_meta_clears.len() > MAX_BULK_SIZE {
+    if body.namespace_meta_clears.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!(
                     "sync_push limited to {} namespace_meta_clears per request",
-                    MAX_BULK_SIZE
+                    app.max_page_size
                 )
             })),
         )

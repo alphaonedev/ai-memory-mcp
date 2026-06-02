@@ -391,6 +391,7 @@ mod cov897_tests {
             rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
             resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: crate::handlers::MAX_BULK_SIZE,
         };
         (app, tmp)
     }

@@ -179,6 +179,7 @@ fn make_test_state() -> (AppState, std::path::PathBuf) {
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
     };
 
     // Leak the tempdir so the scratch files outlive the test (otherwise

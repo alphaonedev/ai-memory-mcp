@@ -373,6 +373,19 @@ pub struct AppState {
     /// `crate::encryption::get_or_create_keypair`) delegates to the
     /// same `RuntimeContext::global()` singleton.
     pub runtime: Arc<crate::runtime_context::RuntimeContext>,
+
+    /// Operator-resolved per-request page-size / bulk-materialization cap
+    /// (the `[limits].max_page_size` knob, env `AI_MEMORY_MAX_PAGE_SIZE`).
+    /// Bounds how many rows a single list / search response page and a
+    /// single bulk-create / federation-sync request may materialize in
+    /// memory at once — it is NOT a rate limit. Resolved once at
+    /// `bootstrap_serve` from [`crate::config::AppConfig::resolve_limits`];
+    /// falls back to the compiled [`MAX_BULK_SIZE`] default when unset.
+    /// Operators with genuinely large per-request payloads raise this
+    /// knob, but the correct tool for large datasets is pagination
+    /// (`offset` / `since`), not an unbounded page size — a single
+    /// unbounded request would materialize the whole result set in RAM.
+    pub max_page_size: usize,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each
@@ -510,7 +523,17 @@ impl FromRef<AppState> for Db {
     }
 }
 
-pub(crate) const MAX_BULK_SIZE: usize = 1000;
+/// Compiled-default per-request page / bulk-materialization cap.
+///
+/// This is the fallback value for the operator-tunable
+/// [`AppState::max_page_size`] knob (`[limits].max_page_size` /
+/// `AI_MEMORY_MAX_PAGE_SIZE`). It bounds how many rows a single
+/// list / search page and a single bulk-create / federation-sync
+/// request may materialize in memory at once — it is NOT a rate
+/// limit. Exposed `pub` so integration-test `AppState` scaffolds
+/// can seed `max_page_size` from the same named constant instead of
+/// a magic literal.
+pub const MAX_BULK_SIZE: usize = 1000;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 Round-2 F9 — JSON body extractor that returns 400 (not axum's

@@ -2858,6 +2858,18 @@ pub struct AppConfig {
     /// fields). The `db` path stays top-level per the I4 carve-out in
     /// #1146 (path expansion semantics pinned by #507).
     pub storage: Option<StorageSection>,
+
+    /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
+    /// Carries the per-(agent, namespace) daily memory-write quota, the
+    /// lifetime storage cap, the daily link-creation quota, and the
+    /// list/bulk request page-size cap. Resolved via
+    /// [`AppConfig::resolve_limits`]; the resolver applies the uniform
+    /// precedence ladder (`AI_MEMORY_MAX_*` env > `[limits]` section >
+    /// compiled default). Defaults are deliberately generous so the
+    /// substrate is invisible to small-scale operators; operators with
+    /// high event-rate workloads raise them per-deployment without
+    /// recompiling. See [`LimitsSection`].
+    pub limits: Option<LimitsSection>,
 }
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
@@ -2914,6 +2926,7 @@ impl std::fmt::Debug for AppConfig {
             .field("embeddings", &self.embeddings)
             .field("reranker", &self.reranker)
             .field("storage", &self.storage)
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -3278,6 +3291,49 @@ pub struct StorageSection {
     pub max_memory_mb: Option<usize>,
 }
 
+/// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
+///
+/// Wire format:
+/// ```toml
+/// [limits]
+/// max_memories_per_day = 10000000   # per-(agent, namespace) daily write quota
+/// max_storage_bytes    = 1073741824 # per-(agent, namespace) lifetime byte cap
+/// max_links_per_day    = 5000       # per-(agent, namespace) daily link quota
+/// max_page_size        = 1000       # list/bulk request page-size ceiling
+/// ```
+///
+/// Every field is optional; an omitted (or non-positive) value falls
+/// through to the compiled default (`crate::quotas::DEFAULT_MAX_*` for
+/// the three quota knobs, [`crate::handlers::MAX_BULK_SIZE`] for the
+/// page-size cap). Resolved via [`AppConfig::resolve_limits`], which
+/// also honours the `AI_MEMORY_MAX_*` env overrides at higher
+/// precedence than the section.
+///
+/// **Operator guidance for `max_page_size`.** This bounds the number of
+/// rows materialised into a single HTTP list response AND the number of
+/// items accepted in a single bulk / federation-sync request. It is a
+/// per-request in-memory bound, NOT a rate limit: a single request that
+/// asks for (or carries) millions of rows allocates them all at once.
+/// Raise it for bulk verification of a known-small corpus; for
+/// genuinely large datasets paginate with `?offset=` / `?since=` rather
+/// than removing the bound.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LimitsSection {
+    /// Per-(agent, namespace) daily memory-write ceiling stamped at
+    /// quota-row auto-insert. Folds nothing legacy; new at v0.7.x.
+    pub max_memories_per_day: Option<i64>,
+
+    /// Per-(agent, namespace) lifetime storage cap in bytes.
+    pub max_storage_bytes: Option<i64>,
+
+    /// Per-(agent, namespace) daily link-creation ceiling.
+    pub max_links_per_day: Option<i64>,
+
+    /// Maximum items returned in a single list response / accepted in a
+    /// single bulk or federation-sync request.
+    pub max_page_size: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Resolved-config shapes (#1146)
 //
@@ -3505,6 +3561,33 @@ pub struct ResolvedStorage {
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
+
+/// Canonical resolved operator-tunable capacity limits. Produced by
+/// [`AppConfig::resolve_limits`]. Consumed at daemon boot to install the
+/// quota-row auto-insert defaults (`crate::quotas::set_quota_defaults`)
+/// and the HTTP list/bulk page-size cap (`AppState::max_page_size`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLimits {
+    /// Per-(agent, namespace) daily memory-write ceiling.
+    pub max_memories_per_day: i64,
+    /// Per-(agent, namespace) lifetime storage cap in bytes.
+    pub max_storage_bytes: i64,
+    /// Per-(agent, namespace) daily link-creation ceiling.
+    pub max_links_per_day: i64,
+    /// Maximum items per list response / bulk-or-sync request.
+    pub max_page_size: usize,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+/// Env override for `[limits].max_memories_per_day`.
+pub const ENV_MAX_MEMORIES_PER_DAY: &str = "AI_MEMORY_MAX_MEMORIES_PER_DAY";
+/// Env override for `[limits].max_storage_bytes`.
+pub const ENV_MAX_STORAGE_BYTES: &str = "AI_MEMORY_MAX_STORAGE_BYTES";
+/// Env override for `[limits].max_links_per_day`.
+pub const ENV_MAX_LINKS_PER_DAY: &str = "AI_MEMORY_MAX_LINKS_PER_DAY";
+/// Env override for `[limits].max_page_size`.
+pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
 
 /// v0.7.x (issue #1168) — bundle the three model-resolver outputs into
 /// a single triple consumed by the capabilities surface. Lets callers
@@ -5364,6 +5447,7 @@ impl AppConfig {
             "embeddings",
             "reranker",
             "storage",
+            "limits",
         ];
 
         let value: toml::Value = match toml::from_str(contents) {
@@ -5987,6 +6071,82 @@ impl AppConfig {
             archive_on_gc,
             archive_max_days,
             max_memory_mb,
+            source,
+        }
+    }
+
+    /// v0.7.x — resolve the operator-tunable capacity limits.
+    ///
+    /// Precedence ladder per field (highest wins):
+    /// `AI_MEMORY_MAX_*` env > `[limits]` section > compiled default.
+    /// Non-positive values (≤ 0) at any layer are treated as "unset" so
+    /// a stray `0` never silently disables writes — the next layer down
+    /// is consulted instead. The compiled defaults are the named
+    /// `crate::quotas::DEFAULT_MAX_*` constants and
+    /// [`crate::handlers::MAX_BULK_SIZE`]; no numeric literals live in
+    /// this resolver.
+    #[must_use]
+    pub fn resolve_limits(&self) -> ResolvedLimits {
+        let cfg = self.limits.as_ref();
+
+        fn env_pos_i64(name: &str) -> Option<i64> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|n| *n > 0)
+        }
+        fn env_pos_usize(name: &str) -> Option<usize> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+        }
+
+        let mem_env = env_pos_i64(ENV_MAX_MEMORIES_PER_DAY);
+        let mem_cfg = cfg.and_then(|l| l.max_memories_per_day).filter(|n| *n > 0);
+        let max_memories_per_day = mem_env
+            .or(mem_cfg)
+            .unwrap_or(crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY);
+
+        let bytes_env = env_pos_i64(ENV_MAX_STORAGE_BYTES);
+        let bytes_cfg = cfg.and_then(|l| l.max_storage_bytes).filter(|n| *n > 0);
+        let max_storage_bytes = bytes_env
+            .or(bytes_cfg)
+            .unwrap_or(crate::quotas::DEFAULT_MAX_STORAGE_BYTES);
+
+        let links_env = env_pos_i64(ENV_MAX_LINKS_PER_DAY);
+        let links_cfg = cfg.and_then(|l| l.max_links_per_day).filter(|n| *n > 0);
+        let max_links_per_day = links_env
+            .or(links_cfg)
+            .unwrap_or(crate::quotas::DEFAULT_MAX_LINKS_PER_DAY);
+
+        let page_env = env_pos_usize(ENV_MAX_PAGE_SIZE);
+        let page_cfg = cfg.and_then(|l| l.max_page_size).filter(|n| *n > 0);
+        let max_page_size = page_env
+            .or(page_cfg)
+            .unwrap_or(crate::handlers::MAX_BULK_SIZE);
+
+        let source = if mem_env.is_some()
+            || bytes_env.is_some()
+            || links_env.is_some()
+            || page_env.is_some()
+        {
+            ConfigSource::Env
+        } else if mem_cfg.is_some()
+            || bytes_cfg.is_some()
+            || links_cfg.is_some()
+            || page_cfg.is_some()
+        {
+            ConfigSource::Config
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedLimits {
+            max_memories_per_day,
+            max_storage_bytes,
+            max_links_per_day,
+            max_page_size,
             source,
         }
     }
@@ -7294,6 +7454,7 @@ legacy_scoring = false
             embeddings: Some(EmbeddingsSection::default()),
             reranker: Some(RerankerSection::default()),
             storage: Some(StorageSection::default()),
+            limits: Some(LimitsSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -7345,6 +7506,7 @@ legacy_scoring = false
             "embeddings",
             "reranker",
             "storage",
+            "limits",
         ];
 
         for key in table.keys() {
@@ -7826,6 +7988,151 @@ legacy_scoring = false
                 std::env::remove_var(k);
             }
         }
+    }
+
+    fn scrub_limits_env() {
+        for k in [
+            ENV_MAX_MEMORIES_PER_DAY,
+            ENV_MAX_STORAGE_BYTES,
+            ENV_MAX_LINKS_PER_DAY,
+            ENV_MAX_PAGE_SIZE,
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_limits_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.max_memories_per_day,
+            crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY
+        );
+        assert_eq!(
+            r.max_storage_bytes,
+            crate::quotas::DEFAULT_MAX_STORAGE_BYTES
+        );
+        assert_eq!(
+            r.max_links_per_day,
+            crate::quotas::DEFAULT_MAX_LINKS_PER_DAY
+        );
+        assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+    }
+
+    #[test]
+    fn resolve_limits_config_section_when_no_env() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_memories_per_day: Some(5_000_000),
+            max_storage_bytes: Some(9_000_000_000),
+            max_links_per_day: Some(4_000_000),
+            max_page_size: Some(250_000),
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(r.max_memories_per_day, 5_000_000);
+        assert_eq!(r.max_storage_bytes, 9_000_000_000);
+        assert_eq!(r.max_links_per_day, 4_000_000);
+        assert_eq!(r.max_page_size, 250_000);
+        assert_eq!(r.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_limits_env_overrides_config_section() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_MAX_MEMORIES_PER_DAY, "7000000");
+            std::env::set_var(ENV_MAX_PAGE_SIZE, "123456");
+        }
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_memories_per_day: Some(5_000_000),
+            max_storage_bytes: Some(9_000_000_000),
+            max_links_per_day: Some(4_000_000),
+            max_page_size: Some(250_000),
+        });
+        let r = cfg.resolve_limits();
+        // env wins for the two it sets …
+        assert_eq!(r.max_memories_per_day, 7_000_000, "env beats config");
+        assert_eq!(r.max_page_size, 123_456, "env beats config");
+        // … and config still supplies the fields env left unset.
+        assert_eq!(r.max_storage_bytes, 9_000_000_000);
+        assert_eq!(r.max_links_per_day, 4_000_000);
+        assert_eq!(r.source, ConfigSource::Env);
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn resolve_limits_zero_and_garbage_env_fall_through() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_MAX_MEMORIES_PER_DAY, "0"); // non-positive → ignored
+            std::env::set_var(ENV_MAX_STORAGE_BYTES, "not-a-number"); // unparseable → ignored
+            std::env::set_var(ENV_MAX_PAGE_SIZE, "-5"); // negative → unparseable as usize → ignored
+        }
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        // every stray env value falls through to the compiled default.
+        assert_eq!(
+            r.max_memories_per_day,
+            crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY
+        );
+        assert_eq!(
+            r.max_storage_bytes,
+            crate::quotas::DEFAULT_MAX_STORAGE_BYTES
+        );
+        assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn resolve_limits_zero_config_value_falls_through_to_default() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_page_size: Some(0), // non-positive → ignored
+            ..LimitsSection::default()
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+    }
+
+    #[test]
+    fn resolve_limits_section_round_trips_through_toml() {
+        let toml = r#"
+schema_version = 2
+
+[limits]
+max_memories_per_day = 10000000
+max_storage_bytes = 50000000000
+max_links_per_day = 8000000
+max_page_size = 1000000
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse [limits] toml");
+        let l = cfg.limits.as_ref().expect("limits section present");
+        assert_eq!(l.max_memories_per_day, Some(10_000_000));
+        assert_eq!(l.max_storage_bytes, Some(50_000_000_000));
+        assert_eq!(l.max_links_per_day, Some(8_000_000));
+        assert_eq!(l.max_page_size, Some(1_000_000));
+        // env-free resolve picks up the config values verbatim.
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let r = cfg.resolve_limits();
+        assert_eq!(r.max_memories_per_day, 10_000_000);
+        assert_eq!(r.max_page_size, 1_000_000);
+        assert_eq!(r.source, ConfigSource::Config);
     }
 
     #[test]
