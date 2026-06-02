@@ -1,0 +1,196 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  EVIDENCE HUB — index of testing campaigns, baseline environments, and results.
+
+  Operator directive (2026-06-01): "document all testing - document baseline
+  test env - document all results - and document everything on a GitHub Pages
+  under evidence."
+
+  This hub indexes the per-campaign evidence trails. The FROZEN public-claims
+  numbers live one level up at /evidence.html (the canonical SSOT); this page
+  is the running record of HOW those numbers were established.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory · Evidence Hub — testing, baseline env, results</title>
+<meta name="description" content="Evidence hub for ai-memory v0.7.0: per-campaign testing records, baseline test environments, and full pass/fail results with commit SHAs and test-result lines. The running record behind the frozen public claims.">
+<meta name="theme-color" content="#0d1117">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/evidence/">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1100px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--p1);text-decoration:none}a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px;color:var(--p2)}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em}
+h2{font-size:1.6rem;margin:2rem 0 .5rem;font-family:var(--font-mono)}
+h3{font-size:1.05rem;margin:1.25rem 0 .35rem}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:1280px;margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
+.hero{padding:3.5rem 1.5rem 2rem;text-align:center;border-bottom:1px solid var(--border);background:radial-gradient(ellipse at center,rgba(110,231,255,.06),transparent 60%)}
+.hero h1{font-size:clamp(1.8rem,4vw,2.6rem);line-height:1.15;margin-bottom:.85rem}
+.hero .lead{color:var(--text-muted);max-width:780px;margin:0 auto;font-size:1rem}
+.badge{display:inline-block;background:rgba(110,231,255,.12);border:1px solid var(--p1);color:var(--p1);font-family:var(--font-mono);font-size:.75rem;padding:.3rem .8rem;border-radius:4px;letter-spacing:.05em;margin-bottom:1rem}
+section{padding:2.5rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
+.facts{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:.9rem;margin:1rem 0}
+.facts th{text-align:left;padding:.65rem .9rem;background:var(--bg-elev);color:var(--text);font-weight:600;border-bottom:1px solid var(--border-hl);font-size:.78rem;letter-spacing:.05em;text-transform:uppercase}
+.facts td{padding:.65rem .9rem;border-bottom:1px solid var(--border);vertical-align:top}
+.facts tr:hover td{background:var(--bg-card)}
+.facts .num{color:var(--good);font-weight:600;white-space:nowrap}
+.facts .src{color:var(--text-dim);font-size:.78rem}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-top:1rem}
+.ecard{background:var(--bg-card);border:1px solid var(--border);border-left:3px solid var(--p1);border-radius:6px;padding:1.1rem 1.25rem}
+.ecard.green{border-left-color:var(--good)}
+.ecard.pending{border-left-color:var(--gold)}
+.ecard h3{font-family:var(--font-mono);font-size:.98rem;margin-bottom:.4rem;color:var(--text)}
+.ecard .tag{display:inline-block;font-family:var(--font-mono);font-size:.68rem;padding:.15em .55em;border-radius:4px;margin-bottom:.55rem;letter-spacing:.05em;text-transform:uppercase}
+.ecard.green .tag{background:rgba(110,231,255,.12);color:var(--p1);border:1px solid #2a6571}
+.ecard.pending .tag{background:rgba(255,215,0,.12);color:var(--gold);border:1px solid #6a5e10}
+.ecard p{font-size:.88rem;margin-bottom:.5rem}
+.ecard a.more{font-family:var(--font-mono);font-size:.8rem}
+.callout{background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;font-size:.9rem;color:var(--text-muted)}
+footer{padding:2rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85rem}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a href="../" class="home-link">ai-memory</a>
+    <div class="right">
+      <a href="../evidence.html">Frozen Claims</a>
+      <a href="./" style="color:var(--text);font-weight:600">Evidence Hub</a>
+      <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+      <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+      <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <span class="badge">EVIDENCE HUB · v0.7.0 · live record</span>
+    <h1>How the numbers were established.</h1>
+    <p class="lead">
+      The <a href="../evidence.html">Frozen Claims</a> page is the single source of truth for ai-memory's public numbers.
+      This hub is the running record <em>behind</em> those numbers — every testing campaign, the exact baseline environment it ran on,
+      and the full pass/fail results with commit SHAs and verbatim test-result lines. Every entry follows the prime-directive audit
+      trail: discovery → tracker → fix → retest → re-check → close.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Reference baseline</span>
+    <h2>Baseline test environment (this node).</h2>
+    <p>Unless a campaign states otherwise, results on this hub were produced on the following baseline. Each campaign page restates its own environment for self-containment.</p>
+    <table class="facts">
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>Host</td><td class="num">FROSTYi.local — Apple Silicon (arm64)</td></tr>
+        <tr><td>OS</td><td class="num">macOS 26.5 (build 25F71) · Darwin 25.5.0</td></tr>
+        <tr><td>Toolchain</td><td class="num">rustc 1.96.0 (ac68faa20 2026-05-25) · cargo 1.96.0</td></tr>
+        <tr><td>Binary</td><td class="num">ai-memory v0.7.0</td></tr>
+        <tr><td>Schema version</td><td class="num">v54 (sqlite + postgres)</td></tr>
+        <tr><td>Feature tier</td><td class="num">autonomous</td></tr>
+        <tr><td>Embedder / Reranker</td><td class="num">nomic-embed-text-v1.5 / ms-marco-MiniLM-L-6-v2</td></tr>
+        <tr><td>LLM backend</td><td class="num">openrouter · google/gemma-4-26b-a4b-it</td></tr>
+        <tr><td>Branch</td><td class="num">release/v0.7.0</td></tr>
+        <tr><td>Test isolation</td><td class="num">AI_MEMORY_NO_CONFIG=1</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      The four QC gates run on every campaign: <code>cargo fmt --check</code> ·
+      <code>cargo clippy --all-targets -- -D warnings -D clippy::all -D clippy::pedantic</code> ·
+      <code>AI_MEMORY_NO_CONFIG=1 cargo test</code> · <code>cargo audit</code>.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Campaigns</span>
+    <h2>Testing campaigns &amp; closeouts.</h2>
+    <p>Each card links to the full markdown evidence trail in the repo. Green = fixed/retested/closed; Amber = in progress.</p>
+    <div class="card-grid">
+
+      <div class="ecard green">
+        <span class="tag">Closed · GREEN</span>
+        <h3>#1466 — TTL-leak immortal-rows fix</h3>
+        <p>Mid/short rows stored with <code>expires_at: None</code> never expired (2,921 leaked). Fixed at the write-path chokepoint + schema backfill on both backends. Four gates green; lib 5,105 / 0; audit clean; QUAL-10 green. Commit <code>91c032ce</code>.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/docs/v0.7.0/regression-runs/2026-06-01-1466-ttl-leak/README.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard green">
+        <span class="tag">Closed · GREEN</span>
+        <h3>#1182 Round 2 — A2A regression (reproducibility)</h3>
+        <p>Independent re-run off a second pristine rig wipe. Domain 1 (sqlite) 7,458 / 0 / 16; Domain 2 (pg+AGE) 8,494 / 0 / 37. Combined <strong>15,952 / 0</strong>, zero new defects — confirms #1182 reproducible.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/docs/v0.7.0/regression-runs/2026-06-01-round2/README.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard green">
+        <span class="tag">Closed · GREEN</span>
+        <h3>#1182 Round 1 — final-baseline regression</h3>
+        <p>NO-FAIL-MISSION off a pristine rig (<code>docker compose down -v</code>). Combined <strong>15,951 / 0</strong>. Four 1:1 findings filed→fixed→closed (#1444/#1445/#1446/#1447); three codegraph QC audits ZERO-DEFECTS.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/docs/v0.7.0/regression-runs/2026-05-31-final-baseline/README.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard pending">
+        <span class="tag">In progress</span>
+        <h3>DO A2A swarm campaign (T4)</h3>
+        <p>DigitalOcean swarm topology per the <a href="../architectures-t4.html">T4 architecture</a> — 4&nbsp;GB swarm nodes + an 8&nbsp;GB Postgres&nbsp;+&nbsp;Apache&nbsp;AGE node, $75 hard budget cap. Baseline env, per-scenario results, and every filed/fixed/closed finding will be published here as the campaign runs.</p>
+        <a class="more" href="#do-swarm">Status below →</a>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section id="do-swarm">
+  <div class="container">
+    <span class="eyebrow">Live campaign</span>
+    <h2>DO A2A swarm — T4 topology.</h2>
+    <p>
+      Scope: swarm testing only (no hive), per operator directive 2026-06-01. Node sizing: 4&nbsp;GB DigitalOcean droplets for the
+      swarm agents, an 8&nbsp;GB droplet for Postgres&nbsp;+&nbsp;Apache&nbsp;AGE. Hard budget cap: <strong>$75</strong>; droplets torn
+      down at campaign end to stop spend. Architecture reference:
+      <a href="../architectures-t4.html">architectures-t4.html</a>.
+    </p>
+    <table class="facts">
+      <thead><tr><th>Phase</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>Study T4 swarm architecture spec</td><td class="num">queued</td></tr>
+        <tr><td>Provision swarm (4 GB) + Postgres+AGE (8 GB)</td><td class="num">queued</td></tr>
+        <tr><td>Document baseline test env (droplet specs, versions)</td><td class="num">queued</td></tr>
+        <tr><td>Run A2A swarm scenarios</td><td class="num">queued</td></tr>
+        <tr><td>File → fix → retest → close every finding</td><td class="num">queued</td></tr>
+        <tr><td>Tear down droplets · final verdict</td><td class="num">queued</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      This section updates in place as the campaign runs. Every finding gets its own GitHub issue and its own audit trail
+      (issue ↔ ai-memory evidence ↔ commit SHA), per the testing-loop discipline.
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="../evidence.html">Frozen Claims</a> · <a href="../">home</a></p>
+</footer>
+
+</body>
+</html>
