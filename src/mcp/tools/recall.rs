@@ -192,8 +192,15 @@ pub async fn handle_recall_with_pre_recall_hook(
     chain: &crate::hooks::HookChain,
     registry: &mut crate::hooks::ExecutorRegistry,
     // v0.7.0 (issue #518) — recall scope defaults; forwarded
-    // unchanged to `handle_recall`.
+    // unchanged to `handle_recall_caller`.
     recall_scope: Option<&crate::config::RecallScope>,
+    // v0.7.0 #1468 — caller-scoped `scope=private` post-filter caller.
+    // Threaded through to `handle_recall_caller` so the pre-recall-hook
+    // entry point applies the SAME ownership gate as the plain dispatch
+    // path. `None` keeps the single-tenant trust-all read posture. This
+    // is wired now (rather than left as `None`) so wiring this surface
+    // into MCP dispatch later cannot silently bypass #1468.
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     // Resolve the (query, namespace, k) triple once so the hook
     // sees exactly what the recall would see.
@@ -252,7 +259,7 @@ pub async fn handle_recall_with_pre_recall_hook(
         }
     }
 
-    handle_recall(
+    handle_recall_caller(
         conn,
         &effective,
         embedder,
@@ -262,6 +269,7 @@ pub async fn handle_recall_with_pre_recall_hook(
         resolved_ttl,
         resolved_scoring,
         recall_scope,
+        caller,
     )
 }
 
@@ -630,6 +638,40 @@ pub fn handle_recall(
     resolved_scoring: &crate::config::ResolvedScoring,
     recall_scope: Option<&crate::config::RecallScope>,
 ) -> Result<Value, String> {
+    handle_recall_caller(
+        conn,
+        params,
+        embedder,
+        vector_index,
+        reranker,
+        archive_on_gc,
+        resolved_ttl,
+        resolved_scoring,
+        recall_scope,
+        None,
+    )
+}
+
+/// v0.7.0 #1468 — caller-scoped MCP recall entry. Identical to
+/// [`handle_recall`] but threads a visibility `caller` (resolved by the
+/// dispatch layer via
+/// [`crate::identity::resolve_read_visibility_caller`]) into
+/// [`handle_recall_dto`], which post-filters every retrieval branch by
+/// the canonical [`crate::visibility::is_visible_to_caller`] predicate.
+/// `None` preserves the single-tenant trust-all read posture.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_recall_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&BatchedReranker>,
+    archive_on_gc: bool,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    recall_scope: Option<&crate::config::RecallScope>,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let req = RecallRequest::from_mcp_params(params)?;
     handle_recall_dto(
         conn,
@@ -641,6 +683,7 @@ pub fn handle_recall(
         resolved_ttl,
         resolved_scoring,
         recall_scope,
+        caller,
     )
 }
 
@@ -668,6 +711,14 @@ pub fn handle_recall_dto(
     // is spliced into the request before the storage call. `None`
     // keeps v0.6.x recall semantics exactly.
     recall_scope: Option<&crate::config::RecallScope>,
+    // v0.7.0 #1468 — read-path visibility caller. The `db::recall*`
+    // family applies the #151 namespace-scope (`as_agent`) gate but NOT
+    // the per-row `scope=private` ownership predicate, so a cross-agent
+    // private row could otherwise reach the MCP wire. When `Some`, every
+    // retrieval branch drops rows the caller does not own via
+    // `crate::visibility::is_visible_to_caller`. `None` (single-tenant /
+    // no stable env identity) keeps the trust-all read posture.
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     // v0.7.0 Gap 7 (#890) — `verbose_provenance` defaults to true.
     // Pre-Gap-7 recall responses dropped per-row provenance scaffolding
@@ -717,6 +768,20 @@ pub fn handle_recall_dto(
             Some(target) => results
                 .into_iter()
                 .filter(|(m, _)| m.confidence_tier() == target)
+                .collect(),
+        }
+    };
+
+    // v0.7.0 #1468 — per-row ownership visibility filter. Applied at every
+    // retrieval branch immediately before serialization so a cross-agent
+    // `scope=private` row never reaches the wire. No-op when `caller` is
+    // `None` (single-tenant trust-all read posture).
+    let apply_visibility_filter = |results: Vec<(Memory, f64)>| -> Vec<(Memory, f64)> {
+        match caller {
+            None => results,
+            Some(c) => results
+                .into_iter()
+                .filter(|(m, _)| crate::visibility::is_visible_to_caller(m, c))
                 .collect(),
         }
     };
@@ -972,6 +1037,7 @@ pub fn handle_recall_dto(
                     let ce_reranked = ce.rerank(context, results);
                     let ce_reranked = apply_kinds_filter(ce_reranked, kinds_filter.as_deref());
                     let ce_reranked = apply_confidence_tier_filter(ce_reranked);
+                    let ce_reranked = apply_visibility_filter(ce_reranked);
                     // v0.7.0 (issue #518) — session recency boost.
                     let ce_reranked = crate::reranker::apply_session_recency_boost(
                         ce_reranked,
@@ -994,6 +1060,7 @@ pub fn handle_recall_dto(
 
                 let results = apply_kinds_filter(results, kinds_filter.as_deref());
                 let results = apply_confidence_tier_filter(results);
+                let results = apply_visibility_filter(results);
                 // v0.7.0 (issue #518) — session recency boost (no
                 // cross-encoder branch).
                 let results = crate::reranker::apply_session_recency_boost(
@@ -1051,6 +1118,7 @@ pub fn handle_recall_dto(
     );
     let results = apply_kinds_filter(results, kinds_filter.as_deref());
     let results = apply_confidence_tier_filter(results);
+    let results = apply_visibility_filter(results);
     // v0.7.0 (issue #518) — session recency boost on the keyword-only
     // fallback branch as well, so the contract is uniform regardless
     // of which retrieval mode produced the candidate set.
@@ -1192,6 +1260,108 @@ mod tests {
         .expect("ok");
         assert_eq!(resp["mode"].as_str(), Some("keyword"));
         assert_eq!(resp["meta"]["recall_mode"].as_str(), Some("keyword_only"));
+    }
+
+    // --- v0.7.0 #1468 — caller-scoped visibility on the recall path -------
+
+    fn owned_mem(title: &str, agent: &str, scope: Option<&str>) -> Memory {
+        let mut m = make_mem(title, "shared ownership keyword content", "vis");
+        m.metadata = match scope {
+            Some(s) => json!({crate::META_KEY_AGENT_ID: agent, crate::META_KEY_SCOPE: s}),
+            None => json!({crate::META_KEY_AGENT_ID: agent}),
+        };
+        m
+    }
+
+    fn seed_vis(conn: &rusqlite::Connection) {
+        use crate::models::namespace::MemoryScope;
+        db::insert(conn, &owned_mem("priv", "ai:alice", None)).expect("ins");
+        db::insert(
+            conn,
+            &owned_mem("shared", "ai:bob", Some(MemoryScope::Collective.as_str())),
+        )
+        .expect("ins");
+    }
+
+    fn recall_titles(resp: &Value) -> Vec<String> {
+        resp["memories"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["title"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // #1468 — caller=None preserves trust-all recall (single-tenant).
+    #[test]
+    fn recall_caller_none_returns_all() {
+        let conn = fresh_conn();
+        seed_vis(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall_caller(
+            &conn,
+            &json!({"context": "ownership", "namespace": "vis"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(2));
+    }
+
+    // #1468 — a non-owner caller never recalls another agent's private row.
+    #[test]
+    fn recall_non_owner_excludes_cross_agent_private() {
+        let conn = fresh_conn();
+        seed_vis(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall_caller(
+            &conn,
+            &json!({"context": "ownership", "namespace": "vis"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+            Some("ai:carol"),
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(1));
+        assert_eq!(recall_titles(&resp), vec!["shared".to_string()]);
+    }
+
+    // #1468 — the owning caller recalls its OWN private row plus shared.
+    #[test]
+    fn recall_owner_sees_own_private_and_shared() {
+        let conn = fresh_conn();
+        seed_vis(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall_caller(
+            &conn,
+            &json!({"context": "ownership", "namespace": "vis"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+            Some("ai:alice"),
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(2));
     }
 
     // A. happy path — hybrid (embedder=Some)
@@ -1589,6 +1759,7 @@ mod tests {
             &chain,
             &mut registry,
             None,
+            None,
         )
         .await
         .expect("ok");
@@ -1614,6 +1785,7 @@ mod tests {
             &scoring,
             &chain,
             &mut registry,
+            None,
             None,
         )
         .await

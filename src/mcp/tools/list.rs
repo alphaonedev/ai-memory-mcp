@@ -57,7 +57,19 @@ impl McpTool for ListTool {
     }
 }
 
-pub(super) fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+/// v0.7.0 #1468 — `db::list` applies NO visibility filter (it is a pure
+/// namespace/tier/agent_id query), so a cross-agent `scope=private` row
+/// would otherwise leak onto the MCP wire. When `caller` is `Some` (the
+/// MCP dispatch resolved a stable `AI_MEMORY_AGENT_ID` identity via
+/// [`crate::identity::resolve_read_visibility_caller`]) we drop every row
+/// the caller does not own per the canonical
+/// [`crate::visibility::is_visible_to_caller`] predicate. `None`
+/// (single-tenant / no env identity) preserves the trust-all behavior.
+pub(super) fn handle_list(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     // Ultrareview #339: saturate instead of panic (see handle_search).
@@ -80,6 +92,13 @@ pub(super) fn handle_list(conn: &rusqlite::Connection, params: &Value) -> Result
         agent_id,
     )
     .map_err(|e| e.to_string())?;
+    let results = match caller {
+        Some(c) => results
+            .into_iter()
+            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
+            .collect::<Vec<_>>(),
+        None => results,
+    };
     Ok(json!({"memories": results, "count": results.len()}))
 }
 
@@ -136,7 +155,7 @@ mod tests {
     #[test]
     fn empty_db_returns_empty_list() {
         let conn = fresh_conn();
-        let out = handle_list(&conn, &json!({})).expect("ok");
+        let out = handle_list(&conn, &json!({}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(0));
         assert!(out["memories"].as_array().unwrap().is_empty());
     }
@@ -147,7 +166,7 @@ mod tests {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "test", MTier::Mid, "ai:a")).expect("ins");
         db::insert(&conn, &make_mem("b", "test", MTier::Mid, "ai:b")).expect("ins");
-        let out = handle_list(&conn, &json!({})).expect("ok");
+        let out = handle_list(&conn, &json!({}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(2));
     }
 
@@ -157,7 +176,7 @@ mod tests {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "ns1", MTier::Mid, "ai:a")).expect("ins");
         db::insert(&conn, &make_mem("b", "ns2", MTier::Mid, "ai:b")).expect("ins");
-        let out = handle_list(&conn, &json!({"namespace": "ns1"})).expect("ok");
+        let out = handle_list(&conn, &json!({"namespace": "ns1"}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
     }
 
@@ -167,10 +186,10 @@ mod tests {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "ns", MTier::Short, "ai:a")).expect("ins");
         db::insert(&conn, &make_mem("b", "ns", MTier::Long, "ai:b")).expect("ins");
-        let out = handle_list(&conn, &json!({"tier": MTier::Long.as_str()})).expect("ok");
+        let out = handle_list(&conn, &json!({"tier": MTier::Long.as_str()}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
         // invalid tier silently falls through (and_then None) — listed all.
-        let out_bad = handle_list(&conn, &json!({"tier": "nonsense"})).expect("ok");
+        let out_bad = handle_list(&conn, &json!({"tier": "nonsense"}), None).expect("ok");
         assert_eq!(out_bad["count"].as_u64(), Some(2));
     }
 
@@ -180,7 +199,7 @@ mod tests {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "ns", MTier::Mid, "ai:alice")).expect("ins");
         db::insert(&conn, &make_mem("b", "ns", MTier::Mid, "ai:bob")).expect("ins");
-        let out = handle_list(&conn, &json!({"agent_id": "ai:alice"})).expect("ok");
+        let out = handle_list(&conn, &json!({"agent_id": "ai:alice"}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
     }
 
@@ -188,7 +207,7 @@ mod tests {
     #[test]
     fn invalid_agent_id_rejected() {
         let conn = fresh_conn();
-        let err = handle_list(&conn, &json!({"agent_id": "has space"})).unwrap_err();
+        let err = handle_list(&conn, &json!({"agent_id": "has space"}), None).unwrap_err();
         assert!(!err.is_empty(), "expected validation err, got {err}");
     }
 
@@ -197,7 +216,7 @@ mod tests {
     fn limit_overflow_saturates_and_caps() {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "ns", MTier::Mid, "ai:a")).expect("ins");
-        let out = handle_list(&conn, &json!({"limit": u64::MAX})).expect("ok");
+        let out = handle_list(&conn, &json!({"limit": u64::MAX}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
     }
 
@@ -206,9 +225,64 @@ mod tests {
     fn idempotent_listing() {
         let conn = fresh_conn();
         db::insert(&conn, &make_mem("a", "ns", MTier::Mid, "ai:a")).expect("ins");
-        let one = handle_list(&conn, &json!({"namespace": "ns"})).expect("ok");
-        let two = handle_list(&conn, &json!({"namespace": "ns"})).expect("ok");
+        let one = handle_list(&conn, &json!({"namespace": "ns"}), None).expect("ok");
+        let two = handle_list(&conn, &json!({"namespace": "ns"}), None).expect("ok");
         assert_eq!(one["count"], two["count"]);
+    }
+
+    // --- v0.7.0 #1468 — caller-scoped visibility post-filter ----------------
+
+    /// Build a `scope=private` row owned by `agent` (the make_mem default
+    /// already omits scope, which `is_visible_to_caller` reads as private).
+    fn private_mem(title: &str, ns: &str, agent: &str) -> Memory {
+        make_mem(title, ns, MTier::Mid, agent)
+    }
+
+    /// Build a `scope=collective` row (visible to any caller).
+    fn shared_mem(title: &str, ns: &str, agent: &str) -> Memory {
+        use crate::models::namespace::MemoryScope;
+        let mut m = make_mem(title, ns, MTier::Mid, agent);
+        m.metadata = json!({
+            crate::META_KEY_AGENT_ID: agent,
+            crate::META_KEY_SCOPE: MemoryScope::Collective.as_str(),
+        });
+        m
+    }
+
+    // #1468 — caller=None preserves trust-all (single-tenant) read.
+    #[test]
+    fn caller_none_lists_all_including_cross_agent_private() {
+        let conn = fresh_conn();
+        db::insert(&conn, &private_mem("p", "ns", "ai:alice")).expect("ins");
+        db::insert(&conn, &shared_mem("s", "ns", "ai:bob")).expect("ins");
+        let out = handle_list(&conn, &json!({"namespace": "ns"}), None).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(2));
+    }
+
+    // #1468 — a non-owner caller never sees another agent's private row,
+    // but still sees shared rows.
+    #[test]
+    fn caller_non_owner_excludes_cross_agent_private() {
+        let conn = fresh_conn();
+        db::insert(&conn, &private_mem("p", "ns", "ai:alice")).expect("ins");
+        db::insert(&conn, &shared_mem("s", "ns", "ai:bob")).expect("ins");
+        let out = handle_list(&conn, &json!({"namespace": "ns"}), Some("ai:carol")).expect("ok");
+        assert_eq!(
+            out["count"].as_u64(),
+            Some(1),
+            "only the shared row is visible"
+        );
+        assert_eq!(out["memories"][0]["title"], "s");
+    }
+
+    // #1468 — the owning caller sees its OWN private row plus shared rows.
+    #[test]
+    fn caller_owner_sees_own_private_and_shared() {
+        let conn = fresh_conn();
+        db::insert(&conn, &private_mem("p", "ns", "ai:alice")).expect("ins");
+        db::insert(&conn, &shared_mem("s", "ns", "ai:bob")).expect("ins");
+        let out = handle_list(&conn, &json!({"namespace": "ns"}), Some("ai:alice")).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(2));
     }
 }
 

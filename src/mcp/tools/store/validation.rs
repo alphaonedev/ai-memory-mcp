@@ -213,11 +213,16 @@ pub(super) fn parse_and_build_memory(
 
     // v0.7.x Form 6 (issue #759) — caller-supplied `kind` parameter.
     // Recognised values match the [`crate::models::MemoryKind`] enum.
-    // Unknown values are ignored (treated as omission) for forward-compat.
     // `None` means the auto-classify hook (if enabled) decides.
-    let caller_kind = params["kind"]
-        .as_str()
-        .and_then(crate::models::MemoryKind::from_str);
+    //
+    // v0.7.0 #1467 — an explicit, non-parseable `kind` is now REJECTED
+    // (was silently coerced to `Observation`) so the MCP store path
+    // matches the CLI / HTTP strict gate. The MCP store path validates
+    // inline (it does not route through `validate::validate_create`), so
+    // call the shared `validate_kind` here directly.
+    let kind_param = params["kind"].as_str();
+    crate::validate::validate_kind(kind_param).map_err(|e| e.to_string())?;
+    let caller_kind = kind_param.and_then(crate::models::MemoryKind::from_str);
 
     let source_uri = match params["source_uri"].as_str().map(str::trim) {
         Some(s) if !s.is_empty() => {
