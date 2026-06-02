@@ -149,11 +149,11 @@ footer{padding:2rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85
         <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/docs/v0.7.0/regression-runs/2026-05-31-final-baseline/README.md">Full evidence →</a>
       </div>
 
-      <div class="ecard pending">
-        <span class="tag">In progress</span>
-        <h3>DO A2A swarm campaign (T4)</h3>
-        <p>DigitalOcean swarm topology per the <a href="../architectures-t4.html">T4 architecture</a> — 4&nbsp;GB swarm nodes + an 8&nbsp;GB Postgres&nbsp;+&nbsp;Apache&nbsp;AGE node, $75 hard budget cap. Baseline env, per-scenario results, and every filed/fixed/closed finding will be published here as the campaign runs.</p>
-        <a class="more" href="#do-swarm">Status below →</a>
+      <div class="ecard">
+        <span class="tag">Green · 5/5 pass</span>
+        <h3>DO swarm campaign (T4) — 2026-06-02</h3>
+        <p>Scaled-down <a href="../architectures-t4.html">T4 swarm</a> on native DigitalOcean droplets (no Docker): 3×&nbsp;4&nbsp;GB quorum peers (N=3/W=2, mTLS) + 1×&nbsp;8&nbsp;GB Postgres&nbsp;16&nbsp;+&nbsp;Apache&nbsp;AGE&nbsp;1.5.0&nbsp;+&nbsp;pgvector. All 5 scenarios pass; zero defects; spend ≈&nbsp;$0.18. Full evidence: <a href="../v0.7.0/regression-runs/2026-06-02-do-swarm-t4/README.md">campaign README</a>.</p>
+        <a class="more" href="#do-swarm">Results below →</a>
       </div>
 
     </div>
@@ -162,28 +162,38 @@ footer{padding:2rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85
 
 <section id="do-swarm">
   <div class="container">
-    <span class="eyebrow">Live campaign</span>
-    <h2>DO A2A swarm — T4 topology.</h2>
+    <span class="eyebrow">Completed campaign · 2026-06-02</span>
+    <h2>DO swarm — T4 topology (GREEN).</h2>
     <p>
-      Scope: swarm testing only (no hive), per operator directive 2026-06-01. Node sizing: 4&nbsp;GB DigitalOcean droplets for the
-      swarm agents, an 8&nbsp;GB droplet for Postgres&nbsp;+&nbsp;Apache&nbsp;AGE. Hard budget cap: <strong>$75</strong>; droplets torn
-      down at campaign end to stop spend. Architecture reference:
-      <a href="../architectures-t4.html">architectures-t4.html</a>.
+      Scope: swarm testing only (no hive), scaled down significantly per operator directive. Native DigitalOcean droplets — <strong>no
+      Docker</strong> — in region <code>nyc3</code>, VPC <code>10.108.0.0/24</code>, all Ubuntu&nbsp;24.04&nbsp;x64. Binary
+      <code>ai-memory v0.7.0</code> (branch <code>release/v0.7.0</code>) built natively <code>--release --features sal-postgres</code>
+      on the 8&nbsp;GB node and scp'd to the peers. Hard budget cap <strong>$75</strong>; actual spend ≈&nbsp;<strong>$0.18</strong>;
+      all droplets destroyed at close. Full audit trail:
+      <a href="../v0.7.0/regression-runs/2026-06-02-do-swarm-t4/README.md">2026-06-02-do-swarm-t4/README.md</a>.
     </p>
     <table class="facts">
-      <thead><tr><th>Phase</th><th>Status</th></tr></thead>
+      <thead><tr><th>Node</th><th>Size</th><th>Role</th></tr></thead>
       <tbody>
-        <tr><td>Study T4 swarm architecture spec</td><td class="num">queued</td></tr>
-        <tr><td>Provision swarm (4 GB) + Postgres+AGE (8 GB)</td><td class="num">queued</td></tr>
-        <tr><td>Document baseline test env (droplet specs, versions)</td><td class="num">queued</td></tr>
-        <tr><td>Run A2A swarm scenarios</td><td class="num">queued</td></tr>
-        <tr><td>File → fix → retest → close every finding</td><td class="num">queued</td></tr>
-        <tr><td>Tear down droplets · final verdict</td><td class="num">queued</td></tr>
+        <tr><td>amx-pg</td><td class="num">s-4vcpu-8gb</td><td>PostgreSQL 16 + Apache AGE 1.5.0 + pgvector 0.8.2 · amd64 build host</td></tr>
+        <tr><td>amx-peer-1/2/3</td><td class="num">s-2vcpu-4gb ×3</td><td>quorum mesh — N=3 / W=2, mTLS fingerprint allowlist</td></tr>
+      </tbody>
+    </table>
+    <table class="facts">
+      <thead><tr><th>Scenario</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td>S1 · Quorum-write success (W=2, all peers up)</td><td class="num">PASS</td></tr>
+        <tr><td>S2 · Quorum not met under partition → <code>503 quorum_not_met</code></td><td class="num">PASS</td></tr>
+        <tr><td>S3 · mTLS allowlist — rogue/no cert refused at handshake</td><td class="num">PASS</td></tr>
+        <tr><td>S4 · Post-partition convergence (DLQ replay + catchup)</td><td class="num">PASS</td></tr>
+        <tr><td>S5 · Postgres + Apache AGE backend (v54 migrate · CRUD · Cypher)</td><td class="num">PASS</td></tr>
       </tbody>
     </table>
     <div class="callout">
-      This section updates in place as the campaign runs. Every finding gets its own GitHub issue and its own audit trail
-      (issue ↔ ai-memory evidence ↔ commit SHA), per the testing-loop discipline.
+      <strong>Verdict: GREEN, 5/5, zero defects.</strong> Peer-mesh quorum writes, quorum-shortfall semantics, mTLS identity gating,
+      post-partition convergence, and the Postgres + Apache&nbsp;AGE backbone all behave to the T4 contract. The run doubled as a live
+      regression on <strong>#1466</strong> — the tier-default <code>expires_at</code> backfill fired on both the federated SQLite write
+      path and the postgres CRUD path. No findings to file.
     </div>
   </div>
 </section>
