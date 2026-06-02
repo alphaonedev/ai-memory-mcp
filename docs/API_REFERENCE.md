@@ -87,10 +87,20 @@ Status codes you'll commonly encounter:
 
 ## Limits
 
-- Bulk payload cap: **1000 items** (`/memories/bulk`, `/import`, `/sync/push`).
-- List pagination: capped at **200** per page.
+- Bulk / list / sync page-size cap: **1000 items by default**
+  (`/memories/bulk`, `/import`, `/sync/push`, and the per-page cap on
+  list responses). **Operator-tunable** (#1156 follow-up) via the
+  `[limits].max_page_size` config field or the `AI_MEMORY_MAX_PAGE_SIZE`
+  env var (precedence: env > config > compiled default `1000`). The cap
+  bounds per-request in-memory materialization to guard against OOM
+  under an unbounded `limit=`.
 - Recall: capped at **50** per request.
 - Sync/since: capped at **10,000** per request.
+- Per-agent write quotas (daily memories, storage bytes, daily links)
+  are **operator-tunable** via `[limits].max_memories_per_day` /
+  `max_storage_bytes` / `max_links_per_day` (or the matching
+  `AI_MEMORY_MAX_*` env vars). Defaults: 1000 memories/day, 100 MiB,
+  5000 links/day. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
 - No per-client rate limiting at the HTTP layer — all writes contend
   for a single `Mutex<Connection>`. Batch or throttle at the caller.
 
@@ -283,7 +293,10 @@ Archives before delete when `archive_on_gc=true`.
 
 ### `POST /api/v1/memories/bulk` — batch create
 
-Body is a JSON array of `CreateMemory` objects, **≤ 1000** items.
+Body is a JSON array of `CreateMemory` objects, **≤ `max_page_size`**
+items (compiled default **1000**; operator-tunable via
+`[limits].max_page_size` / `AI_MEMORY_MAX_PAGE_SIZE`). Exceeding the cap
+returns **400 Bad Request** with an error echoing the configured cap.
 
 ```json
 { "created": 998, "errors": ["item 17: title is required", … ] }

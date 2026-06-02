@@ -156,9 +156,17 @@ host = "127.0.0.1"
 port = 9077
 tls_cert = "/etc/ai-memory/tls.crt"
 tls_key  = "/etc/ai-memory/tls.key"
-api_key_file = "/etc/ai-memory/api.key"  # mode 0400, owned by service user</code></pre>
+api_key_file = "/etc/ai-memory/api.key"  # mode 0400, owned by service user
 
-  <p>Every knob &mdash; including the 28 environment variables, secret-vs-config classification, and precedence regression tests &mdash; is enumerated in <a href="../ADMIN_GUIDE.md">ADMIN_GUIDE.md</a>.</p>
+[limits]                                 # operator-tunable resource caps (#1156 follow-up)
+max_memories_per_day = 1000              # per-agent daily memory-write quota
+max_storage_bytes    = 104857600         # per-agent storage cap (bytes; 100 MiB)
+max_links_per_day    = 5000              # per-agent daily link-write quota
+max_page_size        = 1000              # list/bulk/sync page-size cap (OOM guard)</code></pre>
+
+  <p>The <code>[limits]</code> section makes both the per-agent daily write quota and the list/bulk/sync page-size cap operator-tunable without recompiling. Each field resolves <strong>AI_MEMORY_MAX_* env &gt; [limits] &gt; compiled default</strong>; a non-positive or unparseable value falls through to the default (so a stray <code>0</code> can never clamp every list response to empty). The three quota fields seed fresh <code>agent_quotas</code> rows; <code>max_page_size</code> bounds per-request in-memory materialization as an OOM guard.</p>
+
+  <p>Every knob &mdash; including the full environment-variable table, secret-vs-config classification, and precedence regression tests &mdash; is enumerated in <a href="../ADMIN_GUIDE.md">ADMIN_GUIDE.md</a> and <a href="../CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
