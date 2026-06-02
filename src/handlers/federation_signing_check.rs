@@ -22,8 +22,6 @@ use crate::federation::signing as fed_signing;
 #[cfg(feature = "sal")]
 use super::AppState;
 #[cfg(feature = "sal")]
-use super::MAX_BULK_SIZE;
-#[cfg(feature = "sal")]
 use super::federation_receive::{
     SyncPushBody, attribute_agent_for_quota, check_sender_clock_skew, next_utc_midnight,
 };
@@ -44,19 +42,26 @@ pub(super) async fn sync_push_via_store(
         )
             .into_response();
     }
-    if body.memories.len() > MAX_BULK_SIZE
-        || body.deletions.len() > MAX_BULK_SIZE
-        || body.archives.len() > MAX_BULK_SIZE
-        || body.restores.len() > MAX_BULK_SIZE
-        || body.pendings.len() > MAX_BULK_SIZE
-        || body.pending_decisions.len() > MAX_BULK_SIZE
-        || body.namespace_meta.len() > MAX_BULK_SIZE
-        || body.namespace_meta_clears.len() > MAX_BULK_SIZE
+    // Postgres-backed /sync/push must honour the same operator-tuned cap
+    // as the sqlite fall-through in `sync_push` (federation_receive.rs):
+    // both gate the documented-in-scope `/sync/push` batch size on
+    // `app.max_page_size` (the resolved [limits] value), not the compiled
+    // MAX_BULK_SIZE default — otherwise an operator who raises the cap
+    // would have postgres peers silently rejected at the old 1000.
+    let cap = app.max_page_size;
+    if body.memories.len() > cap
+        || body.deletions.len() > cap
+        || body.archives.len() > cap
+        || body.restores.len() > cap
+        || body.pendings.len() > cap
+        || body.pending_decisions.len() > cap
+        || body.namespace_meta.len() > cap
+        || body.namespace_meta_clears.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("sync_push limited to {} entries per subcollection", MAX_BULK_SIZE)
+                "error": format!("sync_push limited to {cap} entries per subcollection")
             })),
         )
             .into_response();
