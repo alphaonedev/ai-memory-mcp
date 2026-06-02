@@ -210,6 +210,38 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
     Ok(id)
 }
 
+/// v0.7.0 #1468/#1469 — resolve the visibility *caller* for MCP read
+/// paths (`memory_session_start` / `memory_list` / `memory_search` /
+/// `memory_recall`).
+///
+/// Returns ONLY the stable `AI_MEMORY_AGENT_ID` env override — the exact
+/// same step-2 value the write ladder in [`resolve_agent_id`] stamps into
+/// `metadata.agent_id` — or `None`.
+///
+/// This deliberately does NOT fall through to the clientInfo/host
+/// synthesized ids (steps 3-5). Those embed the live `pid`, so a caller
+/// id minted this process can NEVER equal the owner stamped by a *prior*
+/// process. Threading such an id as the read-path caller both (a) hides an
+/// env-pinned agent's own `scope=private` rows on a fresh-process resume
+/// (#1469) and (b) fails to scope a multi-agent deployment that relies on
+/// the env override for stable identity (#1468). Returning `None` when the
+/// env is unset preserves the single-tenant "trust the local caller"
+/// read posture: the handler skips the ownership post-filter entirely.
+#[must_use]
+pub fn resolve_read_visibility_caller() -> Option<String> {
+    let v = std::env::var(ENV_AGENT_ID).ok()?;
+    if v.is_empty() {
+        return None;
+    }
+    // Match the write path's shape gate so the caller string is identical
+    // to the owner the store stamped via the same env var. A
+    // shape-invalid env value never became an owner, so it can never be a
+    // legitimate caller — drop to None (trust-all) rather than filter
+    // against a value nothing is owned by.
+    validate::validate_agent_id_shape(&v).ok()?;
+    Some(v)
+}
+
 /// Resolve `agent_id` for a single HTTP request.
 ///
 /// `body` is the (optional) `agent_id` field from `CreateMemory`;
@@ -429,6 +461,54 @@ mod tests {
             id.starts_with("host:") || id.starts_with("anonymous:"),
             "got: {id}"
         );
+    }
+
+    // --- v0.7.0 #1468/#1469 — read-path visibility caller resolution ------
+
+    #[test]
+    fn read_visibility_caller_returns_env_when_set() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "ai:alice");
+        }
+        let got = resolve_read_visibility_caller();
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+        assert_eq!(got.as_deref(), Some("ai:alice"));
+    }
+
+    #[test]
+    fn read_visibility_caller_none_when_unset() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+        assert_eq!(resolve_read_visibility_caller(), None);
+    }
+
+    #[test]
+    fn read_visibility_caller_none_when_empty_or_shape_invalid() {
+        let _g = env_var_lock();
+        // Empty → None (treated as unset).
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "");
+        }
+        assert_eq!(resolve_read_visibility_caller(), None);
+        // Shape-invalid (whitespace) → None: a value the write path would
+        // have rejected can never be a legitimate owner, so do not filter
+        // against it (drop to trust-all rather than hide everything).
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "has space");
+        }
+        assert_eq!(resolve_read_visibility_caller(), None);
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
     }
 
     /// v0.7.0 SECURITY regression — primitive-level closure of the

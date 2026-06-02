@@ -585,6 +585,7 @@ pub use quota_status::handle_quota_status;
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 pub use check_agent_action::handle_check_agent_action;
 pub use recall::handle_recall;
+pub use recall::handle_recall_caller;
 pub use recall::handle_recall_with_pre_recall_hook;
 // v0.7.x #1155 / FX-4 PERF-2 (2026-05-26) — batched front-end
 // consumed by the HTTP recall handler when releasing the DB mutex
@@ -1173,7 +1174,11 @@ fn dispatch_memory_store(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_recall(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_recall(
+    // v0.7.0 #1468 — resolve the read-path visibility caller from the
+    // stable `AI_MEMORY_AGENT_ID` env (or None) so cross-agent
+    // `scope=private` rows are dropped before serialization.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_recall_caller(
         ctx.conn,
         ctx.arguments,
         ctx.embedder,
@@ -1183,6 +1188,7 @@ fn dispatch_memory_recall(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
         ctx.resolved_ttl,
         ctx.resolved_scoring,
         ctx.recall_scope,
+        caller.as_deref(),
     )
 }
 
@@ -1193,11 +1199,15 @@ fn dispatch_memory_recall_observations(ctx: &ToolDispatchCtx<'_>) -> Result<Valu
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_search(ctx.conn, ctx.arguments)
+    // v0.7.0 #1468 — see `dispatch_memory_recall`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_search(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_list(ctx.conn, ctx.arguments)
+    // v0.7.0 #1468 — see `dispatch_memory_recall`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_list(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_load_family(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1471,11 +1481,20 @@ fn dispatch_memory_gc(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_session_start(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    // v0.7.0 #1420 — thread the MCP-handshake-captured caller
-    // identity (`initialize.clientInfo.name` → `ctx.mcp_client`) so
-    // the post-list visibility filter at handle_session_start drops
-    // cross-agent `scope=private` rows before they reach the wire.
-    handle_session_start(ctx.conn, ctx.arguments, ctx.llm, ctx.mcp_client)
+    // v0.7.0 #1420 — the post-list visibility filter at
+    // handle_session_start drops cross-agent `scope=private` rows before
+    // they reach the wire.
+    //
+    // #1469 — the caller MUST be the stable `AI_MEMORY_AGENT_ID` identity
+    // (or None), NOT the raw handshake `clientInfo.name`. The store path
+    // stamps `metadata.agent_id` from the env (or a pid-bearing
+    // synthesized id); a fresh resume process can never reproduce a prior
+    // process's synthesized owner, so keying the read filter on
+    // `clientInfo.name` made an agent invisible to its OWN private WIP
+    // rows on resume. Resolving env > None makes resume see exactly the
+    // rows the same env identity wrote, and keeps single-tenant trust-all.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_session_start(ctx.conn, ctx.arguments, ctx.llm, caller.as_deref())
 }
 
 fn dispatch_memory_namespace_set_standard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

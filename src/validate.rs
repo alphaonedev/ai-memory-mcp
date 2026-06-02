@@ -724,8 +724,11 @@ const MAX_CITATIONS_PER_MEMORY: usize = 64;
 /// commonly bounded at 2 KiB; we set a slightly larger headroom for
 /// `doc:` / `file:` payloads while still bounding the column size.
 const MAX_SOURCE_URI_LEN: usize = 4_096;
-/// v0.7.0 Form 4 — accepted URI form schemes.
-const VALID_SOURCE_URI_SCHEMES: &[&str] = &["uri:", "doc:", "file:"];
+/// v0.7.0 Form 4 — accepted URI form schemes. `pub(crate)` so tests in
+/// sibling modules build valid `source_uri` fixtures from this SSOT
+/// rather than re-hardcoding a scheme literal that would rot if the
+/// accepted-scheme set changes.
+pub(crate) const VALID_SOURCE_URI_SCHEMES: &[&str] = &["uri:", "doc:", "file:"];
 
 /// v0.7.0 Form 4 (issue #757) — validate a [`Citation`] envelope.
 ///
@@ -904,6 +907,12 @@ pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     validate_expires_at(mem.expires_at.as_deref())?;
     validate_ttl_secs(mem.ttl_secs)?;
     validate_metadata(&mem.metadata)?;
+    // v0.7.0 #1467 — reject an explicit, non-parseable Form-6 `kind` at
+    // the DTO boundary so the HTTP / MCP write surfaces stop silently
+    // coercing it to `Observation` (CLI already rejects). The downstream
+    // `kind.and_then(from_str).unwrap_or_default()` then only ever
+    // defaults a genuinely-absent `kind`.
+    validate_kind(mem.kind.as_deref())?;
     // v0.7.0 Form 4 — fact-provenance fields are optional but when
     // supplied must satisfy the per-field invariants.
     validate_citations(&mem.citations)?;
@@ -912,6 +921,31 @@ pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     }
     if let Some(ref span) = mem.source_span {
         validate_source_span(span)?;
+    }
+    Ok(())
+}
+
+/// v0.7.0 #1467 — validate the optional Form-6 `kind` wire value.
+///
+/// `None` is `Ok` (the caller omitted it; the write path's
+/// auto-classify hook or the `Observation` default applies). A
+/// `Some(s)` value is `Ok` iff it matches a
+/// [`crate::models::MemoryKind`] variant exactly (lowercase,
+/// case-sensitive — matching the CLI's `--kind` gate). Any other
+/// `Some` value — wrong case (`"Claim"`), unknown (`"bogus"`),
+/// trailing whitespace (`"claim "`), or empty (`""`) — is rejected so
+/// all three write surfaces (CLI, HTTP, MCP) agree instead of two
+/// silently data-lossing the field where the third rejects it.
+pub fn validate_kind(kind: Option<&str>) -> Result<()> {
+    if let Some(s) = kind
+        && crate::models::MemoryKind::from_str(s).is_none()
+    {
+        let expected = crate::models::MemoryKind::all()
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("invalid kind '{s}' (expected one of: {expected})");
     }
     Ok(())
 }
@@ -2267,6 +2301,49 @@ mod tests {
         let mut m = cm_valid();
         m.source = "bogus".to_string();
         assert!(validate_create(&m).is_err());
+    }
+
+    // --- v0.7.0 #1467 — Form-6 `kind` strict validation ------------------
+
+    #[test]
+    fn validate_kind_none_is_ok() {
+        assert!(validate_kind(None).is_ok());
+    }
+
+    #[test]
+    fn validate_kind_accepts_all_canonical_variants() {
+        for k in crate::models::MemoryKind::all() {
+            assert!(
+                validate_kind(Some(k.as_str())).is_ok(),
+                "canonical variant {:?} must validate",
+                k.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_kind_rejects_wrong_case_unknown_and_whitespace() {
+        for bad in ["Claim", "bogus", "claim ", "OBSERVATION", ""] {
+            let err = validate_kind(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid kind") && err.contains("expected one of"),
+                "expected strict rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_create_rejects_invalid_kind() {
+        let mut m = cm_valid();
+        m.kind = Some("bogus".to_string());
+        assert!(validate_create(&m).is_err());
+    }
+
+    #[test]
+    fn validate_create_accepts_valid_kind() {
+        let mut m = cm_valid();
+        m.kind = Some("claim".to_string());
+        assert!(validate_create(&m).is_ok());
     }
 
     #[test]

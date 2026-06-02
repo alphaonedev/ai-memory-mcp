@@ -67,7 +67,20 @@ impl McpTool for SearchTool {
     }
 }
 
-pub(super) fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+/// v0.7.0 #1468 — the underlying `db::search_with_source_uri` /
+/// `db::list_by_source_uri` apply the #151 namespace-scope (`as_agent`)
+/// visibility, but NOT the per-row `scope=private` ownership predicate, so
+/// a cross-agent private row can still match a keyword query. When
+/// `caller` is `Some` (MCP dispatch resolved a stable `AI_MEMORY_AGENT_ID`
+/// identity via [`crate::identity::resolve_read_visibility_caller`]) we
+/// additionally drop rows the caller does not own per
+/// [`crate::visibility::is_visible_to_caller`]. `None` keeps the
+/// single-tenant trust-all behavior.
+pub(super) fn handle_search(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let query = params["query"].as_str();
     let namespace = params["namespace"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
@@ -112,6 +125,7 @@ pub(super) fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Resu
             let results =
                 db::list_by_source_uri(conn, uri, namespace, Some(limit.min(200)), as_agent)
                     .map_err(|e| e.to_string())?;
+            let results = filter_visible(results, caller);
             return Ok(json!({"results": results, "count": results.len()}));
         }
         return Err("query is required".into());
@@ -133,7 +147,140 @@ pub(super) fn handle_search(conn: &rusqlite::Connection, params: &Value) -> Resu
         source_uri,
     )
     .map_err(|e| e.to_string())?;
+    let results = filter_visible(results, caller);
     Ok(json!({"results": results, "count": results.len()}))
+}
+
+/// Drop rows the `caller` does not own (canonical #951 predicate). No-op
+/// when `caller` is `None` (single-tenant trust-all read posture).
+fn filter_visible(
+    results: Vec<crate::models::Memory>,
+    caller: Option<&str>,
+) -> Vec<crate::models::Memory> {
+    match caller {
+        Some(c) => results
+            .into_iter()
+            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
+            .collect(),
+        None => results,
+    }
+}
+
+#[cfg(test)]
+mod visibility_1468_tests {
+    //! v0.7.0 #1468 — caller-scoped `scope=private` post-filter on the
+    //! `memory_search` read path.
+    use super::*;
+    use crate::models::{Memory, Tier as MTier};
+    use crate::storage as db;
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn mem(title: &str, agent: &str, scope: Option<&str>) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        let metadata = match scope {
+            Some(s) => json!({crate::META_KEY_AGENT_ID: agent, crate::META_KEY_SCOPE: s}),
+            None => json!({crate::META_KEY_AGENT_ID: agent}),
+        };
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: MTier::Mid,
+            namespace: "ns".to_string(),
+            title: title.to_string(),
+            // shared keyword so the FTS query matches every row
+            content: "needle in the haystack".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        }
+    }
+
+    fn seed(conn: &rusqlite::Connection) {
+        use crate::models::namespace::MemoryScope;
+        // private row owned by alice + collective row owned by bob
+        db::insert(conn, &mem("priv", "ai:alice", None)).expect("ins");
+        db::insert(
+            conn,
+            &mem("shared", "ai:bob", Some(MemoryScope::Collective.as_str())),
+        )
+        .expect("ins");
+    }
+
+    #[test]
+    fn caller_none_returns_all() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let out = handle_search(&conn, &json!({"query": "needle"}), None).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn non_owner_excludes_cross_agent_private() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let out = handle_search(&conn, &json!({"query": "needle"}), Some("ai:carol")).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(1));
+        assert_eq!(out["results"][0]["title"], "shared");
+    }
+
+    #[test]
+    fn owner_sees_own_private_and_shared() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let out = handle_search(&conn, &json!({"query": "needle"}), Some("ai:alice")).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(2));
+    }
+
+    /// #1468 — the empty-query + `source_uri` early-return branch
+    /// (`db::list_by_source_uri`) MUST apply the same caller-scoped
+    /// `scope=private` filter as the main keyword path; without it the
+    /// reciprocal "everything from this document" query would leak a
+    /// cross-agent private row.
+    #[test]
+    fn source_uri_only_branch_excludes_cross_agent_private() {
+        // Build the fixture URI from the validator's accepted-scheme
+        // SSOT so the test can't rot if the scheme set changes.
+        let uri = format!(
+            "{}atlas/doc-1",
+            crate::validate::VALID_SOURCE_URI_SCHEMES[0]
+        );
+        let conn = fresh_conn();
+        let mut priv_row = mem("priv", "ai:alice", None);
+        priv_row.source_uri = Some(uri.clone());
+        let mut shared_row = mem("shared", "ai:bob", Some("collective"));
+        shared_row.source_uri = Some(uri.clone());
+        db::insert(&conn, &priv_row).expect("ins");
+        db::insert(&conn, &shared_row).expect("ins");
+
+        // Non-owner: alice's private row is dropped, bob's shared survives.
+        let out = handle_search(&conn, &json!({"source_uri": uri}), Some("ai:carol")).expect("ok");
+        assert_eq!(out["count"].as_u64(), Some(1));
+        assert_eq!(out["results"][0]["title"], "shared");
+
+        // Trust-all caller (None) keeps both.
+        let all = handle_search(&conn, &json!({"source_uri": uri}), None).expect("ok");
+        assert_eq!(all["count"].as_u64(), Some(2));
+    }
 }
 
 #[cfg(test)]
