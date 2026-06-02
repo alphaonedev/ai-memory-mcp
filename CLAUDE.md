@@ -424,6 +424,10 @@ script (Docker / Plan C deployments).
 | 46 | `AI_MEMORY_DB_PATH` | path | unset (legacy alias; substrate reads `AI_MEMORY_DB` — see #1) | doc-comment reference only (`src/identity/keypair.rs:132`) | config | **Doc-comment reference, not a live env-var read.** The substrate's canonical DB-path env var is `AI_MEMORY_DB` (row #1 in this table); the docstring at `src/identity/keypair.rs:132` mentions `AI_MEMORY_DB_PATH` as an example of the env-override pattern but no `std::env::var("AI_MEMORY_DB_PATH")` site exists in production code. Listed here for table-completeness and to flag the docstring reconciliation (use `AI_MEMORY_DB` in operator-facing prose; treat `AI_MEMORY_DB_PATH` as a stale alias slated for docstring cleanup in v0.7.x). |
 | 47 | `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` | comma-separated base64 Ed25519 pubkeys | unset (no host signatures accepted) | MCP `memory_capture_turn` | config | **[#1414, v0.7.0]** Per-host Ed25519 pubkey allowlist for L4 `memory_capture_turn` signature verification per #1389 + RFC-0001 §"Signature + attestation". When a host supplies `host_signature_b64` + `host_pubkey_b64`, the substrate decodes the pubkey, requires it to appear on this comma-separated allowlist, then verifies the signature via Ed25519 over the canonical-bytes encoding `host_session_id \|\| 0x00 \|\| host_turn_index \|\| 0x00 \|\| role \|\| 0x00 \|\| content`. Unenrolled pubkeys yield `HOST_PUBKEY_NOT_ENROLLED`; verified signatures land `attest_level = "signed_by_peer"` on the resulting memory + the L4 `signed_events` row. Unset / empty allowlist refuses every signed-path call (conservative default per the v0.7.0 sole-authority rule); operators enroll hosts by appending the b64 pubkey to this list, no daemon restart required (the env is re-read per call). Source: `src/mcp/tools/capture_turn.rs::L4_HOST_PUBKEY_ALLOWLIST_ENV`. |
 | 48 | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | bool (`1`/`true`) | `false` (permissive default at v0.7.0) | CLI/daemon/MCP (every store write path) | config | **[#626 Layer-3 C7, v0.7.0]** Fail-CLOSED on unsigned writes when truthy: every store surface (MCP `memory_store`, HTTP `POST /api/v1/memories`, CLI) that receives a write WITHOUT a caller-presented Ed25519 `signature` is rejected with `403 ATTESTATION_FAILED` instead of landing `attest_level = "claimed"`. When a `signature` IS presented it is verified against the agent's bound public key regardless of this flag (valid → `agent_attested`; forged → `403`); this flag only governs the unsigned-write disposition. Default `false` keeps the v0.6.x permissive posture where unsigned writes land claimed. Mirrors the federation `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` (#29/#30) secure-opt-in convention. Source: `src/identity/attest.rs::require_agent_attestation_enabled` (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION`). |
+| 49 | `AI_MEMORY_MAX_MEMORIES_PER_DAY` | i64 (>0) | `1000` (`DEFAULT_MAX_MEMORIES_PER_DAY`) | CLI/daemon/MCP | config | **[#1156 follow-up, v0.7.x]** Operator-tunable per-agent daily memory-write quota seeded into every fresh `agent_quotas` row. Resolves through `AppConfig::resolve_limits()` → seeds the process-wide `crate::quotas::QuotaDefaults` OnceLock once during `serve`/`mcp`/CLI boot. Precedence: env > `[limits].max_memories_per_day` > compiled `DEFAULT_MAX_MEMORIES_PER_DAY`. Non-positive / garbage values fall through to the compiled default. Existing quota rows are NOT retroactively rewritten — this seeds the default for rows created after the change. Source: `src/config.rs::resolve_limits` + `src/quotas.rs::{QuotaDefaults,set_quota_defaults,quota_defaults}`. |
+| 50 | `AI_MEMORY_MAX_STORAGE_BYTES` | i64 (>0) | `104857600` (100 MiB = `DEFAULT_MAX_STORAGE_BYTES`) | CLI/daemon/MCP | config | **[#1156 follow-up, v0.7.x]** Operator-tunable per-agent storage-byte quota seeded into every fresh `agent_quotas` row. Same resolver + precedence ladder as #49 (env > `[limits].max_storage_bytes` > compiled default). Non-positive / garbage values fall through. Source: `src/config.rs::resolve_limits` + `src/quotas.rs`. |
+| 51 | `AI_MEMORY_MAX_LINKS_PER_DAY` | i64 (>0) | `5000` (`DEFAULT_MAX_LINKS_PER_DAY`) | CLI/daemon/MCP | config | **[#1156 follow-up, v0.7.x]** Operator-tunable per-agent daily link-write quota seeded into every fresh `agent_quotas` row. Same resolver + precedence ladder as #49 (env > `[limits].max_links_per_day` > compiled default). Non-positive / garbage values fall through. Source: `src/config.rs::resolve_limits` + `src/quotas.rs`. |
+| 52 | `AI_MEMORY_MAX_PAGE_SIZE` | usize (>0) | `1000` (`MAX_BULK_SIZE`) | CLI/daemon/MCP | config | **[#1156 follow-up, v0.7.x]** Operator-tunable cap on list/bulk page size — bounds per-request in-memory materialization to prevent OOM under an unbounded `limit=`. Caps list-response page size (`memories_query.rs`), bulk-write batch size (`POST /api/v1/memories/bulk`), and federation `/sync/push` batch size. Resolves through `AppConfig::resolve_limits()` into the `AppState.max_page_size` field (handlers read `app.max_page_size`). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / garbage values fall through to the compiled default so a stray `0` cannot clamp every list response to empty. Source: `src/config.rs::resolve_limits` + `src/handlers/transport.rs::MAX_BULK_SIZE`. |
 | — | `RUST_LOG` | tracing filter | unset (= `info`) | all | config | Standard `tracing-subscriber` filter (e.g. `RUST_LOG=ai_memory=debug`). Not an `AI_MEMORY_*` var — listed for completeness. |
 
 **Regression tests.** Precedence + secret-classification invariants
@@ -444,7 +448,7 @@ are pinned by `tests/config_precedence.rs`:
 If you add a new env var, update the table above AND extend
 `tests/config_precedence.rs` so the invariant is mechanically enforced.
 
-### Config schema v0.7.x (#1146) — sectioned `[llm]` / `[embeddings]` / `[reranker]` / `[storage]`
+### Config schema v0.7.x (#1146) — sectioned `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` / `[limits]`
 
 **Canonical shape.** As of v0.7.x (#1146), `~/.config/ai-memory/config.toml`
 uses a schema-versioned, sectioned shape:
@@ -490,6 +494,15 @@ archive_on_gc     = true
 
 [mcp]
 profile = "full"
+
+[limits]
+# Operator-tunable resource caps. All four fall back to the compiled
+# defaults when absent, non-positive, or unparseable. Precedence per
+# field: AI_MEMORY_MAX_* env > this section > compiled default.
+max_memories_per_day = 1000        # per-agent daily memory-write quota
+max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
+max_links_per_day    = 5000        # per-agent daily link-write quota
+max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
 ```
 
 **Canonical resolver.** Every LLM-init surface (MCP stdio, HTTP daemon,
@@ -503,10 +516,28 @@ CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  co
 ```
 
 Sister resolvers `resolve_llm_auto_tag`, `resolve_embeddings`,
-`resolve_reranker`, and `resolve_storage` follow the same ladder for
-their respective concerns. The `ResolvedLlm` struct's `Debug` impl
-redacts the resolved `api_key` to `<redacted>` so accidental `{:?}`
-prints never leak credentials.
+`resolve_reranker`, `resolve_storage`, and `resolve_limits` follow the
+same ladder for their respective concerns. The `ResolvedLlm` struct's
+`Debug` impl redacts the resolved `api_key` to `<redacted>` so
+accidental `{:?}` prints never leak credentials.
+
+**`[limits]` resolver (#1156 follow-up).** `AppConfig::resolve_limits()`
+produces a `ResolvedLimits` carrying `max_memories_per_day`,
+`max_storage_bytes`, `max_links_per_day` (all `i64`) and
+`max_page_size` (`usize`), each with a `ConfigSource` provenance tag
+(`Env` / `Config` / `CompiledDefault`). The four quota / page-size
+knobs follow the uniform ladder `AI_MEMORY_MAX_* env > [limits]
+section > compiled default`, and any non-positive or unparseable value
+is filtered so it falls through to the next layer (a stray `0`
+`max_page_size` can never clamp every list response to empty). The
+three quota fields seed the process-wide `crate::quotas::QuotaDefaults`
+OnceLock once at boot (consumed deep in the `agent_quotas`-row SQL
+binds, where no `AppConfig` is in scope); `max_page_size` lands on the
+`AppState.max_page_size` field that every Axum handler reads via
+`State(app)`. Compiled defaults: `DEFAULT_MAX_MEMORIES_PER_DAY = 1000`,
+`DEFAULT_MAX_STORAGE_BYTES = 104857600` (100 MiB),
+`DEFAULT_MAX_LINKS_PER_DAY = 5000` (all in `src/quotas.rs`), and
+`MAX_BULK_SIZE = 1000` (`src/handlers/transport.rs`).
 
 **Inline-key rejection.** `[llm].api_key = "<literal>"` is rejected at
 parse time with a clear stderr error and the daemon falls back to

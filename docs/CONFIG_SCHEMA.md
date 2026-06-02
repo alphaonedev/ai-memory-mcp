@@ -65,6 +65,18 @@ archive_max_days  = 90
 max_memory_mb     = 4096
 
 # ---------------------------------------------------------------------
+# [limits] — operator-tunable resource caps (#1156 follow-up).
+# All four fall back to the compiled default when absent, non-positive,
+# or unparseable. Precedence per field:
+#   AI_MEMORY_MAX_* env > [limits] section > compiled default.
+# ---------------------------------------------------------------------
+[limits]
+max_memories_per_day = 1000        # per-agent daily memory-write quota
+max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
+max_links_per_day    = 5000        # per-agent daily link-write quota
+max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
+
+# ---------------------------------------------------------------------
 # Existing sections at v0.7.x — see env-var table in CLAUDE.md.
 # ---------------------------------------------------------------------
 [mcp]
@@ -85,6 +97,16 @@ methods:
 - `AppConfig::resolve_embeddings()`
 - `AppConfig::resolve_reranker()`
 - `AppConfig::resolve_storage()`
+- `AppConfig::resolve_limits()` — resource caps; produces `ResolvedLimits`
+  (`max_memories_per_day` / `max_storage_bytes` / `max_links_per_day`
+  as `i64`, `max_page_size` as `usize`). The three quota fields seed the
+  process-wide `crate::quotas::QuotaDefaults` OnceLock once at boot (the
+  `agent_quotas`-row SQL binds have no `AppConfig` in scope);
+  `max_page_size` lands on `AppState.max_page_size`, read by every Axum
+  handler via `State(app)`. Precedence ladder for this section is
+  `AI_MEMORY_MAX_* env > [limits] > compiled default` (no CLI flag, no
+  legacy flat field). Non-positive / unparseable values are filtered so
+  a stray `0` `max_page_size` cannot clamp every list response to empty.
 
 **Uniform precedence ladder** (CLI > env > config > legacy > compiled):
 

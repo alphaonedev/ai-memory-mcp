@@ -337,6 +337,10 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` or `KIMI_API_KEY`, `DASHSCOPE_API_KEY` or `QWEN_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
 | `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI, `deepseek-chat` for DeepSeek, `gemma3:4b` for Ollama). |
 | `OLLAMA_BASE_URL` | unset | Legacy escape hatch honoured ONLY when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Pre-#1067 callers using the old env var keep working. |
+| `AI_MEMORY_MAX_MEMORIES_PER_DAY` | `1000` | **[#1156 follow-up, v0.7.x]** Per-agent daily memory-write quota seeded into fresh `agent_quotas` rows. Precedence: env > `[limits].max_memories_per_day` > compiled default. Non-positive / unparseable falls through. |
+| `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-agent storage-byte quota seeded into fresh `agent_quotas` rows. Same ladder as above (`[limits].max_storage_bytes`). |
+| `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-agent daily link-write quota seeded into fresh `agent_quotas` rows. Same ladder as above (`[limits].max_links_per_day`). |
+| `AI_MEMORY_MAX_PAGE_SIZE` | `1000` | **[#1156 follow-up, v0.7.x]** Cap on list / bulk-write / federation-sync page size — bounds per-request in-memory materialization (OOM guard). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / unparseable falls through. |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to `1` to skip config file loading (useful for testing) |
 
@@ -367,6 +371,11 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `ttl.long_ttl_secs` | Integer | `0` (never expires) | `0` = never expires, or positive integer | TTL for long-tier memories in seconds |
 | `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | Per-access TTL window for short-tier memories. **Sliding-window REPLACEMENT semantic** (not max-of-old-and-new extend): on every access, `expires_at = now + short_extend_secs`. The create-time `short_ttl_secs` (6h default) is only a backstop until first access. |
 | `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | Per-access TTL window for mid-tier memories. **Sliding-window REPLACEMENT semantic** (not extend): on every access, `expires_at = now + mid_extend_secs`. The create-time `mid_ttl_secs` (7d default) is only a backstop until first access. |
+| `[limits]` | Section | -- | -- | **[#1156 follow-up, v0.7.x]** Operator-tunable resource caps. Per-field precedence: `AI_MEMORY_MAX_* env > [limits] > compiled default`; non-positive / unparseable values fall through. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). |
+| `limits.max_memories_per_day` | Integer (>0) | `1000` | Any positive integer | Per-agent daily memory-write quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_MEMORIES_PER_DAY`. |
+| `limits.max_storage_bytes` | Integer (>0) | `104857600` (100 MiB) | Any positive integer | Per-agent storage-byte quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_STORAGE_BYTES`. |
+| `limits.max_links_per_day` | Integer (>0) | `5000` | Any positive integer | Per-agent daily link-write quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_LINKS_PER_DAY`. |
+| `limits.max_page_size` | Integer (>0) | `1000` | Any positive integer | Cap on list / bulk-write / federation-sync page size (OOM guard). Lands on `AppState.max_page_size`. Env override: `AI_MEMORY_MAX_PAGE_SIZE`. |
 
 > **Note:** Set any TTL to `0` to disable expiry for that tier. Values are clamped to a 10-year maximum (315,360,000 seconds). Negative extension values are clamped to 0.
 
@@ -553,6 +562,19 @@ Below is a complete example showing every supported field with explanatory comme
 # long_ttl_secs = 0             # 0 = never expires (default)
 # short_extend_secs = 3600      # +1 hour on access (default)
 # mid_extend_secs = 86400       # +1 day on access (default)
+
+# ---------------------------------------------------------------------------
+# [limits] — operator-tunable resource caps (#1156 follow-up, v0.7.x)
+# ---------------------------------------------------------------------------
+# All four fall back to the compiled default when absent, non-positive, or
+# unparseable. Per-field precedence: AI_MEMORY_MAX_* env > [limits] > default.
+# The three quota fields seed fresh agent_quotas rows (existing rows are not
+# rewritten); max_page_size bounds list/bulk/sync page size as an OOM guard.
+# [limits]
+# max_memories_per_day = 1000        # per-agent daily memory-write quota
+# max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
+# max_links_per_day    = 5000        # per-agent daily link-write quota
+# max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
 ```
 
 **Precedence:** For per-invocation subcommands (`mcp`, `store`, `recall`, etc.), CLI flags and MCP args take precedence over `config.toml` values. When the MCP server is launched by an AI client, the `--tier` flag in the MCP args is used, not the `config.toml` `tier` setting. The `serve` daemon is a special case: it has no `--tier` flag, so tier is resolved from `config.toml` (`tier = "..."`) with the compiled-in default (`semantic`) as the only fallback. See issue #703.
@@ -569,6 +591,10 @@ These are set in the source code and require recompilation to change:
 | `PROMOTION_THRESHOLD` | 5 accesses | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
 | `MID_TTL_EXTEND_SECS` | 86400 (1 day) | `models.rs` |
+| `DEFAULT_MAX_MEMORIES_PER_DAY` | 1000 | `quotas.rs` (compiled fallback for `[limits].max_memories_per_day` / `AI_MEMORY_MAX_MEMORIES_PER_DAY`) |
+| `DEFAULT_MAX_STORAGE_BYTES` | 104857600 (100 MiB) | `quotas.rs` (compiled fallback for `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES`) |
+| `DEFAULT_MAX_LINKS_PER_DAY` | 5000 | `quotas.rs` (compiled fallback for `[limits].max_links_per_day` / `AI_MEMORY_MAX_LINKS_PER_DAY`) |
+| `MAX_BULK_SIZE` | 1000 | `handlers/transport.rs` (compiled fallback for `[limits].max_page_size` / `AI_MEMORY_MAX_PAGE_SIZE`) |
 
 ## Profiles (v0.6.4+)
 
