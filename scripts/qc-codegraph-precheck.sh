@@ -75,6 +75,17 @@ collect_sites () {
         fi
         # Find matching lines and filter to lineno < test_line.
         # Pattern format: `for_agent("LIT")` or `for_admin("LIT")`.
+        #
+        # NOTE: the inner match list is captured into a variable and fed
+        # to the loop via a here-string (`<<<`) rather than a second
+        # process substitution. A process substitution nested inside the
+        # outer `< <(find ...)` one reliably SIGTRAPs (exit 133) under
+        # macOS system bash 3.2 on arm64; the here-string is behaviour-
+        # identical and runs the loop in the current shell so `out`
+        # still accumulates.
+        local matches
+        matches="$(grep -n "${pattern}(\"" "$f" 2>/dev/null || true)"
+        [[ -z "${matches}" ]] && continue
         while IFS=: read -r lineno content; do
             # Skip blank/no-match
             [[ -z "${lineno}" ]] && continue
@@ -90,7 +101,7 @@ collect_sites () {
                 local rel="${f#"${ROOT}/"}"
                 out+="${rel}:${lineno}:${literal}"$'\n'
             fi
-        done < <(grep -n "${pattern}(\"" "$f" 2>/dev/null || true)
+        done <<< "${matches}"
     done < <(find "${ROOT}/src" -type f -name '*.rs' -print0)
     # Sort + dedup so the diff against the allowlist is order-stable.
     printf '%s' "$out" | LC_ALL=C sort -u
