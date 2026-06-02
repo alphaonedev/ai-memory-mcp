@@ -64,7 +64,7 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
 /// `migrations/{sqlite,postgres}/` for the SQL.
 ///
-/// **Current value: tracks `current_schema_version()` (v53 at v0.7.0
+/// **Current value: tracks `current_schema_version()` (v54 at v0.7.0
 /// release).** The const auto-resolves from the SSOT at
 /// `crate::storage::migrations::CURRENT_SCHEMA_VERSION`; this docstring
 /// names the v0.7.0-release tip for narrative continuity but the value

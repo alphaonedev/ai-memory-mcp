@@ -44,7 +44,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // Growth is justified: a new attestation persist branch on an
     // existing write path, no speculative surface. 16_100 = 16_033 + 67
     // headroom; far under QUAL-10's 1.5x aspirational cap.
-    ("src/storage/mod.rs", 16_100),
+    //
+    // 2026-06-01 — bumped 16_100 → 16_200 by the #1466 TTL-leak fix:
+    // the immortal-rows regression suite (insert / insert_with_conflict /
+    // insert_if_newer / consolidate backfill assertions + the
+    // ttl_gap_secs helper) added ~100 LOC of tests to the in-file
+    // `mod tests`, pushing the file to 16_143. Growth is justified: pure
+    // regression coverage for the tier-default expiry chokepoint, zero
+    // new production surface. 16_200 = 16_143 + 57 headroom; far under
+    // the 1.5x cap.
+    ("src/storage/mod.rs", 16_200),
     ("src/mcp/mod.rs", 14_000),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
@@ -72,7 +81,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // Growth is justified: new entries on the canonical SAL trait surface
     // needed for postgres-backed agent attestation, mirroring the SQLite
     // path. 15_400 = 15_353 + 47 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 15_400),
+    //
+    // 2026-06-01 — bumped 15_400 → 15_500 by the #1466 TTL-leak fix: the
+    // postgres `migrate_v54` twin (tier-default expiry backfill on legacy
+    // immortal rows, parity with the SQLite v54 ladder arm) added ~40 LOC,
+    // pushing the file to 15_416. Growth is justified: a new migration on
+    // the canonical postgres ladder mirroring the SQLite backfill, no
+    // speculative surface. 15_500 = 15_416 + 84 headroom; far under the
+    // 1.5x cap.
+    ("src/store/postgres.rs", 15_500),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /

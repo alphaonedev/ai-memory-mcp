@@ -852,7 +852,11 @@ mod tests {
             confidence: 1.0,
             source: "test".to_string(),
             access_count: 0,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+            // created_at is `now` so the #1466 tier-default expiry
+            // backfill on this Mid row (created_at + 7d) lands in the
+            // future and the row survives the sync pull; updated_at stays
+            // far-future so it still classifies as the "newer" side.
+            created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: "2099-01-01T00:00:00Z".to_string(),
             last_accessed_at: None,
             expires_at: None,

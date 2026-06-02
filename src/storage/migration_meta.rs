@@ -448,6 +448,22 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
         reversible: true,
         data_loss_risk: DataLossRisk::None,
     },
+    // v0.7.0 #1466 — one-shot backfill of tier-default expiry on legacy
+    // immortal rows (mid/short rows persisted with a NULL `expires_at`
+    // before the write-path chokepoint fix landed). Both backends apply
+    // it: sqlite via a parameterised UPDATE arm, postgres via the
+    // `migrate_v54` twin — the interval is derived from
+    // `Tier::default_ttl_secs()` (no literal). Idempotent (only NULL-
+    // expiry rows match; a second pass updates nothing). NOT reversible:
+    // the original NULL set is unrecoverable once stamped, but no column
+    // or table is dropped, so the data-loss class is `None`.
+    MigrationMeta {
+        version: crate::storage::migrations::current_schema_version(),
+        name: "BACKFILL_NULL_EXPIRY_TIER_DEFAULT",
+        idempotent: true,
+        reversible: false,
+        data_loss_risk: DataLossRisk::None,
+    },
 ];
 
 /// Look up the metadata for a target schema version.

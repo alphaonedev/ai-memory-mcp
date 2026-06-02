@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 53).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 54).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -551,7 +551,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       eliminated; `touch_many` for K=10 recalls drops 5-10x wall
 //       cost. Pure DDL — DROP TRIGGER + recreate with `AFTER UPDATE
 //       OF title, content, tags` column scope. Idempotent.
-const CURRENT_SCHEMA_VERSION: i64 = 53;
+/// Current schema tip — the single source of truth for the sqlite
+/// schema version. The literal lives HERE and nowhere else on the
+/// sqlite side; every migration arm/gate/stamp/meta entry references
+/// this constant (or the `current_schema_version()` accessor) by name,
+/// so no call site carries a bare version literal. The latest migration
+/// always targets THIS tip, so its ladder arm gates on
+/// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
+const CURRENT_SCHEMA_VERSION: i64 = 54;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -2225,6 +2232,41 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v0.7.0 #1466 — one-shot backfill of tier-default expiry on
+            // legacy immortal rows. Before the write-path chokepoint fix,
+            // every internally-minted mid/short memory built with
+            // `expires_at: None` landed with a NULL expiry, which GC
+            // (`expires_at IS NOT NULL AND expires_at < now`) can never
+            // reap. Stamp those rows with `created_at + tier-default TTL`
+            // so they age out on the next sweep.
+            //
+            // The interval is derived from `Tier::default_ttl_secs()` — the
+            // SAME SSOT the write path uses — and bound as a parameter, so
+            // the backfill can never drift from the canonical per-tier TTL
+            // and carries no hardcoded interval literal. `long` rows have no
+            // TTL (`default_ttl_secs() == None`) and are left NULL.
+            //
+            // `strftime` emits `YYYY-MM-DDTHH:MM:SS+00:00` — the same
+            // RFC3339 shape `Utc::now().to_rfc3339()` produces — so the
+            // lexical comparison in `gc()` stays monotonic. Idempotent:
+            // only NULL-expiry rows are touched, so a re-run finds none.
+            for tier in [
+                crate::models::Tier::Mid,
+                crate::models::Tier::Short,
+                crate::models::Tier::Long,
+            ] {
+                if let Some(ttl_secs) = tier.default_ttl_secs() {
+                    conn.execute(
+                        "UPDATE memories \
+                            SET expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', created_at, ?1) \
+                          WHERE expires_at IS NULL AND tier = ?2",
+                        params![format!("+{ttl_secs} seconds"), tier.as_str()],
+                    )?;
+                }
+            }
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -2493,6 +2535,104 @@ mod tests {
         .unwrap();
         super::migrate(&conn).expect("migrate v28->v29 ok");
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v54_backfills_null_expiry_on_non_long_rows() {
+        // #1466 — the v54 backlog migration stamps `created_at +
+        // tier-default TTL` onto legacy immortal rows (NULL expiry on
+        // mid/short), leaving long NULL. Build rows at the current
+        // schema, force them to the pre-fix immortal state (NULL
+        // expiry), rewind the version stamp by one, and re-run migrate
+        // so only the terminal v54 arm executes.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        let created = "2026-01-01T00:00:00+00:00";
+        for (id, tier) in [("mid1", "mid"), ("short1", "short"), ("long1", "long")] {
+            conn.execute(
+                "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, expires_at) \
+                 VALUES (?1, ?2, 'ns', ?1, 'c', ?3, ?3, NULL)",
+                params![id, tier, created],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION - 1],
+        )
+        .unwrap();
+
+        super::migrate(&conn).expect("v54 backfill arm runs");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        let expiry = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT expires_at FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let gap = |id: &str| -> i64 {
+            let exp = expiry(id).expect("non-long row must be backfilled");
+            let base = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+            let got = chrono::DateTime::parse_from_rfc3339(&exp).unwrap();
+            (got - base).num_seconds()
+        };
+        assert_eq!(gap("mid1"), crate::SECS_PER_WEEK, "mid backfill = +1w");
+        assert_eq!(
+            gap("short1"),
+            6 * crate::SECS_PER_HOUR,
+            "short backfill = +6h"
+        );
+        assert!(expiry("long1").is_none(), "long has no TTL — stays NULL");
+    }
+
+    #[test]
+    fn migrate_v54_is_idempotent_on_already_stamped_rows() {
+        // A second pass must not move an already-stamped expiry: the arm
+        // only touches `expires_at IS NULL` rows. Run the full ladder
+        // (which lands the backfill), capture the value, rewind + re-run,
+        // and assert the expiry is unchanged.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        let created = "2026-01-01T00:00:00+00:00";
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, expires_at) \
+             VALUES ('m', 'mid', 'ns', 't', 'c', ?1, ?1, NULL)",
+            params![created],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION - 1],
+        )
+        .unwrap();
+        super::migrate(&conn).expect("first v54 pass");
+        let first: String = conn
+            .query_row("SELECT expires_at FROM memories WHERE id='m'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION - 1],
+        )
+        .unwrap();
+        super::migrate(&conn).expect("second v54 pass");
+        let second: String = conn
+            .query_row("SELECT expires_at FROM memories WHERE id='m'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "idempotent: already-stamped expiry must not move"
+        );
     }
 
     #[test]
