@@ -230,7 +230,8 @@ Expected log lines, in rough order:
 [INFO] migration v51 applied (federation_nonces persistence)
 [INFO] migration v52 applied (transcript_line_dedup #1389 L4)
 [INFO] migration v53 applied (memories_au FTS trigger scoping #1418)
-[INFO] schema_version=53 — ladder complete
+[INFO] migration v54 applied (tier-default expiry backfill #1466)
+[INFO] schema_version=54 — ladder complete
 [INFO] HTTP API listening on 127.0.0.1:9077
 [INFO] MCP stdio dispatch ready
 ```
