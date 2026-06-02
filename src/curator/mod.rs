@@ -1922,6 +1922,11 @@ fn apply_rollback_handles_storage_error() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let conn = db::open(tmp.path()).unwrap();
 
+    // created_at is `now` so the #1466 tier-default expiry backfill on
+    // this Mid row (created_at + 7d) lands in the future and the row
+    // stays listable; a fixed past date would backfill to an already-
+    // expired stamp and `db::list` would filter it out.
+    let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {
         id: "m1".to_string(),
         tier: Tier::Mid,
@@ -1933,8 +1938,8 @@ fn apply_rollback_handles_storage_error() {
         confidence: 1.0,
         source: "test".to_string(),
         access_count: 0,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
         last_accessed_at: None,
         expires_at: None,
         metadata: serde_json::json!({}),

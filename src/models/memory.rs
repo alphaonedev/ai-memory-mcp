@@ -576,6 +576,36 @@ impl Memory {
     /// `MemoryLinkRelation::COUNT` + `EXPECTED_CLI_SUBCOMMANDS_*`
     /// drift-blocker pattern landed in commits 960578cfd + 233e8a247.
     pub const FIELD_COUNT: usize = 26;
+
+    /// v0.7.0 #1466 — the `expires_at` value a fresh store must persist.
+    /// An explicit value the caller supplied wins; otherwise a non-`Long`
+    /// row is stamped with `created_at + Tier::default_ttl_secs()` so it
+    /// is reapable by GC (`expires_at IS NOT NULL AND expires_at < now`).
+    /// `Long` rows have no TTL and stay immortal (returns `None`).
+    ///
+    /// Single SSOT for the tier-default backfill across every store
+    /// backend (SQLite `storage::insert` + the `insert_with_conflict` /
+    /// `insert_if_newer` / `consolidate` siblings, and the Postgres
+    /// `store` path). Before this, those paths bound `expires_at`
+    /// verbatim, so any internal caller that hand-built a `mid`/`short`
+    /// Memory with `expires_at: None` created an immortal row GC could
+    /// never collect. The interval comes from `Tier::default_ttl_secs()`
+    /// — no hardcoded TTL literal — so it can never drift from the
+    /// canonical per-tier TTL. Output mirrors the normal store path
+    /// (`to_rfc3339`) so the string comparison in `gc()` stays
+    /// monotonic; a malformed `created_at` falls back to `now` rather
+    /// than silently dropping the expiry.
+    #[must_use]
+    pub fn effective_expires_at(&self) -> Option<String> {
+        if self.expires_at.is_some() {
+            return self.expires_at.clone();
+        }
+        let ttl = self.tier.default_ttl_secs()?;
+        let base = chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+        Some((base + chrono::Duration::seconds(ttl)).to_rfc3339())
+    }
 }
 
 /// Default for [`Memory::version`] on rows that pre-date schema v45
@@ -1452,6 +1482,92 @@ mod tests {
     fn tier_rank_orders_short_mid_long() {
         assert!(Tier::Short.rank() < Tier::Mid.rank());
         assert!(Tier::Mid.rank() < Tier::Long.rank());
+    }
+
+    // #1466 — `effective_expires_at` is the single SSOT backfill used by
+    // every store path. These pin the immortal-row regression: a non-Long
+    // memory with `expires_at: None` must come back stamped at
+    // `created_at + Tier::default_ttl_secs()`, Long stays None, and an
+    // explicit value is preserved verbatim.
+
+    #[test]
+    fn effective_expires_at_backfills_mid_at_created_plus_one_week() {
+        let mut m = Memory::default();
+        m.tier = Tier::Mid;
+        m.created_at = "2026-01-01T00:00:00+00:00".to_string();
+        m.expires_at = None;
+        let got = m.effective_expires_at().expect("mid must backfill");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&got).unwrap();
+        let base = chrono::DateTime::parse_from_rfc3339(&m.created_at).unwrap();
+        assert_eq!(
+            (parsed - base).num_seconds(),
+            crate::SECS_PER_WEEK,
+            "mid backfill must equal created_at + SECS_PER_WEEK"
+        );
+    }
+
+    #[test]
+    fn effective_expires_at_backfills_short_at_created_plus_six_hours() {
+        let mut m = Memory::default();
+        m.tier = Tier::Short;
+        m.created_at = "2026-01-01T00:00:00+00:00".to_string();
+        m.expires_at = None;
+        let got = m.effective_expires_at().expect("short must backfill");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&got).unwrap();
+        let base = chrono::DateTime::parse_from_rfc3339(&m.created_at).unwrap();
+        assert_eq!(
+            (parsed - base).num_seconds(),
+            6 * crate::SECS_PER_HOUR,
+            "short backfill must equal created_at + 6h"
+        );
+    }
+
+    #[test]
+    fn effective_expires_at_long_stays_none() {
+        let mut m = Memory::default();
+        m.tier = Tier::Long;
+        m.created_at = "2026-01-01T00:00:00+00:00".to_string();
+        m.expires_at = None;
+        assert_eq!(
+            m.effective_expires_at(),
+            None,
+            "long has no TTL — must stay immortal"
+        );
+    }
+
+    #[test]
+    fn effective_expires_at_preserves_explicit_value() {
+        let explicit = "2027-06-15T12:00:00+00:00".to_string();
+        for tier in [Tier::Short, Tier::Mid, Tier::Long] {
+            let mut m = Memory::default();
+            m.tier = tier;
+            m.created_at = "2026-01-01T00:00:00+00:00".to_string();
+            m.expires_at = Some(explicit.clone());
+            assert_eq!(
+                m.effective_expires_at(),
+                Some(explicit.clone()),
+                "an explicit expiry must win over the tier default"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_expires_at_output_is_rfc3339_for_lexical_gc_compare() {
+        // gc() compares `expires_at < now` as rfc3339 STRINGS, so the
+        // backfill must emit the same `...THH:MM:SS+00:00` shape
+        // `Utc::now().to_rfc3339()` produces — never a space-separated
+        // SQLite datetime() form (which would sort wrong).
+        let mut m = Memory::default();
+        m.tier = Tier::Mid;
+        m.created_at = "2026-01-01T00:00:00+00:00".to_string();
+        m.expires_at = None;
+        let got = m.effective_expires_at().unwrap();
+        assert!(got.contains('T'), "must be ISO 'T'-separated: {got}");
+        assert!(!got.contains(' '), "must not contain a space: {got}");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&got).is_ok(),
+            "must round-trip through rfc3339 parse: {got}"
+        );
     }
 
     #[test]

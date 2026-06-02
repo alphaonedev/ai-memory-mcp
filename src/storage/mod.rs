@@ -701,7 +701,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
         params![
             mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
             tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
             metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
             mem.entity_id, mem.persona_version,
             citations_json, mem.source_uri, source_span_json,
@@ -966,7 +966,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+                    mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
                     metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
@@ -4032,10 +4032,15 @@ pub fn consolidate(
         };
         consult_governance_pre_write(&candidate)?;
 
+        // v0.7.0 #1466 — consolidate mints a fresh memory via this raw
+        // INSERT, so it must carry the tier-default expiry too; otherwise a
+        // consolidated mid/short row would be immortal (NULL expires_at) and
+        // never reaped by GC. `candidate.created_at == now` so the backfill
+        // here matches the `?10` bound below.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11)",
-            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, metadata_json],
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12)",
+            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json],
         )?;
 
         // Delete source memories first. Note: we intentionally do NOT create
@@ -6851,7 +6856,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         params![
             mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
             tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.expires_at,
+            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
             metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
             mem.entity_id, mem.persona_version,
             citations_json, mem.source_uri, source_span_json,
@@ -10488,6 +10493,111 @@ mod tests {
         let conn = test_db();
         let got = get(&conn, "nonexistent-id").unwrap();
         assert!(got.is_none());
+    }
+
+    // #1466 — write-path chokepoint regression. A non-Long memory handed
+    // to any insert path with `expires_at: None` must land with a
+    // tier-default expiry so GC (`expires_at IS NOT NULL AND expires_at <
+    // now`) can eventually reap it; before the fix it landed NULL =
+    // immortal. Long stays NULL; an explicit expiry is preserved.
+
+    fn ttl_gap_secs(created_at: &str, expires_at: &str) -> i64 {
+        let base = chrono::DateTime::parse_from_rfc3339(created_at).unwrap();
+        let exp = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
+        (exp - base).num_seconds()
+    }
+
+    #[test]
+    fn insert_backfills_mid_expiry_when_none() {
+        let conn = test_db();
+        let mut mem = make_memory("mid none", "test", Tier::Mid, 5);
+        mem.expires_at = None;
+        let id = insert(&conn, &mem).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        let exp = got.expires_at.expect("mid must not land immortal");
+        assert_eq!(ttl_gap_secs(&got.created_at, &exp), crate::SECS_PER_WEEK);
+    }
+
+    #[test]
+    fn insert_backfills_short_expiry_when_none() {
+        let conn = test_db();
+        let mut mem = make_memory("short none", "test", Tier::Short, 5);
+        mem.expires_at = None;
+        let id = insert(&conn, &mem).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        let exp = got.expires_at.expect("short must not land immortal");
+        assert_eq!(
+            ttl_gap_secs(&got.created_at, &exp),
+            6 * crate::SECS_PER_HOUR
+        );
+    }
+
+    #[test]
+    fn insert_leaves_long_expiry_none() {
+        let conn = test_db();
+        let mut mem = make_memory("long none", "test", Tier::Long, 5);
+        mem.expires_at = None;
+        let id = insert(&conn, &mem).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert!(got.expires_at.is_none(), "long has no TTL — must stay NULL");
+    }
+
+    #[test]
+    fn insert_preserves_explicit_expiry() {
+        let conn = test_db();
+        let explicit = "2027-06-15T12:00:00+00:00".to_string();
+        let mut mem = make_memory("mid explicit", "test", Tier::Mid, 5);
+        mem.expires_at = Some(explicit.clone());
+        let id = insert(&conn, &mem).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.expires_at, Some(explicit));
+    }
+
+    #[test]
+    fn insert_with_conflict_backfills_mid_expiry_when_none() {
+        let conn = test_db();
+        let mut mem = make_memory("conflict mid", "test", Tier::Mid, 5);
+        mem.expires_at = None;
+        let id = insert_with_conflict(&conn, &mem, ConflictMode::Merge).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        let exp = got.expires_at.expect("mid must not land immortal");
+        assert_eq!(ttl_gap_secs(&got.created_at, &exp), crate::SECS_PER_WEEK);
+    }
+
+    #[test]
+    fn insert_if_newer_backfills_mid_expiry_when_none() {
+        let conn = test_db();
+        let mut mem = make_memory("newer mid", "test", Tier::Mid, 5);
+        mem.expires_at = None;
+        let id = insert_if_newer(&conn, &mem).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        let exp = got.expires_at.expect("mid must not land immortal");
+        assert_eq!(ttl_gap_secs(&got.created_at, &exp), crate::SECS_PER_WEEK);
+    }
+
+    #[test]
+    fn consolidate_backfills_mid_expiry() {
+        let conn = test_db();
+        let a = make_memory("src a", "test", Tier::Mid, 5);
+        let b = make_memory("src b", "test", Tier::Mid, 5);
+        let id_a = insert(&conn, &a).unwrap();
+        let id_b = insert(&conn, &b).unwrap();
+        let new_id = consolidate(
+            &conn,
+            &[id_a, id_b],
+            "merged",
+            "summary body",
+            "test",
+            &Tier::Mid,
+            "test",
+            "agent-x",
+        )
+        .unwrap();
+        let got = get(&conn, &new_id).unwrap().unwrap();
+        let exp = got
+            .expires_at
+            .expect("consolidated mid must not land immortal");
+        assert_eq!(ttl_gap_secs(&got.created_at, &exp), crate::SECS_PER_WEEK);
     }
 
     #[test]

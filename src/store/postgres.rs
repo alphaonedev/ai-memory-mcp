@@ -430,7 +430,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       the schema-version reach — the SQLite/postgres
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep so a
 //       single logical schema number tracks both adapters.
-const CURRENT_SCHEMA_VERSION: i32 = 53;
+const CURRENT_SCHEMA_VERSION: i32 = 54;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1169,6 +1169,9 @@ impl PostgresStore {
         }
         if current_version < 53 {
             self.migrate_v53().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v54().await?;
         }
 
         Ok(())
@@ -2213,6 +2216,54 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v53 applied (#1418: memories_au column-scope is sqlite-only; no-op postgres DDL)"
+        );
+        Ok(())
+    }
+
+    /// v54 (#1466) — backfill tier-default expiry on legacy immortal
+    /// rows. Postgres twin of the SQLite v54 backfill: before the
+    /// write-path chokepoint fix, every internally-minted mid/short
+    /// memory persisted with `expires_at: None` landed with a NULL
+    /// expiry that the TTL sweep can never reap. Stamp those rows with
+    /// `created_at + tier-default TTL` so they age out on the next sweep.
+    ///
+    /// The interval is derived from `Tier::default_ttl_secs()` — the
+    /// SAME SSOT the write path uses — and bound as a parameter, so the
+    /// backfill carries no hardcoded interval literal and can never
+    /// drift from the canonical per-tier TTL. `long` rows have no TTL
+    /// (`default_ttl_secs() == None`) and are left NULL. Idempotent:
+    /// only NULL-expiry rows are touched, so a re-run finds none.
+    async fn migrate_v54(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v54 tx", e))?;
+
+        for tier in [Tier::Mid, Tier::Short, Tier::Long] {
+            if let Some(ttl_secs) = tier.default_ttl_secs() {
+                sqlx::query(
+                    "UPDATE memories \
+                        SET expires_at = created_at + ($1 || ' seconds')::interval \
+                      WHERE expires_at IS NULL AND tier = $2",
+                )
+                .bind(ttl_secs.to_string())
+                .bind(tier.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v54 backfill expires_at", e))?;
+            }
+        }
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v54 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v54 applied (#1466: backfilled tier-default expiry on NULL-expiry mid/short rows)"
         );
         Ok(())
     }
@@ -7345,7 +7396,10 @@ impl MemoryStore for PostgresStore {
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
         let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
-        let expires_at = parse_rfc3339_opt(memory.expires_at.as_deref());
+        // v0.7.0 #1466 — backfill the tier-default expiry so a hand-built
+        // mid/short Memory with `expires_at: None` is reapable, matching the
+        // SQLite `storage::insert` chokepoint. Shared SSOT on `Memory`.
+        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
                 detail: format!("serialize tags: {e}"),
@@ -7570,7 +7624,10 @@ impl MemoryStore for PostgresStore {
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
         let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
-        let expires_at = parse_rfc3339_opt(memory.expires_at.as_deref());
+        // v0.7.0 #1466 — backfill the tier-default expiry so a hand-built
+        // mid/short Memory with `expires_at: None` is reapable, matching the
+        // SQLite `storage::insert` chokepoint. Shared SSOT on `Memory`.
+        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
                 detail: format!("serialize tags: {e}"),
@@ -7752,7 +7809,10 @@ impl MemoryStore for PostgresStore {
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
         let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
-        let expires_at = parse_rfc3339_opt(memory.expires_at.as_deref());
+        // v0.7.0 #1466 — backfill the tier-default expiry so a hand-built
+        // mid/short Memory with `expires_at: None` is reapable, matching the
+        // SQLite `storage::insert` chokepoint. Shared SSOT on `Memory`.
+        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
                 detail: format!("serialize tags: {e}"),
@@ -8528,7 +8588,10 @@ impl MemoryStore for PostgresStore {
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
         let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
-        let expires_at = parse_rfc3339_opt(memory.expires_at.as_deref());
+        // v0.7.0 #1466 — backfill the tier-default expiry so a hand-built
+        // mid/short Memory with `expires_at: None` is reapable, matching the
+        // SQLite `storage::insert` chokepoint. Shared SSOT on `Memory`.
+        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
                 detail: format!("serialize tags: {e}"),
