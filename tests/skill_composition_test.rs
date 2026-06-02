@@ -145,8 +145,17 @@ fn seed_reflection(
     // Patch access_count + created_at to model the historical state we want.
     // `created_at` matters for the recency term; `access_count` is the
     // recall_count proxy.
+    //
+    // `expires_at` is forced NULL: `db::insert` stamps a tier-default
+    // expiry of `created_at + Tier::Mid TTL` (7d) via
+    // `Memory::effective_expires_at` (#1466 SSOT backfill). With a
+    // back-dated `created_at` (e.g. 30d/300d ago) that lands the row
+    // already-expired, so the compositional-context handler's
+    // `expires_at > now` filter would silently drop every historical
+    // reflection — modelling a persisted (post-promotion) reflection
+    // means it must not carry a stale TTL.
     conn.execute(
-        "UPDATE memories SET access_count = ?1, created_at = ?2 WHERE id = ?3",
+        "UPDATE memories SET access_count = ?1, created_at = ?2, expires_at = NULL WHERE id = ?3",
         rusqlite::params![access_count, created.to_rfc3339(), id],
     )
     .expect("update reflection metadata");
