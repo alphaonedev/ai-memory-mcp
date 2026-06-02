@@ -42,7 +42,7 @@ agents and humans always know exactly what's loaded and what's configured.
 ```
 
 > DOC-4 (med/low review batch) — example version + schema bumped to
-> match the v0.7.0 substrate (`CURRENT_SCHEMA_VERSION = 53`). The
+> match the v0.7.0 substrate (`CURRENT_SCHEMA_VERSION = 54`). The
 > pre-v0.7.0 example showed v0.6.3 / schema v19, which was 32
 > migrations behind the substrate and 2+ major releases behind the
 > daemon binary integrators land on today.
