@@ -58,6 +58,18 @@ fn make_corpus(namespace: &str) -> Vec<Memory> {
             let alpha = "alpha ".repeat(i + 1);
             let content =
                 format!("{alpha} memory body number {i} with mixed tokens beta gamma delta");
+            // Pin an explicit far-future expiry. Short-tier rows whose
+            // `expires_at` is None inherit the SHORT_TTL backstop
+            // (created_at + 6h) via `Memory::effective_expires_at`
+            // (#1466, shared SSOT across both backends). Because the
+            // corpus deliberately back-dates `created_at` up to 49h to
+            // exercise the recency ranking factor, ~24 of the 30
+            // short-tier rows would otherwise be born already-expired
+            // and never surface — making the "every alpha-bearing row"
+            // assertion below fail at 26/50. An explicit expiry is
+            // returned verbatim by `effective_expires_at`, decoupling
+            // the age signal from reapability so all 50 rows persist.
+            let expires_at = Some((now + chrono::Duration::days(365)).to_rfc3339());
             Memory {
                 id: format!("p-{i:02}"),
                 tier,
@@ -72,7 +84,7 @@ fn make_corpus(namespace: &str) -> Vec<Memory> {
                 created_at: updated_rfc.clone(),
                 updated_at: updated_rfc,
                 last_accessed_at: None,
-                expires_at: None,
+                expires_at,
                 metadata: serde_json::json!({"agent_id": "ai:recall-parity"}),
                 reflection_depth: 0,
                 memory_kind: ai_memory::models::MemoryKind::Observation,
