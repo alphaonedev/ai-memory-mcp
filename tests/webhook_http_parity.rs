@@ -57,6 +57,22 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::subscriptions::{self, NewSubscription};
 
+/// #1478 — upper bound on how long each lifecycle-parity test waits for
+/// the dispatched POST to land at the wiremock sink. Generous so a slow
+/// host under full-suite `--features sal` HTTP contention — where the
+/// `std::thread::spawn`-detached dispatch (`src/subscriptions.rs`) plus
+/// the `Connection::open` reopen and first-call cold root-cert TLS init
+/// can take several seconds — still observes the POST within it. A
+/// genuine dispatch-drop never reaches the sink and still trips this
+/// deadline, so detection power is preserved. Mirrors the #1477
+/// `SINK_POLL_DEADLINE` / #1475 `DRAIN_DEADLINE` convention (the prior
+/// inline 5s budget was too tight and flaked under full-suite
+/// saturation; the stale "within 2s" panic strings predated even that).
+const WEBHOOK_RECEIPT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// #1478 — poll cadence while waiting for the dispatched POST to arrive.
+const WEBHOOK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 // --------------------------------------------------------------------
 // Test harness
 // --------------------------------------------------------------------
@@ -213,7 +229,7 @@ async fn wait_for_event(
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(WEBHOOK_POLL_INTERVAL).await;
     }
 }
 
@@ -285,12 +301,13 @@ async fn webhook_fires_on_http_delete() {
         .await;
     assert_eq!(status, StatusCode::OK, "delete should succeed");
 
-    // Windows CI is consistently slower than Linux/macOS on the
-    // std::thread::spawn dispatch + Connection::open cycle. 5s gives
-    // enough headroom on every supported platform.
-    let req = wait_for_event(&mock, "memory_delete", &mock_path, Duration::from_secs(5))
+    let req = wait_for_event(&mock, "memory_delete", &mock_path, WEBHOOK_RECEIPT_DEADLINE)
         .await
-        .expect("memory_delete webhook must fire on HTTP DELETE within 2s");
+        .unwrap_or_else(|| {
+            panic!(
+                "memory_delete webhook must fire on HTTP DELETE within {WEBHOOK_RECEIPT_DEADLINE:?}"
+            )
+        });
 
     // Validate the event payload shape matches the MCP precedent.
     let body: Value = serde_json::from_slice(&req.body).expect("payload is valid JSON");
@@ -318,9 +335,18 @@ async fn webhook_fires_on_http_promote() {
         .await;
     assert_eq!(status, StatusCode::OK, "promote should succeed");
 
-    let req = wait_for_event(&mock, "memory_promote", &mock_path, Duration::from_secs(5))
-        .await
-        .expect("memory_promote webhook must fire on HTTP promote within 2s");
+    let req = wait_for_event(
+        &mock,
+        "memory_promote",
+        &mock_path,
+        WEBHOOK_RECEIPT_DEADLINE,
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "memory_promote webhook must fire on HTTP promote within {WEBHOOK_RECEIPT_DEADLINE:?}"
+        )
+    });
 
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_promote");
@@ -355,10 +381,14 @@ async fn webhook_fires_on_http_link_created() {
         &mock,
         "memory_link_created",
         &mock_path,
-        Duration::from_secs(5),
+        WEBHOOK_RECEIPT_DEADLINE,
     )
     .await
-    .expect("memory_link_created webhook must fire on HTTP link within 2s");
+    .unwrap_or_else(|| {
+        panic!(
+            "memory_link_created webhook must fire on HTTP link within {WEBHOOK_RECEIPT_DEADLINE:?}"
+        )
+    });
 
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_link_created");
@@ -402,10 +432,12 @@ async fn webhook_fires_on_http_consolidate() {
         &mock,
         "memory_consolidated",
         &mock_path,
-        Duration::from_secs(5),
+        WEBHOOK_RECEIPT_DEADLINE,
     )
     .await
-    .expect("memory_consolidated webhook must fire on HTTP consolidate within 2s");
+    .unwrap_or_else(|| {
+        panic!("memory_consolidated webhook must fire on HTTP consolidate within {WEBHOOK_RECEIPT_DEADLINE:?}")
+    });
 
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_consolidated");
