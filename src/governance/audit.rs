@@ -1445,10 +1445,18 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fresh_init(tmp.path(), None);
+        // Test-unique actor so the assertion counts only OUR rows. The
+        // forensic SINK is process-global but `test_lock()` only
+        // serialises audit-module tests, so a concurrent non-audit
+        // `record_decision` can append a foreign row into this tmpdir's
+        // file during the flush window (observed on macos CI: 26 lines vs
+        // 25 enqueued). Counting by actor pins the load-bearing claim —
+        // every enqueued row of OURS drained — without an exact total.
+        let actor = "ai:flush-durable-test";
         let n = 25;
         for i in 0..n {
             record_decision(
-                "ai:t",
+                actor,
                 "allow",
                 "bash",
                 "R001",
@@ -1460,8 +1468,12 @@ mod tests {
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let path = tmp.path().join(format!("forensic-{date}.jsonl"));
         let body = std::fs::read_to_string(&path).expect("file written by background writer");
-        let lines = body.lines().filter(|l| !l.trim().is_empty()).count();
-        assert_eq!(lines, n, "every enqueued row drained to disk");
+        let ours = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<ForensicDecision>(l).ok())
+            .filter(|row| row.actor == actor)
+            .count();
+        assert_eq!(ours, n, "every enqueued row drained to disk");
         shutdown();
     }
 
