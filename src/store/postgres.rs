@@ -6465,6 +6465,20 @@ impl PostgresStore {
     }
 }
 
+/// #1473 — sargable namespace equality predicate for `list()`. Emitted
+/// when the caller supplies an explicit namespace; the bare `= $1`
+/// equality is recognized as an `Index Cond` on `memories_namespace_idx`
+/// even under sqlx's generic prepared-statement plan.
+const NS_FILTER_SARGABLE: &str = "namespace = $1";
+
+/// #1473 — OR-NULL optional namespace predicate for `list()`. Emitted
+/// only when the caller passes NO namespace, where it is a no-op (an
+/// unfiltered list has no index to exploit, so the OR-NULL form costs
+/// nothing the equality form would save). Never use this form when a
+/// namespace IS present — under the generic plan it degrades to a Seq
+/// Scan (the #1473 defect).
+const NS_FILTER_OPTIONAL: &str = "($1::text IS NULL OR namespace = $1)";
+
 /// Exclusive upper bound for a byte-ordered prefix range: the smallest
 /// string strictly greater than every string starting with `prefix`.
 ///
@@ -8181,9 +8195,27 @@ impl MemoryStore for PostgresStore {
         // correctly (a privacy/NHI leak + permission-by-side-effect
         // divergence between the two backends). The new $7 binding
         // matches sqlite's `db::list` shape.
-        let rows = sqlx::query(
+        // #1473 — make the namespace filter sargable. The OR-NULL
+        // optional-filter idiom `($1 IS NULL OR namespace = $1)` is
+        // non-sargable under sqlx's generic prepared-statement plan:
+        // the planner can't prove at plan time that `$1` is non-null,
+        // so it emits a Seq Scan even when the caller passes an explicit
+        // namespace — a full-table scan on every namespace-filtered
+        // read. When a namespace IS supplied we emit the bare equality
+        // `namespace = $1`, which the planner turns into an `Index Cond`
+        // on `memories_namespace_idx`. Exact-match semantics are
+        // preserved — this is equality, NOT the prefix byte-range band
+        // `list_by_namespace_prefix` uses. When namespace is absent we
+        // keep the OR-NULL no-op form: an unfiltered list has no index
+        // to use, so the scan is unavoidable and correct.
+        let ns_predicate = if filter.namespace.is_some() {
+            NS_FILTER_SARGABLE
+        } else {
+            NS_FILTER_OPTIONAL
+        };
+        let list_sql = format!(
             "SELECT * FROM memories
-             WHERE ($1::text IS NULL OR namespace = $1)
+             WHERE {ns_predicate}
                AND ($2::text IS NULL OR tier = $2)
                AND (expires_at IS NULL OR expires_at > NOW())
                AND ($3::timestamptz IS NULL OR created_at >= $3)
@@ -8196,18 +8228,19 @@ impl MemoryStore for PostgresStore {
                )
                AND ($7::text IS NULL OR metadata->>'agent_id' = $7)
              ORDER BY priority DESC, updated_at DESC
-             LIMIT $5",
-        )
-        .bind(filter.namespace.as_ref())
-        .bind(filter.tier.as_ref().map(Tier::as_str))
-        .bind(filter.since)
-        .bind(filter.until)
-        .bind(limit)
-        .bind(caller_opt)
-        .bind(filter.agent_id.as_ref())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("list", e))?;
+             LIMIT $5"
+        );
+        let rows = sqlx::query(&list_sql)
+            .bind(filter.namespace.as_ref())
+            .bind(filter.tier.as_ref().map(Tier::as_str))
+            .bind(filter.since)
+            .bind(filter.until)
+            .bind(limit)
+            .bind(caller_opt)
+            .bind(filter.agent_id.as_ref())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list", e))?;
 
         // Belt-and-suspenders: re-apply the predicate in-process so a
         // hypothetical SQL drift between the WHERE clause above and
