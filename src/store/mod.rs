@@ -526,6 +526,33 @@ pub trait MemoryStore: Send + Sync {
         self.store(ctx, memory).await
     }
 
+    /// Store many memories in as few round-trips as the backend allows
+    /// (#1481). Returns the upserted ids in input order.
+    ///
+    /// Contract: callers MUST pre-validate and pre-govern each row
+    /// (the bulk HTTP path filters Deny/Pending/validation failures out
+    /// before calling). This method is the persistence primitive only —
+    /// it is atomic (all rows commit or none do), so a single row that
+    /// fails to persist rolls the whole batch back.
+    ///
+    /// The default implementation loops [`store`](Self::store) so every
+    /// adapter is correct without an override; SQLite inherits it
+    /// unchanged because its writes are in-process (no per-row network
+    /// round-trip to amortise). `PostgresStore` overrides this with one
+    /// multi-row `INSERT ... ON CONFLICT` so an N-row bulk ingest costs a
+    /// single round-trip instead of N.
+    async fn store_batch(
+        &self,
+        ctx: &CallerContext,
+        memories: &[Memory],
+    ) -> StoreResult<Vec<String>> {
+        let mut ids = Vec::with_capacity(memories.len());
+        for memory in memories {
+            ids.push(self.store(ctx, memory).await?);
+        }
+        Ok(ids)
+    }
+
     /// Set or clear the embedding column for an existing memory.
     /// v0.7.0 Wave-3 Continuation 5 — federation receivers re-embed
     /// peer-pushed memories via this path so `recall_hybrid` can find

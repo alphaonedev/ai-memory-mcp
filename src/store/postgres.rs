@@ -7457,6 +7457,61 @@ async fn record_memory_quota_in_tx(
     Ok(())
 }
 
+/// #1481 — count-aware sibling of [`record_memory_quota_in_tx`] for the
+/// batch path. Increments `current_memories_today` by `memories_added`
+/// and `current_storage_bytes` by the pre-summed `bytes_added` in a
+/// single statement, so an N-row bulk ingest by one `(agent, namespace)`
+/// pair costs ONE quota round-trip instead of N. The day-rollover reset
+/// logic is identical to the single-row form; only the increment width
+/// differs (`+ $8` rather than the literal `+ 1`).
+async fn record_memory_quota_batch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent_id: &str,
+    namespace: &str,
+    memories_added: i64,
+    bytes_added: i64,
+) -> StoreResult<()> {
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO agent_quotas (
+             agent_id, namespace,
+             max_memories_per_day, max_storage_bytes, max_links_per_day,
+             current_memories_today, current_storage_bytes, current_links_today,
+             day_started_at, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $8, $6, 0, $7, $7, $7)
+         ON CONFLICT (agent_id, namespace) DO UPDATE SET
+             current_memories_today = CASE
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
+                     THEN agent_quotas.current_memories_today + $8
+                 ELSE $8
+             END,
+             current_links_today = CASE
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
+                     THEN agent_quotas.current_links_today
+                 ELSE 0
+             END,
+             current_storage_bytes = agent_quotas.current_storage_bytes + EXCLUDED.current_storage_bytes,
+             day_started_at = CASE
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
+                     THEN agent_quotas.day_started_at
+                 ELSE $7
+             END,
+             updated_at = $7",
+    )
+    .bind(agent_id)
+    .bind(namespace)
+    .bind(quota_defaults().max_memories_per_day)
+    .bind(quota_defaults().max_storage_bytes)
+    .bind(quota_defaults().max_links_per_day)
+    .bind(bytes_added)
+    .bind(now)
+    .bind(memories_added)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("record agent_quotas batch memory increment", e))?;
+    Ok(())
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
     fn capabilities(&self) -> Capabilities {
@@ -7666,6 +7721,273 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("commit store tx", e))?;
         Ok(id)
+    }
+
+    /// #1481 — single multi-row upsert for the bulk-ingest path. Mirrors
+    /// `store`'s INSERT column list, `ON CONFLICT (title, namespace) DO
+    /// UPDATE` clause, and quota accounting, but binds every row's values
+    /// in ONE statement via `sqlx::QueryBuilder::push_values`, collapsing
+    /// the per-row `2N` round-trips (`store` × N) to `1 + G` (one batch
+    /// INSERT + one quota upsert per distinct `(agent, namespace)` group,
+    /// normally G = 1).
+    ///
+    /// Atomicity: the whole batch + quota updates ride a single
+    /// transaction, so a failure rolls every row back — matching the
+    /// trait contract. Governance is NOT consulted here: the caller
+    /// (`bulk_create`) already enforces it per row and only hands us the
+    /// Allowed set, exactly as the single-row `store` path expects its
+    /// caller to have gated.
+    ///
+    /// Intra-batch dedup: postgres rejects an `ON CONFLICT DO UPDATE`
+    /// whose conflict target `(title, namespace)` is affected twice in
+    /// one command. We therefore keep only the LAST occurrence of each
+    /// `(title, namespace)` — last-write-wins, identical to the final DB
+    /// state a sequential `store` loop would leave — and return its id
+    /// for every input position that collapsed into it.
+    async fn store_batch(
+        &self,
+        ctx: &CallerContext,
+        memories: &[Memory],
+    ) -> StoreResult<Vec<String>> {
+        if memories.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Substrate governance parity: each row still passes the
+        // pre-write hook (the caller's HTTP governance gate is the
+        // namespace `write=` rule; this is the operator-signed substrate
+        // refuse hook that every backend write path consults).
+        for memory in memories {
+            consult_governance_pre_write_pg(memory)?;
+        }
+
+        // Keep the LAST occurrence of each (title, namespace) so the
+        // single INSERT never affects a conflict-target row twice. We
+        // record, for every input row, the id of the row it maps to so
+        // the returned Vec stays aligned with `memories` 1:1.
+        let mut last_index: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::with_capacity(memories.len());
+        for (idx, memory) in memories.iter().enumerate() {
+            last_index.insert((memory.title.as_str(), memory.namespace.as_str()), idx);
+        }
+        let mut keep: Vec<usize> = (0..memories.len())
+            .filter(|idx| {
+                last_index[&(
+                    memories[*idx].title.as_str(),
+                    memories[*idx].namespace.as_str(),
+                )] == *idx
+            })
+            .collect();
+        keep.sort_unstable();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin store_batch tx", e))?;
+
+        let mut builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id
+            ) ",
+        );
+
+        // push_values moves each row's bound values into the builder's
+        // arg buffer; the owned JSON strings below therefore outlive the
+        // statement. Any per-row serialization failure aborts the whole
+        // (atomic) batch — these are infallible-in-practice serde
+        // encodings of already-validated `Memory` fields.
+        let mut push_err: Option<StoreError> = None;
+        builder.push_values(keep.iter().copied(), |mut row, idx| {
+            let memory = &memories[idx];
+            let created_at = match parse_rfc3339_required(&memory.created_at) {
+                Ok(v) => v,
+                Err(e) => {
+                    push_err.get_or_insert(e);
+                    return;
+                }
+            };
+            let updated_at = match parse_rfc3339_required(&memory.updated_at) {
+                Ok(v) => v,
+                Err(e) => {
+                    push_err.get_or_insert(e);
+                    return;
+                }
+            };
+            let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
+            let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
+            let tags_json = match serde_json::to_value(&memory.tags) {
+                Ok(v) => v,
+                Err(e) => {
+                    push_err.get_or_insert(StoreError::IntegrityFailed {
+                        detail: format!("serialize tags: {e}"),
+                    });
+                    return;
+                }
+            };
+            let citations_json = match serde_json::to_string(&memory.citations) {
+                Ok(v) => v,
+                Err(e) => {
+                    push_err.get_or_insert(StoreError::IntegrityFailed {
+                        detail: format!("serialize citations: {e}"),
+                    });
+                    return;
+                }
+            };
+            let source_span_json = match &memory.source_span {
+                Some(span) => match serde_json::to_string(span) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        push_err.get_or_insert(StoreError::IntegrityFailed {
+                            detail: format!("serialize source_span: {e}"),
+                        });
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let confidence_signals_json = match &memory.confidence_signals {
+                Some(s) => match serde_json::to_string(s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        push_err.get_or_insert(StoreError::IntegrityFailed {
+                            detail: format!("serialize confidence_signals: {e}"),
+                        });
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+
+            row.push_bind(memory.id.clone())
+                .push_bind(memory.tier.as_str().to_string())
+                .push_bind(memory.namespace.clone())
+                .push_bind(memory.title.clone())
+                .push_bind(memory.content.clone())
+                .push_bind(tags_json)
+                .push_bind(memory.priority)
+                .push_bind(memory.confidence)
+                .push_bind(memory.source.clone())
+                .push_bind(memory.access_count)
+                .push_bind(created_at)
+                .push_bind(updated_at)
+                .push_bind(last_accessed_at)
+                .push_bind(expires_at)
+                .push_bind(memory.metadata.clone())
+                .push_bind(memory.reflection_depth)
+                .push_bind(memory.memory_kind.as_str().to_string())
+                .push_bind(citations_json)
+                .push_bind(memory.source_uri.clone())
+                .push_bind(source_span_json)
+                .push_bind(memory.confidence_source.as_str().to_string())
+                .push_bind(confidence_signals_json)
+                .push_bind(memory.confidence_decayed_at.clone())
+                .push_bind(mentioned_entity_id);
+        });
+        if let Some(e) = push_err {
+            return Err(e);
+        }
+
+        builder.push(
+            " ON CONFLICT (title, namespace) DO UPDATE SET
+                content = EXCLUDED.content,
+                tier = CASE
+                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                        THEN EXCLUDED.tier
+                    ELSE memories.tier
+                END,
+                tags = EXCLUDED.tags,
+                priority = EXCLUDED.priority,
+                confidence = EXCLUDED.confidence,
+                updated_at = EXCLUDED.updated_at,
+                metadata = CASE
+                    WHEN memories.metadata ? 'agent_id'
+                        THEN jsonb_set(
+                            EXCLUDED.metadata,
+                            '{agent_id}',
+                            memories.metadata -> 'agent_id'
+                        )
+                    ELSE EXCLUDED.metadata
+                END,
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   ELSE EXCLUDED.memory_kind END,
+                citations = EXCLUDED.citations,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = EXCLUDED.confidence_source,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+            RETURNING id, title, namespace",
+        );
+
+        let rows = builder
+            .build()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("store_batch multi-row insert", e))?;
+
+        // Map (title, namespace) -> returned id so every input position
+        // (including the ones that collapsed into a later duplicate) can
+        // resolve to its persisted id in 1:1 input order.
+        let mut id_by_key: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row
+                .try_get("id")
+                .map_err(|e| to_store_err("store_batch read returned id", e))?;
+            let title: String = row
+                .try_get("title")
+                .map_err(|e| to_store_err("store_batch read returned title", e))?;
+            let namespace: String = row
+                .try_get("namespace")
+                .map_err(|e| to_store_err("store_batch read returned namespace", e))?;
+            id_by_key.insert((title, namespace), id);
+        }
+
+        // Quota: one upsert per distinct (quota_agent_id, namespace),
+        // counting every input row (duplicates included — each was a
+        // caller-requested write, matching the sequential `store` count).
+        let mut quota_groups: std::collections::HashMap<(String, String), (i64, i64)> =
+            std::collections::HashMap::new();
+        for memory in memories {
+            let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
+            let entry = quota_groups
+                .entry((quota_agent_id, memory.namespace.clone()))
+                .or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(memory_storage_bytes(memory));
+        }
+        for ((agent_id, namespace), (count, bytes)) in &quota_groups {
+            record_memory_quota_batch_in_tx(&mut tx, agent_id, namespace, *count, *bytes).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit store_batch tx", e))?;
+
+        let mut ids = Vec::with_capacity(memories.len());
+        for memory in memories {
+            let key = (memory.title.clone(), memory.namespace.clone());
+            let id = id_by_key
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| StoreError::IntegrityFailed {
+                    detail: format!(
+                        "store_batch: no RETURNING id for (title, namespace) of memory {}",
+                        memory.id
+                    ),
+                })?;
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// v0.7.0 #1416 / RFC-0001 — L4 layered-capture idempotent write on

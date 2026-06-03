@@ -543,9 +543,14 @@ pub async fn bulk_create(
         // `governance_pending_create` precondition lookup the SAL
         // path runs internally).
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
-        let mut created: usize = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
+        // #1481 — collect the governance-Allowed rows and persist them in
+        // ONE multi-row INSERT via `store_batch`, instead of streaming a
+        // `store()` round-trip per row. Validation / Deny / Pending still
+        // accumulate per row exactly as before; only the persistence of
+        // the surviving rows is batched.
+        let mut allowed: Vec<Memory> = Vec::new();
         for body in bodies {
             if let Err(e) = validate::RequestValidator::validate_create(&body) {
                 // Issue #851: do not echo the caller's title back paired
@@ -665,16 +670,28 @@ pub async fn bulk_create(
                 }
             }
 
-            match app.store.store(&ctx, &mem).await {
-                Ok(_) => created += 1,
+            allowed.push(mem);
+        }
+
+        // #1481 — single batched upsert for every Allowed row. The batch
+        // is atomic: on success each row counts as `created` (matching
+        // the prior per-row semantics, including upserts); on failure the
+        // whole batch rolled back, so all Allowed rows report one
+        // sanitized error rather than partially-applied state.
+        let created: usize = if allowed.is_empty() {
+            0
+        } else {
+            match app.store.store_batch(&ctx, &allowed).await {
+                Ok(ids) => ids.len(),
                 Err(e) => {
-                    // Issue #851: SAL store errors can carry raw
-                    // sqlx/sqlite text. Sanitize before echoing.
-                    tracing::warn!("bulk_create(postgres): store.store failed: {e}");
+                    // Issue #851: SAL store errors can carry raw sqlx
+                    // text. Sanitize before echoing.
+                    tracing::warn!("bulk_create(postgres): store_batch failed: {e}");
                     errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                    0
                 }
             }
-        }
+        };
         return Json(json!({
             "created": created,
             "errors": errors,

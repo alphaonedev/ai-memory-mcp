@@ -129,7 +129,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // hot-path query rewrite plus the migration ladder bookkeeping it
     // requires, no speculative surface. 15_750 = 15_669 + 81 headroom;
     // far under the 1.5x cap.
-    ("src/store/postgres.rs", 15_750),
+    //
+    // 2026-06-03 — bumped 15_750 → 16_080 by the #1481 batch bulk-ingest
+    // fix: the `store_batch` multi-row-upsert override on PostgresStore
+    // (one `QueryBuilder` INSERT ... ON CONFLICT ... RETURNING for the
+    // whole batch, intra-batch (title, namespace) dedup, and id-alignment
+    // back-mapping) plus the count-aware `record_memory_quota_batch_in_tx`
+    // sibling added ~329 LOC, pushing the file to 15_998. Growth is
+    // justified: it collapses the postgres bulk_create path from 2N
+    // round-trips to 1+G on the canonical SAL surface, no speculative
+    // surface. 16_080 = 15_998 + 82 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 16_080),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
