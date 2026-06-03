@@ -1530,6 +1530,46 @@ mod tests {
     }
 
     #[test]
+    fn deferred_check_allow_signs_nothing_on_request_thread() {
+        // Grounds the EXPLAIN-audit slate "Fix #5" premise (move
+        // audit-chain Ed25519 per-row signing off the request thread):
+        // the `memory_store` write path's governance gate
+        // (`storage::GOVERNANCE_PRE_WRITE` -> this fn) performs ZERO
+        // synchronous signing on an ALLOW verdict. Contrast
+        // `check_emits_signed_event`, which proves the SYNCHRONOUS
+        // `check_agent_action` signs + appends a `signed_events` row on
+        // EVERY check (Allow included) — that path is reached only by the
+        // CLI `rules check` one-shot and the explicit
+        // `memory_check_agent_action` tool, never by a memory write.
+        let _forensic = forensic_lock();
+        let conn = fresh_conn();
+        let (queue, _rx) = crate::governance::deferred_audit::DeferredAuditQueue::new();
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".into(),
+            payload: serde_json::json!({"namespace": "anything", "tier": "short"}),
+        };
+        let decision =
+            check_agent_action_deferred_cached(&conn, None, "agent:hotpath", &action, &queue)
+                .unwrap();
+        assert_eq!(decision, Decision::Allow);
+        // No rule matched -> ALLOW -> NOT a refusal -> nothing enqueued
+        // to the off-thread drainer either.
+        assert!(!decision.is_refusal());
+        // The load-bearing assertion: the request thread wrote ZERO
+        // signed_events rows. A regression that re-routed the write-path
+        // gate through the synchronous `emit_check_event` (per-row
+        // Ed25519 sign + chain INSERT) would make this count == 1.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM signed_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "write-path governance gate must not synchronously sign on ALLOW; \
+             per-row Ed25519 signing belongs off the request thread"
+        );
+    }
+
+    #[test]
     fn refuse_short_circuit_still_emits_event() {
         let _forensic = forensic_lock();
         let conn = fresh_conn();
