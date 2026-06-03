@@ -292,7 +292,10 @@ static DAEMON_AUDIT_KEY: OnceLock<SigningKey> = OnceLock::new();
 pub fn try_sign_audit_payload(payload_hash: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     let key = DAEMON_AUDIT_KEY.get()?;
     let sig: Signature = key.sign(payload_hash);
-    Some((sig.to_bytes().to_vec(), "daemon_signed"))
+    Some((
+        sig.to_bytes().to_vec(),
+        crate::models::AttestLevel::DaemonSigned.as_str(),
+    ))
 }
 
 /// `true` when the daemon has installed a process-wide audit-row

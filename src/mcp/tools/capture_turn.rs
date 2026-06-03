@@ -485,7 +485,7 @@ fn verify_host_signature(
     canonical_bytes: &[u8],
 ) -> Result<(Option<Vec<u8>>, String), String> {
     match (req.host_signature_b64.as_deref(), req.host_pubkey_b64.as_deref()) {
-        (None, None) => Ok((None, "self_signed".to_string())),
+        (None, None) => Ok((None, crate::models::AttestLevel::SelfSigned.as_str().to_string())),
         (Some(_), None) | (None, Some(_)) => Err(
             "INVALID_INPUT: host_signature_b64 and host_pubkey_b64 must both be present or both absent"
                 .to_string(),
@@ -520,7 +520,7 @@ fn verify_host_signature(
                     format!("INVALID_INPUT: signature_verification_failed: {e}")
                 })?;
 
-            Ok((Some(sig_bytes), "signed_by_peer".to_string()))
+            Ok((Some(sig_bytes), crate::models::AttestLevel::SignedByPeer.as_str().to_string()))
         }
     }
 }

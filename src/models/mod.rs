@@ -105,8 +105,12 @@ mod tests {
 
     #[test]
     fn attest_level_from_str_canonical_strings() {
-        // The three strings H2/H3 already write to the
-        // `memory_links.attest_level` column must round-trip.
+        // Every canonical wire string a production emit-site writes to
+        // the `attest_level` column must round-trip. All five variants
+        // are covered because #1431 migrated every production emit-site
+        // off raw literals onto `AttestLevel::<Variant>.as_str()` —
+        // SignedByPeer (capture_turn host-signed) and DaemonSigned
+        // (governance audit) are exercised here so the SSOT can't drift.
         assert_eq!(
             AttestLevel::from_str("unsigned"),
             Some(AttestLevel::Unsigned)
@@ -119,6 +123,28 @@ mod tests {
             AttestLevel::from_str("peer_attested"),
             Some(AttestLevel::PeerAttested)
         );
+        assert_eq!(
+            AttestLevel::from_str("signed_by_peer"),
+            Some(AttestLevel::SignedByPeer)
+        );
+        assert_eq!(
+            AttestLevel::from_str("daemon_signed"),
+            Some(AttestLevel::DaemonSigned)
+        );
+    }
+
+    #[test]
+    fn attest_level_as_str_exact_wire_strings() {
+        // SSOT contract: the exact bytes every #1431-migrated production
+        // emit-site now writes. If any arm drifts, the federation
+        // receive path, capture_turn host-signing, the governance audit
+        // chain, persona stamping, skill registration, and reflection
+        // export all silently decouple from the DB column + the parser.
+        assert_eq!(AttestLevel::Unsigned.as_str(), "unsigned");
+        assert_eq!(AttestLevel::SelfSigned.as_str(), "self_signed");
+        assert_eq!(AttestLevel::PeerAttested.as_str(), "peer_attested");
+        assert_eq!(AttestLevel::SignedByPeer.as_str(), "signed_by_peer");
+        assert_eq!(AttestLevel::DaemonSigned.as_str(), "daemon_signed");
     }
 
     #[test]
@@ -135,6 +161,8 @@ mod tests {
             AttestLevel::Unsigned,
             AttestLevel::SelfSigned,
             AttestLevel::PeerAttested,
+            AttestLevel::SignedByPeer,
+            AttestLevel::DaemonSigned,
         ] {
             let s = lvl.as_str();
             assert_eq!(
@@ -150,6 +178,8 @@ mod tests {
         assert_eq!(format!("{}", AttestLevel::Unsigned), "unsigned");
         assert_eq!(format!("{}", AttestLevel::SelfSigned), "self_signed");
         assert_eq!(format!("{}", AttestLevel::PeerAttested), "peer_attested");
+        assert_eq!(format!("{}", AttestLevel::SignedByPeer), "signed_by_peer");
+        assert_eq!(format!("{}", AttestLevel::DaemonSigned), "daemon_signed");
     }
 
     #[test]
