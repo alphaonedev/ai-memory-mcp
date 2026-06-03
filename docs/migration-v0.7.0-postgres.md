@@ -35,7 +35,7 @@ identically on either backend.
 ## Schema parity status (v0.7.0)
 
 As of v0.7.0 release (post Wave 2 + ship-readiness cascade), both
-backends sit at **schema_version=54**. The full v16 → v54 ladder
+backends sit at **schema_version=55**. The full v16 → v55 ladder
 on the postgres side covers: governance inheritance, webhook
 subscriptions, audit chain, transcripts, signed events with the
 V-4 cross-row hash chain (#698), agent quotas, link `attest_level`,
@@ -47,15 +47,21 @@ columns, optimistic-concurrency `version` column at v45,
 `federation_push_dlq` table at v48, archive_memories +14
 columns at v49, per-namespace K8 quota dimension at v50 #1156,
 `federation_nonces` persistence table at v51 #1255 / PR #1296,
-`transcript_line_dedup` idempotency table at v52 #1389, and the
-`memories_au` FTS5 trigger scoping at v53 #1418).
-The v34 → v53 deltas land via in-process
-`migrate_v34() … migrate_v53()` async functions invoked by
+`transcript_line_dedup` idempotency table at v52 #1389, the
+`memories_au` FTS5 trigger scoping at v53 #1418, the tier-default
+expiry backfill at v54 #1466, and the federation-catchup
+`updated_at` index work at v55 #1476 (a sargable rewrite of
+`list_memories_updated_since`; postgres adds NO new index because
+`memories_updated_at_idx (updated_at DESC)` already serves the
+range scan via Index Scan Backward, so `migrate_v55()` is a
+version-stamp no-op on the postgres side).
+The v34 → v55 deltas land via in-process
+`migrate_v34() … migrate_v55()` async functions invoked by
 `schema-init --upgrade`; they are NOT separate `.sql` files.
 
 If you migrated from sqlite to postgres on v0.7-alpha, your
 postgres db is at v15. Run `ai-memory schema-init --upgrade`
-against v0.7.0 (see "In-place v15 → v53" below) before
+against v0.7.0 (see "In-place v15 → v55" below) before
 pointing a v0.7.0 daemon at it.
 
 ## Pre-flight checklist

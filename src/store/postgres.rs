@@ -428,7 +428,19 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       the schema-version reach — the SQLite/postgres
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep so a
 //       single logical schema number tracks both adapters.
-const CURRENT_SCHEMA_VERSION: i32 = 54;
+// v55 = #1476 (perf, 2026-06-03) — sargable federation-catchup. The
+//       `list_memories_updated_since` predicate is rewritten from the
+//       non-sargable `($1 IS NULL OR updated_at > $1)` to a None/Some
+//       split (`updated_at > $1`) so the planner gets a true Index Cond
+//       range + early-stop under LIMIT. On postgres NO new index is
+//       added: the bootstrap schema already ships
+//       `memories_updated_at_idx ON memories (updated_at DESC)`, which a
+//       bidirectional btree serves via Index Scan Backward — so the
+//       postgres twin is a version-stamp only (v51 / v53 precedent). The
+//       SQLite backend, which has no pre-existing updated_at index, adds
+//       one at v55 (`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`).
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
+const CURRENT_SCHEMA_VERSION: i32 = 55;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1168,8 +1180,11 @@ impl PostgresStore {
         if current_version < 53 {
             self.migrate_v53().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 54 {
             self.migrate_v54().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v55().await?;
         }
 
         Ok(())
@@ -2253,7 +2268,7 @@ impl PostgresStore {
             }
         }
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 54).await?;
 
         tx.commit()
             .await
@@ -2262,6 +2277,50 @@ impl PostgresStore {
         tracing::info!(
             target = "store::postgres",
             "schema migration v54 applied (#1466: backfilled tier-default expiry on NULL-expiry mid/short rows)"
+        );
+        Ok(())
+    }
+
+    /// v55 (#1476, perf) — postgres no-op twin of the SQLite
+    /// federation-catchup `updated_at` index migration.
+    ///
+    /// The real fix for `list_memories_updated_since` is the sargable
+    /// rewrite of its predicate (the former `($1 IS NULL OR updated_at >
+    /// $1)` OR-NULL branch is split into a None path with no predicate
+    /// and a Some path with the bare range bound `updated_at > $1`). On
+    /// postgres that rewrite is sufficient on its own because the
+    /// bootstrap schema **already** ships an index on `updated_at` —
+    /// `memories_updated_at_idx ON memories (updated_at DESC)`
+    /// (`src/store/postgres_schema.sql`). A btree is bidirectional, so
+    /// that DESC index serves `WHERE updated_at > $1 ORDER BY updated_at
+    /// ASC LIMIT` via an **Index Scan Backward** with a true
+    /// `Index Cond: updated_at > $1` — verified on a 200k-row probe
+    /// (`EXPLAIN GENERIC_PLAN`, full-scan cost 2396, identical to a
+    /// dedicated ASC index). Adding a second ASC index here would be
+    /// redundant write-amplification on the hot write path, so the
+    /// postgres twin is a version-stamp only (the v51 / v53 precedent).
+    ///
+    /// The SQLite backend has no pre-existing `updated_at` index, so its
+    /// v55 arm DOES create one
+    /// (`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`); the
+    /// `CURRENT_SCHEMA_VERSION` stays pinned in lockstep so a single
+    /// logical schema number tracks both adapters.
+    async fn migrate_v55(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v55 tx", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v55 migration", e))?;
+
+        tracing::info!(
+            target = "store::postgres",
+            "schema migration v55 applied (#1476: sargable federation-catchup rewrite; existing memories_updated_at_idx DESC serves the range scan — no new postgres index)"
         );
         Ok(())
     }
@@ -8662,17 +8721,38 @@ impl MemoryStore for PostgresStore {
         // and already refuses to project rows that shouldn't
         // federate. Re-fix at the federation handler layer is
         // tracked as a follow-up.
-        let rows = sqlx::query(
-            "SELECT * FROM memories \
-             WHERE ($1::timestamptz IS NULL OR updated_at > $1) \
-             ORDER BY updated_at ASC \
-             LIMIT $2",
-        )
-        .bind(since_dt)
-        .bind(limit_i)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("list memories updated since", e))?;
+        // #1476 — sargable split. The former
+        // `($1 IS NULL OR updated_at > $1)` predicate is non-sargable:
+        // even with `idx_memories_updated_at` present the generic
+        // (bind-param) plan degrades to `Index Scan + Filter` rather than
+        // a true `Index Cond` range scan, because the planner cannot push
+        // an OR-NULL branch into the index range. Splitting on `since`
+        // gives each path a predicate the planner can fold into the index
+        // (`Index Cond: updated_at > $1`) or drop entirely (None branch),
+        // with early-stop under the LIMIT. Verified via EXPLAIN
+        // GENERIC_PLAN on a 200k-row probe (full-scan cost 7177 → 2396).
+        let rows = match since_dt {
+            None => sqlx::query(
+                "SELECT * FROM memories \
+                     ORDER BY updated_at ASC \
+                     LIMIT $1",
+            )
+            .bind(limit_i)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list memories updated since", e))?,
+            Some(dt) => sqlx::query(
+                "SELECT * FROM memories \
+                     WHERE updated_at > $1 \
+                     ORDER BY updated_at ASC \
+                     LIMIT $2",
+            )
+            .bind(dt)
+            .bind(limit_i)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list memories updated since", e))?,
+        };
 
         rows.iter().map(Self::row_to_memory).collect()
     }
