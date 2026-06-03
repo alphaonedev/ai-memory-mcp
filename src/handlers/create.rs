@@ -854,123 +854,144 @@ async fn create_memory_postgres(
         Err(e) => return store_err_to_response(e),
     }
 
-    match app
+    // #1480 — pipeline the cross-region peer broadcast with the local
+    // durable write. `mem.id` is a caller-generated UUID (assigned
+    // above) and `store_with_embedding` RETURNs that same id, so the
+    // broadcast body is fully known before the commit lands. The peer
+    // `/sync/push` accept is an idempotent upsert keyed by id
+    // (tier-never-downgrades), so issuing the broadcast before local
+    // durability is safe: a failed local write returns an error and the
+    // client retries with the SAME id (peers converge idempotently);
+    // anti-entropy (`memories_updated_since` pull) reconciles any
+    // orphaned peer row. Governance was already enforced above, so the
+    // only failure modes left at the store call are transient infra
+    // errors. Net effect: the local fsync overlaps the peer RTT instead
+    // of being paid serially before it.
+    //
+    // #931 — debug-level entry logs on BOTH the `Some(fed)` and `None`
+    // arm so the Track D Docker probe can distinguish "federation never
+    // wired into AppState" from "federation wired but emitted zero peer
+    // requests".
+    let store_fut = app
         .store
-        .store_with_embedding(&ctx, &mem, embedding.as_deref())
-        .await
-    {
-        Ok(id) => {
-            // v0.7.0 Wave-3 Continuation 2 Phase 9 — audit emit on
-            // postgres write.
-            if crate::audit::is_enabled() {
-                let scope = mem
-                    .metadata
-                    .get("scope")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                crate::audit::emit(crate::audit::EventBuilder::new(
-                    crate::audit::AuditAction::Store,
-                    crate::audit::actor(agent_id.to_string(), "http_body", scope.clone()),
-                    crate::audit::target_memory(
-                        id.clone(),
-                        mem.namespace.clone(),
-                        Some(mem.title.clone()),
-                        Some(mem.tier.to_string()),
-                        scope,
-                    ),
-                ));
+        .store_with_embedding(&ctx, &mem, embedding.as_deref());
+    let (id, quorum_outcome) = match app.federation.as_ref() {
+        Some(fed) => {
+            tracing::debug!(
+                target: "ai_memory::federation::sync",
+                memory_id = %mem.id,
+                namespace = %mem.namespace,
+                peer_count = fed.peer_count(),
+                backend = "postgres",
+                "create_memory_postgres: pipelining broadcast_store_quorum with local write",
+            );
+            let mem_echo = mem.clone();
+            let (store_res, quorum_res) = tokio::join!(
+                store_fut,
+                crate::federation::broadcast_store_quorum(fed, &mem_echo)
+            );
+            // Local durability gates everything: a failed local write
+            // returns the store error and DISCARDS the already-in-flight
+            // quorum outcome (the client retries with the same id).
+            match store_res {
+                Ok(id) => (id, Some(quorum_res)),
+                Err(e) => return store_err_to_response(e),
             }
-            // #932 (v0.7.0 Track D, 2026-05-20) — postgres-backed
-            // subscription dispatch. The sqlite-side dispatch reads
-            // from the `subscriptions` table; postgres subscriptions
-            // land as memories in `_subscriptions/<aid>` and are
-            // INVISIBLE to that lookup. Pre-#932 the postgres
-            // `create_memory_postgres` branch fired zero webhooks on
-            // every `memory_store` event — vacuously satisfying the
-            // v0.7.0 HMAC-non-optional guarantee. `dispatch_event_postgres`
-            // walks every `_subscriptions/<*>` row across tenants
-            // (bypass_visibility=true), applies the same matcher the
-            // sqlite path uses, and feeds the canonical
-            // `dispatch_event_to_subs` worker pool. Fire-and-forget;
-            // never panics; never rolls back the local commit.
-            let id_for_dispatch = id.clone();
-            let ns_for_dispatch = mem.namespace.clone();
-            let agent_for_dispatch = agent_id.to_string();
-            super::dispatch_event_postgres(
-                app,
-                crate::mcp::registry::tool_names::MEMORY_STORE,
-                &id_for_dispatch,
-                &ns_for_dispatch,
-                Some(&agent_for_dispatch),
-                None,
-            )
-            .await;
-
-            // F-A2A1.6 (#700, S18) — postgres-branch federation fanout.
-            //
-            // #931 (v0.7.0 Track D, 2026-05-20) — debug-level entry
-            // logs on BOTH the `Some(fed)` and the `None` arm so the
-            // Track D Docker probe can distinguish "federation was
-            // never wired into AppState" from "federation was wired
-            // but emitted zero peer requests". Pre-#931 the postgres
-            // branch was completely silent on the broadcast path,
-            // so `docker logs alice | grep federation` came up empty
-            // even when `app.federation` resolved correctly and the
-            // broadcast actually fired against zero peers.
-            match app.federation.as_ref() {
-                Some(fed) => {
-                    tracing::debug!(
-                        target: "ai_memory::federation::sync",
-                        memory_id = %id,
-                        namespace = %mem.namespace,
-                        peer_count = fed.peer_count(),
-                        backend = "postgres",
-                        "create_memory_postgres: entering broadcast_store_quorum",
-                    );
-                    let mut mem_echo = mem.clone();
-                    mem_echo.id = id.clone();
-                    match crate::federation::broadcast_store_quorum(fed, &mem_echo).await {
-                        Ok(tracker) => {
-                            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                                // #869 — typed 503 envelope via the shared helper.
-                                let payload =
-                                    crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::quorum_not_met_response(&payload);
-                            }
-                        }
-                        Err(err) => {
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
-                        }
-                    }
-                }
-                None => {
-                    tracing::debug!(
-                        target: "ai_memory::federation::sync",
-                        memory_id = %id,
-                        namespace = %mem.namespace,
-                        backend = "postgres",
-                        "create_memory_postgres: federation disabled — skipping broadcast",
-                    );
-                }
-            }
-            // #869 — typed serialise helper so a 201 + `{}` never masks
-            // a real encode failure.
-            let mut payload = match super::to_value_or_500("create_memory.postgres.response", &mem)
-            {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id));
-                if !auto_tags.is_empty() {
-                    obj.insert("auto_tags".to_string(), json!(auto_tags));
-                }
-            }
-            (StatusCode::CREATED, Json(payload)).into_response()
         }
-        Err(e) => store_err_to_response(e),
+        None => {
+            tracing::debug!(
+                target: "ai_memory::federation::sync",
+                memory_id = %mem.id,
+                namespace = %mem.namespace,
+                backend = "postgres",
+                "create_memory_postgres: federation disabled — skipping broadcast",
+            );
+            match store_fut.await {
+                Ok(id) => (id, None),
+                Err(e) => return store_err_to_response(e),
+            }
+        }
+    };
+
+    // Local write succeeded. Audit + webhook dispatch fire on local
+    // durability REGARDLESS of the quorum outcome — the local write is
+    // never rolled back (ADR-0001) — then quorum gates 201 vs 503.
+
+    // v0.7.0 Wave-3 Continuation 2 Phase 9 — audit emit on postgres write.
+    if crate::audit::is_enabled() {
+        let scope = mem
+            .metadata
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        crate::audit::emit(crate::audit::EventBuilder::new(
+            crate::audit::AuditAction::Store,
+            crate::audit::actor(agent_id.to_string(), "http_body", scope.clone()),
+            crate::audit::target_memory(
+                id.clone(),
+                mem.namespace.clone(),
+                Some(mem.title.clone()),
+                Some(mem.tier.to_string()),
+                scope,
+            ),
+        ));
     }
+    // #932 (v0.7.0 Track D, 2026-05-20) — postgres-backed subscription
+    // dispatch. The sqlite-side dispatch reads from the `subscriptions`
+    // table; postgres subscriptions land as memories in
+    // `_subscriptions/<aid>` and are INVISIBLE to that lookup. Pre-#932
+    // the postgres `create_memory_postgres` branch fired zero webhooks
+    // on every `memory_store` event — vacuously satisfying the v0.7.0
+    // HMAC-non-optional guarantee. `dispatch_event_postgres` walks every
+    // `_subscriptions/<*>` row across tenants (bypass_visibility=true),
+    // applies the same matcher the sqlite path uses, and feeds the
+    // canonical `dispatch_event_to_subs` worker pool. Fire-and-forget;
+    // never panics; never rolls back the local commit.
+    let id_for_dispatch = id.clone();
+    let ns_for_dispatch = mem.namespace.clone();
+    let agent_for_dispatch = agent_id.to_string();
+    super::dispatch_event_postgres(
+        app,
+        crate::mcp::registry::tool_names::MEMORY_STORE,
+        &id_for_dispatch,
+        &ns_for_dispatch,
+        Some(&agent_for_dispatch),
+        None,
+    )
+    .await;
+
+    // #1480 — evaluate the pipelined quorum result now that the local
+    // write is durable and audit/dispatch have fired. A failed quorum
+    // returns 503 but never rolls back the local write (ADR-0001).
+    if let Some(quorum_res) = quorum_outcome {
+        match quorum_res {
+            Ok(tracker) => {
+                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                    // #869 — typed 503 envelope via the shared helper.
+                    let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                    return super::quorum_not_met_response(&payload);
+                }
+            }
+            Err(err) => {
+                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                return super::quorum_not_met_response(&payload);
+            }
+        }
+    }
+
+    // #869 — typed serialise helper so a 201 + `{}` never masks a real
+    // encode failure.
+    let mut payload = match super::to_value_or_500("create_memory.postgres.response", &mem) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("id".to_string(), serde_json::Value::String(id));
+        if !auto_tags.is_empty() {
+            obj.insert("auto_tags".to_string(), json!(auto_tags));
+        }
+    }
+    (StatusCode::CREATED, Json(payload)).into_response()
 }
 
 pub async fn create_memory(

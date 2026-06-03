@@ -609,3 +609,129 @@ async fn cross_namespace_dispatch_on_postgres() {
     shutdown.notify_one();
     let _ = handle.await;
 }
+
+// ===================================================================
+// #1480: create pipelines the peer broadcast with the local write
+// ===================================================================
+
+/// A postgres-backed `POST /api/v1/memories` (create) on a daemon with
+/// three mock peers and `W=2` must:
+///   (a) return `201 CREATED` with the new id,
+///   (b) durably persist the row locally (GET-by-id round-trips),
+///   (c) STILL fan the memory out to every peer.
+///
+/// This pins the #1480 quorum-write-pipelining restructure of
+/// `handlers::create::create_memory_postgres`: the serial
+/// `store → audit → dispatch → broadcast` block was replaced by a
+/// `tokio::join!(store_fut, broadcast_store_quorum(fed, &mem))` so the
+/// local fsync overlaps the peer RTT. The broadcast now fires
+/// CONCURRENTLY with the local write rather than after it — this test
+/// proves the restructure did not drop the fanout: every peer's
+/// `sync_push` counter must still bump, AND the local write must still
+/// be durable + retrievable. The id is a caller-generated UUID that
+/// `store_with_embedding` RETURNs unchanged, so the pre-durability
+/// broadcast body carries the same id the GET resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_postgres_pipelines_broadcast_with_local_write() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+
+    let peer1 = spawn_inproc_mock_peer().await;
+    let peer2 = spawn_inproc_mock_peer().await;
+    let peer3 = spawn_inproc_mock_peer().await;
+    let peer_urls = vec![peer1.url.clone(), peer2.url.clone(), peer3.url.clone()];
+    let cfg = federation_cfg_for_test(&peer_urls, 2);
+
+    let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
+    let client = reqwest::Client::new();
+
+    let agent = "ai:alice-create-pipeline";
+    let title = format!("pipelined-create-{}", uuid::Uuid::new_v4());
+    let ns = format!("team-{}", uuid::Uuid::new_v4());
+    let body = json!({
+        "title": title,
+        "content": "body that rides the #1480 pipelined broadcast path",
+        "namespace": ns,
+        "tier": "mid",
+        "priority": 5,
+    });
+    let resp = client
+        .post(format!("{base}/api/v1/memories"))
+        .header("x-agent-id", agent)
+        .json(&body)
+        .send()
+        .await
+        .expect("create post");
+    // (a) 201 CREATED with the new id.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "pipelined create must 201: {resp:?}"
+    );
+    let resp_body: Value = resp.json().await.expect("create body");
+    let new_id = resp_body["id"]
+        .as_str()
+        .expect("create must return id")
+        .to_string();
+
+    // (b) local write durably persisted — GET-by-id round-trips through
+    // the postgres SAL `get` path (`{"memory": …, "links": …}`).
+    let got: Value = client
+        .get(format!("{base}/api/v1/memories/{new_id}"))
+        .header("x-agent-id", agent)
+        .send()
+        .await
+        .expect("get memory")
+        .json()
+        .await
+        .expect("get body");
+    assert_eq!(
+        got["memory"]["id"].as_str(),
+        Some(new_id.as_str()),
+        "stored memory must be retrievable post-pipeline: {got}"
+    );
+    assert_eq!(
+        got["memory"]["title"].as_str(),
+        Some(title.as_str()),
+        "retrieved memory title must match the created one: {got}"
+    );
+
+    // (c) the pipelined broadcast still fanned out to every peer. Post-
+    // quorum straggler detach (the W=2 of N=4 policy) means peer-3
+    // completes too even though quorum was met at peer-1+peer-2.
+    let timeout = Duration::from_secs(5);
+    let p1_ok = wait_for_counter(&peer1.count, 1, timeout).await;
+    let p2_ok = wait_for_counter(&peer2.count, 1, timeout).await;
+    let p3_ok = wait_for_counter(&peer3.count, 1, timeout).await;
+    assert!(
+        p1_ok && p2_ok && p3_ok,
+        "pipelined create must still broadcast to every peer: p1={} p2={} p3={}",
+        peer1.count.load(Ordering::Relaxed),
+        peer2.count.load(Ordering::Relaxed),
+        peer3.count.load(Ordering::Relaxed),
+    );
+
+    // Wire-shape: the broadcast body carried the just-created memory by
+    // the SAME id the GET resolved — proving the pre-durability
+    // broadcast and the durable local row reference one identity.
+    let recorded = peer1.recorded.lock().await;
+    let saw_created = recorded.iter().any(|p| {
+        p.get("memories")
+            .and_then(|m| m.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|m| {
+                    m.get("id").and_then(|i| i.as_str()) == Some(new_id.as_str())
+                        && m.get("title").and_then(|t| t.as_str()) == Some(title.as_str())
+                })
+            })
+    });
+    assert!(
+        saw_created,
+        "peer-1 must have received the created memory (id={new_id}) in a sync_push body"
+    );
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
