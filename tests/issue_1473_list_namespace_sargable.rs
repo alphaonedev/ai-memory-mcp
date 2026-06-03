@@ -76,7 +76,7 @@ const FILTER_TOKEN: &str = "Filter";
 /// that drives the index access.
 const NAMESPACE_COLUMN: &str = "namespace";
 
-/// PostgreSQL error fragment emitted when the server predates
+/// `PostgreSQL` error fragment emitted when the server predates
 /// `EXPLAIN (GENERIC_PLAN)` (added in v16). Treated as a graceful skip
 /// rather than a failure so the suite stays green on an older local PG.
 const GENERIC_PLAN_UNSUPPORTED_FRAGMENT: &str = "GENERIC_PLAN";
