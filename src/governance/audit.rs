@@ -35,6 +35,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
@@ -104,6 +105,143 @@ static SINK: OnceLock<Mutex<Option<ForensicSink>>> = OnceLock::new();
 
 fn sink() -> &'static Mutex<Option<ForensicSink>> {
     SINK.get_or_init(|| Mutex::new(None))
+}
+
+// ---------------------------------------------------------------------------
+// Background single-writer (#1472)
+// ---------------------------------------------------------------------------
+//
+// The hash chain MUST be advanced in a serialized critical section (each
+// row's `prev_hash` points at the prior row's `self_hash`), but the
+// blocking file `open()`/`write()` does NOT need to sit inside that
+// section. We keep the microsecond chain-head update under the sink lock
+// and hand the fully-formed line to a single background OS thread that
+// owns all forensic file I/O.
+//
+// Why a single writer preserves tamper-evidence: rows are enqueued WHILE
+// the sink lock is held, so the channel-delivery order is identical to
+// the `prev_hash` chain order, which is therefore identical to the
+// on-disk append order. A multi-writer pool would NOT preserve that
+// invariant; the single FIFO consumer is load-bearing.
+
+/// OS-thread name for the background writer that owns all forensic file
+/// I/O. Kept off the request path so blocking syscalls never serialize
+/// behind the sink lock.
+const WRITER_THREAD_NAME: &str = "ai-memory-audit-writer";
+
+/// A unit of work for the background writer: either a formed line bound
+/// for a destination file, or a barrier whose acknowledgement channel is
+/// signalled once every line enqueued before it has been written.
+enum WriteOp {
+    Append {
+        path: PathBuf,
+        line: String,
+    },
+    Barrier(Sender<()>),
+    /// Flush and drop any cached destination handle. Sent by `init` so a
+    /// re-init never keeps writing to a handle whose file was rotated or
+    /// removed out from under it (same path, new inode).
+    Reset,
+}
+
+static WRITER: OnceLock<Sender<WriteOp>> = OnceLock::new();
+
+/// Lazily spawn (once per process) the background writer and return its
+/// FIFO sender. Subsequent `init`/`shutdown` cycles reuse the same
+/// thread, so repeated test setup never leaks threads.
+fn writer() -> &'static Sender<WriteOp> {
+    WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WriteOp>();
+        std::thread::Builder::new()
+            .name(WRITER_THREAD_NAME.to_string())
+            .spawn(move || run_writer(rx))
+            .expect("spawning the forensic audit writer thread");
+        tx
+    })
+}
+
+/// Drain loop for the background writer. Keeps the destination file open
+/// across appends (one `open()` per rotated file, not one per row) and
+/// coalesces a burst into a single flush.
+fn run_writer(rx: Receiver<WriteOp>) {
+    let mut open_file: Option<(PathBuf, File)> = None;
+    let mut pending_barriers: Vec<Sender<()>> = Vec::new();
+
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+        }
+
+        let mut needs_flush = false;
+        for op in batch {
+            match op {
+                WriteOp::Append { path, line } => {
+                    let reopen = open_file.as_ref().map_or(true, |(p, _)| p != &path);
+                    if reopen {
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(file) => open_file = Some((path, file)),
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "ai_memory::governance::audit",
+                                    "forensic: opening {} failed: {e}",
+                                    path.display()
+                                );
+                                open_file = None;
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some((path, file)) = open_file.as_mut() {
+                        if let Err(e) = writeln!(file, "{line}") {
+                            tracing::error!(
+                                target: "ai_memory::governance::audit",
+                                "forensic: appending to {} failed: {e}",
+                                path.display()
+                            );
+                        } else {
+                            needs_flush = true;
+                        }
+                    }
+                }
+                WriteOp::Barrier(ack) => pending_barriers.push(ack),
+                WriteOp::Reset => {
+                    if let Some((_, file)) = open_file.as_mut() {
+                        let _ = file.flush();
+                    }
+                    open_file = None;
+                    needs_flush = false;
+                }
+            }
+        }
+
+        if needs_flush {
+            if let Some((_, file)) = open_file.as_mut() {
+                let _ = file.flush();
+            }
+        }
+        for ack in pending_barriers.drain(..) {
+            let _ = ack.send(());
+        }
+    }
+}
+
+/// Block until the background writer has durably appended every row
+/// enqueued before this call. Safe to call when the writer has never
+/// been spawned (it will be spawned, drain nothing, and return).
+pub fn flush_blocking() {
+    let (ack, done) = std::sync::mpsc::channel();
+    if writer().send(WriteOp::Barrier(ack)).is_ok() {
+        let _ = done.recv();
+    }
+}
+
+/// Test-only: enqueue a raw append directly to the background writer,
+/// bypassing the sink + hash chain. Lets tests drive the writer's
+/// open/append branches (including the error arm) with arbitrary paths.
+#[cfg(test)]
+pub(crate) fn enqueue_append_for_test(path: PathBuf, line: String) {
+    let _ = writer().send(WriteOp::Append { path, line });
 }
 
 // ---------------------------------------------------------------------------
@@ -203,12 +341,25 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     let mut guard = sink()
         .lock()
         .map_err(|_| anyhow!("forensic sink mutex poisoned"))?;
+    // Invalidate any cached destination handle the background writer is
+    // holding from a prior epoch. New appends can only be enqueued under
+    // this same guard (see `try_record_decision`), so sending `Reset`
+    // while holding it guarantees the writer drops the stale handle
+    // before any row for the freshly-initialised sink is enqueued —
+    // without this, a re-init over a removed/rotated same-named file
+    // would keep writing to the unlinked inode.
+    let _ = writer().send(WriteOp::Reset);
     *guard = Some(new_sink);
     Ok(())
 }
 
 /// Tear down the sink (test-only convenience).
+///
+/// Drains the background writer first so any rows still in flight are
+/// durably on disk before the sink is cleared — callers (and tests) that
+/// read the forensic file after `shutdown` returns see the full chain.
 pub fn shutdown() {
+    flush_blocking();
     if let Ok(mut guard) = sink().lock() {
         *guard = None;
     }
@@ -263,18 +414,21 @@ pub fn try_record_decision(
 
     let self_hash = row.self_hash();
     let line = serde_json::to_string(&row).context("serialising forensic row")?;
-
     let file_path = daily_path(&s.dir, &now);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file_path)
-        .with_context(|| format!("opening forensic log {}", file_path.display()))?;
-    writeln!(f, "{line}")
-        .with_context(|| format!("appending forensic line to {}", file_path.display()))?;
-    f.flush().ok();
 
+    // Advance the in-memory chain head and enqueue the durable append —
+    // both while still holding the sink lock, so the order rows reach the
+    // background writer equals their `prev_hash` chain order (and hence
+    // their on-disk order). The blocking open()/write() now runs off the
+    // request thread, removing per-write file I/O from this serialized
+    // critical section (#1472).
     s.last_hash = self_hash;
+    writer()
+        .send(WriteOp::Append {
+            path: file_path,
+            line,
+        })
+        .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
     Ok(())
 }
 
@@ -1279,5 +1433,107 @@ mod tests {
             report_after_recover.total_lines, 1,
             "fresh_init must clear the tempdir so test-B sees only its own row"
         );
+    }
+
+    // -- #1472 background-writer coverage -------------------------------
+
+    #[test]
+    fn flush_blocking_makes_records_durable_without_shutdown() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fresh_init(tmp.path(), None);
+        let n = 25;
+        for i in 0..n {
+            record_decision(
+                "ai:t",
+                "allow",
+                "bash",
+                "R001",
+                serde_json::json!({ "i": i }),
+            );
+        }
+        // No shutdown — flush_blocking alone must drain the writer.
+        flush_blocking();
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp.path().join(format!("forensic-{date}.jsonl"));
+        let body = std::fs::read_to_string(&path).expect("file written by background writer");
+        let lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(lines, n, "every enqueued row drained to disk");
+        shutdown();
+    }
+
+    #[test]
+    fn writer_reopens_when_destination_path_changes() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // First destination.
+        let tmp_a = TempDir::new().unwrap();
+        fresh_init(tmp_a.path(), None);
+        record_decision("ai:a", "allow", "bash", "R001", serde_json::json!({}));
+        shutdown();
+        // Second, different destination — forces the writer's reopen arm
+        // because the cached open file points at tmp_a, not tmp_b.
+        let tmp_b = TempDir::new().unwrap();
+        fresh_init(tmp_b.path(), None);
+        record_decision("ai:b", "allow", "bash", "R002", serde_json::json!({}));
+        shutdown();
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let body_a =
+            std::fs::read_to_string(tmp_a.path().join(format!("forensic-{date}.jsonl"))).unwrap();
+        let body_b =
+            std::fs::read_to_string(tmp_b.path().join(format!("forensic-{date}.jsonl"))).unwrap();
+        assert!(body_a.contains("ai:a") && !body_a.contains("ai:b"));
+        assert!(body_b.contains("ai:b") && !body_b.contains("ai:a"));
+    }
+
+    #[test]
+    fn writer_logs_and_recovers_when_open_fails() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // Parent dir does not exist → create(true).append(true) cannot
+        // open it; the writer must log + continue without panicking.
+        let bad = tmp.path().join("missing-parent").join("forensic.jsonl");
+        enqueue_append_for_test(bad.clone(), "{}".to_string());
+        flush_blocking();
+        assert!(!bad.exists(), "open failure must not create the file");
+        // Writer is still healthy: a subsequent good append succeeds.
+        let good = tmp.path().join("good.jsonl");
+        enqueue_append_for_test(good.clone(), "{\"ok\":true}".to_string());
+        flush_blocking();
+        let body = std::fs::read_to_string(&good).expect("good append after prior error");
+        assert!(body.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn reinit_invalidates_cached_handle_over_same_path_new_inode() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Same dir + same date file name across two init epochs. The
+        // first epoch leaves the writer holding an open handle to the
+        // file's inode. Removing the file and re-initing must make the
+        // writer drop that handle (WriteOp::Reset) so the second epoch's
+        // row lands on the freshly created file, not the unlinked inode.
+        let tmp = TempDir::new().unwrap();
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp.path().join(format!("forensic-{date}.jsonl"));
+
+        fresh_init(tmp.path(), None);
+        record_decision("ai:epoch-1", "allow", "bash", "R001", serde_json::json!({}));
+        flush_blocking();
+        assert!(path.exists(), "epoch-1 row created the file");
+
+        // fresh_init removes the file (new inode on the next write) and
+        // re-inits over the identical path.
+        fresh_init(tmp.path(), None);
+        record_decision("ai:epoch-2", "allow", "bash", "R002", serde_json::json!({}));
+        flush_blocking();
+
+        let body = std::fs::read_to_string(&path).expect("epoch-2 row on the recreated file");
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only epoch-2's row is visible on the new inode"
+        );
+        assert!(body.contains("ai:epoch-2") && !body.contains("ai:epoch-1"));
+        shutdown();
     }
 }
