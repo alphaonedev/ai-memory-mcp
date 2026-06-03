@@ -4343,7 +4343,12 @@ impl PostgresStore {
              {params_lit}) AS (target_id agtype, relation agtype, depth agtype, path agtype)"
         );
 
+        // #1482 — the cypher text is per-call-unique (inlined ids +
+        // depth), so caching it as a named prepared statement only
+        // pollutes the bounded per-connection LRU and evicts genuinely
+        // reusable hot statements. Run it via the unnamed statement.
         let rows = sqlx::query(&sql)
+            .persistent(false)
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher kg_query", e))?;
@@ -4648,7 +4653,11 @@ impl PostgresStore {
               valid_until agtype, observed_by agtype)"
         );
 
+        // #1482 — per-call-unique cypher text (inlined id + since/until
+        // + cap); run unnamed so it never enters the prepared-statement
+        // cache and evicts reusable hot statements.
         let rows = sqlx::query(&sql)
+            .persistent(false)
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher kg_timeline", e))?;
@@ -5403,7 +5412,11 @@ impl PostgresStore {
              LIMIT {cap} \
              $$) AS (path agtype)"
         );
+        // #1482 — per-call-unique cypher text (inlined source/target
+        // ids + depth + cap); run unnamed so it never enters the
+        // prepared-statement cache and evicts reusable hot statements.
         let rows = sqlx::query(&sql)
+            .persistent(false)
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher find_paths", e))?;
