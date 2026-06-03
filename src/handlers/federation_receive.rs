@@ -839,7 +839,7 @@ pub async fn sync_push(
                             valid_until: link.valid_until.as_deref(),
                         };
                         match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
-                            Ok(()) => "peer_attested",
+                            Ok(()) => crate::models::AttestLevel::PeerAttested.as_str(),
                             Err(e) => {
                                 // Tampered / malformed-sig: refuse to land
                                 // the row. The receiver-side warn log is
@@ -865,14 +865,14 @@ pub async fn sync_push(
                         // later enroll the key (`identity import`) and
                         // re-sync to upgrade the row's attest_level on
                         // a subsequent re-send.
-                        "unsigned"
+                        crate::models::AttestLevel::Unsigned.as_str()
                     }
                 }
             }
             // No signature on the wire (legacy v0.6.x peer) or no
             // observed_by claim → treat as unsigned. Same posture as
             // pre-H3 federation.
-            _ => "unsigned",
+            _ => crate::models::AttestLevel::Unsigned.as_str(),
         };
 
         match db::create_link_inbound(&lock.0, link, attest_level) {

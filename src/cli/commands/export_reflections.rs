@@ -288,9 +288,9 @@ pub(crate) fn summarise_attest_level(edges: &[ReflectsOnEdge]) -> &'static str {
     }
     match best {
         3 => "signed",
-        2 => "peer_attested",
-        1 => "self_signed",
-        _ => "unsigned",
+        2 => crate::models::AttestLevel::PeerAttested.as_str(),
+        1 => crate::models::AttestLevel::SelfSigned.as_str(),
+        _ => crate::models::AttestLevel::Unsigned.as_str(),
     }
 }
 

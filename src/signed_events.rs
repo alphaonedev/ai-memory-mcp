@@ -621,7 +621,7 @@ pub fn verify_chain(
                 // Legitimately-unsigned (`attest_level == "unsigned"`)
                 // legacy rows remain skip-by-design.
                 _ => {
-                    if event.attest_level != "unsigned" {
+                    if event.attest_level != crate::models::AttestLevel::Unsigned.as_str() {
                         signature_failures.push(event.sequence);
                     }
                 }

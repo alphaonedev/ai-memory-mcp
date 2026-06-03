@@ -214,9 +214,9 @@ pub(super) fn register_core(
     let event_bytes = serde_json::to_vec(&event_payload).unwrap_or_default();
     let ev_hash = payload_hash(&event_bytes);
     let attest = if signature_bytes.is_some() {
-        "self_signed"
+        crate::models::AttestLevel::SelfSigned.as_str()
     } else {
-        "unsigned"
+        crate::models::AttestLevel::Unsigned.as_str()
     };
     let event = SignedEvent {
         id: Uuid::new_v4().to_string(),

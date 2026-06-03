@@ -366,7 +366,7 @@ impl<'a> PersonaGenerator<'a> {
                 "entity_id": entity_id,
                 "sources": source_ids.clone(),
                 "version": version,
-                "attest_level": "unsigned",
+                "attest_level": crate::models::AttestLevel::Unsigned.as_str(),
                 "generated_at": now,
             }
         });

@@ -342,7 +342,7 @@ pub(super) async fn sync_push_via_store(
                             valid_until: link.valid_until.as_deref(),
                         };
                         match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
-                            Ok(()) => "peer_attested",
+                            Ok(()) => crate::models::AttestLevel::PeerAttested.as_str(),
                             Err(e) => {
                                 tracing::warn!(
                                     "sync_push: signature rejected for link \
@@ -357,10 +357,10 @@ pub(super) async fn sync_push_via_store(
                             }
                         }
                     }
-                    None => "unsigned",
+                    None => crate::models::AttestLevel::Unsigned.as_str(),
                 }
             }
-            _ => "unsigned",
+            _ => crate::models::AttestLevel::Unsigned.as_str(),
         };
         match app.store.apply_remote_link(&ctx, link, attest_level).await {
             Ok(()) => links_applied += 1,

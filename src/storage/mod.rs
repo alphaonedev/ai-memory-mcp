@@ -3625,7 +3625,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
     // `observed_by` claim becomes the `agent_id` for the K9 evaluation
     // when not bypassed — that's the peer's claimed writer and matches
     // what the rule matcher already uses for outbound links.
-    let skip_governance = attest_level == "peer_attested";
+    let skip_governance = attest_level == crate::models::AttestLevel::PeerAttested.as_str();
     let peer_agent_id = link.observed_by.as_deref().unwrap_or("system");
     validate_link_pre_create(
         conn,
