@@ -185,8 +185,18 @@ async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
          is not actually exercising the dispatch path (peak={peak})"
     );
     // The semaphore should be fully drained (all permits returned)
-    // by the end of the test.
-    let idle_avail = dispatch_semaphore_available_permits();
+    // by the end of the test. Under full-suite load the wiremock
+    // backends are slower (HTTP contention pushes per-delivery latency
+    // past the 5 s sampler window), so poll until drained rather than
+    // asserting immediately. A genuine permit leak never drains and
+    // trips the deadline (still FAILs correctly); a slow host just
+    // takes a few extra 50 ms iterations.
+    let mut idle_avail = dispatch_semaphore_available_permits();
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while idle_avail != BOUND && std::time::Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        idle_avail = dispatch_semaphore_available_permits();
+    }
     assert_eq!(
         idle_avail, BOUND,
         "PERF-3 invariant violated: semaphore did not drain fully \
