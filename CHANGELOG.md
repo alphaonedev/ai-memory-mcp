@@ -105,6 +105,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via the LLM-agnostic backend (§2.7) but does not *attest* it. Tracked
   under [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
 
+### v0.7.0 postgres write-path scaling — #1472 epic + #1473 read-path sibling (2026-06-02/03)
+
+Vertical/federated scaling load tests surfaced a Postgres write ceiling that did NOT lift with vCPU. Root-caused to two non-sargable query shapes on the postgres SAL adapter (`src/store/postgres.rs`), not the SQLite single-writer limit. Each fix was proved with a live PG16 `EXPLAIN` plan-shape probe (sargable equality → `Index Cond` vs. the prior `Seq Scan`/`Filter`), gated (fmt + clippy::pedantic + full suite), and committed to `release/v0.7.0`.
+
+#### Performance
+
+- **[#1472](https://github.com/alphaonedev/ai-memory-mcp/issues/1472)** — scope the per-write subscription dispatch from a full-table `Seq Scan` to a sargable namespace-prefix byte-range scan, and route the forensic-audit fsync off the request-thread mutex. On a bare-metal PG16 control the write ceiling lifted **33 → 290 rps (8.5×)**; the metal-control sweep measured **358 → 1067 rps (3.0×)** end-to-end (commits `8bdd7a177`, `4fb063b7c`).
+- **[#1473](https://github.com/alphaonedev/ai-memory-mcp/issues/1473)** — make `PostgresStore::list()`'s namespace filter sargable. The optional-filter idiom `($1 IS NULL OR namespace = $1)` is non-sargable under sqlx's generic prepared-statement plan (the planner can't prove `$1` non-null at plan time, so it emits a `Seq Scan` even for an explicit namespace); `list()` now emits a bare `namespace = $1` equality when a namespace is supplied, which plans as an `Index Cond` on `memories_namespace_idx`. Live PG16 `EXPLAIN (GENERIC_PLAN)`: sargable form `Index Cond` cost 11.28 vs. OR-NULL `Filter` cost 47.51 (commit `4fc5e411f`).
+
+#### Tests
+
+- **[#1474](https://github.com/alphaonedev/ai-memory-mcp/issues/1474)** — lockstep-bump the QUAL-10 `src/store/postgres.rs` module-size ceiling 15_500 → 15_650 for the #1472 dispatch fix's +142 LOC; the lockstep bump had been missed in `4fb063b7c` and surfaced as a RED `qual_10` gate (the `--lib` subset that gated the merge does not run the `tests/` integration binaries) (commit `6ba2f3f8c`).
+- **[#1473](https://github.com/alphaonedev/ai-memory-mcp/issues/1473)** — new `tests/issue_1473_list_namespace_sargable.rs` proves the plan SHAPE (not wall-clock) via `EXPLAIN (GENERIC_PLAN)` + `SET enable_seqscan = off`, gated on `feature = "sal-postgres"` and skipped without `AI_MEMORY_TEST_POSTGRES_URL` (commit `4fc5e411f`).
+- **[#1475](https://github.com/alphaonedev/ai-memory-mcp/issues/1475)** — replace the immediate post-dispatch semaphore-drain assert in `tests/subscriptions_no_thread_spawn_per_subscriber.rs` with a poll-until-drained loop (30 s deadline, 50 ms cadence) so a slow CI host no longer flakes while a genuine permit leak still trips the deadline (commit `c24d0e67a`).
+
 ### v0.7.0 security-review epic #1450 — 9-finding hardening sweep (2026-05-31)
 
 Full-spectrum multi-agent security review of the v0.7.0 substrate. Each finding was fixed 1:1 with a regression test, gated (fmt + clippy::pedantic + full suite + audit), and committed to `release/v0.7.0`. Parent epic **[#1450](https://github.com/alphaonedev/ai-memory-mcp/issues/1450)**.
@@ -201,7 +216,7 @@ This batch completes the surface with C6 + C7:
 - Standardize on Rust **MSRV 1.96** across the toolchain.
 - **Packaging** — decommission the Ubuntu Launchpad PPA channel; reframe the APT distribution path PPA → `.deb` across docs.
 - **LLM substrate** — switch IronClaw A2A + docs examples to OpenRouter Gemma 4 26B, superseding the prior xAI Grok 4.3 curator wiring (ai-memory product line only).
-- SSOT migrations (no behavior change): `AttestLevel` literals → `AttestLevel::*.as_str()` (**[#1431](https://github.com/alphaonedev/ai-memory-mcp/issues/1431)**, partial — consumer sites still migrating); orphan `attest_level="signed"` offload row → `SelfSigned` (**[#1438](https://github.com/alphaonedev/ai-memory-mcp/issues/1438)**); visibility predicates → `META_KEY_*`/`MemoryScope` helpers (**[#1436](https://github.com/alphaonedev/ai-memory-mcp/issues/1436)**); `Tier` parsers → `Tier::from_str` (**[#1432](https://github.com/alphaonedev/ai-memory-mcp/issues/1432)**); `HEADER_AGENT_ID` / `HEADER_CONTENT_TYPE` / `MIME_JSON` / HTTP error-code literal sweeps.
+- SSOT migrations (no behavior change): `AttestLevel` literals → `AttestLevel::*.as_str()` (**[#1431](https://github.com/alphaonedev/ai-memory-mcp/issues/1431)**, completed in `89e02ddd3` — the final 17 production emit/compare sites across 9 files, incl. the full `federation_signing_check` path + the governance audit daemon-signing tag, now route through the const); orphan `attest_level="signed"` offload row → `SelfSigned` (**[#1438](https://github.com/alphaonedev/ai-memory-mcp/issues/1438)**); visibility predicates → `META_KEY_*`/`MemoryScope` helpers (**[#1436](https://github.com/alphaonedev/ai-memory-mcp/issues/1436)**); `Tier` parsers → `Tier::from_str` (**[#1432](https://github.com/alphaonedev/ai-memory-mcp/issues/1432)**); `HEADER_AGENT_ID` / `HEADER_CONTENT_TYPE` / `MIME_JSON` / HTTP error-code literal sweeps.
 
 #### Fixed
 
