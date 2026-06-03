@@ -15,7 +15,7 @@
 //!
 //! This test proves the plan SHAPE rather than wall-clock latency, so
 //! it does not need to seed a large table:
-//!   * `EXPLAIN (GENERIC_PLAN, …)` (PostgreSQL 16+) plans the query
+//!   * `EXPLAIN (GENERIC_PLAN, …)` (`PostgreSQL` 16+) plans the query
 //!     with its parameters left generic — exactly the param-agnostic
 //!     plan sqlx reuses — so the assertion reproduces the production
 //!     planning context, not a one-off custom plan.

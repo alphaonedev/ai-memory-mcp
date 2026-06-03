@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 54).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 55).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -139,6 +139,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
 CREATE INDEX IF NOT EXISTS idx_memories_priority ON memories(priority DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
+-- #1476 — federation-catchup range scan for `memories_updated_since`
+-- (`WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT`). Also added by
+-- migration v55 (file 0046) for upgrading DBs; carried inline here so a
+-- fresh bootstrap that applies SCHEMA has it even before the ladder runs.
+CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_title_ns ON memories(title, namespace);
 -- Partial indexes referencing v36+ columns (`atom_of`, `atomised_into`,
 -- `source_uri`, `confidence_source`, `mentioned_entity_id`) and the v41
@@ -558,7 +563,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 54;
+const CURRENT_SCHEMA_VERSION: i64 = 55;
 
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
@@ -932,6 +937,13 @@ const MIGRATION_V52_SQLITE: &str =
 // DDL on every re-apply.
 const MIGRATION_V53_SQLITE: &str =
     include_str!("../../migrations/sqlite/0045_v53_memories_au_trigger_columns.sql");
+// v0.7.0 #1476 — federation-catchup `updated_at` index. Pairs with the
+// sargable rewrite of `memories_updated_since` so the Some path range-
+// scans the index and the None path reads in index order, each with
+// early-stop under the LIMIT. Pure additive `CREATE INDEX IF NOT EXISTS`
+// — fully idempotent + replay-safe.
+const MIGRATION_V55_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0046_v55_idx_memories_updated_at.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2232,7 +2244,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 54 {
             // v0.7.0 #1466 — one-shot backfill of tier-default expiry on
             // legacy immortal rows. Before the write-path chokepoint fix,
             // every internally-minted mid/short memory built with
@@ -2265,6 +2277,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     )?;
                 }
             }
+        }
+        if version < CURRENT_SCHEMA_VERSION {
+            // v0.7.0 #1476 — federation-catchup `updated_at` index.
+            // `memories_updated_since` drives every W=2 peer catchup
+            // with `WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT`.
+            // The query is now sargable (the OR-NULL branch was split
+            // out), but without an index on `updated_at` SQLite still
+            // full-scans + sorts. `idx_memories_updated_at` lets the Some
+            // path use the index as a range bound and the None path read
+            // in index order, each with early-stop under the LIMIT.
+            // `CREATE INDEX IF NOT EXISTS` so the migration is replay-safe.
+            conn.execute_batch(MIGRATION_V55_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -2436,6 +2460,15 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// Dispatch trigger for the v54 backfill arm (#1466). v54 is a
+    /// *frozen historical* migration: `migrate()` runs its arm whenever
+    /// `version < 54`, no matter how far `CURRENT_SCHEMA_VERSION` advances
+    /// past it. Tests that target the v54 backfill specifically rewind to
+    /// one below this fixed trigger — NOT `CURRENT_SCHEMA_VERSION - 1`,
+    /// which tracks the moving ladder tip and would skip the v54 arm
+    /// entirely once v55+ are terminal.
+    const V54_DISPATCH_TRIGGER: i64 = 54;
+
     /// Open an in-memory DB and apply the production schema + every
     /// migration. Mirrors `crate::db::open(":memory:")` without going
     /// through the connection pragma setter — keeps the test focused
@@ -2521,10 +2554,10 @@ mod tests {
 
     #[test]
     fn migrate_from_current_minus_one_runs_only_terminal_arm() {
-        // Stamp `version = CURRENT - 1` and run migrate; only the v29
-        // arm (`if version < 29`) executes. We verify it lands at
-        // CURRENT and the EXCLUSIVE transaction wraps the single arm
-        // cleanly.
+        // Stamp `version = CURRENT - 1` and run migrate; only the terminal
+        // arm (`if version < CURRENT_SCHEMA_VERSION`) executes. We verify it
+        // lands at CURRENT and the EXCLUSIVE transaction wraps the single
+        // arm cleanly.
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(SCHEMA).expect("apply SCHEMA");
         conn.execute("DELETE FROM schema_version", []).unwrap();
@@ -2533,7 +2566,7 @@ mod tests {
             params![CURRENT_SCHEMA_VERSION - 1],
         )
         .unwrap();
-        super::migrate(&conn).expect("migrate v28->v29 ok");
+        super::migrate(&conn).expect("terminal-arm migrate ok");
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
     }
 
@@ -2543,8 +2576,9 @@ mod tests {
         // tier-default TTL` onto legacy immortal rows (NULL expiry on
         // mid/short), leaving long NULL. Build rows at the current
         // schema, force them to the pre-fix immortal state (NULL
-        // expiry), rewind the version stamp by one, and re-run migrate
-        // so only the terminal v54 arm executes.
+        // expiry), rewind the version stamp to one below the v54 trigger,
+        // and re-run migrate so the v54 backfill arm executes (the
+        // terminal v55 index arm also runs but does not touch expiry).
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(SCHEMA).expect("apply SCHEMA");
         let created = "2026-01-01T00:00:00+00:00";
@@ -2559,7 +2593,7 @@ mod tests {
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
-            params![CURRENT_SCHEMA_VERSION - 1],
+            params![V54_DISPATCH_TRIGGER - 1],
         )
         .unwrap();
 
@@ -2607,7 +2641,7 @@ mod tests {
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
-            params![CURRENT_SCHEMA_VERSION - 1],
+            params![V54_DISPATCH_TRIGGER - 1],
         )
         .unwrap();
         super::migrate(&conn).expect("first v54 pass");
@@ -2620,7 +2654,7 @@ mod tests {
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
-            params![CURRENT_SCHEMA_VERSION - 1],
+            params![V54_DISPATCH_TRIGGER - 1],
         )
         .unwrap();
         super::migrate(&conn).expect("second v54 pass");
@@ -2633,6 +2667,55 @@ mod tests {
             first, second,
             "idempotent: already-stamped expiry must not move"
         );
+    }
+
+    #[test]
+    fn latest_arm_creates_updated_at_index_and_is_idempotent() {
+        // #1476 — the latest ladder arm sources MIGRATION_V55_SQLITE
+        // (`CREATE INDEX IF NOT EXISTS idx_memories_updated_at`). Start a
+        // DB one version below current WITHOUT the index, run the ladder,
+        // and assert the index materialised; then rewind and re-run to
+        // prove the `IF NOT EXISTS` form is replay-safe and the version
+        // stays put. No hardcoded version literal — the seed version is
+        // derived from CURRENT_SCHEMA_VERSION so the test tracks the
+        // constant across future schema bumps (same SSOT discipline as
+        // the v54 idempotency test above).
+        const PRIOR_VERSION: i64 = CURRENT_SCHEMA_VERSION - 1;
+        const UPDATED_AT_INDEX: &str = "idx_memories_updated_at";
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        // SCHEMA carries the index inline (fresh-bootstrap parity), so
+        // drop it to simulate a DB that predates the index migration.
+        conn.execute(&format!("DROP INDEX IF EXISTS {UPDATED_AT_INDEX}"), [])
+            .expect("drop index to simulate a pre-index DB");
+        assert!(
+            !index_exists(&conn, UPDATED_AT_INDEX),
+            "precondition: index removed to simulate a pre-index DB"
+        );
+
+        let seed_prior_version = |conn: &Connection| {
+            conn.execute("DELETE FROM schema_version", []).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![PRIOR_VERSION],
+            )
+            .unwrap();
+        };
+
+        seed_prior_version(&conn);
+        super::migrate(&conn).expect("first index-migration pass");
+        assert!(
+            index_exists(&conn, UPDATED_AT_INDEX),
+            "latest arm must create {UPDATED_AT_INDEX}"
+        );
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // Rewind + replay: CREATE INDEX IF NOT EXISTS is a no-op.
+        seed_prior_version(&conn);
+        super::migrate(&conn).expect("second pass is replay-safe");
+        assert!(index_exists(&conn, UPDATED_AT_INDEX));
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -3017,6 +3100,10 @@ mod tests {
         assert!(column_exists(&conn, "memories", "atom_of"));
         assert!(index_exists(&conn, "idx_memories_atom_of"));
         assert!(index_exists(&conn, "idx_memories_atomised_into"));
+        // v55 (#1476) — federation-catchup `updated_at` index. The
+        // legacy v1 schema has no such index, so its presence here proves
+        // the v55 migration arm (MIGRATION_V55_SQLITE) actually ran.
+        assert!(index_exists(&conn, "idx_memories_updated_at"));
     }
 
     #[test]

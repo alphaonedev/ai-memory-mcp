@@ -53,7 +53,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // regression coverage for the tier-default expiry chokepoint, zero
     // new production surface. 16_200 = 16_143 + 57 headroom; far under
     // the 1.5x cap.
-    ("src/storage/mod.rs", 16_200),
+    //
+    // 2026-06-03 — bumped 16_200 → 16_300 by the #1476 federation-catchup
+    // sargability fix: the `memories_updated_since` None/Some predicate
+    // split (+ the `idx_memories_updated_at` migration sourcing) plus its
+    // regression suite (`insert_memory_at` helper +
+    // `memories_updated_since_sargable_split_none_and_some_paths` +
+    // `memories_updated_since_uses_updated_at_index` EXPLAIN-plan
+    // assertion) pushed the file to 16_248. Growth is justified: a
+    // hot-path query rewrite plus its plan-shape + behavioral regression
+    // coverage, zero speculative surface. 16_300 = 16_248 + 52 headroom;
+    // far under the 1.5x cap.
+    ("src/storage/mod.rs", 16_300),
     ("src/mcp/mod.rs", 14_000),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
@@ -107,7 +118,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // doc comments). Still under the existing 15_650 ceiling, so the
     // ceiling is unchanged; recording the new actual LOC here keeps the
     // headroom math honest (15_650 = 15_589 + 61, far under the 1.5x cap).
-    ("src/store/postgres.rs", 15_650),
+    //
+    // 2026-06-03 — bumped 15_650 → 15_750 by the #1476 federation-catchup
+    // sargability fix: the `list_memories_updated_since` None/Some
+    // predicate split, the `CURRENT_SCHEMA_VERSION` 54→55 bump with its
+    // v55 history block, and the version-stamp-only `migrate_v55()` twin
+    // (a no-op because `memories_updated_at_idx (updated_at DESC)` already
+    // serves the range scan) with its extensive justification doc comment
+    // added 80 LOC, pushing the file to 15_669. Growth is justified: a
+    // hot-path query rewrite plus the migration ladder bookkeeping it
+    // requires, no speculative surface. 15_750 = 15_669 + 81 headroom;
+    // far under the 1.5x cap.
+    ("src/store/postgres.rs", 15_750),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /

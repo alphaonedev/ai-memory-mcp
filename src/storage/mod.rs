@@ -8226,18 +8226,32 @@ pub fn memories_updated_since(
     // refuses to project rows that shouldn't federate. The proper
     // fix would belong in the federation handler (or the visibility
     // gate audit) — tracked under follow-up rather than at the SAL.
-    let mut stmt = conn.prepare(
-        "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
+    // #1476 — sargable split, mirrors src/store/postgres.rs. The former
+    // `(?1 IS NULL OR updated_at > ?1)` predicate is non-sargable: SQLite
+    // cannot use `idx_memories_updated_at` to satisfy an OR-NULL branch,
+    // so it falls back to a full table scan. Splitting on `since` lets
+    // the None path read in index order (no predicate) and the Some path
+    // use the index as a range bound (`updated_at > ?1`), each with
+    // early-stop under the LIMIT.
+    const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
                 expires_at, metadata \
-         FROM memories \
-         WHERE (?1 IS NULL OR updated_at > ?1) \
-         ORDER BY updated_at ASC \
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![since, limit], row_to_memory)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+         FROM memories ";
+    let rows = match since {
+        None => {
+            let mut stmt = conn.prepare(&format!("{COLS} ORDER BY updated_at ASC LIMIT ?1"))?;
+            stmt.query_map(params![limit], row_to_memory)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        }
+        Some(s) => {
+            let mut stmt = conn.prepare(&format!(
+                "{COLS} WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT ?2"
+            ))?;
+            stmt.query_map(params![s, limit], row_to_memory)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        }
+    };
+    rows.map_err(Into::into)
 }
 
 /// Deep health check — verifies DB is accessible and FTS is functional.
@@ -10319,6 +10333,97 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// Insert a minimal memory row with an explicit `updated_at` so the
+    /// federation-catchup tests can control the range boundary. Only the
+    /// NOT-NULL/no-default columns are specified; everything else falls to
+    /// the schema defaults (which `row_to_memory` reads cleanly).
+    fn insert_memory_at(conn: &Connection, id: &str, updated_at: &str) {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+             VALUES (?1, 'mid', 'ns', ?1, 'content body', ?2, ?2)",
+            params![id, updated_at],
+        )
+        .expect("insert memory row");
+    }
+
+    #[test]
+    fn memories_updated_since_sargable_split_none_and_some_paths() {
+        // #1476 — the OR-NULL predicate was split into a None path (no
+        // predicate, ORDER BY updated_at ASC) and a Some path (strict
+        // `updated_at > ?1`). Pin the behavioral contract of both branches
+        // so the sargable rewrite can never silently change which rows a
+        // peer catchup observes.
+        let conn = test_db();
+        let t1 = "2026-01-01T00:00:00+00:00";
+        let t2 = "2026-01-02T00:00:00+00:00";
+        let t3 = "2026-01-03T00:00:00+00:00";
+        // Insert out of order to prove ORDER BY actually sorts.
+        insert_memory_at(&conn, "b", t2);
+        insert_memory_at(&conn, "c", t3);
+        insert_memory_at(&conn, "a", t1);
+
+        // None path: every row, ascending by updated_at.
+        let all = memories_updated_since(&conn, None, 100).expect("none path");
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b", "c"],
+            "None path: all rows ASC by updated_at"
+        );
+
+        // Some path is STRICTLY greater — the boundary row (t1) is excluded.
+        let after_t1 = memories_updated_since(&conn, Some(t1), 100).expect("some path");
+        let ids: Vec<&str> = after_t1.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["b", "c"],
+            "Some(t1): strict > excludes the boundary row"
+        );
+
+        // Past the newest row → empty.
+        let after_t3 = memories_updated_since(&conn, Some(t3), 100).expect("some path empty");
+        assert!(
+            after_t3.is_empty(),
+            "Some(t3): nothing strictly newer than the max"
+        );
+
+        // LIMIT caps from the low end of the range (oldest-first under ASC).
+        let one = memories_updated_since(&conn, Some(t1), 1).expect("some path limited");
+        let ids: Vec<&str> = one.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["b"],
+            "Some(t1) LIMIT 1: oldest row strictly after t1"
+        );
+    }
+
+    #[test]
+    fn memories_updated_since_uses_updated_at_index() {
+        // #1476 — the sargable Some path must resolve through
+        // `idx_memories_updated_at`, not a full table scan. Assert the
+        // query plan references the index via EXPLAIN QUERY PLAN.
+        let conn = test_db();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT id FROM memories WHERE updated_at > ?1 \
+                 ORDER BY updated_at ASC LIMIT ?2",
+            )
+            .expect("prepare explain");
+        let plan: String = stmt
+            .query_map(params!["2026-01-01T00:00:00+00:00", 10_i64], |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("explain rows")
+            .map(|r| r.expect("explain detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_memories_updated_at"),
+            "sargable catchup query must use idx_memories_updated_at; plan was: {plan}"
+        );
     }
 
     #[test]
