@@ -100,6 +100,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // justified: a real perf fix (8.5x write throughput) on the canonical
     // SAL postgres surface, no speculative surface. 15_650 = 15_556 + 94
     // headroom; far under the 1.5x cap.
+    //
+    // 2026-06-03 — NO bump: the #1473 list() sargability fix (commit
+    // 4fc5e411f) grew the file 15_556 → 15_589 (+33: the dynamic
+    // namespace-predicate split + the two NS_FILTER_* consts and their
+    // doc comments). Still under the existing 15_650 ceiling, so the
+    // ceiling is unchanged; recording the new actual LOC here keeps the
+    // headroom math honest (15_650 = 15_589 + 61, far under the 1.5x cap).
     ("src/store/postgres.rs", 15_650),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate

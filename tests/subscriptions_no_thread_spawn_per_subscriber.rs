@@ -43,6 +43,15 @@ use common::fresh_db_tempfile_path as fresh_db;
 const BOUND: usize = 8;
 const SUBSCRIBERS: usize = 50;
 
+/// #1475 — upper bound on how long the post-dispatch semaphore drain
+/// may take. Generous so a slow CI host under full-suite HTTP
+/// contention still drains within it; a genuine permit leak never
+/// drains and trips this deadline (the assert then FAILs correctly).
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// #1475 — poll cadence while waiting for the semaphore to drain.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Custom responder that ACKs with the dispatched correlation id so
 /// `deliver_with_retry` counts the call as a success. Wiremock's
 /// per-mock `respond_with` is async-friendly; we add a per-response
@@ -192,9 +201,9 @@ async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
     // trips the deadline (still FAILs correctly); a slow host just
     // takes a few extra 50 ms iterations.
     let mut idle_avail = dispatch_semaphore_available_permits();
-    let drain_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline = std::time::Instant::now() + DRAIN_DEADLINE;
     while idle_avail != BOUND && std::time::Instant::now() < drain_deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         idle_avail = dispatch_semaphore_available_permits();
     }
     assert_eq!(

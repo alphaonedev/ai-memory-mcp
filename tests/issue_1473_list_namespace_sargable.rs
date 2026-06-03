@@ -173,11 +173,15 @@ async fn list_namespace_filter_is_sargable_under_generic_plan() {
     // Fixed behavior: the namespace equality drives an index access
     // condition. With enable_seqscan=off a non-sargable predicate would
     // be unable to produce an `Index Cond: (namespace = $1)` — it would
-    // appear under `Filter` instead.
+    // appear under `Filter` instead. Match the full adjacency form
+    // (`Index Cond: (namespace =`) rather than the two tokens
+    // independently, so an index condition on some OTHER column cannot
+    // false-pass this assertion.
+    let ns_index_cond = format!("{INDEX_COND_TOKEN}: ({NAMESPACE_COLUMN} =");
     assert!(
-        plan.contains(INDEX_COND_TOKEN) && plan.contains(NAMESPACE_COLUMN),
-        "#1473: sargable namespace filter must plan as an `{INDEX_COND_TOKEN}` on \
-         `{NAMESPACE_COLUMN}`; got plan:\n{plan}"
+        plan.contains(&ns_index_cond),
+        "#1473: sargable namespace filter must plan as an `{ns_index_cond}…)` index \
+         condition; got plan:\n{plan}"
     );
 
     // Contrast probe: the OLD OR-NULL form must NOT yield a namespace
@@ -188,7 +192,6 @@ async fn list_namespace_filter_is_sargable_under_generic_plan() {
     let or_null_plan = explain_generic_plan(&mut conn, &or_null_sql)
         .await
         .expect("EXPLAIN on OR-NULL form");
-    let ns_index_cond = format!("{INDEX_COND_TOKEN}: ({NAMESPACE_COLUMN} =");
     assert!(
         !or_null_plan.contains(&ns_index_cond),
         "#1473: the OR-NULL namespace form is expected to be NON-sargable (degrade to a \
