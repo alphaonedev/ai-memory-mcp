@@ -89,7 +89,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the canonical postgres ladder mirroring the SQLite backfill, no
     // speculative surface. 15_500 = 15_416 + 84 headroom; far under the
     // 1.5x cap.
-    ("src/store/postgres.rs", 15_500),
+    //
+    // 2026-06-03 — bumped 15_500 → 15_650 by the #1472 write-ceiling fix
+    // (commit 4fb063b7c): scoping the postgres subscription dispatch from a
+    // per-write full-table scan to a sargable namespace-prefix byte-range
+    // scan added 142 LOC, pushing the file to 15_556; the lockstep bump was
+    // missed in 4fb063b7c and surfaced as a RED qual_10 gate on
+    // release/v0.7.0 (the --lib subset that gated the #1472/#1431 merge does
+    // not run tests/ integration binaries). Tracked as #1474. Growth is
+    // justified: a real perf fix (8.5x write throughput) on the canonical
+    // SAL postgres surface, no speculative surface. 15_650 = 15_556 + 94
+    // headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 15_650),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
