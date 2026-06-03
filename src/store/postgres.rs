@@ -6857,6 +6857,13 @@ const KG_TIMELINE_DEFAULT_LIMIT_SAL: usize = 200;
 /// Mirrors `crate::db::KG_TIMELINE_MAX_LIMIT`.
 const KG_TIMELINE_MAX_LIMIT_SAL: usize = 1000;
 
+/// Hard ceiling on rows returned by a single store-level list scan
+/// ([`PostgresStore::list_by_namespace_prefix`],
+/// [`PostgresStore::list_memories_updated_since`]). Bounds the
+/// per-write dispatch and federation-catchup hot paths so one call
+/// cannot exhaust the connection pool with an unbounded fetch.
+const STORE_LIST_MAX_LIMIT_SAL: i64 = 10_000;
+
 /// Apply the published timeline page-size policy: default to
 /// [`KG_TIMELINE_DEFAULT_LIMIT_SAL`] when the caller didn't pass a
 /// limit, then clamp to the `[1, KG_TIMELINE_MAX_LIMIT_SAL]` band so a
@@ -8324,7 +8331,7 @@ impl MemoryStore for PostgresStore {
         prefix: &str,
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = (limit as i64).clamp(1, 10_000);
+        let limit: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
         // Sargable prefix scan via a half-open byte range on the
         // `namespace` btree (`memories_namespace_idx`). The database
         // collation is byte-ordered (C.UTF-8), so
@@ -8707,7 +8714,7 @@ impl MemoryStore for PostgresStore {
         since: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
-        let limit_i: i64 = limit.clamp(1, 10_000).try_into().unwrap_or(500);
+        let limit_i: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
         let since_dt = match since {
             None => None,
             Some(s) => Some(parse_rfc3339_required(s)?),
