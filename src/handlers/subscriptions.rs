@@ -32,6 +32,18 @@ use super::StorageBackend;
 use super::store_err_to_response;
 use super::{fanout_or_503, resolve_caller_agent_id};
 
+/// Namespace prefix under which subscriptions are mirrored as memories
+/// (`_subscriptions/<agent_id>`). Used by the postgres dispatch path to
+/// scope the subscriber lookup to a sargable namespace range.
+#[cfg(feature = "sal")]
+const SUBSCRIPTION_NS_PREFIX: &str = "_subscriptions/";
+
+/// Upper bound on subscription rows pulled per dispatch tick. Matches
+/// the sqlite path's implicit ceiling; production deployments rarely
+/// exceed dozens of subscribers.
+#[cfg(feature = "sal")]
+const SUBSCRIPTION_DISPATCH_LIMIT: usize = 1000;
+
 // --- /api/v1/notify (POST) + /api/v1/inbox (GET) ---------------------------
 
 #[derive(Deserialize)]
@@ -903,24 +915,22 @@ pub async fn dispatch_event_postgres(
     // wire surface (subscribe/list/unsubscribe handlers).
     let ctx = crate::store::CallerContext::for_admin("subscription-dispatch");
 
-    // We don't have a namespace-prefix filter on the SAL `list` method
-    // yet (`Filter::namespace` is exact-match). For dispatch we list
-    // with `namespace=None` (all rows) and filter to `_subscriptions/`
-    // in Rust. The limit is bounded at 1000 to match the sqlite path's
-    // implicit limit (subscriptions::list has no LIMIT clause, but
-    // production deployments rarely exceed dozens of subscribers).
-    // A future SAL extension can add `namespace_prefix` to push this
-    // filter into SQL.
-    let filter = crate::store::Filter {
-        namespace: None,
-        limit: 1000,
-        ..Default::default()
-    };
-    let memories = match app.store.list(&ctx, &filter).await {
+    // Pull only the subscription mirror rows (`_subscriptions/<agent>`)
+    // via the sargable namespace-prefix scan. `Filter::namespace` is
+    // exact-match, so dispatch historically listed with `namespace=None`
+    // (every row) and filtered to `_subscriptions/` in Rust — a full
+    // table seq-scan on EVERY write that scaled with corpus size. The
+    // prefix scan lets the planner range-scan the `namespace` index
+    // instead, making dispatch O(subscribers) rather than O(corpus).
+    let memories = match app
+        .store
+        .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, SUBSCRIPTION_DISPATCH_LIMIT)
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(
-                "dispatch_event_postgres: SAL list failed: {e} — \
+                "dispatch_event_postgres: SAL prefix-list failed: {e} — \
                  no subscribers will fire this tick"
             );
             return;
@@ -929,7 +939,7 @@ pub async fn dispatch_event_postgres(
 
     let mut matching: Vec<(crate::subscriptions::Subscription, Option<String>)> = Vec::new();
     for m in memories {
-        if !m.namespace.starts_with("_subscriptions/") {
+        if !m.namespace.starts_with(SUBSCRIPTION_NS_PREFIX) {
             continue;
         }
         let meta = &m.metadata;

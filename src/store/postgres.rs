@@ -6465,6 +6465,28 @@ impl PostgresStore {
     }
 }
 
+/// Exclusive upper bound for a byte-ordered prefix range: the smallest
+/// string strictly greater than every string starting with `prefix`.
+///
+/// Increments the last byte that is `< 0xFF`, dropping any trailing
+/// `0xFF` bytes. Returns `None` when no such bound exists (empty prefix,
+/// or all-`0xFF`), in which case the caller uses an open-ended `>=`
+/// lower bound only. Valid for the database's byte-ordered (C) collation.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(&last) = bytes.last() {
+        if last < 0xFF {
+            *bytes.last_mut().unwrap() = last + 1;
+            // Bytes before the incremented one stay valid UTF-8; the
+            // incremented tail byte keeps any multi-byte sequence's lead
+            // bytes intact for ASCII prefixes (our namespaces are ASCII).
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.pop();
+    }
+    None
+}
+
 /// v0.7.0 fold-A2A1.3 (#700) — AGE-side runtime failure classifier.
 ///
 /// Decides whether a `StoreError` returned from one of the
@@ -8202,6 +8224,67 @@ impl MemoryStore for PostgresStore {
             .into_iter()
             .filter(|m| is_visible_to_caller(m, caller))
             .collect())
+    }
+
+    async fn list_by_namespace_prefix(
+        &self,
+        _ctx: &CallerContext,
+        prefix: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        let limit: i64 = (limit as i64).clamp(1, 10_000);
+        // Sargable prefix scan via a half-open byte range on the
+        // `namespace` btree (`memories_namespace_idx`). The database
+        // collation is byte-ordered (C.UTF-8), so
+        //   namespace >= prefix AND namespace < upper_bound(prefix)
+        // selects exactly the rows whose namespace starts with `prefix`
+        // — and the planner turns it into an `Index Cond` even under the
+        // generic prepared-statement plan sqlx uses (a parameterized
+        // `LIKE`/`~>=~` does NOT: it degrades to a full index Filter
+        // scan). This is the per-write dispatch hot path; the prior
+        // `list(namespace=None)` here seq-scanned the entire table on
+        // every write.
+        let upper = prefix_upper_bound(prefix);
+        let rows = match upper {
+            Some(ref upper) => {
+                sqlx::query(
+                    "SELECT * FROM memories
+                     WHERE namespace >= $1 AND namespace < $2
+                     ORDER BY namespace
+                     LIMIT $3",
+                )
+                .bind(prefix)
+                .bind(upper)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT * FROM memories
+                     WHERE namespace >= $1
+                     ORDER BY namespace
+                     LIMIT $2",
+                )
+                .bind(prefix)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| to_store_err("list_by_namespace_prefix", e))?;
+
+        // Belt-and-suspenders: re-apply the prefix predicate in-process
+        // so the result is correct even if the byte-range bounds ever
+        // drift from the requested prefix.
+        rows.iter()
+            .map(Self::row_to_memory)
+            .collect::<StoreResult<Vec<_>>>()
+            .map(|mems| {
+                mems.into_iter()
+                    .filter(|m| m.namespace.starts_with(prefix))
+                    .collect()
+            })
     }
 
     async fn search(
@@ -12578,6 +12661,65 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // prefix_upper_bound underpins the sargable namespace-prefix range
+    // used by `list_by_namespace_prefix` (the per-write dispatch hot
+    // path). Under the byte-ordered (C) collation, the half-open range
+    // [prefix, upper) must contain EXACTLY the strings starting with
+    // `prefix` — a wrong bound silently drops or duplicates subscribers.
+    #[test]
+    fn prefix_upper_bound_increments_last_byte() {
+        // '/' is 0x2F → '0' is 0x30.
+        assert_eq!(
+            prefix_upper_bound("_subscriptions/").as_deref(),
+            Some("_subscriptions0")
+        );
+        assert_eq!(prefix_upper_bound("a").as_deref(), Some("b"));
+        assert_eq!(prefix_upper_bound("ns/").as_deref(), Some("ns0"));
+    }
+
+    #[test]
+    fn prefix_upper_bound_bounds_exactly_the_prefix_band() {
+        // Every string starting with the prefix sorts inside [lo, hi);
+        // the nearest non-matching neighbours sort outside it.
+        let lo = "_subscriptions/";
+        let hi = prefix_upper_bound(lo).unwrap();
+        for inside in [
+            "_subscriptions/",
+            "_subscriptions/alice",
+            "_subscriptions/zzz",
+            "_subscriptions/\u{10FFFF}",
+        ] {
+            assert!(inside >= lo && inside < hi.as_str(), "{inside}");
+        }
+        for outside in [
+            "_subscriptions",   // shorter, not in the namespace
+            "_subscriptions.",  // '.' = 0x2E < '/'
+            "_subscriptions0",  // == hi, excluded
+            "_subscriptions0a", // beyond hi
+            "_subscriptionz",   // 'z' > 's'… diverges before the slash
+        ] {
+            assert!(
+                !(outside >= lo && outside < hi.as_str()),
+                "{outside} must fall outside [{lo}, {hi})"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_upper_bound_empty_and_non_ascii_degrade_to_none() {
+        // Empty prefix → no upper bound (open-ended `>=` lower bound
+        // only; the in-process starts_with filter keeps the result
+        // correct).
+        assert_eq!(prefix_upper_bound(""), None);
+        // A prefix whose last UTF-8 byte increments into an invalid
+        // continuation (e.g. 'ÿ' = 0xC3 0xBF → 0xC3 0xC0) yields no
+        // valid-UTF-8 successor → None, the same safe degrade. We never
+        // pass non-ASCII namespace prefixes, but the path must not panic.
+        assert_eq!(prefix_upper_bound("\u{00ff}"), None);
+        // ASCII always has a clean successor.
+        assert_eq!(prefix_upper_bound("_inbox/").as_deref(), Some("_inbox0"));
+    }
 
     // QC Obs #6 (2026-05-20) — `assert_age_id_safe` is a security
     // primitive: it gates whether a caller-supplied id can be inlined

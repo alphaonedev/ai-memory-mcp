@@ -603,6 +603,36 @@ pub trait MemoryStore: Send + Sync {
     /// deterministic across calls with identical `Filter`.
     async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>>;
 
+    /// Fetch rows whose namespace begins with `prefix`, capped at
+    /// `limit`. Used by event dispatch to pull the subscription mirror
+    /// (`_subscriptions/<agent>`) without enumerating the whole store.
+    ///
+    /// The default impl preserves the historical behavior — a full
+    /// [`list`](Self::list) with an in-process prefix filter — so
+    /// adapters that have no cheaper path keep working unchanged. The
+    /// postgres adapter overrides this with a sargable prefix query so
+    /// the lookup uses the `namespace` btree index instead of
+    /// seq-scanning every row on every write (the per-write dispatch
+    /// hot path).
+    async fn list_by_namespace_prefix(
+        &self,
+        ctx: &CallerContext,
+        prefix: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        let filter = Filter {
+            namespace: None,
+            limit,
+            ..Default::default()
+        };
+        Ok(self
+            .list(ctx, &filter)
+            .await?
+            .into_iter()
+            .filter(|m| m.namespace.starts_with(prefix))
+            .collect())
+    }
+
     /// Keyword search (FTS-equivalent). Adapters without full-text
     /// search may return `UnsupportedCapability` and let upper
     /// layers fall back.
