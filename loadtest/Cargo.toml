@@ -1,0 +1,23 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone, dependency-free load-test harness for ai-memory. Decoupled
+# from the product crate (its own Cargo.toml / Cargo.lock / target) so it
+# never perturbs the ai-memory build, gates, or CI. Pure std — no external
+# crates (project no-external-injection policy). Build: `cargo build --release`.
+[package]
+name = "loadtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dependency-free HTTP load-test harness for the ai-memory daemon + federated hive"
+license = "Apache-2.0"
+
+[[bin]]
+name = "loadtest"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
