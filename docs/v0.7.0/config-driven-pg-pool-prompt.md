@@ -1,4 +1,4 @@
-# Work Prompt — v0.7.0 Enhancement (a): Config-Driven Postgres Pool Sizing + Doc-Drift Fix
+# Work Prompt — v0.7.0 Enhancement (a): Config-Driven Postgres Pool Sizing + Doc-Drift Fix + PgBouncer Admin-Docs
 
 > **Document type:** Operational AI-NHI work prompt. The operator feeds this
 > document back to the agent to BEGIN the work. Each task below carries a
@@ -75,9 +75,29 @@ tuned without a recompile) AND a doc/code-drift fix (the docs promise a knob the
 binary does not read). It is cheap, low-risk v0.7.0 ship-hardening: it mirrors an
 existing precedent exactly and touches the postgres adapter + config resolver only.
 
-**Out of THIS prompt's scope (these are v0.8.0, tracked separately):** the
-load-shed/admission-control layer on `build_router` (enhancement b), PgBouncer
-deployment, and the module-model consolidation contract.
+**PgBouncer enters v0.7.0 as CONFIG-ONLY admin docs (T7), not code.** PgBouncer is
+an external middleman daemon: an operator runs it between ai-memory and Postgres and
+configures it via `pgbouncer.ini` + `userlist.txt`; ai-memory points its connection
+string at port 6432 instead of 5432. There is NO application code required to deploy
+it. Because it is config-only, the *operator setup documentation* ships in v0.7.0
+alongside (a) — they are the same surface (how to size + pool the Postgres
+connection). Transaction-mode compatibility (the mode that gives the fan-in benefit)
+has two Postgres-session-semantics caveats, BOTH resolved in config (T7): pin
+PgBouncer ≥1.21 with `max_prepared_statements > 0` to preserve Fix #4
+prepared-statement plan caching, and push `statement_timeout` / `lock_timeout` to
+role defaults (`ALTER ROLE`) so they survive PgBouncer's inter-transaction
+`DISCARD ALL`. The AGE cypher path is ALREADY transaction-mode-safe (every call site
+does `LOAD 'age'` + `SET LOCAL search_path` inside its own transaction and runs AGE
+statements `.persistent(false)`).
+
+**Out of THIS prompt's scope (these remain v0.8.0, tracked separately under
+issue #1488):** the load-shed/admission-control layer on `build_router`
+(enhancement b), the module-model Hot/Cold consolidation contract, and the empirical
+per-module envelope (X) measurement. Note: the per-module agent ceiling is bounded by
+AGE write throughput on that module's backbone — PgBouncer fixes connection-count
+fan-in, NOT write concurrency — so the "1000 agents/module" figure remains a
+conservative design DEFAULT pending the v0.8.0 4.D measurement, never a benchmarked
+guarantee in v0.7.0 docs.
 
 ---
 
@@ -91,7 +111,9 @@ deployment, and the module-model consolidation contract.
 | T4 | Wire resolved pool config into daemon `build_store_handle` | `src/daemon_runtime.rs` | S |
 | T5 | Fix doc-drift (postgres.rs docstring + enterprise-deployment.md + config example + CLAUDE.md env table) | docs + `src/config.rs` table | S |
 | T6 | Tests: precedence + resolver + pool-build + doc-name-match | `tests/config_precedence.rs`, unit mods | M |
-| T7 | QC gates + coverage + commit + PR + merge + push to release/v0.7.0 | — | S |
+| T7 | PgBouncer admin-docs + transaction-mode compat (config-only) | `docs/enterprise-deployment.md`, `docs/v0.7.0/*` | M |
+| T8 | *(Optional)* `after_connect` pooler-resilience hardening | `src/store/postgres.rs` | S |
+| T9 | QC gates + coverage + commit + PR + merge + push to release/v0.7.0 | — | S |
 
 ---
 
@@ -232,7 +254,102 @@ default-equality + doc-name-match tests pass; full suite green.
 
 ---
 
-### T7 — QC gates + coverage + commit + PR + merge + push
+### T7 — PgBouncer admin-docs + transaction-mode compat (config-only)
+
+**Starter prompt:**
+> RE-READ the FIRST READ block. PgBouncer is a config-only external daemon — NO
+> application code in this task. Add an operator-facing PgBouncer section to
+> `docs/enterprise-deployment.md` (extend §5.6 "Connection pooling", which already
+> sketches the PgBouncer port 6432 / `pool_mode=transaction` / `max_client_conn` /
+> `default_pool_size` shape — reconcile it to the now-real `AI_MEMORY_PG_POOL_*`
+> knobs from T3/T5 so the sqlx-pool guidance and the PgBouncer guidance agree). The
+> section MUST cover, with NO bare literals in prose tables (state every value as the
+> named-constant default it traces to where one exists):
+> 1. **What PgBouncer is and is not** — a connection-multiplexing middleman for
+>    transient/bursty *session* fan-in; it removes the connection-count ceiling, NOT
+>    AGE write-concurrency. Explicitly state it is config-only (no ai-memory code).
+> 2. **Wiring** — point ai-memory's Postgres URL at PgBouncer's port (6432) instead
+>    of the Postgres port (5432); a minimal `pgbouncer.ini` + `userlist.txt` example;
+>    `pool_mode = transaction`. **Hard rule: `pool_mode = transaction` is REQUIRED;
+>    `statement` mode is forbidden and `session` mode forfeits the fan-in benefit.**
+>    Explain WHY in our terms: the AGE cypher path issues `LOAD 'age'` + `SET LOCAL
+>    search_path` + the `cypher()` call as multiple statements that MUST execute on
+>    the SAME backend within one transaction. Statement-mode pooling can route each
+>    statement to a different backend — the `cypher()` call then lands on a backend
+>    where `search_path`/`LOAD` never ran, breaking the graph path and risking
+>    partially-applied multi-statement graph writes. Transaction mode pins the whole
+>    transaction to one backend, which is exactly what AGE needs.
+> 3. **Compat caveat 1 — prepared statements (Fix #4):** pin PgBouncer **≥1.21** and
+>    set `max_prepared_statements` > 0 so sqlx's named prepared statements (the Fix #4
+>    plan-caching hot path) survive transaction-mode multiplexing. State plainly that
+>    omitting this regresses Fix #4.
+> 4. **Compat caveat 2 — session timeouts:** the per-session `statement_timeout` /
+>    `lock_timeout` set in `after_connect` (`src/store/postgres.rs`) do NOT survive
+>    PgBouncer's inter-transaction `DISCARD ALL`; the robust path is role defaults —
+>    `ALTER ROLE ai_memory SET statement_timeout = ...; SET lock_timeout = ...;` —
+>    quoting the same `DEFAULT_*` values the binary uses. (Config fix, not code.)
+> 5. **AGE is already safe** — note that the cypher path sets `SET LOCAL search_path`
+>    + `LOAD 'age'` per-transaction and runs `.persistent(false)`, so transaction-mode
+>    pooling needs nothing extra for the graph path.
+> 6. **Capacity honesty** — PgBouncer enables per-module session fan-in; the
+>    per-module agent ceiling is bounded by AGE write throughput and the module-model
+>    default is 1000 agents/module as a CONSERVATIVE DESIGN DEFAULT pending the v0.8.0
+>    4.D envelope measurement. Do NOT print "5000 agents on one daemon" or any
+>    unmeasured concurrent-agent number. Scale-out to thousands is via composing
+>    independent modules (each its own PG+AGE backbone + PgBouncer), not one daemon.
+> 7. **Two host-level operational risks to call out** (operator-facing, config/sizing,
+>    no code): (a) **SQLite hot-tier memory pressure** — a module fronting up to ~1000
+>    agents runs that many 1:1 SQLite hot tiers; the per-agent cache/mmap footprint
+>    must be capped (page-cache + mmap limits) and the host RAM-budgeted, or the module
+>    container OOMs. This is part of why the module default sits at ~⅓ of the measured
+>    envelope. (b) **Cross-module federation latency** — agents in module A reaching
+>    module B's corpus pay cross-node RTT through the federation layer; highly
+>    interdependent agents make that network hop, not Postgres, the bottleneck. The
+>    mitigation is locality (co-locate interdependent agents in one module) and the
+>    Hot/Cold consolidation contract — both tracked under #1488 (4.C). Frame these as
+>    "size and place modules with this in mind," not as v0.7.0 defects.
+> Cross-link issue #1488 (v0.8.0 Pillar 4) for (b)/4.B/4.C/4.D. fmt the markdown;
+> ensure every internal code reference is a real, current line (no stale `:468`-style
+> drift — the T5 reconciliation rule applies here too).
+
+**Done when:** §5.6 documents the real PgBouncer setup + both transaction-mode compat
+fixes + the AGE-safe note + the capacity-honesty framing + the
+transaction-mode-required hard rule (with the AGE multi-statement rationale) + the two
+host-level operational risks (SQLite hot-tier OOM capping; cross-module federation
+latency); all code refs current; zero unmeasured agent-count claims; cross-links #1488.
+
+---
+
+### T8 — *(Optional)* `after_connect` pooler-resilience hardening
+
+> **OPTIONAL + gated.** The T7 role-default config is the PRIMARY, sufficient fix for
+> the session-timeout caveat. Do T8 only if it adds value WITHOUT regressing the
+> non-pooled (direct-to-Postgres) deployment, which is the default. If it cannot be
+> done cleanly, SKIP it and say so in the PR — the config path already closes the gap.
+
+**Starter prompt:**
+> RE-READ the FIRST READ block. Goal: make the timeout safety-envelope resilient when
+> ai-memory runs behind a transaction-mode pooler that issues `DISCARD ALL` between
+> transactions (which silently clears the `after_connect` session SETs). Evaluate the
+> minimal-surface option FIRST and prefer it: emit a single `tracing::warn!` (once, at
+> connect) when the resolved pool `max_connections` and acquire behavior suggest a
+> pooler AND the operator has not set role-level timeout defaults — pointing them at
+> the T7 `ALTER ROLE` guidance. Do NOT add a heuristic that fires on direct-Postgres
+> deployments (false positives are worse than the warning's value). Do NOT convert the
+> session SETs to `SET LOCAL` blanket-wrapping — ai-memory's non-transactional
+> statements would then run with no timeout, REGRESSING the safety envelope on the
+> common direct path. Any new threshold/name is a named `const`. If no clean,
+> regression-free hardening exists, leave `after_connect` exactly as T2 preserved it
+> and document the decision in the PR body. fmt + clippy pedantic clean.
+
+**Done when:** EITHER a regression-free, const-driven pooler-detection warn-log is
+added (direct-Postgres path unchanged), OR the task is consciously skipped with the
+rationale recorded in the PR — never a change that weakens the direct-path timeout
+envelope.
+
+---
+
+### T9 — QC gates + coverage + commit + PR + merge + push
 
 **Starter prompt:**
 > RE-READ the FIRST READ block. Run the full gate set on a fresh build:
@@ -245,8 +362,11 @@ default-equality + doc-name-match tests pass; full suite green.
 > `config.rs` coverage did not regress — RAISE the floor if the new tests lifted it
 > (Lane 2 discipline: floors rise, never fall). Stage EXPLICIT paths only (no
 > `git add -A`). Commit grouped by intent:
-> `feat(config): config-driven postgres pool sizing (AI_MEMORY_PG_POOL_*)` and
-> `docs: reconcile pool-sizing drift in enterprise-deployment + env table`. Every
+> `feat(config): config-driven postgres pool sizing (AI_MEMORY_PG_POOL_*)`,
+> `docs: reconcile pool-sizing drift in enterprise-deployment + env table`, and
+> `docs: PgBouncer transaction-mode admin setup (config-only, >=1.21)`
+> (+ a `fix(store): warn when behind a pooler without role-default timeouts` commit
+> ONLY if T8 produced a code change; skip it if T8 was consciously skipped). Every
 > commit ends with `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>`.
 > Open ONE PR targeting `release/v0.7.0` with the AI-involvement section, a Summary
 > citing the doc-drift defect closed, and a Test plan checklist. When the PR is
@@ -266,5 +386,12 @@ PR opened + merged + pushed to `release/v0.7.0`, PR URL + SHA reported.
 - [ ] Zero new hardcoded literals at logic sites — all defaults + env names are `const`.
 - [ ] Doc-drift closed: no `with_pool_options` refs; env table + deployment guide +
       config template describe the real knobs; env-var names byte-match a guard test.
+- [ ] PgBouncer admin-docs (T7) land in `enterprise-deployment.md §5.6`: config-only
+      wiring (port 6432, `pool_mode=transaction`), the two transaction-mode compat
+      fixes (≥1.21 `max_prepared_statements` for Fix #4; role-default timeouts for the
+      `after_connect` envelope), the AGE-already-safe note, and the capacity-honesty
+      framing (no unmeasured concurrent-agent numbers; module-model scale-out; #1488).
+- [ ] T8 either lands a regression-free, const-driven pooler-warning OR is skipped
+      with the rationale in the PR — the direct-Postgres timeout envelope is unchanged.
 - [ ] Every new branch covered; coverage floors raised where lifted.
 - [ ] Six QC gates green; one PR merged + pushed to `release/v0.7.0`; URL + SHA reported.
