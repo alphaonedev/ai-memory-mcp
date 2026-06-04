@@ -287,11 +287,19 @@ report as `docs/CAMPAIGN-v0.6.0.0.md` on the release.
 
 ## Not included (deliberate)
 
-- **LLM / Ollama installation** on the droplets. Gemma 4 via Ollama
-  is compute-heavy and the DO test focuses on the memory system
-  itself. The curator phase runs with `--dry-run`; operators who
-  want the full LLM-mediated autonomy test should size up to
-  `s-4vcpu-16gb` and follow `RUNBOOK-curator-soak.md`.
+- **Local LLM (Ollama) installation** on the droplets. Running Gemma 4
+  *locally* via Ollama is compute-heavy, and this DO test focuses on the
+  memory system itself, so the curator phase runs with `--dry-run` on a
+  CPU-only droplet. This is a sizing choice for the local-model path, **not
+  a GPU requirement of ai-memory** — post-#1067/#1146 the autonomous tier
+  drives every feature through any OpenAI-compatible endpoint (a remote
+  cloud API like OpenRouter, or an internal HA inference VIP) with **no
+  local model and no GPU on the droplet**. Operators who want the full
+  LLM-mediated autonomy test on a small droplet point `[llm]` at a remote
+  backend (`AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_API_KEY` +
+  `AI_MEMORY_LLM_MODEL`) per `docs/integrations/llm-backends.md`; those who
+  prefer the local-model path should size up to `s-4vcpu-16gb` and follow
+  `RUNBOOK-curator-soak.md`.
 - **TurboQuant compression** — scrapped (#284/#287). See CHANGELOG
   scrap note.
 - **Week-long soak** — not a ship-gate. Post-release validation; see

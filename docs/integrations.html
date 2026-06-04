@@ -376,7 +376,7 @@ curl https://memory.local:9077/api/v1/recall \
             <span class="client-tier t2">▸ TIER 2 · TESTED</span>
           </div>
         </div>
-        <p class="client-desc">Local LLM hosts. Post-#1067 (v0.7.0), any of 15 OpenAI-compatible vendors or local Ollama works; Ollama shown here for zero-network installs.</p>
+        <p class="client-desc">Local LLM hosts. Post-#1067 (v0.7.0), any of 15 OpenAI-compatible vendors or local Ollama works; Ollama shown here for zero-network installs. <strong>No GPU required</strong> — on CPU-only or air-gapped hosts, point <code>[llm]</code> at a remote cloud API or internal HA endpoint instead (no local model). See the <a href="autonomous.html#no-gpu">No GPU required</a> walkthrough.</p>
         <pre class="client-config"><span class="cmt"># Smart/autonomous tier — any LLM backend post-#1067; default Ollama model is gemma3:4b</span>
 ollama pull gemma3:4b
 ai-memory mcp --tier smart</pre>
