@@ -229,6 +229,10 @@ jobs:
     name: Check (${{ matrix.os }})
     needs: classify
     runs-on: ${{ matrix.os }}
+    # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
+    # download on the semantic-tier CLI recall path) fails fast instead of
+    # pinning a runner for hours. Normal run is well under this.
+    timeout-minutes: 45
     env:
       # #1407/#1405/#1387 — the ubuntu `cargo test` link step OOM'd the
       # linker (`collect2: ld terminated with signal 7 [Bus error]`).
@@ -412,6 +416,8 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    # #1487 — bound the job so a wedged test can't pin the runner.
+    timeout-minutes: 45
     env:
       # v0.7.x (#1148) — mold linker + line-only DWARF to keep peak
       # linker RSS under the 7 GB ubuntu-latest ceiling for the heavy
@@ -665,6 +671,8 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    # #1487 — bound the job so a wedged test can't pin the runner.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -771,6 +779,12 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    # #1487 — this job hung 2h13m on run 26944887140 when a semantic-tier
+    # CLI recall stalled on an unbounded HF-Hub model download and there
+    # was no timeout to kill it. The root cause is fixed in
+    # embeddings::Embedder::download_within; this bound is the
+    # defense-in-depth backstop. Normal instrumented run is ~25 min.
+    timeout-minutes: 60
     env:
       # v0.7.x (#1148) — mold linker + line-only DWARF keep peak
       # linker RSS under the 7 GB ubuntu-latest ceiling for the

@@ -6,7 +6,13 @@
 // Integration tests — all run through the CLI binary
 //
 // AI_MEMORY_NO_CONFIG=1 prevents loading ~/.config/ai-memory/config.toml
-// which may set tier=autonomous and trigger embedder/LLM initialization.
+// which may set tier=autonomous and trigger LLM initialization. NOTE
+// (#1487): it does NOT disable the embedder — with no config file
+// `effective_tier` still defaults to `semantic` (config.rs), so CLI
+// `recall` builds a MiniLM embedder and may download its weights from
+// the HuggingFace Hub. That download is now bounded by a watchdog
+// (embeddings::Embedder::download_within) so a stalled HF connection
+// degrades to keyword-only instead of hanging the test process.
 
 mod common;
 use common::free_port;
