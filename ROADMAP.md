@@ -478,7 +478,7 @@ L4 is the architecturally clean removal of the entire problem class: hosts volun
 
 **Anchor:** AI NHI advisory dated 2026-05-11, refined against the moonshot synthesis 2026-05-25. Every item is checked against the §2 seven properties and the §3 scope test.
 
-**Executive position.** v0.8.0 expands the substrate's reach from single-agent + small-swarm operation into **federation-across-organizational-trust-boundaries with coordination primitives that carry separation-of-powers across endpoints**. New v0.8.0 total: ~47 sessions. Compatible with Q4 2026 ship target at the demonstrated cadence.
+**Executive position.** v0.8.0 expands the substrate's reach from single-agent + small-swarm operation into **federation-across-organizational-trust-boundaries with coordination primitives that carry separation-of-powers across endpoints**, and adds the **Pillar 4 connection-scaling substrate** (module model + admission control + per-module PgBouncer) that lets a hive scale past the single-backbone connection ceiling. New v0.8.0 total: ~58.5 sessions. Compatible with Q4 2026 ship target at the demonstrated cadence.
 
 #### Competitive landscape
 
@@ -573,6 +573,63 @@ MCP tools (5): `memory_routine_create`, `memory_routine_freeze`, `memory_routine
 
 **Strengthens §2.5 (attested-identity tiebreak) + §2.2 (coherent across federation).** G-Counter, PN-Counter, LWW-Register with attested-identity tiebreak, OR-Set. Per-memory vector clock. Federation push/pull merges via CRDT semantics. Conflict-aware curator. **R6 — Consensus-based truth determination** (4-of-5 agree → 0.95). Effort: ~3 sessions.
 
+#### Pillar 4 — Connection-Scaling & Admission-Control Substrate (module model)
+
+**Strengthens §2.1 (endpoint-resident at fleet scale) + §2.3 (stoppable via structural backpressure).** This pillar is the substrate work that lets a swarm/hive scale from 1k–10k agents (v0.7.0 shared-nothing SQLite-1:1 + P2P, which ships now) up to 100k–1M agents via the **module** primitive — without pointing millions of agents at a single Postgres+AGE backbone. It is net-new for v0.8.0 per operator directive 2026-06-04 (design memory `1b9bdfe0`). **Tracker:** [#1488](https://github.com/alphaonedev/ai-memory-mcp/issues/1488).
+
+**The module primitive.** 1 module = N agents (each 1:1 with its own SQLite hot tier) + 1 PostgreSQL+Apache AGE backbone (shared consolidated corpus + graph). Swarms and hives compose from modules. Self-similar; bounds every backend constraint per module; makes AGE permanently module-local (resolves the cross-tenant distributed-graph problem by construction). **Default module size: 1000 agents/module** (AI-DevOps-managed; sized for operating headroom at ~⅓ of the measured per-module envelope, not for minimizing module count).
+
+##### §11.4.Pillar4.A Admission control / load-shed layer (enhancement b) (+2 sessions)
+
+A bounded-concurrency admission layer on [`crate::build_router`] so a daemon under
+overload sheds load with a typed `503` instead of unbounded handler fan-out
+collapsing the process. Implemented hand-rolled (semaphore + `axum::middleware::from_fn`,
+mirroring the existing hand-rolled per-request timeout layer at
+`build_router_with_timeout` — which deliberately avoids enabling tower-http features
+to keep `Cargo.toml` unchanged). The concurrency ceiling is config-driven
+(`AI_MEMORY_MAX_INFLIGHT_REQUESTS` + `[limits]`), every value a named constant.
+**Strengthens §2.3 (stoppable):** backpressure is structured data, not silent
+queue-collapse.
+
+##### §11.4.Pillar4.B PgBouncer per-module pooler (+1.5 sessions)
+
+PgBouncer (≥1.21, for `max_prepared_statements`) as the per-module connection pooler
+in front of each module's Postgres+AGE backbone. Transaction-mode multiplexing with
+`max_prepared_statements` set so the Fix #4 sqlx prepared-statement / generic-plan
+pinning (shipped v0.7.0) survives the pooler (pre-1.21 transaction-mode broke named
+prepared statements). Deliverables: deploy templates (compose + k8s), expansion of
+`docs/enterprise-deployment.md §10.4`, and an `infra/lan-parity-test/` integration
+test proving plan-caching holds through PgBouncer. **Supavisor is explicitly NOT
+adopted** — the documented hive (Topology 8/9, `docs/reference-architectures.md`)
+absorbs millions-agent fan-in via hierarchical tiering (1:10–1:100 per tier) + the
+HMAC-batching edge sync gateway *before* Postgres, so the millions-of-concurrent-PG-
+connections condition Supavisor exists to solve never arises; PgBouncer is the
+documented pooler and the module model keeps each backbone's writer count bounded.
+
+##### §11.4.Pillar4.C Module consolidation contract — Hot/Cold + staggered AGE-cold-path (+3 sessions) — **cutline-protected**
+
+The pivotal piece. Formalizes the two-tier storage contract the module model depends
+on: SQLite is the agent-private **hot** path (most ops never touch Postgres);
+PG+AGE is the shared **cold**/consolidated corpus. AGE graph writes are
+staggered-batched as a cold path to bound `ag_catalog` concurrent-write lock
+contention (the binding constraint on per-module agent count under mutation, not
+static graph size). Without this contract, AGE write-viability under concurrency caps
+the module far below its read-side envelope. **Strengthens §2.4 (improvable —
+consolidated cross-agent corpus) + §2.2 (coherent).**
+
+##### §11.4.Pillar4.D Empirical module-envelope (X) measurement campaign (+1 session)
+
+Measure — do not guess — the per-module agent ceiling on the rig: the pgvector
+index-health knee (≤~10⁷ vectors) and the AGE write-contention knee (≤~10⁷ edges +
+mutation-rate ceiling). Publish X; confirm the 1000-agents/module default sits at
+~⅓ of measured X for AI-DevOps operating headroom. **Strengthens §2.5 (attested —
+honest published scaling claims).**
+
+**On-ramp already shipped in v0.7.0:** config-driven Postgres pool sizing
+(`AI_MEMORY_PG_POOL_MAX`/`_MIN`/`_ACQUIRE_TIMEOUT_SECS`) — enhancement (a) — lands as
+v0.7.0 ship-hardening so a module/daemon is tunable without a recompile before this
+pillar builds on it.
+
 #### Strategic adjacencies — re-evaluated under §3 scope test
 
 ##### §11.4.A LongMemEval Gemma 4 refresh — pre-distribution honesty (+1 session, urgent)
@@ -659,6 +716,10 @@ v0.7.0 grand-slam terminal schema is v53 (sqlite + postgres lockstep; v51 added 
 | Pillar 2 — Typed Cognition | 4 | 0 | 4 |
 | Pillar 2.5 — Compaction + R4 curator daemon | 5 | 0 | 5 |
 | Pillar 3 — CRDTs + R6 consensus | 3 | 0 | 3 |
+| Pillar 4.A — Admission control / load-shed layer (enh. b) | 0 | +2 | 2 |
+| Pillar 4.B — PgBouncer per-module pooler | 0 | +1.5 | 1.5 |
+| Pillar 4.C — Module consolidation contract (Hot/Cold + AGE cold-path) | 0 | +3 | 3 |
+| Pillar 4.D — Empirical module-envelope (X) measurement | 0 | +1 | 1 |
 | §11.4.B Claude Code plugin marketplace install | 0 | +1 | 1 |
 | §11.4.C vLLM first-class inference backend | 0 | +5 | 5 |
 | §11.4.D Model signature verification chain | 0 | +2 | 2 |
@@ -670,7 +731,7 @@ v0.7.0 grand-slam terminal schema is v53 (sqlite + postgres lockstep; v51 added 
 | §11.4.H.2 — IDE plugin coverage (#1391) | 0 | +2 | 2 |
 | §11.4.H.3 — REMOVED (promoted to v0.7.0 as L4; #1392 closed) | 0 | 0 | 0 |
 | §11.4.H.4 — Decision-detector (#1393) | 0 | +1 | 1 |
-| **TOTAL (substrate scope, post §3 cuts)** | **24.5** | **+26.5** | **~51 sessions** |
+| **TOTAL (substrate scope, post §3 cuts)** | **24.5** | **+34** | **~58.5 sessions** |
 | §11.4.F (relocated to sibling) | 0 | 0 | 0 (sibling) |
 | §11.4.G (relocated to sibling) | 0 | 0 | 0 (sibling) |
 
@@ -681,6 +742,7 @@ v0.7.0 grand-slam terminal schema is v53 (sqlite + postgres lockstep; v51 added 
 - **Attested checkpoints (§Pillar 1 NEW)** — procurement-grade separation-of-duties primitive.
 - **Pillar 3 CRDT four-primitive set with documented merge** — baseline.
 - **vLLM first-class inference backend (§11.4.C)** — load-bearing for §2.6 at federation scale.
+- **Pillar 4.C module consolidation contract (Hot/Cold + staggered AGE cold-path)** — the piece the whole module model depends on; without it AGE write-contention caps per-module agent count far below the read-side envelope.
 
 **Defer to v0.8.1 if substrate ships clean:**
 - Routines, Claude Code plugin marketplace install, Pillar 2 typed cognition.
