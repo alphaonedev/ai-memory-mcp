@@ -2722,6 +2722,28 @@ pub struct AppConfig {
     /// Operators only need to touch this when the workload requires
     /// long-running maintenance queries from the daemon itself.
     pub postgres_statement_timeout_secs: Option<u64>,
+    /// v0.7.0 (a) — connection-pool ceiling (sqlx `max_connections`)
+    /// for the postgres backend. `None` selects the compiled
+    /// `DEFAULT_MAX_CONNECTIONS`. Operators tune this per module/daemon
+    /// without a recompile via `AI_MEMORY_PG_POOL_MAX`. Resolved by
+    /// [`AppConfig::resolve_pg_pool`]; non-positive values fall through
+    /// to the default.
+    pub postgres_pool_max_connections: Option<u32>,
+    /// v0.7.0 (a) — connection-pool floor of always-open warm
+    /// connections (sqlx `min_connections`). `None` selects the
+    /// compiled `DEFAULT_MIN_CONNECTIONS`. Operator knob:
+    /// `AI_MEMORY_PG_POOL_MIN`. Resolved by
+    /// [`AppConfig::resolve_pg_pool`]; non-positive values fall through
+    /// to the default.
+    pub postgres_pool_min_connections: Option<u32>,
+    /// v0.7.0 (a) — how long a pool `acquire()` waits for a free
+    /// connection before erroring (sqlx `acquire_timeout`), in whole
+    /// seconds. `None` selects the compiled default derived from
+    /// `DEFAULT_ACQUIRE_TIMEOUT`. Operator knob:
+    /// `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS`. Resolved by
+    /// [`AppConfig::resolve_pg_pool`]; non-positive values fall through
+    /// to the default.
+    pub postgres_acquire_timeout_secs: Option<u64>,
     /// v0.7.0 H7 (round-2) — per-HTTP-request wall-clock timeout in
     /// seconds. Applied as a middleware to every axum route in
     /// [`crate::build_router`] so a slow-POST (slowloris-style)
@@ -2910,6 +2932,18 @@ impl std::fmt::Debug for AppConfig {
             .field(
                 "postgres_statement_timeout_secs",
                 &self.postgres_statement_timeout_secs,
+            )
+            .field(
+                "postgres_pool_max_connections",
+                &self.postgres_pool_max_connections,
+            )
+            .field(
+                "postgres_pool_min_connections",
+                &self.postgres_pool_min_connections,
+            )
+            .field(
+                "postgres_acquire_timeout_secs",
+                &self.postgres_acquire_timeout_secs,
             )
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("llm_call_timeout_secs", &self.llm_call_timeout_secs)
@@ -3588,6 +3622,18 @@ pub const ENV_MAX_STORAGE_BYTES: &str = "AI_MEMORY_MAX_STORAGE_BYTES";
 pub const ENV_MAX_LINKS_PER_DAY: &str = "AI_MEMORY_MAX_LINKS_PER_DAY";
 /// Env override for `[limits].max_page_size`.
 pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
+
+/// v0.7.0 (a) — env override for the postgres pool ceiling
+/// (`postgres_pool_max_connections`). Byte-matches the name documented
+/// in `docs/enterprise-deployment.md §5.6`.
+pub const ENV_PG_POOL_MAX: &str = "AI_MEMORY_PG_POOL_MAX";
+/// v0.7.0 (a) — env override for the postgres pool floor
+/// (`postgres_pool_min_connections`). Byte-matches the name documented
+/// in `docs/enterprise-deployment.md §5.6`.
+pub const ENV_PG_POOL_MIN: &str = "AI_MEMORY_PG_POOL_MIN";
+/// v0.7.0 (a) — env override for the pool acquire-timeout
+/// (`postgres_acquire_timeout_secs`), in whole seconds.
+pub const ENV_PG_ACQUIRE_TIMEOUT_SECS: &str = "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS";
 
 /// v0.7.x (issue #1168) — bundle the three model-resolver outputs into
 /// a single triple consumed by the capabilities surface. Lets callers
@@ -5433,6 +5479,9 @@ impl AppConfig {
             "hooks",
             "subscriptions",
             "postgres_statement_timeout_secs",
+            "postgres_pool_max_connections",
+            "postgres_pool_min_connections",
+            "postgres_acquire_timeout_secs",
             "request_timeout_secs",
             "llm_call_timeout_secs",
             "verify",
@@ -6151,6 +6200,57 @@ impl AppConfig {
         }
     }
 
+    /// Resolve the Postgres connection-pool sizing knobs into a
+    /// [`crate::store::PoolConfig`] for the daemon's `build_store_handle`.
+    ///
+    /// Follows the uniform precedence ladder, per field:
+    ///
+    /// ```text
+    /// AI_MEMORY_PG_POOL_MAX / _MIN / _ACQUIRE_TIMEOUT_SECS env
+    ///   > top-level config.toml field
+    ///   > compiled default (PoolConfig::default())
+    /// ```
+    ///
+    /// Mirrors [`Self::resolve_limits`]: any non-positive or unparseable
+    /// value is filtered so it falls through to the next layer (a stray
+    /// `0` `max_connections` can never collapse the pool to unusable).
+    #[cfg(feature = "sal")]
+    #[must_use]
+    pub fn resolve_pg_pool(&self) -> crate::store::PoolConfig {
+        fn env_pos_u32(name: &str) -> Option<u32> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|n| *n > 0)
+        }
+        fn env_pos_u64(name: &str) -> Option<u64> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+        }
+
+        let defaults = crate::store::PoolConfig::default();
+
+        let max_connections = env_pos_u32(ENV_PG_POOL_MAX)
+            .or_else(|| self.postgres_pool_max_connections.filter(|n| *n > 0))
+            .unwrap_or(defaults.max_connections);
+
+        let min_connections = env_pos_u32(ENV_PG_POOL_MIN)
+            .or_else(|| self.postgres_pool_min_connections.filter(|n| *n > 0))
+            .unwrap_or(defaults.min_connections);
+
+        let acquire_timeout_secs = env_pos_u64(ENV_PG_ACQUIRE_TIMEOUT_SECS)
+            .or_else(|| self.postgres_acquire_timeout_secs.filter(|n| *n > 0))
+            .unwrap_or(defaults.acquire_timeout_secs);
+
+        crate::store::PoolConfig {
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+        }
+    }
+
     /// Write a default config file if one doesn't exist yet.
     pub fn write_default_if_missing() {
         let Some(path) = Self::config_path() else {
@@ -6195,6 +6295,14 @@ impl AppConfig {
 
 # Archive expired memories before GC deletion (default: true)
 # archive_on_gc = true
+
+# Postgres connection-pool sizing (postgres store only; sqlite ignores).
+# Precedence per field: AI_MEMORY_PG_POOL_MAX / _MIN /
+# _ACQUIRE_TIMEOUT_SECS env > these fields > compiled default.
+# Non-positive / unparseable values fall through to the default.
+# postgres_pool_max_connections = 16        # hard ceiling on open connections
+# postgres_pool_min_connections = 2         # always-open warm-connection floor
+# postgres_acquire_timeout_secs = 30        # acquire() wait before erroring (secs)
 
 # Per-tier TTL overrides (uncomment to customize)
 # [ttl]
@@ -7440,6 +7548,9 @@ legacy_scoring = false
             hooks: Some(HooksConfig::default()),
             subscriptions: Some(SubscriptionsConfig::default()),
             postgres_statement_timeout_secs: Some(30),
+            postgres_pool_max_connections: Some(16),
+            postgres_pool_min_connections: Some(2),
+            postgres_acquire_timeout_secs: Some(30),
             request_timeout_secs: Some(60),
             llm_call_timeout_secs: Some(30),
             verify: Some(VerifyConfig::default()),
@@ -7492,6 +7603,9 @@ legacy_scoring = false
             "hooks",
             "subscriptions",
             "postgres_statement_timeout_secs",
+            "postgres_pool_max_connections",
+            "postgres_pool_min_connections",
+            "postgres_acquire_timeout_secs",
             "request_timeout_secs",
             "llm_call_timeout_secs",
             "verify",
@@ -8133,6 +8247,98 @@ max_page_size = 1000000
         assert_eq!(r.max_memories_per_day, 10_000_000);
         assert_eq!(r.max_page_size, 1_000_000);
         assert_eq!(r.source, ConfigSource::Config);
+    }
+
+    #[cfg(feature = "sal")]
+    fn scrub_pg_pool_env() {
+        for k in [
+            ENV_PG_POOL_MAX,
+            ENV_PG_POOL_MIN,
+            ENV_PG_ACQUIRE_TIMEOUT_SECS,
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        let cfg = empty_app_config();
+        let r = cfg.resolve_pg_pool();
+        assert_eq!(r, crate::store::PoolConfig::default());
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_config_overrides_default() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        let mut cfg = empty_app_config();
+        cfg.postgres_pool_max_connections = Some(64);
+        cfg.postgres_pool_min_connections = Some(8);
+        cfg.postgres_acquire_timeout_secs = Some(15);
+        let r = cfg.resolve_pg_pool();
+        assert_eq!(r.max_connections, 64);
+        assert_eq!(r.min_connections, 8);
+        assert_eq!(r.acquire_timeout_secs, 15);
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_env_overrides_config() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        unsafe {
+            std::env::set_var(ENV_PG_POOL_MAX, "100");
+            std::env::set_var(ENV_PG_ACQUIRE_TIMEOUT_SECS, "45");
+        }
+        let mut cfg = empty_app_config();
+        cfg.postgres_pool_max_connections = Some(64);
+        cfg.postgres_pool_min_connections = Some(8);
+        cfg.postgres_acquire_timeout_secs = Some(15);
+        let r = cfg.resolve_pg_pool();
+        // env wins for the two it sets …
+        assert_eq!(r.max_connections, 100, "env beats config");
+        assert_eq!(r.acquire_timeout_secs, 45, "env beats config");
+        // … and config still supplies the field env left unset.
+        assert_eq!(r.min_connections, 8);
+        scrub_pg_pool_env();
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_zero_and_garbage_fall_through() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        unsafe {
+            std::env::set_var(ENV_PG_POOL_MAX, "0"); // non-positive → ignored
+            std::env::set_var(ENV_PG_POOL_MIN, "not-a-number"); // unparseable → ignored
+        }
+        let mut cfg = empty_app_config();
+        // A zero config value must also fall through, never clamp the pool.
+        cfg.postgres_acquire_timeout_secs = Some(0);
+        let r = cfg.resolve_pg_pool();
+        // every stray value falls through to the compiled default.
+        assert_eq!(r, crate::store::PoolConfig::default());
+        scrub_pg_pool_env();
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn pg_pool_env_const_names_byte_match_documented() {
+        // Doc-name-match guard: these byte values are documented in
+        // CLAUDE.md's Environment Variables table + the enterprise
+        // deployment guide §5.6. Pin the drift so it can never recur.
+        assert_eq!(ENV_PG_POOL_MAX, "AI_MEMORY_PG_POOL_MAX");
+        assert_eq!(ENV_PG_POOL_MIN, "AI_MEMORY_PG_POOL_MIN");
+        assert_eq!(
+            ENV_PG_ACQUIRE_TIMEOUT_SECS,
+            "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS"
+        );
     }
 
     #[test]

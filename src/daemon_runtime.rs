@@ -2676,6 +2676,11 @@ async fn build_store_handle(
     // default 384 is converted in-place to match the configured
     // embedder's actual dimension (e.g. 768 for `nomic_embed_v15`).
     configured_embedding_dim: Option<u32>,
+    // Resolved Postgres connection-pool sizing (`AI_MEMORY_PG_POOL_MAX` /
+    // `_MIN` / `_ACQUIRE_TIMEOUT_SECS` > config.toml > compiled default),
+    // produced by `AppConfig::resolve_pg_pool`. Threaded into the sqlx
+    // `PgPoolOptions` build; inert on the sqlite path.
+    pool: crate::store::PoolConfig,
 ) -> Result<(
     crate::handlers::StorageBackend,
     Arc<dyn crate::store::MemoryStore>,
@@ -2699,21 +2704,34 @@ async fn build_store_handle(
                     let store = if let Some(dim) = configured_embedding_dim {
                         tracing::info!(
                             "Wave-3 (issue #877): opening Postgres SAL store at {url} \
-                             (statement_timeout={timeout}s, embedding_dim={dim}, auto_migrate=on)"
+                             (statement_timeout={timeout}s, embedding_dim={dim}, auto_migrate=on, \
+                             pool_max={}, pool_min={}, acquire_timeout={}s)",
+                            pool.max_connections,
+                            pool.min_connections,
+                            pool.acquire_timeout_secs
                         );
                         crate::store::postgres::PostgresStore::connect_with_dim_and_timeout_auto_migrate(
-                            url, dim, timeout,
+                            url, dim, timeout, pool,
                         )
                         .await
                         .context("connect postgres adapter (auto-migrate dim)")?
                     } else {
                         tracing::info!(
                             "Wave-3: opening Postgres SAL store at {url} \
-                             (statement_timeout={timeout}s, no embedder configured)"
+                             (statement_timeout={timeout}s, no embedder configured, \
+                             pool_max={}, pool_min={}, acquire_timeout={}s)",
+                            pool.max_connections,
+                            pool.min_connections,
+                            pool.acquire_timeout_secs
                         );
-                        crate::store::postgres::PostgresStore::connect_with_timeout(url, timeout)
-                            .await
-                            .context("connect postgres adapter")?
+                        crate::store::postgres::PostgresStore::connect_with_dim_and_timeout(
+                            url,
+                            crate::store::postgres::DEFAULT_EMBEDDING_DIM,
+                            timeout,
+                            pool,
+                        )
+                        .await
+                        .context("connect postgres adapter")?
                     };
                     Ok((StorageBackend::Postgres, Arc::new(store)))
                 }
@@ -2722,6 +2740,7 @@ async fn build_store_handle(
                     let _ = url;
                     let _ = postgres_statement_timeout_secs;
                     let _ = configured_embedding_dim;
+                    let _ = pool;
                     anyhow::bail!(
                         "--store-url postgres:// requires the binary to be built with \
                          --features sal-postgres; this binary was built with --features sal only"
@@ -2747,6 +2766,7 @@ async fn build_store_handle(
         None => {
             let _ = postgres_statement_timeout_secs;
             let _ = configured_embedding_dim;
+            let _ = pool;
             tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
             let store = crate::store::sqlite::SqliteStore::open(db_path)
                 .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
@@ -3616,6 +3636,7 @@ pub async fn bootstrap_serve(
         db_path,
         app_config.postgres_statement_timeout_secs,
         configured_embedding_dim,
+        app_config.resolve_pg_pool(),
     )
     .await
     .context("build SAL store handle")?;
@@ -7404,9 +7425,15 @@ decision = "allow"
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("scheme.db");
         let url = format!("sqlite:///{}", db.display());
-        let (backend, store) = build_store_handle(Some(&url), &db, None, None)
-            .await
-            .expect("sqlite:// URL must dispatch to SqliteStore");
+        let (backend, store) = build_store_handle(
+            Some(&url),
+            &db,
+            None,
+            None,
+            crate::store::PoolConfig::default(),
+        )
+        .await
+        .expect("sqlite:// URL must dispatch to SqliteStore");
         // Backend tag must reflect the SQLite path.
         assert!(
             matches!(backend, crate::handlers::StorageBackend::Sqlite),
@@ -7425,7 +7452,14 @@ decision = "allow"
     async fn fx_f2_build_store_handle_unknown_scheme_errors() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("ignored.db");
-        let result = build_store_handle(Some("mysql://host/db"), &db, None, None).await;
+        let result = build_store_handle(
+            Some("mysql://host/db"),
+            &db,
+            None,
+            None,
+            crate::store::PoolConfig::default(),
+        )
+        .await;
         let err = match result {
             Ok(_) => panic!("unrecognised scheme MUST bail; got Ok"),
             Err(e) => e,
@@ -7445,9 +7479,10 @@ decision = "allow"
     async fn fx_f2_build_store_handle_no_url_falls_through_to_db_path() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("fallthrough.db");
-        let (backend, _store) = build_store_handle(None, &db, None, None)
-            .await
-            .expect("absent --store-url MUST resolve to SqliteStore via --db");
+        let (backend, _store) =
+            build_store_handle(None, &db, None, None, crate::store::PoolConfig::default())
+                .await
+                .expect("absent --store-url MUST resolve to SqliteStore via --db");
         assert!(matches!(backend, crate::handlers::StorageBackend::Sqlite));
     }
 

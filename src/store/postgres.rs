@@ -491,11 +491,12 @@ pub fn render_schema_sql(template: &str, dim: u32) -> String {
     template.replace(EMBEDDING_DIM_PLACEHOLDER, &dim.to_string())
 }
 
-/// Default connection pool settings. Tuned for a mid-range ai-memory
-/// daemon — adjust via `PostgresStore::with_pool_options` when wiring
-/// a larger deployment.
-const DEFAULT_MAX_CONNECTIONS: u32 = 16;
-const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connection-pool sizing knobs. Defined in the `sal`-gated parent
+/// module (`crate::store`) so the daemon's `build_store_handle` can
+/// name the type in a `sal`-only build; re-exported here so existing
+/// `crate::store::postgres::PoolConfig` references (tests, the connect
+/// chain) keep resolving.
+pub use crate::store::PoolConfig;
 
 /// v0.7.0 M4 — default connection-level `statement_timeout` (seconds)
 /// applied to every postgres connection in the pool. 30s bounds the
@@ -556,7 +557,8 @@ impl PostgresStore {
     ///
     /// Same as [`Self::connect`].
     pub async fn connect_with_timeout(url: &str, secs: u64) -> StoreResult<Self> {
-        Self::connect_with_dim_and_timeout(url, DEFAULT_EMBEDDING_DIM, secs).await
+        Self::connect_with_dim_and_timeout(url, DEFAULT_EMBEDDING_DIM, secs, PoolConfig::default())
+            .await
     }
 
     /// Connect using a Postgres URL with an explicit embedding column
@@ -579,14 +581,23 @@ impl PostgresStore {
     /// not one of the supported values, or schema-bootstrap failures
     /// bubble up unchanged.
     pub async fn connect_with_dim(url: &str, dim: u32) -> StoreResult<Self> {
-        Self::connect_with_dim_and_timeout(url, dim, DEFAULT_STATEMENT_TIMEOUT_SECS).await
+        Self::connect_with_dim_and_timeout(
+            url,
+            dim,
+            DEFAULT_STATEMENT_TIMEOUT_SECS,
+            PoolConfig::default(),
+        )
+        .await
     }
 
-    /// Connect with an explicit embedding dim and `statement_timeout`
-    /// (seconds). The fully-parameterised entry point — both
-    /// [`Self::connect`] and [`Self::connect_with_dim`] delegate here.
-    /// See M4/M7 in `src/store/postgres.rs::DEFAULT_STATEMENT_TIMEOUT_SECS`
-    /// for the rationale on the safety envelope.
+    /// Connect with an explicit embedding dim, `statement_timeout`
+    /// (seconds), and connection-pool sizing ([`PoolConfig`]). The
+    /// fully-parameterised entry point — both [`Self::connect`] and
+    /// [`Self::connect_with_dim`] delegate here with
+    /// [`PoolConfig::default`]. See M4/M7 in
+    /// `src/store/postgres.rs::DEFAULT_STATEMENT_TIMEOUT_SECS` for the
+    /// rationale on the safety envelope, and `AppConfig::resolve_pg_pool`
+    /// for how operators override the pool sizing at the daemon boundary.
     ///
     /// # Errors
     ///
@@ -595,6 +606,7 @@ impl PostgresStore {
         url: &str,
         dim: u32,
         statement_timeout_secs: u64,
+        pool_config: PoolConfig,
     ) -> StoreResult<Self> {
         if !SUPPORTED_EMBEDDING_DIMS.contains(&i32::try_from(dim).unwrap_or(-1)) {
             return Err(StoreError::InvalidInput {
@@ -617,6 +629,23 @@ impl PostgresStore {
         // postgres-native "disabled" sentinel; we skip the SET in
         // that case to keep the wire silent for operators who
         // explicitly opted out of the safety envelope.
+        //
+        // POOLER NOTE: this session-level `SET` is correct for a direct
+        // Postgres connection and for PgBouncer *session* mode. Under
+        // PgBouncer *transaction* mode (the mode the T4+ enterprise
+        // topology recommends) the standalone `SET` does NOT persist —
+        // PgBouncer runs it on whichever server connection it assigns
+        // for that one statement, then releases the connection, so the
+        // envelope is lost before the next transaction. Operators
+        // fronting the primary with a transaction-mode pooler MUST also
+        // pin the envelope at the Postgres role level (`ALTER ROLE
+        // aimemory SET statement_timeout = '…'; … SET lock_timeout =
+        // '…';`) so every backend inherits it as its server default.
+        // See docs/enterprise-deployment.md §5.6.6. We deliberately do
+        // NOT use the libpq `options` startup parameter to carry the
+        // timeout (PgBouncer < 1.21 rejects it and the daemon would
+        // fail to connect), keeping the role-level path the single
+        // version-independent pooled-deployment recipe.
         let stmt_secs = statement_timeout_secs;
         let lock_secs = if stmt_secs == 0 {
             0
@@ -624,8 +653,9 @@ impl PostgresStore {
             DEFAULT_LOCK_TIMEOUT_SECS
         };
         let pool = PgPoolOptions::new()
-            .max_connections(DEFAULT_MAX_CONNECTIONS)
-            .acquire_timeout(DEFAULT_ACQUIRE_TIMEOUT)
+            .max_connections(pool_config.max_connections)
+            .min_connections(pool_config.min_connections)
+            .acquire_timeout(Duration::from_secs(pool_config.acquire_timeout_secs))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     use sqlx::Executor;
@@ -906,8 +936,11 @@ impl PostgresStore {
         url: &str,
         dim: u32,
         statement_timeout_secs: u64,
+        pool_config: PoolConfig,
     ) -> StoreResult<Self> {
-        let store = Self::connect_with_dim_and_timeout(url, dim, statement_timeout_secs).await?;
+        let store =
+            Self::connect_with_dim_and_timeout(url, dim, statement_timeout_secs, pool_config)
+                .await?;
 
         let current = store.current_embedding_dim().await?;
         let target_i32 = i32::try_from(dim).unwrap_or(384);
