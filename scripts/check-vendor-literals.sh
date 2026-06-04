@@ -138,6 +138,17 @@ scan_production_lines () {
     local boundary
     boundary=$(find_test_boundary "$f")
     local rel="${f#"${ROOT}/"}"
+    # NOTE: the inner match list is captured into a variable and fed to
+    # the loop via a here-string (`<<<`) rather than a process
+    # substitution. A `done < <(grep …)` nested inside the caller's
+    # outer `done < <(find …)` process substitution reliably SIGTRAPs
+    # (exit 133) under macOS system bash 3.2.57 on arm64 once enough
+    # sub-processes fork; the here-string is behaviour-identical and
+    # runs the loop in the current shell. Mirrors the same fix applied
+    # to scripts/qc-codegraph-precheck.sh (#1486 / 941b5a706).
+    local matches
+    matches="$(grep -En "$pattern" "$f" 2>/dev/null || true)"
+    [[ -z "$matches" ]] && return 0
     while IFS=: read -r lineno content; do
         [[ -z "$lineno" ]] && continue
         if (( lineno >= boundary )); then
@@ -150,7 +161,7 @@ scan_production_lines () {
             //*|/\**|\**) continue ;;
         esac
         printf '%s:%s:%s\n' "$rel" "$lineno" "$content"
-    done < <(grep -En "$pattern" "$f" 2>/dev/null || true)
+    done <<< "$matches"
 }
 
 # Self-test mode — inject a contrived violation, run the gate, confirm
