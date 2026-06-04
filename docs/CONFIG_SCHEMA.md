@@ -6,6 +6,19 @@ sectioned configuration format introduced in
 Every deployment of `ai-memory` (MCP server, HTTP daemon, CLI) reads
 configuration from a single file at `~/.config/ai-memory/config.toml`.
 
+> **No GPU required.** Nothing in this schema is hard-wired to a GPU,
+> to Ollama, or to Gemma — those are the local-first default, not a
+> requirement. Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)
+> + #1146 the autonomous tier drives every feature through **any
+> OpenAI-compatible endpoint**: a remote cloud API (e.g. OpenRouter as
+> a low-cost example) *where you have API access*, or an internal
+> air-gapped HA inference VIP *where you have systems with no GPUs* and
+> want to run ai-memory in autonomous mode with `--profile full`. Set
+> `[llm].backend` to a cloud/`openai-compatible` value and the daemon
+> host carries no model weight at all (only the ~90 MB CPU
+> cross-encoder if `[reranker].enabled = true`). The model names below
+> are examples — substitute whatever your provider or endpoint serves.
+
 ## Quick reference
 
 ```toml

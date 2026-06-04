@@ -209,7 +209,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The four feature tiers</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Pick the model size your hardware allows.</h2>
-    <p class="lede">Autonomous features unlock as the operator allocates more memory to the daemon. Keyword tier needs zero extra RAM — just FTS5. Semantic tier loads embeddings (~256 MB). Smart tier adds Gemma 4 E2B (~1 GB). Autonomous tier upgrades to Gemma 4 E4B + cross-encoder reranker (~4 GB total).</p>
+    <p class="lede">Autonomous features unlock as the operator allocates more memory to the daemon. Keyword tier needs zero extra RAM — just FTS5. Semantic tier loads embeddings (~256 MB). Smart tier adds Gemma 4 E2B (~1 GB). Autonomous tier upgrades to Gemma 4 E4B + cross-encoder reranker (~4 GB total). <strong>The RAM figures below are the local-model path</strong> (Ollama serving Gemma + a local embedder); when you point <code>[llm]</code> + <code>[embeddings]</code> at a remote API (see <a href="#no-gpu">No GPU required</a> below), the daemon host carries no model weight at all — only the ~90 MB CPU cross-encoder if reranking is enabled.</p>
     <div class="tier-cards">
       <div class="tier kw">
         <div class="nm">Keyword</div>
@@ -410,8 +410,73 @@ EOF
   </div>
 </section>
 
+<section id="no-gpu">
+  <div class="container">
+    <span class="eyebrow">No GPU required — any LLM backend</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">Autonomous mode on CPU-only or air-gapped hosts — point <code>[llm]</code> at any LLM you have API access to.</h2>
+    <p class="lede">Nothing on this page is hard-wired to a GPU, to Ollama, or to Gemma. The Ollama + Gemma quick-start above is the <strong>local-first default</strong>, not a requirement. As of v0.7.0 (#1067 + #1146) <strong>any LLM reachable over an HTTP endpoint can drive every autonomous feature</strong> — wherever you have API access, wherever you run on hosts with no GPUs, and you want to run ai-memory in autonomous mode with <code>--profile full</code>. The backend is a config choice (<code>[llm]</code> in <code>config.toml</code> or the <code>AI_MEMORY_LLM_*</code> env vars), resolved through the canonical precedence ladder <code>CLI&nbsp;&gt;&nbsp;env&nbsp;&gt;&nbsp;[llm]&nbsp;&gt;&nbsp;legacy&nbsp;&gt;&nbsp;default</code>.</p>
+    <p class="lede" style="margin-top:.5rem">Two CPU-only / air-gap postures below. The model names are <strong>examples, not requirements</strong> — substitute whatever model your provider or internal endpoint serves.</p>
+
+    <h3 style="font-family:var(--font-sans);font-size:1.15rem;margin-top:1.75rem">A. Cloud API — no local model, no GPU (OpenRouter shown as one low-cost example)</h3>
+    <div class="snip"><span class="cm"># Any OpenAI-compatible vendor works (openai | xai | anthropic | gemini |</span>
+<span class="cm"># deepseek | kimi | qwen | mistral | groq | together | cerebras |</span>
+<span class="cm"># openrouter | fireworks | …). OpenRouter + a Gemma 4 chat model is shown</span>
+<span class="cm"># here only as a low-cost EXAMPLE — swap `model` for any model the vendor serves.</span>
+<span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF
+schema_version = <span class="num">2</span>
+tier = <span class="val">"autonomous"</span>
+
+[llm]
+backend     = <span class="val">"openrouter"</span>
+model       = <span class="val">"google/gemma-4-26b-it"</span>   <span class="cm"># example; any served model is fine</span>
+api_key_env = <span class="val">"OPENROUTER_API_KEY"</span>      <span class="cm"># env-var reference — never inline the key</span>
+
+[embeddings]
+backend = <span class="val">"openai-compatible"</span>          <span class="cm"># CPU-only remote embeddings — no local model</span>
+url     = <span class="val">"https://api.openai.com/v1"</span>
+model   = <span class="val">"text-embedding-3-small"</span>
+
+[reranker]
+enabled = <span class="ok">true</span>
+model   = <span class="val">"ms-marco-MiniLM-L-6-v2"</span>     <span class="cm"># ~90 MB CPU cross-encoder; no GPU</span>
+EOF
+
+<span class="ok">$</span> export OPENROUTER_API_KEY=<span class="val">"sk-or-…"</span>     <span class="cm"># secret via env, never written to config</span>
+<span class="ok">$</span> ai-memory serve --profile full
+<span class="ok">$</span> ai-memory doctor                       <span class="cm"># LLM Reachability (#1146) — confirms which layer won</span>
+<span class="ok">→ "tier": "autonomous"</span></div>
+
+    <h3 style="font-family:var(--font-sans);font-size:1.15rem;margin-top:1.5rem">B. Air-gapped — internal HA inference endpoint (no public internet, no GPU on the ai-memory host)</h3>
+    <div class="snip"><span class="cm"># The ai-memory host needs no GPU and no public egress — it speaks HTTP to an</span>
+<span class="cm"># internal load-balanced inference endpoint (vLLM / llama.cpp server / TGI /</span>
+<span class="cm"># your own gateway). `openai-compatible` requires an explicit base_url.</span>
+<span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF
+schema_version = <span class="num">2</span>
+tier = <span class="val">"autonomous"</span>
+
+[llm]
+backend  = <span class="val">"openai-compatible"</span>
+model    = <span class="val">"gemma-4-26b"</span>                       <span class="cm"># example; whatever your gateway serves</span>
+base_url = <span class="val">"https://llm-ha.internal.corp/v1"</span>    <span class="cm"># internal HA VIP, mTLS terminated upstream</span>
+api_key_env = <span class="val">"AI_MEMORY_LLM_API_KEY"</span>
+
+[embeddings]
+backend = <span class="val">"openai-compatible"</span>
+url     = <span class="val">"https://llm-ha.internal.corp/v1"</span>
+model   = <span class="val">"nomic-embed-text-v1.5"</span>
+
+[reranker]
+enabled = <span class="ok">true</span>
+model   = <span class="val">"ms-marco-MiniLM-L-6-v2"</span>
+EOF
+
+<span class="ok">$</span> ai-memory serve --profile full</div>
+    <p class="lede" style="margin-top:1rem"><strong>Secrets discipline:</strong> the key is referenced by env-var name (<code>api_key_env</code>) or by a mode-0400 file (<code>api_key_file</code>) — an inline <code>api_key = "…"</code> literal is rejected at parse time. <strong>Canonical schema + per-vendor recipes:</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a> · <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/llm-backends.md">integrations/llm-backends.md</a>.</p>
+  </div>
+</section>
+
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · LLM bridge in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/llm.rs">llm.rs</a> · models served via <a href="https://ollama.com">Ollama</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · LLM bridge in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/llm.rs">llm.rs</a> · models served via <a href="https://ollama.com">Ollama</a> by default, or <a href="#no-gpu">any OpenAI-compatible endpoint</a> (cloud or air-gap, no GPU)</p>
   <p style="margin-top:.7rem;color:var(--google)">▸ <strong>Thanks to Google for open-sourcing Gemma 4.</strong> The autonomous tier of ai-memory is built on the foundation Gemma provides.</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="credits.html">Credits</a></p>
 </footer>
