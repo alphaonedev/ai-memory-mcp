@@ -114,6 +114,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
+    # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
+    # download on the semantic-tier CLI recall path) fails fast instead of
+    # pinning a runner for hours. Root cause fixed in
+    # embeddings::Embedder::download_within; this is the backstop.
+    timeout-minutes: 75
     permissions:
       contents: read
       pull-requests: write

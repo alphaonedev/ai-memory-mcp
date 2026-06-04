@@ -15,6 +15,17 @@ const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 #[allow(dead_code)]
 const MINILM_DIM: usize = 384;
 const MAX_SEQ_LEN: usize = 256;
+
+/// Wall-clock budget for the one-time MiniLM weight download from the
+/// HuggingFace Hub (#1487). hf-hub 0.5's sync `ureq` client has no
+/// request timeout, so a stalled HF connection mid-`model.safetensors`
+/// would block the calling thread forever — which on the CLI recall path
+/// (where `effective_tier` defaults to `semantic`) hung a one-shot
+/// `ai-memory recall` indefinitely and pinned a CI runner for 2h+ (no
+/// `Command::output()` EOF). When the bounded download exceeds this
+/// budget we abandon it and fall back to the offline/keyword path
+/// (`load_from_fallback`), matching the existing degraded-load contract.
+const HF_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// Fallback subdirectory under $HOME for pre-downloaded `MiniLM` model files
 const FALLBACK_MODEL_SUBDIR: &str =
     ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main";
@@ -186,13 +197,14 @@ impl Embedder {
     pub fn new_local() -> Result<Self> {
         let device = Device::Cpu;
 
-        let (config_path, tokenizer_path, weights_path) = match Self::download_via_hf_hub() {
-            Ok(paths) => paths,
-            Err(e) => {
-                eprintln!("ai-memory: hf-hub download failed ({e}), trying fallback dir");
-                Self::load_from_fallback()?
-            }
-        };
+        let (config_path, tokenizer_path, weights_path) =
+            match Self::download_within(HF_DOWNLOAD_TIMEOUT, Self::download_via_hf_hub) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    eprintln!("ai-memory: hf-hub download failed ({e}), trying fallback dir");
+                    Self::load_from_fallback()?
+                }
+            };
 
         let config_data =
             std::fs::read_to_string(&config_path).context("failed to read config.json")?;
@@ -546,6 +558,45 @@ impl Embedder {
             .zip(secondary.iter())
             .map(|(p, s)| w * p + one_minus_w * s)
             .collect()
+    }
+
+    /// Run a blocking model-download closure on a detached watchdog
+    /// thread, returning its result or erroring after `budget` (#1487).
+    ///
+    /// hf-hub 0.5's sync client exposes no request timeout, so a stalled
+    /// HuggingFace connection blocks the download thread indefinitely.
+    /// We hand the work to a `std::thread::spawn` (a *daemon* thread — it
+    /// is never joined) and wait on an mpsc channel with `recv_timeout`.
+    /// On timeout we abandon the still-running download and surface an
+    /// `Err`; the caller then falls back to the offline/keyword path. The
+    /// abandoned thread cannot keep the process alive — when `main`
+    /// returns the process exits and the daemon thread dies with it, so a
+    /// one-shot CLI invocation no longer hangs on a stuck download.
+    fn download_within<F>(
+        budget: std::time::Duration,
+        f: F,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
+    where
+        F: FnOnce() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
+            + Send
+            + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The receiver may already be gone (timeout fired first); a
+            // failed send is expected and intentionally ignored.
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(budget) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => anyhow::bail!(
+                "hf-hub model download exceeded {}s budget",
+                budget.as_secs()
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("hf-hub model download thread terminated without a result")
+            }
+        }
     }
 
     fn download_via_hf_hub() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
@@ -1709,5 +1760,48 @@ mod c5_ollama_variant_tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], vec![1.0_f32, 2.0_f32, 3.0_f32]);
         assert_eq!(batch[1], vec![1.0_f32, 2.0_f32, 3.0_f32]);
+    }
+
+    // #1487 — the download watchdog must surface an error instead of
+    // blocking forever when the underlying download closure stalls.
+    #[test]
+    fn download_within_times_out_on_stalled_closure() {
+        let start = std::time::Instant::now();
+        let res = Embedder::download_within(std::time::Duration::from_millis(50), || {
+            // Simulate a wedged hf-hub `.get()` that never returns within
+            // the budget. The watchdog must abandon it, not join it.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok((
+                std::path::PathBuf::new(),
+                std::path::PathBuf::new(),
+                std::path::PathBuf::new(),
+            ))
+        });
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "stalled download must error, not hang");
+        assert!(
+            res.unwrap_err().to_string().contains("budget"),
+            "error should explain the timeout budget"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "watchdog must return promptly after the budget, not wait for the closure: {elapsed:?}"
+        );
+    }
+
+    // #1487 — a closure that completes within budget passes its result
+    // through unchanged (the happy path the watchdog must not disturb).
+    #[test]
+    fn download_within_passes_through_fast_result() {
+        let res = Embedder::download_within(std::time::Duration::from_secs(5), || {
+            Ok((
+                std::path::PathBuf::from("config.json"),
+                std::path::PathBuf::from("tokenizer.json"),
+                std::path::PathBuf::from("model.safetensors"),
+            ))
+        })
+        .expect("fast closure must pass through");
+        assert_eq!(res.0, std::path::PathBuf::from("config.json"));
+        assert_eq!(res.2, std::path::PathBuf::from("model.safetensors"));
     }
 }
