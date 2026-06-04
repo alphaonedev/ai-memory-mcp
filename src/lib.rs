@@ -44,6 +44,39 @@ pub const MIB: usize = KIB * KIB;
 pub const GIB: usize = MIB * KIB;
 
 // ---------------------------------------------------------------------------
+// v0.7.0 multi-agent literal-sweep (scanner B findings F-B6/F-B9/F-B10) —
+// named consts for the genuinely-duplicated, load-bearing values so they are
+// grep-able and refactor-safe. Each equals the literal it replaces
+// byte-for-byte; this is a naming refactor, never a value change.
+//
+// Deliberately NOT promoted (per-site semantic audit, F-B1..F-B5/F-B8):
+//   * `Duration::from_secs(30 | 60 | 5)` and `from_millis(500)` are NOT one
+//     semantic — the 30s sites alone span `GENERATE_TIMEOUT`,
+//     `CIRCUIT_BREAKER_COOLDOWN`, `QuorumPolicy` total-timeout, an embeddings
+//     retry sleep, and several HTTP-client `.timeout(..)` calls, and most
+//     already carry a proper local name. Folding them into one
+//     `DEFAULT_NETWORK_TIMEOUT` would couple unrelated knobs and erase those
+//     local names — a false SSOT. These small-int timeouts are exactly the
+//     legitimate-literal class the vendor-literal gate carves out
+//     (CLAUDE.md §"Lint gates"), so they are left in place.
+//   * F-B5 `from_millis(10)` poll ticks — almost entirely test-region noise.
+//   * F-B7 KIB/MIB/GIB landed above.
+// ---------------------------------------------------------------------------
+
+/// F-B6 — Axum production request-body cap (2 MiB).
+pub const HTTP_BODY_LIMIT_BYTES: usize = 2 * MIB;
+/// F-B6 — test-side body read cap; pinned equal to the production limit so
+/// tests exercise the full `0..=2 MiB` envelope production accepts (was an
+/// asymmetric 1 MiB across 90+ `to_bytes(.., 1024 * 1024)` call sites).
+pub const TEST_BODY_READ_CAP: usize = HTTP_BODY_LIMIT_BYTES;
+/// F-B9 — recall primary-context semantic blend weight. Named to disambiguate
+/// from `ConfidenceTier::LIKELY_MIN` (also 0.7, a different concept).
+pub const RECALL_PRIMARY_CTX_BLEND: f32 = 0.7;
+/// F-B10 — recall cosine-similarity gate (relaxed 0.3 → 0.2 in v0.6.2 Patch 2,
+/// scenario-18; load-bearing per CLAUDE.md §"Recall Pipeline").
+pub const RECALL_COSINE_GATE: f64 = 0.2;
+
+// ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
 // canonical HTTP route-path consts. The substrate's HTTP router
 // (`build_router_with_timeout` in `src/lib.rs`) registers ~87
@@ -921,7 +954,7 @@ pub fn build_router_with_timeout(
             postgres_route_gate_layer,
         ))
         .layer(TraceLayer::new_for_http())
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
         .layer(CorsLayer::new())
         // H7 (v0.7.0 round-2) — per-request wall-clock timeout.
         // Applied outermost (last in the layer stack) so it bounds

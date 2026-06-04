@@ -992,9 +992,11 @@ pub fn handle_recall_dto(
                 } else {
                     let joined = context_tokens.join(" ");
                     match emb.embed(&joined) {
-                        Ok(ctx_emb) => {
-                            crate::embeddings::Embedder::fuse(&primary_emb, &ctx_emb, 0.7)
-                        }
+                        Ok(ctx_emb) => crate::embeddings::Embedder::fuse(
+                            &primary_emb,
+                            &ctx_emb,
+                            crate::RECALL_PRIMARY_CTX_BLEND,
+                        ),
                         Err(e) => {
                             tracing::warn!("context_tokens embed failed, using primary only: {e}");
                             primary_emb

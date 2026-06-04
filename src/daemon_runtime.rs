@@ -84,10 +84,10 @@ use crate::migrate;
 
 const DEFAULT_DB: &str = "ai-memory.db";
 const DEFAULT_PORT: u16 = 9077;
-const GC_INTERVAL_SECS: u64 = 1800;
+const GC_INTERVAL_SECS: u64 = 30 * crate::SECS_PER_MINUTE as u64;
 /// WAL auto-checkpoint cadence in the HTTP daemon. Bounds `*-wal`
 /// file growth between `SQLite`'s internal page-count checkpoints.
-const WAL_CHECKPOINT_INTERVAL_SECS: u64 = 600;
+const WAL_CHECKPOINT_INTERVAL_SECS: u64 = 10 * crate::SECS_PER_MINUTE as u64;
 /// v0.7.0 K2 — pending_actions timeout sweeper cadence. Fires every
 /// 60s and transitions `status='pending'` rows whose age exceeds the
 /// per-row `default_timeout_seconds` (or the global default below) to
