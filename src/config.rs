@@ -58,35 +58,27 @@ impl EmbeddingModel {
 }
 
 // ---------------------------------------------------------------------------
-// LLM models
+// LLM model defaults
 // ---------------------------------------------------------------------------
 
-/// Supported LLM models (served via Ollama).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmModel {
-    /// Google Gemma 4 Effective 2B — ~1 GB Q4
-    Gemma4E2B,
-    /// Google Gemma 4 Effective 4B — ~2.3 GB Q4
-    Gemma4E4B,
-}
-
-impl LlmModel {
-    /// Ollama model tag used to pull / run this model.
-    pub fn ollama_model_id(&self) -> &str {
-        match self {
-            Self::Gemma4E2B => "gemma4:e2b",
-            Self::Gemma4E4B => "gemma4:e4b",
-        }
-    }
-
-    /// Human-readable display name.
-    pub fn display_name(&self) -> &str {
-        match self {
-            Self::Gemma4E2B => "Gemma 4 Effective 2B (Q4)",
-            Self::Gemma4E4B => "Gemma 4 Effective 4B (Q4)",
-        }
-    }
+/// Provider-agnostic default backend LLM model tag for the LLM-capable
+/// feature tiers (smart / autonomous).
+///
+/// The NAME is vendor-agnostic by design (#1067 / #1146 / #1490): ai-memory
+/// speaks to ANY backend — local Ollama, OpenAI, Anthropic, xAI, Gemini,
+/// Groq, OpenRouter, or any OpenAI-compatible endpoint — selected via the
+/// `[llm]` config section or `AI_MEMORY_LLM_*` env vars. The VALUE returned
+/// here is only the compiled fallback used when no model is configured at any
+/// precedence layer; it is identical to [`backend_default_model`]'s catch-all
+/// arm (the single source of truth for the local-Ollama default tag) and is
+/// overridden at every layer in the resolver ladder
+/// (CLI > env > `[llm]` > legacy flat field > this compiled default).
+///
+/// No vendor/model name is baked into any tier-config identifier — the tier
+/// presets carry this resolved default string, not a model-named enum.
+#[must_use]
+pub fn default_tier_llm_model() -> &'static str {
+    backend_default_model(crate::llm::BACKEND_OLLAMA)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +109,9 @@ pub enum FeatureTier {
     Keyword,
     /// `MiniLM` embeddings + HNSW index — ~256 MB.
     Semantic,
-    /// nomic-embed + Gemma 4 E2B via Ollama — ~1 GB.
+    /// nomic-embed + a backend LLM (any configured provider) — ~1 GB.
     Smart,
-    /// nomic-embed + Gemma 4 E4B + cross-encoder via Ollama — ~4 GB.
+    /// nomic-embed + a backend LLM (any configured provider) + cross-encoder — ~4 GB.
     Autonomous,
 }
 
@@ -165,14 +157,14 @@ impl FeatureTier {
             Self::Smart => TierConfig {
                 tier: self,
                 embedding_model: Some(EmbeddingModel::NomicEmbedV15),
-                llm_model: Some(LlmModel::Gemma4E2B),
+                llm_model: Some(default_tier_llm_model().to_string()),
                 cross_encoder: false,
                 max_memory_mb: 1024,
             },
             Self::Autonomous => TierConfig {
                 tier: self,
                 embedding_model: Some(EmbeddingModel::NomicEmbedV15),
-                llm_model: Some(LlmModel::Gemma4E4B),
+                llm_model: Some(default_tier_llm_model().to_string()),
                 cross_encoder: true,
                 max_memory_mb: 4096,
             },
@@ -209,7 +201,12 @@ impl std::fmt::Display for FeatureTier {
 pub struct TierConfig {
     pub tier: FeatureTier,
     pub embedding_model: Option<EmbeddingModel>,
-    pub llm_model: Option<LlmModel>,
+    /// Default backend LLM model tag for this tier, or `None` for tiers that
+    /// use no LLM (keyword / semantic). The value is the provider-agnostic
+    /// compiled default ([`default_tier_llm_model`]); the operator-resolved
+    /// backend/model is carried by [`ResolvedLlm`] via [`AppConfig::resolve_llm`]
+    /// and can be ANY backend. Treated as an on/off gate at the call sites.
+    pub llm_model: Option<String>,
     pub cross_encoder: bool,
     pub max_memory_mb: usize,
 }
@@ -3711,10 +3708,7 @@ impl ResolvedModels {
         Self {
             llm: ResolvedLlm {
                 backend: "ollama".to_string(),
-                model: tier
-                    .llm_model
-                    .map(|m| m.ollama_model_id().to_string())
-                    .unwrap_or_default(),
+                model: tier.llm_model.clone().unwrap_or_default(),
                 base_url: "http://localhost:11434".to_string(),
                 api_key: None,
                 api_key_source: KeySource::None,
@@ -6524,7 +6518,10 @@ mod tests {
         let json = serde_json::to_string_pretty(&caps).unwrap();
         assert!(json.contains("\"tier\": \"smart\""));
         assert!(json.contains("nomic"));
-        assert!(json.contains("gemma4:e2b"));
+        // The smart tier surfaces the provider-agnostic compiled default
+        // model tag — asserted against the single source of truth, not a
+        // copied literal, so no vendor/model string is pinned in the test.
+        assert!(json.contains(default_tier_llm_model()));
     }
 
     /// v0.6.3.1 (capabilities schema v2, P1 honesty patch).
@@ -7689,19 +7686,28 @@ legacy_scoring = false
     // display impls that no other test exercises. ----
 
     #[test]
-    fn llm_model_display_name_each_variant() {
-        // Lines 84-89: `LlmModel::display_name` for each enum arm.
+    fn tier_llm_model_is_agnostic_gate() {
+        // The Gemma-only `LlmModel` enum was removed (#1490): no model name
+        // survives as a config-surface identifier. The LLM-capable tiers
+        // carry the provider-agnostic compiled default; keyword/semantic
+        // carry `None` (LLM disabled). Pin the gate + the single-source-of-
+        // truth default rather than any hardcoded vendor string.
+        assert!(FeatureTier::Keyword.config().llm_model.is_none());
+        assert!(FeatureTier::Semantic.config().llm_model.is_none());
         assert_eq!(
-            LlmModel::Gemma4E2B.display_name(),
-            "Gemma 4 Effective 2B (Q4)"
+            FeatureTier::Smart.config().llm_model.as_deref(),
+            Some(default_tier_llm_model())
         );
         assert_eq!(
-            LlmModel::Gemma4E4B.display_name(),
-            "Gemma 4 Effective 4B (Q4)"
+            FeatureTier::Autonomous.config().llm_model.as_deref(),
+            Some(default_tier_llm_model())
         );
-        // Also pin the ollama_model_id for completeness.
-        assert_eq!(LlmModel::Gemma4E2B.ollama_model_id(), "gemma4:e2b");
-        assert_eq!(LlmModel::Gemma4E4B.ollama_model_id(), "gemma4:e4b");
+        // The default routes through the agnostic resolver table, never a
+        // model-named identifier.
+        assert_eq!(
+            default_tier_llm_model(),
+            backend_default_model(crate::llm::BACKEND_OLLAMA)
+        );
     }
 
     #[test]
@@ -8419,13 +8425,12 @@ max_page_size = 1000000
     #[test]
     fn resolve_llm_1146_tier_model_override_clobbers_config_model_1440() {
         // #1440 regression: the pre-fix curator `--daemon` path passed
-        // the feature-tier's default Ollama model id
-        // (`FeatureTier::Autonomous` -> `gemma4:e4b`) as the CLI-arm
-        // model override. Because the CLI arm is highest precedence,
-        // it clobbered the operator's configured `[llm].model`,
-        // sending `gemma4:e4b` to OpenRouter -> fast HTTP 400 on every
-        // curator call. This test pins BOTH halves of the RCA so the
-        // bug can't silently return:
+        // the feature-tier's default (local-Ollama) model id as the
+        // CLI-arm model override. Because the CLI arm is highest
+        // precedence, it clobbered the operator's configured
+        // `[llm].model`, sending the local default to OpenRouter ->
+        // fast HTTP 400 on every curator call. This test pins BOTH
+        // halves of the RCA so the bug can't silently return:
         //   1. With no override (the `--once` / fixed `--daemon` path),
         //      the configured model wins.
         //   2. Passing the tier-default id as the override DOES clobber
@@ -8439,10 +8444,7 @@ max_page_size = 1000000
         // source of truth rather than asserting against a copy.
         let configured_backend = "openrouter";
         let configured_model = "google/gemma-4-26b-a4b-it";
-        let tier_default_model = crate::config::FeatureTier::Autonomous
-            .config()
-            .llm_model
-            .map(|m| m.ollama_model_id().to_string());
+        let tier_default_model = crate::config::FeatureTier::Autonomous.config().llm_model;
 
         let mut cfg = empty_app_config();
         cfg.llm = Some(LlmSection {
