@@ -434,6 +434,13 @@ cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
         (recommended, post-<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1146">#1146</a>)
         or via <code>AI_MEMORY_LLM_BACKEND</code> env vars (override path).
       </p>
+      <p class="lede" style="margin-top:0.5rem">
+        <strong>No GPU required.</strong> Nothing here is hard-wired to a GPU, to Ollama, or to Gemma &mdash; those are the
+        local-first default, not a requirement. Wherever you have API access, run on hosts with no GPUs, and want
+        autonomous mode with <code>--profile full</code>, point <code>[llm]</code> at a remote cloud API (e.g. OpenRouter as a
+        low-cost example) or an internal air-gapped HA inference endpoint. See the
+        <a href="autonomous.html#no-gpu">No GPU required &mdash; any LLM backend</a> walkthrough on the autonomous page.
+      </p>
       <p>
         <strong>Single source of truth.</strong> <code>config.toml</code> is consumed by every surface —
         the MCP server, the HTTP daemon, <code>ai-memory atomise</code>, <code>ai-memory curator</code>, the boot
