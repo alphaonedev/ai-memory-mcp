@@ -2577,21 +2577,21 @@ pub fn run_mcp_server(
         profile.expected_tool_count()
     );
 
-    // Apply config.toml overrides — tiers gate features, models are independently configurable
-    // Only override if the tier actually uses an LLM (smart/autonomous)
+    // Apply config.toml overrides — tiers gate features, models are independently configurable.
+    // Only override if the tier actually uses an LLM (smart/autonomous). The legacy flat-field
+    // `llm_model` is provider/model-agnostic (#1067 / #1146 / #1490): ANY model string is honored
+    // here and the concrete backend/model is resolved through `resolve_llm` below (which folds
+    // this same flat field through its Legacy arm). This is only a tier-gate carrier — no vendor
+    // or model name is hardcoded, and no override is silently dropped.
     if tier_config.llm_model.is_some()
         && let Some(ref llm_override) = app_config.llm_model
     {
-        match llm_override.as_str() {
-            "gemma4:e2b" => {
-                tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E2B);
-                eprintln!("ai-memory: llm_model override from config: gemma4:e2b");
-            }
-            "gemma4:e4b" => {
-                tier_config.llm_model = Some(crate::config::LlmModel::Gemma4E4B);
-                eprintln!("ai-memory: llm_model override from config: gemma4:e4b");
-            }
-            other => eprintln!("ai-memory: unknown llm_model '{other}', using tier default"),
+        let trimmed = llm_override.trim();
+        if trimmed.is_empty() {
+            eprintln!("ai-memory: empty llm_model override ignored, using tier default");
+        } else {
+            tier_config.llm_model = Some(trimmed.to_string());
+            eprintln!("ai-memory: llm_model override from config: {trimmed}");
         }
     }
 
