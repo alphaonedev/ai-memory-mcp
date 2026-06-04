@@ -58,6 +58,16 @@
 //!    response to empty; all three garbage values fall through to the
 //!    compiled defaults.
 //!
+//! 7. **`test_pg_pool_{config_overrides_default,env_overrides_config,
+//!    zero_falls_through}`** (config-driven pg pool / T6) — the
+//!    `AI_MEMORY_PG_POOL_*` env vars (table rows #53-55) resolve `env >
+//!    postgres_pool_* config fields > compiled PoolConfig::default()`
+//!    through `AppConfig::resolve_pg_pool()`. The zero-fallthrough test
+//!    pins that a stray `0` / unparseable value at any layer falls
+//!    through instead of clamping the pool to 0 (which would hang every
+//!    `acquire()`). Gated on `sal` (resolver + `PoolConfig` are
+//!    SAL-feature surfaces).
+//!
 //! All tests serialize env mutation through the shared `ENV_LOCK`: the
 //! single-key tests via [`EnvVarGuard`], and the multi-key `[limits]`
 //! tests via [`MultiEnvVarGuard`] (which acquires the non-reentrant
@@ -384,4 +394,114 @@ fn test_limits_garbage_env_falls_through_to_default() {
         "non-positive page-size env must be ignored"
     );
     assert!(r.max_storage_bytes > 0, "unparseable env must be ignored");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Postgres pool sizing — AI_MEMORY_PG_POOL_* env vars override the
+//    `postgres_pool_*` config fields, which override the compiled
+//    PoolConfig::default() (max=16 / min=2 / acquire_timeout=30s). Mirrors
+//    the [limits] ladder for the connection-pool knobs (T6 / config-driven
+//    pg pool work). Gated on `sal` because `resolve_pg_pool` + `PoolConfig`
+//    live behind the SAL feature.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "sal")]
+#[test]
+fn test_pg_pool_config_overrides_default() {
+    use ai_memory::store::PoolConfig;
+
+    // Config sets all three fields; env unset → config must beat the
+    // compiled PoolConfig::default().
+    let cfg = AppConfig {
+        postgres_pool_max_connections: Some(64),
+        postgres_pool_min_connections: Some(8),
+        postgres_acquire_timeout_secs: Some(15),
+        ..AppConfig::default()
+    };
+
+    let _guard = MultiEnvVarGuard::apply(&[
+        (ai_memory::config::ENV_PG_POOL_MAX, None),
+        (ai_memory::config::ENV_PG_POOL_MIN, None),
+        (ai_memory::config::ENV_PG_ACQUIRE_TIMEOUT_SECS, None),
+    ]);
+
+    let resolved = cfg.resolve_pg_pool();
+    assert_eq!(
+        resolved,
+        PoolConfig {
+            max_connections: 64,
+            min_connections: 8,
+            acquire_timeout_secs: 15,
+        },
+        "config fields must beat PoolConfig::default() when env is unset",
+    );
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn test_pg_pool_env_overrides_config() {
+    use ai_memory::store::PoolConfig;
+
+    let cfg = AppConfig {
+        postgres_pool_max_connections: Some(64),
+        postgres_pool_min_connections: Some(8),
+        postgres_acquire_timeout_secs: Some(15),
+        ..AppConfig::default()
+    };
+
+    // Env sets max + acquire-timeout; min is left to config. Single lock
+    // acquisition for the batch (see `MultiEnvVarGuard`).
+    let _guard = MultiEnvVarGuard::apply(&[
+        (ai_memory::config::ENV_PG_POOL_MAX, Some("100")),
+        (ai_memory::config::ENV_PG_ACQUIRE_TIMEOUT_SECS, Some("45")),
+        (ai_memory::config::ENV_PG_POOL_MIN, None),
+    ]);
+
+    let resolved = cfg.resolve_pg_pool();
+    assert_eq!(
+        resolved,
+        PoolConfig {
+            max_connections: 100,
+            min_connections: 8,
+            acquire_timeout_secs: 45,
+        },
+        "AI_MEMORY_PG_POOL_* env must beat the postgres_pool_* config fields; \
+         config supplies the min the env left unset",
+    );
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn test_pg_pool_zero_falls_through() {
+    use ai_memory::store::PoolConfig;
+
+    // A `0` / unparseable value at ANY layer must fall through to the next,
+    // never clamp the pool to 0 (a 0 max_connections would make every
+    // acquire() hang until the acquire-timeout fires).
+    let cfg = AppConfig {
+        // config min is a non-positive 0 → must be ignored, default (2) wins.
+        postgres_pool_min_connections: Some(0),
+        ..AppConfig::default()
+    };
+
+    let _guard = MultiEnvVarGuard::apply(&[
+        (ai_memory::config::ENV_PG_POOL_MAX, Some("0")), // non-positive → ignored
+        (ai_memory::config::ENV_PG_POOL_MIN, Some("garbage")), // unparseable → ignored
+        (ai_memory::config::ENV_PG_ACQUIRE_TIMEOUT_SECS, Some("-5")), // non-numeric u64 → ignored
+    ]);
+
+    let resolved = cfg.resolve_pg_pool();
+    assert_eq!(
+        resolved,
+        PoolConfig::default(),
+        "zero / garbage at every layer must fall through to the compiled \
+         PoolConfig::default(), never clamp the pool to 0",
+    );
+    assert!(
+        resolved.max_connections > 0,
+        "max_connections must never resolve to 0",
+    );
+    assert!(
+        resolved.min_connections > 0,
+        "min_connections must never resolve to 0 when config supplied a 0",
+    );
 }

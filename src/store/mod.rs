@@ -65,6 +65,59 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 pub use crate::models::{CaptureTurnResult, CaptureTurnWrite};
 use crate::quotas::QuotaStatus;
 
+/// Default connection pool ceiling. Tuned for a mid-range ai-memory
+/// daemon — operators override via the `AI_MEMORY_PG_POOL_MAX` /
+/// `AI_MEMORY_PG_POOL_MIN` / `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` knobs
+/// (resolved by `AppConfig::resolve_pg_pool` and threaded in as a
+/// [`PoolConfig`]) when wiring a larger deployment.
+///
+/// Lives here in `store` (the `sal`-gated module) rather than in the
+/// `sal-postgres`-gated `store::postgres` so the daemon's
+/// `build_store_handle` — which is `#[cfg(feature = "sal")]` and must
+/// name `PoolConfig` in its signature even in a `sal`-only build with no
+/// postgres adapter compiled — can reference the type. The postgres
+/// adapter re-exports it (`pub use crate::store::PoolConfig;`).
+const DEFAULT_MAX_CONNECTIONS: u32 = 16;
+
+/// Default floor of always-open connections kept warm in the pool.
+/// Mirrors the long-documented `min=2` posture so a daemon that has
+/// gone idle still answers the next request without paying full TCP +
+/// TLS + `after_connect` setup latency on a cold pool. sqlx's own
+/// default is `0`; we set `2` explicitly because the prior code never
+/// wired `min_connections`, leaving the documented floor un-shipped.
+const DEFAULT_MIN_CONNECTIONS: u32 = 2;
+
+/// Default `acquire()` wait before erroring, in whole seconds.
+const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+
+/// Resolved connection-pool sizing knobs threaded from
+/// `AppConfig::resolve_pg_pool` down into the sqlx `PgPoolOptions`
+/// build. Mirrors the `statement_timeout_secs` threading pattern: a
+/// small `Copy` bundle so the connect chain takes one parameter
+/// instead of three positional `u32`/`u64`s. Construct via
+/// [`PoolConfig::default`] for the compiled defaults, or build
+/// explicitly from resolved config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Hard ceiling on open connections (sqlx `max_connections`).
+    pub max_connections: u32,
+    /// Floor of always-open warm connections (sqlx `min_connections`).
+    pub min_connections: u32,
+    /// How long `acquire()` waits for a free connection before erroring
+    /// (sqlx `acquire_timeout`), in whole seconds.
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            min_connections: DEFAULT_MIN_CONNECTIONS,
+            acquire_timeout_secs: DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// Knowledge-graph backend resolved at adapter init.
 ///
 /// v0.7 Track J substrate: Postgres adapters detect Apache AGE at
@@ -2150,6 +2203,19 @@ mod tests {
         assert_eq!(ctx.agent_id, "alice");
         assert!(ctx.as_agent.is_none());
         assert!(ctx.request_id.is_none());
+    }
+
+    #[test]
+    fn pool_config_default_equals_named_constants() {
+        let d = PoolConfig::default();
+        assert_eq!(d.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(d.min_connections, DEFAULT_MIN_CONNECTIONS);
+        assert_eq!(d.acquire_timeout_secs, DEFAULT_ACQUIRE_TIMEOUT_SECS);
+        // Documented compiled defaults (CLAUDE.md env table + enterprise
+        // deployment §5.6): min=2, max=16, acquire-timeout=30s.
+        assert_eq!(d.max_connections, 16);
+        assert_eq!(d.min_connections, 2);
+        assert_eq!(d.acquire_timeout_secs, 30);
     }
 
     #[test]
