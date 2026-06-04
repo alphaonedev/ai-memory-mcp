@@ -38,7 +38,7 @@
 
 #![cfg(feature = "sal-postgres")]
 
-use ai_memory::store::postgres::PostgresStore;
+use ai_memory::store::postgres::{PoolConfig, PostgresStore};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -167,9 +167,14 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
     // is what the daemon does at `bootstrap_serve` time when the
     // configured tier is `autonomous` / `smart` (= NomicEmbedV15, 768).
     {
-        let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(&url, 768, 30)
-            .await
-            .expect("auto-migrate to dim=768");
+        let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+            &url,
+            768,
+            30,
+            PoolConfig::default(),
+        )
+        .await
+        .expect("auto-migrate to dim=768");
     }
     assert_eq!(
         current_dim(&inspect).await,
@@ -180,9 +185,14 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
     // Step 3: idempotence — a second auto-migrate at 768 is a no-op
     // and leaves the column unchanged.
     {
-        let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(&url, 768, 30)
-            .await
-            .expect("idempotent auto-migrate");
+        let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+            &url,
+            768,
+            30,
+            PoolConfig::default(),
+        )
+        .await
+        .expect("idempotent auto-migrate");
     }
     assert_eq!(
         current_dim(&inspect).await,
@@ -208,9 +218,14 @@ async fn auto_migrate_no_op_when_fresh_schema_already_matches() {
     reset_schema(&inspect).await;
 
     {
-        let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(&url, 768, 30)
-            .await
-            .expect("fresh bootstrap at dim=768 via auto-migrate path");
+        let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+            &url,
+            768,
+            30,
+            PoolConfig::default(),
+        )
+        .await
+        .expect("fresh bootstrap at dim=768 via auto-migrate path");
     }
     assert_eq!(
         current_dim(&inspect).await,
@@ -247,9 +262,14 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
 
     // 2) Re-open with auto-migrate at 768 (simulates the fixed daemon
     //    bootstrap path with an autonomous-tier embedder).
-    let store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(&url, 768, 30)
-        .await
-        .expect("auto-migrate at bootstrap");
+    let store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+        &url,
+        768,
+        30,
+        PoolConfig::default(),
+    )
+    .await
+    .expect("auto-migrate at bootstrap");
 
     // 3) Insert a memory with a 768-dim embedding via the SAL surface
     //    the HTTP create_memory handler uses. `store_with_embedding`
