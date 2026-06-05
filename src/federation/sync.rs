@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+use crate::federation::identity::chain::CHAIN_HEADER;
 use crate::federation::identity::credential::CREDENTIAL_HEADER;
 use crate::federation::identity::outbound;
 use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingAction, PendingDecision};
@@ -141,6 +142,20 @@ pub(super) async fn post_once(
             Err(e) => {
                 tracing::warn!(target: "federation::signing", error = %e,
                     "failed to encode outbound federation credential header; omitting");
+            }
+        }
+        // FED-P4d — when the leaf is signed by an intermediate rather than a
+        // root, also attach the anchor-first intermediate chain so a peer
+        // holding only the root in its trust bundle can verify the full
+        // chain. A node holding no intermediates (the P2/P3 one-level case)
+        // emits no chain header, so the wire stays byte-identical to pre-P4.
+        let intermediates = outbound::current_intermediates();
+        match crate::federation::identity::chain::intermediates_to_header_value(&intermediates) {
+            Ok(Some(value)) => req = req.header(CHAIN_HEADER, value),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(target: "federation::signing", error = %e,
+                    "failed to encode outbound federation chain header; omitting");
             }
         }
     }
