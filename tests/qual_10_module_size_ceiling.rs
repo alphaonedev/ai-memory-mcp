@@ -185,10 +185,37 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // bump: 7528. Growth is justified: each change hardens an existing
     // startup path plus its regression coverage (no speculative
     // surface). 7600 = 7528 + ~72 headroom; well under the 1.5x cap.
-    ("src/daemon_runtime.rs", 7_600),
+    //
+    // 2026-06-05 — bumped 7_600 → 7_700 by the federation-identity-at-scale
+    // epic (FED-P3/P4, merged via bdf93e6a5): the daemon-boot wiring for
+    // zero-touch trust grew the file to 7621 — `resolve sender identity
+    // instead of hardcoding host:<hostname>` (0aa8fc2db), `thread
+    // operator-config identity into resolver` (3e041cd8c), and `spawn
+    // credential renewal worker at daemon boot` (91a2dcfa4). The lockstep
+    // bump was missed at merge because the epic's --lib merge gate does not
+    // run the tests/ integration binaries — qual_10 only runs under the
+    // full Per-Module Coverage Thresholds llvm-cov job, which first
+    // re-checked the ceiling on the #1508 push. Growth is justified: each
+    // change wires an existing daemon-boot path for first-party-CA identity
+    // resolution / credential renewal (no speculative surface). 7700 = 7621
+    // + 79 headroom; far under the 1.5x cap.
+    ("src/daemon_runtime.rs", 7_700),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
-    ("src/storage/migrations.rs", 3_500),
+    // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
+    // migration-capability work: the operator-directed in-process
+    // pre-migration DB snapshot (`snapshot_before_migration` +
+    // `database_main_file_path` + the `PRE_MIGRATION_BACKUP_*` consts and
+    // their `*_for_tests` accessor, written within migration scope so a
+    // recoverable backup exists BEFORE any schema mutation) plus its 3
+    // in-file regression tests (`in_memory_db_has_no_snapshot_file_path`,
+    // `snapshot_before_migration_is_noop_for_in_memory_db`,
+    // `pre_migration_backup_infix_accessor_is_stable_and_nonempty`) grew
+    // the file to 3625. Growth is justified: a new
+    // recover-from-backup safety primitive on the open/migrate path plus
+    // its regression coverage, zero speculative surface. 3700 = 3625 + 75
+    // headroom; far under the 1.5x cap.
+    ("src/storage/migrations.rs", 3_700),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
