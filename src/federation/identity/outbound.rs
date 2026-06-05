@@ -89,6 +89,12 @@ fn global() -> &'static OutboundCredentialHolder {
     GLOBAL.get_or_init(|| OutboundCredentialHolder::new(load_from_env_logged()))
 }
 
+/// The process-wide holder, for the renewal worker to refresh in place.
+#[must_use]
+pub fn shared() -> &'static OutboundCredentialHolder {
+    global()
+}
+
 /// Snapshot of the node's currently-held outbound credential (hot path,
 /// called per outbound federation POST).
 #[must_use]
