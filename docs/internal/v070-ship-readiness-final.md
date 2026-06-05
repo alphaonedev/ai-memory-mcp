@@ -131,7 +131,7 @@ the full text. Rolled up:
       ADRs.
 - [x] Tool-count baseline preserved (73 total at release HEAD, pinned by
       `Profile::full().expected_tool_count()`).
-- [x] Schema baseline preserved (v49 on both backends at release HEAD).
+- [x] Schema baseline preserved (v55 on both backends at release HEAD).
 - [x] All 7 Batman forms IMPLEMENTED (`batman-framework-audit.md`
       post-closeout section).
 - [x] CHANGELOG + release-notes + MIGRATION_v0.7.md reconciled with

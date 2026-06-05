@@ -41,7 +41,7 @@ subscriptions, audit chain, transcripts, signed events with the
 V-4 cross-row hash chain (#698), agent quotas, link `attest_level`,
 A2A correlation, smart-load veto, KG temporal-index v2,
 tier-promotion metadata, subscription DLQ, `consolidated_from_agents`
-array, plus the v34 → v53 deltas (recursive-learning depth
+array, plus the v34 → v55 deltas (recursive-learning depth
 columns, Batman Form-4/5 provenance + confidence-calibration
 columns, optimistic-concurrency `version` column at v45,
 `federation_push_dlq` table at v48, archive_memories +14
@@ -95,7 +95,7 @@ ai-memory schema-init \
 ```
 
 Idempotent on rerun. Exit code 0 + `schema-init complete:
-schema_version=53, kg_backend=AGE` is the success signal.
+schema_version=55, kg_backend=AGE` is the success signal.
 
 ## Step 2 — Dry-run the migration
 
@@ -238,7 +238,7 @@ Same dry-run / verify dance. Useful for:
   surfaces (the migration is lossless either direction at v0.7.0
   schema parity).
 
-## In-place v15 → v53 (postgres → postgres on the same host)
+## In-place v15 → v55 (postgres → postgres on the same host)
 
 If you're upgrading an existing v0.7-alpha postgres db (schema v15)
 to v0.7.0's v53 parity:
@@ -249,7 +249,7 @@ ai-memory schema-init \
   --upgrade
 ```
 
-`schema-init --upgrade` walks the v15 → v53 deltas idempotently (the v34 → v53 layer lands via in-process `migrate_v34()…migrate_v53()` async functions invoked by `--upgrade`).
+`schema-init --upgrade` walks the v15 → v55 deltas idempotently (the v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()` async functions invoked by `--upgrade`).
 Existing data is preserved; only DDL changes. The migration tool's
 `--in-place` mode is the moral equivalent — pick whichever fits your
 workflow.

@@ -836,7 +836,7 @@ work in v0.7.x with a single-line deprecation WARN at load time;
 they will be removed in v0.8.0.
 
 The DB schema migration is **automatic** — the daemon walks v33 →
-v49 on first open of an existing v0.6.x DB. No operator action
+v55 on first open of an existing v0.6.x DB. No operator action
 required.
 
 For a comprehensive walkthrough (security-posture defaults that
