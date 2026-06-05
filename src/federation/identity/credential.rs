@@ -57,7 +57,7 @@ pub const SUBJECT_PUBKEY_LEN: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
 /// `X-Memory-Cred` header value (`v1=<base64>`) written by the renewal
 /// worker (ADR-001 Decision 5). Unset = this node holds no credential and
 /// falls back to legacy per-peer enrollment on the wire.
-pub const FED_CREDENTIAL_PATH_ENV: &str = "AI_MEMORY_FED_CREDENTIAL_PATH";
+pub const FED_CREDENTIAL_PATH_ENV: &str = "AI_MEMORY_FED_CRED_PATH";
 
 // ---- canonical claim field keys (lexicographically ordered by BTreeMap) ----
 const FIELD_CRED_VERSION: &str = "cred_version";
