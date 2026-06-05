@@ -25,7 +25,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use super::credential::SignedCredential;
+use super::credential::{FederationCredential, SignedCredential};
 use super::outbound::{self, OutboundCredentialHolder};
 
 /// Wall-clock UNIX seconds of the last tick that observed a held
@@ -136,15 +136,96 @@ pub fn refresh_once(holder: &OutboundCredentialHolder, now_unix: i64) -> Renewal
     outcome
 }
 
+/// FED-P4-f (§8) — append a `federation.credential_renewed` row to the
+/// `signed_events` audit chain when the renewal worker swaps a fresh
+/// credential into the live send path. The canonical-CBOR payload binds
+/// the subject id, issuer id, trust domain, and the new validity window
+/// so a downstream auditor can reconstruct *which* credential this node
+/// began presenting and when, without re-reading the (now-overwritten)
+/// credential file.
+///
+/// Issuance ([`super::issuer::FederationIssuer`]) is centrally operated
+/// and revocation is by self-expiry (no CRL — see `issuer.rs`), so
+/// renewal is the only node-local credential-lifecycle transition there
+/// is to audit; this is the whole of the §8 "issue/renew/revoke" audit
+/// obligation that a node observes about its own credential.
+///
+/// Best-effort: the audit chain is allowed to gap on an encode/append
+/// fault; the credential swap has already happened and MUST NOT be
+/// undone by an audit failure (mirrors the `federation.quota_refused`
+/// and `memory_link.invalidated` emit posture).
+fn emit_renewal_audit(conn: &rusqlite::Connection, claims: &FederationCredential, now_unix: i64) {
+    use std::collections::BTreeMap;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    // Sort keys via BTreeMap so the encoding is stable across releases —
+    // the SHA-256 over these bytes is the chain's commitment to the
+    // renewal shape (mirrors `emit_pending_action_event`).
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert(
+        "subject_agent_id",
+        ciborium::Value::Text(claims.subject_agent_id.clone()),
+    );
+    map.insert("issuer_id", ciborium::Value::Text(claims.issuer_id.clone()));
+    map.insert(
+        "trust_domain",
+        ciborium::Value::Text(claims.trust_domain.clone()),
+    );
+    map.insert(
+        "not_before",
+        ciborium::Value::Integer(claims.not_before.into()),
+    );
+    map.insert(
+        "not_after",
+        ciborium::Value::Integer(claims.not_after.into()),
+    );
+    map.insert("renewed_at_unix", ciborium::Value::Integer(now_unix.into()));
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+    let mut cbor: Vec<u8> = Vec::with_capacity(128);
+    if let Err(e) = ciborium::ser::into_writer(&value, &mut cbor) {
+        tracing::warn!(target: "federation::signing", error = %e,
+            "failed to encode canonical CBOR for credential-renewal audit event");
+        return;
+    }
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        crate::signed_events::payload_hash(&cbor),
+        claims.subject_agent_id.clone(),
+        crate::signed_events::event_types::FED_CREDENTIAL_RENEWED.to_string(),
+        timestamp,
+    );
+    if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
+        tracing::warn!(target: "federation::signing", error = %e,
+            "failed to append credential-renewal audit row; live credential is retained");
+    }
+}
+
 /// Spawn the background credential-refresh worker. Mirrors
 /// `spawn_replay_federation_push_dlq`: an immediate first tick (so a
 /// credential written before boot is honoured at once) followed by
 /// `refresh_once → sleep(interval)` forever.
-pub fn spawn_refresh_outbound_credential(interval: Duration) -> tokio::task::JoinHandle<()> {
+///
+/// `db` is the shared rusqlite handle: on a `Reloaded` tick the worker
+/// appends a `federation.credential_renewed` row to the `signed_events`
+/// audit chain (FED-P4-f §8). The emission lives here rather than in
+/// [`refresh_once`] so that decision core stays `Connection`-free and
+/// pure-tested off the process-global holder.
+pub fn spawn_refresh_outbound_credential(
+    db: crate::handlers::Db,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let now_unix = chrono::Utc::now().timestamp();
-            let _ = refresh_once(outbound::shared(), now_unix);
+            let outcome = refresh_once(outbound::shared(), now_unix);
+            if outcome == RenewalOutcome::Reloaded {
+                if let Some(cred) = outbound::shared().current() {
+                    let lock = db.lock().await;
+                    emit_renewal_audit(&lock.0, cred.credential(), now_unix);
+                }
+            }
             // FED-P4d — refresh the slower-rotating intermediate chain on the
             // same tick. A load/parse fault is logged and the prior chain is
             // retained (no reset), so a transiently-bad file never strips a
@@ -248,5 +329,33 @@ mod tests {
             holder.current().expect("held").credential().not_after,
             renewed.credential().not_after
         );
+    }
+
+    #[test]
+    fn emit_renewal_audit_appends_signed_event() {
+        // FED-P4-f §8 — a renewal must land a
+        // `federation.credential_renewed` row in the signed_events
+        // audit chain, attributed to the credential's subject id.
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(include_str!(
+            "../../../migrations/sqlite/0020_v07_signed_events.sql"
+        ))
+        .expect("apply signed_events migration");
+        let issued = 1_900_000_000;
+        let cred = cred_at(issued);
+        let claims = cred.credential().clone();
+        emit_renewal_audit(&conn, &claims, issued + 5);
+        let rows =
+            crate::signed_events::list_signed_events(&conn, Some(&claims.subject_agent_id), 10, 0)
+                .expect("list");
+        assert_eq!(rows.len(), 1, "exactly one renewal audit row");
+        assert_eq!(
+            rows[0].event_type,
+            crate::signed_events::event_types::FED_CREDENTIAL_RENEWED
+        );
+        assert_eq!(rows[0].agent_id, claims.subject_agent_id);
+        // Chain columns are writer-populated: first row → sequence 1.
+        assert_eq!(rows[0].sequence, 1);
+        assert!(!rows[0].payload_hash.is_empty());
     }
 }

@@ -3755,8 +3755,10 @@ pub async fn bootstrap_serve(
         let renewal_interval = Duration::from_secs(
             federation::identity::renewal::DEFAULT_RENEWAL_INTERVAL_SECS.unsigned_abs(),
         );
-        let _renewal_handle =
-            federation::identity::renewal::spawn_refresh_outbound_credential(renewal_interval);
+        let _renewal_handle = federation::identity::renewal::spawn_refresh_outbound_credential(
+            db_state.clone(),
+            renewal_interval,
+        );
         tracing::info!(
             "federation outbound credential renewal worker enabled: refreshing every {}s",
             renewal_interval.as_secs(),
