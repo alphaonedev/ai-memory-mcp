@@ -728,6 +728,14 @@ pub struct ServeArgs {
     /// node convergent within one interval after resume.
     #[arg(long, default_value_t = 30)]
     pub catchup_interval_secs: u64,
+    /// v0.7.0 epic (ADR-001) — the federation identity this node signs and
+    /// presents as (`sender_agent_id`). Precedence-2 source, below the
+    /// `AI_MEMORY_FED_IDENTITY` env override and above the historical
+    /// `host:<hostname>` default. Set this to a stable, trust-domain-scoped
+    /// id (e.g. `region/nyc/node-7`) so a node's identity survives a
+    /// hostname change. Unset = keep the hostname default.
+    #[arg(long)]
+    pub federation_identity: Option<String>,
 
     // -------- v0.7.0 Wave-3 — adapter selection --------------------
     /// v0.7.0 Wave-3 — full SAL store URL. When set, the daemon binds
@@ -3427,7 +3435,12 @@ pub async fn bootstrap_serve(
         args.quorum_client_cert.as_deref(),
         args.quorum_client_key.as_deref(),
         args.quorum_ca_cert.as_deref(),
-        format!("host:{}", gethostname::gethostname().to_string_lossy()),
+        // v0.7.0 epic (ADR-001) — federation identity is resolved, not
+        // hardcoded. Precedence: AI_MEMORY_FED_IDENTITY env >
+        // `--federation-identity` operator config > the historical
+        // `host:<hostname>` default. A blank flag is skipped by the
+        // resolver, so it can never collapse the identity to empty.
+        federation::identity::resolve_federation_identity(args.federation_identity.as_deref()),
         // v0.7.0 fold-A2A1.4 (#702) — thread the operator-configured
         // `[api] api_key` into federation outbound so peer POSTs carry
         // `x-api-key`. Without this, cross-host federation BREAKS when
@@ -3728,6 +3741,28 @@ pub async fn bootstrap_serve(
                 args.catchup_interval_secs,
             );
         }
+    }
+
+    // FED-P3b — outbound credential renewal worker. When this node holds a
+    // CA-issued credential file (`AI_MEMORY_FED_CRED_PATH`), keep it fresh:
+    // an external issuer rewrites the short-lived credential on renewal and
+    // this worker swaps it into the live send path without a daemon
+    // restart. Independent of the catchup interval; a no-op (not spawned)
+    // when no credential path is configured.
+    if federation.is_some()
+        && std::env::var(federation::identity::credential::FED_CREDENTIAL_PATH_ENV).is_ok()
+    {
+        let renewal_interval = Duration::from_secs(
+            federation::identity::renewal::DEFAULT_RENEWAL_INTERVAL_SECS.unsigned_abs(),
+        );
+        let _renewal_handle = federation::identity::renewal::spawn_refresh_outbound_credential(
+            db_state.clone(),
+            renewal_interval,
+        );
+        tracing::info!(
+            "federation outbound credential renewal worker enabled: refreshing every {}s",
+            renewal_interval.as_secs(),
+        );
     }
 
     if matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
@@ -4787,6 +4822,7 @@ mod tests {
             quorum_client_key: None,
             quorum_ca_cert: None,
             catchup_interval_secs: 0,
+            federation_identity: None,
             #[cfg(feature = "sal")]
             store_url: None,
         }
