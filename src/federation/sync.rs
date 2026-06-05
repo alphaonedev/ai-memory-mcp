@@ -5,36 +5,17 @@
 //! broadcast_*_quorum, bulk_catchup_push.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
-use crate::federation::identity::credential::{CREDENTIAL_HEADER, SignedCredential};
+use crate::federation::identity::credential::CREDENTIAL_HEADER;
+use crate::federation::identity::outbound;
 use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingAction, PendingDecision};
 use crate::replication::{AckTracker, QuorumError};
 
 use super::FederationConfig;
-
-/// This node's held outbound federation credential, loaded once at first
-/// outbound POST from [`SignedCredential::load_from_env`]
-/// (`AI_MEMORY_FED_CRED_PATH`). `None` = this node holds no
-/// credential and presents only its legacy per-message signature — the
-/// receiver then falls back to per-peer `.pub` enrollment. Boot-once is
-/// symmetric with the receiver's `cached_trust_bundle()`; the renewal
-/// worker (P3 next) replaces this with a reloadable handle.
-fn cached_outbound_credential() -> Option<&'static SignedCredential> {
-    static CRED: OnceLock<Option<SignedCredential>> = OnceLock::new();
-    CRED.get_or_init(|| {
-        SignedCredential::load_from_env().unwrap_or_else(|e| {
-            tracing::warn!(target: "federation::signing", error = %e,
-                "failed to load outbound federation credential; presenting per-message signature only");
-            None
-        })
-    })
-    .as_ref()
-}
 
 #[derive(Debug)]
 pub(super) enum AckOutcome {
@@ -154,7 +135,7 @@ pub(super) async fn post_once(
     // Held-credential absence is the normal pre-enrollment state; a
     // malformed-encode is logged and skipped, never fatal — the wire
     // still carries the legacy signature, so this degrades to per-peer.
-    if let Some(cred) = cached_outbound_credential() {
+    if let Some(cred) = outbound::current() {
         match cred.to_header_value() {
             Ok(value) => req = req.header(CREDENTIAL_HEADER, value),
             Err(e) => {
