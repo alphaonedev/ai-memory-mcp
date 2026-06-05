@@ -23,8 +23,9 @@
 //! `memory_capture_turn` MCP tool). Closes the #1388 substrate
 //! failure mode at the storage layer.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use std::path::PathBuf;
 
 pub(super) const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS memories (
@@ -565,6 +566,94 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
 const CURRENT_SCHEMA_VERSION: i64 = 55;
 
+/// Filename infix tagging a pre-migration safety snapshot. The snapshot
+/// lands as a SIBLING of the live database file (never a temp dir) so a
+/// failed or partially-applied schema upgrade is recoverable from the
+/// very directory the operator already trusts for their data. This is the
+/// single source of truth for the infix; the `vFROM-to-vTO` version
+/// markers and a monotonic uniqueness token are appended at snapshot
+/// time. See `snapshot_before_migration`.
+const PRE_MIGRATION_BACKUP_INFIX: &str = "pre-migration";
+
+/// File extension applied to a pre-migration snapshot. A plain SQLite
+/// database (same on-disk format / SQLCipher keying as the source), just
+/// named so an operator can tell it apart from the live DB at a glance.
+const PRE_MIGRATION_BACKUP_EXT: &str = "bak";
+
+/// Test-facing accessor for [`PRE_MIGRATION_BACKUP_INFIX`] so coverage
+/// tests can locate / name-assert the snapshot file WITHOUT restamping the
+/// literal — keeps the infix a single source of truth across crate and
+/// test boundaries (integration tests only see `pub` items).
+#[must_use]
+pub fn pre_migration_backup_infix_for_tests() -> &'static str {
+    PRE_MIGRATION_BACKUP_INFIX
+}
+
+/// Resolve the on-disk path of the connection's `main` database, or
+/// `None` for an in-memory / transient DB (empty file string). Read from
+/// `pragma_database_list` so the snapshot path is derived from the
+/// connection itself — the migration stays self-contained and does not
+/// need its caller to thread the path through.
+fn database_main_file_path(conn: &Connection) -> Option<PathBuf> {
+    conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|file| !file.is_empty())
+    .map(PathBuf::from)
+}
+
+/// Snapshot the live DB file immediately BEFORE a schema-mutating upgrade
+/// runs, so an interrupted or partial migration is recoverable. Returns
+/// the snapshot path on success, or `None` when no snapshot applies (an
+/// in-memory DB has no file to copy).
+///
+/// `VACUUM INTO` is used rather than a raw file copy: it produces a
+/// transactionally-consistent image that folds in any pending WAL frames
+/// and inherits the source connection's SQLCipher keying, so the snapshot
+/// is itself a valid, openable database — not a half-written page image.
+/// It runs OUTSIDE the migration's `BEGIN EXCLUSIVE` (VACUUM cannot run
+/// inside a transaction); the caller invokes it before opening that
+/// transaction.
+///
+/// The snapshot path encodes the from→to version span plus a monotonic
+/// nanosecond token, so repeated upgrades of the same DB never collide.
+fn snapshot_before_migration(
+    conn: &Connection,
+    from_version: i64,
+    to_version: i64,
+) -> Result<Option<PathBuf>> {
+    let Some(db_path) = database_main_file_path(conn) else {
+        return Ok(None);
+    };
+
+    let file_name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = db_path.parent().map(PathBuf::from).unwrap_or_default();
+    let token = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let snapshot_name = format!(
+        "{file_name}.{PRE_MIGRATION_BACKUP_INFIX}-v{from_version}-to-v{to_version}-{token}.{PRE_MIGRATION_BACKUP_EXT}"
+    );
+    let snapshot_path = parent.join(snapshot_name);
+
+    // Single-quote-escape the target for the SQL string literal (the path
+    // is crate-derived, but doubling quotes is the correct hygiene).
+    let target = snapshot_path.to_string_lossy().replace('\'', "''");
+    conn.execute(&format!("VACUUM INTO '{target}'"), [])
+        .with_context(|| {
+            format!(
+                "pre-migration snapshot (v{from_version}→v{to_version}) failed; \
+                 refusing to mutate schema without a recoverable backup"
+            )
+        })?;
+
+    Ok(Some(snapshot_path))
+}
+
 /// v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
 ///
 /// Test-facing helper exposing the SAME constant the migration ladder
@@ -973,6 +1062,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
     if version >= CURRENT_SCHEMA_VERSION {
         return Ok(());
+    }
+
+    // Pre-migration safety snapshot. A `version > 0` stamp means this is a
+    // pre-existing, populated DB about to be schema-mutated by the ladder
+    // below (a fresh DB stamps 0 and has nothing to lose, so it is
+    // skipped). Several ladder arms are irreversible (see
+    // `migration_meta::MIGRATION_LADDER`: v34/v50/v54) — restore-from-
+    // backup is their only rollback path, so we take that backup HERE,
+    // before any schema mutation, rather than leaving it to an external
+    // step. Runs before `BEGIN EXCLUSIVE` because `VACUUM INTO` cannot
+    // execute inside a transaction.
+    if version > 0 {
+        if let Some(snapshot) = snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)? {
+            tracing::info!(
+                from_version = version,
+                to_version = CURRENT_SCHEMA_VERSION,
+                snapshot = %snapshot.display(),
+                "pre-migration database snapshot written"
+            );
+        }
     }
 
     conn.execute_batch("BEGIN EXCLUSIVE")?;
@@ -2538,6 +2647,43 @@ mod tests {
             super::current_schema_version_for_tests(),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn in_memory_db_has_no_snapshot_file_path() {
+        // An in-memory DB reports an empty `file` in pragma_database_list,
+        // so the snapshot helpers must yield None (nothing to copy) rather
+        // than attempting a VACUUM INTO an empty path.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        assert!(
+            super::database_main_file_path(&conn).is_none(),
+            "in-memory DB must have no resolvable on-disk file path"
+        );
+    }
+
+    #[test]
+    fn snapshot_before_migration_is_noop_for_in_memory_db() {
+        // The migration path calls this before mutating schema; for an
+        // in-memory DB it must short-circuit to Ok(None) — no file written,
+        // no error — so the rest of the ladder still runs.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        let from = CURRENT_SCHEMA_VERSION - 1;
+        let made = super::snapshot_before_migration(&conn, from, CURRENT_SCHEMA_VERSION)
+            .expect("snapshot helper must not error on in-memory db");
+        assert!(
+            made.is_none(),
+            "in-memory DB upgrade must not produce a snapshot file"
+        );
+    }
+
+    #[test]
+    fn pre_migration_backup_infix_accessor_is_stable_and_nonempty() {
+        // The infix accessor is the single source of truth coverage tests
+        // use to locate the snapshot; assert it is non-empty and matches
+        // the private constant.
+        let infix = super::pre_migration_backup_infix_for_tests();
+        assert!(!infix.is_empty(), "snapshot infix must be non-empty");
+        assert_eq!(infix, super::PRE_MIGRATION_BACKUP_INFIX);
     }
 
     #[test]

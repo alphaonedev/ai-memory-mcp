@@ -373,6 +373,9 @@ pub use connection::open;
 // existing `ai_memory::db::current_schema_version_for_tests()` shim
 // (via `pub use storage as db;` in `src/lib.rs`).
 pub use migrations::current_schema_version_for_tests;
+// Pre-migration safety-snapshot infix accessor — lets coverage tests
+// locate / name-assert the snapshot file without restamping the literal.
+pub use migrations::pre_migration_backup_infix_for_tests;
 pub use reflect::{
     ReflectError, ReflectHookDecision, ReflectHooks, ReflectInput, ReflectOutcome,
     canonical_cbor_reflection_depth_exceeded, reflect, reflect_with_hooks,
