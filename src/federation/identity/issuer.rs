@@ -31,6 +31,7 @@ use std::path::Path;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use super::chain::CertChain;
 use super::credential::{CredentialError, FederationCredential, SignedCredential};
 
 /// Default credential lifetime. Short by design so a leaked credential
@@ -41,6 +42,12 @@ pub const DEFAULT_CREDENTIAL_TTL_SECS: i64 = crate::SECS_PER_HOUR;
 /// minted credential is not rejected as `NotYetValid` by a verifier whose
 /// clock trails the issuer's by a few seconds.
 pub const DEFAULT_CLOCK_SKEW_SECS: i64 = 30;
+
+/// Default lifetime for an *intermediate CA* credential. Longer than a
+/// leaf TTL — an intermediate is itself re-minted by its parent on a
+/// slower cadence than the leaves it signs — but still bounded so a
+/// compromised region key self-expires without a manual revocation list.
+pub const DEFAULT_INTERMEDIATE_TTL_SECS: i64 = crate::SECS_PER_DAY;
 
 /// Reasons issuance fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +218,65 @@ impl FederationIssuer {
             cred_version: super::credential::CRED_VERSION,
         };
         Ok(cred.sign(&self.signing_key)?)
+    }
+
+    /// Mint an *intermediate CA* credential: a [`SignedCredential`] whose
+    /// subject is another issuer's identity (`intermediate_id`) bound to
+    /// that issuer's verifying key, signed by this (parent/root) issuer.
+    ///
+    /// Structurally this is an ordinary credential — there is no separate
+    /// "CA cert" wire type. It becomes the anchor link of a
+    /// [`super::chain::CertChain`]: a receiver that trusts *this* issuer's
+    /// key thereby trusts every leaf the intermediate signs, without ever
+    /// enrolling the intermediate's key directly. `intermediate_id` MUST
+    /// equal the intermediate issuer's own `issuer_id` — that name binding
+    /// (`child.issuer_id == parent.subject_agent_id`) is what
+    /// [`super::chain::CertChain::verify`] enforces between links.
+    ///
+    /// Uses [`DEFAULT_INTERMEDIATE_TTL_SECS`]; call
+    /// [`Self::issue_with_ttl`] directly for a custom intermediate lifetime.
+    ///
+    /// # Errors
+    /// See [`Self::issue_with_ttl`].
+    pub fn issue_intermediate(
+        &self,
+        intermediate_id: impl Into<String>,
+        intermediate_pubkey: &VerifyingKey,
+        now_unix: i64,
+    ) -> Result<SignedCredential, IssuerError> {
+        self.issue_with_ttl(
+            intermediate_id,
+            intermediate_pubkey,
+            DEFAULT_INTERMEDIATE_TTL_SECS,
+            now_unix,
+        )
+    }
+
+    /// Mint a leaf credential for `subject_agent_id` and assemble it into a
+    /// [`CertChain`] anchored by `intermediates`.
+    ///
+    /// `intermediates` is anchor-first: the root-signed credential for
+    /// *this* (intermediate) issuer comes first, then any deeper links, so
+    /// the chain reads root → … → this-issuer → leaf. A receiver verifies
+    /// the whole chain against a trust bundle holding only the *root* key —
+    /// this is the outbound-path assembly that lets a region node present
+    /// one self-contained chain instead of requiring the receiver to
+    /// pre-enroll every intermediate.
+    ///
+    /// Pass an empty `intermediates` to produce a single-level chain
+    /// equivalent to a bare [`Self::issue`] (back-compat with P2/P3).
+    ///
+    /// # Errors
+    /// See [`Self::issue_with_ttl`].
+    pub fn issue_chained(
+        &self,
+        subject_agent_id: impl Into<String>,
+        subject_pubkey: &VerifyingKey,
+        intermediates: Vec<SignedCredential>,
+        now_unix: i64,
+    ) -> Result<CertChain, IssuerError> {
+        let leaf = self.issue(subject_agent_id, subject_pubkey, now_unix)?;
+        Ok(CertChain::new(leaf, intermediates))
     }
 
     /// Mint a credential for a peer whose mTLS identity has been attested.
@@ -408,6 +474,74 @@ mod tests {
         let err = FederationIssuer::load(IssuerConfig::new("some-ca", "fleet.example"), tmp.path())
             .unwrap_err();
         assert_eq!(err, IssuerError::MissingPrivateKey);
+    }
+
+    #[test]
+    fn intermediate_credential_uses_intermediate_ttl() {
+        let root = issuer(20);
+        let now = 1_900_000_000;
+        let region_key = subject_key(60);
+        let anchor = root
+            .issue_intermediate("region/nyc/ca", &region_key, now)
+            .expect("issue intermediate");
+        let cred = anchor.credential();
+        assert_eq!(cred.subject_agent_id, "region/nyc/ca");
+        assert_eq!(cred.subject_pubkey, region_key.to_bytes());
+        assert_eq!(cred.not_after, now + DEFAULT_INTERMEDIATE_TTL_SECS);
+        anchor
+            .verify_against(&root.verifying_key(), now)
+            .expect("intermediate verifies under root key");
+    }
+
+    #[test]
+    fn issue_chained_assembles_root_verifiable_two_level_chain() {
+        use super::super::chain::{CertChain, DEFAULT_MAX_CHAIN_DEPTH};
+        use super::super::trust_bundle::TrustBundle;
+        let now = 1_900_000_000;
+
+        // Root mints an intermediate CA for region/nyc.
+        let root = issuer(21);
+        let region_signing = SigningKey::from_bytes(&[70; 32]);
+        let region = FederationIssuer::new(
+            region_signing.clone(),
+            IssuerConfig::new("region/nyc/ca", "fleet.example"),
+        );
+        let anchor = root
+            .issue_intermediate(region.issuer_id(), &region.verifying_key(), now)
+            .expect("issue intermediate");
+
+        // Region issuer mints a leaf for a node + wraps the chain.
+        let node_key = subject_key(71);
+        let chain: CertChain = region
+            .issue_chained("region/nyc/node-1", &node_key, vec![anchor], now)
+            .expect("issue chained");
+        assert_eq!(chain.depth(), 2);
+
+        // A receiver trusting ONLY the root key verifies the whole chain.
+        let bundle = TrustBundle::new().with_issuer(root.issuer_id(), root.verifying_key());
+        let verified = chain
+            .verify(&bundle, now, DEFAULT_MAX_CHAIN_DEPTH)
+            .expect("chain verifies against root-only bundle");
+        assert_eq!(verified.subject_agent_id, "region/nyc/node-1");
+        assert_eq!(verified.subject_pubkey, node_key.to_bytes());
+    }
+
+    #[test]
+    fn issue_chained_with_no_intermediates_is_single_level() {
+        use super::super::chain::{CertChain, DEFAULT_MAX_CHAIN_DEPTH};
+        use super::super::trust_bundle::TrustBundle;
+        let iss = issuer(22);
+        let now = 1_900_000_000;
+        let node_key = subject_key(72);
+        let chain: CertChain = iss
+            .issue_chained("node", &node_key, vec![], now)
+            .expect("issue chained");
+        assert_eq!(chain.depth(), 1);
+        let bundle = TrustBundle::new().with_issuer(iss.issuer_id(), iss.verifying_key());
+        let verified = chain
+            .verify(&bundle, now, DEFAULT_MAX_CHAIN_DEPTH)
+            .expect("single-level chain verifies");
+        assert_eq!(verified.subject_agent_id, "node");
     }
 
     #[test]
