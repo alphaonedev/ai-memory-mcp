@@ -5,15 +5,36 @@
 //! broadcast_*_quorum, bulk_catchup_push.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+use crate::federation::identity::credential::{CREDENTIAL_HEADER, SignedCredential};
 use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingAction, PendingDecision};
 use crate::replication::{AckTracker, QuorumError};
 
 use super::FederationConfig;
+
+/// This node's held outbound federation credential, loaded once at first
+/// outbound POST from [`SignedCredential::load_from_env`]
+/// (`AI_MEMORY_FED_CREDENTIAL_PATH`). `None` = this node holds no
+/// credential and presents only its legacy per-message signature — the
+/// receiver then falls back to per-peer `.pub` enrollment. Boot-once is
+/// symmetric with the receiver's `cached_trust_bundle()`; the renewal
+/// worker (P3 next) replaces this with a reloadable handle.
+fn cached_outbound_credential() -> Option<&'static SignedCredential> {
+    static CRED: OnceLock<Option<SignedCredential>> = OnceLock::new();
+    CRED.get_or_init(|| {
+        SignedCredential::load_from_env().unwrap_or_else(|e| {
+            tracing::warn!(target: "federation::signing", error = %e,
+                "failed to load outbound federation credential; presenting per-message signature only");
+            None
+        })
+    })
+    .as_ref()
+}
 
 #[derive(Debug)]
 pub(super) enum AckOutcome {
@@ -125,6 +146,22 @@ pub(super) async fn post_once(
         .filter(|s| !s.is_empty())
     {
         req = req.header(crate::federation::peer_attestation::PEER_ID_HEADER, peer_id);
+    }
+    // FED-P3a — attach this node's CA-issued credential so the receiver
+    // can verify our per-message signature against the trust bundle
+    // instead of a manually enrolled `.pub` (the sender half of the
+    // receiver swap in `federation_signing_check::resolve_peer_verifying_key`).
+    // Held-credential absence is the normal pre-enrollment state; a
+    // malformed-encode is logged and skipped, never fatal — the wire
+    // still carries the legacy signature, so this degrades to per-peer.
+    if let Some(cred) = cached_outbound_credential() {
+        match cred.to_header_value() {
+            Ok(value) => req = req.header(CREDENTIAL_HEADER, value),
+            Err(e) => {
+                tracing::warn!(target: "federation::signing", error = %e,
+                    "failed to encode outbound federation credential header; omitting");
+            }
+        }
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
