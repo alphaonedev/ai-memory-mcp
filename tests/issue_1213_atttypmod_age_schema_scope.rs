@@ -179,7 +179,6 @@ async fn issue_1213_atttypmod_probe_scopes_to_public_schema() {
     // doesn't conflict with this test's `CREATE TABLE public.memories`
     // staging.
     let _public_lock = PublicSchemaLock::acquire()
-        .await
         .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     // pgvector is required for `vector(N)` columns; refuse to run if
@@ -316,7 +315,6 @@ async fn issue_1213_unscoped_probe_demonstrates_root_cause() {
     };
     // #1381: see sibling test for rationale on PublicSchemaLock.
     let _public_lock = PublicSchemaLock::acquire()
-        .await
         .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let pool = inspect_pool(&url).await;
