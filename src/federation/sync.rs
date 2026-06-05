@@ -19,7 +19,7 @@ use super::FederationConfig;
 
 /// This node's held outbound federation credential, loaded once at first
 /// outbound POST from [`SignedCredential::load_from_env`]
-/// (`AI_MEMORY_FED_CREDENTIAL_PATH`). `None` = this node holds no
+/// (`AI_MEMORY_FED_CRED_PATH`). `None` = this node holds no
 /// credential and presents only its legacy per-message signature — the
 /// receiver then falls back to per-peer `.pub` enrollment. Boot-once is
 /// symmetric with the receiver's `cached_trust_bundle()`; the renewal
