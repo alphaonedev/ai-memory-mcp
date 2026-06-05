@@ -15,6 +15,7 @@
 //! [`crate::identity`].
 
 pub mod credential;
+pub mod inventory;
 pub mod issuer;
 pub mod outbound;
 pub mod renewal;
