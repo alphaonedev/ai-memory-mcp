@@ -83,6 +83,12 @@ pub enum CredentialError {
     UnsupportedVersion(u16),
     /// `subject_pubkey` is not a valid Edwards-curve point.
     BadSubjectKey,
+    /// The credential's `issuer_id` is not present in the trust bundle, so
+    /// no key is available to verify its signature against.
+    UnknownIssuer,
+    /// The credential's `trust_domain` does not match the domain the
+    /// receiving trust bundle is scoped to (multi-tenant isolation).
+    WrongTrustDomain,
 }
 
 impl CredentialError {
@@ -96,6 +102,8 @@ impl CredentialError {
             Self::Expired => "credential_expired",
             Self::UnsupportedVersion(_) => "credential_unsupported_version",
             Self::BadSubjectKey => "credential_bad_subject_key",
+            Self::UnknownIssuer => "credential_unknown_issuer",
+            Self::WrongTrustDomain => "credential_wrong_trust_domain",
         }
     }
 }

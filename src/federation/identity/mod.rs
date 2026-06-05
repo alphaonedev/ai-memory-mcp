@@ -16,5 +16,6 @@
 
 pub mod credential;
 pub mod resolver;
+pub mod trust_bundle;
 
 pub use resolver::{FED_IDENTITY_ENV, default_hostname_identity, resolve_federation_identity};
