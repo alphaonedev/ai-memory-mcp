@@ -90,7 +90,7 @@ footer a{color:var(--muted)}
   <div class="meta-row">
     <span>release/v0.7.0 @ <code>1cb95bbe7</code></span>
     <span>SHIP-RECOMMENDED 2026-05-22</span>
-    <span>schema v33 &rarr; v53</span>
+    <span>schema v33 &rarr; v55</span>
     <span>capabilities v2 &rarr; v3</span>
   </div>
 </header>
@@ -114,7 +114,7 @@ footer a{color:var(--muted)}
   <div class="entry">
     <span class="tag new">NEW</span>
     <h3>Ed25519 attestation + signed-events V-4 chain</h3>
-    <p>Per-agent Ed25519 keypairs (<code>ai-memory identity generate</code>) sign every memory link write. Inbound verification against <code>observed_by</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) shipped at schema v34, part of the v33 &rarr; v53 migration ladder. The audit chain compliance teams have been asking for.</p>
+    <p>Per-agent Ed25519 keypairs (<code>ai-memory identity generate</code>) sign every memory link write. Inbound verification against <code>observed_by</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) shipped at schema v34, part of the v33 &rarr; v55 migration ladder. The audit chain compliance teams have been asking for.</p>
   </div>
 
   <div class="entry">
@@ -245,6 +245,18 @@ footer a{color:var(--muted)}
     <span class="tag changed">CHANGED</span>
     <h3>FTS5 update-trigger scoping (#1418)</h3>
     <p>Schema v53 (R5.F5.2 perf-audit closeout) scopes the <code>memories_au</code> FTS5 sync trigger to <code>AFTER UPDATE OF title, content, tags</code> so hot-path UPDATEs touching only non-FTS columns (<code>embedding</code>, <code>access_count</code>, <code>last_accessed_at</code>, <code>confidence_decayed_at</code>, <code>version</code>) no longer pay 2 spurious FTS5 row ops apiece. A 100k-row embed backfill sheds 200k wasted ops; <code>touch_many</code> for K=10 recalls drops 5&ndash;10&times; wall cost. Pure DDL, idempotent.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>Tier-default expiry backfill (#1466)</h3>
+    <p>Schema v54 backfills <code>expires_at = created_at + tier.default_ttl_secs()</code> onto legacy NULL-expiry mid/short rows left immortal by a pre-TTL daemon, closing the TTL-leak immortal-rows class so GC reclaims them on schedule. In-code backfill arm (no new <code>.sql</code> file); idempotent &mdash; rows that already carry an <code>expires_at</code> or are <code>long</code>-tier are untouched.</p>
+  </div>
+
+  <div class="entry">
+    <span class="tag changed">CHANGED</span>
+    <h3>Sargable federation-catchup query + <code>idx_memories_updated_at</code> (#1476)</h3>
+    <p>Schema v55 makes the W=2 peer-catchup query <code>WHERE updated_at &gt; ?1 ORDER BY updated_at ASC LIMIT ?2</code> (driving every <code>GET /api/v1/sync/since</code>) sargable by splitting the former <code>(?1 IS NULL OR updated_at &gt; ?1)</code> OR-NULL predicate into a <code>None</code> path (no predicate) and a <code>Some</code> path (bare range bound). SQLite adds <code>idx_memories_updated_at ON memories(updated_at)</code> so the planner range-scans the index instead of full-scan + sort; postgres adds NO new index because its bootstrap <code>memories_updated_at_idx (updated_at DESC)</code> already serves the range via <code>Index Scan Backward</code>, so <code>migrate_v55()</code> is a postgres version-stamp no-op. Measured ~3&times; cost reduction (EXPLAIN GENERIC_PLAN 7177 &rarr; 2396 on a 200k-row probe). Idempotent.</p>
   </div>
 
   <div class="entry">

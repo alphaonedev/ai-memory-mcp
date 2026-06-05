@@ -2,7 +2,7 @@
 
 **Document classification:** Public-facing, procurement-grade.
 **Date:** 2026-05-23.
-**ai-memory version:** v0.7.0 (sqlite + postgres schema **v49**, lockstep).
+**ai-memory version:** v0.7.0 (sqlite + postgres schema **v55**, lockstep).
 **Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.md) — the NSA CSI concern + recommendation mapping that Task E ships.
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json).
 
