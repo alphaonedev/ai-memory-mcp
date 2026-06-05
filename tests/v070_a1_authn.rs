@@ -431,6 +431,7 @@ async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
         quorum_client_key: None,
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
+        federation_identity: None,
         #[cfg(feature = "sal")]
         store_url: None,
     };
@@ -476,6 +477,7 @@ async fn s5c1_pattern_a_loopback_bind_without_api_key_succeeds_with_warn() {
         quorum_client_key: None,
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
+        federation_identity: None,
         #[cfg(feature = "sal")]
         store_url: None,
     };
