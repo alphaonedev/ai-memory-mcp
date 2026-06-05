@@ -1163,13 +1163,16 @@ mod tests {
         // the contract here so a future refactor doesn't quietly drop
         // the override.
         let _g = key_dir_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Bind the override path once (OS-agnostic temp root) and assert
+        // the same value round-trips, so the contract can't desync.
+        let override_path = std::env::temp_dir().join("ai-memory-key-dir-override-probe");
         // SAFETY: env mutation serialised by `key_dir_env_lock` for
         // the duration of this test.
         unsafe {
-            std::env::set_var("AI_MEMORY_KEY_DIR", "/tmp/h4-override-test");
+            std::env::set_var("AI_MEMORY_KEY_DIR", &override_path);
         }
         let p = default_key_dir().expect("default dir");
-        assert_eq!(p, PathBuf::from("/tmp/h4-override-test"));
+        assert_eq!(p, override_path);
         // SAFETY: scoped cleanup so other tests see the unset value.
         unsafe {
             std::env::remove_var("AI_MEMORY_KEY_DIR");
