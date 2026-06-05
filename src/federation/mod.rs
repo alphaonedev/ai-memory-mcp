@@ -34,6 +34,10 @@
 //!   rely on the sync-daemon for eventual propagation. Only the HTTP
 //!   daemon is a federation node.
 
+// v0.7.0 epic — federation identity at scale. Phase 1: `identity::resolver`
+// de-hardcodes the `host:<hostname>` bootstrap identity behind an explicit
+// precedence (env > operator config > hostname). See ADR-001.
+pub mod identity;
 pub mod peer;
 pub mod peer_attestation;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker. The

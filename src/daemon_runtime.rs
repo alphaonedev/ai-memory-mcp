@@ -3427,7 +3427,12 @@ pub async fn bootstrap_serve(
         args.quorum_client_cert.as_deref(),
         args.quorum_client_key.as_deref(),
         args.quorum_ca_cert.as_deref(),
-        format!("host:{}", gethostname::gethostname().to_string_lossy()),
+        // v0.7.0 epic (ADR-001) — federation identity is resolved, not
+        // hardcoded. Precedence: AI_MEMORY_FED_IDENTITY env > operator
+        // config > the historical `host:<hostname>` default. Passing
+        // `None` here keeps today's hostname default until the declarative
+        // inventory threads an explicit identity through in a later phase.
+        federation::identity::resolve_federation_identity(None),
         // v0.7.0 fold-A2A1.4 (#702) — thread the operator-configured
         // `[api] api_key` into federation outbound so peer POSTs carry
         // `x-api-key`. Without this, cross-host federation BREAKS when
