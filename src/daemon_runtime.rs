@@ -728,6 +728,14 @@ pub struct ServeArgs {
     /// node convergent within one interval after resume.
     #[arg(long, default_value_t = 30)]
     pub catchup_interval_secs: u64,
+    /// v0.7.0 epic (ADR-001) — the federation identity this node signs and
+    /// presents as (`sender_agent_id`). Precedence-2 source, below the
+    /// `AI_MEMORY_FED_IDENTITY` env override and above the historical
+    /// `host:<hostname>` default. Set this to a stable, trust-domain-scoped
+    /// id (e.g. `region/nyc/node-7`) so a node's identity survives a
+    /// hostname change. Unset = keep the hostname default.
+    #[arg(long)]
+    pub federation_identity: Option<String>,
 
     // -------- v0.7.0 Wave-3 — adapter selection --------------------
     /// v0.7.0 Wave-3 — full SAL store URL. When set, the daemon binds
@@ -3428,11 +3436,11 @@ pub async fn bootstrap_serve(
         args.quorum_client_key.as_deref(),
         args.quorum_ca_cert.as_deref(),
         // v0.7.0 epic (ADR-001) — federation identity is resolved, not
-        // hardcoded. Precedence: AI_MEMORY_FED_IDENTITY env > operator
-        // config > the historical `host:<hostname>` default. Passing
-        // `None` here keeps today's hostname default until the declarative
-        // inventory threads an explicit identity through in a later phase.
-        federation::identity::resolve_federation_identity(None),
+        // hardcoded. Precedence: AI_MEMORY_FED_IDENTITY env >
+        // `--federation-identity` operator config > the historical
+        // `host:<hostname>` default. A blank flag is skipped by the
+        // resolver, so it can never collapse the identity to empty.
+        federation::identity::resolve_federation_identity(args.federation_identity.as_deref()),
         // v0.7.0 fold-A2A1.4 (#702) — thread the operator-configured
         // `[api] api_key` into federation outbound so peer POSTs carry
         // `x-api-key`. Without this, cross-host federation BREAKS when
@@ -4812,6 +4820,7 @@ mod tests {
             quorum_client_key: None,
             quorum_ca_cert: None,
             catchup_interval_secs: 0,
+            federation_identity: None,
             #[cfg(feature = "sal")]
             store_url: None,
         }
