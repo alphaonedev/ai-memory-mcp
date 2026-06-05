@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::federation::identity::chain::{CHAIN_HEADER, CertChain, DEFAULT_MAX_CHAIN_DEPTH};
 use crate::federation::identity::credential::{CREDENTIAL_HEADER, SignedCredential};
 use crate::federation::identity::trust_bundle::TrustBundle;
 use crate::federation::signing as fed_signing;
@@ -469,9 +470,16 @@ fn resolve_peer_verifying_key(
 ) -> Option<VerifyingKey> {
     if !bundle.is_empty()
         && let Some(cred_value) = headers.get(CREDENTIAL_HEADER).and_then(|v| v.to_str().ok())
-        && let Some(vk) = verify_credential_pubkey(cred_value, peer_id, bundle, now_unix)
     {
-        return Some(vk);
+        // FED-P4 — a hierarchical peer additionally carries its
+        // intermediate CA cert(s) in CHAIN_HEADER; absent ⇒ single-level
+        // (P2/P3) verify, byte-identical to pre-P4.
+        let chain_value = headers.get(CHAIN_HEADER).and_then(|v| v.to_str().ok());
+        if let Some(vk) =
+            verify_credential_pubkey(cred_value, chain_value, peer_id, bundle, now_unix)
+        {
+            return Some(vk);
+        }
     }
     peer_id.and_then(|pid| {
         crate::governance::audit::load_daemon_verifying_key(pid)
@@ -480,26 +488,32 @@ fn resolve_peer_verifying_key(
     })
 }
 
-/// v0.7.0 FED-P2d — verify a wire `X-Memory-Cred` value against the
-/// trust bundle and bind it to the claimed peer-id.
+/// v0.7.0 FED-P2d / FED-P4 — verify a wire `X-Memory-Cred` (+ optional
+/// `X-Memory-Cred-Chain`) against the trust bundle and bind it to the
+/// claimed peer-id.
 ///
-/// Returns the credential's subject verifying key only when ALL hold:
-///   - the header value parses as a `SignedCredential`,
-///   - the bundle trusts the issuer AND the credential is within its
-///     validity window (`bundle.verify`),
-///   - the credential's `subject_agent_id` equals the claimed
-///     `X-Peer-Id` (identity binding — prevents a valid credential for
-///     agent A from authenticating a push attributed to agent B).
+/// Returns the leaf credential's subject verifying key only when ALL hold:
+///   - the leaf header value parses as a `SignedCredential`,
+///   - any presented intermediate-chain header parses,
+///   - the assembled chain verifies against the bundle: the anchor's
+///     issuer is trusted, every link's signature + window + name + domain
+///     binding holds, and the depth is within `DEFAULT_MAX_CHAIN_DEPTH`
+///     (a one-level chain — no chain header — reduces to the exact P2/P3
+///     `bundle.verify` semantics),
+///   - the leaf's `subject_agent_id` equals the claimed `X-Peer-Id`
+///     (identity binding — prevents a valid credential for agent A from
+///     authenticating a push attributed to agent B).
 ///
 /// Any failure logs a WARN against `federation::signing` and returns
 /// `None`, signalling the caller to fall through to the legacy path.
 fn verify_credential_pubkey(
     cred_value: &str,
+    chain_value: Option<&str>,
     peer_id: Option<&str>,
     bundle: &TrustBundle,
     now_unix: i64,
 ) -> Option<VerifyingKey> {
-    let signed = match SignedCredential::from_header_value(cred_value) {
+    let leaf = match SignedCredential::from_header_value(cred_value) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -511,14 +525,30 @@ fn verify_credential_pubkey(
             return None;
         }
     };
-    let cred = match bundle.verify(&signed, now_unix) {
+    let intermediates = match chain_value {
+        Some(value) => match CertChain::intermediates_from_header_value(value) {
+            Ok(inters) => inters,
+            Err(e) => {
+                tracing::warn!(
+                    target: "federation::signing",
+                    tag = e.tag(),
+                    peer_id = %peer_id.unwrap_or(""),
+                    "sync: X-Memory-Cred-Chain malformed; falling back to legacy"
+                );
+                return None;
+            }
+        },
+        None => Vec::new(),
+    };
+    let chain = CertChain::new(leaf, intermediates);
+    let cred = match chain.verify(bundle, now_unix, DEFAULT_MAX_CHAIN_DEPTH) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
                 target: "federation::signing",
                 tag = e.tag(),
                 peer_id = %peer_id.unwrap_or(""),
-                "sync: X-Memory-Cred failed trust-bundle verification; falling back to legacy"
+                "sync: X-Memory-Cred chain failed trust-bundle verification; falling back to legacy"
             );
             return None;
         }
@@ -1128,6 +1158,7 @@ mod fed_p2d_credential_resolution_tests {
 
         let resolved = verify_credential_pubkey(
             &signed.to_header_value().expect("encode credential"),
+            None,
             Some(TEST_PEER_ID),
             &bundle,
             TEST_NOW_UNIX,
@@ -1213,6 +1244,7 @@ mod fed_p2d_credential_resolution_tests {
 
         let resolved = verify_credential_pubkey(
             &signed.to_header_value().expect("encode"),
+            None,
             Some(TEST_PEER_ID),
             &bundle,
             TEST_NOW_UNIX,
@@ -1237,6 +1269,7 @@ mod fed_p2d_credential_resolution_tests {
 
         let resolved = verify_credential_pubkey(
             &signed.to_header_value().expect("encode"),
+            None,
             Some(TEST_PEER_ID),
             &bundle,
             TEST_NOW_UNIX,
@@ -1253,6 +1286,7 @@ mod fed_p2d_credential_resolution_tests {
         let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
         let resolved = verify_credential_pubkey(
             "v1=not-valid-base64-cbor!!!",
+            None,
             Some(TEST_PEER_ID),
             &bundle,
             TEST_NOW_UNIX,
@@ -1260,6 +1294,113 @@ mod fed_p2d_credential_resolution_tests {
         assert!(
             resolved.is_none(),
             "a malformed X-Memory-Cred value must be refused, not panic"
+        );
+    }
+
+    // FED-P4 — hierarchical chain on the receiver verify path.
+    #[test]
+    fn hierarchical_chain_resolves_leaf_key_against_root_only_bundle() {
+        use crate::federation::identity::chain::CHAIN_HEADER;
+
+        // Root signs an intermediate region CA; the region CA signs the
+        // node leaf. The receiver enrols ONLY the root key.
+        let root = FederationIssuer::new(
+            fixed_signing_key(70),
+            IssuerConfig::new("ca:root", TEST_TRUST_DOMAIN),
+        );
+        let region = FederationIssuer::new(
+            fixed_signing_key(71),
+            IssuerConfig::new("region/nyc/ca", TEST_TRUST_DOMAIN),
+        );
+        let anchor = root
+            .issue_intermediate(region.issuer_id(), &region.verifying_key(), TEST_NOW_UNIX)
+            .expect("issue intermediate");
+
+        let node_pub = fixed_signing_key(72).verifying_key();
+        let chain = region
+            .issue_chained(TEST_PEER_ID, &node_pub, vec![anchor], TEST_NOW_UNIX)
+            .expect("issue chained");
+
+        let bundle = TrustBundle::new().with_issuer("ca:root", root.verifying_key());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CREDENTIAL_HEADER,
+            HeaderValue::from_str(&chain.leaf.to_header_value().expect("encode leaf"))
+                .expect("header"),
+        );
+        headers.insert(
+            CHAIN_HEADER,
+            HeaderValue::from_str(
+                &chain
+                    .intermediates_header_value()
+                    .expect("encode chain")
+                    .expect("two-level chain emits header"),
+            )
+            .expect("header"),
+        );
+
+        let resolved =
+            resolve_peer_verifying_key(&headers, Some(TEST_PEER_ID), &bundle, TEST_NOW_UNIX);
+        assert_eq!(
+            resolved.map(|k| k.to_bytes()),
+            Some(node_pub.to_bytes()),
+            "root-only bundle must resolve the leaf key through the presented chain"
+        );
+    }
+
+    // FED-P4 — a tampered intermediate (not signed by the trusted root)
+    // must fail the chain and fall through to the legacy path (None here).
+    #[test]
+    fn hierarchical_chain_with_untrusted_root_is_refused() {
+        use crate::federation::identity::chain::CHAIN_HEADER;
+
+        // The intermediate is signed by a DIFFERENT (untrusted) root.
+        let rogue_root = FederationIssuer::new(
+            fixed_signing_key(80),
+            IssuerConfig::new("ca:root", TEST_TRUST_DOMAIN),
+        );
+        let region = FederationIssuer::new(
+            fixed_signing_key(81),
+            IssuerConfig::new("region/nyc/ca", TEST_TRUST_DOMAIN),
+        );
+        let anchor = rogue_root
+            .issue_intermediate(region.issuer_id(), &region.verifying_key(), TEST_NOW_UNIX)
+            .expect("issue intermediate");
+        let node_pub = fixed_signing_key(82).verifying_key();
+        let chain = region
+            .issue_chained(TEST_PEER_ID, &node_pub, vec![anchor], TEST_NOW_UNIX)
+            .expect("issue chained");
+
+        // Bundle trusts a genuine root whose key differs from rogue_root.
+        let genuine_root = FederationIssuer::new(
+            fixed_signing_key(83),
+            IssuerConfig::new("ca:root", TEST_TRUST_DOMAIN),
+        );
+        let bundle = TrustBundle::new().with_issuer("ca:root", genuine_root.verifying_key());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CREDENTIAL_HEADER,
+            HeaderValue::from_str(&chain.leaf.to_header_value().expect("encode leaf"))
+                .expect("header"),
+        );
+        headers.insert(
+            CHAIN_HEADER,
+            HeaderValue::from_str(
+                &chain
+                    .intermediates_header_value()
+                    .expect("encode chain")
+                    .expect("header present"),
+            )
+            .expect("header"),
+        );
+
+        let resolved =
+            resolve_peer_verifying_key(&headers, Some(TEST_PEER_ID), &bundle, TEST_NOW_UNIX);
+        assert!(
+            resolved.is_none(),
+            "a chain anchored in an untrusted root must be refused"
         );
     }
 }
