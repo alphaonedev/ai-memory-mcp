@@ -142,7 +142,6 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
     // Issue #1381: cross-process serialise on `public.memories`
     // ownership so a sibling test binary's bootstrap can't race us.
     let _public_lock = PublicSchemaLock::acquire()
-        .await
         .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let inspect = inspection_pool(&url).await;
@@ -211,7 +210,6 @@ async fn auto_migrate_no_op_when_fresh_schema_already_matches() {
         return;
     };
     let _public_lock = PublicSchemaLock::acquire()
-        .await
         .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let inspect = inspection_pool(&url).await;
@@ -249,7 +247,6 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
         return;
     };
     let _public_lock = PublicSchemaLock::acquire()
-        .await
         .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
 
     let inspect = inspection_pool(&url).await;
