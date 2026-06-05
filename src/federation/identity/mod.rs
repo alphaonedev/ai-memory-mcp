@@ -14,6 +14,7 @@
 //! owns its own identity surface, distinct from the low-level crypto in
 //! [`crate::identity`].
 
+pub mod credential;
 pub mod resolver;
 
 pub use resolver::{FED_IDENTITY_ENV, default_hostname_identity, resolve_federation_identity};
