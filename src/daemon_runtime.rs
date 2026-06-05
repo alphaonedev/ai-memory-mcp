@@ -3735,6 +3735,26 @@ pub async fn bootstrap_serve(
         }
     }
 
+    // FED-P3b — outbound credential renewal worker. When this node holds a
+    // CA-issued credential file (`AI_MEMORY_FED_CRED_PATH`), keep it fresh:
+    // an external issuer rewrites the short-lived credential on renewal and
+    // this worker swaps it into the live send path without a daemon
+    // restart. Independent of the catchup interval; a no-op (not spawned)
+    // when no credential path is configured.
+    if federation.is_some()
+        && std::env::var(federation::identity::credential::FED_CREDENTIAL_PATH_ENV).is_ok()
+    {
+        let renewal_interval = Duration::from_secs(
+            federation::identity::renewal::DEFAULT_RENEWAL_INTERVAL_SECS.unsigned_abs(),
+        );
+        let _renewal_handle =
+            federation::identity::renewal::spawn_refresh_outbound_credential(renewal_interval);
+        tracing::info!(
+            "federation outbound credential renewal worker enabled: refreshing every {}s",
+            renewal_interval.as_secs(),
+        );
+    }
+
     if matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
         tracing::warn!(
             "v0.7.0 Wave-3: postgres-backed daemon — handlers that have not \
