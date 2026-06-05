@@ -15,6 +15,7 @@
 //! [`crate::identity`].
 
 pub mod credential;
+pub mod issuer;
 pub mod resolver;
 pub mod trust_bundle;
 
