@@ -1,5 +1,15 @@
 # Federation hardening (mTLS + X-API-Key + peer attestation)
 
+> **Looking for zero-touch trust?** This document covers the
+> **transport/identity hardening** layer — mTLS allowlist, X-API-Key, and
+> the per-peer attestation JSON. The newer **CA-rooted, attestation-issued,
+> short-lived credential** system that replaces O(N²) manual `.pub`
+> enrollment with O(1) "trust the CA" — the enterprise zero-touch trust
+> capability that scales a fleet from 1 to ~1,000,000 agents — is
+> documented in **[`docs/federation-identity.md`](federation-identity.md)**.
+> The two layers compose: mTLS is the transport boundary, zero-touch
+> credentials are the application identity carried *inside* it.
+
 v0.7.0 hardens the v0.6.x federation surface with three concurrent
 authentication layers and three new `AI_MEMORY_FED_*` env vars. Peers
 that don't satisfy every configured layer cannot push or fan-out into
@@ -311,7 +321,10 @@ production daemon will refuse the same attack shapes.
   namespace allowlists. Both default-deny; both pinned by their own
   test binaries.
 
-See also: [`docs/MIGRATION_v0.7.md` §"Federation hardening"](MIGRATION_v0.7.md#federation-hardening),
+See also: the **zero-touch CA-rooted trust** companion at
+[`docs/federation-identity.md`](federation-identity.md) (the O(1)
+credential system layered on top of this hardening),
+[`docs/MIGRATION_v0.7.md` §"Federation hardening"](MIGRATION_v0.7.md#federation-hardening),
 the canonical inventory in
 [`docs/internal/v070-feature-inventory.md` §"Feature: Federation hardening"](internal/v070-feature-inventory.md),
 the V-4 audit chain that records peer-write events at
