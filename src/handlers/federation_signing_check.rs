@@ -468,6 +468,11 @@ fn resolve_peer_verifying_key(
     bundle: &TrustBundle,
     now_unix: i64,
 ) -> Option<VerifyingKey> {
+    // FED-P4-e (§8) — signed-vs-unsigned-ratio SLO: bucket every inbound
+    // identity resolution by whether the peer presented a credential at
+    // all, independent of trust-bundle state or verify outcome.
+    crate::metrics::record_federation_inbound_cred(headers.contains_key(CREDENTIAL_HEADER));
+
     if !bundle.is_empty()
         && let Some(cred_value) = headers.get(CREDENTIAL_HEADER).and_then(|v| v.to_str().ok())
     {
@@ -475,10 +480,13 @@ fn resolve_peer_verifying_key(
         // intermediate CA cert(s) in CHAIN_HEADER; absent ⇒ single-level
         // (P2/P3) verify, byte-identical to pre-P4.
         let chain_value = headers.get(CHAIN_HEADER).and_then(|v| v.to_str().ok());
-        if let Some(vk) =
-            verify_credential_pubkey(cred_value, chain_value, peer_id, bundle, now_unix)
-        {
-            return Some(vk);
+        match verify_credential_pubkey(cred_value, chain_value, peer_id, bundle, now_unix) {
+            Some(vk) => {
+                // FED-P4-e (§8) — verify-failure-rate SLO.
+                crate::metrics::record_federation_cred_verify(true);
+                return Some(vk);
+            }
+            None => crate::metrics::record_federation_cred_verify(false),
         }
     }
     peer_id.and_then(|pid| {

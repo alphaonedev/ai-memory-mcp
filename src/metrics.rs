@@ -205,6 +205,46 @@ pub struct Metrics {
     /// `tracing::warn!` so operators see the subscription id + correlation
     /// id of the dropped row.
     pub subscription_dlq_overflow_total: IntCounter,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — federation
+    /// credential-verification outcomes on the receiver path, labeled
+    /// `result` (`ok` | `fail`). The verify-failure-rate SLO is
+    /// `fail / (ok + fail)`. A non-zero sustained fail rate means peers
+    /// are presenting credentials the local trust bundle cannot verify
+    /// — an expired leaf, a revoked issuer, a clock-skew window, or a
+    /// chain that fails to anchor. Healthy meshes hold this at 0 once
+    /// every peer's issuer key is enrolled in the bundle.
+    pub federation_cred_verify_total: IntCounterVec,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — inbound federation
+    /// requests bucketed by whether they presented a signed credential
+    /// at all, labeled `presence` (`signed` | `unsigned`). The
+    /// signed-vs-unsigned-ratio SLO is `signed / (signed + unsigned)`.
+    /// During a rollout this climbs from 0 toward 1 as peers upgrade to
+    /// credential-presenting builds; operators gate the flip of
+    /// `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` to the secure default on
+    /// this ratio reaching 1.0 across the fleet.
+    pub federation_inbound_cred_total: IntCounterVec,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — age in seconds of
+    /// the local outbound leaf credential (now − `issued_at`),
+    /// refreshed on every renewal tick. The max-cred-age SLO alerts
+    /// when this approaches the leaf TTL
+    /// ([`crate::federation::identity::issuer::DEFAULT_CREDENTIAL_TTL_SECS`])
+    /// — a credential that ages past its TTL without a renewal means
+    /// the refresh worker has stalled and outbound sync will start
+    /// failing peer verification.
+    pub federation_cred_max_age_seconds: IntGauge,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — seconds since the
+    /// last successful outbound-credential renewal (now − last-renew
+    /// wall clock), refreshed on every renewal tick. The renewal-lag
+    /// SLO alerts when this exceeds the configured refresh interval by
+    /// a safety margin: a healthy worker re-renews well inside the leaf
+    /// TTL, so a lag larger than the interval means renewals are
+    /// silently failing (bad CA reachability, key-load fault) even
+    /// though the worker thread is still alive.
+    pub federation_renewal_lag_seconds: IntGauge,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -477,6 +517,58 @@ impl Metrics {
         )?;
         registry.register(Box::new(subscription_dlq_overflow_total.clone()))?;
 
+        // FED-P4-e (federation-identity-at-scale §8) — federation
+        // identity SLO surfaces: verify-failure-rate, signed-vs-unsigned
+        // ratio, max cred age, renewal lag.
+        let federation_cred_verify_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_cred_verify_total",
+                "Federation credential-verification outcomes on the \
+                 receiver path, labeled result (ok|fail). \
+                 verify-failure-rate SLO = fail / (ok + fail). Non-zero \
+                 sustained fail rate means peers present credentials the \
+                 local trust bundle cannot verify (expired leaf, revoked \
+                 issuer, clock skew, or a chain that fails to anchor).",
+            ),
+            &["result"],
+        )?;
+        registry.register(Box::new(federation_cred_verify_total.clone()))?;
+
+        let federation_inbound_cred_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_inbound_cred_total",
+                "Inbound federation requests bucketed by whether they \
+                 presented a signed credential, labeled presence \
+                 (signed|unsigned). signed-vs-unsigned-ratio SLO = \
+                 signed / (signed + unsigned). Climbs toward 1.0 as \
+                 peers upgrade to credential-presenting builds.",
+            ),
+            &["presence"],
+        )?;
+        registry.register(Box::new(federation_inbound_cred_total.clone()))?;
+
+        let federation_cred_max_age_seconds = IntGauge::new(
+            "ai_memory_federation_cred_max_age_seconds",
+            "Age in seconds of the local outbound leaf credential \
+             (now - issued_at), refreshed on every renewal tick. \
+             max-cred-age SLO alerts when this approaches the leaf TTL \
+             — a credential aging past its TTL without a renewal means \
+             the refresh worker has stalled and outbound sync will \
+             start failing peer verification.",
+        )?;
+        registry.register(Box::new(federation_cred_max_age_seconds.clone()))?;
+
+        let federation_renewal_lag_seconds = IntGauge::new(
+            "ai_memory_federation_renewal_lag_seconds",
+            "Seconds since the last successful outbound-credential \
+             renewal (now - last-renew wall clock), refreshed on every \
+             renewal tick. renewal-lag SLO alerts when this exceeds the \
+             configured refresh interval by a safety margin: a lag \
+             larger than the interval means renewals are silently \
+             failing even though the worker thread is still alive.",
+        )?;
+        registry.register(Box::new(federation_renewal_lag_seconds.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -502,6 +594,10 @@ impl Metrics {
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,
+            federation_cred_verify_total,
+            federation_inbound_cred_total,
+            federation_cred_max_age_seconds,
+            federation_renewal_lag_seconds,
         })
     }
 }
@@ -521,6 +617,67 @@ pub fn record_subscription_dlq_overflow() {
 #[must_use]
 pub fn subscription_dlq_overflow_count() -> u64 {
     registry().subscription_dlq_overflow_total.get()
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — record one federation
+/// credential-verification outcome on the receiver path. `ok = true`
+/// means the presented credential (or chain leaf) verified against the
+/// local trust bundle; `ok = false` means it was rejected. Feeds the
+/// verify-failure-rate SLO.
+pub fn record_federation_cred_verify(ok: bool) {
+    let result = if ok { "ok" } else { "fail" };
+    registry()
+        .federation_cred_verify_total
+        .with_label_values(&[result])
+        .inc();
+}
+
+/// FED-P4-e — read the federation credential-verify counter for a given
+/// outcome (`ok` | `fail`). Test-only accessor for the SLO regression.
+#[must_use]
+pub fn federation_cred_verify_count(result: &str) -> u64 {
+    registry()
+        .federation_cred_verify_total
+        .with_label_values(&[result])
+        .get()
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — record one inbound
+/// federation request bucketed by whether it presented a signed
+/// credential. `signed = true` means a credential header was present
+/// (regardless of verify outcome); `false` means the peer sent no
+/// credential. Feeds the signed-vs-unsigned-ratio SLO.
+pub fn record_federation_inbound_cred(signed: bool) {
+    let presence = if signed { "signed" } else { "unsigned" };
+    registry()
+        .federation_inbound_cred_total
+        .with_label_values(&[presence])
+        .inc();
+}
+
+/// FED-P4-e — read the inbound-credential presence counter for a given
+/// bucket (`signed` | `unsigned`). Test-only accessor for the SLO
+/// regression.
+#[must_use]
+pub fn federation_inbound_cred_count(presence: &str) -> u64 {
+    registry()
+        .federation_inbound_cred_total
+        .with_label_values(&[presence])
+        .get()
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — set the age in seconds
+/// of the local outbound leaf credential (now − `issued_at`). Called on
+/// every renewal tick. Feeds the max-cred-age SLO.
+pub fn set_federation_cred_max_age_seconds(secs: i64) {
+    registry().federation_cred_max_age_seconds.set(secs);
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — set the seconds elapsed
+/// since the last successful outbound-credential renewal. Called on
+/// every renewal tick. Feeds the renewal-lag SLO.
+pub fn set_federation_renewal_lag_seconds(secs: i64) {
+    registry().federation_renewal_lag_seconds.set(secs);
 }
 
 /// Cluster-A COR-3 (v0.7.0) — record a single corrupt-provenance row
@@ -651,6 +808,11 @@ mod tests {
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
         registry().federation_push_dlq_depth.set(0);
+        // FED-P4-e — federation identity SLO surfaces.
+        record_federation_cred_verify(true);
+        record_federation_inbound_cred(true);
+        set_federation_cred_max_age_seconds(0);
+        set_federation_renewal_lag_seconds(0);
 
         let text = render();
         for name in [
@@ -666,9 +828,45 @@ mod tests {
             "ai_memory_subscriptions_active",
             // v0.7.0 Track D #933 — federation push DLQ depth gauge.
             "ai_memory_federation_push_dlq_depth",
+            // FED-P4-e — federation identity SLO surfaces (§8).
+            "ai_memory_federation_cred_verify_total",
+            "ai_memory_federation_inbound_cred_total",
+            "ai_memory_federation_cred_max_age_seconds",
+            "ai_memory_federation_renewal_lag_seconds",
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }
+    }
+
+    #[test]
+    fn federation_cred_verify_labels_outcome() {
+        let before_ok = federation_cred_verify_count("ok");
+        let before_fail = federation_cred_verify_count("fail");
+        record_federation_cred_verify(true);
+        record_federation_cred_verify(false);
+        assert!(federation_cred_verify_count("ok") >= before_ok + 1);
+        assert!(federation_cred_verify_count("fail") >= before_fail + 1);
+        let text = render();
+        assert!(text.contains("ai_memory_federation_cred_verify_total{result=\"ok\"}"));
+        assert!(text.contains("ai_memory_federation_cred_verify_total{result=\"fail\"}"));
+    }
+
+    #[test]
+    fn federation_inbound_cred_labels_presence() {
+        let before_signed = federation_inbound_cred_count("signed");
+        let before_unsigned = federation_inbound_cred_count("unsigned");
+        record_federation_inbound_cred(true);
+        record_federation_inbound_cred(false);
+        assert!(federation_inbound_cred_count("signed") >= before_signed + 1);
+        assert!(federation_inbound_cred_count("unsigned") >= before_unsigned + 1);
+    }
+
+    #[test]
+    fn federation_cred_age_and_lag_gauges_settable() {
+        set_federation_cred_max_age_seconds(1234);
+        set_federation_renewal_lag_seconds(56);
+        assert_eq!(registry().federation_cred_max_age_seconds.get(), 1234);
+        assert_eq!(registry().federation_renewal_lag_seconds.get(), 56);
     }
 
     #[test]
