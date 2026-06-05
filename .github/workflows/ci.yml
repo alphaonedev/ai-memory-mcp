@@ -232,7 +232,16 @@ jobs:
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours. Normal run is well under this.
-    timeout-minutes: 45
+    #
+    # windows-latest gets a wider 60-min budget: this branch's
+    # Cargo.toml/src changes force the full test suite (TEST_IMPACT=__ALL__
+    # via scripts/ci-test-impact.sh), and the Windows runner's slower test
+    # execution + `cargo build --release` step legitimately approached the
+    # 45-min cap (run 26998232157 cancelled Check (windows-latest) at the
+    # cap with no hang). The Linux watchdog (`timeout` wrapper on the
+    # impact-aware test step, #1492) is Linux-gated, so Windows relies on
+    # this job-level budget instead.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
     env:
       # #1407/#1405/#1387 — the ubuntu `cargo test` link step OOM'd the
       # linker (`collect2: ld terminated with signal 7 [Bus error]`).
@@ -600,22 +609,65 @@ jobs:
           echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
           echo "impact: ${TEST_IMPACT:-unset}"
           echo "::endgroup::"
+
+          # #1492 hung-test watchdog (postgres-gate arm). The default
+          # `check` job already wraps its test step in GNU `timeout`; this
+          # gate needs the same guard because run 26998232157 cancelled
+          # here: the `embedding_dim_migration` binary hung ~26 min on a
+          # leaked Postgres advisory lock (a `PublicSchemaLock` Drop bug
+          # released the lock from a cross-runtime sqlx pool, which failed
+          # 100% and leaked the lock; the next test's unbounded
+          # `pg_advisory_lock` then blocked until the 45-min job cap). The
+          # test-side defect is fixed in tests/common/postgres_env.rs, but
+          # the watchdog stays so any future hang fails the STEP fast (25
+          # min < the 45-min job cap) with a named ::error:: instead of a
+          # silent job-level cancel. This job is always Linux (ubuntu + a
+          # postgres service container), so GNU coreutils `timeout` is
+          # reliably present — no per-OS gating needed (unlike the cross-OS
+          # `check` matrix).
+          TIMEOUT_BIN=""
+          if command -v gtimeout >/dev/null 2>&1; then
+            TIMEOUT_BIN=gtimeout
+          elif timeout --version 2>/dev/null | grep -qi coreutils; then
+            TIMEOUT_BIN=timeout
+          fi
+          if [ -n "$TIMEOUT_BIN" ]; then
+            echo "::notice::[#1492] sal-postgres hung-test watchdog active via '$TIMEOUT_BIN' (1500s per invocation)"
+          else
+            echo "::warning::[#1492] sal-postgres watchdog could not find GNU timeout — relying on job-level timeout-minutes"
+          fi
+          pg_test() {
+            local label="$1"; shift
+            local rc=0
+            if [ -n "$TIMEOUT_BIN" ]; then
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test "$@" || rc=$?
+            else
+              cargo test "$@" || rc=$?
+            fi
+            if [ "$rc" -ne 0 ]; then
+              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                echo "::error::[#1492 watchdog] sal-postgres '${label}' exceeded the 1500s per-invocation timeout and was terminated (previously a silent hang until the 45min job cap; see run 26998232157 embedding_dim_migration / leaked advisory lock). Reproduce with the impact set logged above."
+              fi
+              return "$rc"
+            fi
+          }
+
           case "${TEST_IMPACT:-__ALL__}" in
             __SKIP__)
               echo "::notice::docs-only diff — sal-postgres test step is a no-op"
               ;;
             __ALL__|"")
               echo "::notice::running FULL sal-postgres test suite"
-              cargo test --features sal-postgres -- --test-threads=1
+              pg_test "full sal-postgres suite" --features sal-postgres -- --test-threads=1
               ;;
             *)
               echo "::notice::running --lib + impact-selected sal-postgres integration binaries"
-              cargo test --features sal-postgres --lib -- --test-threads=1
+              pg_test "sal-postgres --lib" --features sal-postgres --lib -- --test-threads=1
               ARGS=()
               for t in $TEST_IMPACT; do
                 ARGS+=(--test "$t")
               done
-              cargo test --features sal-postgres "${ARGS[@]}" -- --test-threads=1
+              pg_test "impact-selected sal-postgres binaries (${TEST_IMPACT})" --features sal-postgres "${ARGS[@]}" -- --test-threads=1
               ;;
           esac
 
