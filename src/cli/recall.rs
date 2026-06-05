@@ -366,7 +366,11 @@ pub(crate) fn run_with_embedder(
                     Some(tokens) if !tokens.is_empty() => {
                         let joined = tokens.join(" ");
                         match emb.embed(&joined) {
-                            Ok(ctx_emb) => embeddings::Embedder::fuse(&primary_emb, &ctx_emb, 0.7),
+                            Ok(ctx_emb) => embeddings::Embedder::fuse(
+                                &primary_emb,
+                                &ctx_emb,
+                                crate::RECALL_PRIMARY_CTX_BLEND,
+                            ),
                             Err(e) => {
                                 writeln!(
                                     out.stderr,

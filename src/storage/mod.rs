@@ -7601,7 +7601,7 @@ fn semantic_phase(
             let cosine = f64::from(1.0 - hit.distance);
             // v0.6.2 (S18 iteration): cosine gate relaxed 0.3 → 0.2 —
             // see the matching comment in the linear-scan branch below.
-            if cosine > 0.2 {
+            if cosine > crate::RECALL_COSINE_GATE {
                 needed_ids.push(hit.id.clone());
                 hit_meta.push((hit.id.clone(), cosine));
             }
@@ -7754,7 +7754,7 @@ fn semantic_phase(
                 query_embedding,
                 &emb,
             ));
-            if cosine > 0.2 {
+            if cosine > crate::RECALL_COSINE_GATE {
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 hnsw_candidates_count += 1;
             }

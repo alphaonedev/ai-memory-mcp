@@ -189,7 +189,7 @@ async fn sync_since_with_headers(
     let req = req_builder.body(Body::empty()).unwrap();
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+    let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
