@@ -17,6 +17,12 @@ use axum::{
 };
 use serde_json::json;
 
+use std::sync::OnceLock;
+
+use ed25519_dalek::VerifyingKey;
+
+use crate::federation::identity::credential::{CREDENTIAL_HEADER, SignedCredential};
+use crate::federation::identity::trust_bundle::TrustBundle;
 use crate::federation::signing as fed_signing;
 
 #[cfg(feature = "sal")]
@@ -410,6 +416,136 @@ pub(super) async fn sync_push_via_store(
         .into_response()
 }
 
+/// v0.7.0 FED-P2d — process-wide federation trust bundle, loaded once
+/// from the environment on first verify and cached for the daemon's
+/// lifetime. An empty bundle (no `AI_MEMORY_FED_TRUST_BUNDLE_DIR`, a
+/// missing dir, or a dir with no valid issuer keys) is the signal to
+/// fall through to the legacy per-peer `.pub` enrolment path, so a
+/// node that has not adopted CA-rooted credentials behaves exactly as
+/// it did pre-P2. A load error is logged once and treated as empty
+/// (never partitions a federation pair on a misconfigured bundle dir).
+///
+/// FED-P3 replaces this boot-once cache with an `AppState`-threaded,
+/// reloadable bundle so an operator can rotate the trust root without
+/// a daemon restart; the receiver-verify call sites are unchanged by
+/// that swap because both take `&TrustBundle`.
+fn cached_trust_bundle() -> &'static TrustBundle {
+    static BUNDLE: OnceLock<TrustBundle> = OnceLock::new();
+    BUNDLE.get_or_init(|| {
+        TrustBundle::load_from_env().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "federation::signing",
+                error = %e,
+                "failed to load federation trust bundle; continuing with legacy per-peer verify"
+            );
+            TrustBundle::new()
+        })
+    })
+}
+
+/// v0.7.0 FED-P2d — resolve the Ed25519 verifying key the receiver
+/// should check a peer's `X-Memory-Sig` against.
+///
+/// Precedence:
+///   1. **CA-rooted credential** — when the trust bundle is non-empty
+///      AND the peer presented an `X-Memory-Cred` header that the
+///      bundle can verify AND the credential's subject binds to the
+///      claimed `X-Peer-Id`, use the credential's subject key.
+///   2. **Legacy per-peer enrolment** — otherwise fall through to the
+///      historical on-disk `.pub` key for the peer-id.
+///
+/// Credential verification NEVER hard-fails the request here: any
+/// parse / trust / binding failure logs a WARN and returns the legacy
+/// key (or `None`), so a transient or malformed credential can never
+/// partition a federation pair that also has a legacy enrolled key.
+/// The enforcement matrix in the caller still decides the outcome from
+/// the `(sig_header, resolved_key)` pair — this function only swaps the
+/// key *source*, leaving the four-arm policy untouched.
+fn resolve_peer_verifying_key(
+    headers: &HeaderMap,
+    peer_id: Option<&str>,
+    bundle: &TrustBundle,
+    now_unix: i64,
+) -> Option<VerifyingKey> {
+    if !bundle.is_empty()
+        && let Some(cred_value) = headers.get(CREDENTIAL_HEADER).and_then(|v| v.to_str().ok())
+        && let Some(vk) = verify_credential_pubkey(cred_value, peer_id, bundle, now_unix)
+    {
+        return Some(vk);
+    }
+    peer_id.and_then(|pid| {
+        crate::governance::audit::load_daemon_verifying_key(pid)
+            .ok()
+            .flatten()
+    })
+}
+
+/// v0.7.0 FED-P2d — verify a wire `X-Memory-Cred` value against the
+/// trust bundle and bind it to the claimed peer-id.
+///
+/// Returns the credential's subject verifying key only when ALL hold:
+///   - the header value parses as a `SignedCredential`,
+///   - the bundle trusts the issuer AND the credential is within its
+///     validity window (`bundle.verify`),
+///   - the credential's `subject_agent_id` equals the claimed
+///     `X-Peer-Id` (identity binding — prevents a valid credential for
+///     agent A from authenticating a push attributed to agent B).
+///
+/// Any failure logs a WARN against `federation::signing` and returns
+/// `None`, signalling the caller to fall through to the legacy path.
+fn verify_credential_pubkey(
+    cred_value: &str,
+    peer_id: Option<&str>,
+    bundle: &TrustBundle,
+    now_unix: i64,
+) -> Option<VerifyingKey> {
+    let signed = match SignedCredential::from_header_value(cred_value) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "federation::signing",
+                tag = e.tag(),
+                peer_id = %peer_id.unwrap_or(""),
+                "sync: X-Memory-Cred malformed; falling back to legacy per-peer verify"
+            );
+            return None;
+        }
+    };
+    let cred = match bundle.verify(&signed, now_unix) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                target: "federation::signing",
+                tag = e.tag(),
+                peer_id = %peer_id.unwrap_or(""),
+                "sync: X-Memory-Cred failed trust-bundle verification; falling back to legacy"
+            );
+            return None;
+        }
+    };
+    if peer_id != Some(cred.subject_agent_id.as_str()) {
+        tracing::warn!(
+            target: "federation::signing",
+            peer_id = %peer_id.unwrap_or(""),
+            cred_subject = %cred.subject_agent_id,
+            "sync: X-Memory-Cred subject does not match X-Peer-Id; refusing credential binding"
+        );
+        return None;
+    }
+    match cred.subject_verifying_key() {
+        Ok(vk) => Some(vk),
+        Err(e) => {
+            tracing::warn!(
+                target: "federation::signing",
+                tag = e.tag(),
+                peer_id = %peer_id.unwrap_or(""),
+                "sync: X-Memory-Cred subject key malformed; falling back to legacy"
+            );
+            None
+        }
+    }
+}
+
 /// v0.7.0 #791 — verify the `X-Memory-Sig` header against the raw
 /// body bytes the receiver observed. Returns `Some(Response)` to
 /// short-circuit with a 401 when verification is required and fails;
@@ -445,11 +581,12 @@ pub(super) fn verify_signature_or_reject(
     let nonce_header = headers
         .get(fed_signing::NONCE_HEADER)
         .and_then(|v| v.to_str().ok());
-    let pubkey = peer_id.and_then(|pid| {
-        crate::governance::audit::load_daemon_verifying_key(pid)
-            .ok()
-            .flatten()
-    });
+    let pubkey = resolve_peer_verifying_key(
+        headers,
+        peer_id,
+        cached_trust_bundle(),
+        chrono::Utc::now().timestamp(),
+    );
 
     match (sig_header, pubkey.as_ref()) {
         (Some(sig), Some(pk)) => {
@@ -713,11 +850,12 @@ pub(super) fn verify_get_signature_or_reject(
     let nonce_header = headers
         .get(fed_signing::NONCE_HEADER)
         .and_then(|v| v.to_str().ok());
-    let pubkey = peer_id.and_then(|pid| {
-        crate::governance::audit::load_daemon_verifying_key(pid)
-            .ok()
-            .flatten()
-    });
+    let pubkey = resolve_peer_verifying_key(
+        headers,
+        peer_id,
+        cached_trust_bundle(),
+        chrono::Utc::now().timestamp(),
+    );
 
     let canonical = canonical_get_bytes(method, path, query);
 
@@ -927,6 +1065,201 @@ mod sal_boundary_961_tests {
             local_cap,
             GovernancePolicy::default().effective_max_reflection_depth(),
             "fallback cap must match the compiled default (parity with pre-#961 behavior)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FED-P2d — receiver-side credential-path pubkey resolution
+// ---------------------------------------------------------------------------
+//
+// Pins the surgical key-source swap in `resolve_peer_verifying_key`:
+// when the trust bundle trusts the credential's issuer AND the
+// credential binds to the claimed peer-id, the resolved key is the
+// credential's subject key; on any bundle-empty / cred-absent /
+// cred-invalid / wrong-subject condition the resolver falls through to
+// the legacy per-peer path (which, with no on-disk enrolment in these
+// isolated tests, yields `None`). The four-arm enforcement matrix in
+// the verify functions is unchanged — these tests only exercise the
+// key *source*.
+#[cfg(test)]
+mod fed_p2d_credential_resolution_tests {
+    use super::{resolve_peer_verifying_key, verify_credential_pubkey};
+    use crate::federation::identity::credential::CREDENTIAL_HEADER;
+    use crate::federation::identity::issuer::{FederationIssuer, IssuerConfig};
+    use crate::federation::identity::trust_bundle::TrustBundle;
+    use axum::http::{HeaderMap, HeaderValue};
+    use ed25519_dalek::SigningKey;
+
+    const TEST_ISSUER_ID: &str = "ca:test-issuer";
+    const TEST_TRUST_DOMAIN: &str = "test.federation.local";
+    const TEST_PEER_ID: &str = "host:peer-a";
+    const TEST_NOW_UNIX: i64 = 1_700_000_000;
+
+    fn fixed_signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn test_issuer() -> FederationIssuer {
+        FederationIssuer::new(
+            fixed_signing_key(7),
+            IssuerConfig::new(TEST_ISSUER_ID, TEST_TRUST_DOMAIN),
+        )
+    }
+
+    fn headers_with_cred(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CREDENTIAL_HEADER,
+            HeaderValue::from_str(value).expect("valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn credential_path_returns_subject_key_when_issuer_trusted() {
+        let issuer = test_issuer();
+        let subject_signing = fixed_signing_key(42);
+        let subject_pub = subject_signing.verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+
+        let resolved = verify_credential_pubkey(
+            &signed.to_header_value().expect("encode credential"),
+            Some(TEST_PEER_ID),
+            &bundle,
+            TEST_NOW_UNIX,
+        );
+        assert_eq!(
+            resolved.map(|k| k.to_bytes()),
+            Some(subject_pub.to_bytes()),
+            "trusted credential must resolve to the subject's key"
+        );
+    }
+
+    #[test]
+    fn resolve_uses_credential_when_bundle_trusts_issuer() {
+        let issuer = test_issuer();
+        let subject_signing = fixed_signing_key(99);
+        let subject_pub = subject_signing.verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+        let headers = headers_with_cred(&signed.to_header_value().expect("encode"));
+
+        let resolved =
+            resolve_peer_verifying_key(&headers, Some(TEST_PEER_ID), &bundle, TEST_NOW_UNIX);
+        assert_eq!(
+            resolved.map(|k| k.to_bytes()),
+            Some(subject_pub.to_bytes()),
+            "resolver must prefer the trusted credential's subject key"
+        );
+    }
+
+    #[test]
+    fn empty_bundle_falls_through_to_legacy_path() {
+        // Empty bundle: even a present, well-formed credential is ignored;
+        // resolution falls to the legacy per-peer path, which has no
+        // on-disk enrolment in this isolated test → None.
+        let issuer = test_issuer();
+        let subject_pub = fixed_signing_key(13).verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        let headers = headers_with_cred(&signed.to_header_value().expect("encode"));
+
+        let resolved = resolve_peer_verifying_key(
+            &headers,
+            Some(TEST_PEER_ID),
+            &TrustBundle::new(),
+            TEST_NOW_UNIX,
+        );
+        assert!(
+            resolved.is_none(),
+            "empty bundle must defer to the legacy path (no enrolment → None)"
+        );
+    }
+
+    #[test]
+    fn absent_credential_falls_through_to_legacy_path() {
+        let issuer = test_issuer();
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+        let resolved = resolve_peer_verifying_key(
+            &HeaderMap::new(),
+            Some(TEST_PEER_ID),
+            &bundle,
+            TEST_NOW_UNIX,
+        );
+        assert!(
+            resolved.is_none(),
+            "no X-Memory-Cred header must defer to the legacy path"
+        );
+    }
+
+    #[test]
+    fn wrong_subject_credential_is_refused() {
+        // A credential validly minted for a DIFFERENT subject must not
+        // authenticate a push attributed to TEST_PEER_ID — the identity
+        // binding (subject_agent_id == peer_id) blocks it.
+        let issuer = test_issuer();
+        let other_subject_pub = fixed_signing_key(55).verifying_key();
+        let signed = issuer
+            .issue("host:peer-b", &other_subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential for peer-b");
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+
+        let resolved = verify_credential_pubkey(
+            &signed.to_header_value().expect("encode"),
+            Some(TEST_PEER_ID),
+            &bundle,
+            TEST_NOW_UNIX,
+        );
+        assert!(
+            resolved.is_none(),
+            "credential whose subject != peer-id must be refused (no cross-binding)"
+        );
+    }
+
+    #[test]
+    fn untrusted_issuer_credential_is_refused() {
+        // Issuer not in the bundle → UnknownIssuer → None (fall through).
+        let issuer = test_issuer();
+        let subject_pub = fixed_signing_key(21).verifying_key();
+        let signed = issuer
+            .issue(TEST_PEER_ID, &subject_pub, TEST_NOW_UNIX)
+            .expect("issue credential");
+        // Bundle trusts a DIFFERENT issuer key.
+        let bundle = TrustBundle::new()
+            .with_issuer("ca:other-issuer", fixed_signing_key(200).verifying_key());
+
+        let resolved = verify_credential_pubkey(
+            &signed.to_header_value().expect("encode"),
+            Some(TEST_PEER_ID),
+            &bundle,
+            TEST_NOW_UNIX,
+        );
+        assert!(
+            resolved.is_none(),
+            "credential from an untrusted issuer must be refused"
+        );
+    }
+
+    #[test]
+    fn malformed_credential_value_is_refused() {
+        let issuer = test_issuer();
+        let bundle = TrustBundle::new().with_issuer(TEST_ISSUER_ID, issuer.verifying_key());
+        let resolved = verify_credential_pubkey(
+            "v1=not-valid-base64-cbor!!!",
+            Some(TEST_PEER_ID),
+            &bundle,
+            TEST_NOW_UNIX,
+        );
+        assert!(
+            resolved.is_none(),
+            "a malformed X-Memory-Cred value must be refused, not panic"
         );
     }
 }
