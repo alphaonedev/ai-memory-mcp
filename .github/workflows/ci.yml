@@ -347,23 +347,35 @@ jobs:
           # flush partial output; --kill-after escalates to SIGKILL for a
           # truly wedged process.
           #
-          # GNU `timeout` only ships on the ubuntu runner (where the #1492
-          # hang occurred). macOS has no `timeout` (coreutils, if present,
-          # is g-prefixed) and Windows' `timeout.exe` is an unrelated
-          # console-pause command — so detect a *GNU* timeout binary and
-          # degrade gracefully to a bare `cargo test` (job-level cap still
-          # applies, i.e. the pre-#1492 behaviour) where none exists,
-          # rather than crashing the step with `timeout: command not found`.
+          # The #1492 hang was observed ONLY on the ubuntu runner, and the
+          # watchdog is gated to Linux for two reasons:
+          #   1. macOS ships no `timeout` (coreutils, if present, is
+          #      g-prefixed `gtimeout`) — bare detection would crash the
+          #      step with `timeout: command not found`.
+          #   2. Windows' Git-bash DOES ship an MSYS coreutils `timeout`
+          #      that matches a naive `--version | grep coreutils` probe,
+          #      but it mishandles the native `cargo.exe` process-tree /
+          #      signal semantics: it fired falsely at the 1500s cap and
+          #      SIGTERM-killed the full Windows suite (exit 143 → step
+          #      exit 124) even though the suite completes under the 45-min
+          #      job cap. The original hang never occurred on Windows.
+          # So restrict the watchdog to Linux (reliable GNU `timeout` +
+          # POSIX process-group signal semantics over native test binaries)
+          # and degrade to a bare `cargo test` everywhere else — the
+          # job-level `timeout-minutes: 45` cap still applies as the
+          # universal backstop (the pre-#1492 behaviour).
           TIMEOUT_BIN=""
-          if command -v gtimeout >/dev/null 2>&1; then
-            TIMEOUT_BIN=gtimeout
-          elif timeout --version 2>/dev/null | grep -qi coreutils; then
-            TIMEOUT_BIN=timeout
+          if [ "${RUNNER_OS:-}" = "Linux" ]; then
+            if command -v gtimeout >/dev/null 2>&1; then
+              TIMEOUT_BIN=gtimeout
+            elif timeout --version 2>/dev/null | grep -qi coreutils; then
+              TIMEOUT_BIN=timeout
+            fi
           fi
           if [ -n "$TIMEOUT_BIN" ]; then
             echo "::notice::[#1492] hung-test watchdog active via '$TIMEOUT_BIN' (1500s per invocation)"
           else
-            echo "::notice::[#1492] no GNU timeout on this runner — watchdog disabled; job-level timeout-minutes still applies"
+            echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} (Linux-only; job-level timeout-minutes still applies)"
           fi
           run_tests() {
             local label="$1"; shift
