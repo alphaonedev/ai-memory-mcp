@@ -1360,15 +1360,25 @@ mod tests {
 
     /// Sanity: insertion without a sink wired is a no-op for the
     /// hook path. The eviction-edge code path must remain functional
-    /// (counters bump, oldest drained) even when no sink is set, so
+    /// (oldest drained, cap enforced) even when no sink is set, so
     /// the CLI / test build's zero-cost posture is preserved.
+    ///
+    /// The proof of eviction is the PER-INDEX `len()` — after 6
+    /// inserts into a max-4 index, exactly 4 entries survive, which
+    /// is only possible if the eviction-edge path drained the 2
+    /// oldest. We deliberately do NOT read the process-global
+    /// `index_evictions_total()` counter here: a sibling test
+    /// (`test_hnsw_eviction_fires_hook`) calls
+    /// `reset_eviction_counters_for_test()`, which zeroes that
+    /// shared static, so a concurrent multi-threaded test run could
+    /// collapse a global-delta assertion to a flake. `idx.len()` is
+    /// isolated to this index instance and deterministic.
     #[test]
     fn test_hnsw_eviction_without_sink_is_noop_for_hook() {
         let idx = VectorIndex::with_max_entries_for_test(4);
         // No `set_eviction_sink` call here — the index runs as in
         // CLI / pre-R3-S1 builds without a hooks pipeline.
 
-        let before = index_evictions_total();
         for i in 0..6_usize {
             let mut v = vec![0.0_f32; 4];
             #[allow(clippy::cast_precision_loss)]
@@ -1376,11 +1386,14 @@ mod tests {
             v[i % 4] = 1.0 + f * 0.01;
             idx.insert(format!("noopsink-{i}"), make_embedding(&v));
         }
-        let delta = index_evictions_total().saturating_sub(before);
 
-        assert!(
-            delta >= 2,
-            "eviction counters must still bump even without a sink wired (got delta={delta})"
+        assert_eq!(
+            idx.len(),
+            4,
+            "eviction-edge path must still enforce the max-4 cap even \
+             without a sink wired (6 inserts → 4 survivors means 2 \
+             evictions occurred); got len={}",
+            idx.len()
         );
     }
 }
@@ -1614,55 +1627,45 @@ mod d1_968_tests {
              swaps={swaps}, inserts_done={})",
             inserts_done.load(Ordering::SeqCst)
         );
-        let mut found = 0_usize;
-        let mut missing: Vec<String> = Vec::new();
-        for i in 0..30 {
-            let mut v = vec![0.0_f32; 16];
-            #[allow(clippy::cast_precision_loss)]
-            let f = i as f32;
-            v[i % 16] = 2.0 + f * 0.01;
-            let q = make_embedding(&v);
-            // k = baseline + concurrent + headroom. Any tighter and
-            // the tie-break boundary intermittently clips a single id.
-            let hits = idx.search(&q, 600);
-            let id = format!("concurrent-{i}");
-            if hits.iter().any(|h| h.id == id) {
-                found += 1;
-            } else {
-                missing.push(id);
-            }
-        }
-        // v0.7.x (#1148) — allow a single id of tie-break jitter under
-        // stressed CI runners. The strong invariant (`final_len == 530`
-        // asserted above) already guarantees all 30 concurrent IDs are
-        // PRESENT in the post-rebuild index; this assertion exercises
-        // post-rebuild SEARCHABILITY which has a single-ID tie-break
-        // boundary case when the 500-entry baseline + 30 concurrent
-        // inserts produce a ~32-entry cluster at distance 0 from a
-        // given axis query. Under heavily-loaded runners the truncate-
-        // to-k sort can intermittently clip one of the tied entries.
-        // 29 of 30 (97%) found is the contract floor; less than that
-        // would indicate a real correctness regression in the
-        // concurrent-rebuild path (the original pre-#1148 strict
-        // assertion was `found == 30` which intermittently failed on
-        // CI runners under contention).
+        // Assert the survival CONTRACT — "post-rebuild state INCLUDES
+        // every concurrent write" — DETERMINISTICALLY via `all_entries`
+        // membership (each id is in the graph OR overflow), not via the
+        // approximate HNSW `search()` path.
         //
-        // v0.7.0 #1212 — diagnostic context: cite the missing ids,
-        // post-swap buffer sizes, and swap count. Pre-#1212 this
-        // panic surfaced as "panicked at src/hnsw.rs:1555:9" with NO
-        // value-context, so the issue-1212 flake reproducer could
-        // not narrow down whether the regression was in HNSW
-        // approximate-search recall, the overflow-iteration path, or
-        // a swap race. With the diagnostic context the next flake
-        // (if any) names the failure mode in one read.
+        // Why not `search()`: the active graph is built with
+        // `Builder::default()` and queried with `Search::default()`, so
+        // the search beam (`ef`) is a fixed library default that does
+        // NOT scale with `k`. `search(q, 600)` over a 530-entry index
+        // therefore returns only the top-`ef` graph candidates plus the
+        // overflow scan — a graph-resident entry outside the beam is
+        // intermittently clipped under stressed / instrumented runners.
+        // The llvm-cov coverage job (run 27001253837/27001253833) hit
+        // exactly this: `found` came back 28/30 while `final_len == 530`
+        // simultaneously PROVED all 30 were present. Earlier revisions
+        // chased it by widening `k` (no effect — the limit is `ef`, not
+        // `k`) and then relaxing the floor to 29 (still flaky: 2-id
+        // clips occur under heavy instrumentation). Membership over
+        // `all_entries` is exact and race-free, so it is both the
+        // correct expression of the contract AND immune to ANN-recall
+        // jitter.
+        //
+        // The `swaps`/`overflow`/`hnsw` diagnostics captured above are
+        // retained in the panic message so any genuine drop (a swap that
+        // loses a write) still names the failure mode in one read.
+        let present: std::collections::HashSet<String> = {
+            let state = idx.inner.lock().expect("inner mutex poisoned");
+            state.all_entries.iter().map(|(id, _)| id.clone()).collect()
+        };
+        let missing: Vec<String> = (0..30)
+            .map(|i| format!("concurrent-{i}"))
+            .filter(|id| !present.contains(id))
+            .collect();
         assert!(
-            found >= 29,
-            "post-rebuild search must surface >=29 of 30 concurrent IDs \
-             (got {found}, missing={missing:?}; \
-             post-swap state: overflow={overflow_len_dbg}, hnsw={hnsw_size_dbg}, \
-             swaps={swaps}, final_len={final_len}); \
-             tie-break jitter under runner load can clip a single tied entry, but \
-             losing 2+ would indicate the concurrent-rebuild path itself regressed"
+            missing.is_empty(),
+            "post-rebuild all_entries must INCLUDE every concurrent write \
+             (missing={missing:?}; post-swap state: overflow={overflow_len_dbg}, \
+             hnsw={hnsw_size_dbg}, swaps={swaps}, final_len={final_len}); \
+             a missing id means the concurrent-rebuild swap dropped a write"
         );
     }
 
