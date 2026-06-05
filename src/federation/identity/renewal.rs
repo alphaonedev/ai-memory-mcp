@@ -117,6 +117,14 @@ pub fn spawn_refresh_outbound_credential(interval: Duration) -> tokio::task::Joi
         loop {
             let now_unix = chrono::Utc::now().timestamp();
             let _ = refresh_once(outbound::shared(), now_unix);
+            // FED-P4d — refresh the slower-rotating intermediate chain on the
+            // same tick. A load/parse fault is logged and the prior chain is
+            // retained (no reset), so a transiently-bad file never strips a
+            // node of its hierarchical proof.
+            if let Err(e) = outbound::reload_intermediates_from_env() {
+                tracing::warn!(target: "federation::signing", error = %e,
+                    "failed to reload outbound federation intermediate chain; retaining prior");
+            }
             tokio::time::sleep(interval).await;
         }
     })

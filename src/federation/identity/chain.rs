@@ -172,17 +172,7 @@ impl CertChain {
     /// # Errors
     /// [`CredentialError::Malformed`] on an internal serialisation fault.
     pub fn intermediates_header_value(&self) -> Result<Option<String>, CredentialError> {
-        if self.intermediates.is_empty() {
-            return Ok(None);
-        }
-        let mut items = Vec::with_capacity(self.intermediates.len());
-        for ic in &self.intermediates {
-            items.push(ciborium::Value::Bytes(ic.to_wire_bytes()?));
-        }
-        let value = ciborium::Value::Array(items);
-        let mut out = Vec::new();
-        ciborium::ser::into_writer(&value, &mut out).map_err(|_| CredentialError::Malformed)?;
-        Ok(Some(format!("{CREDENTIAL_PREFIX}{}", B64.encode(out))))
+        intermediates_to_header_value(&self.intermediates)
     }
 
     /// Parse a [`CHAIN_HEADER`] value (`v1=<base64(CBOR array)>`) into the
@@ -315,6 +305,67 @@ pub fn subject_in_delegated_namespace(subject_agent_id: &str, ca_namespace: &str
     subject_agent_id.starts_with(&boundary)
 }
 
+/// Env var naming a file whose contents are a [`CHAIN_HEADER`] value
+/// (`v1=<base64(CBOR array)>`) — the anchor-first intermediate CA certs a
+/// node presents alongside its leaf credential so peers can verify a
+/// hierarchical chain against a root-only trust bundle. Unset ⇒ the node
+/// holds no intermediates and presents a direct (P2/P3) leaf only.
+pub const FED_CRED_CHAIN_PATH_ENV: &str = "AI_MEMORY_FED_CRED_CHAIN_PATH";
+
+/// Encode anchor-first `intermediates` as the [`CHAIN_HEADER`] value, or
+/// `None` when the list is empty (a direct root-signed leaf emits no chain
+/// header, degrading to the exact P2/P3 wire). Shared by
+/// [`CertChain::intermediates_header_value`] and the outbound sender path.
+///
+/// # Errors
+/// [`CredentialError::Malformed`] on an internal serialisation fault.
+pub fn intermediates_to_header_value(
+    intermediates: &[SignedCredential],
+) -> Result<Option<String>, CredentialError> {
+    if intermediates.is_empty() {
+        return Ok(None);
+    }
+    let mut items = Vec::with_capacity(intermediates.len());
+    for ic in intermediates {
+        items.push(ciborium::Value::Bytes(ic.to_wire_bytes()?));
+    }
+    let value = ciborium::Value::Array(items);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&value, &mut out).map_err(|_| CredentialError::Malformed)?;
+    Ok(Some(format!("{CREDENTIAL_PREFIX}{}", B64.encode(out))))
+}
+
+/// Load anchor-first intermediates from a file whose contents are a
+/// [`CHAIN_HEADER`] value. A missing file is `Ok(Vec::new())` — holding no
+/// intermediates is the normal one-level posture, not an error.
+///
+/// # Errors
+/// [`std::io::Error`] on a read fault other than not-found, or `InvalidData`
+/// if the content is not a parseable chain-header value.
+pub fn load_intermediates_from_path(
+    path: &std::path::Path,
+) -> std::io::Result<Vec<SignedCredential>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    CertChain::intermediates_from_header_value(raw.trim())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Load the held outbound intermediates named by [`FED_CRED_CHAIN_PATH_ENV`].
+/// An unset env var is `Ok(Vec::new())` — the node presents a direct leaf.
+///
+/// # Errors
+/// Propagates [`load_intermediates_from_path`] faults.
+pub fn load_intermediates_from_env() -> std::io::Result<Vec<SignedCredential>> {
+    match std::env::var(FED_CRED_CHAIN_PATH_ENV) {
+        Ok(path) => load_intermediates_from_path(std::path::Path::new(&path)),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +496,75 @@ mod tests {
             CertChain::intermediates_from_header_value("v1=@@notbase64@@").unwrap_err(),
             CredentialError::Malformed
         );
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        dir.push(".local-runs");
+        dir.push("test-tmp");
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn unique_chain_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        scratch_dir().join(format!("chain-{label}-{nanos}.chain"))
+    }
+
+    #[test]
+    fn free_encoder_matches_the_chain_method() {
+        let (_bundle, inter, leaf) = two_level_setup();
+        let chain = CertChain::new(leaf, vec![inter.clone()]);
+        assert_eq!(
+            intermediates_to_header_value(&[inter]).expect("free encode"),
+            chain.intermediates_header_value().expect("method encode"),
+        );
+        assert!(
+            intermediates_to_header_value(&[])
+                .expect("empty encode")
+                .is_none(),
+            "an empty intermediates list emits no header"
+        );
+    }
+
+    #[test]
+    fn load_intermediates_from_path_round_trips() {
+        let (bundle, inter, leaf) = two_level_setup();
+        let header = intermediates_to_header_value(std::slice::from_ref(&inter))
+            .expect("encode")
+            .expect("two-level emits a header");
+        let path = unique_chain_path("roundtrip");
+        std::fs::write(&path, format!("{header}\n")).expect("write chain file");
+
+        let loaded = load_intermediates_from_path(&path).expect("io ok");
+        let rebuilt = CertChain::new(leaf, loaded);
+        let verified = rebuilt
+            .verify(&bundle, NOW, DEFAULT_MAX_CHAIN_DEPTH)
+            .expect("rebuilt chain verifies");
+        assert_eq!(verified.subject_agent_id, "region/nyc/node-1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_intermediates_from_path_missing_file_is_empty() {
+        let path = unique_chain_path("missing");
+        assert!(
+            load_intermediates_from_path(&path)
+                .expect("missing file is not an error")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn load_intermediates_from_path_malformed_is_invalid_data() {
+        let path = unique_chain_path("garbage");
+        std::fs::write(&path, "not-a-chain-header").expect("write");
+        let err = load_intermediates_from_path(&path).expect_err("malformed must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
