@@ -300,14 +300,22 @@ fn sanitise_for_pg_ident(s: &str, max_len: usize) -> String {
 /// a different magic number so we don't deadlock against
 /// `PostgresStore::connect` itself.
 ///
-/// The lock is session-scoped: the held connection in
-/// [`PublicSchemaLock`] keeps the lock for the lifetime of the
-/// guard, and the explicit `pg_advisory_unlock` in `Drop` releases
-/// it deterministically (rather than relying on session-end
-/// release on connection drop).
+/// The lock is session-scoped: a dedicated owner thread (see
+/// [`PublicSchemaLock::acquire`]) holds the locking connection for
+/// the lifetime of the guard, and `Drop` signals that thread to run
+/// `pg_advisory_unlock` on the SAME connection before joining — so
+/// release is deterministic rather than relying on racy session-end
+/// release on connection drop.
 pub struct PublicSchemaLock {
-    pool: PgPool,
-    key: i64,
+    /// Signalling channel to the owner thread. Dropping the `Sender`
+    /// (in [`PublicSchemaLock::drop`]) tells the owner thread to run
+    /// `pg_advisory_unlock` on the SAME connection that took the lock
+    /// and then exit.
+    release_tx: Option<std::sync::mpsc::Sender<()>>,
+    /// Handle to the owner thread that holds the locking connection
+    /// for the lifetime of the guard. Joined in `Drop` so the lock is
+    /// reliably released before the next test's `acquire()` runs.
+    owner: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PublicSchemaLock {
@@ -317,67 +325,156 @@ impl PublicSchemaLock {
     /// deadlock against the bootstrap path.
     const PUBLIC_MEMORIES_LOCK_KEY: i64 = 0x1381_5081_1F50_1357_u64.cast_signed();
 
+    /// Upper bound on how long `acquire()` waits for a leaked / busy
+    /// holder before giving up. A bounded wait surfaces a stuck lock
+    /// as a fast, legible test failure instead of an unbounded hang
+    /// that CI only kills at the 45-min job `timeout-minutes` cap.
+    const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+    /// Poll cadence for the `pg_try_advisory_lock` deadline-loop.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
     /// Acquire the cross-process advisory lock that serialises
     /// ownership of `public.memories`. Returns `None` when
     /// `AI_MEMORY_TEST_POSTGRES_URL` is unset so the caller can
     /// `eprintln!("skip: …")` and return early.
     ///
-    /// The acquisition queues behind any existing holder
-    /// (`pg_advisory_lock` is the queued, not the try-shape, variant)
-    /// — slow peer tests simply make us wait.
+    /// ## Why a dedicated owner thread
     ///
-    /// Designed to be `await`-ed from inside a `#[tokio::test]`
-    /// runtime — we deliberately do NOT spin up a private runtime
-    /// here because nested runtimes panic with "Cannot start a
-    /// runtime from within a runtime" under sqlx's current-thread
-    /// driver.
-    pub async fn acquire() -> Option<Self> {
+    /// Postgres advisory locks are *session-scoped*: a lock taken on
+    /// one connection can only be released by `pg_advisory_unlock` on
+    /// that SAME connection (or by the session closing). The lock is
+    /// also held for the whole lifetime of the guard, which spans
+    /// `.await` points back on the caller's `#[tokio::test]` runtime.
+    ///
+    /// A single dedicated owner thread (with its own current-thread
+    /// runtime) opens one `PgConnection`, takes the lock, signals
+    /// readiness, then parks until `Drop`. The unlock therefore runs
+    /// on the same runtime + connection that took the lock, which is
+    /// what makes the release reliable. The pre-fix design cloned a
+    /// pool built on the test runtime and tried to unlock it from a
+    /// throwaway Drop-time runtime; that cross-runtime pool use failed
+    /// 100% with "pool timed out while waiting for an open connection",
+    /// leaking the lock and hanging the *next* test's acquire until the
+    /// CI job timeout.
+    ///
+    /// ## Why bounded `pg_try_advisory_lock` instead of `pg_advisory_lock`
+    ///
+    /// `pg_advisory_lock` waits unboundedly behind any holder — and a
+    /// holder leaked by the old Drop bug meant the next acquire blocked
+    /// until the 45-min job cap. The deadline-loop over the try-shape
+    /// caps the wait at [`Self::ACQUIRE_TIMEOUT`] so a stuck lock fails
+    /// fast and legibly.
+    pub fn acquire() -> Option<Self> {
         let base_url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_secs(10))
-            .connect(&base_url)
-            .await
-            .unwrap_or_else(|e| panic!("PublicSchemaLock: connect: {e}"));
         let key = Self::PUBLIC_MEMORIES_LOCK_KEY;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("PublicSchemaLock: pg_advisory_lock: {e}"));
-        Some(Self { pool, key })
+
+        // `ready_rx` carries the owner thread's lock-acquisition result;
+        // `release_rx` is how `Drop` later signals release + exit.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let owner = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build PublicSchemaLock owner runtime");
+            rt.block_on(async move {
+                use sqlx::Connection as _;
+                let mut conn = match sqlx::PgConnection::connect(&base_url).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("connect: {e}")));
+                        return;
+                    }
+                };
+
+                // Bounded deadline-loop: a leaked / busy holder surfaces
+                // as a fast failure instead of an unbounded wait.
+                let deadline = std::time::Instant::now() + Self::ACQUIRE_TIMEOUT;
+                let got = loop {
+                    match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                        .bind(key)
+                        .fetch_one(&mut conn)
+                        .await
+                    {
+                        Ok(true) => break true,
+                        Ok(false) => {
+                            if std::time::Instant::now() >= deadline {
+                                break false;
+                            }
+                            tokio::time::sleep(Self::POLL_INTERVAL).await;
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("pg_try_advisory_lock: {e}")));
+                            return;
+                        }
+                    }
+                };
+                if !got {
+                    let _ = ready_tx.send(Err(format!(
+                        "timed out after {:?} waiting for advisory lock {key} \
+                         (a prior holder leaked the lock?)",
+                        Self::ACQUIRE_TIMEOUT
+                    )));
+                    return;
+                }
+
+                // Signal success, then park until Drop drops `release_tx`.
+                if ready_tx.send(Ok(())).is_err() {
+                    // The acquire() caller went away before we signalled;
+                    // release and exit so we don't leak the lock.
+                    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                        .bind(key)
+                        .execute(&mut conn)
+                        .await;
+                    return;
+                }
+                // We are the only task on this current-thread runtime, so a
+                // blocking std-channel recv here is fine — it parks the
+                // thread until Drop signals (or disconnects).
+                let _ = release_rx.recv();
+                if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(key)
+                    .execute(&mut conn)
+                    .await
+                {
+                    eprintln!("PublicSchemaLock: pg_advisory_unlock failed: {e}");
+                }
+                // `conn` drops here on its own runtime — clean session close.
+            });
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Some(Self {
+                release_tx: Some(release_tx),
+                owner: Some(owner),
+            }),
+            Ok(Err(e)) => {
+                let _ = owner.join();
+                panic!("PublicSchemaLock: {e}");
+            }
+            Err(_) => {
+                let _ = owner.join();
+                panic!("PublicSchemaLock: owner thread exited before signalling readiness");
+            }
+        }
     }
 }
 
 impl Drop for PublicSchemaLock {
     fn drop(&mut self) {
-        // Release the advisory lock explicitly. Best-effort — Drop
-        // is infallible by trait contract, so we eprintln on
-        // failure rather than propagating.
-        //
-        // Drop is sync; sqlx is async. Spawn a thread that builds its
-        // OWN tokio runtime so we don't double-enter the test
-        // runtime. The thread joins before Drop returns so the lock
-        // is reliably released by the time the next test's
-        // `acquire()` can re-take it.
-        let key = self.key;
-        let pool = self.pool.clone();
-        let join = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build PublicSchemaLock drop-time tokio runtime");
-            rt.block_on(async move {
-                sqlx::query("SELECT pg_advisory_unlock($1)")
-                    .bind(key)
-                    .execute(&pool)
-                    .await
-            })
-        });
-        match join.join() {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => eprintln!("PublicSchemaLock: pg_advisory_unlock failed: {e}"),
-            Err(e) => eprintln!("PublicSchemaLock: unlock thread panicked: {e:?}"),
+        // Tell the owner thread to release the advisory lock + exit by
+        // dropping the Sender (disconnects `release_rx.recv()`), then
+        // join so the lock is reliably gone before the next test's
+        // `acquire()` runs. The unlock executes on the SAME connection
+        // + runtime that took the lock (advisory locks are
+        // session-scoped), which is what makes release reliable.
+        drop(self.release_tx.take());
+        if let Some(owner) = self.owner.take()
+            && let Err(e) = owner.join()
+        {
+            eprintln!("PublicSchemaLock: owner thread panicked: {e:?}");
         }
     }
 }
