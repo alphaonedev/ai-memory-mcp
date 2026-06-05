@@ -53,6 +53,12 @@ pub const CREDENTIAL_SIG_LEN: usize = ed25519_dalek::SIGNATURE_LENGTH;
 /// Length of the subject Ed25519 verifying key.
 pub const SUBJECT_PUBKEY_LEN: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
 
+/// Filesystem path to this node's held outbound credential — the
+/// `X-Memory-Cred` header value (`v1=<base64>`) written by the renewal
+/// worker (ADR-001 Decision 5). Unset = this node holds no credential and
+/// falls back to legacy per-peer enrollment on the wire.
+pub const FED_CREDENTIAL_PATH_ENV: &str = "AI_MEMORY_FED_CREDENTIAL_PATH";
+
 // ---- canonical claim field keys (lexicographically ordered by BTreeMap) ----
 const FIELD_CRED_VERSION: &str = "cred_version";
 const FIELD_ISSUER_ID: &str = "issuer_id";
@@ -394,6 +400,37 @@ impl SignedCredential {
         }
         Ok(())
     }
+
+    /// Load a held outbound credential from a file whose contents are the
+    /// `X-Memory-Cred` header value (`v1=<base64>`, as produced by
+    /// [`Self::to_header_value`]). A missing file is `Ok(None)` — holding no
+    /// credential is the normal pre-enrollment state, not an error.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on a read fault other than not-found, or
+    /// `InvalidData` if the file content is not a parseable header value.
+    pub fn load_from_path(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let cred = Self::from_header_value(raw.trim())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(cred))
+    }
+
+    /// Load the held outbound credential named by [`FED_CREDENTIAL_PATH_ENV`].
+    /// An unset env var is `Ok(None)` — this node simply holds no credential.
+    ///
+    /// # Errors
+    /// Propagates [`Self::load_from_path`] faults.
+    pub fn load_from_env() -> std::io::Result<Option<Self>> {
+        match std::env::var(FED_CREDENTIAL_PATH_ENV) {
+            Ok(path) => Self::load_from_path(std::path::Path::new(&path)),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 /// Map a missing-prefix header to the right error: a recognised future
@@ -598,6 +635,75 @@ mod tests {
         assert_eq!(
             SignedCredential::from_wire_bytes(&[0x01, 0x02, 0x03]).unwrap_err(),
             CredentialError::Malformed
+        );
+    }
+
+    // ---- FED-P3a: held outbound credential loader ----
+
+    fn loader_scratch_dir() -> std::path::PathBuf {
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        dir.push(".local-runs");
+        dir.push("test-tmp");
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn unique_cred_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        loader_scratch_dir().join(format!("cred-{label}-{nanos}.cred"))
+    }
+
+    #[test]
+    fn load_from_path_round_trips_a_written_credential() {
+        let ca = ca_key(11);
+        let now = 1_900_000_000;
+        let signed = sample(now).sign(&ca).expect("sign");
+        let header = signed.to_header_value().expect("encode");
+        let path = unique_cred_path("roundtrip");
+        std::fs::write(&path, format!("{header}\n")).expect("write cred file");
+
+        let loaded = SignedCredential::load_from_path(&path)
+            .expect("io ok")
+            .expect("present");
+        assert_eq!(loaded.credential(), signed.credential());
+        loaded
+            .verify_against(&ca.verifying_key(), now)
+            .expect("loaded credential still verifies");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_path_missing_file_is_none() {
+        let path = unique_cred_path("missing");
+        assert!(
+            SignedCredential::load_from_path(&path)
+                .expect("missing file is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_from_path_malformed_content_is_invalid_data() {
+        let path = unique_cred_path("garbage");
+        std::fs::write(&path, "not-a-credential").expect("write");
+        let err = SignedCredential::load_from_path(&path).expect_err("malformed must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_env_unset_is_none() {
+        // SAFETY: single-threaded within this test; we only remove the var.
+        unsafe {
+            std::env::remove_var(FED_CREDENTIAL_PATH_ENV);
+        }
+        assert!(
+            SignedCredential::load_from_env()
+                .expect("unset env is not an error")
+                .is_none()
         );
     }
 }
