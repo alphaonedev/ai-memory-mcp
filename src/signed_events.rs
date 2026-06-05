@@ -190,6 +190,18 @@ pub mod event_types {
     /// (`src/atomisation/mod.rs::943`). v0.7.0 Batman Form 1-4
     /// atomisation engine.
     pub const ATOMISATION_COMPLETE: &str = "atomisation_complete";
+
+    /// `signed_events.event_type` for an outbound federation credential
+    /// renewal — emitted by the file-refresh renewal worker
+    /// (`src/federation/identity/renewal.rs`) on every tick that swaps a
+    /// freshly-issued credential into the live send path
+    /// ([`crate::federation::identity::renewal::RenewalOutcome::Reloaded`]).
+    /// This is the FED-P4-f §8 audit obligation: the node's own
+    /// credential lifecycle is recorded in the tamper-evident chain.
+    /// Issuance (`FederationIssuer`) is centrally operated and revocation
+    /// is by self-expiry (no CRL — see `issuer.rs`), so renewal is the
+    /// only node-local lifecycle transition there is to audit.
+    pub const FED_CREDENTIAL_RENEWED: &str = "federation.credential_renewed";
 }
 
 /// One row of the `signed_events` audit table.

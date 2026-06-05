@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+use crate::federation::identity::chain::CHAIN_HEADER;
+use crate::federation::identity::credential::CREDENTIAL_HEADER;
+use crate::federation::identity::outbound;
 use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingAction, PendingDecision};
 use crate::replication::{AckTracker, QuorumError};
 
@@ -125,6 +128,36 @@ pub(super) async fn post_once(
         .filter(|s| !s.is_empty())
     {
         req = req.header(crate::federation::peer_attestation::PEER_ID_HEADER, peer_id);
+    }
+    // FED-P3a — attach this node's CA-issued credential so the receiver
+    // can verify our per-message signature against the trust bundle
+    // instead of a manually enrolled `.pub` (the sender half of the
+    // receiver swap in `federation_signing_check::resolve_peer_verifying_key`).
+    // Held-credential absence is the normal pre-enrollment state; a
+    // malformed-encode is logged and skipped, never fatal — the wire
+    // still carries the legacy signature, so this degrades to per-peer.
+    if let Some(cred) = outbound::current() {
+        match cred.to_header_value() {
+            Ok(value) => req = req.header(CREDENTIAL_HEADER, value),
+            Err(e) => {
+                tracing::warn!(target: "federation::signing", error = %e,
+                    "failed to encode outbound federation credential header; omitting");
+            }
+        }
+        // FED-P4d — when the leaf is signed by an intermediate rather than a
+        // root, also attach the anchor-first intermediate chain so a peer
+        // holding only the root in its trust bundle can verify the full
+        // chain. A node holding no intermediates (the P2/P3 one-level case)
+        // emits no chain header, so the wire stays byte-identical to pre-P4.
+        let intermediates = outbound::current_intermediates();
+        match crate::federation::identity::chain::intermediates_to_header_value(&intermediates) {
+            Ok(Some(value)) => req = req.header(CHAIN_HEADER, value),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(target: "federation::signing", error = %e,
+                    "failed to encode outbound federation chain header; omitting");
+            }
+        }
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
