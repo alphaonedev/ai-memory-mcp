@@ -64,7 +64,22 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // hot-path query rewrite plus its plan-shape + behavioral regression
     // coverage, zero speculative surface. 16_300 = 16_248 + 52 headroom;
     // far under the 1.5x cap.
-    ("src/storage/mod.rs", 16_300),
+    //
+    // 2026-06-05 — bumped 16_300 → 16_400 by the storage/mod.rs coverage
+    // floor restoration: the Per-Module Coverage Thresholds gate flagged
+    // storage/mod.rs at 93.90% < its 94% floor (a latent regression
+    // unmasked once the #92 hnsw concurrent-rebuild flake stopped
+    // short-circuiting the run at test-exec). The fix adds a DB-free
+    // `is_visible_scope_matrix_covers_every_arm` test pinning every
+    // MemoryScope arm of the Rust-side visibility predicate
+    // (`is_visible` / `matches_subtree` / `compute_visibility_prefixes`),
+    // which integration recall only exercises for whichever scope the
+    // fixture corpus carries — leaving the other arms uncovered. The
+    // ~122-LOC `mod tests` addition pushed the file to 16_370. Growth is
+    // justified: pure regression coverage that lifts the file back over
+    // its 94% floor, zero new production surface. 16_400 = 16_370 + 30
+    // headroom; far under the 1.5x cap.
+    ("src/storage/mod.rs", 16_400),
     ("src/mcp/mod.rs", 14_000),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
