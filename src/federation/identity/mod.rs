@@ -14,6 +14,7 @@
 //! owns its own identity surface, distinct from the low-level crypto in
 //! [`crate::identity`].
 
+pub mod chain;
 pub mod credential;
 pub mod inventory;
 pub mod issuer;
