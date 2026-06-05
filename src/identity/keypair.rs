@@ -129,7 +129,7 @@ pub(crate) fn key_dir_env_lock() -> &'static std::sync::Mutex<()> {
 ///
 /// `AI_MEMORY_KEY_DIR` env-var override: when set and non-empty, that
 /// path is returned verbatim. This mirrors the env-override pattern
-/// other paths in `ai-memory` use (`AI_MEMORY_DB_PATH`,
+/// other paths in `ai-memory` use (`AI_MEMORY_DB`,
 /// `AI_MEMORY_AGENT_ID`) and lets H4's `memory_verify` integration
 /// tests stand up an isolated key dir per test without shelling out to
 /// the operator's real `~/.config/ai-memory/keys/`. Operators who want
