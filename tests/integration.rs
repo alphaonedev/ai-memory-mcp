@@ -27,6 +27,16 @@ const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // #1501 — the CLI `recall`/`store` subprocesses default to the semantic
+    // tier, which lazily downloads the MiniLM weights from HuggingFace Hub on
+    // first touch. Spawned once per test, many of these race on the shared
+    // hf-hub cache lock on a cold CI cache and stack into a multi-minute hang
+    // (caught by the #1492 watchdog). These tests assert budget/ranking/wire
+    // behavior, not embedding quality, and already tolerate the keyword
+    // fallback — so force the embedder offline to keep the suite hermetic and
+    // deterministic. The model-load path itself is covered by the embeddings
+    // unit tests.
+    c.env("AI_MEMORY_EMBED_OFFLINE", "1");
     // v0.7.0 K3 — the integration suite asserts the gate's strict
     // semantics (Pending/Deny on policy violation). The v0.7.0
     // process default for `permissions.mode` is `advisory` (log +

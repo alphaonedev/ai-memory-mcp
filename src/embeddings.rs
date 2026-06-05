@@ -197,14 +197,26 @@ impl Embedder {
     pub fn new_local() -> Result<Self> {
         let device = Device::Cpu;
 
-        let (config_path, tokenizer_path, weights_path) =
+        let (config_path, tokenizer_path, weights_path) = if Self::remote_fetch_disabled() {
+            // Offline mode (#1501): skip the network HF-Hub fetch entirely and
+            // rely solely on a pre-staged cache. This eliminates the cold-cache
+            // concurrent-download race — many parallel `ai-memory recall`
+            // subprocesses (the integration suite spawns one per test, all
+            // first-touch-downloading the same MiniLM weights) serialise on the
+            // hf-hub cache lock at up to HF_DOWNLOAD_TIMEOUT each, stacking to a
+            // multi-minute stall. When the cache is absent this `?` errors fast
+            // and the caller degrades to the keyword path (same contract as a
+            // timed-out download), but without any network wait.
+            Self::load_from_fallback()?
+        } else {
             match Self::download_within(HF_DOWNLOAD_TIMEOUT, Self::download_via_hf_hub) {
                 Ok(paths) => paths,
                 Err(e) => {
                     eprintln!("ai-memory: hf-hub download failed ({e}), trying fallback dir");
                     Self::load_from_fallback()?
                 }
-            };
+            }
+        };
 
         let config_data =
             std::fs::read_to_string(&config_path).context("failed to read config.json")?;
@@ -613,6 +625,20 @@ impl Embedder {
             .get("model.safetensors")
             .context("failed to download model.safetensors")?;
         Ok((config_path, tokenizer_path, weights_path))
+    }
+
+    /// Whether the local MiniLM embedder must avoid the network and use only
+    /// a pre-staged cache. Honors the de-facto-standard `HF_HUB_OFFLINE` plus
+    /// the dedicated `AI_MEMORY_EMBED_OFFLINE` knob. Used by hermetic CI (the
+    /// integration suite sets it to dodge the #1501 cold-download race) and by
+    /// air-gapped operators who pre-stage the weights in `FALLBACK_MODEL_SUBDIR`.
+    fn remote_fetch_disabled() -> bool {
+        let truthy = |name: &str| {
+            std::env::var(name)
+                .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false)
+        };
+        truthy("AI_MEMORY_EMBED_OFFLINE") || truthy("HF_HUB_OFFLINE")
     }
 
     fn load_from_fallback() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
@@ -1506,6 +1532,60 @@ fn load_from_fallback_succeeds_when_files_present() {
     assert!(cfg.ends_with("config.json"));
     assert!(tok.ends_with("tokenizer.json"));
     assert!(w.ends_with("model.safetensors"));
+}
+
+#[test]
+fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
+    // #1501 — with the offline knob set and no pre-staged cache, `new_local`
+    // must take the no-network branch and surface the fallback error fast
+    // (the caller then degrades to keyword). This proves the cold-download
+    // race can't happen: no HF-Hub fetch is attempted at all.
+    use std::sync::Mutex;
+    // env::set_var + HOME are process-wide; serialize against the other
+    // env-mutating tests in this module.
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-memory-1501-offline-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp).expect("mk empty home");
+    let prev_home = std::env::var("HOME").ok();
+    let prev_off = std::env::var("AI_MEMORY_EMBED_OFFLINE").ok();
+    // SAFETY: serialized via LOCK; no other thread mutates these here.
+    unsafe {
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
+    }
+    assert!(
+        Embedder::remote_fetch_disabled(),
+        "offline knob must be honored"
+    );
+    let result = Embedder::new_local();
+    // Restore env before any assertion that could panic.
+    unsafe {
+        match prev_home {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_off {
+            Some(v) => std::env::set_var("AI_MEMORY_EMBED_OFFLINE", v),
+            None => std::env::remove_var("AI_MEMORY_EMBED_OFFLINE"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    let msg = match result {
+        Ok(_) => panic!("empty cache + offline must error (degrades to keyword)"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("not found") || msg.contains("fallback"),
+        "offline empty-cache error should point at the fallback dir: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
