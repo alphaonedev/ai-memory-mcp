@@ -6,6 +6,10 @@
 # its threshold. Passes (exit 0) when all per-module thresholds hold
 # AND the global floor is met.
 #
+# Also emits non-fatal CANARY warnings (#1424) for any module that clears
+# its floor by less than 0.5pp — a proactive flag for fragile floors that
+# are one unrelated-churn commit away from a CI regression.
+#
 # Usage:
 #   bash coverage/check-thresholds.sh [thresholds.toml] [cov.json]
 #
@@ -109,6 +113,17 @@ while IFS= read -r line; do
 
     if awk "BEGIN { exit !($current >= $threshold) }"; then
       pass_count=$((pass_count + 1))
+      # Canary (#1424): a module that clears its floor by <0.5pp is one churn
+      # commit away from a fragile-floor CI regression (the failure mode that
+      # filed #1424 — daemon_runtime.rs slipping 85.88%→84.89% on unrelated
+      # whole-workspace branch-count drift). Warn, never fail: this is a
+      # proactive flag for maintainers to add headroom before it trips.
+      if awk "BEGIN { exit !(($current - $threshold) < 0.5) }"; then
+        headroom=$(awk "BEGIN { printf \"%.2f\", $current - $threshold }")
+        printf 'CANARY: %-44s measured %.2f%% clears floor %s%% by only %spp (<0.5pp)\n' \
+          "$path" "$current" "$threshold" "$headroom"
+        warn_count=$((warn_count + 1))
+      fi
     else
       printf 'FAIL: %-44s measured %.2f%% < threshold %s%%\n' \
         "$path" "$current" "$threshold"
