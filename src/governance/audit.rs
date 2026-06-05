@@ -1374,10 +1374,18 @@ mod tests {
         let pubkey = key.verifying_key();
         fresh_init(tmp.path(), Some(key));
 
+        // Unique agent-id markers for THIS test so the recovery
+        // assertion can check its own rows by identity and stay robust
+        // to foreign modules that bleed unrelated rows into the
+        // process-global sink (#1495).
+        let agent_phase_a = "ai:test-a";
+        let agent_bleed = "ai:bleed-from-elsewhere";
+        let agent_phase_b = "ai:test-b";
+
         // Test A writes 3 records.
         for i in 0..3 {
             record_decision(
-                "ai:test-a",
+                agent_phase_a,
                 "allow",
                 "bash",
                 &format!("R00{i}"),
@@ -1391,9 +1399,9 @@ mod tests {
         // extra record. With the global sink shared, this lands in
         // tmp_A — proving the bleed vector exists when callers
         // ignore the lock.
-        let handle = std::thread::spawn(|| {
+        let handle = std::thread::spawn(move || {
             record_decision(
-                "ai:bleed-from-elsewhere",
+                agent_bleed,
                 "allow",
                 "bash",
                 "R999",
@@ -1436,18 +1444,37 @@ mod tests {
         // regardless of what bled in before.
         fresh_init(tmp.path(), Some(fresh_key()));
         record_decision(
-            "ai:test-b",
+            agent_phase_b,
             "allow",
             "bash",
             "R001",
             serde_json::json!({"b": 1}),
         );
         shutdown();
-        let report_after_recover =
-            verify_since(tmp.path(), &since, None).expect("verify after recover");
-        assert_eq!(
-            report_after_recover.total_lines, 1,
-            "fresh_init must clear the tempdir so test-B sees only its own row"
+
+        // Deterministic, foreign-bleed-robust recovery check: read THIS
+        // test's recovered forensic file and assert by unique agent id
+        // that fresh_init truncated the pre-bleed rows (phase-A + bleed
+        // gone) while test-B's own row survived. A global `total_lines`
+        // equality is unsound here — concurrent foreign modules append
+        // unrelated rows to the shared sink during the recovery window
+        // (#1495), the same reason the upper bound above was retired.
+        let recovered_path = tmp.path().join(format!(
+            "{FORENSIC_FILE_PREFIX}{since}{FORENSIC_FILE_SUFFIX}"
+        ));
+        let recovered =
+            std::fs::read_to_string(&recovered_path).expect("read recovered forensic file");
+        assert!(
+            !recovered.contains(agent_phase_a),
+            "fresh_init must clear pre-bleed phase-A rows; found {agent_phase_a} in {recovered_path:?}"
+        );
+        assert!(
+            !recovered.contains(agent_bleed),
+            "fresh_init must clear the bled row; found {agent_bleed} in {recovered_path:?}"
+        );
+        assert!(
+            recovered.contains(agent_phase_b),
+            "test-B's own row must survive fresh_init; missing {agent_phase_b} in {recovered_path:?}"
         );
     }
 
