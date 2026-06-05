@@ -334,24 +334,48 @@ jobs:
           echo "count:  ${TEST_IMPACT_COUNT:-unset} / ${TEST_IMPACT_TOTAL:-unset}"
           echo "impact: ${TEST_IMPACT:-unset}"
           echo "::endgroup::"
+
+          # #1492 hung-test watchdog. libtest has no built-in per-test
+          # timeout, so a single wedged integration test (e.g. an ephemeral
+          # TCP port-bind / wait_for_ready race) used to stall this step
+          # silently until the job-level `timeout-minutes: 45` killed it —
+          # ~34 min of wasted budget and ZERO diagnosability (the hung
+          # test's name never printed). Wrap each invocation in GNU
+          # `timeout` so a hang fails the STEP fast (25 min < the 45 min
+          # job cap) with a named ::error:: pointing at the logged impact
+          # set, instead of a silent job-level cancel. SIGTERM lets libtest
+          # flush partial output; --kill-after escalates to SIGKILL for a
+          # truly wedged process.
+          run_tests() {
+            local label="$1"; shift
+            local rc=0
+            timeout --signal=TERM --kill-after=60 1500 cargo test "$@" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                echo "::error::[#1492 watchdog] '${label}' exceeded the 1500s per-invocation timeout and was terminated (previously a silent ~34min hang until the 45min job cap). Reproduce with the impact set logged above; then file a follow-up for the specific flaky test."
+              fi
+              return "$rc"
+            fi
+          }
+
           case "${TEST_IMPACT:-__ALL__}" in
             __SKIP__)
               echo "::notice::docs-only diff — test step is a no-op"
               ;;
             __ALL__|"")
               echo "::notice::running FULL test suite"
-              cargo test
+              run_tests "full suite (cargo test)"
               ;;
             *)
               # Always run --lib first (catches every inline unit test)
               echo "::notice::running cargo test --lib + impact-selected integration binaries"
-              cargo test --lib
+              run_tests "cargo test --lib" --lib
               # Dispatch each impacted tests/*.rs binary
               ARGS=()
               for t in $TEST_IMPACT; do
                 ARGS+=(--test "$t")
               done
-              cargo test "${ARGS[@]}"
+              run_tests "impact-selected integration binaries (${TEST_IMPACT})" "${ARGS[@]}"
               ;;
           esac
 
