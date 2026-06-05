@@ -10573,6 +10573,128 @@ mod tests {
         }
     }
 
+    fn mem_with_scope(ns: &str, scope: Option<&str>) -> Memory {
+        let mut m = make_memory("scoped", ns, Tier::Long, 5);
+        if let Some(s) = scope {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                crate::META_KEY_SCOPE.to_string(),
+                serde_json::Value::String(s.to_string()),
+            );
+            m.metadata = serde_json::Value::Object(map);
+        }
+        m
+    }
+
+    // Pins the Rust-side visibility predicate (`is_visible`) that the HNSW
+    // recall branch uses when SQL-side visibility can't be attached. Exercises
+    // every `MemoryScope` arm plus `matches_subtree`, which the integration
+    // recall paths only hit for whichever scope the fixture corpus happens to
+    // carry — leaving the other arms uncovered. Deterministic, no DB.
+    #[test]
+    fn is_visible_scope_matrix_covers_every_arm() {
+        // No-agent caller (all-None prefixes) bypasses the filter entirely.
+        let unfiltered = (None, None, None, None);
+        assert!(super::is_visible(
+            &mem_with_scope("acme/eng/web", Some("private")),
+            &unfiltered
+        ));
+
+        // 4-level agent ns populates every prefix slot:
+        // p=acme/eng/web/team, t=acme/eng/web, u=acme/eng, o=acme.
+        let prefixes = super::compute_visibility_prefixes(Some("acme/eng/web/team"));
+        assert_eq!(
+            prefixes,
+            (
+                Some("acme/eng/web/team".to_string()),
+                Some("acme/eng/web".to_string()),
+                Some("acme/eng".to_string()),
+                Some("acme".to_string()),
+            )
+        );
+
+        // Collective: visible to anyone.
+        assert!(super::is_visible(
+            &mem_with_scope("zzz/other", Some("collective")),
+            &prefixes
+        ));
+
+        // Private: only the caller's own namespace (p) is visible.
+        assert!(super::is_visible(
+            &mem_with_scope("acme/eng/web/team", Some("private")),
+            &prefixes
+        ));
+        assert!(!super::is_visible(
+            &mem_with_scope("acme/eng/web", Some("private")),
+            &prefixes
+        ));
+
+        // Absent scope key → MemoryScope::default() (Private) semantics.
+        assert!(super::is_visible(
+            &mem_with_scope("acme/eng/web/team", None),
+            &prefixes
+        ));
+        assert!(!super::is_visible(
+            &mem_with_scope("acme/other", None),
+            &prefixes
+        ));
+
+        // Team subtree (t = acme/eng/web): exact + descendant in, sibling out.
+        assert!(super::is_visible(
+            &mem_with_scope("acme/eng/web", Some("team")),
+            &prefixes
+        ));
+        assert!(super::is_visible(
+            &mem_with_scope("acme/eng/web/team/v2", Some("team")),
+            &prefixes
+        ));
+        assert!(!super::is_visible(
+            &mem_with_scope("acme/eng/api", Some("team")),
+            &prefixes
+        ));
+
+        // Unit subtree (u = acme/eng).
+        assert!(super::is_visible(
+            &mem_with_scope("acme/eng", Some("unit")),
+            &prefixes
+        ));
+        assert!(!super::is_visible(
+            &mem_with_scope("acme/sales", Some("unit")),
+            &prefixes
+        ));
+
+        // Org subtree (o = acme).
+        assert!(super::is_visible(
+            &mem_with_scope("acme", Some("org")),
+            &prefixes
+        ));
+        assert!(!super::is_visible(
+            &mem_with_scope("globex", Some("org")),
+            &prefixes
+        ));
+
+        // matches_subtree None arm: a shallow agent leaves the org slot empty,
+        // so an org-scoped memory is denied (no prefix to match against).
+        let shallow = super::compute_visibility_prefixes(Some("acme"));
+        assert_eq!(shallow.3, None);
+        assert!(!super::is_visible(
+            &mem_with_scope("acme", Some("org")),
+            &shallow
+        ));
+
+        // Unknown scope string → from_str None → caller denied.
+        assert!(!super::is_visible(
+            &mem_with_scope("acme/eng/web/team", Some("definitely-not-a-scope")),
+            &prefixes
+        ));
+
+        // None-agent → all-None tuple (the no-filter sentinel).
+        assert_eq!(
+            super::compute_visibility_prefixes(None),
+            (None, None, None, None)
+        );
+    }
+
     #[test]
     fn open_creates_schema() {
         let conn = test_db();
