@@ -37,10 +37,22 @@
 //! [`SignedCredential::verify_against`]. [`subject_in_delegated_namespace`]
 //! is a pure helper callers may apply on the returned leaf.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::VerifyingKey;
 
-use super::credential::{CredentialError, FederationCredential, SignedCredential};
+use super::credential::{
+    CREDENTIAL_PREFIX, CredentialError, FederationCredential, SignedCredential,
+};
 use super::trust_bundle::TrustBundle;
+
+/// HTTP header carrying the base64(CBOR) array of *intermediate* CA certs
+/// (anchor-first) for a hierarchical credential. The leaf still travels in
+/// [`super::credential::CREDENTIAL_HEADER`]; this header is emitted only when
+/// the leaf is signed by an intermediate rather than a root, so single-level
+/// P2/P3 peers never send it and receivers that see it absent verify exactly
+/// as they did pre-P4.
+pub const CHAIN_HEADER: &str = "x-memory-cred-chain";
 
 /// Default maximum chain depth (levels, leaf inclusive). `2` is the P4
 /// target: root → intermediate → leaf is depth 2 (one intermediate + the
@@ -148,6 +160,60 @@ impl CertChain {
     #[must_use]
     pub fn depth(&self) -> usize {
         self.intermediates.len() + 1
+    }
+
+    /// Encode the anchor-first intermediates as the [`CHAIN_HEADER`] value
+    /// (`v1=<base64(CBOR array of credential wire envelopes)>`), or `None`
+    /// when the chain is one-level (no intermediates ⇒ no chain header, so a
+    /// hierarchical sender degrades to the exact P2/P3 wire when it happens to
+    /// hold a root-signed leaf). The leaf is encoded separately via
+    /// [`SignedCredential::to_header_value`] into the credential header.
+    ///
+    /// # Errors
+    /// [`CredentialError::Malformed`] on an internal serialisation fault.
+    pub fn intermediates_header_value(&self) -> Result<Option<String>, CredentialError> {
+        if self.intermediates.is_empty() {
+            return Ok(None);
+        }
+        let mut items = Vec::with_capacity(self.intermediates.len());
+        for ic in &self.intermediates {
+            items.push(ciborium::Value::Bytes(ic.to_wire_bytes()?));
+        }
+        let value = ciborium::Value::Array(items);
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&value, &mut out).map_err(|_| CredentialError::Malformed)?;
+        Ok(Some(format!("{CREDENTIAL_PREFIX}{}", B64.encode(out))))
+    }
+
+    /// Parse a [`CHAIN_HEADER`] value (`v1=<base64(CBOR array)>`) into the
+    /// anchor-first intermediates list. Pair with a leaf parsed from the
+    /// credential header to reconstruct a [`CertChain`] via [`Self::new`].
+    ///
+    /// # Errors
+    /// [`CredentialError::Malformed`] on a missing prefix, bad base64, or a
+    /// structurally invalid CBOR array / envelope.
+    pub fn intermediates_from_header_value(
+        value: &str,
+    ) -> Result<Vec<SignedCredential>, CredentialError> {
+        let b64 = value
+            .strip_prefix(CREDENTIAL_PREFIX)
+            .ok_or(CredentialError::Malformed)?;
+        let wire = B64.decode(b64).map_err(|_| CredentialError::Malformed)?;
+        let parsed: ciborium::Value =
+            ciborium::de::from_reader(&wire[..]).map_err(|_| CredentialError::Malformed)?;
+        let items = match parsed {
+            ciborium::Value::Array(a) => a,
+            _ => return Err(CredentialError::Malformed),
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let bytes = match item {
+                ciborium::Value::Bytes(b) => b,
+                _ => return Err(CredentialError::Malformed),
+            };
+            out.push(SignedCredential::from_wire_bytes(&bytes)?);
+        }
+        Ok(out)
     }
 
     /// Verify the whole chain against `bundle` at `now_unix`, rejecting
@@ -321,6 +387,64 @@ mod tests {
             .verify(&bundle, NOW, DEFAULT_MAX_CHAIN_DEPTH)
             .expect("chain verifies");
         assert_eq!(verified.subject_agent_id, "region/nyc/node-1");
+    }
+
+    #[test]
+    fn intermediates_header_round_trips_and_reverifies() {
+        let (bundle, inter, leaf) = two_level_setup();
+        let chain = CertChain::new(leaf, vec![inter]);
+
+        // Encode the intermediates to the chain header, parse them back,
+        // reassemble with a freshly-decoded leaf, and prove the rebuilt
+        // chain still verifies against the root-only bundle.
+        let header = chain
+            .intermediates_header_value()
+            .expect("encode chain header")
+            .expect("two-level chain emits a header");
+        let parsed_inters =
+            CertChain::intermediates_from_header_value(&header).expect("parse chain header");
+        let leaf_header = chain.leaf.to_header_value().expect("encode leaf");
+        let parsed_leaf = SignedCredential::from_header_value(&leaf_header).expect("parse leaf");
+
+        let rebuilt = CertChain::new(parsed_leaf, parsed_inters);
+        let verified = rebuilt
+            .verify(&bundle, NOW, DEFAULT_MAX_CHAIN_DEPTH)
+            .expect("rebuilt chain verifies");
+        assert_eq!(verified.subject_agent_id, "region/nyc/node-1");
+    }
+
+    #[test]
+    fn direct_chain_emits_no_intermediates_header() {
+        let root = signing_key(60);
+        let node = signing_key(61);
+        let leaf = mint(
+            &root,
+            "root",
+            "region/nyc/node-1",
+            &node.verifying_key(),
+            DOMAIN,
+            NOW + 3600,
+        );
+        let chain = CertChain::direct(leaf);
+        assert!(
+            chain
+                .intermediates_header_value()
+                .expect("encode")
+                .is_none(),
+            "a one-level chain must emit no chain header"
+        );
+    }
+
+    #[test]
+    fn malformed_chain_header_is_rejected() {
+        assert_eq!(
+            CertChain::intermediates_from_header_value("not-a-prefix").unwrap_err(),
+            CredentialError::Malformed
+        );
+        assert_eq!(
+            CertChain::intermediates_from_header_value("v1=@@notbase64@@").unwrap_err(),
+            CredentialError::Malformed
+        );
     }
 
     #[test]
