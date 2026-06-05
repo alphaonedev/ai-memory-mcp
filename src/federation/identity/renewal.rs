@@ -22,10 +22,19 @@
 //! `refresh_once → sleep(interval)`. The decision core ([`apply_refresh`])
 //! is pure and unit-tested off the process-global holder.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use super::credential::SignedCredential;
 use super::outbound::{self, OutboundCredentialHolder};
+
+/// Wall-clock UNIX seconds of the last tick that observed a held
+/// credential (seeded on first observation, advanced on every
+/// successful reload). Backs the FED-P4-e renewal-lag SLO: a lag that
+/// grows without bound means the refresh worker is no longer pulling a
+/// fresh credential even though its thread is alive. `0` = not yet
+/// observed.
+static LAST_RENEW_UNIX: AtomicI64 = AtomicI64::new(0);
 
 /// Default interval between credential-file refresh checks. One minute is
 /// far below any sane credential TTL, so a freshly written credential is
@@ -93,9 +102,28 @@ pub fn refresh_once(holder: &OutboundCredentialHolder, now_unix: i64) -> Renewal
     if outcome == RenewalOutcome::Reloaded {
         tracing::info!(target: "federation::signing",
             "outbound federation credential reloaded from disk");
+        // A fresh credential landed — reset the renewal-lag clock.
+        LAST_RENEW_UNIX.store(now_unix, Ordering::Relaxed);
     }
     if let Some(current) = holder.current() {
-        let not_after = current.credential().not_after;
+        // FED-P4-e (§8) — refresh the federation-identity SLO gauges on
+        // every tick that observes a held credential.
+        let claims = current.credential();
+        crate::metrics::set_federation_cred_max_age_seconds((now_unix - claims.not_before).max(0));
+        // Seed the lag clock on first observation so a freshly-booted
+        // daemon reports lag 0 rather than `now - 0`.
+        let last = match LAST_RENEW_UNIX.compare_exchange(
+            0,
+            now_unix,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => now_unix,
+            Err(prev) => prev,
+        };
+        crate::metrics::set_federation_renewal_lag_seconds((now_unix - last).max(0));
+
+        let not_after = claims.not_after;
         if now_unix > not_after {
             tracing::warn!(target: "federation::signing", not_after,
                 "held outbound credential has EXPIRED and no fresh credential is on disk; \
@@ -182,6 +210,26 @@ mod tests {
         assert_eq!(
             apply_refresh(&holder, Some(held)),
             RenewalOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn refresh_once_sets_cred_age_gauge() {
+        // A held credential whose not_before is a known distance behind
+        // `now_unix` must drive the max-cred-age gauge to that distance.
+        // (Env var AI_MEMORY_FED_CRED_PATH is unset under the test
+        // harness, so load_from_env yields None and the held cred stays.)
+        let issued = 1_900_000_000;
+        let held = cred_at(issued);
+        let not_before = held.credential().not_before;
+        let holder = OutboundCredentialHolder::new(Some(held));
+        let now = not_before + 1234;
+        let _ = refresh_once(&holder, now);
+        assert_eq!(
+            crate::metrics::registry()
+                .federation_cred_max_age_seconds
+                .get(),
+            1234
         );
     }
 
