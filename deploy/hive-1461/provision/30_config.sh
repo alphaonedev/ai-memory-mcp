@@ -24,6 +24,22 @@ source "$(dirname "$0")/lib.sh"
 
 RENDER_DIR="$RUN_DIR/render"; mkdir -p "$RENDER_DIR"
 SECRETS_DIR="$RUN_DIR/secrets"; mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
+
+# Daemon HTTP api_key (S5-C1 / #1458). The peer `serve` binds 0.0.0.0, and the
+# daemon REFUSES a non-loopback bind when its top-level `api_key` is unset
+# (default-off auth would expose every privileged write endpoint to any caller
+# that can reach the bind address). The top-level `api_key` field has NO
+# env-indirection (unlike [llm].api_key_env), so it is rendered INLINE into the
+# peer config.toml — the canonical S5-C1 mechanism entrypoint.plan-c.sh uses
+# (#845). The file therefore carries a secret and is chmod 0600 on the remote.
+# /api/v1/health is exempt and /api/v1/sync/* bypasses under mTLS, so the
+# federation health gate (50_federation.sh) and peer quorum POSTs succeed
+# WITHOUT presenting the key; only the non-federation privileged surfaces
+# require x-api-key (test clients present it in the P3 phase). Generated once
+# into the gitignored run dir (mode 0600), never committed, never echoed.
+API_PW_FILE="$SECRETS_DIR/api.pw"
+if [ ! -s "$API_PW_FILE" ]; then openssl rand -hex 32 > "$API_PW_FILE"; chmod 600 "$API_PW_FILE"; log "generated daemon api_key -> $API_PW_FILE"; fi
+API_KEY="$(cat "$API_PW_FILE")"
 REMOTE_CFG="/root/.config/ai-memory/config.toml"
 REMOTE_ETC_CFG="/etc/ai-memory/config.toml"
 REMOTE_ENVFILE="/etc/ai-memory/ai-memory.env"
@@ -33,6 +49,15 @@ render_peer_config() {
   cat <<TOML
 schema_version = 2
 tier = "autonomous"
+
+# Daemon HTTP API key (S5-C1 / #1458): REQUIRED because this peer binds 0.0.0.0
+# — the daemon refuses a non-loopback bind without it. TOP-LEVEL field (the
+# [api] subsection is silently ignored by serde; src/config.rs:2283), inline is
+# the only mechanism (no top-level api_key_env). /api/v1/health is exempt and
+# /api/v1/sync/* bypasses under mTLS, so the federation health gate + peer
+# quorum POSTs need not present it; other privileged endpoints require x-api-key
+# (test clients supply it in P3). config.toml is chmod 0600 on the remote.
+api_key = "$API_KEY"
 
 # Embedder: autonomous-tier nomic-embed-text (768-dim) via the local CPU Ollama
 # sidecar (25_ollama_embed.sh). build_embedder() reads these LEGACY FLAT fields,
@@ -116,11 +141,14 @@ push_node() {
     ctrl)  render_ctrl_config  > "$outdir/config.toml" ;;
     *) die "[$host] unknown role '$role'" ;;
   esac
+  # Peer config carries the inline daemon api_key secret; keep it root-only at
+  # rest (mirrors the remote 0600 below). Harmless for agent/ctrl (no secret).
+  chmod 600 "$outdir/config.toml"
 
   log "[$host] pushing config.toml (role=$role)"
   ssh_node "$ip" "mkdir -p /root/.config/ai-memory /etc/ai-memory /var/log/ai-memory/audit"
   scp_to "$outdir/config.toml" "$ip" "$REMOTE_CFG"
-  ssh_node "$ip" "cp '$REMOTE_CFG' '$REMOTE_ETC_CFG'"
+  ssh_node "$ip" "cp '$REMOTE_CFG' '$REMOTE_ETC_CFG'; chmod 600 '$REMOTE_CFG' '$REMOTE_ETC_CFG'"
 
   # Secret EnvironmentFile — only the keys this role actually needs.
   local envf="$SECRETS_DIR/$host.env"
