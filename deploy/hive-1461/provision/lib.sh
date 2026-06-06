@@ -21,6 +21,16 @@ INV_JSON="$RUN_DIR/inventory.json"
 # Campaign + pinned-artifact constants (single source of truth for the toolkit).
 CAMPAIGN="${CAMPAIGN:-hive-1461}"
 FEDERATION_PORT="${FEDERATION_PORT:-9077}"
+
+# Zero-touch first-party trust constants (45_zero_touch.sh). Derived from
+# CAMPAIGN so there is a single source of truth and no bare literal.
+#   * FED_ISSUER_ID  — the campaign CA identity. MUST be slash-free: a trust
+#     bundle is non-recursive, so a slashed issuer-id would nest the published
+#     `<issuer-id>.pub` in a skipped sub-dir → empty bundle → UnknownIssuer.
+#   * FED_TRUST_DOMAIN — scopes every minted credential; a receiver bound to a
+#     different domain rejects it (TrustBundle::with_trust_domain isolation).
+FED_ISSUER_ID="${FED_ISSUER_ID:-$CAMPAIGN-ca}"
+FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 GOLDEN_SHA256="${GOLDEN_SHA256:-5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"

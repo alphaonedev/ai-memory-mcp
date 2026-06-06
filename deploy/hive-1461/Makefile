@@ -28,6 +28,7 @@ PROV_STEPS := \
   25_ollama_embed.sh \
   30_config.sh \
   40_tls.sh \
+  45_zero_touch.sh \
   50_federation.sh
 
 .PHONY: help seed up inventory provision validate test report down preflight require-token
@@ -38,10 +39,10 @@ help: ## Show this help
 	@printf "\nflow: make seed up provision validate test   (teardown: make down)\n\n"
 
 preflight: ## Verify operator-host CLI prerequisites are present
-	@for b in terraform jq openssl ssh scp curl; do \
+	@for b in terraform jq openssl ssh scp curl cargo; do \
 	  command -v $$b >/dev/null 2>&1 || { echo "FATAL: missing prerequisite '$$b'"; exit 1; }; \
 	done
-	@echo "preflight OK (terraform jq openssl ssh scp curl present)"
+	@echo "preflight OK (terraform jq openssl ssh scp curl cargo present)"
 
 require-token:
 	@[ -n "$${DIGITALOCEAN_TOKEN:-}" ] || { echo "FATAL: export DIGITALOCEAN_TOKEN before apply/destroy"; exit 1; }
