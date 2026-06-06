@@ -112,7 +112,7 @@ Per the prime directive pm-v3 (canonical memory `cd8ede94-3376-4837-b570-9d97529
 | Item | Value |
 |------|-------|
 | Campaign date | 2026-05-18 (evening dogfood; post-Gap-7 + post-Track-A) |
-| Operator | binary2029@gmail.com (justin@alpha-one.mobi) |
+| Operator | justin@alpha-one.mobi |
 | Authoring agent | Claude Opus 4.7 (1M context) |
 | Authority | Autonomous execution under pm-v3 (verify-before-claiming + no-operator-handoffs + fix-all-in-current-release) |
 | Prior campaign | `/Users/fate/v07/v07-fixes/docs/v0.7.0/test-campaign-2026-05-18/` (Track A NHI re-run + in-campaign fix batch) |

@@ -75,7 +75,7 @@ Per the prime directive testing-loop addendum (canonical in memory `f1dca8fa` + 
 | Item | Value |
 |------|-------|
 | Campaign date | 2026-05-18 (morning re-run + afternoon fix batch) |
-| Operator | binary2029@gmail.com (justin@alpha-one.mobi) |
+| Operator | justin@alpha-one.mobi |
 | Authoring agent | Claude (Opus 4.7 1M context) |
 | Authority | Autonomous execution authorized by operator 2026-05-18 (connectivity-loss recovery + fix-everything-in-v0.7.0 directive + testing-loop addendum) |
 | Iter checkpoints | `_v070_strategic_tracking/iter #19` (memory `a1697779`), `iter #20` (this campaign verdict) |
