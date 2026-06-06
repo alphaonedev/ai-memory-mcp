@@ -983,7 +983,7 @@ pub fn handle_recall_dto(
 
     // Use hybrid recall if embedder is available
     if let Some(emb) = embedder {
-        match emb.embed(context) {
+        match emb.embed_query(context) {
             Ok(primary_emb) => {
                 // v0.6.0.0: fuse primary query with context-token embedding
                 // at 70/30 when caller supplied conversation tokens.
@@ -991,7 +991,7 @@ pub fn handle_recall_dto(
                     primary_emb
                 } else {
                     let joined = context_tokens.join(" ");
-                    match emb.embed(&joined) {
+                    match emb.embed_query(&joined) {
                         Ok(ctx_emb) => crate::embeddings::Embedder::fuse(
                             &primary_emb,
                             &ctx_emb,

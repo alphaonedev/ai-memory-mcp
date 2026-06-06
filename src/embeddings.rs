@@ -35,6 +35,39 @@ const NOMIC_OLLAMA_MODEL: &str = "nomic-embed-text";
 #[allow(dead_code)]
 const NOMIC_DIM: usize = 768;
 
+/// nomic-embed-text-v1.5 is an ASYMMETRIC retrieval model (#1520):
+/// corpus documents and search queries must each be embedded under a
+/// distinct task-instruction prefix, or the cosine similarity between a
+/// query and the document that answers it collapses. These are the
+/// canonical v1.5 prefixes (trailing space is part of the prefix).
+const NOMIC_PREFIX_DOCUMENT: &str = "search_document: ";
+const NOMIC_PREFIX_QUERY: &str = "search_query: ";
+
+/// Retrieval role of a text handed to the embedder. Drives the
+/// asymmetric task-instruction prefix for backends that require one
+/// (Ollama nomic-embed-text-v1.5); symmetric backends (the in-process
+/// candle MiniLM-L6-v2) ignore it. See #1520.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedRole {
+    /// Text stored / indexed as a corpus document. This is the default
+    /// role for every write/index path and for symmetric comparisons
+    /// (dedup probes, family-descriptor matching).
+    Document,
+    /// Text used as a search query against the corpus (recall paths).
+    Query,
+}
+
+impl EmbedRole {
+    /// The nomic-embed-text-v1.5 task-instruction prefix for this role.
+    #[must_use]
+    pub fn nomic_prefix(self) -> &'static str {
+        match self {
+            Self::Document => NOMIC_PREFIX_DOCUMENT,
+            Self::Query => NOMIC_PREFIX_QUERY,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // v0.7.0 F6 — EmbedStatus surface
 // ---------------------------------------------------------------------------
@@ -144,6 +177,20 @@ pub trait Embed: Send + Sync {
     /// for I/O, tokenisation, or model-forward failures. The
     /// `MockEmbedder` never errors.
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Produce a single embedding vector for `text` used as a search
+    /// query. Default implementation delegates to [`Embed::embed`],
+    /// which is correct for symmetric embedders (and the test
+    /// `MockEmbedder`); the production [`Embedder`] overrides it so the
+    /// asymmetric Ollama nomic backend applies the `search_query:` task
+    /// prefix (#1520).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Embed::embed`].
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text)
+    }
 
     /// Produce embedding vectors for a batch of texts. Default
     /// implementation calls [`Embed::embed`] in a loop; implementors
@@ -298,8 +345,30 @@ impl Embedder {
         }
     }
 
-    /// Generate an embedding for a single text input.
+    /// Generate an embedding for a single text input indexed as a
+    /// corpus document. Thin alias for [`Embedder::embed_with_role`]
+    /// with [`EmbedRole::Document`] — the safe default for every
+    /// write/index path and for symmetric comparisons.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with_role(text, EmbedRole::Document)
+    }
+
+    /// Generate an embedding for a text used as a search query. Thin
+    /// alias for [`Embedder::embed_with_role`] with [`EmbedRole::Query`].
+    /// For the asymmetric Ollama nomic backend this applies the
+    /// `search_query:` task prefix so query↔document cosine is
+    /// meaningful (#1520); the symmetric local MiniLM backend ignores
+    /// the role.
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with_role(text, EmbedRole::Query)
+    }
+
+    /// Generate an embedding for `text` under an explicit retrieval
+    /// [`EmbedRole`]. The local candle MiniLM backend is symmetric and
+    /// ignores the role; the Ollama nomic backend prepends the
+    /// role-specific task-instruction prefix required by
+    /// nomic-embed-text-v1.5 (#1520).
+    pub fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>> {
         match self {
             Self::Local {
                 model,
@@ -309,11 +378,27 @@ impl Embedder {
                 // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
                 // is shared across threads; `BertModel::forward(&self, ...)`
                 // is inference-only and safe to call concurrently
-                // against the same weights.
+                // against the same weights. MiniLM is symmetric, so the
+                // role carries no prefix here.
                 Self::embed_local(model, tokenizer, device, text)
             }
-            Self::Ollama { client, model_name } => client.embed_text(text, model_name),
+            Self::Ollama { client, model_name } => {
+                if Self::ollama_requires_nomic_prefix(model_name) {
+                    let prefixed = format!("{}{}", role.nomic_prefix(), text);
+                    client.embed_text(&prefixed, model_name)
+                } else {
+                    client.embed_text(text, model_name)
+                }
+            }
         }
+    }
+
+    /// Whether the configured Ollama embed model uses nomic-style
+    /// asymmetric task prefixes. Gated on the model id so a different
+    /// (symmetric) Ollama embed model is never corrupted by an injected
+    /// `search_document:` / `search_query:` prefix (#1520).
+    fn ollama_requires_nomic_prefix(model_name: &str) -> bool {
+        model_name.starts_with(NOMIC_OLLAMA_MODEL)
     }
 
     /// v0.7.0 F6 — generate an embedding and report the outcome.
@@ -671,6 +756,10 @@ impl Embed for Embedder {
         Self::embed(self, text)
     }
 
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        Self::embed_query(self, text)
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         Self::embed_batch(self, texts)
     }
@@ -825,6 +914,39 @@ mod tests {
         let v = vec![1.0, 0.0, 0.0];
         let sim = Embedder::cosine_similarity(&v, &v);
         assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn embed_role_maps_to_nomic_prefix() {
+        // #1520 — asymmetric nomic prefixes must be role-distinct so a
+        // query and the document that answers it land in the same space.
+        assert_eq!(EmbedRole::Document.nomic_prefix(), NOMIC_PREFIX_DOCUMENT);
+        assert_eq!(EmbedRole::Query.nomic_prefix(), NOMIC_PREFIX_QUERY);
+        assert_ne!(
+            EmbedRole::Document.nomic_prefix(),
+            EmbedRole::Query.nomic_prefix()
+        );
+        // The trailing space is part of the wire prefix.
+        assert!(NOMIC_PREFIX_DOCUMENT.ends_with(' '));
+        assert!(NOMIC_PREFIX_QUERY.ends_with(' '));
+    }
+
+    #[test]
+    fn nomic_prefix_gating_is_model_scoped() {
+        // The prefix is applied only when the Ollama embed model is
+        // nomic; a different (symmetric) Ollama model must NOT be
+        // corrupted by an injected task prefix (#1520).
+        // The nomic model id (bare and tag-qualified) requires prefixing.
+        assert!(Embedder::ollama_requires_nomic_prefix(NOMIC_OLLAMA_MODEL));
+        assert!(Embedder::ollama_requires_nomic_prefix(&format!(
+            "{NOMIC_OLLAMA_MODEL}:v1.5"
+        )));
+        // Representative non-nomic (symmetric) Ollama embed models must
+        // NOT be prefixed, or their cosine geometry would be corrupted.
+        let other_embed_models = ["mxbai-embed-large", "all-minilm"];
+        for model in other_embed_models {
+            assert!(!Embedder::ollama_requires_nomic_prefix(model));
+        }
     }
 
     #[test]
