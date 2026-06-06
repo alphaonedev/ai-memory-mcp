@@ -103,6 +103,129 @@ fn cmd_output_or_panic(bin: &str, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|e| panic!("failed to spawn {bin} {args:?}: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// #1522 — bounded-deadline subprocess drivers for governance CLI tests
+// ---------------------------------------------------------------------------
+//
+// `cargo test` has no per-test timeout, so a single subprocess-spawn stall
+// under parallel load (shared cargo target dir + heavy sibling daemons) can
+// wedge the entire integration binary until an external kill — the failure
+// mode #1522 documents on `test_enforce_promote_with_approve_policy`. The
+// governance enforce tests below route every CLI / MCP subprocess wait
+// through these drivers, which spawn the child with piped stdio, drain
+// stdout/stderr on dedicated reader threads (so a full pipe buffer can never
+// wedge the child while we poll), and poll for exit against a deadline. On
+// expiry the driver kills the child and panics with the partial captured
+// output, converting a silent hang into a fast, loud, diagnosable failure.
+
+/// Per-subprocess wall-clock deadline. Generous relative to the ~0.4s
+/// isolated runtime of these tests so legitimate slow runs under heavy
+/// parallel load never trip it, while still bounding the pathological
+/// spawn-stall to a finite window.
+const GOVERNANCE_CLI_DEADLINE_SECS: u64 = 60;
+/// Poll cadence while waiting for the child to exit.
+const GOVERNANCE_CLI_POLL_INTERVAL_MS: u64 = 25;
+
+/// Spawn `command`, drain its stdio, and wait for exit against the
+/// [`GOVERNANCE_CLI_DEADLINE_SECS`] deadline. Kills the child and panics
+/// with partial output on expiry. `stdin` is closed (`null`), matching the
+/// semantics of [`std::process::Command::output`] for these non-interactive
+/// CLI calls.
+fn output_bounded(command: &mut std::process::Command, ctx: &str) -> std::process::Output {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn subprocess for {ctx}: {e}"));
+    wait_child_bounded(child, ctx, "CLI")
+}
+
+/// Spawn an `ai-memory mcp` subprocess, write the JSON-RPC `requests` to its
+/// stdin, close stdin (EOF), then wait for exit against the deadline. Same
+/// kill-and-panic-on-expiry contract as [`output_bounded`].
+fn drive_mcp_bounded(
+    command: &mut std::process::Command,
+    requests: &[String],
+    ctx: &str,
+) -> std::process::Output {
+    use std::io::Write;
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn mcp subprocess for {ctx}: {e}"));
+    {
+        let mut stdin = child.stdin.take().expect("piped mcp stdin");
+        for line in requests {
+            writeln!(stdin, "{line}")
+                .unwrap_or_else(|e| panic!("failed to write mcp stdin for {ctx}: {e}"));
+        }
+        stdin
+            .flush()
+            .unwrap_or_else(|e| panic!("failed to flush mcp stdin for {ctx}: {e}"));
+    } // stdin dropped here → child sees EOF and can exit
+    wait_child_bounded(child, ctx, "MCP")
+}
+
+/// Shared exit-wait core: drains stdout/stderr on reader threads, polls
+/// `try_wait` against the deadline, kills + panics on expiry. `kind` labels
+/// the subprocess class in the diagnostic.
+fn wait_child_bounded(
+    mut child: std::process::Child,
+    ctx: &str,
+    kind: &str,
+) -> std::process::Output {
+    use std::io::Read;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Duration::from_secs(GOVERNANCE_CLI_DEADLINE_SECS);
+    let poll = std::time::Duration::from_millis(GOVERNANCE_CLI_POLL_INTERVAL_MS);
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let so = stdout_reader.join().unwrap_or_default();
+                    let se = stderr_reader.join().unwrap_or_default();
+                    panic!(
+                        "#1522 governance {kind}-subprocess deadline \
+                         ({GOVERNANCE_CLI_DEADLINE_SECS}s) exceeded for {ctx}; killed. \
+                         partial stdout={:?} stderr={:?}",
+                        String::from_utf8_lossy(&so),
+                        String::from_utf8_lossy(&se),
+                    );
+                }
+                std::thread::sleep(poll);
+            }
+            Err(e) => panic!("try_wait failed for {ctx}: {e}"),
+        }
+    };
+    let stdout = stdout_reader.join().expect("stdout reader thread panicked");
+    let stderr = stderr_reader.join().expect("stderr reader thread panicked");
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
 #[test]
 fn test_cli_store_and_recall() {
     let dir = std::env::temp_dir();
@@ -6180,11 +6303,8 @@ fn set_governance(
     governance: &serde_json::Value,
     owner_agent_id: &str,
 ) {
-    use std::io::Write;
-
-    let out = cmd(binary)
-        .env_remove("AI_MEMORY_AGENT_ID")
-        .args([
+    let out = output_bounded(
+        cmd(binary).env_remove("AI_MEMORY_AGENT_ID").args([
             "--db",
             db_path.to_str().unwrap(),
             "--agent-id",
@@ -6199,38 +6319,15 @@ fn set_governance(
             "policy",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "set_governance store",
+    );
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let sid = v["id"].as_str().unwrap().to_string();
 
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_namespace_set_standard","arguments":{
@@ -6239,11 +6336,21 @@ fn set_governance(
                 "governance": governance,
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let _ = child.wait_with_output();
+        .to_string(),
+    ];
+    let _ = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "set_governance set_standard",
+    );
 }
 
 #[test]
@@ -6257,8 +6364,8 @@ fn test_enforce_any_allows_store() {
         &serde_json::json!({"write":"any","promote":"any","delete":"any","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6273,9 +6380,9 @@ fn test_enforce_any_allows_store() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "any_allows_store",
+    );
     assert!(
         out.status.success(),
         "any-write must allow: {}",
@@ -6295,8 +6402,8 @@ fn test_enforce_registered_blocks_unregistered() {
         &serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6310,9 +6417,9 @@ fn test_enforce_registered_blocks_unregistered() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "registered_blocks_unregistered",
+    );
     assert!(!out.status.success(), "unregistered must be blocked");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not a registered agent"), "got: {err}");
@@ -6323,8 +6430,8 @@ fn test_enforce_registered_blocks_unregistered() {
 fn test_enforce_registered_allows_registered() {
     let db = fresh_enforce_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let _ = cmd(bin)
-        .args([
+    let _ = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "agents",
@@ -6333,9 +6440,9 @@ fn test_enforce_registered_allows_registered() {
             "alice",
             "--agent-type",
             "human",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "registered_allows register",
+    );
     set_governance(
         bin,
         &db,
@@ -6343,8 +6450,8 @@ fn test_enforce_registered_allows_registered() {
         &serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6358,9 +6465,9 @@ fn test_enforce_registered_allows_registered() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "registered_allows store",
+    );
     assert!(out.status.success());
     let _ = std::fs::remove_file(&db);
 }
@@ -6376,8 +6483,8 @@ fn test_enforce_owner_blocks_non_owner_delete() {
         &serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let store = cmd(bin)
-        .args([
+    let store = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6392,24 +6499,24 @@ fn test_enforce_owner_blocks_non_owner_delete() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_blocks_delete store",
+    );
     let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let del = cmd(bin)
-        .args([
+    let del = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
             "bob",
             "delete",
             &id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_blocks_delete delete",
+    );
     assert!(!del.status.success());
     let err = String::from_utf8_lossy(&del.stderr);
     assert!(err.contains("not the owner"), "got: {err}");
@@ -6427,8 +6534,8 @@ fn test_enforce_owner_allows_self_delete() {
         &serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let store = cmd(bin)
-        .args([
+    let store = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6443,24 +6550,24 @@ fn test_enforce_owner_allows_self_delete() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_allows_self_delete store",
+    );
     let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let del = cmd(bin)
-        .args([
+    let del = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
             "alice",
             "delete",
             &id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_allows_self_delete delete",
+    );
     assert!(del.status.success());
     let _ = std::fs::remove_file(&db);
 }
@@ -6476,8 +6583,8 @@ fn test_enforce_approve_queues_pending() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6492,9 +6599,9 @@ fn test_enforce_approve_queues_pending() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "approve_queues_pending store",
+    );
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["status"], "pending");
@@ -6513,8 +6620,8 @@ fn test_enforce_pending_list_and_approve() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let queued = cmd(bin)
-        .args([
+    let queued = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6529,25 +6636,25 @@ fn test_enforce_pending_list_and_approve() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_list_and_approve store",
+    );
     let pending_id =
         serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-    let list = cmd(bin)
-        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
-        .output()
-        .unwrap();
+    let list = output_bounded(
+        cmd(bin).args(["--db", db.to_str().unwrap(), "--json", "pending", "list"]),
+        "pending_list_and_approve list",
+    );
     assert!(list.status.success());
     let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(lv["count"], 1);
 
-    let ap = cmd(bin)
-        .args([
+    let ap = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6556,16 +6663,16 @@ fn test_enforce_pending_list_and_approve() {
             "pending",
             "approve",
             &pending_id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_list_and_approve approve",
+    );
     assert!(ap.status.success());
     let av: serde_json::Value = serde_json::from_slice(&ap.stdout).unwrap();
     assert_eq!(av["approved"], true);
     assert_eq!(av["decided_by"], "approver");
 
-    let ap2 = cmd(bin)
-        .args([
+    let ap2 = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6573,9 +6680,9 @@ fn test_enforce_pending_list_and_approve() {
             "pending",
             "approve",
             &pending_id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_list_and_approve double-approve",
+    );
     assert!(!ap2.status.success());
     let _ = std::fs::remove_file(&db);
 }
@@ -6591,8 +6698,8 @@ fn test_enforce_pending_reject_status() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let queued = cmd(bin)
-        .args([
+    let queued = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6607,17 +6714,17 @@ fn test_enforce_pending_reject_status() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_reject_status store",
+    );
     let pending_id =
         serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-    let rj = cmd(bin)
-        .args([
+    let rj = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6626,15 +6733,15 @@ fn test_enforce_pending_reject_status() {
             "pending",
             "reject",
             &pending_id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_reject_status reject",
+    );
     assert!(rj.status.success());
     let rv: serde_json::Value = serde_json::from_slice(&rj.stdout).unwrap();
     assert_eq!(rv["rejected"], true);
 
-    let list = cmd(bin)
-        .args([
+    let list = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--json",
@@ -6642,9 +6749,9 @@ fn test_enforce_pending_reject_status() {
             "list",
             "--status",
             "rejected",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_reject_status list",
+    );
     let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(lv["count"], 1);
     let _ = std::fs::remove_file(&db);
@@ -6655,8 +6762,8 @@ fn test_enforce_unset_falls_back_to_default_policy() {
     // Default: { write: Any, promote: Any, delete: Owner, approver: Human }
     let db = fresh_enforce_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6671,9 +6778,9 @@ fn test_enforce_unset_falls_back_to_default_policy() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "unset_falls_back_to_default_policy store",
+    );
     assert!(out.status.success(), "default write policy is Any");
     let _ = std::fs::remove_file(&db);
 }
@@ -6689,8 +6796,8 @@ fn test_enforce_promote_with_approve_policy() {
         &serde_json::json!({"write":"any","promote":"approve","delete":"any","approver":"human"}),
         "owner",
     );
-    let store = cmd(bin)
-        .args([
+    let store = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6705,15 +6812,15 @@ fn test_enforce_promote_with_approve_policy() {
             "hi",
             "-t",
             "mid",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "promote_with_approve_policy store",
+    );
     let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let pr = cmd(bin)
-        .args([
+    let pr = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6721,9 +6828,9 @@ fn test_enforce_promote_with_approve_policy() {
             "--json",
             "promote",
             &id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "promote_with_approve_policy promote",
+    );
     assert!(pr.status.success());
     let v: serde_json::Value = serde_json::from_slice(&pr.stdout).unwrap();
     assert_eq!(v["status"], "pending");
@@ -6733,8 +6840,6 @@ fn test_enforce_promote_with_approve_policy() {
 
 #[test]
 fn test_enforce_mcp_pending_tools() {
-    use std::io::Write;
-
     let db = fresh_enforce_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     set_governance(
@@ -6744,8 +6849,8 @@ fn test_enforce_mcp_pending_tools() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let queued = cmd(bin)
-        .args([
+    let queued = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6760,17 +6865,31 @@ fn test_enforce_mcp_pending_tools() {
             "x",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "mcp_pending_tools store",
+    );
     let pending_id =
         serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-    let mut child = cmd(bin)
-        .args([
+    let requests = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+            .to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_pending_list","arguments":{}}
+        })
+        .to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_pending_approve","arguments":{"id": pending_id, "agent_id": "approver-mcp"}}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "mcp",
@@ -6778,36 +6897,10 @@ fn test_enforce_mcp_pending_tools() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_pending_list","arguments":{}}
-        })
-    )
-    .unwrap();
-    writeln!(stdin, "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"memory_pending_approve","arguments":{"id": pending_id, "agent_id": "approver-mcp"}}
-        })).unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "mcp_pending_tools mcp",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
 
