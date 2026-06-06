@@ -5,7 +5,7 @@ follow-up PRs as the QuorumWriter layer is instrumented and real chaos
 campaigns run against a multi-node fixture.
 
 Date: 2026-04-19
-Author: Claude Opus 4.7 (1M context) on behalf of @binary2029
+Author: Claude Opus 4.7 (1M context) on behalf of @alphaonedev
 Related: PR #277 (v0.6.0 GA), PR #279 (Track B — SAL + Postgres)
 
 ---

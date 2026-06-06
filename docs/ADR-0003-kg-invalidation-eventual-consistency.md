@@ -3,7 +3,7 @@
 Status: **Accepted** — implemented in v0.6.3 (PR #390).
 
 Date: 2026-04-26
-Author: Claude Opus 4.7 (1M context) on behalf of @binary2029
+Author: Claude Opus 4.7 (1M context) on behalf of @alphaonedev
 Related: ADR-0001 (Quorum replication), ADR-0002 (Schema v15)
 
 ---
