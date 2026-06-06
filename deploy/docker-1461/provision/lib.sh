@@ -57,7 +57,7 @@ PEER_PUBLISHED_PORT_BASE="${DOCKER_1461_PORT_BASE:-19280}"        # host loopbac
 QUORUM_WRITES="${DOCKER_1461_QUORUM_WRITES:-2}"                   # W-of-N synchronous
 
 # --------------------------------------------------------------------------
-# PostgreSQL 16 + Apache AGE + pgvector
+# PostgreSQL 18 + Apache AGE + pgvector
 # --------------------------------------------------------------------------
 PG_CONTAINER="${DOCKER_1461_PG_CONTAINER:-${CAMPAIGN}-pg-age}"
 PG_HOSTNAME="${DOCKER_1461_PG_HOSTNAME:-pg-age}"                  # intra-bridge DNS
@@ -81,7 +81,22 @@ EXPECTED_SCHEMA="${DOCKER_1461_EXPECTED_SCHEMA:-55}"
 EMBED_DIM="${DOCKER_1461_EMBED_DIM:-768}"
 EMBED_MODEL="${DOCKER_1461_EMBED_MODEL:-nomic-embed-text}"        # Ollama tag
 EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
-AGE_BASE_IMAGE="${DOCKER_1461_AGE_BASE_IMAGE:-apache/age:release_PG16_1.6.0}"
+# PostgreSQL + Apache AGE stack pins. The apache/age PG18 base ships AGE
+# compiled into the PG18 tree (age.so + age--<ver>.sql + age.control) but
+# the server itself at the image's minor (18.1 as of the release_PG18_1.7.0
+# digest). We bump the server to the EXACT target minor via a pinned pgdg
+# apt --only-upgrade inside Dockerfile.pg-age-vector (ABI-safe within major
+# 18 — AGE loads across PG minors). Every literal lives HERE (SSOT), passed
+# to the build as --build-arg, asserted by the validate harness; the
+# Dockerfile carries no version literal of its own.
+AGE_BASE_IMAGE="${DOCKER_1461_AGE_BASE_IMAGE:-apache/age:release_PG18_1.7.0}"
+PG_MAJOR="${DOCKER_1461_PG_MAJOR:-18}"                            # server major (apt pkg suffix)
+PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-18.4-1.pgdg13+1}"   # pinned exact pgdg .deb
+PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.2-1.pgdg13+1}"
+# Reproducibility assertion anchors (validate harness asserts these exact
+# upstream-reported versions — the directive: results must reflect 18.4 + AGE 1.7.0).
+EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-18.4}"
+EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.7.0}"
 PG_AGE_VECTOR_IMAGE="${DOCKER_1461_PG_IMAGE:-ai-memory-${CAMPAIGN}-pg-age-vector:latest}"
 DAEMON_IMAGE="${DOCKER_1461_DAEMON_IMAGE:-ai-memory-${CAMPAIGN}-daemon:latest}"
 CARGO_FEATURES="${DOCKER_1461_CARGO_FEATURES:-sal,sal-postgres}"
