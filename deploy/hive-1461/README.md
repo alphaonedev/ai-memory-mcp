@@ -12,8 +12,8 @@ toolkit brings every node to a verified federated state; a verification harness
 proves it.
 
 ```
-make seed up provision validate      # build + prove
-make down                            # tear it all down
+make seed up provision validate test  # build, prove, full-spectrum test
+make down                             # tear it all down
 ```
 
 ## Topology
@@ -72,6 +72,7 @@ SSH command line.
 | 2    | `make up`          | `terraform apply` → fleet; render `inventory.json` from TF state         |
 | 3    | `make provision`   | push-based bring-up, steps `00`→`50` (below)                             |
 | 4    | `make validate`    | verification harness → machine + human report; non-zero on any FAIL      |
+| 5    | `make test`        | full-spectrum P3 suite (regression/crypto/federation/a2a/ai_nhi)         |
 | —    | `make down`        | `terraform destroy` (destructive; 5s abort window)                       |
 
 `provision/` steps (deterministic + idempotent, run in order):
@@ -124,15 +125,48 @@ systemd-active (every peer); and a fleet **federation-convergence** probe that
 writes a collective-scope marker to one peer and reads it back by id on another
 over the encrypted path.
 
+The canonical green baseline report is committed at
+[`results/verify-baseline.{json,tsv}`](results/verify-baseline.tsv):
+**`TOTAL=40 PASS=40 FAIL=0`**.
+
+## Full-spectrum testing (`make test`)
+
+`make test` runs the P3 suite (`test/run.sh`) against the live fleet. Like the
+verification harness, every probe goes over the **real TLS+mTLS path** and
+authenticates with `x-api-key`; throwaway markers land in the `_test` / `_verify`
+namespaces and are best-effort deleted, so the baseline corpus is never mutated.
+It emits the same machine-JSON + human-table report pair under
+`.local-runs/hive-1461/reports/test-<ts>.*` and exits `0` iff every check is
+green. Five groups, **22 checks**:
+
+| Group        | What it proves                                                                                          |
+|--------------|--------------------------------------------------------------------------------------------------------|
+| `regression` | CRUD roundtrip; semantic search (exercises the nomic embedder end-to-end); namespace isolation; private-scope owner visibility (a private memory is invisible to a different caller). |
+| `crypto`     | **Negative** TLS/mTLS + authz: no client cert refused (`000`); non-allowlisted client cert refused (`000`); wrong server CA refused (`000`); privileged endpoint without `x-api-key` → `401`; with key → `200`; `/health` exempt → `200`; admin endpoint as non-admin → `403`. |
+| `federation` | Write to peer-1; converge on peer-2 (same region) **and** peer-3 (cross-region nyc3→sfo2) within the catch-up window. |
+| `a2a`        | Agent-to-agent E2E: `agent-alpha` (an mTLS client node) writes a collective memory to a peer **over the network**; `agent-beta` (a different client identity on a different node) reads it back on the write peer **and** on a federated peer. |
+| `ai_nhi`     | The grok-driven NHI loop: `agent-alpha` drives a **live xAI/grok** `expand_query` decision over the mesh, commits the LLM-derived term as a collective memory, and the decision converges on a federated peer — a full NHI decision → commit → federate loop. |
+
+The canonical green report is committed at
+[`results/test-full-spectrum.{json,tsv}`](results/test-full-spectrum.tsv):
+**`TOTAL=22 PASS=22 FAIL=0`** (every `crypto` negative refused at `000`; the
+`ai_nhi` decision returned a real grok term and converged cross-node).
+
+> **Run order.** `make test` is gated behind a green `make validate` — run the
+> P2.2 verification first so a fleet defect surfaces as a verification FAIL
+> rather than a confusing test FAIL.
+
 ## Layout
 
 ```
 deploy/hive-1461/
-├── Makefile                 single entrypoint (seed/up/provision/validate/report/down)
+├── Makefile                 single entrypoint (seed/up/provision/validate/test/report/down)
 ├── README.md                this runbook
 ├── terraform/               VPC + firewall + role droplets + outputs
 ├── provision/               push-based 0->60 toolkit (00..50 + lib.sh + pg-age/)
-├── validate/                verification harness (run.sh)
+├── validate/                verification harness (run.sh) — P2.2 baseline gate
+├── test/                    full-spectrum P3 suite (run.sh) — regression/crypto/federation/a2a/ai_nhi
+├── results/                 committed canonical green reports (verify + full-spectrum)
 └── baseline/                pre-teardown snapshots of the prior environment
 ```
 

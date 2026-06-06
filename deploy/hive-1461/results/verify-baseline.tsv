@@ -1,0 +1,40 @@
+hive-agent-nyc3-01	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-agent-nyc3-01	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-agent-nyc3-02	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-agent-nyc3-02	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-agent-nyc3-03	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-agent-nyc3-03	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-ctrl-nyc3-01	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-ctrl-nyc3-01	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-peer-nyc3-01	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-peer-nyc3-01	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-peer-nyc3-02	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-peer-nyc3-02	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-peer-sfo2-01	binary.sha256	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7	PASS
+hive-peer-sfo2-01	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+hive-peer-nyc3-01	health.status	ok	ok	PASS
+hive-peer-nyc3-01	health.version	0.7.0	0.7.0	PASS
+hive-peer-nyc3-01	health.embedder_ready	true	true	PASS
+hive-peer-nyc3-01	health.federation_enabled	true	true	PASS
+hive-peer-nyc3-01	caps.storage_backend	postgres	postgres	PASS
+hive-peer-nyc3-01	caps.db_schema_version	55	55	PASS
+hive-peer-nyc3-01	systemd.active	active	active	PASS
+hive-peer-nyc3-01	single_instance	1	1	PASS
+hive-peer-nyc3-02	health.status	ok	ok	PASS
+hive-peer-nyc3-02	health.version	0.7.0	0.7.0	PASS
+hive-peer-nyc3-02	health.embedder_ready	true	true	PASS
+hive-peer-nyc3-02	health.federation_enabled	true	true	PASS
+hive-peer-nyc3-02	caps.storage_backend	postgres	postgres	PASS
+hive-peer-nyc3-02	caps.db_schema_version	55	55	PASS
+hive-peer-nyc3-02	systemd.active	active	active	PASS
+hive-peer-nyc3-02	single_instance	1	1	PASS
+hive-peer-sfo2-01	health.status	ok	ok	PASS
+hive-peer-sfo2-01	health.version	0.7.0	0.7.0	PASS
+hive-peer-sfo2-01	health.embedder_ready	true	true	PASS
+hive-peer-sfo2-01	health.federation_enabled	true	true	PASS
+hive-peer-sfo2-01	caps.storage_backend	postgres	postgres	PASS
+hive-peer-sfo2-01	caps.db_schema_version	55	55	PASS
+hive-peer-sfo2-01	systemd.active	active	active	PASS
+hive-peer-sfo2-01	single_instance	1	1	PASS
+fleet	federation.write	memory id	dfd31932-90c9-4f13-9d27-9b78a83bc939	PASS
+fleet	federation.convergence	dfd31932-90c9-4f13-9d27-9b78a83bc939 on hive-peer-nyc3-02	dfd31932-90c9-4f13-9d27-9b78a83bc939 present on hive-peer-nyc3-02	PASS

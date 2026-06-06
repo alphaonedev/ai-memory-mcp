@@ -1,0 +1,29 @@
+{
+  "campaign": "hive-1461",
+  "timestamp": "20260606T014341Z",
+  "suite": "p3-full-spectrum",
+  "checks": [
+    {"group": "regression", "test": "create", "expected": "memory id", "got": "5c8f0f8a-ad3a-492f-8449-849516733d5f", "status": "PASS"},
+    {"group": "regression", "test": "get_by_id", "expected": "content present", "got": "p3-20260606T014341Z-24489 found", "status": "PASS"},
+    {"group": "regression", "test": "search_semantic", "expected": "id in results (count=1)", "got": "5c8f0f8a-ad3a-492f-8449-849516733d5f", "status": "PASS"},
+    {"group": "regression", "test": "list_namespace", "expected": "id listed in _test", "got": "5c8f0f8a-ad3a-492f-8449-849516733d5f", "status": "PASS"},
+    {"group": "regression", "test": "private_isolation", "expected": "404 for non-owner", "got": "not visible to ai:agent-beta@hive-1461", "status": "PASS"},
+    {"group": "regression", "test": "ns_cross_isolation", "expected": "absent from other ns", "got": "isolated", "status": "PASS"},
+    {"group": "crypto", "test": "no_client_cert", "expected": "refused (000)", "got": "000", "status": "PASS"},
+    {"group": "crypto", "test": "rogue_client_cert", "expected": "refused (000)", "got": "000", "status": "PASS"},
+    {"group": "crypto", "test": "wrong_server_ca", "expected": "refused (000)", "got": "000", "status": "PASS"},
+    {"group": "crypto", "test": "apikey_required", "expected": "401", "got": "401", "status": "PASS"},
+    {"group": "crypto", "test": "apikey_accepted", "expected": "200", "got": "200", "status": "PASS"},
+    {"group": "crypto", "test": "health_exempt", "expected": "200", "got": "200", "status": "PASS"},
+    {"group": "crypto", "test": "admin_gated", "expected": "403", "got": "403", "status": "PASS"},
+    {"group": "federation", "test": "write", "expected": "memory id", "got": "7b51687a-7b8f-4a72-8e81-f7d605505d6c", "status": "PASS"},
+    {"group": "federation", "test": "converge_same_region", "expected": "7b51687a-7b8f-4a72-8e81-f7d605505d6c on hive-peer-nyc3-02", "got": "present on hive-peer-nyc3-02", "status": "PASS"},
+    {"group": "federation", "test": "converge_cross_region", "expected": "7b51687a-7b8f-4a72-8e81-f7d605505d6c on hive-peer-sfo2-01", "got": "present on hive-peer-sfo2-01", "status": "PASS"},
+    {"group": "a2a", "test": "agent_write", "expected": "memory id (alpha->peer1)", "got": "1dc2bd2f-0a86-4200-8d10-b008c3cf9f21", "status": "PASS"},
+    {"group": "a2a", "test": "beta_read_writepeer", "expected": "visible cross-agent", "got": "1dc2bd2f-0a86-4200-8d10-b008c3cf9f21 present", "status": "PASS"},
+    {"group": "a2a", "test": "beta_read_fedpeer", "expected": "visible on federated peer", "got": "1dc2bd2f-0a86-4200-8d10-b008c3cf9f21 present on hive-peer-nyc3-02", "status": "PASS"},
+    {"group": "ai_nhi", "test": "llm_decision", "expected": "non-empty expanded_terms", "got": "term=paxos algorithm", "status": "PASS"},
+    {"group": "ai_nhi", "test": "nhi_commit", "expected": "memory id (alpha decision->peer1)", "got": "3578c77e-a0a2-4c0c-8904-aaaf337cdcae", "status": "PASS"},
+    {"group": "ai_nhi", "test": "nhi_converge", "expected": "decision visible on federated peer", "got": "3578c77e-a0a2-4c0c-8904-aaaf337cdcae present on hive-peer-nyc3-02", "status": "PASS"}
+  ]
+}

@@ -6,7 +6,7 @@
 #     export DIGITALOCEAN_TOKEN=...        # DO API token (apply/destroy only)
 #     export OPENROUTER_API_KEY=...        # peer chat LLM (ROTATED key)
 #     export XAI_API_KEY=...               # agent grok NHI driver LLM
-#     make seed up provision validate
+#     make seed up provision validate test
 #
 # Every target is idempotent and re-runnable. Provisioning is push-based over
 # SSH; nothing is installed on the operator host beyond the CLI prereqs below.
@@ -35,7 +35,7 @@ PROV_STEPS := \
 help: ## Show this help
 	@awk 'BEGIN{FS=":.*##"; printf "\nhive-1461 baseline targets:\n\n"} \
 	  /^[a-zA-Z0-9_-]+:.*##/{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-	@printf "\nflow: make seed up provision validate   (teardown: make down)\n\n"
+	@printf "\nflow: make seed up provision validate test   (teardown: make down)\n\n"
 
 preflight: ## Verify operator-host CLI prerequisites are present
 	@for b in terraform jq openssl ssh scp curl; do \
@@ -68,15 +68,16 @@ provision: preflight ## Push-based 0->60 bring-up (binary/PG+AGE/embed/config/TL
 validate: ## Run the verification harness (machine+human report; non-zero on any FAIL)
 	bash $(VALIDATE)/run.sh
 
-test: ## Run the full-spectrum test suite (P3) if authored
-	@if [ -x $(TEST)/run.sh ]; then bash $(TEST)/run.sh; \
-	  else echo "P3 test suite not yet authored ($(TEST)/run.sh absent)"; fi
+test: validate ## Run the full-spectrum test suite (P3) — gated behind a green validate
+	bash $(TEST)/run.sh
 
-report: ## Print the most recent verification report
+report: ## Print the most recent verification + full-spectrum-test reports
 	@d="$${HIVE_RUN_DIR:-../../.local-runs/hive-1461}/reports"; \
-	  latest="$$(ls -t $$d/verify-*.json 2>/dev/null | head -1)"; \
-	  [ -n "$$latest" ] && { echo "latest report: $$latest"; cat "$$latest"; } \
-	  || echo "no report yet — run 'make validate'"
+	  for pfx in verify test; do \
+	    latest="$$(ls -t $$d/$$pfx-*.json 2>/dev/null | head -1)"; \
+	    [ -n "$$latest" ] && { echo "latest $$pfx report: $$latest"; cat "$$latest"; echo; } \
+	      || echo "no $$pfx report yet — run 'make $$([ $$pfx = verify ] && echo validate || echo test)'"; \
+	  done
 
 down: preflight require-token ## terraform destroy (DESTRUCTIVE — tears the fleet down)
 	@echo "About to DESTROY the entire hive-1461 fleet. Ctrl-C within 5s to abort."; sleep 5
