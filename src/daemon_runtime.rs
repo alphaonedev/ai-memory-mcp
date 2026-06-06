@@ -1988,6 +1988,70 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
 // Embedder / vector-index canonical builders
 // ---------------------------------------------------------------------------
 
+/// #1521 — resolve the daemon embedder model under the canonical
+/// precedence ladder, mirroring the [`AppConfig::resolve_embeddings`]
+/// layering for the model dimension:
+///
+///   1. `[embeddings].model` (sectioned v2 config, #1146)
+///   2. legacy flat `embedding_model` (deprecated)
+///   3. tier-preset `embedding_model`
+///   4. `None` (keyword-only / embeddings disabled)
+///
+/// The model is read from the explicit section/flat fields rather than
+/// `ResolvedEmbeddings.model` (which defaults to nomic whenever ANY
+/// `[embeddings]` key is present), so a url-only section on the semantic
+/// tier still keeps the tier-preset MiniLM model. A configured id the
+/// 2-model daemon embedder cannot construct (or an unparseable one)
+/// degrades to the tier preset — the operator picked a pin, not
+/// keyword-only. Pure: no network I/O, so the precedence is unit-testable
+/// without an HF-Hub fetch (`build_embedder` does the construction).
+#[allow(deprecated)]
+fn resolve_embedder_model(
+    tier_config: &crate::config::TierConfig,
+    app_config: &AppConfig,
+) -> Option<crate::config::EmbeddingModel> {
+    let preset = tier_config.embedding_model;
+    let preset_label = preset
+        .map(|m| m.hf_model_id().to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    let configured = app_config
+        .embeddings
+        .as_ref()
+        .and_then(|section| section.model.clone())
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| (raw, "[embeddings].model"))
+        .or_else(|| {
+            app_config
+                .embedding_model
+                .clone()
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| (raw, "legacy embedding_model"))
+        });
+
+    let Some((raw, origin)) = configured else {
+        return preset;
+    };
+    match crate::config::EmbeddingModel::from_canonical_id(&raw) {
+        Some(model) => {
+            tracing::info!(
+                "embedder: using configured model {} from {origin} (tier-preset would have been {})",
+                model.hf_model_id(),
+                preset_label
+            );
+            Some(model)
+        }
+        None => {
+            tracing::warn!(
+                "embedder: configured model {raw:?} (from {origin}) is not constructible by the \
+                 daemon embedder (supported: nomic-embed-text-v1.5, all-MiniLM-L6-v2); \
+                 falling back to tier-preset {preset_label}"
+            );
+            preset
+        }
+    }
+}
+
 /// Construct the [`Embedder`] for a given tier. Returns `None` for the
 /// keyword tier (no embedder requested) and on load failure (caller
 /// degrades to keyword fallback). On failure the diagnostic is emitted
@@ -2000,47 +2064,22 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
 #[allow(deprecated)]
 pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -> Option<Embedder> {
     let tier_config = feature_tier.config();
-    // L2 fix: honor the documented top-level `embedding_model` override
-    // before falling back to the tier preset. Resolution order:
-    //   1. `AppConfig.embedding_model` override (if parseable)
-    //   2. Tier-preset `embedding_model` (existing behavior)
-    //   3. Disabled (keyword-only)
-    // A parse failure on the override degrades to the tier preset rather
-    // than disabling embeddings outright — the operator only mistyped a
-    // pin, they didn't ask for keyword-only.
-    let preset = tier_config.embedding_model;
-    let preset_label = preset
-        .map(|m| m.hf_model_id().to_string())
-        .unwrap_or_else(|| "none".to_string());
-    let resolved = match app_config.embedding_model.as_deref() {
-        Some(raw) => match raw.parse::<crate::config::EmbeddingModel>() {
-            Ok(model) => {
-                tracing::info!(
-                    "embedder: using app_config override {} (tier-preset would have been {})",
-                    model.hf_model_id(),
-                    preset_label
-                );
-                Some(model)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "embedder: ignoring invalid app_config.embedding_model={raw:?} ({e}); \
-                     falling back to tier-preset {}",
-                    preset_label
-                );
-                preset
-            }
-        },
-        None => preset,
-    };
-    let Some(emb_model) = resolved else {
+    // #1521: consume the canonical embeddings resolver so the sectioned
+    // `[embeddings]` block (#1146) drives the daemon embedder, not just
+    // the deprecated flat fields. The model is resolved by the pure
+    // `resolve_embedder_model` helper (precedence: `[embeddings].model`
+    // section > legacy flat `embedding_model` > tier preset); the URL is
+    // taken from the resolver, which layers `[embeddings].url` > legacy
+    // `embed_url`/`ollama_url` > default.
+    let resolved_embeddings = app_config.resolve_embeddings();
+    let Some(emb_model) = resolve_embedder_model(&tier_config, app_config) else {
         tracing::info!(
             "embedder disabled — tier={} keyword-only (FTS5); semantic recall not wired",
             feature_tier.as_str()
         );
         return None;
     };
-    let embed_url = app_config.effective_embed_url().to_string();
+    let embed_url = resolved_embeddings.url.clone();
     // #1143: the daemon embed client is always Ollama-wire-shape (it
     // talks to a local Ollama OR a compatible nomic-embed-text host).
     // Using `new_with_url` here is correct regardless of
@@ -5147,6 +5186,112 @@ mod tests {
         assert!(
             emb.is_none(),
             "unparseable override + keyword tier must return None"
+        );
+    }
+
+    // ----- resolve_embedder_model (#1521 precedence) --------------------
+
+    /// #1521 — the sectioned `[embeddings].model` block must beat the
+    /// tier preset. Semantic tier presets MiniLM; a section pinning nomic
+    /// must win. This is the core regression the issue describes (the
+    /// section was silently dropped in favour of the preset).
+    #[test]
+    fn resolve_embedder_model_section_beats_tier_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("nomic_embed_v15".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::NomicEmbedV15),
+            "[embeddings].model must override the Semantic tier MiniLM preset"
+        );
+    }
+
+    /// #1521 — the deprecated flat `embedding_model` field must still be
+    /// honored when no section is present (backward compat).
+    #[test]
+    fn resolve_embedder_model_legacy_flat_still_honored() {
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".to_string());
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::NomicEmbedV15),
+            "legacy flat embedding_model must still override the preset"
+        );
+    }
+
+    /// #1521 — when BOTH are set the section wins over the legacy flat
+    /// field (precedence ladder ordering).
+    #[test]
+    fn resolve_embedder_model_section_beats_legacy_flat() {
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".to_string());
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("mini_lm_l6_v2".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "[embeddings].model must win over legacy flat embedding_model"
+        );
+    }
+
+    /// #1521 — a url-only section (no model key) must NOT force a model;
+    /// the tier preset is kept. Guards against keying the model decision
+    /// off `ResolvedEmbeddings.model` (which defaults to nomic whenever
+    /// any `[embeddings]` key is present).
+    #[test]
+    fn resolve_embedder_model_url_only_section_keeps_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            url: Some("http://127.0.0.1:11435".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "url-only section must keep the Semantic MiniLM preset"
+        );
+    }
+
+    /// #1521 — a configured model the 2-model daemon embedder cannot
+    /// construct degrades to the tier preset rather than disabling.
+    #[test]
+    fn resolve_embedder_model_unsupported_id_falls_back_to_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("bge-large-en".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "unsupported model id must fall back to the tier preset"
+        );
+    }
+
+    /// #1521 — nothing configured at any layer: keyword tier (no preset)
+    /// yields None; semantic tier yields its MiniLM preset.
+    #[test]
+    fn resolve_embedder_model_unconfigured_uses_tier_preset() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            resolve_embedder_model(&FeatureTier::Keyword.config(), &cfg),
+            None,
+            "keyword tier has no preset → None"
+        );
+        assert_eq!(
+            resolve_embedder_model(&FeatureTier::Semantic.config(), &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "semantic tier preset is MiniLM"
         );
     }
 
