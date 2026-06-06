@@ -1,0 +1,1980 @@
+[
+  {
+    "id": 574750405,
+    "name": "amx-hive-sub",
+    "memory": 8192,
+    "vcpus": 4,
+    "disk": 160,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-4vcpu-8gb",
+      "memory": 8192,
+      "vcpus": 4,
+      "disk": 160,
+      "price_monthly": 48,
+      "price_hourly": 0.07143,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 5,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 160,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-4vcpu-8gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "104.131.48.67",
+          "netmask": "255.255.192.0",
+          "gateway": "104.131.0.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.6",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T12:36:37Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574750408,
+    "name": "amx-hive-a5",
+    "memory": 2048,
+    "vcpus": 1,
+    "disk": 50,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-1vcpu-2gb",
+      "memory": 2048,
+      "vcpus": 1,
+      "disk": 50,
+      "price_monthly": 12,
+      "price_hourly": 0.01786,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 2,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 50,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-1vcpu-2gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "167.71.240.201",
+          "netmask": "255.255.240.0",
+          "gateway": "167.71.240.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.8",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T12:36:39Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574750410,
+    "name": "amx-hive-a1",
+    "memory": 2048,
+    "vcpus": 1,
+    "disk": 50,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-1vcpu-2gb",
+      "memory": 2048,
+      "vcpus": 1,
+      "disk": 50,
+      "price_monthly": 12,
+      "price_hourly": 0.01786,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 2,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 50,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-1vcpu-2gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "68.183.159.231",
+          "netmask": "255.255.240.0",
+          "gateway": "68.183.144.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.10",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T12:36:39Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574750411,
+    "name": "amx-hive-a4",
+    "memory": 2048,
+    "vcpus": 1,
+    "disk": 50,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-1vcpu-2gb",
+      "memory": 2048,
+      "vcpus": 1,
+      "disk": 50,
+      "price_monthly": 12,
+      "price_hourly": 0.01786,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 2,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 50,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-1vcpu-2gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "167.99.120.101",
+          "netmask": "255.255.240.0",
+          "gateway": "167.99.112.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.7",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T12:36:39Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574750412,
+    "name": "amx-hive-a3",
+    "memory": 2048,
+    "vcpus": 1,
+    "disk": 50,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-1vcpu-2gb",
+      "memory": 2048,
+      "vcpus": 1,
+      "disk": 50,
+      "price_monthly": 12,
+      "price_hourly": 0.01786,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 2,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 50,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-1vcpu-2gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "64.225.13.113",
+          "netmask": "255.255.240.0",
+          "gateway": "64.225.0.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.9",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T12:36:39Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574750413,
+    "name": "amx-hive-a2",
+    "memory": 2048,
+    "vcpus": 1,
+    "disk": 50,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-1vcpu-2gb",
+      "memory": 2048,
+      "vcpus": 1,
+      "disk": 50,
+      "price_monthly": 12,
+      "price_hourly": 0.01786,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 2,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 50,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-1vcpu-2gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "165.22.34.184",
+          "netmask": "255.255.240.0",
+          "gateway": "165.22.32.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.11",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T12:36:40Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574785823,
+    "name": "amx-hive-sfo-sub",
+    "memory": 4096,
+    "vcpus": 2,
+    "disk": 80,
+    "region": {
+      "slug": "sfo2",
+      "name": "San Francisco 2",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-120gb-intel",
+        "c-2",
+        "c2-2vcpu-4gb",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "c5-2vcpu-4gb",
+        "g-2vcpu-8gb",
+        "s-4vcpu-8gb-240gb-intel",
+        "gd-2vcpu-8gb",
+        "g-2vcpu-8gb-intel",
+        "gd-2vcpu-8gb-intel",
+        "m-2vcpu-16gb",
+        "c-4",
+        "g6_5-2vcpu-8gb",
+        "g5_5-2vcpu-8gb-intel",
+        "c2-4vcpu-8gb",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "m-2vcpu-16gb-intel",
+        "m3-2vcpu-16gb",
+        "c-4-intel",
+        "m3-2vcpu-16gb-intel",
+        "c2-4vcpu-8gb-intel",
+        "c5-4vcpu-8gb",
+        "g-4vcpu-16gb",
+        "s-8vcpu-16gb-480gb-intel",
+        "so-2vcpu-16gb-intel",
+        "so-2vcpu-16gb",
+        "m6-2vcpu-16gb",
+        "gd-4vcpu-16gb",
+        "so1_5-2vcpu-16gb-intel",
+        "g-4vcpu-16gb-intel",
+        "gd-4vcpu-16gb-intel",
+        "c5-4vcpu-8gb-intel",
+        "so1_5-2vcpu-16gb",
+        "m-4vcpu-32gb",
+        "c-8",
+        "g6_5-4vcpu-16gb",
+        "g5_5-4vcpu-16gb-intel",
+        "c2-8vcpu-16gb",
+        "s-8vcpu-32gb-640gb-intel",
+        "m-4vcpu-32gb-intel",
+        "m3-4vcpu-32gb",
+        "c-8-intel",
+        "m3-4vcpu-32gb-intel",
+        "c2-8vcpu-16gb-intel",
+        "c5-8vcpu-16gb",
+        "g-8vcpu-32gb",
+        "so-4vcpu-32gb-intel",
+        "so-4vcpu-32gb",
+        "m6-4vcpu-32gb",
+        "gd-8vcpu-32gb",
+        "so1_5-4vcpu-32gb-intel",
+        "g-8vcpu-32gb-intel",
+        "gd-8vcpu-32gb-intel",
+        "c5-8vcpu-16gb-intel",
+        "so1_5-4vcpu-32gb",
+        "m-8vcpu-64gb",
+        "c-16",
+        "g6_5-8vcpu-32gb",
+        "g5_5-8vcpu-32gb-intel",
+        "c2-16vcpu-32gb",
+        "m-8vcpu-64gb-intel",
+        "m3-8vcpu-64gb",
+        "c-16-intel",
+        "m3-8vcpu-64gb-intel",
+        "c2-16vcpu-32gb-intel",
+        "c5-16vcpu-32gb",
+        "g-16vcpu-64gb",
+        "so-8vcpu-64gb-intel",
+        "so-8vcpu-64gb",
+        "m6-8vcpu-64gb",
+        "gd-16vcpu-64gb",
+        "so1_5-8vcpu-64gb-intel",
+        "g-16vcpu-64gb-intel",
+        "gd-16vcpu-64gb-intel",
+        "c5-16vcpu-32gb-intel",
+        "so1_5-8vcpu-64gb",
+        "m-16vcpu-128gb",
+        "c-32",
+        "g6_5-16vcpu-64gb",
+        "g5_5-16vcpu-64gb-intel",
+        "c2-32vcpu-64gb",
+        "m-16vcpu-128gb-intel",
+        "m3-16vcpu-128gb",
+        "c-32-intel",
+        "m3-16vcpu-128gb-intel",
+        "c2-32vcpu-64gb-intel",
+        "c-48",
+        "m-24vcpu-192gb",
+        "g-32vcpu-128gb",
+        "so-16vcpu-128gb-intel",
+        "so-16vcpu-128gb",
+        "m6-16vcpu-128gb",
+        "gd-32vcpu-128gb",
+        "so1_5-16vcpu-128gb-intel",
+        "m-24vcpu-192gb-intel",
+        "g-32vcpu-128gb-intel",
+        "m3-24vcpu-192gb",
+        "g-40vcpu-160gb",
+        "gd-32vcpu-128gb-intel",
+        "c5-32vcpu-64gb-intel",
+        "so1_5-16vcpu-128gb",
+        "c-48-intel",
+        "m3-24vcpu-192gb-intel",
+        "gd-40vcpu-160gb",
+        "c2-48vcpu-96gb-intel",
+        "g5_5-32vcpu-128gb-intel",
+        "so-24vcpu-192gb-intel",
+        "so-24vcpu-192gb",
+        "m6-24vcpu-192gb",
+        "m-32vcpu-256gb-intel",
+        "c-60-intel",
+        "so1_5-24vcpu-192gb-intel",
+        "m3-32vcpu-256gb-intel",
+        "g-48vcpu-192gb-intel",
+        "c2-60vcpu-120gb-intel",
+        "gd-48vcpu-192gb-intel",
+        "c5-48vcpu-96gb-intel",
+        "so1_5-24vcpu-192gb",
+        "so-32vcpu-256gb-intel",
+        "g5_5-48vcpu-192gb-intel",
+        "so1_5-32vcpu-256gb-intel",
+        "g-60vcpu-240gb-intel",
+        "m-48vcpu-384gb-intel",
+        "gd-60vcpu-240gb-intel",
+        "c5-60vcpu-120gb-intel",
+        "m3-48vcpu-384gb-intel",
+        "g5_5-60vcpu-240gb-intel",
+        "so-48vcpu-384gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-2vcpu-4gb",
+      "memory": 4096,
+      "vcpus": 2,
+      "disk": 80,
+      "price_monthly": 24,
+      "price_hourly": 0.03571,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 4,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 80,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-2vcpu-4gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "206.189.79.3",
+          "netmask": "255.255.240.0",
+          "gateway": "206.189.64.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.120.0.2",
+          "netmask": "255.255.240.0",
+          "gateway": "10.120.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T15:42:15Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "d6770c90-7612-4e8f-8ff5-70345eff05ad"
+  },
+  {
+    "id": 574845737,
+    "name": "lt-gen-nyc-1",
+    "memory": 2048,
+    "vcpus": 2,
+    "disk": 60,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-2vcpu-2gb",
+      "memory": 2048,
+      "vcpus": 2,
+      "disk": 60,
+      "price_monthly": 18,
+      "price_hourly": 0.02679,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 3,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 60,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-2vcpu-2gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "138.197.83.93",
+          "netmask": "255.255.240.0",
+          "gateway": "138.197.80.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.2",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T20:45:48Z",
+    "tags": [
+      "loadtest"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574863511,
+    "name": "lt-scale-nyc-16gb",
+    "memory": 16384,
+    "vcpus": 8,
+    "disk": 320,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-8vcpu-16gb",
+      "memory": 16384,
+      "vcpus": 8,
+      "disk": 320,
+      "price_monthly": 96,
+      "price_hourly": 0.14286,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 6,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 320,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-8vcpu-16gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "165.227.209.109",
+          "netmask": "255.255.240.0",
+          "gateway": "165.227.208.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.3",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T22:53:51Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574865753,
+    "name": "lt-gen-nyc-8x",
+    "memory": 16384,
+    "vcpus": 8,
+    "disk": 320,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-8vcpu-16gb",
+      "memory": 16384,
+      "vcpus": 8,
+      "disk": 320,
+      "price_monthly": 96,
+      "price_hourly": 0.14286,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 6,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 320,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-8vcpu-16gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "159.203.129.209",
+          "netmask": "255.255.240.0",
+          "gateway": "159.203.128.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.4",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T23:05:14Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  },
+  {
+    "id": 574866788,
+    "name": "arm-peer-sfo",
+    "memory": 8192,
+    "vcpus": 4,
+    "disk": 160,
+    "region": {
+      "slug": "sfo2",
+      "name": "San Francisco 2",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-120gb-intel",
+        "c-2",
+        "c2-2vcpu-4gb",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "c5-2vcpu-4gb",
+        "g-2vcpu-8gb",
+        "s-4vcpu-8gb-240gb-intel",
+        "gd-2vcpu-8gb",
+        "g-2vcpu-8gb-intel",
+        "gd-2vcpu-8gb-intel",
+        "m-2vcpu-16gb",
+        "c-4",
+        "g6_5-2vcpu-8gb",
+        "g5_5-2vcpu-8gb-intel",
+        "c2-4vcpu-8gb",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "m-2vcpu-16gb-intel",
+        "m3-2vcpu-16gb",
+        "c-4-intel",
+        "m3-2vcpu-16gb-intel",
+        "c2-4vcpu-8gb-intel",
+        "c5-4vcpu-8gb",
+        "g-4vcpu-16gb",
+        "s-8vcpu-16gb-480gb-intel",
+        "so-2vcpu-16gb-intel",
+        "so-2vcpu-16gb",
+        "m6-2vcpu-16gb",
+        "gd-4vcpu-16gb",
+        "so1_5-2vcpu-16gb-intel",
+        "g-4vcpu-16gb-intel",
+        "gd-4vcpu-16gb-intel",
+        "c5-4vcpu-8gb-intel",
+        "so1_5-2vcpu-16gb",
+        "m-4vcpu-32gb",
+        "c-8",
+        "g6_5-4vcpu-16gb",
+        "g5_5-4vcpu-16gb-intel",
+        "c2-8vcpu-16gb",
+        "s-8vcpu-32gb-640gb-intel",
+        "m-4vcpu-32gb-intel",
+        "m3-4vcpu-32gb",
+        "c-8-intel",
+        "m3-4vcpu-32gb-intel",
+        "c2-8vcpu-16gb-intel",
+        "c5-8vcpu-16gb",
+        "g-8vcpu-32gb",
+        "so-4vcpu-32gb-intel",
+        "so-4vcpu-32gb",
+        "m6-4vcpu-32gb",
+        "gd-8vcpu-32gb",
+        "so1_5-4vcpu-32gb-intel",
+        "g-8vcpu-32gb-intel",
+        "gd-8vcpu-32gb-intel",
+        "c5-8vcpu-16gb-intel",
+        "so1_5-4vcpu-32gb",
+        "m-8vcpu-64gb",
+        "c-16",
+        "g6_5-8vcpu-32gb",
+        "g5_5-8vcpu-32gb-intel",
+        "c2-16vcpu-32gb",
+        "m-8vcpu-64gb-intel",
+        "m3-8vcpu-64gb",
+        "c-16-intel",
+        "m3-8vcpu-64gb-intel",
+        "c2-16vcpu-32gb-intel",
+        "c5-16vcpu-32gb",
+        "g-16vcpu-64gb",
+        "so-8vcpu-64gb-intel",
+        "so-8vcpu-64gb",
+        "m6-8vcpu-64gb",
+        "gd-16vcpu-64gb",
+        "so1_5-8vcpu-64gb-intel",
+        "g-16vcpu-64gb-intel",
+        "gd-16vcpu-64gb-intel",
+        "c5-16vcpu-32gb-intel",
+        "so1_5-8vcpu-64gb",
+        "m-16vcpu-128gb",
+        "c-32",
+        "g6_5-16vcpu-64gb",
+        "g5_5-16vcpu-64gb-intel",
+        "c2-32vcpu-64gb",
+        "m-16vcpu-128gb-intel",
+        "m3-16vcpu-128gb",
+        "c-32-intel",
+        "m3-16vcpu-128gb-intel",
+        "c2-32vcpu-64gb-intel",
+        "c-48",
+        "m-24vcpu-192gb",
+        "g-32vcpu-128gb",
+        "so-16vcpu-128gb-intel",
+        "so-16vcpu-128gb",
+        "m6-16vcpu-128gb",
+        "gd-32vcpu-128gb",
+        "so1_5-16vcpu-128gb-intel",
+        "m-24vcpu-192gb-intel",
+        "g-32vcpu-128gb-intel",
+        "m3-24vcpu-192gb",
+        "g-40vcpu-160gb",
+        "gd-32vcpu-128gb-intel",
+        "c5-32vcpu-64gb-intel",
+        "so1_5-16vcpu-128gb",
+        "c-48-intel",
+        "m3-24vcpu-192gb-intel",
+        "gd-40vcpu-160gb",
+        "c2-48vcpu-96gb-intel",
+        "g5_5-32vcpu-128gb-intel",
+        "so-24vcpu-192gb-intel",
+        "so-24vcpu-192gb",
+        "m6-24vcpu-192gb",
+        "m-32vcpu-256gb-intel",
+        "c-60-intel",
+        "so1_5-24vcpu-192gb-intel",
+        "m3-32vcpu-256gb-intel",
+        "g-48vcpu-192gb-intel",
+        "c2-60vcpu-120gb-intel",
+        "gd-48vcpu-192gb-intel",
+        "c5-48vcpu-96gb-intel",
+        "so1_5-24vcpu-192gb",
+        "so-32vcpu-256gb-intel",
+        "g5_5-48vcpu-192gb-intel",
+        "so1_5-32vcpu-256gb-intel",
+        "g-60vcpu-240gb-intel",
+        "m-48vcpu-384gb-intel",
+        "gd-60vcpu-240gb-intel",
+        "c5-60vcpu-120gb-intel",
+        "m3-48vcpu-384gb-intel",
+        "g5_5-60vcpu-240gb-intel",
+        "so-48vcpu-384gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-4vcpu-8gb",
+      "memory": 8192,
+      "vcpus": 4,
+      "disk": 160,
+      "price_monthly": 48,
+      "price_hourly": 0.07143,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 5,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 160,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-4vcpu-8gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "165.22.144.70",
+          "netmask": "255.255.240.0",
+          "gateway": "165.22.144.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.120.0.3",
+          "netmask": "255.255.240.0",
+          "gateway": "10.120.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T23:12:43Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "d6770c90-7612-4e8f-8ff5-70345eff05ad"
+  },
+  {
+    "id": 574866790,
+    "name": "arm-peer-nyc",
+    "memory": 8192,
+    "vcpus": 4,
+    "disk": 160,
+    "region": {
+      "slug": "nyc3",
+      "name": "New York 3",
+      "sizes": [
+        "s-1vcpu-512mb-10gb",
+        "s-1vcpu-1gb",
+        "s-1vcpu-1gb-amd",
+        "s-1vcpu-1gb-intel",
+        "s-1vcpu-1gb-35gb-intel",
+        "s-1vcpu-2gb",
+        "s-1vcpu-2gb-amd",
+        "s-1vcpu-2gb-intel",
+        "s-1vcpu-2gb-70gb-intel",
+        "s-2vcpu-2gb",
+        "s-2vcpu-2gb-amd",
+        "s-2vcpu-2gb-intel",
+        "s-2vcpu-2gb-90gb-intel",
+        "s-2vcpu-4gb",
+        "s-2vcpu-4gb-amd",
+        "s-2vcpu-4gb-intel",
+        "s-2vcpu-4gb-120gb-intel",
+        "s-2vcpu-8gb-amd",
+        "s-2vcpu-8gb-160gb-intel",
+        "s-4vcpu-8gb",
+        "s-4vcpu-8gb-amd",
+        "s-4vcpu-8gb-intel",
+        "s-4vcpu-8gb-240gb-intel",
+        "s-4vcpu-16gb-amd",
+        "s-4vcpu-16gb-320gb-intel",
+        "s-8vcpu-16gb",
+        "s-8vcpu-16gb-amd",
+        "s-8vcpu-16gb-intel",
+        "s-8vcpu-16gb-480gb-intel",
+        "s-8vcpu-32gb-amd",
+        "s-8vcpu-32gb-640gb-intel"
+      ],
+      "available": true,
+      "features": [
+        "backups",
+        "ipv6",
+        "metadata",
+        "install_agent",
+        "storage",
+        "image_transfer"
+      ]
+    },
+    "image": {
+      "id": 195932981,
+      "name": "24.04 (LTS) x64",
+      "type": "base",
+      "distribution": "Ubuntu",
+      "slug": "ubuntu-24-04-x64",
+      "public": true,
+      "regions": [
+        "nyc3",
+        "ams2",
+        "ams3",
+        "atl1",
+        "blr1",
+        "fra1",
+        "lon1",
+        "mkc1",
+        "nyc1",
+        "nyc2",
+        "ric1",
+        "sfo1",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "min_disk_size": 7,
+      "size_gigabytes": 3.76,
+      "created_at": "2025-08-08T15:11:27Z",
+      "description": "Ubuntu 24.04 (LTS) x64",
+      "status": "available"
+    },
+    "size": {
+      "slug": "s-4vcpu-8gb",
+      "memory": 8192,
+      "vcpus": 4,
+      "disk": 160,
+      "price_monthly": 48,
+      "price_hourly": 0.07143,
+      "regions": [
+        "ams3",
+        "blr1",
+        "fra1",
+        "lon1",
+        "nyc1",
+        "nyc2",
+        "nyc3",
+        "sfo2",
+        "sfo3",
+        "sgp1",
+        "syd1",
+        "tor1"
+      ],
+      "available": true,
+      "transfer": 5,
+      "description": "Basic",
+      "disk_info": [
+        {
+          "type": "local",
+          "size": {
+            "amount": 160,
+            "unit": "gib"
+          }
+        }
+      ]
+    },
+    "size_slug": "s-4vcpu-8gb",
+    "features": [
+      "droplet_agent",
+      "private_networking"
+    ],
+    "status": "active",
+    "networks": {
+      "v4": [
+        {
+          "ip_address": "159.203.97.254",
+          "netmask": "255.255.240.0",
+          "gateway": "159.203.96.1",
+          "type": "public"
+        },
+        {
+          "ip_address": "10.108.0.5",
+          "netmask": "255.255.240.0",
+          "gateway": "10.108.0.1",
+          "type": "private"
+        }
+      ]
+    },
+    "created_at": "2026-06-02T23:12:43Z",
+    "tags": [
+      "ai-memory-hive"
+    ],
+    "volume_ids": [],
+    "vpc_uuid": "58eca95c-d94d-4e58-9ba4-b62a1e6de1b3"
+  }
+]

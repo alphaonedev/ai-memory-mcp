@@ -1,0 +1,13 @@
+574750405    amx-hive-sub         nyc3    8192     4    ai-memory-hive
+574750408    amx-hive-a5          nyc3    2048     1    ai-memory-hive
+574750410    amx-hive-a1          nyc3    2048     1    ai-memory-hive
+574750411    amx-hive-a4          nyc3    2048     1    ai-memory-hive
+574750412    amx-hive-a3          nyc3    2048     1    ai-memory-hive
+574750413    amx-hive-a2          nyc3    2048     1    ai-memory-hive
+574785823    amx-hive-sfo-sub     sfo2    4096     2    ai-memory-hive
+574845737    lt-gen-nyc-1         nyc3    2048     2    loadtest
+574863511    lt-scale-nyc-16gb    nyc3    16384    8    ai-memory-hive
+574865753    lt-gen-nyc-8x        nyc3    16384    8    ai-memory-hive
+574866788    arm-peer-sfo         sfo2    8192     4    ai-memory-hive
+574866790    arm-peer-nyc         nyc3    8192     4    ai-memory-hive
+e9ddd280-95f0-4e41-8498-38e016b39933    a2a-v07-fw
