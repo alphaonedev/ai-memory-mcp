@@ -26,7 +26,7 @@ EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"
 
 # Pinned third-party images / refs (reproducibility anchors).
-AGE_IMAGE="${AGE_IMAGE:-apache/age:PG16_latest}"
+AGE_IMAGE="${AGE_IMAGE:-apache/age:release_PG16_1.6.0}"
 OLLAMA_IMAGE="${OLLAMA_IMAGE:-ollama/ollama:0.6.8}"
 
 # Autonomous-tier substrate model wiring (matches entrypoint.plan-c.sh's
@@ -38,6 +38,12 @@ OLLAMA_IMAGE="${OLLAMA_IMAGE:-ollama/ollama:0.6.8}"
 # legacy flat `embed_url`/`ollama_url` fields — `build_embedder` reads those,
 # NOT the v2 `[embeddings].url` section (src/config.rs::effective_embed_url).
 EMBED_MODEL="${EMBED_MODEL:-nomic-embed-text}"          # Ollama-registry id (768-dim)
+# Embedding column dimension for the peer pgvector schema. MUST match the
+# embedder's output width or every embedding insert fails the vector(N) check.
+# nomic-embed-text (v1.5) emits 768; the ai-memory baseline schema defaults to
+# 384 (MiniLM), so `schema-init` is invoked with --embedding-dim "$EMBED_DIM"
+# to template `vector(768)`. Override in lockstep with EMBED_MODEL for forks.
+EMBED_DIM="${EMBED_DIM:-768}"
 EMBED_OLLAMA_URL="${EMBED_OLLAMA_URL:-http://127.0.0.1:11434}"
 PEER_LLM_MODEL="${PEER_LLM_MODEL:-google/gemma-4-26b-a4b-it}"  # OpenRouter chat id
 AGENT_LLM_MODEL="${AGENT_LLM_MODEL:-grok-4.3}"                 # xAI chat id (agent NHI)

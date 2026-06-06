@@ -49,8 +49,8 @@ inv_ips_by_role peer | while read -r ip; do
   echo "$exts" | grep -q vector || die "[$host] vector(pgvector) extension missing"
   log "[$host] extensions OK: $(echo $exts | tr '\n' ' ')"
 
-  log "[$host] ai-memory schema-init (v55 + ai_memory_kg graph)"
-  ssh_node "$ip" "/usr/local/bin/ai-memory schema-init --store-url 'postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory'"
+  log "[$host] ai-memory schema-init (v55 + ai_memory_kg graph, vector($EMBED_DIM))"
+  ssh_node "$ip" "/usr/local/bin/ai-memory schema-init --embedding-dim $EMBED_DIM --store-url 'postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory'"
   log "[$host] PG+AGE substrate ready"
 done
 log "peer DB substrate complete on all peers"

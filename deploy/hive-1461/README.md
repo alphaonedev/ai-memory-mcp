@@ -90,7 +90,7 @@ SSH command line.
 ## What "reproducible" means here
 
 - **Pinned artifacts** (`provision/lib.sh`): binary `sha256`, version `0.7.0`,
-  schema `v55`, `ollama/ollama:0.6.8`, `apache/age:PG16_latest`, embedder/LLM
+  schema `v55`, `ollama/ollama:0.6.8`, `apache/age:release_PG16_1.6.0`, embedder/LLM
   model ids — all single-source constants, overridable by env for forks.
 - **Deterministic inventory**: `inventory.json` is a pure projection of
   Terraform state; the whole toolkit drives off it.

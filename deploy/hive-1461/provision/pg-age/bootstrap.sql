@@ -24,4 +24,12 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 GRANT USAGE ON SCHEMA ag_catalog TO aimemory;
 GRANT ALL ON ALL TABLES IN SCHEMA ag_catalog TO aimemory;
-ALTER DATABASE aimemory SET search_path = ag_catalog, "$user", public;
+
+-- ai-memory's schema-init issues UNqualified `CREATE TABLE memories ...` etc.,
+-- which land in the FIRST writable schema on search_path. public must therefore
+-- come before ag_catalog, and aimemory needs CREATE on public (PG16 strips the
+-- implicit public-CREATE grant from non-owners). ag_catalog stays LAST so AGE
+-- agtype/cypher function + type resolution still scans it -- function/type
+-- lookup walks the whole search_path, so trailing placement is sufficient.
+GRANT USAGE, CREATE ON SCHEMA public TO aimemory;
+ALTER DATABASE aimemory SET search_path = "$user", public, ag_catalog;
