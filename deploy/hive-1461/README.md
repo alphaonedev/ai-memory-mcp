@@ -36,7 +36,8 @@ cert, and run no inbound HTTPS daemon.
 
 ## Prerequisites (operator host)
 
-- `terraform` (HashiCorp, not OpenTofu), `jq`, `openssl`, `ssh`/`scp`, `curl`.
+- `terraform` (HashiCorp, not OpenTofu), `jq`, `openssl`, `ssh`/`scp`, `curl`,
+  `cargo` (builds the first-party `fed_issue` zero-touch issuer on demand).
 - A DigitalOcean API token in `DIGITALOCEAN_TOKEN` (apply/destroy only).
 - An SSH keypair registered on DO whose private half is `~/.ssh/id_ed25519`
   (override with `SSH_KEY=...`). It is the `root` login for every droplet.
@@ -86,7 +87,21 @@ SSH command line.
 | 25   | `25_ollama_embed.sh`    | per-peer CPU Ollama sidecar serving `nomic-embed-text` (768-dim) |
 | 30   | `30_config.sh`          | render + push per-role `config.toml` + secret EnvironmentFile    |
 | 40   | `40_tls.sh`             | campaign CA + per-node leaf certs + mTLS allowlist fan-out       |
+| 45   | `45_zero_touch.sh`      | mint campaign CA + per-peer credential; fan out keys/bundle/cred; wire peer-enrollment env (O(1) trust) |
 | 50   | `50_federation.sh`      | per-peer systemd unit; start the quorum mesh; health-gate        |
+
+> **Step 45 (zero-touch first-party trust)** is the application-identity layer
+> that sits *inside* the mTLS transport (step 40). It mints a campaign CA, issues
+> each peer a short-lived CA-signed credential binding its federation identity to
+> an Ed25519 key, and fans out only the **CA verifying key** (not every peer's
+> pubkey) — replacing O(N²) per-peer key exchange with O(1) "trust the CA". It
+> wires `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1` so receivers **fail closed** on
+> any unenrolled peer. Runs after `30_config.sh` (the EnvironmentFile it appends
+> to must exist) and before `50_federation.sh` (the sole pusher of that file +
+> the daemon (re)start that loads the new trust env). The issuer is the
+> first-party `examples/fed_issue.rs` `cargo` example — compiled on demand, never
+> linked into the golden binary, so the pinned `sha256` is unchanged. See
+> [`docs/zero-touch-quickstart.md`](../../docs/zero-touch-quickstart.md).
 
 ## What "reproducible" means here
 
@@ -137,20 +152,23 @@ authenticates with `x-api-key`; throwaway markers land in the `_test` / `_verify
 namespaces and are best-effort deleted, so the baseline corpus is never mutated.
 It emits the same machine-JSON + human-table report pair under
 `.local-runs/hive-1461/reports/test-<ts>.*` and exits `0` iff every check is
-green. Five groups, **22 checks**:
+green. Six groups, **26 checks**:
 
 | Group        | What it proves                                                                                          |
 |--------------|--------------------------------------------------------------------------------------------------------|
 | `regression` | CRUD roundtrip; semantic search (exercises the nomic embedder end-to-end); namespace isolation; private-scope owner visibility (a private memory is invisible to a different caller). |
 | `crypto`     | **Negative** TLS/mTLS + authz: no client cert refused (`000`); non-allowlisted client cert refused (`000`); wrong server CA refused (`000`); privileged endpoint without `x-api-key` → `401`; with key → `200`; `/health` exempt → `200`; admin endpoint as non-admin → `403`. |
 | `federation` | Write to peer-1; converge on peer-2 (same region) **and** peer-3 (cross-region nyc3→sfo2) within the catch-up window. |
+| `zerotouch`  | **Zero-touch first-party trust** (step 45): an *enrolled* peer writes a collective memory that converges on a federated peer purely on its **CA-signed credential** — no operator-pushed pubkey; an *unenrolled* peer-id presenting a valid api-key + mTLS but no enrollment is **failed closed** on `/sync/since` (`401 peer_not_enrolled`, the `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1` gate). |
 | `a2a`        | Agent-to-agent E2E: `agent-alpha` (an mTLS client node) writes a collective memory to a peer **over the network**; `agent-beta` (a different client identity on a different node) reads it back on the write peer **and** on a federated peer. |
 | `ai_nhi`     | The grok-driven NHI loop: `agent-alpha` drives a **live xAI/grok** `expand_query` decision over the mesh, commits the LLM-derived term as a collective memory, and the decision converges on a federated peer — a full NHI decision → commit → federate loop. |
 
 The canonical green report is committed at
 [`results/test-full-spectrum.{json,tsv}`](results/test-full-spectrum.tsv):
-**`TOTAL=22 PASS=22 FAIL=0`** (every `crypto` negative refused at `000`; the
-`ai_nhi` decision returned a real grok term and converged cross-node).
+**`TOTAL=26 PASS=26 FAIL=0`** (every `crypto` negative refused at `000`; the
+`zerotouch` enrolled peer converged on its CA credential while the unenrolled
+peer was failed closed; the `ai_nhi` decision returned a real grok term and
+converged cross-node).
 
 > **Run order.** `make test` is gated behind a green `make validate` — run the
 > P2.2 verification first so a fleet defect surfaces as a verification FAIL

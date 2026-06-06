@@ -187,6 +187,8 @@ blockquote strong{color:var(--p1)}
         <tr><td><code>AI_MEMORY_FED_CRED_PATH</code></td><td>Path to this node's issued leaf credential (what it presents).</td></tr>
         <tr><td><code>AI_MEMORY_FED_CRED_CHAIN_PATH</code></td><td>Path to the anchor-first intermediate chain (hierarchical trust).</td></tr>
         <tr><td><code>AI_MEMORY_FED_INVENTORY_PATH</code></td><td>Path to the declarative GitOps inventory YAML.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code></td><td><strong>Fail-closed gate.</strong> When <code>=1</code>, a receiver rejects any peer with no valid CA-signed credential — <code>401 peer_not_enrolled</code>. The switch that makes enrollment mandatory.</td></tr>
+        <tr><td><code>AI_MEMORY_KEY_DIR</code></td><td>Directory holding this node's signing keypair at <code>&lt;key_dir&gt;/&lt;federation-identity&gt;.{pub,priv}</code>, loaded by the resolved (slashed) identity.</td></tr>
         <tr><td><code>AI_MEMORY_FED_REQUIRE_SIG</code></td><td>Receivers reject unsigned posts (default-on; inherited enforcement gate).</td></tr>
       </tbody>
     </table>
@@ -277,9 +279,49 @@ $env:AI_MEMORY_FED_IDENTITY     = "region/nyc/node-1"</code></pre>
 
 <section>
   <div class="container">
+    <span class="eyebrow">Reproducible tooling</span>
+    <h2>The first-party issuer.</h2>
+    <p>All CA / node / credential material is minted by <code>examples/fed_issue.rs</code> — a <strong>standalone first-party <code>cargo</code> example</strong> that composes the Ed25519 + canonical-CBOR primitives already in <code>ai-memory</code>. It is <strong>never linked into the golden binary</strong>: there is no <code>Cargo.toml</code> change and the pinned <code>sha256</code> is unchanged. Build + run it on demand — the first call compiles, the rest are cache hits. Every verb is idempotent, so a re-run yields a <strong>stable</strong> trust topology.</p>
+    <table>
+      <thead><tr><th>Verb</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>mint-ca</code></td><td>Generate the campaign CA keypair (<code>--key-dir</code>, <code>--issuer-id</code>).</td></tr>
+        <tr><td><code>export-bundle</code></td><td>Publish <strong>only the CA verifying key</strong> to the trust bundle dir — the sole anchor a receiver needs.</td></tr>
+        <tr><td><code>gen-node</code></td><td>Generate a node signing keypair (<code>--agent-id</code> may be a slashed federation identity).</td></tr>
+        <tr><td><code>issue</code></td><td>Mint a short-lived CA-signed credential binding the node's identity → its verifying key, scoped to the trust domain (<code>--ttl-secs</code> default 3600).</td></tr>
+      </tbody>
+    </table>
+    <blockquote>
+      <strong>One footgun:</strong> <code>issuer-id</code> MUST be slash-free. <code>TrustBundle::from_dir</code> is non-recursive, so a slashed id would nest the published <code>&lt;issuer-id&gt;.pub</code> in a skipped sub-dir → empty bundle → <code>UnknownIssuer</code>. The tool's <code>validate_issuer_id</code> rejects it at the boundary; node <code>subject-agent-id</code>s, by contrast, may be slashed.
+    </blockquote>
+    <p>The push-based <code>deploy/hive-1461/provision/45_zero_touch.sh</code> drives these four verbs per peer: mint the CA once, then per peer generate a keypair, issue a credential, fan out <code>keys/</code> + <code>trust/</code> + <code>credential</code> to <code>/etc/ai-memory</code> (private key <code>0400</code>, public <code>0444</code>), and append the five daemon env vars. Agents and <code>ctrl</code> are pure mTLS API clients, not mesh members, and are skipped. Step-by-step: <a href="zero-touch-quickstart.md" style="color:var(--p1)">docs/zero-touch-quickstart.md</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Validated</span>
+    <h2>Proven on a live fleet.</h2>
+    <p>The <code>hive-1461</code> reproducible baseline runs this arm as provisioning step 45 and the full-spectrum P3 suite exercises it over the <strong>real TLS+mTLS path</strong> against the live mesh. The committed canonical report is <strong class="tier-primary">TOTAL=26 PASS=26 FAIL=0</strong>, including four dedicated <code>zerotouch</code> checks:</p>
+    <table>
+      <thead><tr><th>Check</th><th>Proves</th></tr></thead>
+      <tbody>
+        <tr><td><code>enrolled_write</code></td><td>An enrolled peer writes a collective memory using only its CA-signed credential.</td></tr>
+        <tr><td><code>enrolled_converge</code></td><td>That memory converges on a federated peer <strong>via the CA credential</strong> — no operator-pushed pubkey.</td></tr>
+        <tr><td><code>unenrolled_status</code></td><td>A peer with valid api-key + mTLS but <strong>no enrollment</strong> is refused <code>401</code> on <code>/sync/since</code>.</td></tr>
+        <tr><td><code>unenrolled_reason</code></td><td>The refusal is <code>peer_not_enrolled</code> — the <code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1</code> fail-closed gate.</td></tr>
+      </tbody>
+    </table>
+    <p>Both the environment <em>and</em> the results are peer-reproducible: <code>make seed up provision validate test</code> stands the fleet up and re-proves all 26 checks. The report ships at <code>deploy/hive-1461/results/test-full-spectrum.{json,tsv}</code>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
     <span class="eyebrow">Next</span>
     <h2>Where to go.</h2>
     <ul>
+      <li>→ <a href="zero-touch-quickstart.md" style="color:var(--p1)">Zero-touch quickstart</a> — the concrete operator how-to: the <code>fed_issue</code> verbs, on-disk layout, and the push-based enrollment flow.</li>
       <li>→ <a href="federation-identity.md" style="color:var(--p1)">Federation identity at scale</a> — the full configuration + admin reference (every env var, the inventory schema, the rollout playbook).</li>
       <li>→ <a href="federation.md" style="color:var(--p1)">Federation hardening</a> — the mTLS / X-API-Key / peer-attestation transport layer beneath this.</li>
       <li>→ <a href="agent-identity.html" style="color:var(--p1)">Agent identity (NHI)</a> — the per-memory provenance this trust domain authenticates.</li>
