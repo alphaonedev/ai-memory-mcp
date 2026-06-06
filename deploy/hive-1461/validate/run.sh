@@ -32,6 +32,16 @@ JSON="$REPORTS/verify-$TS.json"
 REMOTE_TLS="/etc/ai-memory/tls"
 NS_VERIFY="_verify"
 
+# Daemon HTTP api_key (30_config.sh / S5-C1 #1458). Peers bind 0.0.0.0 and
+# therefore run with a top-level `api_key`, so every privileged endpoint
+# (/capabilities, POST/GET/DELETE /memories) demands `x-api-key`. /health is
+# exempt and /sync/* bypasses under mTLS, so those probes work without it. The
+# harness is a legitimate operator-side client: it reads the campaign key from
+# the gitignored run dir and presents it — exercising the api-key auth path
+# end-to-end. Empty key (keyless single-tenant baseline) → no header sent.
+API_PW_FILE="$RUN_DIR/secrets/api.pw"
+API_KEY=""; [ -s "$API_PW_FILE" ] && API_KEY="$(cat "$API_PW_FILE")"
+
 # record <node> <check> <expected> <got> <PASS|FAIL>
 record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$TSV"; }
 
@@ -42,11 +52,12 @@ mtls_curl() {
   local ip="$1" host="$2" method="$3" path="$4" data="${5:-}"
   local base="--max-time 8 --resolve $host:$FEDERATION_PORT:127.0.0.1 \
     --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key"
+  local keyhdr=""; [ -n "$API_KEY" ] && keyhdr="-H 'x-api-key: $API_KEY'"
   if [ "$method" = "POST" ]; then
-    ssh_node "$ip" "curl -fsS $base -X POST -H 'content-type: application/json' \
+    ssh_node "$ip" "curl -fsS $base $keyhdr -X POST -H 'content-type: application/json' \
       --data '$data' https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
   else
-    ssh_node "$ip" "curl -fsS $base -X $method https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
+    ssh_node "$ip" "curl -fsS $base $keyhdr -X $method https://$host:$FEDERATION_PORT$path" 2>/dev/null || true
   fi
 }
 
@@ -99,7 +110,11 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
   [ "$active" = "active" ] && record "$host" "systemd.active" active "$active" PASS \
                            || record "$host" "systemd.active" active "${active:-<none>}" FAIL
 
-  nproc="$(ssh_node "$pub" "pgrep -fc 'ai-memory serve' 2>/dev/null" || echo 0)"
+  # Bracket the first char so the pattern string in THIS pgrep's own remote
+  # shell cmdline (`pgrep -fc '[a]i-memory serve'`) does not satisfy the regex
+  # `[a]i-memory serve` (which needs a literal `ai-memory serve`) — otherwise
+  # `-f` self-matches the matcher's shell and reports one extra instance.
+  nproc="$(ssh_node "$pub" "pgrep -fc '[a]i-memory serve' 2>/dev/null" || echo 0)"
   [ "$nproc" = "1" ] && record "$host" "single_instance" 1 "$nproc" PASS \
                      || record "$host" "single_instance" 1 "${nproc:-0}" FAIL
 done
@@ -152,9 +167,13 @@ fi
 } > "$JSON"
 
 # ---- human summary ----------------------------------------------------------
-total="$(grep -c . "$TSV" || echo 0)"
-passed="$(awk -F'\t' '$5=="PASS"' "$TSV" | grep -c . || echo 0)"
-failed="$(awk -F'\t' '$5=="FAIL"' "$TSV" | grep -c . || echo 0)"
+# `grep -c` already emits 0 on no-match — but it also EXITS 1, which under the
+# `set -euo pipefail` inherited from lib.sh would abort this script. Neutralise
+# the exit with `|| true` (NOT `|| echo 0`, which would append a second 0 →
+# "0\n0" and break the integer test below).
+total="$(grep -c . "$TSV" || true)"
+passed="$(awk -F'\t' '$5=="PASS"' "$TSV" | grep -c . || true)"
+failed="$(awk -F'\t' '$5=="FAIL"' "$TSV" | grep -c . || true)"
 
 printf '\n'
 printf '================ %s baseline verification (%s) ================\n' "$CAMPAIGN" "$TS"
