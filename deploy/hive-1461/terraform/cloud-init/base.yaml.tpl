@@ -6,7 +6,7 @@
 # tooling + the role marker. The application layer (ai-memory binary, PG+AGE
 # container, config.toml, TLS, federation units) is installed by the
 # push-based, idempotent provision/ scripts so it can be re-run and audited
-# live — cloud-init runs once and is hard to debug after the fact.
+# live -- cloud-init runs once and is hard to debug after the fact.
 hostname: ${hostname}
 fqdn: ${hostname}.${campaign}.local
 preserve_hostname: false

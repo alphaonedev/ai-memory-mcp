@@ -7,6 +7,14 @@
 locals {
   # Distinct regions present in the fleet -> one VPC per region.
   regions = distinct([for n in values(var.nodes) : n.region])
+
+  # DO VPC ip_range must be unique per account, so each region gets its own
+  # deterministic, non-overlapping /16: 10.<10+sorted_index>.0.0/16. Sorting
+  # makes the assignment a stable pure function of the region set (nyc3 -> 10.10,
+  # sfo2 -> 10.11, …) so re-plans don't churn already-created VPCs.
+  region_cidr = {
+    for idx, r in sort(local.regions) : r => "10.${10 + idx}.0.0/16"
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -19,7 +27,7 @@ resource "digitalocean_vpc" "regional" {
 
   name     = "${var.campaign}-vpc-${each.key}"
   region   = each.key
-  ip_range = "10.10.0.0/16"
+  ip_range = local.region_cidr[each.key]
 }
 
 # -----------------------------------------------------------------------------
