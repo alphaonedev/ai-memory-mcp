@@ -32,7 +32,7 @@ agent-EXTERNAL actions at write time). The forms:
 | 4 — Fact-provenance | `citations` + `source_uri` + `source_span` (atom-grain span) columns. | **Always on** in store schema (sqlite v38+) |
 | 5 — Confidence + shadow-mode + freshness decay | Auto-confidence calibration; shadow-mode side-by-side scoring; exponential freshness decay on recall. | **Three process-level env vars** on the MCP server + curator daemon: `AI_MEMORY_AUTO_CONFIDENCE=1`, `AI_MEMORY_CONFIDENCE_SHADOW=1`, `AI_MEMORY_CONFIDENCE_DECAY=1` |
 | 6 — MemoryKind vocabulary | 10-variant enum: `Observation` / `Reflection` / `Persona` / `Concept` / `Entity` / `Claim` / `Relation` / `Event` / `Conversation` / `Decision`. | Vocabulary always in schema (`memories.memory_kind`); **auto-classify gated on `GovernancePolicy.auto_classify_kind = "regex_then_llm"` (or `regex_only`) in a namespace standard memory** |
-| 7 — Substrate-authority at write | `check_agent_action` consulted at substrate-internal write paths; v0.8.0 wires the agent-EXTERNAL surface. | **Operator key + R001–R004 signed + enabled** |
+| 7 — Substrate-authority at write | `check_agent_action` consulted at substrate-internal write paths AND at the four agent-EXTERNAL daemon wire-points (skill emission, federation POST, hook subprocess spawn, LLM HTTP) via `wire_check::check` — shipped v0.7.0 (#760). | **Operator key + R001–R004 signed + enabled**; the agent-EXTERNAL hook is armed only under the `serve`/curator daemon |
 
 Forms 1, 3, 4 are on by default in the MCP write path the moment you
 launch with `--tier autonomous`. Forms 2, 5, 6, 7 need explicit
@@ -71,12 +71,6 @@ profile = "full"
 
 ## The 7-step recipe
 
-> **Heads-up — known wart in v0.7.0.** `ai-memory rules keygen` writes
-> the operator key to `<config-dir>/operator.key`, but `ai-memory rules
-> enable` looks in `<config-dir>/keys/operator.key`. Step 1 below
-> includes the one-line `mv` workaround. Tracking issue: see
-> [§"Known wart"](#known-wart) at the end of this document.
-
 Set the DB path once so the rest of the recipe doesn't have to repeat
 it:
 
@@ -106,26 +100,22 @@ Ed25519 operator key generated: <fingerprint> -> <key-dir>/operator.key
 }
 ```
 
-**Workaround for the v0.7.0 path mismatch (macOS / Linux):**
+No file move is required. `rules keygen` writes the operator keypair to
+the singleton location `<config-dir>/ai-memory/operator.key{,.pub}`
+(parent of the per-agent `keys/` directory), and every consumer resolves
+it there: the verify path (`rules_store::resolve_operator_pubkey`) reads
+the singleton directly, and the mutation verbs (`add` / `enable` /
+`disable` / `remove` / `sign-seed`) fall back to it automatically when
+no key is staged under `keys/` (closed by #800 Gap #6 and #822). A fresh
+`keygen` followed immediately by `enable` just works.
 
-```bash
-# macOS
-KEYDIR="$HOME/Library/Application Support/ai-memory/keys"
-# Linux
-# KEYDIR="$HOME/.config/ai-memory/keys"
+Files written by `keygen`, and where each lives:
 
-mv "$(dirname "$KEYDIR")/operator.key"     "$KEYDIR/operator.key"
-mv "$(dirname "$KEYDIR")/operator.key.pub" "$KEYDIR/operator.key.pub"
-ls -la "$KEYDIR/"
-```
-
-Expected files in the keys directory after the move:
-
-| File | Mode | Purpose |
-|---|---|---|
-| `operator.key` | `0600` | 32-byte Ed25519 seed (private — guard it) |
-| `operator.key.pub` | `0644` | Base64url public verifier |
-| `daemon.priv` / `daemon.pub` | `0600` / `0644` | Per-daemon agent identity (separate from the operator key) |
+| File | Location | Mode | Purpose |
+|---|---|---|---|
+| `operator.key` | `<config-dir>/ai-memory/` (singleton) | `0600` | 32-byte Ed25519 seed (private — guard it) |
+| `operator.key.pub` | `<config-dir>/ai-memory/` (singleton) | `0644` | Base64url public verifier |
+| `daemon.priv` / `daemon.pub` | `<config-dir>/ai-memory/keys/` | `0600` / `0644` | Per-daemon agent identity (separate from the operator key) |
 
 ### Step 2 — Sign the seed rules
 
@@ -577,28 +567,55 @@ them back on without re-signing.
 | 4 — Citations + source-URI + atom-grain | Already in store schema | ACTIVE |
 | 5 — Confidence + freshness decay | Curator daemon + namespace `shadow_mode` | ACTIVE |
 | 6 — MemoryKind auto-classify | Namespace `auto_classify` policy | ACTIVE (curator backfills idle rows) |
-| 7 — Agent-EXTERNAL governance | Operator key + R001–R004 enabled | ACTIVE (substrate-INTERNAL only at v0.7.0; agent-EXTERNAL Layer-4 surface wires fully at v0.8.0 per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)) |
+| 7 — Agent-EXTERNAL governance | Operator key + R001–R004 enabled + `serve`/curator daemon | ACTIVE (substrate-INTERNAL write paths + the four agent-EXTERNAL daemon wire-points; shipped v0.7.0 per [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760)) |
 
-The qualifier on Form 7 matters: at v0.7.0, the wired surface is
-substrate-internal (any path that calls `memory_store` / `memory_link`
-/ `memory_delete` / `memory_archive` / `memory_consolidate` /
-`memory_replay`). The agent-EXTERNAL Layer-4 surface (Bash /
-FilesystemWrite outside the substrate / NetworkRequest / ProcessSpawn)
-is `callable_now=false` until the v0.8.0 harness-boundary wiring lands.
-Operators can already enforce the same rules at the harness boundary
-themselves via a `PreToolUse` hook that shells out to `ai-memory rules
-check`; the [cookbook recipe](https://github.com/alphaonedev/ai-memory-mcp/tree/feat/v0.7.0-grand-slam/cookbook/agent-external-governance)
-documents that pattern.
+The qualifier on Form 7 is no longer a version gate. Two surfaces are
+wired:
 
-## Known wart
+- **Substrate-internal** — any path that calls `memory_store` /
+  `memory_link` / `memory_delete` / `memory_archive` /
+  `memory_consolidate` / `memory_replay`, gated pre-write by
+  `GOVERNANCE_PRE_WRITE`.
+- **Agent-EXTERNAL** — wired in v0.7.0 (issue
+  [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760)) at
+  four daemon-side boundaries, each calling `wire_check::check` BEFORE
+  the external action proceeds: skill-manifest emission
+  (`FilesystemWrite`, `src/mcp/tools/skill_export.rs`), federation peer
+  POST (`NetworkRequest`, `src/federation/sync.rs`), hooks subprocess
+  spawn (`ProcessSpawn`, `src/hooks/executor.rs`), and LLM HTTP
+  (`NetworkRequest`, `src/llm.rs`). The daemon's `bootstrap_serve`
+  installs the single `GOVERNANCE_PRE_ACTION` closure that consults the
+  operator-signed `governance_rules` table; a Deny verdict halts the
+  operation, it does not merely log it.
 
-`ai-memory rules keygen` writes the operator key to
-`<config-dir>/operator.key`, but `ai-memory rules enable` looks in
-`<config-dir>/keys/operator.key`. The Step 1 workaround moves the files
-into the expected location. The fix is a one-line change — either
-keygen should write into `keys/` or enable should fall back to
-`<config-dir>/operator.key`. Tracked separately on the issue list under
-the `bug` / `governance` labels.
+Two limits this does **not** cover, which you own:
+
+1. **Daemon-only arming.** A stdio `ai-memory mcp` process never
+   installs `GOVERNANCE_PRE_ACTION` (by design — CLI/one-shot ops stay
+   unimpeded), so the agent-EXTERNAL gate is live only under the
+   `serve`/curator daemon you stood up in Step 5. Capable ≠ active per
+   process.
+2. **The harness's own tools.** Claude Code's `Bash` / `Write` outside
+   the substrate are not substrate-intercepted. Enforce the same rules
+   at that boundary with a `PreToolUse` hook that shells out to
+   `ai-memory rules check`; the [cookbook recipe](https://github.com/alphaonedev/ai-memory-mcp/tree/feat/v0.7.0-grand-slam/cookbook/agent-external-governance)
+   documents the pattern.
+
+## Resolved: keygen ↔ enable key-path resolution
+
+Earlier v0.7.0 builds had a path mismatch: `rules keygen` wrote the
+operator key to the singleton `<config-dir>/ai-memory/operator.key`,
+but the mutation verbs only looked under `<config-dir>/ai-memory/keys/`,
+so a fresh `keygen` + `enable` refused with
+`governance.no_operator_key` unless you mirrored the files by hand.
+
+This is fixed. `load_operator_signing_key_from_dir`
+(`src/cli/rules.rs`) now resolves the operator key across three
+layouts in order — `keys/operator.priv`+`operator.pub` (legacy pair),
+`keys/operator.key`+`.pub` (staged-under-keys), then the parent-dir
+singleton `<config-dir>/ai-memory/operator.key`+`.pub` that `keygen`
+actually writes (#800 Gap #6). `rules sign-seed` applies the same
+precedence (#822). No `mv` workaround is needed.
 
 ## Related documentation
 
