@@ -76,7 +76,7 @@ Inherited from `ai-memory/v0.7.0-nhi-testing` playbook hard rules and CLAUDE.md:
 | Item | Value |
 |------|-------|
 | Campaign start | 2026-05-17 |
-| Operator | binary2029@gmail.com (justin@alpha-one.mobi) |
+| Operator | justin@alpha-one.mobi |
 | Authoring agent | Claude (Opus 4.7 1M context) |
 | Authority | Autonomous execution authorized by operator while traveling |
 | Source handoff | `.local-runs/handoff-prompt-next-session-2026-05-17.md` (in this repo) |

@@ -126,9 +126,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "104.131.48.67",
+          "ip_address": "REDACTED",
           "netmask": "255.255.192.0",
-          "gateway": "104.131.0.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -273,9 +273,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "167.71.240.201",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "167.71.240.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -420,9 +420,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "68.183.159.231",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "68.183.144.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -567,9 +567,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "167.99.120.101",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "167.99.112.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -714,9 +714,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "64.225.13.113",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "64.225.0.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -861,9 +861,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "165.22.34.184",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "165.22.32.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -1115,9 +1115,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "206.189.79.3",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "206.189.64.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -1262,9 +1262,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "138.197.83.93",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "138.197.80.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -1409,9 +1409,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "165.227.209.109",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "165.227.208.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -1556,9 +1556,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "159.203.129.209",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "159.203.128.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -1810,9 +1810,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "165.22.144.70",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "165.22.144.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {
@@ -1957,9 +1957,9 @@
     "networks": {
       "v4": [
         {
-          "ip_address": "159.203.97.254",
+          "ip_address": "REDACTED",
           "netmask": "255.255.240.0",
-          "gateway": "159.203.96.1",
+          "gateway": "REDACTED",
           "type": "public"
         },
         {

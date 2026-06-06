@@ -9,7 +9,7 @@
 > Status: **ACCEPTED, v0.7.0 ship-readiness wave** (issue
 > [#767](https://github.com/alphaonedev/ai-memory-mcp/issues/767)).
 > Date: 2026-05-15. Author: AI NHI dev team session (Claude Opus 4.7
-> 1M context). Reviewer: operator (binary2029@gmail.com).
+> 1M context). Reviewer: operator (justin@alpha-one.mobi).
 
 ## ADR-1 — QW-4 disposition: docs-only (no code feature)
 
