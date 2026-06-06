@@ -1,0 +1,20 @@
+docker-1461-peer-1	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+docker-1461-peer-1	container.health	healthy	healthy	PASS
+docker-1461-peer-1	single_instance	1	1	PASS
+docker-1461-peer-2	binary.version	*0.7.0*	ai-memory 0.7.0	PASS
+docker-1461-peer-2	container.health	healthy	healthy	PASS
+docker-1461-peer-2	single_instance	1	1	PASS
+docker-1461-peer-1	health.status	ok	ok	PASS
+docker-1461-peer-1	health.version	0.7.0	0.7.0	PASS
+docker-1461-peer-1	health.embedder_ready	true	true	PASS
+docker-1461-peer-1	health.federation_enabled	true	true	PASS
+docker-1461-peer-1	caps.storage_backend	postgres	postgres	PASS
+docker-1461-peer-1	caps.db_schema_version	55	55	PASS
+docker-1461-peer-2	health.status	ok	ok	PASS
+docker-1461-peer-2	health.version	0.7.0	0.7.0	PASS
+docker-1461-peer-2	health.embedder_ready	true	true	PASS
+docker-1461-peer-2	health.federation_enabled	true	true	PASS
+docker-1461-peer-2	caps.storage_backend	postgres	postgres	PASS
+docker-1461-peer-2	caps.db_schema_version	55	55	PASS
+fleet	federation.write	memory id	d07a6eea-410f-49e3-9b3a-8c8bad4b1fc8	PASS
+fleet	federation.convergence	d07a6eea-410f-49e3-9b3a-8c8bad4b1fc8 on docker-1461-peer-2	d07a6eea-410f-49e3-9b3a-8c8bad4b1fc8 present on docker-1461-peer-2	PASS

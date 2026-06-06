@@ -1,0 +1,32 @@
+{
+  "campaign": "docker-1461",
+  "timestamp": "20260606T105643Z",
+  "suite": "d6-full-spectrum",
+  "checks": [
+    {"group": "regression", "test": "create", "expected": "memory id", "got": "f22466c6-ea70-4ca1-8953-8780a871572b", "status": "PASS"},
+    {"group": "regression", "test": "get_by_id", "expected": "content present", "got": "d6-20260606T105643Z-3108 found", "status": "PASS"},
+    {"group": "regression", "test": "search_semantic", "expected": "id in results (count=1)", "got": "f22466c6-ea70-4ca1-8953-8780a871572b", "status": "PASS"},
+    {"group": "regression", "test": "list_namespace", "expected": "id listed in _test", "got": "f22466c6-ea70-4ca1-8953-8780a871572b", "status": "PASS"},
+    {"group": "regression", "test": "private_isolation", "expected": "hidden from non-owner", "got": "not visible to ai:agent-beta@docker-1461", "status": "PASS"},
+    {"group": "regression", "test": "ns_cross_isolation", "expected": "absent from other ns", "got": "isolated", "status": "PASS"},
+    {"group": "crypto", "test": "no_client_cert", "expected": "000", "got": "000", "status": "PASS"},
+    {"group": "crypto", "test": "rogue_client_cert", "expected": "000", "got": "000", "status": "PASS"},
+    {"group": "crypto", "test": "wrong_server_ca", "expected": "000", "got": "000", "status": "PASS"},
+    {"group": "crypto", "test": "apikey_required", "expected": "401", "got": "401", "status": "PASS"},
+    {"group": "crypto", "test": "apikey_accepted", "expected": "200", "got": "200", "status": "PASS"},
+    {"group": "crypto", "test": "health_exempt", "expected": "200", "got": "200", "status": "PASS"},
+    {"group": "crypto", "test": "admin_gated", "expected": "403", "got": "403", "status": "PASS"},
+    {"group": "federation", "test": "write", "expected": "memory id", "got": "d76878a5-3d02-483b-ba21-9aebfd974642", "status": "PASS"},
+    {"group": "federation", "test": "converge", "expected": "d76878a5-3d02-483b-ba21-9aebfd974642 on docker-1461-peer-2", "got": "present on docker-1461-peer-2", "status": "PASS"},
+    {"group": "zerotouch", "test": "enrolled_write", "expected": "memory id", "got": "327c5399-2c81-4e5b-a721-065387790382", "status": "PASS"},
+    {"group": "zerotouch", "test": "enrolled_converge", "expected": "327c5399-2c81-4e5b-a721-065387790382 on docker-1461-peer-2 (credential-only trust)", "got": "present via CA credential", "status": "PASS"},
+    {"group": "zerotouch", "test": "unenrolled_status", "expected": "401", "got": "401", "status": "PASS"},
+    {"group": "zerotouch", "test": "unenrolled_reason", "expected": "peer_not_enrolled", "got": "fail-closed", "status": "PASS"},
+    {"group": "a2a", "test": "agent_write", "expected": "memory id (alpha->peer1)", "got": "a3d8e39d-c505-4231-a986-5ce2892d2006", "status": "PASS"},
+    {"group": "a2a", "test": "beta_read_writepeer", "expected": "visible cross-agent", "got": "a3d8e39d-c505-4231-a986-5ce2892d2006 present", "status": "PASS"},
+    {"group": "a2a", "test": "beta_read_fedpeer", "expected": "visible on federated peer", "got": "a3d8e39d-c505-4231-a986-5ce2892d2006 present on docker-1461-peer-2", "status": "PASS"},
+    {"group": "ai_nhi", "test": "llm_decision", "expected": "non-empty expanded_terms", "got": "term=Byzantine fault tolerance", "status": "PASS"},
+    {"group": "ai_nhi", "test": "nhi_commit", "expected": "memory id (alpha decision->peer1)", "got": "0645fb81-bf2f-4128-bac5-ef0b1403253e", "status": "PASS"},
+    {"group": "ai_nhi", "test": "nhi_converge", "expected": "decision visible on federated peer", "got": "0645fb81-bf2f-4128-bac5-ef0b1403253e present on docker-1461-peer-2", "status": "PASS"}
+  ]
+}
