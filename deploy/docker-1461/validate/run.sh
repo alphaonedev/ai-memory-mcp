@@ -25,7 +25,10 @@
 #                             federation_enabled) ; capabilities.storage_backend
 #                             == postgres ; capabilities.db_schema_version ==
 #                             EXPECTED_SCHEMA
-#   fleet                   : federation convergence — write a collective marker
+#   fleet                   : daemon -> PostgreSQL leg is TLS (third encrypted
+#                             leg) — every daemon-owned PG backend negotiated
+#                             ssl=true (pg_stat_ssl, >=1 ssl / 0 plain) ;
+#                             federation convergence — write a collective marker
 #                             to peer-1, read it by id on peer-2 within the
 #                             catch-up window, best-effort DELETE cleanup.
 #
@@ -111,6 +114,24 @@ for i in $(seq 1 "$PEER_COUNT"); do
   rec_eq "$name" "caps.storage_backend" postgres "$(json_field "$caps" storage_backend)"
   rec_eq "$name" "caps.db_schema_version" "$EXPECTED_SCHEMA" "$(json_field "$caps" db_schema_version)"
 done
+
+# --------------------------------------------------------------------------
+# Fleet: the daemon -> PostgreSQL leg is TLS (third encrypted leg). Inspect
+# pg_stat_ssl joined to pg_stat_activity INSIDE the PG container: every TCP
+# backend owned by the daemon role must report ssl=true, and there must be at
+# least one (proving the daemons actually hold encrypted pooled connections,
+# not merely "zero plaintext"). The probe's own psql is a unix-socket backend
+# (client_addr IS NULL) and is excluded, so only the daemons' TCP connections
+# are counted.
+# --------------------------------------------------------------------------
+pg_ssl_q="select count(*) from pg_stat_ssl s join pg_stat_activity a on s.pid=a.pid where a.usename='$PG_USER' and a.client_addr is not null and a.backend_type='client backend'"
+ssl_on="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$pg_ssl_q and s.ssl is true" 2>/dev/null | tr -d '[:space:]' || echo x)"
+ssl_off="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$pg_ssl_q and s.ssl is not true" 2>/dev/null | tr -d '[:space:]' || echo x)"
+if [ "$ssl_off" = "0" ] && [ -n "$ssl_on" ] && [ "$ssl_on" != "0" ] && [ "$ssl_on" != "x" ]; then
+  record fleet "daemon_pg.tls" "encrypted (>=1 ssl, 0 plain)" "ssl=$ssl_on plain=$ssl_off" PASS
+else
+  record fleet "daemon_pg.tls" "encrypted (>=1 ssl, 0 plain)" "ssl=${ssl_on:-?} plain=${ssl_off:-?}" FAIL
+fi
 
 # --------------------------------------------------------------------------
 # Fleet: federation convergence (write peer-1 -> read peer-2 over mTLS).
