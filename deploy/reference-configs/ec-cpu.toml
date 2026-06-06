@@ -1,0 +1,124 @@
+# =============================================================================
+# EC-CPU — Enterprise Compute archetype: CPU-only, NO Ollama
+# =============================================================================
+# Embedder runs IN-PROCESS on CPU (candle). The daemon never opens an Ollama
+# connection for embeddings. LLM autonomy (auto_tag / contradiction / query
+# expansion) runs against a CLOUD provider so the host needs no local GPU at
+# all. This is the archetype for fleets with no GPU budget — the do-1461 free
+# CPU swarm is the canonical deployment.
+#
+# Code path this file exercises (all resolvers are PURE, no network I/O):
+#   * config.rs  AppConfig::resolve_embeddings()
+#                 -> [embeddings].model wins the precedence ladder, is run
+#                    through canonicalise_embedding_model(), and its dim is
+#                    looked up in KNOWN_EMBEDDING_DIMS.
+#   * daemon_runtime.rs  resolve_embedder_model()
+#                 -> EmbeddingModel::from_canonical_id("all-MiniLM-L6-v2")
+#                    == EmbeddingModel::MiniLmL6V2.
+#   * embeddings.rs  Embedder::for_model(MiniLmL6V2, _client)
+#                 -> Embedder::new_local() (candle, in-process). The Ollama
+#                    client argument is IGNORED for this model — that is what
+#                    makes EC-CPU the "no-Ollama" archetype.
+#
+# Precedence ladder for every resolved field (highest wins):
+#   CLI flag  >  AI_MEMORY_* env var  >  config.toml section
+#             >  legacy flat field (deprecation WARN)  >  compiled default
+# =============================================================================
+
+# v2 sectioned schema (#1146). MUST be 2 to select the sectioned parse path.
+schema_version = 2
+
+# Feature tier. `autonomous` enables the full LLM-autonomy hook surface.
+tier = "autonomous"
+
+# Storage backend connection. For the Postgres substrate this is the
+# connection URL; the password is supplied out-of-band via the
+# AI_MEMORY_DB env override or the PG* environment — NEVER inline here.
+db = "postgres://ai_memory@localhost:5432/ai_memory"
+
+# --- Postgres connection-pool ceilings (resolve_pg_pool) ---------------------
+# Sized for a dedicated CPU node. Env overrides: AI_MEMORY_PG_POOL_MAX /
+# AI_MEMORY_PG_POOL_MIN / AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS.
+postgres_pool_max_connections = 16
+postgres_pool_min_connections = 2
+postgres_acquire_timeout_secs = 30
+
+# -----------------------------------------------------------------------------
+# [llm] — cloud LLM provider (no local GPU required).
+# The model id is a provider tag passed verbatim to the chat endpoint and is
+# operator-selectable; swap backend/model for any supported provider. The API
+# key is read at runtime from the named env var — NEVER inline a secret here
+# (inline `api_key` is REJECTED at parse time; use api_key_env / api_key_file).
+# -----------------------------------------------------------------------------
+[llm]
+backend = "openrouter"
+model = "google/gemma-4-26b-a4b-it"
+api_key_env = "OPENROUTER_API_KEY"
+
+# Fast structured-output sibling for auto_tag / query-expansion. Inherits every
+# unset field from the parent [llm]; override `model` to a cheaper/faster tag.
+[llm.auto_tag]
+model = "google/gemma-4-26b-a4b-it"
+
+# -----------------------------------------------------------------------------
+# [embeddings] — THE archetype-defining block.
+# `model` carries ONLY the operator-facing model alias (irreducible config
+# data). MiniLmL6V2 is the candle in-process CPU embedder: the daemon resolves
+# it via EmbeddingModel::from_canonical_id and builds Embedder::new_local(),
+# so `backend`/`url` below are inert for this model (present for schema
+# uniformity and for operators who later switch to an Ollama-served model).
+# -----------------------------------------------------------------------------
+[embeddings]
+backend = "ollama"
+url = "http://localhost:11434"
+model = "all-MiniLM-L6-v2"
+backfill_batch = 100
+
+# -----------------------------------------------------------------------------
+# [reranker] — cross-encoder rerank stage. Runs on CPU; the single v0.7.0
+# variant is the default. `model` is reserved for future bake-offs.
+# -----------------------------------------------------------------------------
+[reranker]
+enabled = true
+model = "ms-marco-MiniLM-L-6-v2"
+
+# -----------------------------------------------------------------------------
+# [storage] — namespace + archive policy.
+# -----------------------------------------------------------------------------
+[storage]
+default_namespace = "alphaone"
+archive_on_gc = true
+archive_max_days = 90
+max_memory_mb = 4096
+
+# -----------------------------------------------------------------------------
+# [limits] — per-(agent, namespace) capacity bounds + request page-size cap.
+# Env overrides: AI_MEMORY_MAX_MEMORIES_PER_DAY / _MAX_STORAGE_BYTES /
+# _MAX_LINKS_PER_DAY / _MAX_PAGE_SIZE.
+# -----------------------------------------------------------------------------
+[limits]
+max_memories_per_day = 10000000
+max_storage_bytes = 1073741824
+max_links_per_day = 5000
+max_page_size = 1000
+
+# -----------------------------------------------------------------------------
+# [permissions] — v0.7.0 secure default is `enforce`.
+# -----------------------------------------------------------------------------
+[permissions]
+mode = "enforce"
+
+# -----------------------------------------------------------------------------
+# [audit] — tamper-evident hash-chained audit trail (SIEM / SOC2 / HIPAA).
+# -----------------------------------------------------------------------------
+[audit]
+enabled = true
+hash_chain = true
+append_only = true
+retention_days = 90
+
+# -----------------------------------------------------------------------------
+# [mcp] — named MCP tool profile (production-secure default surface).
+# -----------------------------------------------------------------------------
+[mcp]
+profile = "core"
