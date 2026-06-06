@@ -20,6 +20,10 @@
 #                (200 without key); admin endpoint as non-admin -> 403.
 #   federation : write to peer-1, converge on peer-2 (same region) AND peer-3
 #                (cross-region nyc3->sfo2) within the catchup window.
+#   zerotouch  : first-party CA trust (provision/45_zero_touch.sh) — an enrolled
+#                peer converges via its CA-signed credential ALONE (no per-peer
+#                pubkey is pushed to any other peer), and an UNENROLLED x-peer-id
+#                is refused 401 `peer_not_enrolled` on /sync/since (fail-closed).
 #   a2a        : agent-to-agent E2E — agent-alpha (an mTLS CLIENT node) writes a
 #                collective memory to a peer over the network; agent-beta (a
 #                different client identity, different node) reads it back BOTH on
@@ -102,6 +106,15 @@ code_raw() {
   local rip="$1" args="$2" out
   out="$(ssh_node "$rip" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 $args; true" 2>/dev/null || true)"
   printf '%s' "${out:-000}"
+}
+
+# body_raw <run_ip> <curl_arg_string> -> response body REGARDLESS of status.
+# Unlike body_req (which uses -fsS and so returns empty on any non-2xx), this
+# keeps the error envelope so a negative check can assert on the JSON `error`
+# tag (e.g. distinguishing an enrollment 401 from an api-key 401).
+body_raw() {
+  local rip="$1" args="$2"
+  ssh_node "$rip" "curl -s --max-time 10 $args; true" 2>/dev/null || true
 }
 
 log "P3 full-spectrum test run $TS — fleet=$CAMPAIGN port=$FEDERATION_PORT"
@@ -235,6 +248,56 @@ if [ -n "$P2_IP" ]; then
 else
   record federation converge_same_region ">=2 peers" "<need 2 peers>" FAIL
 fi
+
+# ====================== GROUP zerotouch ======================================
+# First-party zero-touch trust (provision/45_zero_touch.sh): every peer runs
+# with AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 and holds ONLY the campaign CA
+# verifying key (NO per-peer pubkey was pushed to any other peer). Two proofs:
+#
+#   enrolled_converge : a write on peer-1 converges on peer-2. The ONLY thing
+#     authorizing peer-1's outbound federation push at peer-2 is its CA-signed
+#     credential (X-Memory-Cred) — there is no operator-pushed key for peer-1 in
+#     peer-2's store. Convergence therefore proves a peer joins the mesh via the
+#     issuer-credential path alone ("zero touch").
+#   unenrolled_refused: a request to /sync/since bearing an UNENROLLED X-Peer-Id
+#     and no signature/credential — but valid api-key + mTLS — is refused 401
+#     with `error:peer_not_enrolled` (the #1088 fail-closed arm). The body tag
+#     is asserted so this cannot be confused with an api-key 401.
+if [ -n "$P2_IP" ]; then
+  log "[zerotouch] enrolled peer converges through the REQUIRE_PEER_ENROLLMENT gate"
+  ZNONCE="zt-$TS-$RANDOM"
+  ZBODY="{\"title\":\"$ZNONCE\",\"content\":\"zero-touch enrolled convergence $ZNONCE\",\"namespace\":\"_zerotouch\",\"scope\":\"collective\"}"
+  ZW="$(body_req "$P1_IP" 127.0.0.1 "$P1_H" POST /api/v1/memories "$ZBODY" "$AID_H")"
+  ZMID="$(json_field "$ZW" id)"
+  if [ -z "$ZMID" ]; then
+    fail zerotouch enrolled_write "memory id" "<write failed>"
+  else
+    pass zerotouch enrolled_write "memory id" "$ZMID"; track "$ZMID" "$P1_IP" "$P1_H"
+    i=0; got="<not replicated within window>"; st=FAIL
+    while [ "$i" -lt 20 ]; do
+      ZR="$(body_req "$P2_IP" 127.0.0.1 "$P2_H" GET "/api/v1/memories/$ZMID" "" "$AID_H")"
+      case "$ZR" in *"$ZNONCE"*) st=PASS; got="present on $P2_H via CA credential (no pushed pubkey)"; break ;; esac
+      i=$((i+1)); sleep 2
+    done
+    record zerotouch enrolled_converge "$ZMID on $P2_H (credential-only trust)" "$got" "$st"
+  fi
+else
+  record zerotouch enrolled_converge ">=2 peers" "<need 2 peers>" FAIL
+fi
+
+# Negative: an unenrolled peer-id is refused fail-closed on the sync surface.
+log "[zerotouch] unenrolled peer-id refused on /sync/since (#1088 fail-closed)"
+ZRES="--resolve $P1_H:$FEDERATION_PORT:127.0.0.1"
+ZCA="--cacert $REMOTE_TLS/ca.pem"; ZCERT="--cert $REMOTE_TLS/client.pem"; ZKEY="--key $REMOTE_TLS/client.key"
+ZKEYHDR=""; [ -n "$API_KEY" ] && ZKEYHDR="-H 'x-api-key: $API_KEY'"
+ZROGUE="rogue-unenrolled-$TS"
+ZSYNC="https://$P1_H:$FEDERATION_PORT/api/v1/sync/since?since=1970-01-01T00:00:00Z"
+ZPROBE="$ZRES $ZCA $ZCERT $ZKEY $ZKEYHDR -H 'x-peer-id: $ZROGUE' \"$ZSYNC\""
+zc="$(code_raw "$P1_IP" "$ZPROBE")"
+assert_eq zerotouch unenrolled_status 401 "$zc"
+zb="$(body_raw "$P1_IP" "$ZPROBE")"
+case "$zb" in *peer_not_enrolled*) pass zerotouch unenrolled_reason "peer_not_enrolled" "fail-closed" ;;
+                              *) fail zerotouch unenrolled_reason "peer_not_enrolled" "${zb:-<empty>}" ;; esac
 
 # ====================== GROUP a2a ============================================
 # Agent-to-agent E2E. agent-alpha (mTLS CLIENT node) writes a COLLECTIVE memory
