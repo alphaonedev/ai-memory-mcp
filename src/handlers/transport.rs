@@ -504,7 +504,7 @@ impl AppState {
             return None;
         }
         let embedder = self.embedder.as_ref().as_ref()?;
-        let intent_vec = embedder.embed(intent).ok()?;
+        let intent_vec = embedder.embed_query(intent).ok()?;
         let mut best: Option<(Family, f32)> = None;
         for (family, descriptor_vec) in cache.iter() {
             let score = Embedder::cosine_similarity(&intent_vec, descriptor_vec);

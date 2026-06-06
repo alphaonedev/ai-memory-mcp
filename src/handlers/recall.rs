@@ -300,7 +300,7 @@ async fn recall_response(
         // embedder is unavailable; the trait's recall_hybrid degrades
         // to the FTS-only pool with a synthetic semantic component.
         let query_emb: Option<Vec<f32>> = if let Some(emb) = app.embedder.as_ref().as_ref() {
-            match emb.embed(context) {
+            match emb.embed_query(context) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::warn!("recall (postgres): embed failed, keyword-only: {e}");
@@ -471,7 +471,7 @@ async fn recall_response(
     // Embed the query BEFORE grabbing the DB lock — embed() is CPU-heavy
     // and holding the SQLite mutex across it serialises unrelated writes.
     let query_emb: Option<Vec<f32>> = if let Some(emb) = app.embedder.as_ref().as_ref() {
-        match emb.embed(context) {
+        match emb.embed_query(context) {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!("recall: embedder query failed, falling back to keyword-only: {e}");

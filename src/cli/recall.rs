@@ -360,12 +360,12 @@ pub(crate) fn run_with_embedder(
 
     // Perform recall: hybrid if embedder available, keyword otherwise
     let (results, outcome, mode) = if let Some(emb) = embedder {
-        match emb.embed(&args.context) {
+        match emb.embed_query(&args.context) {
             Ok(primary_emb) => {
                 let query_emb = match args.context_tokens.as_deref() {
                     Some(tokens) if !tokens.is_empty() => {
                         let joined = tokens.join(" ");
-                        match emb.embed(&joined) {
+                        match emb.embed_query(&joined) {
                             Ok(ctx_emb) => embeddings::Embedder::fuse(
                                 &primary_emb,
                                 &ctx_emb,

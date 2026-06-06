@@ -458,7 +458,7 @@ fn best_family_via_embedder(
 ) -> Option<(crate::profile::Family, f32)> {
     use crate::profile::Family;
 
-    let intent_vec = emb.embed(intent).ok()?;
+    let intent_vec = emb.embed_query(intent).ok()?;
     let mut best: Option<(Family, f32)> = None;
     for family in Family::all() {
         let descriptor = family_descriptor(*family);
