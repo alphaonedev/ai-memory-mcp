@@ -120,10 +120,13 @@ done
 # campaign run on PostgreSQL EXACTLY 18.4 + Apache AGE EXACTLY 1.7.0; assert
 # the LIVE server reports those upstream versions so every published result
 # is peer-verifiable against the pinned stack (lib.sh EXPECTED_PG_VERSION /
-# EXPECTED_AGE_VERSION). `server_version` yields the bare minor (e.g. 18.4);
+# EXPECTED_AGE_VERSION). `current_setting('server_version')` returns the
+# bare minor followed by the distro build suffix (e.g.
+# "18.4 (Debian 18.4-1.pgdg13+1)"), so split on the first space to recover
+# the bare upstream minor (18.4) for an exact peer-verifiable match.
 # AGE's installed version comes from pg_extension.extversion.
 # --------------------------------------------------------------------------
-pg_ver="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "select current_setting('server_version')" 2>/dev/null | tr -d '[:space:]' || true)"
+pg_ver="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "select split_part(current_setting('server_version'),' ',1)" 2>/dev/null | tr -d '[:space:]' || true)"
 rec_eq fleet "store.pg_version" "$EXPECTED_PG_VERSION" "$pg_ver" "<unreachable>"
 age_ver="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "select extversion from pg_extension where extname='age'" 2>/dev/null | tr -d '[:space:]' || true)"
 rec_eq fleet "store.age_version" "$EXPECTED_AGE_VERSION" "$age_ver" "<not installed>"
