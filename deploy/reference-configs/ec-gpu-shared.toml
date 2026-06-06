@@ -1,0 +1,116 @@
+# =============================================================================
+# EC-GPU-SHARED — Enterprise Compute archetype: SHARED GPU, Ollama
+# =============================================================================
+# Same embedder family as EC-GPU (768-dim nomic over Ollama) but the GPU is a
+# SHARED, co-tenant resource (a central Ollama host serving several daemons /
+# workloads). The config posture is therefore a GOOD-NEIGHBOUR one: smaller
+# backfill batch (lighter bursts on the shared embed endpoint), a tighter
+# connection pool, and a longer acquire timeout to ride out contention rather
+# than failing fast. The model resolution is byte-identical to EC-GPU — only
+# the resource envelope differs.
+#
+# Code path this file exercises (all resolvers are PURE, no network I/O):
+#   * config.rs  AppConfig::resolve_embeddings()
+#                 -> [embeddings].model wins, canonicalised, dim from
+#                    KNOWN_EMBEDDING_DIMS; [embeddings].url points at the
+#                    SHARED Ollama host (not localhost).
+#   * daemon_runtime.rs  resolve_embedder_model()
+#                 -> EmbeddingModel::from_canonical_id("nomic-embed-text-v1.5")
+#                    == EmbeddingModel::NomicEmbedV15.
+#   * embeddings.rs  Embedder::for_model(NomicEmbedV15, Some(client))
+#                 -> Embedder::new_ollama(): REQUIRES the Ollama client.
+#
+# Precedence ladder for every resolved field (highest wins):
+#   CLI flag  >  AI_MEMORY_* env var  >  config.toml section
+#             >  legacy flat field (deprecation WARN)  >  compiled default
+# =============================================================================
+
+# v2 sectioned schema (#1146). MUST be 2 to select the sectioned parse path.
+schema_version = 2
+
+# Feature tier. `autonomous` enables the full LLM-autonomy hook surface.
+tier = "autonomous"
+
+# Storage backend connection. Password supplied out-of-band via AI_MEMORY_DB /
+# PG* env — NEVER inline here.
+db = "postgres://ai_memory@localhost:5432/ai_memory"
+
+# --- Postgres connection-pool ceilings (resolve_pg_pool) ---------------------
+# Tighter than EC-GPU: a co-tenant daemon should not hoard substrate
+# connections. Longer acquire timeout absorbs contention on the shared box.
+# Env overrides: AI_MEMORY_PG_POOL_MAX / _MIN / AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS.
+postgres_pool_max_connections = 12
+postgres_pool_min_connections = 2
+postgres_acquire_timeout_secs = 45
+
+# -----------------------------------------------------------------------------
+# [llm] — points at the SHARED Ollama host. Native Ollama backend needs no
+# API key (KeySource::None is correct).
+# -----------------------------------------------------------------------------
+[llm]
+backend = "ollama"
+base_url = "http://gpu-shared.internal:11434"
+model = "gemma3:4b"
+
+# Fast structured-output sibling. Inherits backend/base_url from parent [llm].
+[llm.auto_tag]
+model = "gemma3:4b"
+
+# -----------------------------------------------------------------------------
+# [embeddings] — THE archetype-defining block.
+# NomicEmbedV15 (768-dim) over the SHARED Ollama host. `backfill_batch` is
+# deliberately smaller than EC-GPU to keep bursts gentle on the co-tenant
+# endpoint.
+# -----------------------------------------------------------------------------
+[embeddings]
+backend = "ollama"
+url = "http://gpu-shared.internal:11434"
+model = "nomic-embed-text-v1.5"
+backfill_batch = 64
+
+# -----------------------------------------------------------------------------
+# [reranker] — cross-encoder rerank stage (runs in-process, not on the shared
+# GPU, so it carries no co-tenant cost).
+# -----------------------------------------------------------------------------
+[reranker]
+enabled = true
+model = "ms-marco-MiniLM-L-6-v2"
+
+# -----------------------------------------------------------------------------
+# [storage]
+# -----------------------------------------------------------------------------
+[storage]
+default_namespace = "alphaone"
+archive_on_gc = true
+archive_max_days = 90
+max_memory_mb = 8192
+
+# -----------------------------------------------------------------------------
+# [limits]
+# -----------------------------------------------------------------------------
+[limits]
+max_memories_per_day = 10000000
+max_storage_bytes = 1073741824
+max_links_per_day = 5000
+max_page_size = 1000
+
+# -----------------------------------------------------------------------------
+# [permissions]
+# -----------------------------------------------------------------------------
+[permissions]
+mode = "enforce"
+
+# -----------------------------------------------------------------------------
+# [audit]
+# -----------------------------------------------------------------------------
+[audit]
+enabled = true
+hash_chain = true
+append_only = true
+retention_days = 90
+
+# -----------------------------------------------------------------------------
+# [mcp]
+# -----------------------------------------------------------------------------
+[mcp]
+profile = "core"
