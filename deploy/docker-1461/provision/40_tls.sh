@@ -142,4 +142,35 @@ while [ "$i" -le "$PEER_COUNT" ]; do
   i=$((i + 1))
 done
 
-log "tls: OK — CA + client + $PEER_COUNT server certs (curve=$EC_CURVE, days=$CERT_DAYS)"
+# --------------------------------------------------------------------------
+# 5. PostgreSQL server cert (the daemon -> PG store leg, third encrypted
+#    leg of the mesh). A CA-signed leaf whose SAN covers the intra-bridge
+#    DNS name + loopback, so a daemon dialing `pg-age` under
+#    sslmode=verify-full validates the chain AND the hostname against the
+#    SAME campaign CA the API + federation legs already trust — no separate
+#    PKI. The key is bind-mounted into the PG container and re-installed
+#    postgres-owned by its entrypoint wrapper (a bind-mounted host key keeps
+#    its host uid; PostgreSQL refuses an ssl_key_file it does not own).
+# --------------------------------------------------------------------------
+pgtls="$PG_NODE_DIR/tls"
+mkdir -p "$pgtls"
+pgkey="$pgtls/server.key"; pgcert="$pgtls/server.pem"
+if [ ! -s "$pgcert" ] || [ ! -s "$pgkey" ]; then
+  log "tls: minting PG server cert ($PG_HOSTNAME)"
+  _gen_key "$pgkey"
+  csr="$pgtls/server.csr"; ext="$pgtls/server.ext"
+  {
+    printf 'basicConstraints=CA:FALSE\n'
+    printf 'keyUsage=critical,digitalSignature,keyEncipherment\n'
+    printf 'extendedKeyUsage=serverAuth\n'
+    printf 'subjectAltName=DNS:%s,DNS:localhost,IP:127.0.0.1\n' "$PG_HOSTNAME"
+  } >"$ext"
+  openssl req -new -key "$pgkey" -out "$csr" -subj "/CN=${PG_HOSTNAME}" 2>/dev/null
+  _sign_leaf "$csr" "$pgcert" "$ext"
+  rm -f "$csr" "$ext"
+  chmod 0600 "$pgkey"; chmod 0644 "$pgcert"
+else
+  log "tls: reusing PG server cert"
+fi
+
+log "tls: OK — CA + client + $PEER_COUNT server certs + PG server cert (curve=$EC_CURVE, days=$CERT_DAYS)"

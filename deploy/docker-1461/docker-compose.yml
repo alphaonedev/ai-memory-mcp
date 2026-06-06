@@ -39,6 +39,33 @@ services:
     container_name: ${PG_CONTAINER:?PG_CONTAINER must be set in campaign.env}
     hostname: ${PG_HOSTNAME:-pg-age}
     restart: unless-stopped
+    # Entrypoint wrapper: re-install the bind-mounted CA-signed server
+    # cert/key to a postgres-OWNED path (mode 0600) before handing off to
+    # the stock postgres entrypoint. A bind-mounted host key keeps its host
+    # uid; PostgreSQL refuses an ssl_key_file it does not own. `$$@` defers
+    # `$@` to the in-container shell (compose strips one `$`), so the stock
+    # entrypoint receives the `command:` args below verbatim.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        install -d -o postgres -g postgres -m 0750 /etc/postgresql/tls &&
+        install -o postgres -g postgres -m 0644 /certs/server.pem /etc/postgresql/tls/server.pem &&
+        install -o postgres -g postgres -m 0600 /certs/server.key /etc/postgresql/tls/server.key &&
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - --
+    command:
+      # TLS on, leaf cert + key from the postgres-owned install path, and the
+      # hostssl-only client-auth map rendered by provision/00_seed.sh.
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.pem
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
     environment:
       POSTGRES_USER: ${PG_USER:?PG_USER must be set in campaign.env}
       POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set in campaign.env}
@@ -54,6 +81,11 @@ services:
       # auto-migrates its own tables on `serve`; this only creates the
       # extensions, the graph, and the peer schemas.
       - ${PG_INIT_SQL:?PG_INIT_SQL must be set}:/docker-entrypoint-initdb.d/01-init-age.sql:ro
+      # CA-signed PG server cert/key (daemon->PG TLS leg), re-installed
+      # postgres-owned by the entrypoint wrapper above.
+      - ${PG_NODE_DIR:?PG_NODE_DIR must be set}/tls:/certs:ro
+      # hostssl-only client-auth map — rejects non-TLS TCP pre-auth.
+      - ${PG_HBA_FILE:?PG_HBA_FILE must be set}:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB}"]
       interval: 3s

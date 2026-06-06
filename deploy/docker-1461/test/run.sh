@@ -28,7 +28,11 @@
 #                (client-auth mandatory); non-allowlisted client cert refused
 #                (fingerprint pinning); wrong CA on server-verify refused;
 #                privileged endpoint without X-API-Key -> 401; with key -> 200;
-#                /health exempt (200 without key); admin endpoint non-admin -> 403.
+#                /health exempt (200 without key); admin endpoint non-admin -> 403;
+#                PLUS the daemon->PostgreSQL leg (third encrypted leg): every
+#                daemon-owned PG backend negotiated TLS (pg_stat_ssl, >=1 ssl /
+#                0 plain) and a plaintext (sslmode=disable) TCP connection is
+#                refused pre-auth by the hostssl-only pg_hba.conf.
 #   federation : write to peer-1, converge on peer-2 within the catch-up window.
 #   zerotouch  : first-party CA trust — an enrolled peer converges via its
 #                CA-signed credential ALONE (no per-peer pubkey pushed anywhere),
@@ -198,6 +202,31 @@ assert_eq crypto health_exempt 200 "$c"
 # (7) admin-only endpoint as a non-admin caller -> 403 (authz enforced)
 c="$(probe_code "$P1_PORT" "$API_STATS" "${CA_ARG[@]}" "${CERT_ARGS[@]}" "${KEY_HDR[@]}" -H "X-Agent-Id: $AID_H")"
 assert_eq crypto admin_gated 403 "$c"
+
+# (8) daemon -> PostgreSQL leg is TLS (third encrypted leg). Join pg_stat_ssl
+# to pg_stat_activity INSIDE the PG container: every daemon-owned TCP backend
+# must report ssl=true, and there must be >=1 (proving the daemons actually
+# hold encrypted pooled connections, not merely "zero plaintext"). The probe's
+# own psql is a unix-socket backend (client_addr IS NULL) and is excluded.
+pg_ssl_q="select count(*) from pg_stat_ssl s join pg_stat_activity a on s.pid=a.pid where a.usename='$PG_USER' and a.client_addr is not null and a.backend_type='client backend'"
+pssl_on="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$pg_ssl_q and s.ssl is true" 2>/dev/null | tr -d '[:space:]' || echo x)"
+pssl_off="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$pg_ssl_q and s.ssl is not true" 2>/dev/null | tr -d '[:space:]' || echo x)"
+if [ "$pssl_off" = "0" ] && [ -n "$pssl_on" ] && [ "$pssl_on" != "0" ] && [ "$pssl_on" != "x" ]; then
+  pass crypto pg_tls_enforced "all daemon PG backends ssl (>=1)" "ssl=$pssl_on plain=$pssl_off"
+else
+  fail crypto pg_tls_enforced "all daemon PG backends ssl (>=1)" "ssl=${pssl_on:-?} plain=${pssl_off:-?}"
+fi
+
+# (9) plaintext (sslmode=disable) TCP refused pre-auth by the hostssl-only
+# pg_hba.conf. SUCCESS = PostgreSQL rejects the non-TLS handshake before any
+# password is checked ("no pg_hba.conf entry ... no encryption").
+pg_plain_out="$(node_exec "$PG_CONTAINER" psql "host=127.0.0.1 port=$PG_INTERNAL_PORT user=$PG_USER dbname=$PG_DB sslmode=disable connect_timeout=5" -w -tAc 'select 1' 2>&1 || true)"
+case "$pg_plain_out" in
+  *"no encryption"*|*"no pg_hba.conf entry"*|*"no pg_hba"*)
+    pass crypto pg_plaintext_refused "non-TLS TCP refused pre-auth" "rejected (no encryption)" ;;
+  *)
+    fail crypto pg_plaintext_refused "non-TLS TCP refused pre-auth" "${pg_plain_out:-<empty>}" ;;
+esac
 
 # ====================== GROUP federation =====================================
 if [ -n "$P2_PORT" ]; then

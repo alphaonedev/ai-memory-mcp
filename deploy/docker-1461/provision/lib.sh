@@ -67,6 +67,11 @@ PG_USER="${DOCKER_1461_PG_USER:-ai_memory}"
 PG_DB="${DOCKER_1461_PG_DB:-ai_memory}"
 PEER_SCHEMA_PREFIX="${DOCKER_1461_SCHEMA_PREFIX:-ic_peer_}"       # ic_peer_1, ic_peer_2
 AGE_GRAPH_NAME="${DOCKER_1461_AGE_GRAPH:-memory_graph}"
+# daemon -> PostgreSQL transport posture. verify-full = encrypt AND validate the
+# PG server cert against the campaign CA AND match its SAN to the dialed host
+# (`pg-age`). The third encrypted leg of the mesh (the other two are the API
+# mTLS path + the federation/quorum mTLS path).
+PG_SSL_MODE="${DOCKER_1461_PG_SSL_MODE:-verify-full}"
 
 # --------------------------------------------------------------------------
 # Pinned artifacts (reproducibility anchors — assert these, never drift)
@@ -134,6 +139,10 @@ SECRETS_DIR="${RUN_DIR}/secrets"
 REPORTS_DIR="${RUN_DIR}/reports"
 COMPOSE_ENV_FILE="${RUN_DIR}/campaign.env"   # generated; --env-file for compose
 PG_PASSWORD_FILE="${SECRETS_DIR}/pg_password"
+# PG container bind-mount tree (its CA-signed server cert/key) + the rendered
+# hostssl-only client-auth map. Both keep the daemon->PG leg encrypted.
+PG_NODE_DIR="${NODES_ROOT}/${PG_CONTAINER}"
+PG_HBA_FILE="${RUN_DIR}/pg_hba.conf"
 
 # --------------------------------------------------------------------------
 # HTTP API surface (single source — harnesses never inline a path literal)
@@ -188,10 +197,16 @@ peer_quorum_urls() {
 # --------------------------------------------------------------------------
 pg_password() { cat "$PG_PASSWORD_FILE"; }
 
+# The in-container path to the campaign CA the daemon verifies the PG server
+# cert against (every peer mounts its tls dir — which carries ca.pem — at
+# $REMOTE_TLS_DIR). sqlx (runtime-tokio-rustls) honors sslmode + sslrootcert
+# straight off the connection URL, so PG-over-TLS is a pure config choice.
+PG_SSL_ROOT_CERT="${REMOTE_TLS_DIR}/ca.pem"
+
 store_url_for_schema() {
   local schema="$1" host="${2:-$PG_HOSTNAME}" port="${3:-$PG_INTERNAL_PORT}"
-  printf 'postgres://%s:%s@%s:%s/%s?options=-csearch_path%%3D%s%%2Cag_catalog%%2Cpublic&sslmode=disable' \
-    "$PG_USER" "$(pg_password)" "$host" "$port" "$PG_DB" "$schema"
+  printf 'postgres://%s:%s@%s:%s/%s?options=-csearch_path%%3D%s%%2Cag_catalog%%2Cpublic&sslmode=%s&sslrootcert=%s' \
+    "$PG_USER" "$(pg_password)" "$host" "$port" "$PG_DB" "$schema" "$PG_SSL_MODE" "$PG_SSL_ROOT_CERT"
 }
 
 # --------------------------------------------------------------------------
