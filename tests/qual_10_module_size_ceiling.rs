@@ -199,7 +199,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // change wires an existing daemon-boot path for first-party-CA identity
     // resolution / credential renewal (no speculative surface). 7700 = 7621
     // + 79 headroom; far under the 1.5x cap.
-    ("src/daemon_runtime.rs", 7_700),
+    //
+    // 2026-06-06 — bumped 7_700 → 7_850 by the #1521 sectioned-[embeddings]
+    // wiring: the pure `resolve_embedder_model` precedence helper (section
+    // model > legacy flat > tier preset) plus `build_embedder` consuming it
+    // and `resolve_embeddings().url`, with 6 in-file precedence regression
+    // tests, grew the file to 7766. Growth is justified: it wires the
+    // existing [embeddings] config block into the daemon embedder build
+    // path (no speculative surface). 7850 = 7766 + 84 headroom; far under
+    // the 1.5x cap.
+    ("src/daemon_runtime.rs", 7_850),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
