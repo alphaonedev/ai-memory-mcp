@@ -71,6 +71,14 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set in campaign.env}
       POSTGRES_DB: ${PG_DB:?PG_DB must be set in campaign.env}
       POSTGRES_INITDB_ARGS: "--data-checksums"
+      # PG18+ moved the default PGDATA to a major-version-specific dir
+      # (/var/lib/postgresql/$PG_MAJOR/docker) and the entrypoint refuses
+      # to boot when a volume is mounted at the legacy
+      # /var/lib/postgresql/data while PGDATA is the new default
+      # (docker-library/postgres PR #1259 — "unused mount/volume" abort).
+      # Pinning PGDATA to a subdir of our mounted volume skips that
+      # legacy-detection branch and keeps the data path deterministic.
+      PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       # Host-loopback only (127.0.0.1) — exempt from the macOS local-
       # network gate and never advertised on the LAN.
