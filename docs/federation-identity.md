@@ -123,6 +123,8 @@ zero-touch additions:
 | `AI_MEMORY_FED_CRED_PATH` | unset → boot-once keyfile | P2 | Path to this node's issued leaf credential (the outbound credential it presents). |
 | `AI_MEMORY_FED_CRED_CHAIN_PATH` | unset → direct (depth-1) | P4 | Path to the anchor-first intermediate chain this node attaches to outbound requests (hierarchical trust). |
 | `AI_MEMORY_FED_INVENTORY_PATH` | unset | P3 | Path to the declarative inventory YAML (GitOps source of truth, §6). |
+| `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | unset (off) | P2 | **Fail-closed gate.** When `=1`, a receiver rejects any peer that presents no valid CA-signed credential for the configured trust domain — `401 peer_not_enrolled` (`handlers/federation_signing_check.rs`). This is the switch that turns the trust bundle from advisory into mandatory enrollment. |
+| `AI_MEMORY_KEY_DIR` | boot-once keyfile dir | P2 | Directory holding **this node's** Ed25519 signing keypair at `<key_dir>/<federation-identity>.{pub,priv}`. The outbound signer loads the private half by the resolved federation identity, so the file MUST be keyed by that (slashed) identity. Not in the `AI_MEMORY_FED_*` family because it is the generic node-key location shared with the rest of the identity layer. |
 
 ### Identity resolution precedence (P1)
 
