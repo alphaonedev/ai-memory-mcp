@@ -195,10 +195,16 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
             keypair.agent_id
         )
     })?;
-    fs::create_dir_all(dir).with_context(|| format!("creating key directory {}", dir.display()))?;
 
     let pub_path = dir.join(format!("{}{PUB_SUFFIX}", keypair.agent_id));
     let priv_path = dir.join(format!("{}{PRIV_SUFFIX}", keypair.agent_id));
+
+    // #1514 — a SPIFFE-style slashed agent_id (e.g. `campaign/region/host`)
+    // nests the key files under sub-directories of `dir`; create the parent
+    // of each FILE, not just `dir`, or the nested write ENOENTs. For a plain
+    // (slash-free) agent_id the parent IS `dir`, so behaviour is unchanged.
+    ensure_parent(&pub_path)?;
+    ensure_parent(&priv_path)?;
 
     // COVERAGE: with_context lazy-format closures (lines 178, 180)
     //           reachable only when the underlying fs::write fails on
@@ -216,8 +222,10 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
 /// a peer's allowlist entry). The corresponding `.priv` is left absent;
 /// [`load`] will then return a public-only [`AgentKeypair`].
 pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("creating key directory {}", dir.display()))?;
     let pub_path = dir.join(format!("{}{PUB_SUFFIX}", keypair.agent_id));
+    // #1514 — create the parent of the FILE (nested for slashed agent_ids),
+    // not just `dir`; for a slash-free id the parent IS `dir`.
+    ensure_parent(&pub_path)?;
     // COVERAGE: with_context closure (line 192) same class as save's
     //           pub-write closure (line 178) — reachable on EACCES/
     //           ENOSPC; not portable to unit tests on macOS/Linux.
@@ -557,6 +565,22 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
     Ok(EnsureOutcome::Generated { pub_path })
 }
 
+/// Create the parent directory of `path` (recursive `mkdir`).
+///
+/// #1514 — a SPIFFE-style slashed `agent_id` (`campaign/region/host`)
+/// produces a key path nested several directories below `dir`; we must
+/// create the parent of the FILE, not just `dir`, or the subsequent
+/// write fails with `ENOENT`. For a plain (slash-free) `agent_id` the
+/// file parent IS `dir`, so this is behaviourally identical to the old
+/// `create_dir_all(dir)`.
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating key directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 /// Cross-platform `fs::write` with an explicit Unix mode. On non-Unix
 /// targets `mode` is ignored and the file inherits the parent ACL.
 // COVERAGE: the `?` Err-arm closures on `open`/`write_all`/`sync_all`
@@ -632,6 +656,58 @@ mod tests {
         let msg = b"hello world";
         let sig = loaded.private.as_ref().unwrap().sign(msg);
         assert!(kp.public.verify(msg, &sig).is_ok());
+    }
+
+    // #1514 — a SPIFFE-style slashed agent_id nests the key files under
+    // sub-directories of `dir`. `save` must create those parents (not just
+    // `dir`) or the write ENOENTs; `load` must then round-trip the nested
+    // files. Regression pin for the save/load asymmetry.
+    #[test]
+    fn round_trip_save_then_load_slashed_agent_id() {
+        let dir = tmp_dir();
+        let agent_id = "hive-1461/nyc3/hive-peer-nyc3-01";
+        let kp = generate(agent_id).expect("generate slashed id");
+        save(&kp, dir.path()).expect("save slashed id must create nested parents");
+
+        // The files really do live nested under dir.
+        let pub_path = dir.path().join(format!("{agent_id}.pub"));
+        let priv_path = dir.path().join(format!("{agent_id}.priv"));
+        assert!(pub_path.exists(), "nested .pub must exist at {pub_path:?}");
+        assert!(
+            priv_path.exists(),
+            "nested .priv must exist at {priv_path:?}"
+        );
+
+        let loaded = load(agent_id, dir.path()).expect("load slashed id");
+        assert_eq!(loaded.agent_id, agent_id);
+        assert_eq!(loaded.public.to_bytes(), kp.public.to_bytes());
+        assert!(loaded.can_sign(), "private key should round-trip");
+
+        // Modes survive the nested write on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let pub_mode = fs::metadata(&pub_path).unwrap().permissions().mode() & 0o777;
+            let priv_mode = fs::metadata(&priv_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(pub_mode, 0o644, "nested public key must be 0644");
+            assert_eq!(priv_mode, 0o600, "nested private key must be 0600");
+        }
+    }
+
+    // #1514 — `save_public_only` must also create nested parents for a
+    // slashed agent_id (the allowlist-import path).
+    #[test]
+    fn save_public_only_slashed_agent_id_creates_nested_parent() {
+        let dir = tmp_dir();
+        let agent_id = "hive-1461/sfo2/hive-peer-sfo2-01";
+        let kp = generate(agent_id).expect("generate");
+        save_public_only(&kp, dir.path()).expect("save_public_only nested");
+
+        let pub_path = dir.path().join(format!("{agent_id}.pub"));
+        assert!(pub_path.exists(), "nested .pub must exist at {pub_path:?}");
+        let loaded = load(agent_id, dir.path()).expect("load");
+        assert!(!loaded.can_sign(), "public-only save must yield no private");
+        assert_eq!(loaded.public.to_bytes(), kp.public.to_bytes());
     }
 
     #[test]
