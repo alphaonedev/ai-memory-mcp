@@ -55,7 +55,66 @@ impl EmbeddingModel {
             Self::NomicEmbedV15 => "nomic-ai/nomic-embed-text-v1.5",
         }
     }
+
+    /// Canonical-id aliases recognised by [`Self::from_canonical_id`]:
+    /// the snake wire form ([`FromStr`]), the HF id (also the
+    /// [`canonicalise_embedding_model`] output), the unprefixed
+    /// shortname, and the Ollama tag. Centralising the alias strings
+    /// here keeps the model-id literals in one place (#1521).
+    fn canonical_aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::MiniLmL6V2 => MINILM_CANONICAL_ALIASES,
+            Self::NomicEmbedV15 => NOMIC_CANONICAL_ALIASES,
+        }
+    }
+
+    /// Parse any recognised canonical id form — the snake wire form, the
+    /// HF id, the unprefixed shortname, or the Ollama tag — into a
+    /// daemon-constructible model. Returns `None` for ids the 2-model
+    /// daemon embedder cannot build (e.g. `bge-large-en`); callers fall
+    /// back to the tier preset. Case-insensitive; surrounding whitespace
+    /// is trimmed (#1521).
+    ///
+    /// Unlike [`FromStr`] (which only accepts the snake wire form), this
+    /// also accepts whatever an operator wrote in `[embeddings].model`
+    /// after [`canonicalise_embedding_model`], so the sectioned config
+    /// block drives the daemon embedder.
+    #[must_use]
+    pub fn from_canonical_id(s: &str) -> Option<Self> {
+        let needle = s.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        [Self::MiniLmL6V2, Self::NomicEmbedV15]
+            .into_iter()
+            .find(|model| {
+                model
+                    .canonical_aliases()
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(needle))
+            })
+    }
 }
+
+/// Canonical-id aliases for [`EmbeddingModel::MiniLmL6V2`] — snake wire
+/// form, HF id ([`canonicalise_embedding_model`] output), unprefixed
+/// shortname, Ollama tag. See [`EmbeddingModel::from_canonical_id`].
+const MINILM_CANONICAL_ALIASES: &[&str] = &[
+    "mini_lm_l6_v2",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "all-MiniLM-L6-v2",
+    "all-minilm",
+];
+
+/// Canonical-id aliases for [`EmbeddingModel::NomicEmbedV15`] — snake
+/// wire form, HF id ([`canonicalise_embedding_model`] output), Ollama
+/// tag, prefixed HF id. See [`EmbeddingModel::from_canonical_id`].
+const NOMIC_CANONICAL_ALIASES: &[&str] = &[
+    "nomic_embed_v15",
+    "nomic-embed-text-v1.5",
+    "nomic-embed-text",
+    "nomic-ai/nomic-embed-text-v1.5",
+];
 
 // ---------------------------------------------------------------------------
 // LLM model defaults
@@ -6484,6 +6543,59 @@ mod tests {
             err.contains("mini_lm_l6_v2") && err.contains("nomic_embed_v15"),
             "err message should list valid options: {err}"
         );
+    }
+
+    /// #1521 — `from_canonical_id` must accept every form an operator
+    /// might write in `[embeddings].model`: the snake wire form, the HF
+    /// id (the `canonicalise_embedding_model` output), the unprefixed
+    /// shortname, and the Ollama tag. This is what lets the sectioned
+    /// config block drive the daemon embedder.
+    #[test]
+    fn embedding_model_from_canonical_id_accepts_all_forms() {
+        // nomic family — snake, canonical HF id, Ollama tag, prefixed id.
+        for id in [
+            "nomic_embed_v15",
+            "nomic-embed-text-v1.5",
+            "nomic-embed-text",
+            "nomic-ai/nomic-embed-text-v1.5",
+        ] {
+            assert_eq!(
+                EmbeddingModel::from_canonical_id(id),
+                Some(EmbeddingModel::NomicEmbedV15),
+                "nomic alias {id:?} must resolve"
+            );
+        }
+        // MiniLM family — snake, canonical HF id, shortname, Ollama tag.
+        for id in [
+            "mini_lm_l6_v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "all-MiniLM-L6-v2",
+            "all-minilm",
+        ] {
+            assert_eq!(
+                EmbeddingModel::from_canonical_id(id),
+                Some(EmbeddingModel::MiniLmL6V2),
+                "minilm alias {id:?} must resolve"
+            );
+        }
+        // The canonicalised output of a legacy alias must round-trip.
+        assert_eq!(
+            EmbeddingModel::from_canonical_id(&canonicalise_embedding_model(
+                "nomic_embed_v15".to_string()
+            )),
+            Some(EmbeddingModel::NomicEmbedV15)
+        );
+        // Case-insensitive + whitespace-trimmed.
+        assert_eq!(
+            EmbeddingModel::from_canonical_id("  NOMIC-EMBED-TEXT-V1.5  "),
+            Some(EmbeddingModel::NomicEmbedV15)
+        );
+        // Models the 2-model daemon embedder cannot construct → None
+        // (caller falls back to the tier preset), and empty → None.
+        assert_eq!(EmbeddingModel::from_canonical_id("bge-large-en"), None);
+        assert_eq!(EmbeddingModel::from_canonical_id("mxbai-embed-large"), None);
+        assert_eq!(EmbeddingModel::from_canonical_id(""), None);
+        assert_eq!(EmbeddingModel::from_canonical_id("   "), None);
     }
 
     #[test]
