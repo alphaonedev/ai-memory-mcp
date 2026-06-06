@@ -3,7 +3,7 @@
 Status: **Accepted** — implemented in v0.6.3 (PRs #384, #388–#392).
 
 Date: 2026-04-26
-Author: Claude Opus 4.7 (1M context) on behalf of @binary2029
+Author: Claude Opus 4.7 (1M context) on behalf of @alphaonedev
 Related: ADR-0001 (Quorum replication), `docs/MIGRATION-v0.6.2-to-v0.6.3.md`
 
 ---
