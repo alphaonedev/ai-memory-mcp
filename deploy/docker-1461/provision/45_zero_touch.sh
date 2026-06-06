@@ -85,7 +85,9 @@ while [ "$i" -le "$PEER_COUNT" ]; do
 
   # Publish the CA verifying key (the sole trust anchor) into the node's
   # trust dir. The daemon's TrustBundle::from_dir reads <issuer-id>.pub.
-  cp "$BUNDLE_DIR/$FED_ISSUER_ID.pub" "$ntrust/$FED_ISSUER_ID.pub"
+  # `cp -f` so a re-run overwrites the prior 0444 (read-only) anchor instead
+  # of failing EACCES — keeps the 0->60 provision idempotent.
+  cp -f "$BUNDLE_DIR/$FED_ISSUER_ID.pub" "$ntrust/$FED_ISSUER_ID.pub"
   chmod 0444 "$ntrust/$FED_ISSUER_ID.pub"
 
   i=$((i + 1))

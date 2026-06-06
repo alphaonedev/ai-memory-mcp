@@ -26,9 +26,28 @@ TLS_DIR="${AI_MEMORY_TLS_DIR:-/etc/ai-memory-a2a/tls}"
 
 mkdir -p /etc/ai-memory /root/.config/ai-memory
 
-# Daemon keypair (refuse-by-default per Round-4 fix)
-if [ ! -f /root/.config/ai-memory/keys/daemon.priv ]; then
-  /usr/local/bin/ai-memory identity generate --agent-id daemon --json
+# Daemon self-signing keypair (refuse-by-default per Round-4 fix).
+#
+# The daemon runtime loads this key by the LITERAL label
+# DAEMON_KEYPAIR_LABEL = "daemon" (src/daemon_runtime.rs, src/mcp/mod.rs),
+# so the on-disk basename is fixed; expose it as a var to single-source
+# the guard, the generate flag, and the path check below.
+#
+# KEY DIR RESOLUTION BUG FIX: `ai-memory identity generate` resolves its
+# storage dir from AI_MEMORY_KEY_DIR (keypair::default_key_dir,
+# src/identity/keypair.rs:137) — the bind-mounted /etc/ai-memory/keys in
+# this deployment — NOT /root/.config/ai-memory/keys. The previous guard
+# checked the latter, so it never matched the real key, keygen re-ran on
+# every boot, and a re-run with the persisted key present tripped the
+# refuse-by-default and crash-looped the container. Guard and generate
+# now share one resolved $KEY_DIR so the key is minted once and reused
+# across restarts (stable daemon identity).
+DAEMON_KEY_LABEL="${AI_MEMORY_DAEMON_KEY_LABEL:-daemon}"
+KEY_DIR="${AI_MEMORY_KEY_DIR:-/etc/ai-memory/keys}"
+mkdir -p "$KEY_DIR"
+if [ ! -f "$KEY_DIR/$DAEMON_KEY_LABEL.priv" ]; then
+  /usr/local/bin/ai-memory identity generate \
+    --key-dir "$KEY_DIR" --agent-id "$DAEMON_KEY_LABEL" --json
 fi
 
 # #845: optional api_key when AI_MEMORY_API_KEY is set. NOTE the
