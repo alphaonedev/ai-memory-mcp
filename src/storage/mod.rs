@@ -2626,6 +2626,7 @@ pub fn recall_with_telemetry(
         fts_candidates: results.len(),
         hnsw_candidates: 0,
         blend_weight_avg: 0.0,
+        embedding_dim_mismatch: 0,
     };
     Ok((results, outcome, telemetry))
 }
@@ -3124,76 +3125,6 @@ pub fn find_synthesis_candidates(
 // at the module root above for `db::LINK_CYCLE_ERR_PREFIX` path
 // stability.
 
-/// v0.7.0 fix-campaign A3 (LINK-PARITY) — would creating
-/// `source_id --reflects_on--> target_id` close a cycle in the
-/// existing `reflects_on` subgraph?
-///
-/// Walks the `reflects_on` edges outbound from `target_id`. If the
-/// walk visits `source_id` at any depth, the new edge would form a
-/// cycle (the substrate's recursive-learning invariant is that
-/// `reflects_on` forms a DAG — a reflection cannot transitively
-/// reflect on something that reflects on itself).
-///
-/// Returns `Ok(true)` when a cycle would be created, `Ok(false)`
-/// otherwise. SQL errors surface as `Err`. The traversal is depth-
-/// bounded at [`MAX_REFLECTION_CYCLE_DEPTH`] so a pathological graph
-/// can never DOS the writer.
-///
-/// Only `reflects_on` participates in the DAG invariant — `related_to`
-/// / `supersedes` / `contradicts` / `derived_from` are allowed to
-/// form cycles by design (the original v0.6.x semantics) and callers
-/// should not invoke this helper for those relations.
-pub fn would_create_reflection_cycle(
-    conn: &Connection,
-    source_id: &str,
-    target_id: &str,
-) -> Result<bool> {
-    // Trivial self-cycle short-circuit. `validate_link` already
-    // rejects self-links, but this keeps the helper safe to call in
-    // isolation (e.g. unit tests).
-    if source_id == target_id {
-        return Ok(true);
-    }
-    // BFS from `target_id` following `reflects_on` outbound edges.
-    // A visit set prevents re-traversal in case the historical graph
-    // already contains a cycle (corrupted state) — we still terminate
-    // and surface `true` because the new edge would extend that
-    // cycle through `source_id`.
-    let mut frontier: Vec<String> = vec![target_id.to_string()];
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    visited.insert(target_id.to_string());
-    let mut depth = 0usize;
-    let mut stmt = conn.prepare(
-        "SELECT target_id FROM memory_links \
-         WHERE source_id = ?1 AND relation = 'reflects_on'",
-    )?;
-    while !frontier.is_empty() && depth < MAX_REFLECTION_CYCLE_DEPTH {
-        let mut next: Vec<String> = Vec::new();
-        for node in &frontier {
-            let rows = stmt.query_map(params![node], |row| row.get::<_, String>(0))?;
-            for hit in rows {
-                let dst = hit?;
-                if dst == source_id {
-                    return Ok(true);
-                }
-                if visited.insert(dst.clone()) {
-                    next.push(dst);
-                }
-            }
-        }
-        frontier = next;
-        depth += 1;
-    }
-    Ok(false)
-}
-
-/// Maximum BFS depth for [`would_create_reflection_cycle`]. The
-/// substrate's `max_reflection_depth` governance cap is namespace-
-/// configurable but bounded; the cycle walker doubles that ceiling so
-/// a legitimate deep chain still resolves cleanly while a pathological
-/// graph terminates predictably.
-pub const MAX_REFLECTION_CYCLE_DEPTH: usize = 32;
-
 /// v0.7.0 fix-campaign A3 (LINK-PARITY) — shared pre-create validator
 /// invoked by every link-write entry point.
 ///
@@ -3209,9 +3140,12 @@ pub const MAX_REFLECTION_CYCLE_DEPTH: usize = 32;
 /// Pipeline:
 ///
 /// 1. Cycle check — invoked only when `relation == "reflects_on"`.
-///    Calls [`would_create_reflection_cycle`]; on `true`, returns an
-///    error prefixed with [`LINK_CYCLE_ERR_PREFIX`] so HTTP can surface
-///    409 CONFLICT and signed-event emit can record the refusal.
+///    Calls [`crate::kg::cycle_check::would_create_reflection_cycle`]
+///    with the namespace-scoped `effective_max_reflection_depth` cap; on
+///    a `would_cycle` hit, returns an error prefixed with
+///    [`LINK_CYCLE_ERR_PREFIX`] so HTTP can surface 409 CONFLICT and
+///    signed-event emit can record the refusal. The walk fails CLOSED on
+///    SQL errors and on depth-ceiling truncation.
 /// 2. K9 permission eval — runs the unified
 ///    [`crate::permissions::Permissions::evaluate`] pipeline against the
 ///    source memory's namespace. On `Deny`, returns an error prefixed
@@ -3242,12 +3176,30 @@ pub fn validate_link_pre_create(
     // Pass 1: cycle check. Only `reflects_on` participates in the
     // DAG invariant — the other four relations are intentionally
     // allowed to form cycles (e.g. mutual `related_to`).
-    if relation == "reflects_on" && would_create_reflection_cycle(conn, source_id, target_id)? {
-        // #962 typed envelope. Display preserves `LINK_CYCLE_ERR_PREFIX`.
-        return Err(anyhow::Error::new(StorageError::LinkReflectionCycle {
-            source_id: source_id.to_string(),
-            target_id: target_id.to_string(),
-        }));
+    if relation == crate::models::MemoryLinkRelation::ReflectsOn.as_str() {
+        // Resolve the namespace-scoped reflection-depth cap so the cycle
+        // walk's fail-CLOSED ceiling tracks the same governance policy the
+        // MCP link path uses (`src/mcp/tools/link.rs`). The source memory's
+        // namespace governs; a missing source falls back to the default
+        // namespace (create_link's FK guard surfaces the missing row later).
+        let link_ns = match get(conn, source_id) {
+            Ok(Some(m)) => m.namespace,
+            _ => crate::DEFAULT_NAMESPACE.to_string(),
+        };
+        let max_depth = resolve_governance_policy(conn, &link_ns)
+            .unwrap_or_default()
+            .effective_max_reflection_depth();
+        if crate::kg::cycle_check::would_create_reflection_cycle(
+            conn, source_id, target_id, max_depth,
+        )?
+        .would_cycle
+        {
+            // #962 typed envelope. Display preserves `LINK_CYCLE_ERR_PREFIX`.
+            return Err(anyhow::Error::new(StorageError::LinkReflectionCycle {
+                source_id: source_id.to_string(),
+                target_id: target_id.to_string(),
+            }));
+        }
     }
 
     // Pass 2: K9 permission eval. Skip when the caller has already
@@ -7567,6 +7519,10 @@ fn semantic_phase(
     include_archived: bool,
     source_uri_prefix: Option<&str>,
     scored: &mut HashMap<String, (Memory, f64, f64)>,
+    // v0.7.0 H7 — bumped once per stored embedding whose dimensionality
+    // disagrees with `query_embedding` (embedder-model switch). Accumulated
+    // across the whole recall and surfaced via telemetry + an aggregated warn.
+    dim_mismatch_count: &mut usize,
 ) -> Result<usize> {
     let mut hnsw_candidates_count: usize = 0;
     let now = prep.now.as_str();
@@ -7753,10 +7709,18 @@ fn semantic_phase(
                 );
                 continue;
             };
-            let cosine = f64::from(crate::embeddings::Embedder::cosine_similarity(
-                query_embedding,
-                &emb,
-            ));
+            let cosine =
+                match crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, &emb)
+                {
+                    crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                    crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                        // v0.7.0 H7 — stored embedding came from a different
+                        // embedder model; counted (not silently dropped) so the
+                        // aggregated warn + telemetry can flag the model switch.
+                        *dim_mismatch_count += 1;
+                        continue;
+                    }
+                };
             if cosine > crate::RECALL_COSINE_GATE {
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 hnsw_candidates_count += 1;
@@ -7858,6 +7822,7 @@ fn assemble_recall_telemetry(
     fts_candidates: usize,
     hnsw_candidates: usize,
     blend_weights: &[f64],
+    embedding_dim_mismatch: usize,
 ) -> crate::models::RecallTelemetry {
     let blend_weight_avg = if blend_weights.is_empty() {
         0.0
@@ -7870,6 +7835,7 @@ fn assemble_recall_telemetry(
         fts_candidates,
         hnsw_candidates,
         blend_weight_avg,
+        embedding_dim_mismatch,
     }
 }
 
@@ -8044,6 +8010,10 @@ fn recall_hybrid_with_telemetry_inner(
     let mut scored: HashMap<String, (Memory, f64, f64)> = HashMap::with_capacity(scored_cap);
     let mut max_fts_score: f64 = 1.0;
     let mut fts_candidates_count: usize = 0;
+    // v0.7.0 H7 — accumulates stored embeddings whose dimensionality
+    // disagrees with the active model's `query_embedding` across BOTH the
+    // FTS branch (here) and the semantic linear-scan branch (below).
+    let mut dim_mismatch_count: usize = 0;
     for (mem, fts_score, embedding_bytes) in fts_results {
         if fts_score > max_fts_score {
             max_fts_score = fts_score;
@@ -8054,10 +8024,19 @@ fn recall_hybrid_with_telemetry_inner(
         let cosine = match embedding_bytes {
             Some(bytes) if !bytes.is_empty() => {
                 match crate::embeddings::decode_embedding_blob(&bytes) {
-                    Ok(emb) => f64::from(crate::embeddings::Embedder::cosine_similarity(
+                    Ok(emb) => match crate::embeddings::Embedder::cosine_similarity_checked(
                         query_embedding,
                         &emb,
-                    )),
+                    ) {
+                        crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                        crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                            // v0.7.0 H7 — embedder-model switch: count the
+                            // stale-dimension row instead of letting it score a
+                            // silent 0.0 cosine. FTS keyword score still applies.
+                            dim_mismatch_count += 1;
+                            0.0
+                        }
+                    },
                     Err(_) => {
                         tracing::warn!(
                             memory_id = %mem.id,
@@ -8091,7 +8070,23 @@ fn recall_hybrid_with_telemetry_inner(
         include_archived,
         source_uri_prefix,
         &mut scored,
+        &mut dim_mismatch_count,
     )?;
+
+    // v0.7.0 H7 — de-silence embedder-model switches. A non-zero count means
+    // stored embeddings were produced by a different model (different
+    // dimensionality) than the active embedder, so their semantic signal was
+    // forced to 0.0 for this query. One aggregated warn per recall (not per
+    // row) tells the operator the affected rows need re-embedding.
+    if dim_mismatch_count > 0 {
+        tracing::warn!(
+            dim_mismatch_count,
+            active_query_dim = query_embedding.len(),
+            "recall skipped {dim_mismatch_count} stored embedding(s) with mismatched \
+             dimensionality — the embedder model appears to have changed; re-embed the \
+             affected memories to restore their semantic recall signal"
+        );
+    }
 
     // Stage 4 — adaptive blend + per-tier decay.
     let (results, blend_weights) = blend_and_rank(scored, max_fts_score, scoring, limit);
@@ -8108,8 +8103,12 @@ fn recall_hybrid_with_telemetry_inner(
     );
 
     // Stage 6 — telemetry assembly.
-    let telemetry =
-        assemble_recall_telemetry(fts_candidates_count, hnsw_candidates_count, &blend_weights);
+    let telemetry = assemble_recall_telemetry(
+        fts_candidates_count,
+        hnsw_candidates_count,
+        &blend_weights,
+        dim_mismatch_count,
+    );
 
     Ok((budgeted, outcome, telemetry))
 }

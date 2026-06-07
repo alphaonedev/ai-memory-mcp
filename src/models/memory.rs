@@ -1393,6 +1393,13 @@ pub struct RecallTelemetry {
     /// Average semantic blend weight applied across the returned set.
     /// `0.0` for keyword-only recall.
     pub blend_weight_avg: f64,
+    /// v0.7.0 H7 — count of stored embeddings whose dimensionality
+    /// disagreed with the active embedder model during this recall, so
+    /// their semantic signal was forced to `0.0` and excluded from the
+    /// ranking. `0` in steady state; non-zero means the embedder model
+    /// changed and the affected rows need re-embedding. The recall path
+    /// also emits one aggregated `warn!` per query when this is non-zero.
+    pub embedding_dim_mismatch: usize,
 }
 
 #[derive(Debug, Serialize)]
