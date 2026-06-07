@@ -68,6 +68,7 @@ dependencies = [
  "gethostname",
  "hex",
  "hf-hub",
+ "hkdf",
  "http-body-util",
  "instant-distance",
  "libc",
