@@ -401,6 +401,23 @@ pub async fn build_rustls_client_config(
     // US via our client cert fingerprint (Layer 2's trust anchor), not
     // via server-cert validation. Server-cert pinning is a Layer 2b
     // refinement tracked in #224.
+    //
+    // v0.7.0 S6-LOW1 de-silencing: emit a once-per-process operator-visible
+    // warn so the disabled server-cert verification posture is observable in
+    // the daemon log rather than buried in the source. The compensating
+    // control (peer client-cert fingerprint pinning via `--mtls-allowlist`)
+    // is documented on `DangerousAnyServerVerifier`.
+    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            target: "federation::tls",
+            "federation client TLS accepts ANY server certificate (server-cert \
+             verification is OFF); peer authenticity relies entirely on the peer \
+             fingerprint-pinning our client cert via --mtls-allowlist. Front the \
+             federation port with a server-cert-pinning reverse proxy on hostile \
+             networks. See docs/runbook/federation-tls.md (#224)."
+        );
+    });
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(DangerousAnyServerVerifier))

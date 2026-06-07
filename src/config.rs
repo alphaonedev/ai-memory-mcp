@@ -4413,10 +4413,35 @@ pub fn set_active_permissions_mode(mode: PermissionsMode) {
     }
 }
 
-/// Read the process-wide active [`PermissionsMode`]. Falls back to
-/// [`PermissionsMode::default`] (`advisory`) when unset, matching the
-/// v0.7.0 K3 default for upgrading operators (governance recorded but
-/// not blocked at the gate).
+/// The pre-initialization fallback mode for [`active_permissions_mode`].
+///
+/// Every production entry point (CLI, MCP, HTTP `serve`) resolves the
+/// real mode via [`AppConfig::effective_permissions_mode`] — whose
+/// v0.7.0 secure default is [`PermissionsMode::Enforce`] — and installs
+/// it via [`set_active_permissions_mode`] during boot, BEFORE any write
+/// can reach the governance gate. This constant is therefore only ever
+/// observed when the gate is consulted before boot ran (a library
+/// embedding that never called the setter, or a unit test that does not
+/// opt into a specific mode). It is held at `Advisory` to preserve the
+/// historical pre-init behaviour the test suite relies on; the
+/// [`active_permissions_mode`] reader emits a one-shot WARN when it has
+/// to fall back to this value so the uninitialized-gate condition is
+/// observable rather than silent.
+const UNINITIALIZED_PERMISSIONS_MODE_FALLBACK: PermissionsMode = PermissionsMode::Advisory;
+
+/// Read the process-wide active [`PermissionsMode`] installed at boot by
+/// [`set_active_permissions_mode`] (sourced from
+/// [`AppConfig::effective_permissions_mode`], whose v0.7.0 secure
+/// default is [`PermissionsMode::Enforce`]).
+///
+/// When the slot is unset — i.e. boot has NOT run — this returns
+/// [`UNINITIALIZED_PERMISSIONS_MODE_FALLBACK`] and emits a one-shot
+/// operator-visible WARN, because consulting the governance gate before
+/// the mode is installed is a defense-in-depth gap: the gate would run
+/// against the pre-init fallback rather than the operator's resolved
+/// mode. In production this path is unreachable (boot always installs
+/// the mode first); the WARN exists to surface a regression if that
+/// ordering ever breaks.
 ///
 /// Test note: the K1 ship-gate matrix asserts `Pending`/`Deny`
 /// outcomes from `db::enforce_governance` and therefore opts into
@@ -4424,11 +4449,23 @@ pub fn set_active_permissions_mode(mode: PermissionsMode) {
 /// scenario.
 #[must_use]
 pub fn active_permissions_mode() -> PermissionsMode {
-    ACTIVE_PERMISSIONS_MODE
-        .read()
-        .ok()
-        .and_then(|g| *g)
-        .unwrap_or(PermissionsMode::Advisory)
+    match ACTIVE_PERMISSIONS_MODE.read().ok().and_then(|g| *g) {
+        Some(mode) => mode,
+        None => {
+            static UNINIT_GATE_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            UNINIT_GATE_WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: "governance",
+                    fallback = UNINITIALIZED_PERMISSIONS_MODE_FALLBACK.as_str(),
+                    "permissions mode consulted before boot installed it; using the \
+                     pre-init fallback. Production entry points install the resolved \
+                     mode (secure default: enforce) during boot — if you see this in \
+                     a running daemon, the boot ordering regressed."
+                );
+            });
+            UNINITIALIZED_PERMISSIONS_MODE_FALLBACK
+        }
+    }
 }
 
 /// Test-only override of the active mode. Production code MUST use
@@ -7864,6 +7901,29 @@ legacy_scoring = false
         // Lines 2403-2405: `impl Default for PermissionsMode`.
         let m: PermissionsMode = Default::default();
         assert_eq!(m, PermissionsMode::Advisory);
+    }
+
+    #[test]
+    fn active_permissions_mode_uses_named_fallback_when_unset_then_honors_setter() {
+        // v0.7.0 H2 de-silencing: when boot has NOT installed a mode,
+        // the gate reader returns the explicit
+        // UNINITIALIZED_PERMISSIONS_MODE_FALLBACK constant (and emits a
+        // one-shot WARN). Once a mode is installed, the reader honors it.
+        let _serialise = lock_permissions_mode_for_test();
+        clear_permissions_mode_override_for_test();
+        assert_eq!(
+            active_permissions_mode(),
+            UNINITIALIZED_PERMISSIONS_MODE_FALLBACK,
+            "unset gate must return the named pre-init fallback"
+        );
+        set_active_permissions_mode(PermissionsMode::Enforce);
+        assert_eq!(
+            active_permissions_mode(),
+            PermissionsMode::Enforce,
+            "installed mode must win over the fallback"
+        );
+        // Restore the unset state for subsequent tests.
+        clear_permissions_mode_override_for_test();
     }
 
     #[test]
