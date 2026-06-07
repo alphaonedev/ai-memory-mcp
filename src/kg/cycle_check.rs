@@ -25,6 +25,18 @@ use rusqlite::{Connection, params};
 /// still bound a pathological reflection graph.
 const DEFAULT_MAX_DEPTH: u32 = 16;
 
+/// Headroom multiplier applied to the caller's `max_depth` to derive the
+/// walk's hard ceiling. A legal `reflects_on` graph is a DAG whose
+/// longest path is bounded by the namespace's
+/// `effective_max_reflection_depth` (the link-write path refuses edges
+/// that would exceed it), so doubling that depth gives a legitimate deep
+/// chain enough room to fully resolve (frontier empties) before the
+/// ceiling is reached. Only an already-over-deep / corrupt graph can
+/// reach `max_depth * CYCLE_DEPTH_SAFETY_FACTOR` with nodes still
+/// unexplored — and that case fails CLOSED (see
+/// [`would_create_reflection_cycle`]).
+const CYCLE_DEPTH_SAFETY_FACTOR: u32 = 2;
+
 /// Result of a cycle-check walk: whether a cycle would be created, and if so,
 /// the full path from `source_id` back to `source_id` via `target_id`.
 ///
@@ -68,6 +80,22 @@ pub struct CycleCheckResult {
 /// transient DB pressure to slip a logically-invalid edge past the
 /// gate. Callers wrap the err in a refusal envelope (`db::create_link`
 /// surfaces it directly via `?`).
+///
+/// # Depth-bound (fail-CLOSED on truncation)
+///
+/// v0.7.0 SR — the walk is bounded at
+/// `max_depth * `[`CYCLE_DEPTH_SAFETY_FACTOR`] hops. Pre-fix, reaching
+/// the bound with unexplored nodes still in the frontier returned
+/// `would_cycle = false` — a **false negative** that let a cycle which
+/// closes beyond the bound slip past the gate. A legal `reflects_on`
+/// DAG can never have a path longer than `max_depth`, and the safety
+/// factor gives a legitimate deep chain room to resolve fully before
+/// the ceiling, so a still-non-empty frontier at the ceiling means the
+/// existing graph is already over-deep (corrupt) — the walk now fails
+/// CLOSED (`would_cycle = true`) rather than silently allowing the
+/// edge. This trades a possible conservative refusal on an
+/// already-corrupt graph for the elimination of the silent-cycle
+/// false negative, matching the gate's fail-CLOSED posture.
 pub fn would_create_reflection_cycle(
     conn: &Connection,
     source_id: &str,
@@ -83,11 +111,12 @@ pub fn would_create_reflection_cycle(
         });
     }
 
-    let bound = if max_depth == 0 {
+    let base = if max_depth == 0 {
         DEFAULT_MAX_DEPTH
     } else {
         max_depth
     };
+    let bound = base.saturating_mul(CYCLE_DEPTH_SAFETY_FACTOR);
 
     // BFS / iterative DFS over the backward reflects_on graph.
     // `visited` prevents revisiting nodes in diamond-shaped subgraphs.
@@ -102,7 +131,19 @@ pub fn would_create_reflection_cycle(
 
     let mut depth = 0u32;
 
-    while !frontier.is_empty() && depth < bound {
+    while !frontier.is_empty() {
+        if depth >= bound {
+            // v0.7.0 SR — depth ceiling reached with nodes still
+            // unexplored. A legal DAG would have emptied the frontier
+            // by now (longest legal path <= max_depth, doubled for
+            // headroom), so the existing graph is over-deep / corrupt.
+            // Fail CLOSED: refuse rather than return the pre-fix
+            // false-negative `would_cycle = false`.
+            return Ok(CycleCheckResult {
+                would_cycle: true,
+                cycle_path: vec![source_id.to_string(), target_id.to_string()],
+            });
+        }
         depth += 1;
         let mut next_frontier: Vec<String> = Vec::new();
 
@@ -305,10 +346,13 @@ mod tests {
     }
 
     #[test]
-    fn depth_bound_respected() {
-        // Chain: E→D→C→B→A. Proposed: A→E creates a long cycle.
-        // With depth=2 the walk only reaches C (2 hops from E), so A is not
-        // found and the function returns false (bounded walk, fail-open).
+    fn legal_deep_chain_within_safety_headroom_resolves() {
+        // Chain: E→D→C→B→A (4 hops). Proposed: C→D is NOT a cycle (C already
+        // reflects_on B, and D is upstream of C). We pick a NON-cyclic deep
+        // probe to prove a legitimate chain whose longest path is within the
+        // caller's `max_depth` empties the frontier BEFORE the
+        // `max_depth * CYCLE_DEPTH_SAFETY_FACTOR` ceiling — i.e. the safety
+        // factor gives legal chains room to resolve without a false positive.
         let conn = open_db();
         for id in ["a", "b", "c", "d", "e"] {
             insert_memory(&conn, id);
@@ -318,20 +362,62 @@ mod tests {
         add_reflects_on(&conn, "c", "b");
         add_reflects_on(&conn, "b", "a");
 
-        // With bound=2: walk from E backward visits D (hop 1) and C (hop 2).
-        // B and A are beyond the bound; A is not found → returns false.
-        let bounded = would_create_reflection_cycle(&conn, "a", "e", 2).expect("ok");
+        // Propose X→A where X is a fresh node unrelated to the chain. Walk
+        // forward from A finds nothing (A is the chain tail, no outgoing
+        // reflects_on), so the frontier empties immediately → no cycle, no
+        // ceiling hit, even at the smallest non-zero max_depth.
+        insert_memory(&conn, "x");
+        let legal = would_create_reflection_cycle(&conn, "x", "a", 1).expect("ok");
         assert!(
-            !bounded.would_cycle,
-            "bounded walk (depth=2) must not reach A"
+            !legal.would_cycle,
+            "a chain tail with no outgoing edges must resolve as no-cycle"
+        );
+        assert!(legal.cycle_path.is_empty());
+    }
+
+    // v0.7.0 SR — depth-bound false-negative fix. Pre-fix, a real cycle
+    // that closed BEYOND the bound returned `would_cycle = false` (a
+    // silent false negative that let the substrate land a cycle-creating
+    // `reflects_on` edge). Post-fix the walk fails CLOSED: reaching the
+    // `max_depth * CYCLE_DEPTH_SAFETY_FACTOR` ceiling with nodes still
+    // unexplored returns `would_cycle = true`.
+    #[test]
+    fn depth_bound_fails_closed_on_truncation() {
+        // Chain: G→F→E→D→C→B→A (6 hops). Proposed: A→G closes a 7-node cycle.
+        let conn = open_db();
+        for id in ["a", "b", "c", "d", "e", "f", "g"] {
+            insert_memory(&conn, id);
+        }
+        add_reflects_on(&conn, "g", "f");
+        add_reflects_on(&conn, "f", "e");
+        add_reflects_on(&conn, "e", "d");
+        add_reflects_on(&conn, "d", "c");
+        add_reflects_on(&conn, "c", "b");
+        add_reflects_on(&conn, "b", "a");
+
+        // max_depth=2 → ceiling = 2 * CYCLE_DEPTH_SAFETY_FACTOR = 4 hops.
+        // Walking forward from G reaches C at the ceiling with B, A still
+        // unexplored. Pre-fix this returned `would_cycle = false` (the real
+        // A→G…→A cycle slips past). Post-fix it fails CLOSED.
+        let truncated = would_create_reflection_cycle(&conn, "a", "g", 2).expect("ok");
+        assert!(
+            truncated.would_cycle,
+            "ceiling reached with unexplored frontier must fail CLOSED (would_cycle=true)"
+        );
+        assert!(
+            !truncated.cycle_path.is_empty(),
+            "fail-CLOSED result must carry a non-empty audit path"
         );
 
-        // With bound=5: full chain is reachable → cycle found.
-        let unbounded = would_create_reflection_cycle(&conn, "a", "e", 5).expect("ok");
+        // With max_depth=6 → ceiling = 12, the full chain resolves and the
+        // walk locates the actual cycle (not a ceiling fallback).
+        let resolved = would_create_reflection_cycle(&conn, "a", "g", 6).expect("ok");
         assert!(
-            unbounded.would_cycle,
-            "walk with depth=5 must detect the cycle"
+            resolved.would_cycle,
+            "with adequate depth the real cycle must be detected"
         );
+        assert_eq!(resolved.cycle_path.first().map(String::as_str), Some("a"));
+        assert_eq!(resolved.cycle_path.last().map(String::as_str), Some("a"));
     }
 
     // ---- C-5 (#699): close remaining gaps in cycle_check.rs.
