@@ -2628,6 +2628,15 @@ pub struct ServeBootstrap {
     /// so the timeout middleware is wired with the operator's
     /// `request_timeout_secs` (default 60 s).
     pub request_timeout: std::time::Duration,
+    /// v0.7.0 Policy-Engine Item 3 — shared atomic metrics handle for the
+    /// deferred-audit drainer. `serve` polls these on the shutdown path
+    /// (after the HTTP server has quiesced) to wait for every submitted
+    /// refusal to flush into `signed_events` before the WAL checkpoint +
+    /// process exit. The producer-side queue itself lives on `AppState`
+    /// and inside the process-wide governance-hook `OnceLock`s, so this
+    /// metrics handle is the only drain-observability surface `serve`
+    /// retains after the queue is moved into `AppState`.
+    pub deferred_audit_metrics: crate::governance::deferred_audit::DeferredAuditMetrics,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -3087,6 +3096,10 @@ pub async fn bootstrap_serve(
     // writes).
     let (deferred_audit_queue, deferred_audit_supervisor) =
         crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+    // Capture the shared atomic metrics handle BEFORE the queue is cloned
+    // into the governance hooks + moved onto `AppState`. `serve` polls
+    // these on shutdown to drain the queue before the WAL checkpoint.
+    let deferred_audit_metrics = deferred_audit_queue.metrics();
     tracing::info!(
         "policy-engine item 3: deferred-audit drainer spawned (chain-logs \
          storage refusals as `governance.refusal` rows in signed_events)"
@@ -4020,6 +4033,7 @@ pub async fn bootstrap_serve(
         daemon_keypair_outcome,
         // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
         request_timeout: Duration::from_secs(app_config.effective_request_timeout_secs()),
+        deferred_audit_metrics,
     })
 }
 
@@ -4082,13 +4096,23 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
 
-    // Graceful shutdown with WAL checkpoint
-    let shutdown_state = bootstrap.db_state.clone();
+    // Graceful shutdown. The signal future only waits for ctrl_c and
+    // then resolves, which tells axum to begin graceful shutdown of
+    // in-flight requests. The deferred-audit drain + WAL checkpoint run
+    // AFTER the server has fully quiesced (below `serve`), so:
+    //   1. no refusal submitted by an in-flight request is lost, and
+    //   2. the final checkpoint captures every write — including the
+    //      drainer's `signed_events` appends, which share the same WAL
+    //      file even though the drainer holds its own connection.
+    // v0.7.0 Policy-Engine Item 3 (audit-log-loss-on-shutdown fix): the
+    // checkpoint used to live inside this future, firing at signal time
+    // before in-flight requests (and the audit drainer) had quiesced —
+    // so refusal rows submitted during graceful shutdown could be lost.
+    let checkpoint_state = bootstrap.db_state.clone();
+    let drain_metrics = bootstrap.deferred_audit_metrics.clone();
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutting down — checkpointing WAL");
-        let lock = shutdown_state.lock().await;
-        let _ = db::checkpoint(&lock.0);
+        tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
 
     // Native TLS (Layer 1): if both --tls-cert and --tls-key are provided,
@@ -4164,6 +4188,49 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         )
         .await?;
     }
+
+    // v0.7.0 Policy-Engine Item 3 — the HTTP server has now fully
+    // quiesced (graceful shutdown complete; no in-flight request can
+    // submit another refusal), so `submitted` is final. Drain the
+    // deferred-audit queue before exit so every refusal captured during
+    // the daemon's life lands in `signed_events`. We can NOT use
+    // `close_and_flush` here: the governance hooks
+    // (`storage::GOVERNANCE_PRE_WRITE`, `wire_check::GOVERNANCE_PRE_ACTION`)
+    // hold sender clones inside process-wide `OnceLock`s that never drop,
+    // so the channel never closes and awaiting the supervisor would block
+    // forever. `drain_pending` instead polls the shared atomic metrics
+    // until the drainer has caught up to the submitted count.
+    let drained = crate::governance::deferred_audit::drain_pending(
+        &drain_metrics,
+        crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await;
+    if drained {
+        tracing::info!(
+            "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
+            drain_metrics.submitted_count()
+        );
+    } else {
+        tracing::warn!(
+            "deferred-audit drain timed out after {:?}: {} submitted but only {} accounted — \
+             some refusal audit rows may not have flushed before exit",
+            crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+            drain_metrics.submitted_count(),
+            drain_metrics.appended_count()
+                + drain_metrics.append_failure_count()
+                + drain_metrics.send_failure_count(),
+        );
+    }
+
+    // Final WAL checkpoint now that every writer (HTTP handlers + the
+    // deferred-audit drainer) has quiesced. The drainer's appends share
+    // this database's WAL file, so this single checkpoint folds them in
+    // even though the drainer holds its own connection.
+    {
+        let lock = checkpoint_state.lock().await;
+        let _ = db::checkpoint(&lock.0);
+    }
+
     Ok(())
 }
 
