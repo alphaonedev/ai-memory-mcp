@@ -54,7 +54,11 @@ use crate::identity::keypair as kp;
 pub const OPERATOR_KEY_ID: &str = "operator";
 
 /// `attest_level` stamped on rules after the operator signs them.
-pub const OPERATOR_SIGNED_LEVEL: &str = "operator_signed";
+/// Re-exported from the governance layer so the rules table and the
+/// `signed_events` audit chain share one source of truth for the
+/// literal (see [`crate::governance::rules_store::OPERATOR_SIGNED_ATTEST_LEVEL`]).
+pub const OPERATOR_SIGNED_LEVEL: &str =
+    crate::governance::rules_store::OPERATOR_SIGNED_ATTEST_LEVEL;
 
 /// Length of a raw Ed25519 signing-key seed on disk.
 const ED25519_SEED_LEN: usize = ed25519_dalek::SECRET_KEY_LENGTH;
@@ -362,8 +366,12 @@ pub fn run(
             if !sign {
                 bail!("governance.no_operator_key: `rules remove` requires --sign");
             }
-            let _ = load_operator_signing_key_from_dir(&key_dir)?;
-            let removed = rules_store::remove(&conn, &id)?;
+            let signing_key = load_operator_signing_key_from_dir(&key_dir)?;
+            // v0.7.0 SR — route deletion through the audited path so the
+            // removal lands an operator-signed row on the signed_events
+            // chain before the rule row is deleted (atomic). The old
+            // bare `rules_store::remove` left no tamper-evident trace.
+            let removed = rules_store::remove_signed(&conn, &id, &signing_key, OPERATOR_KEY_ID)?;
             let payload = serde_json::json!({ "id": id, "removed": removed });
             emit_ok(json, out, "rules.remove", &payload)?;
             Ok(())
