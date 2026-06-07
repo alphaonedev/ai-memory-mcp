@@ -151,10 +151,22 @@ impl FederationConfig {
         // stub here; the full #697 audit/identity module loads from
         // disk). NON-FATAL: peers running `AI_MEMORY_FED_REQUIRE_SIG=0`
         // accept unsigned posts even when the signing key is missing.
-        let signing_key = crate::governance::audit::load_daemon_signing_key(&sender_agent_id)
-            .ok()
-            .flatten()
-            .map(std::sync::Arc::new);
+        let signing_key = match crate::governance::audit::load_daemon_signing_key(&sender_agent_id)
+        {
+            Ok(maybe_key) => maybe_key.map(std::sync::Arc::new),
+            Err(e) => {
+                tracing::warn!(
+                    target: "federation",
+                    sender_agent_id = %sender_agent_id,
+                    error = %e,
+                    "could not resolve the daemon key directory; federation \
+                     posts will be sent UNSIGNED — peers with require_sig \
+                     enabled will silently reject them (partition risk). \
+                     Fix the key directory permissions/path."
+                );
+                None
+            }
+        };
         Ok(Some(Self {
             policy,
             peers,

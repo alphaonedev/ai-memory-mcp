@@ -840,6 +840,21 @@ pub async fn api_key_auth(
             if let Some(val) = pair.strip_prefix("api_key=") {
                 let decoded = percent_decode_lossy(val);
                 if constant_time_eq(decoded.as_bytes(), expected.as_bytes()) {
+                    // v0.7.0 de-silencing: a credential in the URL query
+                    // string leaks into access logs, the Referer header,
+                    // and proxy logs. Accept it (back-compat) but emit a
+                    // once-per-process operator-visible warn nudging
+                    // migration to the `X-API-Key` request header.
+                    static QUERY_KEY_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    QUERY_KEY_WARN_ONCE.call_once(|| {
+                        tracing::warn!(
+                            target: "http::auth",
+                            "a request authenticated via the `?api_key=` query \
+                             parameter; URL-embedded credentials leak into access \
+                             logs, Referer headers, and proxy logs. Migrate callers \
+                             to the `X-API-Key` request header."
+                        );
+                    });
                     return next.run(req).await.into_response();
                 }
             }
