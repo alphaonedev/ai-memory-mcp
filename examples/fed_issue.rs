@@ -163,6 +163,30 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CREDENTIAL_TTL_SECS)]
         ttl_secs: i64,
     },
+    /// Verify a minted credential (`X-Memory-Cred` header value file) against a
+    /// published trust bundle — proves the zero-touch CA trust chain.
+    ///
+    /// Loads the `<issuer-id>.pub` files from `--bundle-dir`, scopes the bundle
+    /// to `--trust-domain`, parses the credential file (`v1=<base64(CBOR)>`),
+    /// and runs `TrustBundle::verify` — the SAME check the receive path runs.
+    /// Prints the verified `subject_agent_id` and exits 0 on success, non-zero
+    /// (with the `CredentialError`) on any failure (`UnknownIssuer`,
+    /// `WrongTrustDomain`, `BadSignature`, `Expired`, `NotYetValid`). The harness
+    /// asserts exit 0 to prove an enrolled peer's credential chains to the CA.
+    VerifyCred {
+        /// File holding the credential header value (`v1=<base64>`), as written
+        /// by `issue --out`.
+        #[arg(long)]
+        cred_file: PathBuf,
+        /// Trust-bundle directory holding `<issuer-id>.pub` (the campaign CA
+        /// verifying key) — the receiver's `AI_MEMORY_FED_TRUST_BUNDLE_DIR`.
+        #[arg(long)]
+        bundle_dir: PathBuf,
+        /// Trust domain the credential must carry; a credential from another
+        /// domain is rejected (`WrongTrustDomain`).
+        #[arg(long)]
+        trust_domain: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -221,7 +245,46 @@ fn run(command: Command) -> Result<()> {
             );
             Ok(())
         }
+        Command::VerifyCred {
+            cred_file,
+            bundle_dir,
+            trust_domain,
+        } => {
+            let subject = verify_cred(&cred_file, &bundle_dir, &trust_domain)?;
+            println!(
+                "credential VERIFIED: subject={subject} chains to a trusted issuer in {} (domain={trust_domain})",
+                bundle_dir.display()
+            );
+            Ok(())
+        }
     }
+}
+
+/// Verify a minted credential file against a published trust bundle.
+///
+/// Mirrors the receive-path trust decision: build the bundle from the
+/// `<issuer-id>.pub` files in `bundle_dir`, scope it to `trust_domain`, parse
+/// the `v1=<base64>` credential, and run [`TrustBundle::verify`] at the current
+/// wall-clock time. Returns the verified `subject_agent_id` on success so the
+/// caller can confirm the credential is for the expected peer.
+fn verify_cred(cred_file: &Path, bundle_dir: &Path, trust_domain: &str) -> Result<String> {
+    use ai_memory::federation::identity::credential::SignedCredential;
+    use ai_memory::federation::identity::trust_bundle::TrustBundle;
+
+    let raw = std::fs::read_to_string(cred_file)
+        .with_context(|| format!("reading credential file {}", cred_file.display()))?;
+    let signed = SignedCredential::from_header_value(raw.trim())
+        .map_err(|e| anyhow::anyhow!("parsing credential {}: {e}", cred_file.display()))?;
+
+    let bundle = TrustBundle::from_dir(bundle_dir)
+        .with_context(|| format!("loading trust bundle from {}", bundle_dir.display()))?
+        .with_trust_domain(trust_domain.to_string());
+
+    let now = now_unix()?;
+    let cred = bundle
+        .verify(&signed, now)
+        .map_err(|e| anyhow::anyhow!("credential failed CA trust-chain verification: {e}"))?;
+    Ok(cred.subject_agent_id)
 }
 
 /// Reject an `issuer_id` that cannot round-trip through a trust bundle.
