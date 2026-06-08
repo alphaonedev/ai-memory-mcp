@@ -501,6 +501,12 @@ fn migrate_writes_recoverable_pre_migration_snapshot_before_schema_mutation() {
         "snapshot must preserve every seeded v0.6.4 row"
     );
 
+    // Close the snapshot connection before removing the directory.
+    // Windows refuses to delete a file with an open handle (sharing
+    // violation, OS error 32); Unix allows the unlink, which is why this
+    // only surfaced on `Check (windows-latest)`. Mirrors the `drop(conn)`
+    // above and in the sibling tests.
+    drop(snap);
     std::fs::remove_dir_all(&dir).expect("clean up local run dir");
 }
 
