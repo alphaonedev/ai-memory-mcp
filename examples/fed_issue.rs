@@ -76,10 +76,14 @@ const PUB_SUFFIX: &str = ".pub";
 const SECRET_DIR_MODE: u32 = 0o700;
 /// A leaf credential is bearer-presentable but still mode-restricted on the
 /// issuer host; the fan-out step lands it 0400 on the node.
-#[cfg(unix)]
+///
+/// Not `#[cfg(unix)]`-gated: it is passed unconditionally to
+/// [`write_with_mode`], which applies the mode on Unix and no-ops on other
+/// platforms — so the constant must exist on every target.
 const CRED_FILE_MODE: u32 = 0o600;
 /// A published issuer verifying key is world-readable (it is public).
-#[cfg(unix)]
+///
+/// Not `#[cfg(unix)]`-gated for the same reason as [`CRED_FILE_MODE`].
 const PUB_FILE_MODE: u32 = 0o644;
 
 #[derive(Parser)]

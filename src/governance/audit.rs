@@ -707,8 +707,31 @@ fn file_date(path: &Path) -> Result<i64> {
     parse_iso_date(stem)
 }
 
+/// H-track (peer.rs:154 unsigned-on-fail) — distinguish "no signing key
+/// enrolled for this agent" (the expected default: the key file simply
+/// does not exist) from a genuine load failure (corrupt, wrong-length,
+/// or insecure-mode key file).
+///
+/// The former is silent; the latter must be surfaced, because a daemon
+/// that silently falls back to UNSIGNED federation/audit posts partitions
+/// itself from any peer that requires signatures with no operator-visible
+/// signal. Walks the full error chain so a `with_context`-wrapped
+/// `io::Error` is still recognised.
+fn signing_key_load_is_absent(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 /// Load the daemon's signing key by agent_id. Returns `Ok(None)`
 /// when no key is enrolled.
+///
+/// A genuine load failure (a key file that exists but is corrupt,
+/// wrong-length, or has insecure mode bits) is logged at `warn` before
+/// returning `Ok(None)` so the resulting unsigned-operation fallback is
+/// observable rather than silent (H-track peer.rs:154).
 ///
 /// # Errors
 /// - The key dir cannot be resolved.
@@ -719,7 +742,24 @@ pub fn load_daemon_signing_key(agent_id: &str) -> Result<Option<SigningKey>> {
     }
     let kp = match crate::identity::keypair::load(agent_id, &dir) {
         Ok(k) => k,
-        Err(_) => return Ok(None),
+        Err(e) => {
+            if signing_key_load_is_absent(&e) {
+                tracing::debug!(
+                    agent_id,
+                    "no daemon signing key enrolled; operating unsigned \
+                     (expected when no key is provisioned)"
+                );
+            } else {
+                tracing::warn!(
+                    agent_id,
+                    error = %e,
+                    "daemon signing key is present but could not be loaded; \
+                     federation/audit signing falls back to UNSIGNED — peers \
+                     requiring signatures will reject posts. Fix the key file."
+                );
+            }
+            return Ok(None);
+        }
     };
     Ok(kp.private)
 }
@@ -1364,6 +1404,35 @@ mod tests {
         }
         assert!(sk.expect("Ok").is_none());
         assert!(vk.expect("Ok").is_none());
+    }
+
+    #[test]
+    fn signing_key_load_is_absent_only_for_notfound_in_chain() {
+        // A bare NotFound io::Error → absent (the expected "no key
+        // enrolled" case): silent debug path, no operator-facing warn.
+        let notfound: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file").into();
+        assert!(signing_key_load_is_absent(&notfound));
+
+        // The same NotFound wrapped by a `with_context` layer (the shape
+        // keypair::load actually produces) is still recognised because we
+        // walk the whole error chain.
+        let wrapped: anyhow::Error =
+            anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+                .context("reading public key");
+        assert!(signing_key_load_is_absent(&wrapped));
+
+        // A genuine load failure (permission denied) is NOT absent — it
+        // must reach the loud warn branch so the unsigned fallback is
+        // observable rather than silent.
+        let denied: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mode bits").into();
+        assert!(!signing_key_load_is_absent(&denied));
+
+        // A non-io error (e.g. corrupt/wrong-length key parse) is NOT
+        // absent either.
+        let corrupt = anyhow::anyhow!("key material is the wrong length");
+        assert!(!signing_key_load_is_absent(&corrupt));
     }
 
     #[test]

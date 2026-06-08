@@ -241,18 +241,57 @@ pub fn enforced_rule_passes(
     }
 }
 
-/// Resolve the operator verifying key:
+/// Base64url-no-pad (or standard) encoded verifying key written by
+/// `ai-memory rules keygen` (Layout 2 in
+/// [`crate::cli::rules::load_operator_signing_key_from_dir`]).
+const OPERATOR_PUBKEY_KEYGEN_FILE: &str = "operator.key.pub";
+/// Raw 32-byte verifying key written by the legacy `kp::save` keypair
+/// layout (Layout 1 — pairs with `operator.priv`).
+const OPERATOR_PUBKEY_LEGACY_FILE: &str = "operator.pub";
+
+/// `attest_level` stamped on operator-signed governance rows AND on the
+/// `signed_events` audit emissions that record their lifecycle.
+///
+/// Single source of truth for the `"operator_signed"` attestation
+/// string — the CLI re-exports it as
+/// [`crate::cli::rules::OPERATOR_SIGNED_LEVEL`] so the rules table
+/// (`update_signature`) and the audit chain (`remove_signed`) cannot
+/// drift apart on the literal.
+pub const OPERATOR_SIGNED_ATTEST_LEVEL: &str = "operator_signed";
+
+/// Resolve the operator verifying key. The lookup order mirrors the
+/// SIGNER's key-dir resolution
+/// ([`crate::cli::rules::load_operator_signing_key_from_dir`]) so the
+/// verify path can never diverge from the sign path:
 ///
 /// 1. `AI_MEMORY_OPERATOR_PUBKEY` env var (base64, URL-safe-no-pad or
 ///    standard padded — same as the rest of the codebase).
-/// 2. `~/.config/ai-memory/operator.key.pub` file (base64, same
-///    flavors). Path resolution via `dirs::config_dir()`.
+/// 2. The resolved key directory ([`crate::identity::keypair::default_key_dir`],
+///    which honors `AI_MEMORY_KEY_DIR`):
+///    a. `<key_dir>/operator.key.pub` (base64, keygen Layout 2);
+///    b. `<key_dir>/operator.pub` (raw 32 bytes, legacy Layout 1).
+/// 3. The key directory's PARENT (the singleton operator-key location —
+///    `<config>/ai-memory/operator.key.pub` when `AI_MEMORY_KEY_DIR` is
+///    unset, since the default key dir is `<config>/ai-memory/keys`):
+///    a. `<parent>/operator.key.pub` (base64);
+///    b. `<parent>/operator.pub` (raw 32 bytes).
 ///
-/// Returns `None` when neither source resolves a 32-byte verifying
-/// key. A failure to decode either source is silently treated as
-/// "no key" (the once-per-process diagnostic in
-/// [`log_missing_operator_pubkey_once`] surfaces the misconfig to the
-/// operator).
+/// v0.7.0 H5 (HIGH) — pre-fix the verifier read ONLY the env var and
+/// `<config>/ai-memory/operator.key.pub`, ignoring `AI_MEMORY_KEY_DIR`
+/// and the raw-bytes legacy layout. An operator who relocated the key
+/// store via `AI_MEMORY_KEY_DIR` (the documented production override)
+/// signed rules with a key the verifier could not find, so
+/// `resolve_operator_pubkey` returned `None` and every `enabled = 1`
+/// rule silently fell through the `(None, _) => true` pre-L1-6 arm of
+/// [`enforced_rule_passes`] WITHOUT a signature check — a fail-open
+/// signature bypass. Honoring the same key-dir ladder as the signer
+/// closes the divergence: when a key exists the verifier finds it and
+/// enforcement moves to the `(Some(pk), _)` verify arm.
+///
+/// Returns `None` when no source resolves a 32-byte verifying key. A
+/// failure to decode any source is silently treated as "no key" (the
+/// once-per-process diagnostic in [`log_missing_operator_pubkey_once`]
+/// surfaces the misconfig to the operator).
 ///
 /// Exposed `pub` so the daemon startup path
 /// (`bootstrap_serve`) can call this directly to enforce the SEC-2
@@ -280,18 +319,33 @@ pub fn resolve_operator_pubkey() -> Option<ed25519_dalek::VerifyingKey> {
     }
 
     use base64::Engine;
+    let from_bytes = |bytes: &[u8]| -> Option<ed25519_dalek::VerifyingKey> {
+        if bytes.len() != ed25519_dalek::PUBLIC_KEY_LENGTH {
+            return None;
+        }
+        let mut arr = [0u8; ed25519_dalek::PUBLIC_KEY_LENGTH];
+        arr.copy_from_slice(bytes);
+        ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
+    };
     let try_decode = |s: &str| -> Option<ed25519_dalek::VerifyingKey> {
         let trimmed = s.trim();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(trimmed)
             .or_else(|_| base64::engine::general_purpose::STANDARD.decode(trimmed))
             .ok()?;
-        if bytes.len() != ed25519_dalek::PUBLIC_KEY_LENGTH {
-            return None;
+        from_bytes(&bytes)
+    };
+    // Read a base64-encoded `.pub` (keygen layout); fall back to raw
+    // 32-byte bytes (legacy layout) when the text does not base64-decode
+    // to a valid key.
+    let try_pub_file = |path: &std::path::Path| -> Option<ed25519_dalek::VerifyingKey> {
+        let raw = std::fs::read(path).ok()?;
+        if let Ok(text) = std::str::from_utf8(&raw)
+            && let Some(pk) = try_decode(text)
+        {
+            return Some(pk);
         }
-        let mut arr = [0u8; ed25519_dalek::PUBLIC_KEY_LENGTH];
-        arr.copy_from_slice(&bytes);
-        ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
+        from_bytes(&raw)
     };
 
     if let Ok(v) = std::env::var("AI_MEMORY_OPERATOR_PUBKEY")
@@ -301,10 +355,19 @@ pub fn resolve_operator_pubkey() -> Option<ed25519_dalek::VerifyingKey> {
         return Some(pk);
     }
 
-    let base = dirs::config_dir()?;
-    let pub_path = base.join("ai-memory").join("operator.key.pub");
-    let contents = std::fs::read_to_string(&pub_path).ok()?;
-    try_decode(&contents)
+    // Resolve the same key directory the signer uses (honors
+    // AI_MEMORY_KEY_DIR), then walk the key-dir + its parent for both
+    // the base64 keygen layout and the raw-bytes legacy layout.
+    let key_dir = crate::identity::keypair::default_key_dir().ok()?;
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        key_dir.join(OPERATOR_PUBKEY_KEYGEN_FILE),
+        key_dir.join(OPERATOR_PUBKEY_LEGACY_FILE),
+    ];
+    if let Some(parent) = key_dir.parent() {
+        candidates.push(parent.join(OPERATOR_PUBKEY_KEYGEN_FILE));
+        candidates.push(parent.join(OPERATOR_PUBKEY_LEGACY_FILE));
+    }
+    candidates.iter().find_map(|p| try_pub_file(p))
 }
 
 /// Issue #819 — test-only escape hatch for [`resolve_operator_pubkey`].
@@ -439,6 +502,77 @@ pub fn remove(conn: &Connection, id: &str) -> Result<bool> {
     let affected = conn
         .execute("DELETE FROM governance_rules WHERE id = ?1", params![id])
         .with_context(|| format!("rules_store::remove: id={id}"))?;
+    Ok(affected > 0)
+}
+
+/// Remove a rule by id, emitting an operator-signed audit event to the
+/// `signed_events` chain BEFORE the row is deleted — atomically within
+/// a single `IMMEDIATE` transaction.
+///
+/// Returns `true` when a row was deleted (and an audit event emitted),
+/// `false` when no row matched (no event emitted).
+///
+/// v0.7.0 SR — closes the unaudited/unsigned-deletion gap. A bare
+/// `DELETE FROM governance_rules` (the old [`remove`] path the CLI
+/// called) left no tamper-evident trace of WHICH rule was removed or
+/// under whose authority, so a SQL-write gadget — or a careless
+/// operator — could erase a refuse-severity rule with zero audit
+/// residue. The emitted event's `payload_hash` is the SHA-256 over the
+/// removed rule's [`canonical_bytes_for_signing`] and its `signature`
+/// is the operator's Ed25519 signature over that hash, so an auditor
+/// can both prove the deletion was operator-authorized and reconstruct
+/// the removed rule's identity from the append-only chain.
+///
+/// Atomicity: the audit INSERT and the row DELETE share one
+/// transaction. On any error the transaction rolls back, so the rule
+/// row is never deleted unless its audit event was durably written
+/// (and vice versa).
+///
+/// # Errors
+///
+/// Propagates SQLite errors, signing-key/serialisation errors, and
+/// audit-chain INSERT errors.
+pub fn remove_signed(
+    conn: &Connection,
+    id: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    operator_agent_id: &str,
+) -> Result<bool> {
+    use ed25519_dalek::Signer;
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("rules_store::remove_signed: begin IMMEDIATE tx")?;
+
+    let Some(rule) = get(&tx, id)? else {
+        // No matching row — nothing to delete or audit. Commit the empty
+        // transaction so the IMMEDIATE write-lock is released cleanly.
+        tx.commit()
+            .context("rules_store::remove_signed: commit empty tx")?;
+        return Ok(false);
+    };
+
+    let canonical = canonical_bytes_for_signing(&rule)?;
+    let payload_hash = crate::signed_events::payload_hash(&canonical);
+    let signature = signing_key.sign(&payload_hash);
+
+    let event = crate::signed_events::SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: operator_agent_id.to_string(),
+        event_type: crate::signed_events::event_types::GOVERNANCE_RULE_REMOVED.to_string(),
+        payload_hash,
+        signature: Some(signature.to_bytes().to_vec()),
+        attest_level: OPERATOR_SIGNED_ATTEST_LEVEL.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..crate::signed_events::SignedEvent::default()
+    };
+    crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+
+    let affected = tx
+        .execute("DELETE FROM governance_rules WHERE id = ?1", params![id])
+        .with_context(|| format!("rules_store::remove_signed: delete id={id}"))?;
+
+    tx.commit()
+        .context("rules_store::remove_signed: commit tx")?;
     Ok(affected > 0)
 }
 
@@ -728,6 +862,105 @@ mod tests {
         assert!(remove(&conn, "R1").unwrap());
         assert!(!remove(&conn, "R1").unwrap());
         assert_eq!(get(&conn, "R1").unwrap(), None);
+    }
+
+    /// Build a connection carrying BOTH the `governance_rules` table
+    /// (from [`fresh_conn`]) and the `signed_events` audit table so the
+    /// [`remove_signed`] audit emission has somewhere to land.
+    fn fresh_conn_with_audit() -> Connection {
+        let conn = fresh_conn();
+        conn.execute_batch(
+            "CREATE TABLE signed_events (
+                 id TEXT PRIMARY KEY,
+                 agent_id TEXT NOT NULL,
+                 event_type TEXT NOT NULL,
+                 payload_hash BLOB NOT NULL,
+                 signature BLOB,
+                 attest_level TEXT NOT NULL DEFAULT 'unsigned',
+                 timestamp TEXT NOT NULL,
+                 prev_hash BLOB,
+                 sequence INTEGER
+             );
+             CREATE UNIQUE INDEX idx_signed_events_sequence ON signed_events(sequence);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// v0.7.0 SR regression — `remove_signed` must (1) delete the rule
+    /// and (2) leave an operator-signed `governance.rule_removed` row on
+    /// the audit chain whose signature verifies against the operator
+    /// pubkey over the removed rule's canonical payload hash. Pre-fix the
+    /// CLI called the bare `remove`, deleting the rule with zero audit
+    /// residue.
+    #[test]
+    fn remove_signed_emits_operator_signed_audit_event_and_deletes() {
+        use ed25519_dalek::Verifier;
+        let conn = fresh_conn_with_audit();
+        let rule = make_rule("R1", "bash", true);
+        insert(&conn, &rule).unwrap();
+
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let operator_pubkey = signing.verifying_key();
+
+        let removed = remove_signed(&conn, "R1", &signing, "operator").unwrap();
+        assert!(removed, "remove_signed must report the row was deleted");
+        assert_eq!(get(&conn, "R1").unwrap(), None, "rule row must be gone");
+
+        // Exactly one audit row, of the expected type + operator level.
+        let (event_type, attest_level, payload_hash, sig): (String, String, Vec<u8>, Vec<u8>) =
+            conn.query_row(
+                "SELECT event_type, attest_level, payload_hash, signature FROM signed_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .expect("exactly one signed_events row must exist");
+        assert_eq!(
+            event_type,
+            crate::signed_events::event_types::GOVERNANCE_RULE_REMOVED
+        );
+        assert_eq!(attest_level, OPERATOR_SIGNED_ATTEST_LEVEL);
+
+        // payload_hash must be the SHA-256 over the removed rule's
+        // canonical bytes, and the signature must verify against it.
+        let expected_hash =
+            crate::signed_events::payload_hash(&canonical_bytes_for_signing(&rule).unwrap());
+        assert_eq!(payload_hash, expected_hash);
+        assert_eq!(
+            sig.len(),
+            ed25519_dalek::SIGNATURE_LENGTH,
+            "signature must be 64 bytes"
+        );
+        let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+        sig_arr.copy_from_slice(&sig);
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        operator_pubkey
+            .verify(&payload_hash, &signature)
+            .expect("operator signature over payload_hash must verify");
+    }
+
+    /// v0.7.0 SR regression — `remove_signed` on a missing id returns
+    /// `false` and emits NO audit event (no spurious chain rows).
+    #[test]
+    fn remove_signed_missing_id_returns_false_and_emits_nothing() {
+        let conn = fresh_conn_with_audit();
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+        let removed = remove_signed(&conn, "nope", &signing, "operator").unwrap();
+        assert!(!removed);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM signed_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no audit row may be emitted for a no-op removal");
     }
 
     #[test]
@@ -1068,5 +1301,101 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", v) },
             None => unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") },
         }
+    }
+
+    /// H5 regression — the verifier must resolve the operator pubkey from
+    /// the SAME key directory the signer writes to (honoring
+    /// `AI_MEMORY_KEY_DIR`), reading the base64 keygen-layout
+    /// `operator.key.pub` file. Pre-fix the verifier ignored
+    /// `AI_MEMORY_KEY_DIR`, so a custom key-dir deployment resolved no
+    /// pubkey and L1-6 attestation silently failed open.
+    #[test]
+    fn resolve_operator_pubkey_reads_keygen_layout_from_key_dir() {
+        use base64::Engine;
+        let _lock = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let vk = signing.verifying_key();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join(OPERATOR_PUBKEY_KEYGEN_FILE), encoded).unwrap();
+
+        // The env-var path takes precedence, so it MUST be unset for this
+        // test to exercise the key-dir resolution branch.
+        let prior_pubkey = std::env::var("AI_MEMORY_OPERATOR_PUBKEY").ok();
+        let prior_key_dir = std::env::var("AI_MEMORY_KEY_DIR").ok();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+            std::env::set_var("AI_MEMORY_KEY_DIR", dir.path());
+        }
+
+        let got = resolve_operator_pubkey();
+
+        // Restore env before asserting so a failed assertion never leaks
+        // state into sibling tests.
+        unsafe {
+            match prior_pubkey {
+                Some(v) => std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", v),
+                None => std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY"),
+            }
+            match prior_key_dir {
+                Some(v) => std::env::set_var("AI_MEMORY_KEY_DIR", v),
+                None => std::env::remove_var("AI_MEMORY_KEY_DIR"),
+            }
+        }
+
+        assert!(
+            got.is_some(),
+            "verifier must resolve operator.key.pub from AI_MEMORY_KEY_DIR"
+        );
+        assert_eq!(got.unwrap().as_bytes(), vk.as_bytes());
+    }
+
+    /// H5 regression — the verifier must also accept the legacy raw
+    /// 32-byte `operator.pub` layout from the resolved key directory, so
+    /// pre-keygen deployments keep verifying without re-enrolment.
+    #[test]
+    fn resolve_operator_pubkey_reads_legacy_raw_layout_from_key_dir() {
+        let _lock = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let vk = signing.verifying_key();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Legacy layout: raw 32 bytes, no base64 wrapper.
+        std::fs::write(dir.path().join(OPERATOR_PUBKEY_LEGACY_FILE), vk.as_bytes()).unwrap();
+
+        let prior_pubkey = std::env::var("AI_MEMORY_OPERATOR_PUBKEY").ok();
+        let prior_key_dir = std::env::var("AI_MEMORY_KEY_DIR").ok();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+            std::env::set_var("AI_MEMORY_KEY_DIR", dir.path());
+        }
+
+        let got = resolve_operator_pubkey();
+
+        unsafe {
+            match prior_pubkey {
+                Some(v) => std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", v),
+                None => std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY"),
+            }
+            match prior_key_dir {
+                Some(v) => std::env::set_var("AI_MEMORY_KEY_DIR", v),
+                None => std::env::remove_var("AI_MEMORY_KEY_DIR"),
+            }
+        }
+
+        assert!(
+            got.is_some(),
+            "verifier must resolve legacy operator.pub from AI_MEMORY_KEY_DIR"
+        );
+        assert_eq!(got.unwrap().as_bytes(), vk.as_bytes());
     }
 }

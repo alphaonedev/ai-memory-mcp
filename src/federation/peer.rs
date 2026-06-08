@@ -151,10 +151,10 @@ impl FederationConfig {
         // stub here; the full #697 audit/identity module loads from
         // disk). NON-FATAL: peers running `AI_MEMORY_FED_REQUIRE_SIG=0`
         // accept unsigned posts even when the signing key is missing.
-        let signing_key = crate::governance::audit::load_daemon_signing_key(&sender_agent_id)
-            .ok()
-            .flatten()
-            .map(std::sync::Arc::new);
+        let signing_key = resolve_daemon_signing_key(
+            crate::governance::audit::load_daemon_signing_key(&sender_agent_id),
+            &sender_agent_id,
+        );
         Ok(Some(Self {
             policy,
             peers,
@@ -178,5 +178,72 @@ impl FederationConfig {
     #[must_use]
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+}
+
+/// Resolve the optional daemon signing key from a
+/// [`crate::governance::audit::load_daemon_signing_key`] result.
+///
+/// On success the key (if any) is wrapped in an `Arc`. On error the daemon
+/// degrades to UNSIGNED — it logs the key-directory resolution failure and
+/// returns `None` rather than failing the whole `build`, because peers
+/// running `AI_MEMORY_FED_REQUIRE_SIG=0` still accept unsigned posts.
+///
+/// Extracted from [`FederationConfig::build`] so the error branch is
+/// unit-testable: forcing `load_daemon_signing_key` to actually error
+/// requires an unresolvable host config dir, which is not deterministic in
+/// tests (the `dirs` crate falls back to `getpwuid` when `HOME` is unset).
+fn resolve_daemon_signing_key(
+    loaded: anyhow::Result<Option<ed25519_dalek::SigningKey>>,
+    sender_agent_id: &str,
+) -> Option<std::sync::Arc<ed25519_dalek::SigningKey>> {
+    match loaded {
+        Ok(maybe_key) => maybe_key.map(std::sync::Arc::new),
+        Err(e) => {
+            tracing::warn!(
+                target: "federation",
+                sender_agent_id = %sender_agent_id,
+                error = %e,
+                "could not resolve the daemon key directory; federation \
+                 posts will be sent UNSIGNED — peers with require_sig \
+                 enabled will silently reject them (partition risk). \
+                 Fix the key directory permissions/path."
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_signing_key_tests {
+    use super::resolve_daemon_signing_key;
+
+    #[test]
+    fn key_dir_error_degrades_to_unsigned() {
+        // #1533 — the build() key-load error branch must warn and continue
+        // UNSIGNED, never propagate. Driving the resolver with a synthetic
+        // Err covers the branch deterministically (the live error needs an
+        // unresolvable host config dir, which tests cannot force).
+        let got = resolve_daemon_signing_key(
+            Err(anyhow::anyhow!("synthetic key-dir resolution failure")),
+            "ai:unsigned-builder",
+        );
+        assert!(got.is_none(), "key-dir error must degrade to unsigned");
+    }
+
+    #[test]
+    fn absent_key_resolves_to_none() {
+        let got = resolve_daemon_signing_key(Ok(None), "ai:no-key");
+        assert!(got.is_none(), "no enrolled key resolves to None");
+    }
+
+    #[test]
+    fn present_key_is_wrapped_in_arc() {
+        use ed25519_dalek::SigningKey;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let expected = key.to_bytes();
+        let got = resolve_daemon_signing_key(Ok(Some(key)), "ai:signed");
+        let got = got.expect("present key must resolve to Some");
+        assert_eq!(got.to_bytes(), expected, "the loaded key is preserved");
     }
 }

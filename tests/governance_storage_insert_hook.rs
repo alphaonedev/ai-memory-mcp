@@ -376,6 +376,82 @@ fn cli_one_shot_does_not_install_hook() {
 // HTTP handler maps to 403 / `GOVERNANCE_REFUSED`.
 // ---------------------------------------------------------------------------
 
+/// Number of times [`spawn_healthy_serve`] re-rolls the ephemeral port
+/// when the daemon child loses the `free_port()` TOCTOU race and exits
+/// with a bind error before `/health` comes up. A genuine startup crash
+/// carries different stderr and is surfaced immediately, never retried.
+const SPAWN_BIND_RETRY_ATTEMPTS: usize = 5;
+
+/// Substring the daemon's `bind` error carries on an ephemeral-port
+/// collision — `std::io::Error` for `EADDRINUSE` renders as this on both
+/// Linux and macOS. Distinguishes a retryable port race from a real crash.
+const BIND_IN_USE_MARKER: &str = "Address already in use";
+
+/// Spawn the governance-rule `serve` child (operator-pubkey scoped) and
+/// wait for `/health`, retrying on the `free_port()` TOCTOU bind race
+/// (see [`SPAWN_BIND_RETRY_ATTEMPTS`]). The child's stderr is captured so
+/// a retryable port collision is told apart from a genuine startup crash,
+/// which is surfaced immediately with its stderr. Returns the live child
+/// and its bound port.
+fn spawn_healthy_serve(
+    bin: &str,
+    db_path: &std::path::Path,
+    pub_b64: &str,
+) -> (std::process::Child, u16) {
+    use std::io::{BufRead, BufReader};
+    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
+        let port = free_port();
+        let mut child = std::process::Command::new(bin)
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_OPERATOR_PUBKEY", pub_b64)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "serve",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn ai-memory serve");
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            let sink = std::sync::Arc::clone(&stderr_buf);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut guard = sink.lock().unwrap();
+                    guard.push_str(&line);
+                    guard.push('\n');
+                }
+            })
+        });
+
+        if wait_for_health(port) {
+            // Healthy: detach the stderr drainer (it ends when the child
+            // is later killed and the pipe EOFs) and hand back the child.
+            return (child, port);
+        }
+
+        // Never came healthy — reap, then classify via captured stderr.
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+        let stderr = stderr_buf.lock().unwrap().clone();
+        if stderr.contains(BIND_IN_USE_MARKER) && attempt < SPAWN_BIND_RETRY_ATTEMPTS {
+            eprintln!(
+                "spawn_healthy_serve: ephemeral-port bind race on attempt \
+                 {attempt}/{SPAWN_BIND_RETRY_ATTEMPTS}, re-rolling port"
+            );
+            continue;
+        }
+        panic!("serve never came healthy:\n--- child stderr ---\n{stderr}");
+    }
+    unreachable!("loop returns or panics on the final attempt")
+}
+
 fn wait_for_health(port: u16) -> bool {
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -442,29 +518,7 @@ fn refusal_maps_to_http_403() {
         ai_memory::governance::rules_store::insert(&conn, &rule).expect("seed rule");
     }
 
-    let port = free_port();
-    let mut child = std::process::Command::new(bin)
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        .env("AI_MEMORY_OPERATOR_PUBKEY", &pub_b64)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "serve",
-            "--port",
-            &port.to_string(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn ai-memory serve");
-
-    let healthy = wait_for_health(port);
-    if !healthy {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&db_path);
-        panic!("serve never came healthy");
-    }
+    let (mut child, port) = spawn_healthy_serve(bin, &db_path, &pub_b64);
 
     // POST a memory — must come back 403.
     let body = serde_json::json!({
