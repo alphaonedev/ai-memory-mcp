@@ -426,6 +426,10 @@ ATLAS_DIR="${ATLAS_DIR:-$DO_ROOT/atlas}"
 ATLAS_MANIFEST="${ATLAS_MANIFEST:-$ATLAS_DIR/CORPUS_MANIFEST.json}"
 ATLAS_NAMESPACE="${ATLAS_NAMESPACE:-atlas-corpus}"
 ATLAS_AGENT_ID="${ATLAS_AGENT_ID:-ai:atlas-loader@$CAMPAIGN}"
+# Region whose first sorted peer is the Atlas write-anchor (the hive federates
+# the rest). Named here so no region slug is hardcoded at the atlas call site;
+# override to re-anchor ingest in a different region.
+ATLAS_ANCHOR_REGION="${ATLAS_ANCHOR_REGION:-nyc3}"
 # A DEDICATED federation-convergence probe identity, distinct from the loader.
 # The loader writes all 7855 corpus rows and so EXHAUSTS its per-agent daily
 # federation quota (AI_MEMORY_MAX_MEMORIES_PER_DAY, default 1000) — past which
