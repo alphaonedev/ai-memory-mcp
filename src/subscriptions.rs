@@ -1334,7 +1334,20 @@ fn send(
                 return Err(format!("dns-ssrf-rejected: {e}"));
             }
         };
-    let mut builder = reqwest::blocking::Client::builder().timeout(ACK_TIMEOUT);
+    // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
+    // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
+    // for the *validated* host only. reqwest's default redirect
+    // policy follows up to 10 hops and re-resolves DNS for the new
+    // Location host — a host whose addresses were never SSRF-validated
+    // — so a webhook endpoint that returns `302 Location:
+    // http://169.254.169.254/...` would let reqwest connect to an
+    // internal address the guard never cleared. Disabling redirects
+    // closes that window: a 3xx is surfaced as a non-success status
+    // (`http-{status}` below) and fails the dispatch safely, exactly
+    // like any other non-2xx.
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(ACK_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
     for addr in &validated_addrs {
         // Pin reqwest's per-host override. The override SHADOWS
         // reqwest's own DNS query for this host on this client,
@@ -3381,6 +3394,59 @@ mod tests {
             .await
             .unwrap();
         assert!(res.is_err(), "4xx must return Err");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_does_not_follow_redirect_ssrf_pin_bypass() {
+        // SR-W3 (HIGH) regression. The webhook client pins reqwest's
+        // DNS to the SSRF-validated address set of the *original* host.
+        // A malicious endpoint could return a 3xx whose Location points
+        // at an internal address the guard never cleared; reqwest's
+        // default redirect policy would follow it and re-resolve DNS for
+        // the new host, bypassing the pin. With redirects disabled the
+        // 3xx is surfaced as a non-success status and the dispatch fails
+        // safely. We assert BOTH that send returns Err AND that the
+        // redirect target was never requested.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The hook returns a redirect to a path that, if followed, the
+        // mock would happily answer 200 — proving the failure is the
+        // un-followed redirect, not a missing target.
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "/internal-rebind-target"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let redirect_followed = Mock::given(path("/internal-rebind-target"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .named("redirect target must NOT be requested");
+        server.register(redirect_followed).await;
+
+        let url = format!("{}/hook", server.uri());
+        let corr = uuid::Uuid::now_v7().to_string();
+        let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
+            .await
+            .unwrap();
+        assert!(
+            res.is_err(),
+            "redirect must not be followed; 3xx surfaces as a failed dispatch: {res:?}"
+        );
+        // The `.expect(0)` on the redirect-target mock is verified on
+        // server drop; assert it explicitly here for a clear failure
+        // message if reqwest ever regains redirect-following behavior.
+        let hits = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == "/internal-rebind-target")
+            .count();
+        assert_eq!(hits, 0, "redirect target was requested — SSRF pin bypassed");
     }
 
     #[tokio::test(flavor = "multi_thread")]

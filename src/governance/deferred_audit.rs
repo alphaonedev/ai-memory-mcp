@@ -788,6 +788,77 @@ pub async fn close_and_flush(
     supervisor.await
 }
 
+/// Default bounded wait for [`drain_pending`] — how long the daemon's
+/// shutdown path waits for the drainer to flush every submitted refusal
+/// into `signed_events` before giving up and proceeding to WAL checkpoint
+/// + exit. Five seconds comfortably covers a multi-thousand-event backlog
+/// at the sink's ~25-100 microsecond-per-append rate while still bounding
+/// shutdown latency if the drainer is genuinely wedged.
+pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS);
+
+/// Whole-seconds component of [`DEFAULT_SHUTDOWN_DRAIN_TIMEOUT`]. Named so
+/// the magnitude is not an inline literal inside the `Duration` const.
+const SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 5;
+
+/// Poll cadence for [`drain_pending`]. The drainer advances its atomic
+/// counters from another task, so the shutdown path samples them on this
+/// interval rather than busy-spinning.
+const DRAIN_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(DRAIN_POLL_INTERVAL_MILLIS);
+
+/// Whole-milliseconds component of [`DRAIN_POLL_INTERVAL`].
+const DRAIN_POLL_INTERVAL_MILLIS: u64 = 10;
+
+/// Wait (bounded) until every event submitted to the queue has been
+/// accounted for by the drainer — appended to `signed_events`, landed in
+/// the DLQ / counted as an append failure, or recorded as a send failure.
+///
+/// This is the daemon shutdown-path counterpart to [`close_and_flush`].
+/// Unlike `close_and_flush`, it does NOT require the producer-side senders
+/// to be dropped: the daemon installs the queue's sender clones inside
+/// process-wide `OnceLock` governance hooks
+/// (`storage::GOVERNANCE_PRE_WRITE`, `wire_check::GOVERNANCE_PRE_ACTION`)
+/// that live for the entire process lifetime, so the channel never closes
+/// and the drainer's `recv().await` never returns `None`. Awaiting the
+/// supervisor would therefore block forever. Instead we wait for the
+/// drainer to catch up to the submitted count by polling the shared atomic
+/// metrics.
+///
+/// MUST be called only after every write path that can submit a refusal
+/// has quiesced (i.e. after the HTTP server's graceful-shutdown future has
+/// resolved). At that point `submitted` is final, so the loop terminates
+/// as soon as the drainer finishes the backlog.
+///
+/// Returns `true` when the queue fully drained within `timeout`, `false`
+/// when the timeout elapsed with events still in flight (the caller should
+/// log the residual so the audit gap is visible to operators).
+pub async fn drain_pending(metrics: &DeferredAuditMetrics, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if drain_accounted(metrics) >= metrics.submitted_count() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+}
+
+/// Number of submitted events the drainer has finished with — every
+/// received event bumps exactly one of `appended` / `append_failures`
+/// (the latter also covers DLQ landings), and a closed receiver bumps
+/// `send_failures`. The sum equalling `submitted` means the backlog is
+/// fully processed.
+#[must_use]
+fn drain_accounted(metrics: &DeferredAuditMetrics) -> u64 {
+    metrics
+        .appended_count()
+        .saturating_add(metrics.append_failure_count())
+        .saturating_add(metrics.send_failure_count())
+}
+
 // ---------------------------------------------------------------------------
 // Convenience installer for the daemon path
 // ---------------------------------------------------------------------------
@@ -1160,6 +1231,135 @@ mod tests {
             "shutdown must drain every buffered event"
         );
         assert_eq!(metrics.appended_count(), 50);
+    }
+
+    // -----------------------------------------------------------------
+    // drain_pending — shutdown drain that does NOT require the senders to
+    // be dropped (the daemon's governance hooks hold OnceLock-resident
+    // sender clones that live for the whole process, so the channel never
+    // closes — `close_and_flush` would block forever; `drain_pending`
+    // polls the metrics instead).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn drain_pending_completes_without_closing_channel() {
+        let (queue, rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        let recorded: Arc<Mutex<Vec<DeferredAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_factory = recorded.clone();
+        let supervisor = spawn_supervised_drainer(
+            rx,
+            move || MockSink {
+                recorded: recorded_for_factory.clone(),
+                panic_on: None,
+                error_on: None,
+                call_count: Arc::new(AtomicU64::new(0)),
+            },
+            metrics.clone(),
+            u32::MAX,
+        );
+
+        for i in 0..50 {
+            let event = DeferredAuditEvent::from_refusal(
+                &format!("agent:{i}"),
+                &refusal_action(),
+                &refusal_decision(),
+            )
+            .unwrap();
+            queue.submit(event);
+        }
+
+        // Simulate the daemon's OnceLock-held sender by keeping a clone
+        // alive across the drain — the channel MUST stay open the whole
+        // time (this is exactly the scenario that wedges close_and_flush).
+        let hook_held_sender = queue.clone();
+
+        let drained = drain_pending(&metrics, std::time::Duration::from_secs(5)).await;
+        assert!(
+            drained,
+            "drain_pending must complete while the channel is open"
+        );
+        assert!(
+            hook_held_sender.is_open(),
+            "channel must still be open — drain_pending must not depend on sender drop"
+        );
+        assert_eq!(metrics.appended_count(), 50);
+        assert_eq!(recorded.lock().unwrap().len(), 50);
+
+        // Cleanup: drop both producer handles so the drainer can exit.
+        drop(hook_held_sender);
+        drop(queue);
+        let _ = supervisor.await;
+    }
+
+    #[tokio::test]
+    async fn drain_pending_times_out_when_drainer_absent() {
+        // No drainer spawned: submitted events sit in the channel buffer
+        // forever, so the metrics never advance and drain_pending must
+        // report a timeout (false) rather than hang.
+        let (queue, _rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        for i in 0..3 {
+            let event = DeferredAuditEvent::from_refusal(
+                &format!("agent:{i}"),
+                &refusal_action(),
+                &refusal_decision(),
+            )
+            .unwrap();
+            queue.submit(event);
+        }
+        let drained = drain_pending(&metrics, std::time::Duration::from_millis(100)).await;
+        assert!(
+            !drained,
+            "drain_pending must return false when events never get accounted"
+        );
+        assert_eq!(metrics.submitted_count(), 3);
+        assert_eq!(metrics.appended_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_returns_immediately_when_already_drained() {
+        let (queue, _rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        // Nothing submitted → already drained → returns true at once.
+        let drained = drain_pending(&metrics, std::time::Duration::from_secs(5)).await;
+        assert!(drained);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_counts_append_failures_as_accounted() {
+        // A sink that always errors still "accounts" for the event via
+        // append_failures, so drain_pending must terminate (the audit row
+        // is lost/DLQ'd but the shutdown path must not hang on it).
+        let (queue, rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        // Factory yields a sink that errors on its first (only) call, so
+        // the event is "accounted" via append_failures rather than appended.
+        let supervisor = spawn_supervised_drainer(
+            rx,
+            move || MockSink {
+                recorded: Arc::new(Mutex::new(Vec::new())),
+                panic_on: None,
+                error_on: Some(0),
+                call_count: Arc::new(AtomicU64::new(0)),
+            },
+            metrics.clone(),
+            u32::MAX,
+        );
+        let event =
+            DeferredAuditEvent::from_refusal("agent:err", &refusal_action(), &refusal_decision())
+                .unwrap();
+        queue.submit(event);
+        let hook_held = queue.clone();
+        let drained = drain_pending(&metrics, std::time::Duration::from_secs(5)).await;
+        assert!(
+            drained,
+            "append failures count as accounted — must not hang"
+        );
+        assert_eq!(metrics.append_failure_count(), 1);
+        drop(hook_held);
+        drop(queue);
+        let _ = supervisor.await;
     }
 
     #[tokio::test]

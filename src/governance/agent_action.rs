@@ -264,7 +264,7 @@ impl Severity {
 /// |----------------------|-------------------------------------------------------------------------|
 /// | `Bash`               | `{"command_substring":"..."}` — literal substring match on `command`    |
 /// | `FilesystemWrite`    | `{"glob":"/tmp/**"}` — tiny glob over `path`                            |
-/// | `NetworkRequest`     | `{"host":"evil.example.com"}` — exact host match                        |
+/// | `NetworkRequest`     | `{"host":"*.evil.example.com"}` — glob host match (plain host = exact)   |
 /// | `ProcessSpawn`       | `{"binary":"cargo","disk_free_min_gib":20,"args_contain":"..."}` — binary + disk + optional argv substring |
 /// | `Custom`             | `{"kind":"<kind>","namespace_glob":"secure/**","tier":"long","title_contains":"..."}` — kind + optional payload predicates (ANDed) |
 ///
@@ -380,9 +380,16 @@ fn match_network_request(matcher: &serde_json::Value, host: &str) -> bool {
     let Some(target_host) = matcher.get("host").and_then(|v| v.as_str()) else {
         return false;
     };
-    // Exact match on host. A future enhancement can add `host_glob`
-    // for `*.example.com`-style rules.
-    target_host == host
+    // Glob match on host (same engine as the filesystem `glob` matcher).
+    // A plain host with no `*` matches exactly — so pre-existing exact-host
+    // rules are unchanged — while `*.example.com`-style patterns now fire
+    // as the operator intended. Pre-fix this was a literal `==`, so a glob
+    // host pattern silently never matched: a DENY rule written as
+    // `{"host":"*.evil.example.com"}` would fail-OPEN, letting every
+    // subdomain through the gate. Hostnames contain no `/`, so the
+    // single-`*` (segment-bounded) and `**` (cross-segment) forms behave
+    // identically here.
+    crate::governance::glob_matches(target_host, host)
 }
 
 fn match_process_spawn(matcher: &serde_json::Value, binary: &str, args: &[String]) -> bool {
@@ -1355,6 +1362,50 @@ mod tests {
         };
         let allow_decision = check_agent_action(&conn, "agent:t", &allow_action).unwrap();
         assert_eq!(allow_decision, Decision::Allow);
+    }
+
+    // SR — network host matcher glob support. Pre-fix the matcher did a
+    // literal `==`, so a DENY rule written with a `*.example.com` wildcard
+    // silently never matched (fail-OPEN): every subdomain sailed past the
+    // gate. The fix routes the host through `glob_matches`, so the wildcard
+    // DENY rule now fires on every subdomain while an exact host outside the
+    // pattern is still allowed.
+    #[test]
+    fn network_request_glob_host_match_closes_fail_open() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-evil-glob",
+            "network_request",
+            r#"{"host":"*.evil.example.com"}"#,
+            "refuse",
+            true,
+        );
+
+        // A subdomain under the wildcard must be refused (pre-fix: allowed).
+        for sub in ["api.evil.example.com", "c2.evil.example.com"] {
+            let action = AgentAction::NetworkRequest {
+                host: sub.into(),
+                scheme: "https".into(),
+            };
+            let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+            assert!(
+                decision.is_refusal(),
+                "wildcard DENY rule must refuse subdomain {sub}"
+            );
+        }
+
+        // A host outside the wildcard is still allowed.
+        let allow_action = AgentAction::NetworkRequest {
+            host: "good.example.org".into(),
+            scheme: "https".into(),
+        };
+        assert_eq!(
+            check_agent_action(&conn, "agent:t", &allow_action).unwrap(),
+            Decision::Allow
+        );
     }
 
     #[test]

@@ -1285,7 +1285,13 @@ fn dispatch_memory_stats(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_update(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_update(ctx.conn, ctx.arguments, ctx.embedder, ctx.vector_index)
+    handle_update(
+        ctx.conn,
+        ctx.arguments,
+        ctx.embedder,
+        ctx.vector_index,
+        ctx.mcp_client,
+    )
 }
 
 fn dispatch_memory_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
