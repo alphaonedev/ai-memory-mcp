@@ -84,10 +84,11 @@ pgx_schema() {
 # pgx_scalar <region> <schema> <sql> -> single whitespace-trimmed scalar.
 pgx_scalar() { pgx_schema "$1" "$2" "$3" | tr -d '[:space:]'; }
 
-# Resolve the write-anchor peer: nyc3-01 by convention (the first sorted peer of
-# the nyc3 region). The hive federates the rest. No bare literal — derived.
+# Resolve the write-anchor peer: the first sorted peer of $ATLAS_ANCHOR_REGION
+# (default nyc3, named constant in lib.sh — no region slug hardcoded here). The
+# hive federates the rest.
 PEER_IPS="$(inv_ips_by_role peer)"
-ANCHOR_H="$(inv_peer_names_sorted_in_region nyc3 | head -1)"
+ANCHOR_H="$(inv_peer_names_sorted_in_region "$ATLAS_ANCHOR_REGION" | head -1)"
 [ -n "$ANCHOR_H" ] || ANCHOR_H="$(inv_peer_names_sorted | head -1)"
 ANCHOR_IP="$(jq -r --arg h "$ANCHOR_H" 'to_entries[]|select(.key==$h)|.value.public_ip' "$INV_JSON")"
 [ -n "$ANCHOR_IP" ] || die "atlas: could not resolve write-anchor peer ip"
