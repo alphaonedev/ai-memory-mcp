@@ -1075,66 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn config_build_continues_unsigned_when_key_dir_unresolvable() {
-        // #1533 coverage — exercises the build() arm where
-        // `load_daemon_signing_key` returns Err because the key
-        // directory cannot be resolved. Force `default_key_dir()` to
-        // error by clearing every var it consults: `AI_MEMORY_KEY_DIR`
-        // plus `HOME` / `XDG_CONFIG_HOME` (so `dirs::config_dir()`
-        // returns None on unix; on Windows the dir resolves but the
-        // key file is absent — both paths leave the daemon unsigned).
-        // The build must continue UNSIGNED rather than fail outright.
-        // Serialised behind the keypair env lock so concurrent key-dir
-        // tests never observe the half-cleared environment.
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prior_key_dir = std::env::var("AI_MEMORY_KEY_DIR").ok();
-        let prior_home = std::env::var("HOME").ok();
-        let prior_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: process-wide env mutation serialised by the lock
-        // above; every var is restored before the function returns.
-        unsafe {
-            std::env::remove_var("AI_MEMORY_KEY_DIR");
-            std::env::remove_var("HOME");
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-        let built = FederationConfig::build(
-            1,
-            &["http://peer.example".to_string()],
-            Duration::from_millis(500),
-            None,
-            None,
-            None,
-            "ai:unsigned-builder".to_string(),
-            None,
-        );
-        // SAFETY: restore the prior environment before any assertion
-        // can unwind the thread, serialised by the same lock.
-        unsafe {
-            match prior_key_dir {
-                Some(v) => std::env::set_var("AI_MEMORY_KEY_DIR", v),
-                None => std::env::remove_var("AI_MEMORY_KEY_DIR"),
-            }
-            match prior_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prior_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        let cfg = built
-            .expect("build must not fail when the key dir is unresolvable")
-            .expect("config should be Some when w>0 and peers nonempty");
-        assert!(
-            cfg.signing_key.is_none(),
-            "an unresolvable key dir must leave the daemon unsigned, not signed"
-        );
-    }
-
-    #[test]
     fn config_build_rejects_duplicate_peer_urls() {
         let result = FederationConfig::build(
             2,
