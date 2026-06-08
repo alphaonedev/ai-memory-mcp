@@ -228,11 +228,42 @@ pub fn compute_attested_weights(
 /// `path`. Issue #654 MVP gate — call before binding the backend if
 /// the operator has pinned a known-good hash.
 ///
+/// Two checks run, both fail-CLOSED:
+///
+/// 1. **Hash** — the recomputed SHA-256 of the on-disk file MUST equal
+///    `expected.sha256`.
+/// 2. **Signature** — when `expected.signature` is `Some`, the Ed25519
+///    signature MUST verify against the operator's resolved public key
+///    ([`crate::governance::rules_store::resolve_operator_pubkey`]) over
+///    the recomputed SHA-256 hex string's bytes. A signature that is
+///    present but cannot be verified — malformed base64, wrong length,
+///    bad signature, OR no operator key resolvable — is a hard refusal.
+///    Pre-fix the signature field was stored but NEVER checked, so a
+///    record carrying a forged or stale signature passed the gate on the
+///    hash alone (silent unverified-signature gap, issue #654).
+///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or the recomputed hash
-/// does not match `expected.sha256`.
+/// Returns an error if the file cannot be read, the recomputed hash does
+/// not match `expected.sha256`, or a present signature fails to verify.
 pub fn verify_attested_weights(path: &std::path::Path, expected: &AttestedWeights) -> Result<()> {
+    let operator_pubkey = crate::governance::rules_store::resolve_operator_pubkey();
+    verify_attested_weights_with_key(path, expected, operator_pubkey.as_ref())
+}
+
+/// Key-injecting core of [`verify_attested_weights`]. Production callers
+/// use the wrapper (which resolves the operator key from disk/env);
+/// tests pass an explicit `operator_pubkey` so the signature gate can be
+/// exercised hermetically without touching the operator key directory.
+///
+/// # Errors
+///
+/// See [`verify_attested_weights`].
+pub fn verify_attested_weights_with_key(
+    path: &std::path::Path,
+    expected: &AttestedWeights,
+    operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<()> {
     let recomputed = compute_attested_weights(path, &expected.label, None)?;
     if recomputed.sha256 != expected.sha256 {
         return Err(anyhow!(
@@ -243,7 +274,57 @@ pub fn verify_attested_weights(path: &std::path::Path, expected: &AttestedWeight
             recomputed.sha256,
         ));
     }
+
+    // Signature gate (issue #654). The canonical signed message is the
+    // SHA-256 hex string's ASCII bytes — the same value the operator
+    // signs when pinning the weights. A present-but-unverifiable
+    // signature fails CLOSED.
+    if let Some(sig_b64) = expected.signature.as_deref() {
+        let Some(verifying_key) = operator_pubkey else {
+            return Err(anyhow!(
+                "verify_attested_weights: record for {} carries a signature but no operator \
+                 public key could be resolved — refusing to serve (fail-CLOSED, issue #654)",
+                path.display(),
+            ));
+        };
+        verify_attested_weights_signature(&recomputed.sha256, sig_b64, verifying_key).map_err(
+            |e| {
+                anyhow!(
+                    "verify_attested_weights: signature verification failed for {} ({e}) — \
+                     refusing to serve (issue #654)",
+                    path.display(),
+                )
+            },
+        )?;
+    }
+
     Ok(())
+}
+
+/// Verify a base64-encoded Ed25519 `signature` over the `sha256` hex
+/// string's bytes against `verifying_key`. Accepts both URL-safe-no-pad
+/// and standard base64 (mirrors
+/// [`crate::governance::rules_store::resolve_operator_pubkey`]).
+fn verify_attested_weights_signature(
+    sha256: &str,
+    signature: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), ed25519_dalek::SignatureError> {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier};
+
+    let trimmed = signature.trim();
+    let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(trimmed))
+        .map_err(|_| ed25519_dalek::SignatureError::new())?;
+    if sig_bytes.len() != ed25519_dalek::SIGNATURE_LENGTH {
+        return Err(ed25519_dalek::SignatureError::new());
+    }
+    let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+    verifying_key.verify(sha256.as_bytes(), &sig)
 }
 
 #[cfg(test)]
@@ -329,5 +410,107 @@ mod tests {
         let be =
             CpuBackend::new(Arc::new(MockEmbedder), None).with_attested_weights(attested.clone());
         assert_eq!(be.attested_weights(), Some(attested));
+    }
+
+    // ---- issue #654 — Ed25519 signature gate on attested weights ----
+    //
+    // Pre-fix `verify_attested_weights` stored the `signature` field but
+    // never checked it, so a record could pass the gate on the hash
+    // alone while carrying a forged / stale / absent-key signature. These
+    // tests pin the fail-CLOSED signature semantics via the key-injecting
+    // core (`verify_attested_weights_with_key`) so the gate is exercised
+    // hermetically, independent of the operator key directory.
+
+    fn write_attest_fixture(content: &[u8]) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        std::fs::create_dir_all(&dir).expect("mkdir .local-runs");
+        let path = dir.join(format!("inference-attest-sig-{}.bin", uuid::Uuid::new_v4()));
+        let mut f = std::fs::File::create(&path).expect("create fixture");
+        f.write_all(content).expect("write fixture");
+        f.sync_all().expect("sync fixture");
+        path
+    }
+
+    fn sign_b64(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) -> String {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        base64::engine::general_purpose::STANDARD.encode(signing_key.sign(message).to_bytes())
+    }
+
+    #[test]
+    fn verify_attested_weights_accepts_valid_operator_signature() {
+        let mut csprng = rand_core::OsRng;
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let verifying_key = signing_key.verifying_key();
+
+        let path = write_attest_fixture(b"signed weight blob");
+        let unsigned = compute_attested_weights(&path, "fixture", None).expect("compute ok");
+        // Operator signs the sha256 hex string's bytes — the canonical
+        // signed message.
+        let signature = sign_b64(&signing_key, unsigned.sha256.as_bytes());
+        let attested = AttestedWeights {
+            signature: Some(signature),
+            ..unsigned
+        };
+
+        verify_attested_weights_with_key(&path, &attested, Some(&verifying_key))
+            .expect("valid signature must verify");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_attested_weights_rejects_forged_signature() {
+        let mut csprng = rand_core::OsRng;
+        let operator_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let attacker_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+        let path = write_attest_fixture(b"forged weight blob");
+        let unsigned = compute_attested_weights(&path, "fixture", None).expect("compute ok");
+        // Signed by the attacker, verified against the operator key → fail.
+        let signature = sign_b64(&attacker_key, unsigned.sha256.as_bytes());
+        let attested = AttestedWeights {
+            signature: Some(signature),
+            ..unsigned
+        };
+
+        let err =
+            verify_attested_weights_with_key(&path, &attested, Some(&operator_key.verifying_key()))
+                .expect_err("forged signature must be refused");
+        assert!(err.to_string().contains("signature verification failed"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_attested_weights_fails_closed_when_signed_but_no_key() {
+        let mut csprng = rand_core::OsRng;
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+        let path = write_attest_fixture(b"orphan-signature weight blob");
+        let unsigned = compute_attested_weights(&path, "fixture", None).expect("compute ok");
+        let signature = sign_b64(&signing_key, unsigned.sha256.as_bytes());
+        let attested = AttestedWeights {
+            signature: Some(signature),
+            ..unsigned
+        };
+
+        // Signature present but NO operator key resolvable → fail CLOSED.
+        let err = verify_attested_weights_with_key(&path, &attested, None)
+            .expect_err("present signature with no key must fail closed");
+        assert!(err.to_string().contains("no operator public key"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_attested_weights_unsigned_record_skips_signature_gate() {
+        // No signature → only the hash gate runs; no operator key needed.
+        let path = write_attest_fixture(b"unsigned weight blob");
+        let attested = compute_attested_weights(&path, "fixture", None).expect("compute ok");
+        assert!(attested.signature.is_none());
+        verify_attested_weights_with_key(&path, &attested, None)
+            .expect("unsigned record must verify on hash alone");
+        let _ = std::fs::remove_file(&path);
     }
 }

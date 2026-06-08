@@ -151,6 +151,113 @@ fn recall_response_meta_reports_keyword_only_when_embedder_disabled() {
 }
 
 // ---------------------------------------------------------------------------
+// v0.7.0 H7 — embedder-model switch silent recall loss
+// ---------------------------------------------------------------------------
+
+/// When the embedder model changes, previously-stored embeddings have a
+/// different dimensionality than the live query embedding. Pre-H7
+/// `cosine_similarity` collapsed that mismatch to `0.0` — numerically
+/// indistinguishable from a genuinely orthogonal pair — so the stale rows
+/// silently dropped out of the semantic ranking with zero observability.
+/// H7 counts those rows and surfaces the total in `RecallTelemetry`
+/// (plus one aggregated `warn!` per recall). This test seeds a row whose
+/// stored embedding dimensionality differs from the query embedding and
+/// asserts the mismatch is reported rather than swallowed.
+#[test]
+fn recall_telemetry_reports_embedding_dimension_mismatch() {
+    // Legacy (model A) vs active (model B) embedding dimensionalities.
+    const STORED_EMBED_DIM: usize = 3;
+    const ACTIVE_QUERY_DIM: usize = 5;
+
+    let (conn, _path) = fresh_db();
+
+    // Seed one memory the FTS stage will match, then stamp it with a
+    // STORED_EMBED_DIM embedding (establishes the namespace dim).
+    let mem = make_memory(
+        "Kubernetes readiness",
+        "Kubernetes pod readiness probes gate traffic during rollout.",
+    );
+    let id = ai_memory::db::insert(&conn, &mem).expect("insert");
+    let stored_embedding = vec![0.5_f32; STORED_EMBED_DIM];
+    ai_memory::db::set_embedding(&conn, &id, &stored_embedding).expect("set_embedding");
+
+    let scoring = ResolvedScoring::default();
+    // Active embedder produces ACTIVE_QUERY_DIM vectors — a different
+    // model than the one that wrote `stored_embedding`.
+    let query_embedding = vec![0.5_f32; ACTIVE_QUERY_DIM];
+
+    let (_results, _outcome, telemetry) = ai_memory::db::recall_hybrid_with_telemetry(
+        &conn,
+        "kubernetes readiness",
+        &query_embedding,
+        Some("test"),
+        10,
+        None,
+        None,
+        None,
+        None, // vector_index=None -> exercises the inline/linear cosine paths
+        ai_memory::SECS_PER_HOUR,
+        ai_memory::SECS_PER_DAY,
+        None,
+        None,
+        &scoring,
+        false,
+        None,
+    )
+    .expect("recall_hybrid_with_telemetry");
+
+    assert_eq!(
+        telemetry.embedding_dim_mismatch, 1,
+        "the one stale-dimension row must be counted as an embedding dim mismatch, not silently scored 0.0",
+    );
+}
+
+/// Negative control — when the stored embedding dimensionality matches the
+/// query, no mismatch is reported. Guards against the H7 counter firing on
+/// healthy same-model recalls.
+#[test]
+fn recall_telemetry_reports_no_mismatch_when_dimensions_agree() {
+    const EMBED_DIM: usize = 4;
+
+    let (conn, _path) = fresh_db();
+    let mem = make_memory(
+        "Kubernetes readiness",
+        "Kubernetes pod readiness probes gate traffic during rollout.",
+    );
+    let id = ai_memory::db::insert(&conn, &mem).expect("insert");
+    let stored_embedding = vec![0.5_f32; EMBED_DIM];
+    ai_memory::db::set_embedding(&conn, &id, &stored_embedding).expect("set_embedding");
+
+    let scoring = ResolvedScoring::default();
+    let query_embedding = vec![0.5_f32; EMBED_DIM];
+
+    let (_results, _outcome, telemetry) = ai_memory::db::recall_hybrid_with_telemetry(
+        &conn,
+        "kubernetes readiness",
+        &query_embedding,
+        Some("test"),
+        10,
+        None,
+        None,
+        None,
+        None,
+        ai_memory::SECS_PER_HOUR,
+        ai_memory::SECS_PER_DAY,
+        None,
+        None,
+        &scoring,
+        false,
+        None,
+    )
+    .expect("recall_hybrid_with_telemetry");
+
+    assert_eq!(
+        telemetry.embedding_dim_mismatch, 0,
+        "matching dimensionality must not be flagged as a mismatch",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // G8 — reranker silent fallback to lexical Jaccard
 // ---------------------------------------------------------------------------
 

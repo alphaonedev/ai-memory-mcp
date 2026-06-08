@@ -610,6 +610,22 @@ fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
     // Windows/non-Unix: mode bits don't apply. The file inherits the
     // parent directory ACL. Hardware-backed key storage on Windows is
     // out of OSS scope — see the AgenticMem commercial layer.
+    //
+    // v0.7.0 de-silencing: the requested restrictive `mode` cannot be
+    // honored here, so the private key lands with whatever the parent
+    // directory's ACL grants. Emit a once-per-process operator-visible
+    // warn so this weaker-than-Unix posture is observable rather than
+    // silent.
+    static NON_UNIX_KEY_PERM_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    NON_UNIX_KEY_PERM_WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            target: "identity::keypair",
+            "writing key material on a non-Unix platform: restrictive file-mode \
+             bits are not applied, so the key file inherits the parent directory \
+             ACL. Restrict the key directory's ACL manually, or use hardware-backed \
+             key storage, to protect private keys."
+        );
+    });
     fs::write(path, bytes)
 }
 

@@ -316,6 +316,83 @@ pub fn handle_capture_turn(
     let write = prepare_capture_turn(&req, caller)?;
     let attest_level = write.signed_event.attest_level.clone();
 
+    // v0.7.0 H1 (HIGH) — write-gate parity for the mutating
+    // `capture_turn` verb. Pre-fix, L4 turn capture persisted a Memory
+    // row WITHOUT passing through the K9 permission gate or the
+    // K3/Task-1.9 governance gate that `memory_store` enforces, so a
+    // governed namespace could be written via `memory_capture_turn`
+    // ungated. L4 capture is a store-class write: we gate it under the
+    // same `Op::MemoryStore` / `GovernedAction::Store` policy surface as
+    // `memory_store`, against the resolved target namespace. A dedup-hit
+    // is a no-op write, so gating before the idempotent transaction is
+    // safe — a denied namespace refuses uniformly whether or not the
+    // turn was already captured.
+    {
+        let gate_namespace = write.memory.namespace.clone();
+        let gate_payload = json!({
+            "id": write.memory.id,
+            "title": write.memory.title,
+            "namespace": gate_namespace,
+        });
+
+        use crate::permissions::{Op, PermissionContext, Permissions};
+        let ctx = PermissionContext {
+            op: Op::MemoryStore,
+            namespace: gate_namespace.clone(),
+            agent_id: caller.to_string(),
+            payload: gate_payload.clone(),
+        };
+        match Permissions::evaluate(&ctx, &[]) {
+            crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
+            crate::permissions::Decision::Deny(reason) => {
+                return Err(crate::governance::deny_message(
+                    "capture_turn",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
+            }
+            crate::permissions::Decision::Ask(prompt) => {
+                return Ok(json!({
+                    "status": "ask",
+                    "reason": prompt,
+                    "action": "capture_turn",
+                    "namespace": gate_namespace,
+                }));
+            }
+        }
+
+        use crate::models::{GovernanceDecision, GovernedAction};
+        match crate::db::enforce_governance(
+            conn,
+            GovernedAction::Store,
+            &gate_namespace,
+            caller,
+            Some(&write.memory.id),
+            Some(caller),
+            &gate_payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(refusal) => {
+                return Err(crate::governance::deny_message(
+                    "capture_turn",
+                    crate::governance::DenyGate::Governance,
+                    &refusal.reason,
+                ));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "capture_turn",
+                    "namespace": gate_namespace,
+                }));
+            }
+        }
+    }
+
     let result = crate::storage::capture_turn_idempotent(conn, &write)?;
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 

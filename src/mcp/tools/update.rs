@@ -119,6 +119,7 @@ pub(super) fn handle_update(
     params: &Value,
     embedder: Option<&dyn Embed>,
     vector_index: Option<&VectorIndex>,
+    mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
@@ -203,6 +204,95 @@ pub(super) fn handle_update(
     } else {
         None
     };
+
+    // v0.7.0 H1 (HIGH) — write-gate parity for the mutating `update`
+    // verb. Pre-fix, `memory_update` mutated stored rows WITHOUT
+    // passing through the K9 permission gate or the K3/Task-1.9
+    // governance gate that `memory_store` / `memory_delete` /
+    // `memory_promote` all enforce — so a namespace that denies stores
+    // could be written-around by storing once then patching, and an
+    // update could mutate a row in a governed namespace ungated. An
+    // update is a store-class mutation: we gate it under the SAME
+    // `Op::MemoryStore` / `GovernedAction::Store` policy surface (there
+    // is no distinct update-op on the wire). The gate runs against the
+    // EFFECTIVE target namespace — the new namespace when the caller is
+    // moving the row, else the row's current namespace — so a move INTO
+    // a governed namespace is gated by that destination's policy.
+    {
+        let existing = db::get(conn, &resolved_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("memory not found")?;
+        let effective_namespace = namespace.unwrap_or(existing.namespace.as_str()).to_string();
+        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        let mem_owner = existing
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let gate_payload = json!({
+            "id": resolved_id,
+            "title": title.unwrap_or(existing.title.as_str()),
+            "namespace": effective_namespace,
+        });
+
+        use crate::permissions::{Op, PermissionContext, Permissions};
+        let ctx = PermissionContext {
+            op: Op::MemoryStore,
+            namespace: effective_namespace.clone(),
+            agent_id: agent_id.clone(),
+            payload: gate_payload.clone(),
+        };
+        match Permissions::evaluate(&ctx, &[]) {
+            crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
+            crate::permissions::Decision::Deny(reason) => {
+                return Err(crate::governance::deny_message(
+                    "update",
+                    crate::governance::DenyGate::PermissionRule,
+                    &reason,
+                ));
+            }
+            crate::permissions::Decision::Ask(prompt) => {
+                return Ok(json!({
+                    "status": "ask",
+                    "reason": prompt,
+                    "action": "update",
+                    "memory_id": resolved_id,
+                }));
+            }
+        }
+
+        use crate::models::{GovernanceDecision, GovernedAction};
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Store,
+            &effective_namespace,
+            &agent_id,
+            Some(&resolved_id),
+            mem_owner.as_deref(),
+            &gate_payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(refusal) => {
+                return Err(crate::governance::deny_message(
+                    "update",
+                    crate::governance::DenyGate::Governance,
+                    &refusal.reason,
+                ));
+            }
+            GovernanceDecision::Pending(pending_id) => {
+                return Ok(json!({
+                    "status": "pending",
+                    "pending_id": pending_id,
+                    "reason": "governance requires approval",
+                    "action": "update",
+                    "memory_id": resolved_id,
+                }));
+            }
+        }
+    }
 
     // v0.7.0 Provenance Gap 5 (#888) — append-and-archive branch.
     // When `edit_source` is `Llm` or `Hook`, we archive the OLD row
@@ -390,6 +480,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         )
         .expect("ok");
         assert_eq!(out["updated"].as_bool(), Some(true));
@@ -416,6 +507,7 @@ mod tests {
             &json!({"id": "fedcba98", "title": "renamed"}),
             None,
             None,
+            None,
         )
         .expect("prefix ok");
         assert_eq!(out["memory"]["title"].as_str(), Some("renamed"));
@@ -434,6 +526,7 @@ mod tests {
             &json!({"id": id.clone(), "content": "completely new content"}),
             Some(&mock as &dyn crate::embeddings::Embed),
             Some(&idx),
+            None,
         )
         .expect("ok");
         assert_eq!(out["updated"].as_bool(), Some(true));
@@ -454,6 +547,7 @@ mod tests {
             &json!({"id": id.clone(), "tags": ["new-tag"]}),
             Some(&mock as &dyn crate::embeddings::Embed),
             None,
+            None,
         )
         .expect("ok");
         assert_eq!(out["updated"].as_bool(), Some(true));
@@ -466,7 +560,7 @@ mod tests {
     #[test]
     fn missing_id_errors() {
         let conn = fresh_conn();
-        let err = handle_update(&conn, &json!({}), None, None).unwrap_err();
+        let err = handle_update(&conn, &json!({}), None, None, None).unwrap_err();
         assert!(err.contains("id is required"));
     }
 
@@ -474,7 +568,7 @@ mod tests {
     #[test]
     fn invalid_id_format_errors() {
         let conn = fresh_conn();
-        let err = handle_update(&conn, &json!({"id": ""}), None, None).unwrap_err();
+        let err = handle_update(&conn, &json!({"id": ""}), None, None, None).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -485,6 +579,7 @@ mod tests {
         let err = handle_update(
             &conn,
             &json!({"id": "11111111-aaaa-bbbb-cccc-dddddddddddd", "title": "x"}),
+            None,
             None,
             None,
         )
@@ -498,7 +593,8 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
-        let err = handle_update(&conn, &json!({"id": id, "title": ""}), None, None).unwrap_err();
+        let err =
+            handle_update(&conn, &json!({"id": id, "title": ""}), None, None, None).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -508,7 +604,8 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
-        let err = handle_update(&conn, &json!({"id": id, "content": ""}), None, None).unwrap_err();
+        let err =
+            handle_update(&conn, &json!({"id": id, "content": ""}), None, None, None).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -523,6 +620,7 @@ mod tests {
             &json!({"id": id, "namespace": "has space"}),
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(!err.is_empty());
@@ -534,7 +632,8 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
-        let err = handle_update(&conn, &json!({"id": id, "priority": 99}), None, None).unwrap_err();
+        let err =
+            handle_update(&conn, &json!({"id": id, "priority": 99}), None, None, None).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -544,8 +643,14 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
-        let err =
-            handle_update(&conn, &json!({"id": id, "confidence": 5.0}), None, None).unwrap_err();
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "confidence": 5.0}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -558,6 +663,7 @@ mod tests {
         let err = handle_update(
             &conn,
             &json!({"id": id, "expires_at": "not-a-date"}),
+            None,
             None,
             None,
         )
@@ -576,6 +682,7 @@ mod tests {
             &json!({"id": id, "metadata": {"agent_id": "ai:other", "note": "hi"}}),
             None,
             None,
+            None,
         )
         .expect("ok");
         assert_eq!(
@@ -592,10 +699,10 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("idem");
         let id = db::insert(&conn, &mem).expect("ins");
-        let one =
-            handle_update(&conn, &json!({"id": &id, "priority": 8}), None, None).expect("ok 1");
-        let two =
-            handle_update(&conn, &json!({"id": &id, "priority": 8}), None, None).expect("ok 2");
+        let one = handle_update(&conn, &json!({"id": &id, "priority": 8}), None, None, None)
+            .expect("ok 1");
+        let two = handle_update(&conn, &json!({"id": &id, "priority": 8}), None, None, None)
+            .expect("ok 2");
         assert_eq!(one["updated"], two["updated"]);
     }
 
@@ -623,6 +730,7 @@ mod tests {
             }),
             Some(&mock as &dyn crate::embeddings::Embed),
             Some(&idx),
+            None,
         )
         .expect("supersede ok");
         assert_eq!(out["updated"].as_bool(), Some(true));
@@ -667,6 +775,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         )
         .expect("hook supersede ok");
         assert_eq!(out["edit_source"].as_str(), Some("hook"));
@@ -694,7 +803,8 @@ mod tests {
         let id = db::insert(&conn, &mem).expect("ins");
         // Bump version to 2 with a no-expectation update, so the next
         // expected_version=1 call drifts.
-        let _ = handle_update(&conn, &json!({"id": &id, "priority": 6}), None, None).expect("bump");
+        let _ = handle_update(&conn, &json!({"id": &id, "priority": 6}), None, None, None)
+            .expect("bump");
         let err = handle_update(
             &conn,
             &json!({
@@ -702,6 +812,7 @@ mod tests {
                 "title": "stale write",
                 "expected_version": 1,
             }),
+            None,
             None,
             None,
         )
@@ -730,6 +841,7 @@ mod tests {
             &json!({"id": &id, "source_uri": "doc:internal-ref-42"}),
             None,
             None,
+            None,
         )
         .expect("valid source_uri");
         assert_eq!(ok["updated"].as_bool(), Some(true));
@@ -743,6 +855,7 @@ mod tests {
             &json!({"id": &id, "source_uri": "example.com/no-scheme"}),
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(!err.is_empty(), "source_uri must be rejected");
@@ -752,5 +865,85 @@ mod tests {
                 || err.to_lowercase().contains("scheme"),
             "error should reference source uri / scheme; got: {err}"
         );
+    }
+
+    // v0.7.0 H1 (HIGH) regression — the mutating `update` verb must pass
+    // through the same write-gate as `store`/`delete`/`promote`. Install
+    // a `write: Owner` governance policy on a namespace, then attempt an
+    // update by a non-owner agent and assert it is denied. Pre-fix this
+    // returned Ok(updated) because `handle_update` never consulted
+    // governance.
+    fn install_write_owner_policy(conn: &rusqlite::Connection, ns: &str, owner: &str) {
+        use crate::models::{ApproverType, CorePolicy, GovernancePolicy, default_metadata};
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                write: crate::models::GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                ..CorePolicy::default()
+            },
+            ..Default::default()
+        };
+        let mut metadata = default_metadata();
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "agent_id".to_string(),
+                serde_json::Value::String(owner.to_string()),
+            );
+            obj.insert(
+                "governance".to_string(),
+                serde_json::to_value(&policy).unwrap(),
+            );
+        }
+        let mut standard = make_mem("std");
+        standard.namespace = format!("_standards-{ns}");
+        standard.title = format!("std-{ns}");
+        standard.metadata = metadata;
+        let sid = db::insert(conn, &standard).expect("insert standard");
+        db::set_namespace_standard(conn, ns, &sid, None).expect("set standard");
+    }
+
+    #[test]
+    fn governance_deny_blocks_update_by_non_owner() {
+        let _gate = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = fresh_conn();
+        let ns = "gov-deny-upd";
+        install_write_owner_policy(&conn, ns, "ai:alice");
+        let mut mem = make_mem("target");
+        mem.namespace = ns.to_string();
+        mem.metadata = json!({"agent_id": "ai:alice"});
+        let id = db::insert(&conn, &mem).expect("insert");
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "title": "evil rewrite", "agent_id": "ai:eve"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("governance") || err.contains("denied") || err.contains("owner"),
+            "non-owner update must be gated; got: {err}"
+        );
+        crate::config::clear_permissions_mode_override_for_test();
+    }
+
+    #[test]
+    fn governance_allows_update_in_ungoverned_namespace() {
+        // Default (no namespace standard) → write-gate is transparent.
+        let conn = fresh_conn();
+        let mem = make_mem("ok");
+        let id = db::insert(&conn, &mem).expect("insert");
+        let out = handle_update(
+            &conn,
+            &json!({"id": id, "title": "fine rewrite"}),
+            None,
+            None,
+            None,
+        )
+        .expect("ungoverned update should pass the gate");
+        assert_eq!(out["updated"].as_bool(), Some(true));
     }
 }

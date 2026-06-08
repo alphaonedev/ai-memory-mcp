@@ -43,37 +43,39 @@ feature that works on sqlite works on postgres.
 
 | Component | Version | Notes |
 |---|---|---|
-| PostgreSQL | 16.x (16.4+ recommended) | 15.x works for the SAL adapter but Apache AGE 1.5.x targets PG 16. |
-| Apache AGE | 1.5.0 (1.6.0 supported in the bundled Dockerfile) | Built from source against your PG 16, or use the bundled `Dockerfile.pg-age-vector` (see below). |
-| pgvector | 0.7.x or 0.8.x | 0.8 is preferred (faster HNSW); 0.7 is fine. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` which maps Rust vectors to the Postgres `vector` column type. |
+| PostgreSQL | **18.4** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
+| Apache AGE | **1.7.0** (canonical) | Targets PG 18. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` (`apache/age:release_PG18_1.7.0`) or build from source (see below). |
+| pgvector | **0.8.2** (canonical) | Faster HNSW. SSOT: `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
 | ai-memory | v0.7.0 with `--features sal-postgres` | The sql-postgres feature is **off by default** to keep the no-postgres build hermetic. |
 
-### Bundled Dockerfile (Apache AGE + pgvector on PG16, #1065)
+### Bundled Dockerfile (Apache AGE + pgvector on PG18, #1065)
 
-The upstream `apache/age:release_PG16_1.6.0` image ships AGE but **not**
+The upstream `apache/age:release_PG18_1.7.0` image ships AGE but **not**
 pgvector. Because the ai-memory v0.7 SAL postgres adapter REQUIRES
 pgvector (the `sal-postgres` Cargo feature pulls `dep:pgvector` which
 maps Rust vectors to Postgres `vector` columns), the repo ships a
 ready-made stacked image at
-[`infra/lan-parity-test/Dockerfile.pg-age-vector`](../infra/lan-parity-test/Dockerfile.pg-age-vector)
-(#1065). It stacks `postgresql-16-pgvector` (precompiled .deb from the
-pgdg apt repo) onto the AGE base — no source build needed. Use this
-image for any deployment that backs ai-memory onto Postgres+AGE.
+[`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
+(#1065). It layers pgvector `0.8.2` (precompiled .deb from the pgdg apt
+repo) onto the `apache/age:release_PG18_1.7.0` base — no source build
+needed. Use this image for any deployment that backs ai-memory onto
+Postgres+AGE. (The `infra/lan-parity-test/` image — PG 16 + AGE 1.6.0 +
+pgvector 0.8.2 — remains as a tested alternate matrix.)
 
-> **AGE 1.5 + PG 16 cypher-binding compat.** AGE 1.5.0 has a known
-> quirk where parameter binding against `cypher()` plus PostgreSQL 16's
-> stricter `prepare`-path causes a "could not find parameter $N"
-> error in some bind shapes. ai-memory's production code interpolates
+> **Cypher parameter binding.** ai-memory's production code interpolates
 > parameters into the Cypher string through the AGE-recommended
-> `cypher()` SQL-function form and never hits this — but if you write
-> your own SQL probes, prefer the SQL-function form. Wave 1 Stream C
-> fixed our equivalence test harness to use the safe form; production
-> code never needed the fix.
+> `cypher()` SQL-function form, which is portable across AGE releases —
+> if you write your own SQL probes, prefer the SQL-function form. (A
+> historical AGE 1.5.0 + PG 16 quirk could emit "could not find
+> parameter $N" for some bind shapes against the raw `prepare`-path;
+> the SQL-function form sidesteps it entirely and AGE 1.7.0 on PG 18 is
+> unaffected. Wave 1 Stream C fixed our equivalence test harness to use
+> the safe form; production code never needed the fix.)
 
 ## Install — Ubuntu 24.04 example
 
 ```bash
-# 1. PostgreSQL 16 from PGDG.
+# 1. PostgreSQL 18 from PGDG.
 sudo apt install -y curl ca-certificates gnupg lsb-release
 sudo install -d /usr/share/postgresql-common/pgdg
 sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
@@ -82,32 +84,32 @@ echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
      https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
      | sudo tee /etc/apt/sources.list.d/pgdg.list
 sudo apt update
-sudo apt install -y postgresql-16 postgresql-server-dev-16 \
-                    postgresql-contrib-16 build-essential bison flex git
+sudo apt install -y postgresql-18 postgresql-server-dev-18 \
+                    postgresql-contrib-18 build-essential bison flex git
 
-# 2. pgvector 0.8.0 from the upstream release tag.
-git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git
+# 2. pgvector 0.8.2 from the upstream release tag.
+git clone --depth 1 --branch v0.8.2 https://github.com/pgvector/pgvector.git
 cd pgvector
-sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
 cd ..
 
-# 3. Apache AGE 1.5.0 from source against PG 16.
-git clone --depth 1 --branch PG16/v1.5.0 https://github.com/apache/age.git
+# 3. Apache AGE 1.7.0 from source against PG 18.
+git clone --depth 1 --branch PG18/v1.7.0 https://github.com/apache/age.git
 cd age
-sudo make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+sudo make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
 cd ..
 
 # 4. Restart postgres to pick up the shared libraries.
-sudo systemctl restart postgresql@16-main
+sudo systemctl restart postgresql@18-main
 ```
 
 For RHEL / Fedora / Amazon Linux: replace the `apt` lines with the
-PGDG yum repo equivalents and ensure `postgresql16-devel` /
-`postgresql16-contrib` are installed before building AGE.
+PGDG yum repo equivalents and ensure `postgresql18-devel` /
+`postgresql18-contrib` are installed before building AGE.
 
 ### Docker — pgvector is required, not optional ([#1065](https://github.com/alphaonedev/ai-memory-mcp/issues/1065))
 
-The popular `apache/age:release_PG16_*` Docker images **do not bundle
+The popular `apache/age:release_PG18_*` Docker images **do not bundle
 pgvector**. The SAL postgres adapter's `init schema` step calls
 `CREATE EXTENSION IF NOT EXISTS vector` and fails-fast on missing
 extension with the message `extension "vector" is not available` —
@@ -118,18 +120,18 @@ The canonical fix is a 2-line Dockerfile that layers pgvector on top
 of the upstream Apache AGE image:
 
 ```dockerfile
-# Dockerfile.pg-age-vector — see infra/lan-parity-test/Dockerfile.pg-age-vector
-FROM apache/age:release_PG16_1.5.0
+# Dockerfile.pg-age-vector — see deploy/docker-1461/Dockerfile.pg-age-vector
+FROM apache/age:release_PG18_1.7.0
 USER root
 RUN apt-get update \
- && apt-get install -y --no-install-recommends postgresql-16-pgvector \
+ && apt-get install -y --no-install-recommends postgresql-18-pgvector \
  && rm -rf /var/lib/apt/lists/*
 USER postgres
 ```
 
 The ai-memory repo ships this Dockerfile at
-[`infra/lan-parity-test/Dockerfile.pg-age-vector`](../infra/lan-parity-test/Dockerfile.pg-age-vector);
-the lan-parity compose file uses it via:
+[`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector);
+the lan-parity compose file uses its PG 16 + AGE 1.6.0 counterpart via:
 
 ```yaml
 services:
@@ -140,7 +142,7 @@ services:
 ```
 
 Plan C operators running on K8s / ECS / Cloud Run build this image
-once, tag it (`pg-age-vector:PG16-1.5.0-pgvector0.8`), and reference
+once, tag it (`pg-age-vector:PG18.4-1.7.0-pgvector0.8.2`), and reference
 the tag from their workload manifests instead of the bare upstream
 image.
 
@@ -653,7 +655,7 @@ recommendation; the v0.7.0 release does not yet expose these as
 The four KG operations dispatch on the `KgBackend` tag the postgres
 adapter probes at connect time:
 
-| Op | AGE 1.5 (Cypher) | CTE fallback | Speedup at depth=5 |
+| Op | AGE 1.7.0 (Cypher) | CTE fallback | Speedup at depth=5 |
 |---|---|---|---|
 | `kg_query` | `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join | ≥30% (S76 gate) |
 | `kg_timeline` | `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join | ≥30% |
@@ -692,9 +694,10 @@ the v15→v28 migrations idempotently. (See
 
 ### "could not find parameter $N" against a Cypher query
 
-This is the AGE 1.5 + PG 16 binding quirk mentioned above. ai-memory's
-production code never hits it — if you see it, you're running a
-custom psql probe. Use the AGE-recommended SQL-function shape:
+This is the historical AGE 1.5.0 + PG 16 binding quirk mentioned above
+(AGE 1.7.0 on PG 18 is unaffected). ai-memory's production code never
+hits it — if you see it, you're running a custom psql probe. Use the
+AGE-recommended SQL-function shape:
 
 ```sql
 SELECT * FROM cypher('ai_memory_kg', $$
@@ -749,8 +752,8 @@ parity test is the gate that prevents it.
 
 ## References
 
-- Apache AGE 1.5 docs: https://age.apache.org/
-- pgvector 0.8 docs: https://github.com/pgvector/pgvector
+- Apache AGE 1.7.0 docs: https://age.apache.org/
+- pgvector 0.8.2 docs: https://github.com/pgvector/pgvector
 - ai-memory v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md)
 - A2A campaign Pages: https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/
 - Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.md)
