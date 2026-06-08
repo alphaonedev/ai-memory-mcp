@@ -131,6 +131,14 @@ ciborium = "0.2"
 # off so single-node deployments see zero behaviour change.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
+# v0.7.0 H3 — HKDF-SHA256 over the raw X25519 ECDH output before it is
+# used as the ChaCha20-Poly1305 key. Raw DH output is not a uniformly
+# distributed symmetric key; HKDF-extract+expand with a domain-separation
+# label yields a clean 256-bit key and isolates this key space from any
+# other use of the same shared secret. Already in the dependency graph
+# (RustCrypto, depends on `hmac`); promoted to a direct dep so the
+# derivation is explicit at the encryption call site. Pairs with `sha2`.
+hkdf = "0.12"
 # v0.7.0 #1258 — explicit zeroize on secret-bearing types (DB passphrase,
 # ed25519 private-key buffers, LLM `api_key`, hooks HMAC secret, AppConfig
 # `api_key`). `zeroize` 1.x is already in the transitive graph via

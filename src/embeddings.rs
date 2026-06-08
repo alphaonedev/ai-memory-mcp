@@ -232,6 +232,32 @@ pub enum Embedder {
     },
 }
 
+/// v0.7.0 H7 — dimension-aware outcome of a recall-time cosine comparison
+/// between a live query embedding and a stored embedding whose producing
+/// model may have changed since the row was written.
+///
+/// [`Embedder::cosine_similarity`] collapses a dimension mismatch to `0.0`,
+/// which is numerically indistinguishable from a genuinely orthogonal pair.
+/// That makes an embedder-model switch *silent*: every legacy-dimension row
+/// scores `0.0` on the semantic axis and quietly drops out of the ranking
+/// with no operator-visible signal. This enum preserves the same `0.0`
+/// numerical fallback at the call site but lets recall *count and surface*
+/// the mismatch instead of swallowing it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CosineComparison {
+    /// Both vectors share dimensionality; carries the cosine score.
+    Comparable(f32),
+    /// Stored embedding dimensionality differs from the query's — almost
+    /// always the result of a different embedder model. Carries both
+    /// dimensions so callers can report which model produced what.
+    DimensionMismatch {
+        /// Dimensionality of the live query embedding (active model).
+        query_dim: usize,
+        /// Dimensionality of the stored embedding (legacy model).
+        stored_dim: usize,
+    },
+}
+
 impl Embedder {
     /// Create a new local (candle) embedder for MiniLM-L6-v2.
     /// Downloads the model if it is not already cached.
@@ -635,6 +661,25 @@ impl Embedder {
         if denom < 1e-12 { 0.0 } else { dot / denom }
     }
 
+    /// v0.7.0 H7 — dimension-aware companion to [`Embedder::cosine_similarity`].
+    ///
+    /// Returns [`CosineComparison::DimensionMismatch`] instead of silently
+    /// yielding `0.0` when the two vectors have different lengths, so the
+    /// recall pipeline can report cross-model (embedder-switch) embeddings
+    /// rather than dropping their semantic signal unseen. When the
+    /// dimensions agree the result wraps the same value
+    /// [`Embedder::cosine_similarity`] would return.
+    #[must_use]
+    pub fn cosine_similarity_checked(query: &[f32], stored: &[f32]) -> CosineComparison {
+        if query.len() != stored.len() {
+            return CosineComparison::DimensionMismatch {
+                query_dim: query.len(),
+                stored_dim: stored.len(),
+            };
+        }
+        CosineComparison::Comparable(Self::cosine_similarity(query, stored))
+    }
+
     /// Fuse a primary query embedding with a secondary context embedding via
     /// weighted linear combination (v0.6.0.0 contextual recall).
     ///
@@ -979,6 +1024,42 @@ mod tests {
         let b = vec![1.0, 0.0]; // Different dimension
         let sim = Embedder::cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
+    }
+
+    // --- v0.7.0 H7 — dimension-aware cosine for embedder-switch detection ---
+
+    #[test]
+    fn cosine_similarity_checked_comparable_matches_plain_cosine() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![2.0, 1.0, 0.5];
+        let plain = Embedder::cosine_similarity(&a, &b);
+        match Embedder::cosine_similarity_checked(&a, &b) {
+            CosineComparison::Comparable(c) => assert!((c - plain).abs() < 1e-6),
+            CosineComparison::DimensionMismatch { .. } => {
+                panic!("equal-length vectors must compare as Comparable")
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_similarity_checked_flags_dimension_mismatch() {
+        // Simulates an embedder-model switch: stored 384-style vs query
+        // 768-style. The plain cosine would silently return 0.0; the
+        // checked form must instead report the mismatch with both dims.
+        let query = vec![0.0_f32; 5];
+        let stored = vec![0.0_f32; 3];
+        match Embedder::cosine_similarity_checked(&query, &stored) {
+            CosineComparison::DimensionMismatch {
+                query_dim,
+                stored_dim,
+            } => {
+                assert_eq!(query_dim, 5);
+                assert_eq!(stored_dim, 3);
+            }
+            CosineComparison::Comparable(_) => {
+                panic!("differing-length vectors must report DimensionMismatch")
+            }
+        }
     }
 
     // --- v0.6.3.1 P2 — embedding magic-byte codec ---

@@ -35,6 +35,46 @@ use common::free_port;
 // regardless of instrumentation overhead.
 const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Number of times `spawn_serve` re-rolls the ephemeral port when the
+/// daemon child loses the `free_port()` TOCTOU race and exits with a
+/// bind error before `/health` comes up. The window is tiny but real
+/// under full-suite concurrency (many daemon-spawning tests bind
+/// ephemeral ports at once), so we re-roll on a collision rather than
+/// fail the suite on an environmental flake. A genuine startup crash
+/// carries different stderr and is surfaced immediately, never retried.
+const SPAWN_BIND_RETRY_ATTEMPTS: usize = 5;
+
+/// Substring the daemon's `bind` error carries on an ephemeral-port
+/// collision — `std::io::Error` for `EADDRINUSE` renders as this on both
+/// Linux and macOS. Used to tell a retryable port race apart from a real
+/// startup failure so retries never mask a genuine crash.
+const BIND_IN_USE_MARKER: &str = "Address already in use";
+
+/// Poll interval while waiting for the spawned daemon's `/health` to come
+/// up (and for an early-exit child to surface).
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Per-request timeout for the readiness `/health` probe.
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Why a single `try_spawn_serve_once` attempt failed. `BindRace` is the
+/// only retryable variant; the others are surfaced to the caller with the
+/// child's captured stderr for diagnosis.
+enum SpawnFailure {
+    /// Child exited before readiness and its stderr names an in-use port —
+    /// it lost the `free_port()` TOCTOU race. Safe to retry on a new port.
+    BindRace { stderr: String },
+    /// Child exited before readiness for some other reason — a real
+    /// startup failure. Carries exit status + stderr for the panic.
+    Crashed {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+    /// Child stayed up but `/health` never returned 200 within
+    /// [`SPAWN_TIMEOUT`].
+    NeverReady { stderr: String },
+}
+
 /// RAII guard for the spawned daemon. Drops kill the child on test
 /// exit so leaked test processes don't accumulate on flaky failures.
 struct ServeChild {
@@ -62,11 +102,55 @@ impl Drop for ServeChild {
 /// child on drop. `extra_args` are appended to the serve subcommand.
 /// `extra_envs` lets callers set `HOME` (for config-driven `api_key`
 /// scenarios) or other env vars on the child.
+///
+/// Retries on the `free_port()` TOCTOU bind race (see
+/// [`SPAWN_BIND_RETRY_ATTEMPTS`]); a real startup crash is surfaced
+/// immediately with the child's captured stderr.
 fn spawn_serve(
     db: &std::path::Path,
     extra_args: &[&str],
     extra_envs: &[(&str, &str)],
 ) -> ServeChild {
+    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
+        match try_spawn_serve_once(db, extra_args, extra_envs) {
+            Ok(child) => return child,
+            Err(SpawnFailure::BindRace { stderr }) => {
+                // Lost the ephemeral-port race to a concurrent binder —
+                // re-roll the port. Not a product defect.
+                eprintln!(
+                    "spawn_serve: ephemeral-port bind race on attempt \
+                     {attempt}/{SPAWN_BIND_RETRY_ATTEMPTS}, re-rolling port. \
+                     child stderr:\n{stderr}"
+                );
+            }
+            Err(SpawnFailure::Crashed { status, stderr }) => {
+                panic!(
+                    "serve child exited before /health became ready: {status}\n\
+                     --- child stderr ---\n{stderr}"
+                );
+            }
+            Err(SpawnFailure::NeverReady { stderr }) => {
+                panic!(
+                    "serve daemon did not become ready within {SPAWN_TIMEOUT:?}\n\
+                     --- child stderr ---\n{stderr}"
+                );
+            }
+        }
+    }
+    panic!(
+        "serve daemon lost the ephemeral-port bind race \
+         {SPAWN_BIND_RETRY_ATTEMPTS} times in a row"
+    );
+}
+
+/// Single spawn-and-wait attempt backing [`spawn_serve`]. Captures the
+/// child's stderr so the outcome can distinguish a retryable port race
+/// from a genuine startup crash (and so panics carry real diagnostics).
+fn try_spawn_serve_once(
+    db: &std::path::Path,
+    extra_args: &[&str],
+    extra_envs: &[(&str, &str)],
+) -> Result<ServeChild, SpawnFailure> {
     let port = free_port();
     let port_s = port.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
@@ -99,16 +183,34 @@ fn spawn_serve(
     }
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
 
-    // Drain stdout / stderr in background so the child doesn't block.
+    // Drain stdout to the void; capture stderr into a shared buffer so
+    // an early exit can be classified (bind race vs. real crash) and so
+    // failures surface the daemon's own error instead of being silent.
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
     }
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
-    }
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        let sink = std::sync::Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut guard = sink.lock().unwrap();
+                guard.push_str(&line);
+                guard.push('\n');
+            }
+        })
+    });
+    // Join the stderr drainer (the pipe EOFs once the child exits, so the
+    // thread ends promptly) and return everything it captured.
+    let drain_stderr = move || -> String {
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+        stderr_buf.lock().unwrap().clone()
+    };
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
+        .timeout(READINESS_PROBE_TIMEOUT)
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{port}/api/v1/health");
@@ -117,20 +219,27 @@ fn spawn_serve(
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
         {
-            return ServeChild {
+            return Ok(ServeChild {
                 child: Some(child),
                 port,
-            };
+            });
         }
         // Bail early if the child crashed — don't burn the full timeout.
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("serve child exited before /health became ready: {status}");
+            let stderr = drain_stderr();
+            return Err(if stderr.contains(BIND_IN_USE_MARKER) {
+                SpawnFailure::BindRace { stderr }
+            } else {
+                SpawnFailure::Crashed { status, stderr }
+            });
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(READINESS_POLL_INTERVAL);
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("serve daemon did not become ready within {SPAWN_TIMEOUT:?}");
+    Err(SpawnFailure::NeverReady {
+        stderr: drain_stderr(),
+    })
 }
 
 fn http_client() -> reqwest::blocking::Client {

@@ -69,7 +69,7 @@ right when a constraint listed in the "use case" column is breached.
 |---|---|---|---|---|---|---|---|---|---|
 | **T1 — Singleton** | Solo developer; 1 NHI experimentation; offline | SQLite (WAL) | One process; one host | 1 | 1 | <10 ms | none | none | `ai-memory backup --keep 48` |
 | **T2 — Multi-agent / single server** | Engineering team (≤5 agents) on a shared workstation or single VM | SQLite (WAL) shared | Many agents → one daemon | 2–10 | 1 | <15 ms | none (local mTLS optional) | none | hourly local + weekly off-host |
-| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 16 + AGE 1.5 + pgvector 0.8 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
+| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.4 + AGE 1.7.0 + pgvector 0.8.2 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
 | **T4 — Multi-rack / same DC** | Production cluster with rack-affinity routing | Postgres primary + ≥1 streaming replicas; AGE on primary | Rack-affinity W-of-N; per-rack ai-memory replicas | 50–250 | 5–15 | <50 ms (cross-rack RTT) | mandatory | rack-aware W-of-N | pg_basebackup + WAL archive + rack-tagged snapshots |
 | **T5 — Multi-DC / same region** | Multi-AZ within a region; DR ready | Postgres primary + sync replica in second DC (or async-with-RPO) + AGE | Cross-DC federation peers; quorum spans DCs | 250–1000 | 15–50 | 50–150 ms (intra-region WAN) | mandatory | cross-DC W-of-N with quorum tuned for partition | pg_basebackup + WAL ship + off-region | 
 | **T6 — Multi-region / global** | Global product; data-residency requirements | Postgres + AGE **per region**; federation peers between regions | Regional clusters federate; local-first recall | 1000+ | 50–500 | <30 ms local recall; 150–500 ms global propagation | mandatory; per-region CA | regional clusters peer via signed `X-Memory-Sig` + `X-Memory-Nonce` | regional pg snapshots + cross-region object store |
@@ -357,9 +357,9 @@ production Dockerfile. Quick summary:
 
 | Component | Pinned version |
 |---|---|
-| PostgreSQL | 16.x (16.4+ recommended; the AGE 1.5.x target is PG 16) |
-| Apache AGE | 1.5.0 (1.6.0 supported via bundled Dockerfile) |
-| pgvector | 0.8.x preferred; 0.7.x acceptable |
+| PostgreSQL | **18.4** (canonical; SSOT `deploy/docker-1461/provision/lib.sh`). PG 16.x + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
+| Apache AGE | **1.7.0** (targets PG 18; bundled `deploy/docker-1461/Dockerfile.pg-age-vector`) |
+| pgvector | **0.8.2** (`PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
 | ai-memory build | `cargo build --release --features sal-postgres` |
 
 Bootstrap a fresh postgres backend with:
@@ -500,7 +500,7 @@ mTLS + `X-Memory-Sig` + `X-Memory-Nonce` envelope.
 
 ### 5.3 Postgres streaming replication
 
-Standard PG 16 streaming replication. Primary `postgresql.conf`:
+Standard PG 18 streaming replication. Primary `postgresql.conf`:
 
 ```ini
 wal_level = replica
@@ -522,7 +522,7 @@ Replica: `primary_conninfo = 'host=primary.rackA.internal user=aimemory_repl pas
 | Sync (`synchronous_standby_names`) | Primary + slowest sync replica RTT | 0 (committed only after replica ack) | Safest durability; any replica outage stalls writes |
 | Sync with quorum (`ANY 1 (replica1, replica2)`) | Primary + fastest of N RTT | 0 if any synced replica survives | Best balance for T4 |
 
-PG 16's `synchronous_standby_names = 'ANY 1 (replica_b)'` is the
+PG 18's `synchronous_standby_names = 'ANY 1 (replica_b)'` is the
 recommended T4 default: any one named replica must ack before commit,
 so a single-replica outage doesn't stall writes but a primary loss
 guarantees the survivor has every committed transaction.
@@ -1272,10 +1272,10 @@ build time and `hnsw.ef_search=80` at query time
 ### 10.3 AGE extension install + permissions
 
 See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.md)
-for the AGE 1.5.0-from-source recipe. The bundled
-`infra/lan-parity-test/Dockerfile.pg-age-vector` (#1065) stacks
-pgvector on top of `apache/age:release_PG16_*` so K8s / ECS / Cloud
-Run users don't have to build AGE themselves.
+for the AGE 1.7.0-from-source recipe. The bundled
+`deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) stacks
+pgvector 0.8.2 on top of `apache/age:release_PG18_1.7.0` so K8s / ECS /
+Cloud Run users don't have to build AGE themselves.
 
 Permissions:
 
@@ -1326,17 +1326,17 @@ Retention sizing reference:
 ### 10.6 Upgrade path — AGE minor version pinning
 
 **Pin AGE to a specific minor.** The v0.7.0 reference is
-`apache/age:release_PG16_1.5.0` (with the bundled pgvector layer).
+`apache/age:release_PG18_1.7.0` (with the bundled pgvector 0.8.2 layer).
 Do not let your Postgres host's apt-update silently upgrade AGE
-across a minor — the Cypher binding semantics changed between
-1.5.x and 1.6.x and the v0.7.0 tests target 1.5.0.
+across a minor — the Cypher binding semantics have changed between AGE
+minors historically, and the v0.7.0 canonical substrate targets 1.7.0.
 
 Upgrade procedure:
 
 1. Snapshot the primary (`pg_basebackup` + verify).
 2. Stop the ai-memory daemons.
-3. Stop Postgres (`systemctl stop postgresql@16-main`).
-4. Upgrade AGE (`apt install postgresql-age-1.6.x`) — operator-paced.
+3. Stop Postgres (`systemctl stop postgresql@18-main`).
+4. Upgrade AGE (`apt install postgresql-age-1.7.x`) — operator-paced.
 5. Start Postgres; verify `SELECT * FROM pg_extension WHERE
    extname='age';` shows the new version.
 6. Start the ai-memory daemons.
@@ -1630,7 +1630,7 @@ for the single-instance baseline.
 ### 14.8 Backup + tooling discipline
 
 - [ ] Backup cadence per §13.1; quarterly restore drill against a scratch host (§13.2).
-- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v0.7.0 reference: 1.5.0; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
+- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v0.7.0 reference: 1.7.0; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
 
 ### 14.9 Cross-references
 

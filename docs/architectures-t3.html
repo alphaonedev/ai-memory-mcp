@@ -459,6 +459,67 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
 
 <section>
   <div class="container">
+    <span class="eyebrow">Substrate</span>
+    <h2>Pinned Enterprise Federated component versions.</h2>
+    <p>The postgres-backed substrate pins an exact, tested matrix. These are the single source of truth in <code>deploy/docker-1461/provision/lib.sh</code> and are asserted at bring-up — the validate harness refuses to certify a stack whose probed versions drift from the pins below.</p>
+    <table>
+      <thead>
+        <tr><th>Component</th><th>Canonical version</th><th>SSOT pin</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>PostgreSQL</td><td><strong>18.4</strong></td><td><code>PG_APT_VERSION=18.4-1.pgdg13+1</code> · <code>EXPECTED_PG_VERSION=18.4</code></td></tr>
+        <tr><td>Apache AGE</td><td><strong>1.7.0</strong></td><td><code>AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code> · <code>EXPECTED_AGE_VERSION=1.7.0</code></td></tr>
+        <tr><td>pgvector (server extension)</td><td><strong>0.8.2</strong></td><td><code>PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1</code></td></tr>
+        <tr><td>pgvector (Rust binding crate)</td><td><strong>0.4</strong></td><td><code>Cargo.toml</code> → <code>pgvector = "0.4"</code></td></tr>
+        <tr><td>ai-memory postgres schema</td><td><strong>v28</strong></td><td>schema parity with SQLite at v28 (v0.7.0)</td></tr>
+      </tbody>
+    </table>
+    <p>The bundled stacked image at <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> (<code>ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code>, <code>ARG PG_MAJOR=18</code>) layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run operators don't build AGE from source. <strong>Alternate tested matrix:</strong> <code>infra/lan-parity-test/</code> legitimately runs PG 16 + AGE 1.6.0 + pgvector 0.8.2 as a second tested combination; the <em>recommended</em> install targets the PG 18.4 / AGE 1.7.0 matrix above.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Configuration</span>
+    <h2>Federated <code>config.toml</code> — the full option surface.</h2>
+    <p>Every deployment reads a single schema-versioned file at <code>~/.config/ai-memory/config.toml</code>. The precedence ladder is uniform: <strong>CLI flag &gt; <code>AI_MEMORY_*</code> env &gt; <code>[section]</code> &gt; legacy flat field &gt; compiled default</strong>. The complete field-by-field reference (with types, defaults, and resolver semantics) lives in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/docs/CONFIG_SCHEMA.md">docs/CONFIG_SCHEMA.md</a>.</p>
+<pre><code>schema_version = 2
+tier = "autonomous"
+db   = "/var/lib/ai-memory/store.db"
+
+# Postgres connection-pool + query bounds.
+postgres_pool_max_connections   = 16    # env: AI_MEMORY_PG_POOL_MAX
+postgres_pool_min_connections   = 2     # env: AI_MEMORY_PG_POOL_MIN
+postgres_acquire_timeout_secs   = 30    # env: AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS
+postgres_statement_timeout_secs = 30    # 0 disables
+request_timeout_secs  = 60              # axum slowloris guard
+llm_call_timeout_secs = 30
+
+[llm]            # backend / model / base_url / api_key_env|api_key_file
+[embeddings]     # backend / url / model / backfill_batch
+[reranker]       # enabled / model
+[storage]        # default_namespace / archive_on_gc / archive_max_days / max_memory_mb
+[limits]         # max_memories_per_day / max_storage_bytes / max_links_per_day / max_page_size
+[identity]       # anonymize_default
+[audit]          # enabled / path / hash_chain / attestation_cadence_minutes / retention_days
+                 #   + [audit.compliance.{soc2,hipaa,gdpr,fedramp}]
+[transcripts]    # default_ttl_secs / archive_grace_secs / max_decompressed_bytes
+                 #   + [transcripts.namespaces."&lt;pattern&gt;"]
+[hooks]          # [hooks.subscription] hmac_secret  (secret; chmod 600)
+[subscriptions]  # allow_loopback_webhooks  (default false — SSRF guard)
+[verify]         # require_nonce  (link-verify replay protection)
+[agents]         # [agents.defaults.recall_scope] namespaces / since / tier / limit
+[governance]     # require_operator_pubkey  (fail-closed rule enforcement)
+[confidence]     # shadow_retention_days
+[admin]          # agent_ids = [...]  (default-closed admin allowlist)
+[mcp]            # profile
+[permissions]    # mode = "enforce" | "advisory" | "off"</code></pre>
+    <p>All sections are <strong>default-safe</strong> — an absent block selects the compiled default and preserves existing behaviour. Inline <code>api_key = "&lt;literal&gt;"</code> is rejected at parse time; reference secrets via <code>api_key_env</code> / <code>api_key_file</code> (mode 0400) only.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
     <span class="eyebrow">Wiring</span>
     <h2>Governance, skills, and attestations at T3.</h2>
     <ul>

@@ -202,6 +202,16 @@ pub mod event_types {
     /// is by self-expiry (no CRL — see `issuer.rs`), so renewal is the
     /// only node-local lifecycle transition there is to audit.
     pub const FED_CREDENTIAL_RENEWED: &str = "federation.credential_renewed";
+
+    /// `signed_events.event_type` for operator-authorized governance-rule
+    /// deletion via `ai-memory rules remove --sign`
+    /// (`src/governance/rules_store.rs::remove_signed`). Closes the
+    /// audit gap where a `DELETE FROM governance_rules` left no
+    /// tamper-evident trace of WHICH rule the operator removed; the
+    /// emitted row's `payload_hash` is the SHA-256 over the removed
+    /// rule's canonical signing bytes and `signature` is the operator's
+    /// Ed25519 signature over that hash.
+    pub const GOVERNANCE_RULE_REMOVED: &str = "governance.rule_removed";
 }
 
 /// One row of the `signed_events` audit table.

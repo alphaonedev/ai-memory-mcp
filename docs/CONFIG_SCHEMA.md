@@ -99,6 +99,231 @@ profile = "full"
 mode = "enforce"
 ```
 
+## Substrate component versions (Enterprise Federated)
+
+The postgres-backed Enterprise Federated substrate pins an exact,
+tested component matrix. These versions are the **single source of
+truth** in
+[`deploy/docker-1461/provision/lib.sh`](../deploy/docker-1461/provision/lib.sh)
+and are asserted at bring-up by the validate harness (the daemon refuses
+to certify a stack whose probed versions drift from the pins below).
+
+| Component | Canonical version | SSOT pin (`deploy/docker-1461/provision/lib.sh`) |
+|---|---|---|
+| PostgreSQL | **18.4** | `PG_APT_VERSION=18.4-1.pgdg13+1`, `EXPECTED_PG_VERSION=18.4` |
+| Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
+| pgvector (server extension) | **0.8.2** | `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1` |
+| pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
+| ai-memory postgres schema | **v28** | schema parity with SQLite at v28 (v0.7.0) |
+
+The bundled stacked image at
+[`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
+(`ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `ARG PG_MAJOR=18`)
+layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run
+operators do not build AGE from source. See
+[`postgres-age-guide.md`](postgres-age-guide.md) for the from-source
+install recipe and the Docker layering rationale (#1065).
+
+> **Alternate tested matrix.** `infra/lan-parity-test/` and the
+> lan-parity compose harness legitimately run **PG 16 + AGE 1.6.0 +
+> pgvector 0.8.2** as a second tested combination. Those references are
+> factual (not drift); the *recommended* Enterprise Federated install
+> targets the PG 18.4 / AGE 1.7.0 matrix above.
+
+## Enterprise & operational sections
+
+Beyond the four #1146 sectioned blocks (`[llm]` / `[embeddings]` /
+`[reranker]` / `[storage]`) and `[limits]` shown in the Quick reference,
+`AppConfig` (`src/config.rs`) parses the following operator-facing
+sections. Each is **default-safe** — absent blocks select the compiled
+default and preserve the pre-existing behaviour. Fields are listed
+exactly as the SSOT struct declares them.
+
+### Top-level operational fields
+
+```toml
+schema_version = 2          # None/1 = legacy flat parse; >=2 = sectioned parse
+
+# Postgres connection-pool + query bounds (resolved by AppConfig::resolve_pg_pool).
+postgres_pool_max_connections   = 16    # env: AI_MEMORY_PG_POOL_MAX
+postgres_pool_min_connections   = 2     # env: AI_MEMORY_PG_POOL_MIN
+postgres_acquire_timeout_secs   = 30    # env: AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS
+postgres_statement_timeout_secs = 30    # after_connect SET statement_timeout; 0 = disable
+
+# Per-request / per-LLM-call wall-clock timeouts (DoS bounds).
+request_timeout_secs  = 60    # axum middleware ceiling (slowloris guard)
+llm_call_timeout_secs = 30    # wraps every spawn_blocking LLM call in tokio timeout
+
+# MCP-stdio → HTTP daemon write forwarder (federation fanout).
+mcp_federation_forward_url = "http://localhost:9077"
+```
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `schema_version` | `u32?` | `1` (legacy) | `>= 2` selects the sectioned parse path; warns if legacy flat fields coexist. |
+| `postgres_pool_max_connections` | `u32?` | `DEFAULT_MAX_CONNECTIONS` | sqlx `max_connections`; non-positive falls through to default. |
+| `postgres_pool_min_connections` | `u32?` | `DEFAULT_MIN_CONNECTIONS` | sqlx `min_connections` (warm floor). |
+| `postgres_acquire_timeout_secs` | `u64?` | derived from `DEFAULT_ACQUIRE_TIMEOUT` | sqlx `acquire_timeout`, whole seconds. |
+| `postgres_statement_timeout_secs` | `u64?` | `30` | per-connection `statement_timeout`; `0` disables. |
+| `request_timeout_secs` | `u64?` | `60` | per-HTTP-request wall-clock cap (H7). |
+| `llm_call_timeout_secs` | `u64?` | `30` | per-LLM-call timeout; on timeout falls back to the LLM-absent path (H8). |
+| `mcp_federation_forward_url` | `String?` | unset (direct SQLite) | when set, MCP-stdio write tools POST to this daemon so federation fanout runs (#318). |
+
+### `[identity]` — identity-resolution fallback (#198)
+
+```toml
+[identity]
+anonymize_default = false   # true → anonymous:pid-<pid>-<uuid8> instead of host:<hostname>:...
+```
+
+`anonymize_default = true` swaps the hostname-revealing default
+`agent_id` fallback for `anonymous:pid-<pid>-<uuid8>` (the persistent
+equivalent of `AI_MEMORY_ANONYMIZE=1`).
+
+### `[audit]` — tamper-evident audit trail (#487)
+
+Default-OFF. When enabled, emits a hash-chained, append-only JSON audit
+log suitable for SIEM ingestion and SOC2 / HIPAA / GDPR / FedRAMP
+evidence. See [`security/audit-trail.md`](security/audit-trail.md).
+
+```toml
+[audit]
+enabled                     = true
+path                        = "~/.local/state/ai-memory/audit/"   # dir or file
+schema_version              = 1       # reserved; must equal the binary's emitted version
+redact_content              = true    # v1 only supports true (no content field on the wire)
+hash_chain                  = true    # per-line hash chain (load-bearing tamper evidence)
+attestation_cadence_minutes = 60      # periodic CHECKPOINT.sig marker; 0 disables
+append_only                 = true    # best-effort platform append-only file flag
+retention_days              = 90      # purge/verify horizon; compliance presets override
+
+  [audit.compliance]
+  # Industry presets layered on top of the base config. The strictest
+  # (longest retention / most-frequent attestation) applied preset wins.
+  [audit.compliance.soc2]
+  applied                     = true
+  retention_days              = 365
+  [audit.compliance.hipaa]
+  applied                     = false
+  retention_days              = 2190    # 6 years
+  encrypt_at_rest             = true    # pair with --features sqlcipher
+  [audit.compliance.gdpr]
+  applied                     = false
+  pseudonymize_actors         = true
+  [audit.compliance.fedramp]
+  applied                     = false
+  attestation_cadence_minutes = 15
+```
+
+Each `[audit.compliance.<preset>]` table is a `CompliancePreset`:
+`applied` / `retention_days` / `redact_content` /
+`attestation_cadence_minutes` / `encrypt_at_rest` /
+`pseudonymize_actors`. `AuditConfig::effective_retention_days()` and
+`effective_attestation_cadence_minutes()` resolve the strictest active
+policy.
+
+### `[transcripts]` — transcript lifecycle sweeper (I3)
+
+```toml
+[transcripts]
+default_ttl_secs       = 2592000     # 30d archive-eligibility; None → DEFAULT_TRANSCRIPT_TTL_SECS
+archive_grace_secs     = 604800      # 7d linger before prune; None → DEFAULT_..._ARCHIVE_GRACE_SECS
+max_decompressed_bytes = 16777216    # 16 MiB decompression-bomb cap (per fetch call)
+
+  # Per-namespace overrides. Literal match first; trailing "/*" = subtree; "*" = catch-all (last).
+  [transcripts.namespaces."projects/atlas"]
+  default_ttl_secs   = 7776000       # 90d for this namespace
+  archive_grace_secs = 1209600       # 14d
+  auto_extract       = true          # opt into the R5 pre_store transcript-extractor hook
+```
+
+### `[hooks]` — outgoing-webhook signing (K7)
+
+```toml
+[hooks]
+  [hooks.subscription]
+  hmac_secret = "..."   # server-wide HMAC override; signs every webhook payload
+```
+
+`hmac_secret` is a secret: it is `skip_serializing`, redacted to
+`<redacted>` in `Debug`, and zeroized on drop. Keep the config file
+`chmod 600`. When unset, only per-subscription secrets apply.
+
+### `[subscriptions]` — webhook SSRF guard (H11, #628)
+
+```toml
+[subscriptions]
+allow_loopback_webhooks = false   # default false closes an authenticated SSRF gadget
+```
+
+Default-OFF rejects webhook URLs resolving to `127.0.0.0/8` /
+`localhost` / `::1` (which are reachable from the daemon and would
+expose locally-bound services such as Postgres on 5432). Set `true`
+only for CI / dev.
+
+### `[verify]` — link-verification replay protection (H5)
+
+```toml
+[verify]
+require_nonce = false   # true → every POST /api/v1/links/verify must carry verification_nonce
+```
+
+When `true`, missing nonces → 400; replayed `(link_id, signature,
+nonce)` tuples → 409 Conflict. Default-OFF preserves v0.6.x
+verify-anytime semantics.
+
+### `[agents]` — session-default recall scope (#518)
+
+```toml
+[agents]
+  [agents.defaults]
+    [agents.defaults.recall_scope]
+    namespaces = ["projects/atlas"]   # default namespace filter (first applied today)
+    since      = "24h"                # duration → since = now() - 24h
+    tier       = "long"              # "short" / "mid" / "long"
+    limit      = 50                  # default cap (still clamped to per-tool max 50)
+```
+
+Splices defaults into recall requests that pass `session_default=true`
+and omit a field. Resolution: **explicit request args > recall_scope
+defaults > compiled defaults** — the splice never overrides an explicit
+filter.
+
+### `[governance]` — fail-closed rule enforcement (SEC-2, #767)
+
+```toml
+[governance]
+require_operator_pubkey = false   # true → refuse boot if enabled rules exist but no operator pubkey
+```
+
+When `true`, daemon `serve` refuses to start if `governance_rules`
+contains any `enabled = 1` row AND no operator pubkey is resolved (env
+`AI_MEMORY_OPERATOR_PUBKEY` or `~/.config/ai-memory/operator.key.pub`),
+closing the fail-OPEN gap where a SQL-write gadget could install
+unsigned enabled rules.
+
+### `[confidence]` — shadow-observation retention (Cluster G, #767)
+
+```toml
+[confidence]
+shadow_retention_days = 30   # GC purge window; None → 30; 0/negative → sweep is a no-op
+```
+
+### `[admin]` — admin-class caller allowlist (SHIP cluster, #946/#957/#960/#961)
+
+```toml
+[admin]
+agent_ids = ["ops:admin", "ai:claude@workstation"]
+```
+
+**Default-closed.** When absent, every admin-class endpoint
+(`GET /api/v1/export`, `GET /api/v1/agents`, `GET /api/v1/stats`, the
+`POST /api/v1/quota/status` list path) returns `403 Forbidden`. Entries
+must match a caller's resolved `agent_id` verbatim (no glob); entries
+failing `validate_agent_id` are logged at `warn` and dropped so a typo
+cannot lock the operator out. The role gate runs **after**
+`api_key_auth` — set `api_key` too for sensitive corpora.
+
 ## Canonical resolver
 
 Every LLM / embedder / reranker / storage decision in the binary
