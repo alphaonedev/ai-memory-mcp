@@ -77,6 +77,7 @@ use ai_memory::models::{
     MemoryKind, MemoryLinkRelation, Tier, default_metadata,
 };
 use ai_memory::signed_events::list_signed_events;
+#[cfg(feature = "sal")]
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
