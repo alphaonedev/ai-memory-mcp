@@ -45,13 +45,12 @@ default_ttl_secs    = 3600            # 1 hour
 archive_grace_secs  = 300             # 5 minutes
 ```
 
-Schema: [`TranscriptsConfig`](../src/config.rs) at
-[`src/config.rs:1917`](../src/config.rs);
-[`TranscriptNamespaceConfig`](../src/config.rs) at
-[`src/config.rs:1946`](../src/config.rs).
+Schema: [`TranscriptsConfig`](../src/config.rs) and
+[`TranscriptNamespaceConfig`](../src/config.rs), both in
+[`src/config.rs`](../src/config.rs).
 
-**Precedence** (resolved by `TranscriptsConfig::resolve` at
-[`src/config.rs:2004`](../src/config.rs)):
+**Precedence** (resolved by
+[`src/config.rs::TranscriptsConfig::resolve`](../src/config.rs)):
 
 1. Exact match in `namespaces` (e.g. `"team/audit"`).
 2. Longest matching prefix pattern ending in `/*` (e.g. `"team/*"`

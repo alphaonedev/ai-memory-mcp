@@ -40,7 +40,7 @@ CREATE UNIQUE INDEX signed_events_sequence_uniq ON signed_events(sequence);
 ```
 
 The canonical bytes that the chain hash covers are
-([`src/signed_events.rs:150`](../src/signed_events.rs)):
+([`src/signed_events.rs::canonical_chain_bytes`](../src/signed_events.rs)):
 
 ```
 id || 0x1F || agent_id || 0x1F || event_type || 0x1F ||
@@ -53,13 +53,13 @@ RFC3339 timestamps nor UUIDs nor the hex/base64 payloads — so
 concatenation is unambiguous without escaping.
 
 `prev_hash` for row `N` is `SHA-256(canonical_chain_bytes(row N-1))`.
-For row 1, `prev_hash` is 32 zero bytes (`ZERO_HASH` at
-[`src/signed_events.rs:129`](../src/signed_events.rs)). Tampering
+For row 1, `prev_hash` is 32 zero bytes (`ZERO_HASH` in
+[`src/signed_events.rs`](../src/signed_events.rs)). Tampering
 with any prior row's canonical fields invalidates every subsequent
 row's `prev_hash`.
 
 `prev_hash` and `sequence` are populated by `append_signed_event`
-([`src/signed_events.rs:468`](../src/signed_events.rs)) at insert
+([`src/signed_events.rs::append_signed_event`](../src/signed_events.rs)) at insert
 time. **Callers MUST NOT pre-populate them** — any value set by the
 caller is ignored. Use `..SignedEvent::default()` at the
 struct-literal tail to leave them empty.
@@ -77,7 +77,7 @@ already-backfilled table is a no-op.
 
 A partially-backfilled state (some rows have `sequence IS NULL`,
 others don't) is **load-bearing-bad**. `read_chain_head`
-([`src/signed_events.rs:207`](../src/signed_events.rs)) hard-fails
+([`src/signed_events.rs::read_chain_head`](../src/signed_events.rs)) hard-fails
 with a clear diagnostic in this case (the COR-9 fix; cluster-C
 issue #767) and refuses to append further rows until the operator
 re-runs `ai-memory migrate`. Silently treating `NULL` as 0 would
@@ -163,9 +163,9 @@ the chain stays monotonic under concurrent writers. The
 [`tests/deferred_audit_soak.rs`](../tests/deferred_audit_soak.rs)
 soak fires 5,000 concurrent inserts and asserts the chain walk passes
 afterwards. `append_signed_event`
-([`src/signed_events.rs:468`](../src/signed_events.rs)) wraps in a
+([`src/signed_events.rs::append_signed_event`](../src/signed_events.rs)) wraps in a
 transaction; `append_signed_event_no_tx`
-([`src/signed_events.rs:518`](../src/signed_events.rs)) is the
+([`src/signed_events.rs::append_signed_event_no_tx`](../src/signed_events.rs)) is the
 in-an-existing-transaction variant for callers that compose with a
 larger write.
 
