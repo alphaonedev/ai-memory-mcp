@@ -819,7 +819,7 @@ fn require_peer_enrollment_enabled() -> bool {
 // chain through the same `FederationNonceCache` for replay protection.
 // Canonical bytes:
 //
-//   "GET" || 0x0A || "/api/v1/sync/since" || 0x0A || canonical_query
+//   "GET" || 0x0A || super::routes::SYNC_SINCE || 0x0A || canonical_query
 //
 // where `canonical_query` is the request's raw query string verbatim
 // (the caller fixes the param ordering before signing — a future

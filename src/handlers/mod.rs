@@ -73,6 +73,10 @@ pub mod recall;
 /// wrapper around the existing `crate::mcp::handle_<name>` substrate
 /// primitive; wire envelopes are byte-equal across the two surfaces.
 pub mod route_1111;
+/// #1558 batch 4 — HTTP route-path SSOT: one named const per
+/// production route; registration (lib.rs) and match sites
+/// (postgres_gate, federation receive, CLI doctor) share them.
+pub mod routes;
 pub mod share;
 pub mod skills;
 pub mod subscriptions;

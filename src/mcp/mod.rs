@@ -41,6 +41,10 @@ pub mod server_identity;
 // `src/mcp/` is allowlist-pinned by `tests/mcp_param_names_invariant.rs`.
 pub mod param_names;
 
+// #1558 batch 3 — JSON-RPC 2.0 wire-layer SSOT: version tag, reserved
+// error codes, method names, MCP protocol revision.
+pub mod jsonrpc;
+
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
 // `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
@@ -108,7 +112,7 @@ struct RpcError {
 
 fn ok_response(id: Value, result: Value) -> RpcResponse {
     RpcResponse {
-        jsonrpc: "2.0".into(),
+        jsonrpc: jsonrpc::VERSION.into(),
         id,
         result: Some(result),
         error: None,
@@ -117,7 +121,7 @@ fn ok_response(id: Value, result: Value) -> RpcResponse {
 
 fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
     RpcResponse {
-        jsonrpc: "2.0".into(),
+        jsonrpc: jsonrpc::VERSION.into(),
         id,
         result: None,
         error: Some(RpcError {
@@ -2010,16 +2014,19 @@ fn handle_request(
     let id = req.id.clone().unwrap_or(Value::Null);
 
     // Validate JSON-RPC 2.0 version
-    if req.jsonrpc != "2.0" {
+    if req.jsonrpc != jsonrpc::VERSION {
         return err_response(
             id,
-            -32600,
-            "invalid JSON-RPC version (must be \"2.0\")".into(),
+            jsonrpc::INVALID_REQUEST,
+            format!(
+                "invalid JSON-RPC version (must be \"{}\")",
+                jsonrpc::VERSION
+            ),
         );
     }
 
     match req.method.as_str() {
-        "initialize" => {
+        jsonrpc::METHOD_INITIALIZE => {
             // v0.7.x (#1154) — daemon serverInfo Ed25519 signing.
             // Closes NSA CSI MCP Security concern (j) Tool invocation
             // path confusion at the substrate boundary. When the
@@ -2047,29 +2054,43 @@ fn handle_request(
             ok_response(
                 id,
                 json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": jsonrpc::PROTOCOL_REVISION,
                     "capabilities": { "tools": {}, "prompts": {} },
                     "serverInfo": server_info,
                 }),
             )
         }
-        "notifications/initialized" | "ping" => ok_response(id, json!({})),
-        "tools/list" => ok_response(id, tool_definitions_for_profile(profile)),
-        "prompts/list" => ok_response(id, prompt_definitions()),
-        "prompts/get" => {
+        jsonrpc::METHOD_NOTIFICATIONS_INITIALIZED | jsonrpc::METHOD_PING => {
+            ok_response(id, json!({}))
+        }
+        jsonrpc::METHOD_TOOLS_LIST => ok_response(id, tool_definitions_for_profile(profile)),
+        jsonrpc::METHOD_PROMPTS_LIST => ok_response(id, prompt_definitions()),
+        jsonrpc::METHOD_PROMPTS_GET => {
             let prompt_name = match req.params["name"].as_str() {
                 Some(name) if !name.is_empty() => name,
-                _ => return err_response(id, -32602, "missing or empty prompt name".into()),
+                _ => {
+                    return err_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        "missing or empty prompt name".into(),
+                    );
+                }
             };
             match prompt_content(prompt_name, &req.params) {
                 Ok(val) => ok_response(id, val),
-                Err(e) => err_response(id, -32602, e),
+                Err(e) => err_response(id, jsonrpc::INVALID_PARAMS, e),
             }
         }
-        "tools/call" => {
+        jsonrpc::METHOD_TOOLS_CALL => {
             let tool_name = match req.params["name"].as_str() {
                 Some(name) if !name.is_empty() => name,
-                _ => return err_response(id, -32602, "missing or empty tool name".into()),
+                _ => {
+                    return err_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        "missing or empty tool name".into(),
+                    );
+                }
             };
 
             // v0.6.4-002 (RFC S28) — reject calls to tools that are not
@@ -2123,7 +2144,7 @@ fn handle_request(
                     );
                     format!("unknown tool: {tool_name}")
                 };
-                return err_response(id, -32601, hint);
+                return err_response(id, jsonrpc::METHOD_NOT_FOUND, hint);
             }
 
             // Pillar 3 / Stream E — emit a structured tracing span around
@@ -2199,7 +2220,11 @@ fn handle_request(
                 // switch on error code can then misroute / retry
                 // correctly. We surface the tool name in `data` so
                 // clients can log it without parsing the message.
-                return err_response(id, -32601, format!("unknown tool: {tool_name}"));
+                return err_response(
+                    id,
+                    jsonrpc::METHOD_NOT_FOUND,
+                    format!("unknown tool: {tool_name}"),
+                );
             };
             let result = dispatch(&ctx);
 
@@ -2296,7 +2321,11 @@ fn handle_request(
                 ),
             }
         }
-        _ => err_response(id, -32601, format!("method not found: {}", req.method)),
+        _ => err_response(
+            id,
+            jsonrpc::METHOD_NOT_FOUND,
+            format!("method not found: {}", req.method),
+        ),
     }
 }
 
@@ -2349,7 +2378,7 @@ fn load_active_keypair_for_mcp_in(
     }
     // Fallback: substrate-managed daemon keypair (created by the
     // serve/mcp boot path; see daemon_runtime::ensure_and_load_daemon_keypair).
-    match crate::identity::keypair::load("daemon", dir) {
+    match crate::identity::keypair::load(crate::identity::keypair::DAEMON_KEYPAIR_LABEL, dir) {
         Ok(kp) if kp.can_sign() => Some(kp),
         Ok(_) => None,
         Err(e) => {
@@ -2983,7 +3012,7 @@ pub fn run_mcp_server(
                     // serve an infinitely-streaming peer.
                     let resp = err_response(
                         Value::Null,
-                        -32700,
+                        jsonrpc::PARSE_ERROR,
                         format!(
                             "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
                              and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
@@ -3007,7 +3036,7 @@ pub fn run_mcp_server(
             }
             let resp = err_response(
                 Value::Null,
-                -32700,
+                jsonrpc::PARSE_ERROR,
                 format!("parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes"),
             );
             let out = serde_json::to_string(&resp)?;
@@ -3027,7 +3056,7 @@ pub fn run_mcp_server(
             Err(e) => {
                 let resp = err_response(
                     Value::Null,
-                    -32700,
+                    jsonrpc::PARSE_ERROR,
                     format!("parse error: invalid UTF-8: {e}"),
                 );
                 let out = serde_json::to_string(&resp)?;
@@ -3043,7 +3072,11 @@ pub fn run_mcp_server(
         let req: RpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = err_response(Value::Null, -32700, format!("parse error: {e}"));
+                let resp = err_response(
+                    Value::Null,
+                    jsonrpc::PARSE_ERROR,
+                    format!("parse error: {e}"),
+                );
                 let out = serde_json::to_string(&resp)?;
                 writeln!(stdout, "{out}")?;
                 stdout.flush()?;
@@ -3052,7 +3085,7 @@ pub fn run_mcp_server(
         };
 
         // Capture clientInfo.name on initialize (even if id is Null / notification-style).
-        if req.method == "initialize"
+        if req.method == jsonrpc::METHOD_INITIALIZE
             && let Some(name) = req.params["clientInfo"]["name"].as_str()
             && !name.is_empty()
         {

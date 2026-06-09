@@ -773,7 +773,7 @@ pub async fn api_key_auth(
     };
 
     // Exempt health endpoint
-    if req.uri().path() == "/api/v1/health" {
+    if req.uri().path() == super::routes::HEALTH {
         return next.run(req).await.into_response();
     }
 
