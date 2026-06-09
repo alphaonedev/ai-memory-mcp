@@ -49,7 +49,9 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use super::{AppState, StorageBackend};
+use super::AppState;
+#[cfg(feature = "sal")]
+use super::StorageBackend;
 
 /// Build the `Bad Request` envelope used by every #1111 handler when
 /// the substrate primitive returns `Err(String)`. Kept as a free
@@ -99,6 +101,7 @@ pub async fn handle_reflect_http(
     // + signed reflects_on links). Mirrors the sqlite MCP path's
     // argument contract + `REFLECTION_DEPTH_EXCEEDED` / `CALLER_DEPTH_MISMATCH`
     // wire slugs + `{id, reflection_depth, reflects_on, namespace}` shape.
+    #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let (input, caller_depth) = match crate::mcp::parse_reflect_input(&body, None) {
             Ok(parsed) => parsed,
@@ -181,6 +184,7 @@ pub async fn handle_recall_observations_http(
     // Postgres SAL path (#1549): read the recall-consumption ledger
     // through `MemoryStore::list_recall_observations`. Mirrors the
     // sqlite MCP path's filter parsing + `{observations, count}` shape.
+    #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let recall_id = body
             .get("recall_id")
@@ -241,6 +245,7 @@ pub async fn handle_reflection_origin_http(
     // Postgres SAL path (#1549): walk reflection origin metadata through
     // `MemoryStore::get_reflection_origin`. Mirrors the sqlite MCP path's
     // `memory_id` validation + response shape + "memory not found" 4xx.
+    #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let memory_id = match body["memory_id"].as_str() {
             Some(s) if !s.is_empty() => s,

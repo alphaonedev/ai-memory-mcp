@@ -311,6 +311,35 @@ mod tests {
         }
     }
 
+    // ── #1549 reflection_origin_from_memory coverage ─────────────────
+    #[test]
+    fn reflection_origin_from_memory_derives_all_fields() {
+        let mut mem = reflection_memory("m-derive", 2);
+        let mut meta = serde_json::Map::new();
+        meta.insert("agent_id".to_string(), serde_json::json!("ai:signer@host"));
+        meta.insert(
+            REFLECTION_ORIGIN_KEY.to_string(),
+            serde_json::json!({ "peer_origin": "peer-x", "local_depth_at_arrival": 5 }),
+        );
+        mem.metadata = serde_json::Value::Object(meta);
+        let origin = reflection_origin_from_memory(&mem);
+        assert_eq!(origin.memory_id, "m-derive");
+        assert!(origin.is_reflection);
+        assert_eq!(origin.original_depth, 2);
+        assert_eq!(origin.signing_agent.as_deref(), Some("ai:signer@host"));
+        assert_eq!(origin.peer_origin.as_deref(), Some("peer-x"));
+        assert_eq!(origin.local_depth_at_arrival, Some(5));
+    }
+
+    #[test]
+    fn reflection_origin_from_memory_non_reflection_is_flagged_false() {
+        let origin = reflection_origin_from_memory(&reflection_memory("m-base", 0));
+        assert!(!origin.is_reflection);
+        assert_eq!(origin.original_depth, 0);
+        assert!(origin.peer_origin.is_none());
+        assert!(origin.local_depth_at_arrival.is_none());
+    }
+
     #[test]
     fn stamp_skips_non_reflection() {
         let mut mem = reflection_memory("m1", 0);

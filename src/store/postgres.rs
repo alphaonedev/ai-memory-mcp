@@ -10421,7 +10421,8 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         input: &crate::storage::reflect::ReflectInput,
         signing_key: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError> {
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
         // Delegate to the fully-implemented inherent native-sqlx port
         // (validation → source load → depth → governance cap →
         // depth-exceeded signed_events audit → atomic memory + signed
@@ -10487,7 +10488,8 @@ impl MemoryStore for PostgresStore {
             qb.push(" AND observed_at <= ").push_bind(u.to_string());
         }
         let lim_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        qb.push(" ORDER BY observed_at DESC LIMIT ").push_bind(lim_i64);
+        qb.push(" ORDER BY observed_at DESC LIMIT ")
+            .push_bind(lim_i64);
         let rows = qb
             .build()
             .fetch_all(&self.pool)
