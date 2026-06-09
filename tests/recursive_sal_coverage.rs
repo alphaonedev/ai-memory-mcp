@@ -9,6 +9,11 @@
 //! line coverage on BOTH adapters through the trait (not just the inherent
 //! native-sqlx entry points).
 
+// The `MemoryStore` SAL trait (`ai_memory::store`) is `#[cfg(feature = "sal")]`,
+// so this whole coverage file is sal-only; in a non-sal build it compiles to
+// an empty test target.
+#![cfg(feature = "sal")]
+
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::store::{CallerContext, MemoryStore};
 use std::sync::Arc;
@@ -149,8 +154,9 @@ async fn sqlite_sal_recursive_surface_roundtrips() {
     exercise_sal_surface(store.as_ref()).await;
 }
 
-/// Postgres twin — gated on `AI_MEMORY_TEST_POSTGRES_URL`. Mirrors the
-/// gating pattern used across the postgres SAL integration tests.
+/// Postgres twin — compile-gated on `sal-postgres` (PostgresStore lives
+/// behind that feature) and runtime-gated on `AI_MEMORY_TEST_POSTGRES_URL`.
+#[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_sal_recursive_surface_roundtrips() {
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {

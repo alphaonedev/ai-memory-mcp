@@ -934,7 +934,10 @@ pub(crate) fn temporal_window_seconds() -> i64 {
 // Unit tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// The reflection-pass suite exercises the SAL-gated `ReflectionPass` over a
+// `StubLlm: AutonomyLlm`; both are sal-only, so the whole module is gated
+// (non-sal builds have no ReflectionPass to test).
+#[cfg(all(test, feature = "sal"))]
 mod tests {
     use super::*;
     use crate::models::{Memory, MemoryKind, Tier};
