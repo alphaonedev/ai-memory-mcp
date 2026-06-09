@@ -242,11 +242,10 @@ impl McpTool for ConsolidateTool {
         "Merge 2-100 sources into one long-tier memory; deletes sources, adds derived_from links. LLM auto-generates summary if omitted (smart/autonomous tier)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ConsolidateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ConsolidateRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

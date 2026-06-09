@@ -49,11 +49,10 @@ impl McpTool for NamespaceSetStandardTool {
         "Standard memory auto-prepended to recall + session_start. Rule layering: global '*' + parent chain + namespace. Task 1.8: governance policy merged into metadata. P4/G1: inherit flag."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NamespaceSetStandardRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NamespaceSetStandardRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -84,11 +83,10 @@ impl McpTool for NamespaceGetStandardTool {
         "Returns the standard. inherit=true (Task 1.6) returns the resolved chain (global '*' -> ancestors -> namespace)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NamespaceGetStandardRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NamespaceGetStandardRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -115,11 +113,10 @@ impl McpTool for NamespaceClearStandardTool {
         "Clear the namespace standard."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NamespaceClearStandardRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NamespaceClearStandardRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 

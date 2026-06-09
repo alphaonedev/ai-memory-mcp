@@ -44,11 +44,10 @@ impl McpTool for GetTaxonomyTool {
         "Pillar 1 / Stream A: namespace tree (live rows only). Each node has count + subtree_count. Response includes total_count and truncated flag."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(GetTaxonomyRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<GetTaxonomyRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

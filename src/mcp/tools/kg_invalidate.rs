@@ -46,11 +46,10 @@ impl McpTool for KgInvalidateTool {
         "Pillar 2 / Stream C: set valid_until on (source_id, target_id, relation). valid_until defaults to now. Idempotent; response carries previous_valid_until. found:false when no match."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(KgInvalidateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<KgInvalidateRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

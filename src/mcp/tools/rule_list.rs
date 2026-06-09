@@ -149,11 +149,10 @@ impl McpTool for RuleListTool {
         "#691: governance_rules read. Mutation operator-only (CLI/HTTP signed); MCP read-only by design 2026-05-13."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(RuleListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<RuleListRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

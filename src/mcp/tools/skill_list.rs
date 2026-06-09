@@ -150,11 +150,10 @@ impl McpTool for SkillListTool {
         "L1-5: discovery (name, description, id, namespace, digest, metadata). Use memory_skill_get for body."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillListRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

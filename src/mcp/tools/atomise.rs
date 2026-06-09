@@ -293,11 +293,10 @@ impl McpTool for AtomiseTool {
         "WT-1-C: atomise via WT-1-B engine. Atoms = Observation memories with metadata.atom_source_id + derives_from link. Source archived (atomised_into=N). Returns {source_id, atom_ids, atom_count, archived_at}. Idempotent (use force_re_atomise to mint fresh). Too-small sources => {source_too_small:true}. Failures => CURATOR_FAILED / GOVERNANCE_REFUSED envelopes."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(AtomiseRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<AtomiseRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

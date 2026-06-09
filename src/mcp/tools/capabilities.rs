@@ -83,12 +83,11 @@ impl McpTool for CapabilitiesTool {
     fn input_schema() -> Value {
         // Use schemars 0.8's `schema_for!` to derive the schema from the
         // `CapabilitiesRequest` struct, then convert to `serde_json::Value`.
-        let schema = schemars::schema_for!(CapabilitiesRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<CapabilitiesRequest>()
     }
 
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

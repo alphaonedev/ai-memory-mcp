@@ -61,11 +61,10 @@ impl McpTool for ReplayTool {
          `docs/sidechain-transcripts.md` §'Operator workflow' for the setup steps."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ReplayRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ReplayRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

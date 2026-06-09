@@ -49,11 +49,10 @@ impl McpTool for FindPathsTool {
         "J7: undirected BFS over memory_links with cycle detection. Returns id chains source-first. max_depth<=7, max_results<=50."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(FindPathsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<FindPathsRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

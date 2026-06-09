@@ -95,11 +95,10 @@ impl McpTool for RecallObservationsTool {
         "Gap 3 (#886): recall-consumption ledger filter."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(RecallObservationsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<RecallObservationsRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

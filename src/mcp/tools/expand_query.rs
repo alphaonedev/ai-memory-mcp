@@ -55,11 +55,10 @@ impl McpTool for ExpandQueryTool {
         "LLM query expansion. Smart/autonomous tier."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ExpandQueryRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ExpandQueryRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

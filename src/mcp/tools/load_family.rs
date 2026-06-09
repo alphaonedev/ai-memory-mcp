@@ -51,11 +51,10 @@ impl McpTool for LoadFamilyTool {
          NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(LoadFamilyRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<LoadFamilyRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 
@@ -93,11 +92,10 @@ impl McpTool for SmartLoadTool {
          NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SmartLoadRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SmartLoadRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 

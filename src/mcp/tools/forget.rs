@@ -77,11 +77,10 @@ impl McpTool for ForgetTool {
         "Bulk delete by pattern/namespace/tier. Archives first (recover via memory_archive_restore). dry_run previews."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ForgetRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ForgetRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 
@@ -106,11 +105,10 @@ impl McpTool for StatsTool {
         "Totals, per-tier + namespace tallies, archive + DB size."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(StatsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<StatsRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

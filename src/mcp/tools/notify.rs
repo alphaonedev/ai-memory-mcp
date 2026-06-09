@@ -214,11 +214,10 @@ impl McpTool for NotifyTool {
         "Send message to _messages/<target>. Sender = caller agent_id. Read via memory_inbox."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NotifyRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NotifyRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 
@@ -254,8 +253,7 @@ impl McpTool for InboxTool {
         "Read _messages/<agent_id>. access_count==0 is the unread marker."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(InboxRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<InboxRequest>()
     }
     fn family() -> &'static str {
         // Note: `memory_inbox` lives in `Family::Power` per

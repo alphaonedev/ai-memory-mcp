@@ -49,11 +49,10 @@ impl McpTool for EntityRegisterTool {
         "Pillar 2 / Stream B: register entity as long-tier memory (metadata.kind='entity'). Idempotent on (canonical_name, namespace); merges new aliases. Errors if name collides with a non-entity row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(EntityRegisterRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<EntityRegisterRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

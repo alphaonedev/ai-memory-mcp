@@ -188,11 +188,10 @@ impl McpTool for ArchiveListTool {
         "List archived memories. Filter by namespace; paginate via offset/limit."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchiveListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchiveListRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 
@@ -220,11 +219,10 @@ impl McpTool for ArchivePurgeTool {
         "Purge archive. Scope via older_than_days. Unrecoverable."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchivePurgeRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchivePurgeRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 
@@ -251,11 +249,10 @@ impl McpTool for ArchiveRestoreTool {
         "Restore archived row; expires_at cleared."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchiveRestoreRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchiveRestoreRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 
@@ -289,11 +286,10 @@ impl McpTool for GcTool {
         "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(GcRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<GcRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 
@@ -312,11 +308,10 @@ impl McpTool for ArchiveStatsTool {
         "Archive total + per-namespace counts."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchiveStatsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchiveStatsRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 

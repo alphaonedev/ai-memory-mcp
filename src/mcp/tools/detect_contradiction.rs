@@ -79,11 +79,10 @@ impl McpTool for DetectContradictionTool {
         "LLM contradiction check. Smart/autonomous tier."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(DetectContradictionRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<DetectContradictionRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 
