@@ -27,7 +27,7 @@ pub fn handle_skill_resource(conn: &Connection, params: &Value) -> Result<Value,
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_resource requires 'skill_id'")?;
 
-    let resource_path = params["resource_path"]
+    let resource_path = params[crate::models::field_names::RESOURCE_PATH]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_resource requires 'resource_path'")?;
@@ -88,7 +88,7 @@ pub fn handle_skill_resource(conn: &Connection, params: &Value) -> Result<Value,
 
     Ok(json!({
         "skill_id": skill_id,
-        "resource_path": resource_path,
+        (crate::models::field_names::RESOURCE_PATH): resource_path,
         "resource_kind": kind,
         "content": content_value,
         "encoding": encoding,

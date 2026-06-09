@@ -76,7 +76,10 @@ pub fn cmd_ingest_multistep(
         return Ok(());
     }
 
-    if let Some(locked) = envelope.get("tier-locked").and_then(Value::as_str) {
+    if let Some(locked) = envelope
+        .get(crate::models::field_names::TIER_LOCKED)
+        .and_then(Value::as_str)
+    {
         writeln!(out.stdout, "ingest-multistep: tier-locked: {locked}")?;
     } else {
         let variant = envelope

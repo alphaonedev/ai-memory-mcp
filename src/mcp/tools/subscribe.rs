@@ -126,7 +126,7 @@ pub fn handle_subscribe(
     // subscription to a narrow event subset. When omitted, the legacy
     // `events` (comma-separated / `*`) field governs — preserves
     // backward compatibility for pre-P5 subscribers.
-    let event_types: Option<Vec<String>> = params["event_types"].as_array().map(|arr| {
+    let event_types: Option<Vec<String>> = params[field_names::EVENT_TYPES].as_array().map(|arr| {
         arr.iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect()
@@ -174,7 +174,7 @@ pub fn handle_subscribe(
         (field_names::CREATED_BY): created_by,
     });
     if let Some(et) = &event_types {
-        response["event_types"] = json!(et);
+        response[field_names::EVENT_TYPES] = json!(et);
     }
     Ok(response)
 }

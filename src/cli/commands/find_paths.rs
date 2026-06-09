@@ -82,7 +82,7 @@ pub fn cmd_find_paths(
         params["max_results"] = json!(m);
     }
     if args.include_invalidated {
-        params["include_invalidated"] = json!(true);
+        params[crate::models::field_names::INCLUDE_INVALIDATED] = json!(true);
     }
 
     let envelope = crate::mcp::handle_find_paths(&conn, &params)

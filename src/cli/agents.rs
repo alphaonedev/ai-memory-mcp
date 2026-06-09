@@ -166,7 +166,7 @@ pub fn run_agents(
                     serde_json::json!({
                         "bound": true,
                         "agent_id": agent_id,
-                        "agent_pubkey": trimmed,
+                        (field_names::AGENT_PUBKEY): trimmed,
                     })
                 )?;
             } else {

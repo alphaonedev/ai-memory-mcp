@@ -100,6 +100,10 @@ use serde_json::{Value, json};
 use crate::identity::keypair::AgentKeypair;
 use crate::storage::migrations::current_schema_version;
 
+/// Signed-block / response field for the daemon public key (#1558 batch 6).
+/// A signed-envelope field, NOT an MCP tool param — deliberately local.
+const PUBLIC_KEY_FIELD: &str = "public_key";
+
 /// Field set canonically serialised for the daemon-identity Ed25519
 /// signature. Mirrors the discipline established by
 /// [`crate::governance::rules_store::canonical_bytes_for_signing`]:
@@ -147,7 +151,7 @@ pub fn canonical_bytes_for_identity(identity: &DaemonIdentityToSign<'_>) -> Resu
     let canonical = json!({
         (field_names::SCHEMA_VERSION): identity.schema_version,
         "daemon_id": identity.daemon_id,
-        "public_key": identity.public_key,
+        (PUBLIC_KEY_FIELD): identity.public_key,
         "signed_at": identity.signed_at,
     });
     serde_json::to_vec(&canonical)
@@ -200,7 +204,7 @@ pub fn build_signed_identity(
     Ok(Some(json!({
         (field_names::SCHEMA_VERSION): schema_version,
         "daemon_id": kp.agent_id,
-        "public_key": public_key,
+        (PUBLIC_KEY_FIELD): public_key,
         "signed_at": now_rfc3339,
         "signature": sig_b64,
     })))
@@ -241,7 +245,7 @@ pub fn verify_signed_identity(block: &Value) -> Result<(), ed25519_dalek::Signat
         .and_then(Value::as_str)
         .ok_or_else(make_err)?;
     let public_key_b64 = obj
-        .get("public_key")
+        .get(PUBLIC_KEY_FIELD)
         .and_then(Value::as_str)
         .ok_or_else(make_err)?;
     let signed_at = obj

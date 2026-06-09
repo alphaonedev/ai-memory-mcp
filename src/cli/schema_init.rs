@@ -349,7 +349,7 @@ fn list_sqlite_indices(conn: &rusqlite::Connection) -> Result<Vec<String>> {
 fn read_schema_version_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
     let v: i64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
             [],
             |row| row.get(0),
         )
@@ -562,7 +562,7 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
         return false;
     }
 
-    match sqlx::query("SELECT create_graph('memory_graph')")
+    match sqlx::query(crate::store::postgres::SQL_CREATE_AGE_GRAPH)
         .execute(&mut *conn)
         .await
     {
@@ -574,7 +574,7 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
             // against a previously-bootstrapped DB MUST be
             // idempotent.
             let msg = e.to_string();
-            if msg.contains("already exists") {
+            if msg.contains(crate::store::postgres::PG_ERR_ALREADY_EXISTS) {
                 true
             } else {
                 tracing::warn!(

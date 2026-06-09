@@ -123,7 +123,7 @@ pub fn handle_inbox(
             crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?
         }
     };
-    let unread_only = params["unread_only"].as_bool().unwrap_or(false);
+    let unread_only = params[field_names::UNREAD_ONLY].as_bool().unwrap_or(false);
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(50))
         .unwrap_or(usize::MAX)
         .min(500);
@@ -170,7 +170,7 @@ pub fn handle_inbox(
         "agent_id": owner,
         "namespace": namespace,
         "count": messages.len(),
-        "unread_only": unread_only,
+        (field_names::UNREAD_ONLY): unread_only,
         "messages": messages,
     }))
 }

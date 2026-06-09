@@ -110,7 +110,10 @@ impl CheckActionArgs {
             obj.insert("binary".to_string(), Value::String(v.clone()));
         }
         if let Some(v) = &self.custom_kind {
-            obj.insert("custom_kind".to_string(), Value::String(v.clone()));
+            obj.insert(
+                crate::models::field_names::CUSTOM_KIND.to_string(),
+                Value::String(v.clone()),
+            );
         }
         Value::Object(obj)
     }

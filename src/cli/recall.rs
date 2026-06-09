@@ -498,7 +498,7 @@ pub(crate) fn run_with_embedder(
             body["meta"] = serde_json::json!({
                 "budget_tokens_used": outcome.tokens_used,
                 "budget_tokens_remaining": outcome.tokens_remaining.unwrap_or(0),
-                "memories_dropped": outcome.memories_dropped,
+                (field_names::MEMORIES_DROPPED): outcome.memories_dropped,
                 "budget_overflow": outcome.budget_overflow,
             });
         }

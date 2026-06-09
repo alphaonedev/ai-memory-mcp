@@ -571,7 +571,7 @@ pub fn verify_since(
         if date >= cutoff {
             break;
         }
-        let f = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
         for line in BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
@@ -588,7 +588,7 @@ pub fn verify_since(
         if date < cutoff {
             continue;
         }
-        let f = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
         for (idx, line) in BufReader::new(f).lines().enumerate() {
             let line_no = (idx as u64) + 1;
             let line = line.with_context(|| format!("reading {}:{line_no}", file.display()))?;

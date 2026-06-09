@@ -86,7 +86,9 @@ pub fn handle_find_paths(conn: &rusqlite::Connection, params: &Value) -> Result<
     // exclude edges whose `valid_until` lies in the past. Caller can
     // pass `include_invalidated=true` to traverse the full historical
     // link graph (still covered by `memory_kg_timeline`).
-    let include_invalidated = params["include_invalidated"].as_bool().unwrap_or(false);
+    let include_invalidated = params[crate::models::field_names::INCLUDE_INVALIDATED]
+        .as_bool()
+        .unwrap_or(false);
 
     let paths = db::find_paths(
         conn,

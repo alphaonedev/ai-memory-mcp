@@ -368,7 +368,7 @@ impl<'a> PersonaGenerator<'a> {
                 "sources": source_ids.clone(),
                 "version": version,
                 (field_names::ATTEST_LEVEL): crate::models::AttestLevel::Unsigned.as_str(),
-                "generated_at": now,
+                (field_names::GENERATED_AT): now,
             }
         });
 
@@ -843,7 +843,7 @@ pub fn render_persona_json(persona: &Persona) -> String {
         serde_json::Value::Number(serde_json::Number::from(persona.version)),
     );
     map.insert(
-        "generated_at",
+        field_names::GENERATED_AT,
         serde_json::Value::String(persona.generated_at.clone()),
     );
     map.insert(

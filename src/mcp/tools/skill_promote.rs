@@ -106,7 +106,7 @@ pub fn handle_skill_promote_from_reflection(
     active_keypair: Option<&AgentKeypair>,
 ) -> Result<Value, String> {
     // ─── 1. Argument parsing ────────────────────────────────────────────
-    let reflection_id = params["reflection_id"]
+    let reflection_id = params[field_names::REFLECTION_ID]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'reflection_id'")?;
@@ -114,12 +114,12 @@ pub fn handle_skill_promote_from_reflection(
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'skill_name'")?;
-    let skill_description = params["skill_description"]
+    let skill_description = params[field_names::SKILL_DESCRIPTION]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'skill_description'")?;
     let parameters_schema: Option<&Value> = params
-        .get("parameters_schema")
+        .get(field_names::PARAMETERS_SCHEMA)
         .filter(|v| !v.is_null() && v.is_object());
 
     // Validate skill name against agentskills.io §3.1 BEFORE any DB work
@@ -139,7 +139,7 @@ pub fn handle_skill_promote_from_reflection(
         "skill_promote_from_reflection",
         "",
         serde_json::json!({
-            "reflection_id": reflection_id,
+            (field_names::REFLECTION_ID): reflection_id,
             (field_names::SKILL_NAME): skill_name,
         }),
     );

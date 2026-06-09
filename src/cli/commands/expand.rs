@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 
 use crate::cli::CliOutput;
 use crate::config::AppConfig;
+use crate::models::field_names;
 
 /// Exit code when no LLM backend is configured (503-equivalent — the
 /// expansion primitive is unreachable, not failing).
@@ -126,7 +127,7 @@ pub fn run_with_llm(
                 serde_json::to_string(&json!({
                     "query": args.query,
                     "error": msg,
-                    "key_source": key_source,
+                    (field_names::KEY_SOURCE): key_source,
                 }))?
             )?;
         } else {
@@ -143,7 +144,7 @@ pub fn run_with_llm(
     match result {
         Ok(envelope) => {
             let terms = envelope
-                .get("expanded_terms")
+                .get(field_names::EXPANDED_TERMS)
                 .cloned()
                 .unwrap_or_else(|| json!([]));
             if args.json {
@@ -152,9 +153,9 @@ pub fn run_with_llm(
                     "{}",
                     serde_json::to_string(&json!({
                         "query": args.query,
-                        "expanded_terms": terms,
-                        "elapsed_ms": elapsed_ms,
-                        "key_source": key_source,
+                        (field_names::EXPANDED_TERMS): terms,
+                        (field_names::ELAPSED_MS): elapsed_ms,
+                        (field_names::KEY_SOURCE): key_source,
                     }))?
                 )?;
             } else {
@@ -180,8 +181,8 @@ pub fn run_with_llm(
                     serde_json::to_string(&json!({
                         "query": args.query,
                         "error": e,
-                        "elapsed_ms": elapsed_ms,
-                        "key_source": key_source,
+                        (field_names::ELAPSED_MS): elapsed_ms,
+                        (field_names::KEY_SOURCE): key_source,
                     }))?
                 )?;
             } else {

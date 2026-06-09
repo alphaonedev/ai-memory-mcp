@@ -34,6 +34,10 @@ use crate::cli::CliOutput;
 use crate::db;
 use crate::models::{Memory, MemoryKind};
 
+/// Reflection-export subdirectory under `~/.ai-memory` — shared with the
+/// post-reflect auto-export hook (#1558 batch 6).
+pub(crate) const REFLECTIONS_SUBDIR: &str = "reflections";
+
 /// CLI args for `ai-memory export-reflections`.
 #[derive(Args, Debug, Clone)]
 pub struct ExportReflectionsArgs {
@@ -117,7 +121,7 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
         let filename = format!("{}.{}", mem.id, format.extension());
         let path = ns_dir.join(&filename);
-        fs::write(&path, payload).with_context(|| format!("writing {}", path.display()))?;
+        fs::write(&path, payload).with_context(|| crate::errors::msg::writing(path.display()))?;
         summary.written += 1;
         if !args.quiet {
             writeln!(out.stdout, "wrote {}", path.display())?;
@@ -181,9 +185,11 @@ pub(crate) fn resolve_out_dir(explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(p.to_path_buf());
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".ai-memory").join("reflections"));
+        return Ok(PathBuf::from(home)
+            .join(crate::AI_MEMORY_HOME_DIR_NAME)
+            .join(REFLECTIONS_SUBDIR));
     }
-    Ok(PathBuf::from(".ai-memory").join("reflections"))
+    Ok(PathBuf::from(crate::AI_MEMORY_HOME_DIR_NAME).join(REFLECTIONS_SUBDIR))
 }
 
 /// Namespace → safe filesystem path component. Slashes are preserved

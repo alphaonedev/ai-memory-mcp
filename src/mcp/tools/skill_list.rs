@@ -91,15 +91,15 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
             entry["license"] = json!(lic);
         }
         if let Some(compat) = compatibility {
-            entry["compatibility"] = json!(compat);
+            entry[field_names::COMPATIBILITY] = json!(compat);
         }
         if let Some(tools_json) = allowed_tools {
             if let Ok(v) = serde_json::from_str::<Value>(&tools_json) {
-                entry["allowed_tools"] = v;
+                entry[field_names::ALLOWED_TOOLS] = v;
             }
         }
         if let Some(agent) = signing_agent {
-            entry["signing_agent"] = json!(agent);
+            entry[field_names::SIGNING_AGENT] = json!(agent);
         }
         // metadata is a JSON string — include it parsed.
         if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {

@@ -27,6 +27,11 @@ use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
 use crate::reranker::{BatchedReranker, CrossEncoder};
 
+/// Effective-tier banner label for the fully-provisioned tier — the
+/// `config.rs` `FeatureTier` spellings are vendor-carve-out-frozen, so the
+/// banner keeps a file-local spelling (#1558 batch 6).
+const EFFECTIVE_TIER_AUTONOMOUS: &str = "autonomous";
+
 pub(super) mod registry;
 
 // v0.7.x (#1154) — daemon-side Ed25519-signed `serverInfo` block for
@@ -2784,7 +2789,7 @@ pub fn run_mcp_server(
                      building dedicated Ollama embed client at {embed_url} (#1143)"
                 );
             }
-            match OllamaClient::new_with_url(embed_url, "nomic-embed-text") {
+            match OllamaClient::new_with_url(embed_url, crate::embeddings::NOMIC_OLLAMA_MODEL) {
                 Ok(client) => Some(Arc::new(client)),
                 Err(e) => {
                     eprintln!(
@@ -2874,7 +2879,7 @@ pub fn run_mcp_server(
 
     // Report effective tier
     let effective_tier = if llm.is_some() && embedder.is_some() && reranker.is_some() {
-        "autonomous"
+        EFFECTIVE_TIER_AUTONOMOUS
     } else if llm.is_some() && embedder.is_some() {
         "smart"
     } else if embedder.is_some() {

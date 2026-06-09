@@ -146,7 +146,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 return ShellAction::Continue;
             }
             if let Err(e) = validate::validate_id(id) {
-                let _ = writeln!(out.stderr, "invalid id: {e}");
+                let _ = writeln!(out.stderr, "{}", crate::errors::msg::invalid("id", e));
                 return ShellAction::Continue;
             }
             match db::get(conn, id) {
@@ -182,7 +182,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
             }
             let raw_id = parts[1];
             if let Err(e) = validate::validate_id(raw_id) {
-                let _ = writeln!(out.stderr, "invalid id: {e}");
+                let _ = writeln!(out.stderr, "{}", crate::errors::msg::invalid("id", e));
                 return ShellAction::Continue;
             }
             let resolved_id = match db::get(conn, raw_id) {
@@ -349,7 +349,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
             }
         },
-        "namespaces" | "ns" => match db::list_namespaces(conn) {
+        field_names::NAMESPACES | "ns" => match db::list_namespaces(conn) {
             Ok(ns) => {
                 for n in &ns {
                     let _ = writeln!(out.stdout, "  {}: {}", color::cyan(&n.namespace), n.count);
@@ -366,7 +366,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 return ShellAction::Continue;
             }
             if let Err(e) = validate::validate_id(id) {
-                let _ = writeln!(out.stderr, "invalid id: {e}");
+                let _ = writeln!(out.stderr, "{}", crate::errors::msg::invalid("id", e));
                 return ShellAction::Continue;
             }
             match db::delete(conn, id) {

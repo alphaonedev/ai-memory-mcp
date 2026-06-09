@@ -65,8 +65,8 @@ impl AutoPersonaConfig {
     #[must_use]
     pub fn default_for_home() -> Self {
         let base = dirs::home_dir()
-            .map(|h| h.join(".ai-memory").join("personas"))
-            .unwrap_or_else(|| PathBuf::from(".ai-memory").join("personas"));
+            .map(|h| h.join(crate::AI_MEMORY_HOME_DIR_NAME).join("personas"))
+            .unwrap_or_else(|| PathBuf::from(crate::AI_MEMORY_HOME_DIR_NAME).join("personas"));
         Self { out_dir: base }
     }
 }

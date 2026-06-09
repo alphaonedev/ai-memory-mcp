@@ -502,7 +502,7 @@ pub fn handle_reflect(
     Ok(json!({
         "id": outcome.id,
         (field_names::REFLECTION_DEPTH): outcome.reflection_depth,
-        "reflects_on": outcome.reflects_on,
+        (crate::models::link::REL_REFLECTS_ON): outcome.reflects_on,
         "namespace": outcome.namespace,
     }))
 }

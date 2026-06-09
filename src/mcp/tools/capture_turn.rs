@@ -407,7 +407,7 @@ pub fn handle_capture_turn(
             "memory_id": result.memory_id,
             "dedup_hit": true,
             "layer": "L4",
-            "elapsed_ms": elapsed_ms,
+            (field_names::ELAPSED_MS): elapsed_ms,
         }))
     } else {
         Ok(json!({
@@ -415,7 +415,7 @@ pub fn handle_capture_turn(
             "dedup_hit": false,
             "layer": "L4",
             (field_names::ATTEST_LEVEL): attest_level,
-            "elapsed_ms": elapsed_ms,
+            (field_names::ELAPSED_MS): elapsed_ms,
         }))
     }
 }

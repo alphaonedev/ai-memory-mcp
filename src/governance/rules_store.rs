@@ -29,6 +29,10 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+/// `attest_level` value carried by operator-signed governance rules —
+/// shared with `governance install-defaults` (#1558 batch 6).
+pub(crate) const ATTEST_OPERATOR_SIGNED: &str = "operator_signed";
+
 /// One row of `governance_rules`. Field order matches the SQL column
 /// order so projection / debugging is symmetric.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +207,7 @@ pub fn enforced_rule_passes(
     operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> bool {
     match (operator_pubkey, rule.attest_level.as_str()) {
-        (Some(pk), "operator_signed") => match verify_rule_signature(rule, pk) {
+        (Some(pk), ATTEST_OPERATOR_SIGNED) => match verify_rule_signature(rule, pk) {
             Ok(()) => true,
             Err(_) => {
                 tracing::error!(

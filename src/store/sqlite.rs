@@ -81,7 +81,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         let v: i64 = conn
             .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
                 [],
                 |row| row.get(0),
             )

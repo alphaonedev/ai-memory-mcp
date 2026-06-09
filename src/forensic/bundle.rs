@@ -78,6 +78,9 @@ use crate::cli::CliOutput;
 use crate::identity::keypair as kp_mod;
 use crate::identity::sign::SignableLink;
 
+/// Bundle manifest entry name (#1558 batch 6).
+const MANIFEST_FILE_NAME: &str = "manifest.json";
+
 // ─────────────────────────────────────────────────────────────────────
 // Public arguments (consumed by daemon_runtime dispatch)
 // ─────────────────────────────────────────────────────────────────────
@@ -634,7 +637,7 @@ pub fn build_files(
     }
 
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("serialise Manifest")?;
-    files.insert("manifest.json".to_string(), manifest_bytes);
+    files.insert(MANIFEST_FILE_NAME.to_string(), manifest_bytes);
 
     Ok(files)
 }
@@ -841,7 +844,7 @@ fn build_atomisation_envelope(
 
     let archived_at = mem
         .metadata
-        .get("atomisation_archived_at")
+        .get(crate::models::field_names::ATOMISATION_ARCHIVED_AT)
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
 
@@ -1114,7 +1117,7 @@ pub fn verify(bundle_path: &Path) -> Result<VerificationReport> {
     let files = read_ustar(&bytes).context("parse forensic bundle tar")?;
 
     let manifest_bytes = files
-        .get("manifest.json")
+        .get(MANIFEST_FILE_NAME)
         .ok_or_else(|| anyhow!("bundle is missing manifest.json"))?
         .clone();
     let manifest: Manifest =
@@ -1141,7 +1144,7 @@ pub fn verify(bundle_path: &Path) -> Result<VerificationReport> {
         .map(|m| (m.path.as_str(), m))
         .collect();
     for (path, body) in &files {
-        if path == "manifest.json" {
+        if path == MANIFEST_FILE_NAME {
             continue;
         }
         match manifest_index.get(path.as_str()) {

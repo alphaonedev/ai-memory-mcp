@@ -108,8 +108,8 @@ pub(super) fn register_core(
         "name": name,
         (field_names::DESCRIPTION): description,
         "license": license,
-        "compatibility": compatibility,
-        "allowed_tools": allowed_tools,
+        (field_names::COMPATIBILITY): compatibility,
+        (field_names::ALLOWED_TOOLS): allowed_tools,
     }))
     .map_err(|e| format!("frontmatter JSON error: {e}"))?;
 

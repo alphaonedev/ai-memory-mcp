@@ -148,7 +148,7 @@ pub enum RollbackEntry {
 impl RollbackEntry {
     fn action_tag(&self) -> &'static str {
         match self {
-            Self::Consolidate { .. } => "consolidate",
+            Self::Consolidate { .. } => crate::audit::OP_CONSOLIDATE,
             Self::Forget { .. } => "forget",
             Self::PriorityAdjust { .. } => "priority_adjust",
         }

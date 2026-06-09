@@ -308,7 +308,7 @@ impl BootStatus {
 /// failing boot.
 fn read_schema_version(conn: &rusqlite::Connection) -> (String, Option<u32>) {
     match conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
         [],
         |r| r.get::<_, i64>(0),
     ) {
@@ -741,7 +741,7 @@ fn emit_status_header(
                     "embedder": manifest.embedder,
                     "reranker": manifest.reranker,
                     "llm": manifest.llm,
-                    "latency_ms": manifest.latency_ms,
+                    (field_names::LATENCY_MS): manifest.latency_ms,
                     "namespace": manifest.namespace,
                     "count": manifest.count,
                     "note": manifest.note,
@@ -876,7 +876,7 @@ fn emit_json_with_status(
         "embedder": manifest.embedder,
         "reranker": manifest.reranker,
         "llm": manifest.llm,
-        "latency_ms": manifest.latency_ms,
+        (field_names::LATENCY_MS): manifest.latency_ms,
         "namespace": manifest.namespace,
         "count": manifest.count,
         "note": manifest.note,

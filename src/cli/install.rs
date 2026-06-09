@@ -44,6 +44,10 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
+// ── #1558 batch 6 — repeated `.expect` labels on just-built JSON nodes ──
+const EXPECT_JUST_INSERTED_OBJECT: &str = "just-inserted object";
+const EXPECT_JUST_INSERTED_ARRAY: &str = "just-inserted array";
+
 /// Sentinel key that marks the start of a managed block. Used by both
 /// install (to recognise an existing block) and uninstall (to find the
 /// block to remove).
@@ -427,7 +431,7 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
     }
 
     std::fs::write(&config_path, &after_text)
-        .with_context(|| format!("writing {}", config_path.display()))?;
+        .with_context(|| crate::errors::msg::writing(config_path.display()))?;
 
     writeln!(
         out.stdout,
@@ -810,8 +814,8 @@ fn read_config_or_empty(path: &Path) -> Result<(String, Value)> {
     if !path.exists() {
         return Ok((String::new(), Value::Object(Map::new())));
     }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| crate::errors::msg::reading(path.display()))?;
     if text.trim().is_empty() {
         return Ok((text, Value::Object(Map::new())));
     }
@@ -951,7 +955,9 @@ fn apply_mcp_standard(obj: &mut Map<String, Value>, binary: &str, mcp_key: &str)
     if !mcp_servers.is_object() {
         *mcp_servers = Value::Object(Map::new());
     }
-    let mcp_obj = mcp_servers.as_object_mut().expect("just-inserted object");
+    let mcp_obj = mcp_servers
+        .as_object_mut()
+        .expect(EXPECT_JUST_INSERTED_OBJECT);
     mcp_obj.insert(
         "ai-memory".to_string(),
         serde_json::json!({
@@ -1014,14 +1020,16 @@ fn apply_claude_code(obj: &mut Map<String, Value>, binary: &str) {
     if !hooks.is_object() {
         *hooks = Value::Object(Map::new());
     }
-    let hooks_obj = hooks.as_object_mut().expect("just-inserted object");
+    let hooks_obj = hooks.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let session_start = hooks_obj
         .entry(HOOK_EVENT_SESSION_START.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !session_start.is_array() {
         *session_start = Value::Array(Vec::new());
     }
-    let arr = session_start.as_array_mut().expect("just-inserted array");
+    let arr = session_start
+        .as_array_mut()
+        .expect(EXPECT_JUST_INSERTED_ARRAY);
     arr.retain(|v| !is_managed_value(v));
     arr.insert(0, entry);
 }
@@ -1133,14 +1141,14 @@ fn apply_claude_code_pretool(
     if !hooks.is_object() {
         *hooks = Value::Object(Map::new());
     }
-    let hooks_obj = hooks.as_object_mut().expect("just-inserted object");
+    let hooks_obj = hooks.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let pretool = hooks_obj
         .entry(HOOK_EVENT_PRE_TOOL_USE.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !pretool.is_array() {
         *pretool = Value::Array(Vec::new());
     }
-    let arr = pretool.as_array_mut().expect("just-inserted array");
+    let arr = pretool.as_array_mut().expect(EXPECT_JUST_INSERTED_ARRAY);
 
     // Detect any operator-authored entry that points at the same MCP
     // tool with a different `matcher`. That's the conflict path —
@@ -1271,14 +1279,14 @@ fn apply_openclaw(obj: &mut Map<String, Value>, binary: &str) {
     if !mcp.is_object() {
         *mcp = Value::Object(Map::new());
     }
-    let mcp_obj = mcp.as_object_mut().expect("just-inserted object");
+    let mcp_obj = mcp.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let servers = mcp_obj
         .entry("servers".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if !servers.is_object() {
         *servers = Value::Object(Map::new());
     }
-    let servers_obj = servers.as_object_mut().expect("just-inserted object");
+    let servers_obj = servers.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     servers_obj.insert("ai-memory".to_string(), ai_memory_server_value(binary));
 }
 
@@ -1309,7 +1317,7 @@ fn apply_cursor(obj: &mut Map<String, Value>, binary: &str) {
     if !servers.is_object() {
         *servers = Value::Object(Map::new());
     }
-    let servers_obj = servers.as_object_mut().expect("just-inserted object");
+    let servers_obj = servers.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     servers_obj.insert("ai-memory".to_string(), ai_memory_server_value(binary));
 }
 
@@ -1348,14 +1356,14 @@ fn apply_continue(obj: &mut Map<String, Value>, binary: &str) {
     if !exp.is_object() {
         *exp = Value::Object(Map::new());
     }
-    let exp_obj = exp.as_object_mut().expect("just-inserted object");
+    let exp_obj = exp.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let arr = exp_obj
         .entry(KEY_MODEL_CONTEXT_PROTOCOL_SERVERS.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !arr.is_array() {
         *arr = Value::Array(Vec::new());
     }
-    let arr = arr.as_array_mut().expect("just-inserted array");
+    let arr = arr.as_array_mut().expect(EXPECT_JUST_INSERTED_ARRAY);
     arr.retain(|v| !is_managed_value(v));
     let entry = serde_json::json!({
         MARKER_START_KEY: MARKER_PAYLOAD,

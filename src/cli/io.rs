@@ -57,7 +57,7 @@ pub fn export(db_path: &Path, out: &mut CliOutput<'_>) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "memories": memories, "links": links, "count": memories.len(),
-            "exported_at": Utc::now().to_rfc3339(),
+            (crate::models::field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
         }))?
     )?;
     Ok(())
@@ -116,7 +116,7 @@ pub(crate) fn import_from_str(
                     && orig.as_str() != caller_id
                 {
                     obj.insert(
-                        "imported_from_agent_id".to_string(),
+                        crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
                         serde_json::Value::String(orig.clone()),
                     );
                     restamped += 1;

@@ -208,6 +208,12 @@ impl HookDecision {
     /// JSON object, when `action` is unknown, when a required
     /// field is missing, or when the JSON itself is syntactically
     /// invalid.
+    /// `"<field>" must be a string` — shared malformed-field shape
+    /// (#1558 batch 6; single synthesis site for the repeated message).
+    fn malformed_must_be_string(field: &str) -> DecisionParseError {
+        DecisionParseError::Malformed(format!("\"{field}\" must be a string"))
+    }
+
     pub fn parse(line: &str) -> Result<Self, DecisionParseError> {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed == "{}" {
@@ -228,7 +234,7 @@ impl HookDecision {
             .get("action")
             .ok_or(DecisionParseError::MissingAction)?
             .as_str()
-            .ok_or_else(|| DecisionParseError::Malformed("\"action\" must be a string".into()))?;
+            .ok_or_else(|| Self::malformed_must_be_string("action"))?;
 
         match action {
             "allow" => Ok(HookDecision::Allow),
@@ -249,9 +255,7 @@ impl HookDecision {
                         field: "reason",
                     })?
                     .as_str()
-                    .ok_or_else(|| {
-                        DecisionParseError::Malformed("\"reason\" must be a string".into())
-                    })?
+                    .ok_or_else(|| Self::malformed_must_be_string("reason"))?
                     .to_string();
                 let code = obj
                     .get("code")
@@ -269,9 +273,7 @@ impl HookDecision {
                         field: "prompt",
                     })?
                     .as_str()
-                    .ok_or_else(|| {
-                        DecisionParseError::Malformed("\"prompt\" must be a string".into())
-                    })?
+                    .ok_or_else(|| Self::malformed_must_be_string("prompt"))?
                     .to_string();
                 let options_v = obj.get("options").ok_or(DecisionParseError::MissingField {
                     action: "ask_user",
@@ -284,9 +286,7 @@ impl HookDecision {
                     Some(Value::Null) => None,
                     Some(v) => Some(
                         v.as_str()
-                            .ok_or_else(|| {
-                                DecisionParseError::Malformed("\"default\" must be a string".into())
-                            })?
+                            .ok_or_else(|| Self::malformed_must_be_string("default"))?
                             .to_string(),
                     ),
                 };

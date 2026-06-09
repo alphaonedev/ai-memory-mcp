@@ -92,7 +92,7 @@ pub fn cmd_kg_query(
         params["source_id"] = json!(sid);
     }
     if let Some(uri) = &args.by_source_uri {
-        params["by_source_uri"] = json!(uri);
+        params[crate::models::field_names::BY_SOURCE_URI] = json!(uri);
     }
     if let Some(d) = args.max_depth {
         params["max_depth"] = json!(d);
@@ -115,7 +115,7 @@ pub fn cmd_kg_query(
         params["limit"] = json!(l);
     }
     if args.include_invalidated {
-        params["include_invalidated"] = json!(true);
+        params[crate::models::field_names::INCLUDE_INVALIDATED] = json!(true);
     }
 
     let envelope = crate::mcp::handle_kg_query(&conn, &params)

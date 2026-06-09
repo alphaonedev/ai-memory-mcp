@@ -83,7 +83,7 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
     // forest rooted at the document. The traversal is unbounded (one
     // hop, since the goal is "what else is from this document") and
     // bypasses the `source_id`-required argument check.
-    let by_source_uri = params["by_source_uri"]
+    let by_source_uri = params[field_names::BY_SOURCE_URI]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -117,7 +117,7 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
             })
             .collect();
         return Ok(json!({
-            "by_source_uri": uri,
+            (field_names::BY_SOURCE_URI): uri,
             "memories": memories_json,
             "count": roots.len(),
         }));
@@ -160,7 +160,9 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
     // NHI-P3-T7 (v0.7.0 NHI testing): default to "current view" —
     // exclude edges whose `valid_until` lies in the past. Pass
     // `include_invalidated=true` to traverse the full historical graph.
-    let include_invalidated = params["include_invalidated"].as_bool().unwrap_or(false);
+    let include_invalidated = params[field_names::INCLUDE_INVALIDATED]
+        .as_bool()
+        .unwrap_or(false);
 
     let nodes = db::kg_query(
         conn,

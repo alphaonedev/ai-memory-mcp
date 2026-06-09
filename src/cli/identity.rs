@@ -26,6 +26,9 @@ use crate::cli::CliOutput;
 use crate::identity::{self, keypair};
 use crate::validate;
 
+/// JSON output field for the base64 public key (#1558 batch 6).
+const PUBLIC_KEY_B64_FIELD: &str = "public_key_b64";
+
 #[derive(Args)]
 pub struct IdentityArgs {
     /// Override the default key storage directory.
@@ -184,7 +187,7 @@ fn generate(
                 "generated": true,
                 "agent_id": id,
                 "key_dir": dir,
-                "public_key_b64": kp.public_base64(),
+                (PUBLIC_KEY_B64_FIELD): kp.public_base64(),
             })
         )?;
     } else {
@@ -246,7 +249,7 @@ fn import(
                 "agent_id": agent_id,
                 "key_dir": dir,
                 "private_imported": kp.private.is_some(),
-                "public_key_b64": kp.public_base64(),
+                (PUBLIC_KEY_B64_FIELD): kp.public_base64(),
             })
         )?;
     } else {
@@ -269,7 +272,7 @@ fn list(dir: &Path, json_out: bool, out: &mut CliOutput<'_>) -> Result<()> {
             .map(|k| {
                 serde_json::json!({
                     "agent_id": k.agent_id,
-                    "public_key_b64": k.public_base64(),
+                    (PUBLIC_KEY_B64_FIELD): k.public_base64(),
                 })
             })
             .collect();
@@ -301,7 +304,7 @@ fn export_pub(dir: &Path, agent_id: &str, json_out: bool, out: &mut CliOutput<'_
             "{}",
             serde_json::json!({
                 "agent_id": agent_id,
-                "public_key_b64": kp.public_base64(),
+                (PUBLIC_KEY_B64_FIELD): kp.public_base64(),
             })
         )?;
     } else {

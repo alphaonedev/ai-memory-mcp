@@ -192,7 +192,7 @@ pub async fn skill_resource_route(
     }
     let params = json!({
         "skill_id": id,
-        "resource_path": q.path,
+        (field_names::RESOURCE_PATH): q.path,
     });
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_resource(&lock.0, &params) {
@@ -276,12 +276,12 @@ pub async fn skill_promote_route(
         return resp;
     }
     let mut params = json!({
-        "reflection_id": id,
+        (field_names::REFLECTION_ID): id,
         (field_names::SKILL_NAME): body.name,
-        "skill_description": body.description,
+        (field_names::SKILL_DESCRIPTION): body.description,
     });
     if let Some(ps) = body.parameters_schema {
-        params["parameters_schema"] = ps;
+        params[field_names::PARAMETERS_SCHEMA] = ps;
     }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();

@@ -75,8 +75,10 @@ impl AutoExportConfig {
     /// Construct with the canonical default `out_dir`.
     #[must_use]
     pub fn default_for_home() -> Self {
-        let out_dir = export_reflections::resolve_out_dir(None)
-            .unwrap_or_else(|_| PathBuf::from(".ai-memory").join("reflections"));
+        let out_dir = export_reflections::resolve_out_dir(None).unwrap_or_else(|_| {
+            PathBuf::from(crate::AI_MEMORY_HOME_DIR_NAME)
+                .join(export_reflections::REFLECTIONS_SUBDIR)
+        });
         Self {
             out_dir,
             format: ExportFormat::Markdown,

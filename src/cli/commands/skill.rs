@@ -371,7 +371,7 @@ fn run_resource(
 ) -> Result<i32> {
     let params = json!({
         "skill_id": args.id,
-        "resource_path": args.path,
+        (field_names::RESOURCE_PATH): args.path,
     });
     match crate::mcp::handle_skill_resource(conn, &params) {
         Ok(v) => {
@@ -430,16 +430,16 @@ fn run_promote(
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let mut params = json!({
-        "reflection_id": args.id,
+        (field_names::REFLECTION_ID): args.id,
         (field_names::SKILL_NAME): args.name,
-        "skill_description": args.description,
+        (field_names::SKILL_DESCRIPTION): args.description,
     });
     if let Some(ref p) = args.parameters_schema {
         let raw = std::fs::read_to_string(p)
             .map_err(|e| anyhow::anyhow!("read parameters_schema {}: {e}", p.display()))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parse parameters_schema {}: {e}", p.display()))?;
-        params["parameters_schema"] = v;
+        params[field_names::PARAMETERS_SCHEMA] = v;
     }
     match crate::mcp::handle_skill_promote_from_reflection(conn, &params, active_keypair) {
         Ok(v) => {

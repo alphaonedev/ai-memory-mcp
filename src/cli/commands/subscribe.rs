@@ -86,7 +86,7 @@ pub fn cmd_subscribe(
         params[field_names::AGENT_FILTER] = json!(a);
     }
     if !args.event_types.is_empty() {
-        params["event_types"] = json!(args.event_types);
+        params[field_names::EVENT_TYPES] = json!(args.event_types);
     }
 
     let envelope = crate::mcp::handle_subscribe(&conn, &params, None)

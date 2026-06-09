@@ -210,7 +210,7 @@ pub async fn handle_reflect_http(
             Json(json!({
                 "id": outcome.id,
                 (field_names::REFLECTION_DEPTH): outcome.reflection_depth,
-                "reflects_on": outcome.reflects_on,
+                (crate::models::link::REL_REFLECTS_ON): outcome.reflects_on,
                 "namespace": outcome.namespace,
             })),
         )
@@ -309,7 +309,7 @@ pub async fn handle_recall_observations_http(
                 let count = rows.len();
                 (
                     StatusCode::OK,
-                    Json(json!({ "observations": rows, "count": count })),
+                    Json(json!({ (field_names::OBSERVATIONS): rows, "count": count })),
                 )
                     .into_response()
             }
@@ -349,10 +349,10 @@ pub async fn handle_reflection_origin_http(
                 Json(json!({
                     "memory_id": record.memory_id,
                     (field_names::PEER_ORIGIN): record.peer_origin,
-                    "signing_agent": record.signing_agent,
-                    "original_depth": record.original_depth,
-                    "local_depth_at_arrival": record.local_depth_at_arrival,
-                    "is_reflection": record.is_reflection,
+                    (field_names::SIGNING_AGENT): record.signing_agent,
+                    (field_names::ORIGINAL_DEPTH): record.original_depth,
+                    (field_names::LOCAL_DEPTH_AT_ARRIVAL): record.local_depth_at_arrival,
+                    (field_names::IS_REFLECTION): record.is_reflection,
                 })),
             )
                 .into_response(),
