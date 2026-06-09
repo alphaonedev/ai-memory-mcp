@@ -30,6 +30,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
+/// Tracing target for the subscription fan-out / DLQ surface
+/// (#1558 tracing-target SSOT).
+const SUBSCRIPTIONS_TRACE_TARGET: &str = "ai_memory::subscriptions";
+
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
@@ -1456,7 +1460,7 @@ pub(crate) fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
         Some(k) => k,
         None => {
             tracing::warn!(
-                target: "ai_memory::subscriptions",
+                target: SUBSCRIPTIONS_TRACE_TARGET,
                 "hmac_sha256_hex: hmac_secret is not valid hex (len={}); falling back to raw \
                  bytes as key material — this produces a STABLE BUT WEAK key. Re-encode the \
                  secret as hex (e.g. `openssl rand -hex 32`) and restart the daemon. \
@@ -1686,7 +1690,7 @@ fn validate_url_dns_with(
     if hostname_shape_invalid(&resolved_host) {
         if ssrf_dns_fail_open() {
             tracing::warn!(
-                target: "ai_memory::subscriptions",
+                target: SUBSCRIPTIONS_TRACE_TARGET,
                 "SSRF guard: hostname {resolved_host} violates RFC 1035 label/length \
                  limits for {url}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
                  ALLOW (UNSAFE, legacy posture)"
@@ -1705,7 +1709,7 @@ fn validate_url_dns_with(
             let fail_open = ssrf_dns_fail_open();
             if fail_open {
                 tracing::warn!(
-                    target: "ai_memory::subscriptions",
+                    target: SUBSCRIPTIONS_TRACE_TARGET,
                     "SSRF guard: DNS resolution failed for {url}: {e}; \
                      AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to ALLOW \
                      (UNSAFE, legacy posture) — reqwest's resolver may bind to \

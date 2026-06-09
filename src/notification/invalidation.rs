@@ -288,7 +288,7 @@ fn write_notification(
         // a torn write but don't fail the walker (other dependents
         // still need their notifications).
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             dependent_id = %pending.dependent_id,
             invalidated_id = %pending.invalidated_id,
             "failed to append reflection.invalidation_notified row: {e}"

@@ -332,7 +332,7 @@ pub fn require_caller_owns_memory(
         }
     }
     tracing::warn!(
-        target: "ai_memory::authz",
+        target: super::AUTHZ_TRACE_TARGET,
         "ownership-gate 403: caller {caller} != owner {owner} (id={})",
         mem.id
     );

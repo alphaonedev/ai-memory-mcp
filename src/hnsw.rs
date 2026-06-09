@@ -26,6 +26,9 @@ use std::thread::JoinHandle;
 
 use crate::hooks::EvictionEvent;
 
+/// Tracing target for the HNSW eviction worker (#1558 tracing-target SSOT).
+const EVICTION_TRACE_TARGET: &str = "hnsw.eviction";
+
 /// Maximum overflow entries before triggering a rebuild.
 const REBUILD_THRESHOLD: usize = 200;
 
@@ -549,7 +552,7 @@ impl VectorIndex {
             // attribution; this one is the high-level "the index
             // dropped N oldest embeddings" signal operators alert on.
             tracing::warn!(
-                target: "hnsw.eviction",
+                target: EVICTION_TRACE_TARGET,
                 dropped = excess,
                 max_entries = max_entries,
                 "HNSW eviction: dropped {} oldest embeddings to make room",
@@ -578,7 +581,7 @@ impl VectorIndex {
             let sink_guard = self.eviction_sink.lock().ok();
             for (evicted_id, _) in state.all_entries.iter().take(excess) {
                 tracing::warn!(
-                    target: "hnsw.eviction",
+                    target: EVICTION_TRACE_TARGET,
                     evicted_id = %evicted_id,
                     reason = "max_entries_reached",
                     max_entries = max_entries,
@@ -686,7 +689,7 @@ impl VectorIndex {
             let recent = record_eviction_and_count_recent(now_nanos_u64);
             if recent > EVICTION_RATE_CEILING_PER_HOUR {
                 tracing::error!(
-                    target: "hnsw.eviction",
+                    target: EVICTION_TRACE_TARGET,
                     rate_per_hour = recent,
                     ceiling = EVICTION_RATE_CEILING_PER_HOUR,
                     "HNSW eviction rate exceeded {}/hour — recall quality is degrading; \

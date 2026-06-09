@@ -45,6 +45,11 @@
 //! - [`parity`]      — cross-cutting HTTP-parity helpers.
 //! - [`approvals`]   — v0.7.0 K10 approval API.
 
+/// Tracing target for HTTP-layer authorization (ownership-gate /
+/// caller-resolution) denials, shared across the handler sub-modules
+/// (#1558 tracing-target SSOT).
+pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
+
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;

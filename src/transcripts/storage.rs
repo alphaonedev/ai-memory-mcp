@@ -13,6 +13,10 @@ use std::io::{Read, Write};
 
 use crate::config::{ResolvedTranscriptLifecycle, TranscriptsConfig};
 
+/// Tracing target for transcript retention / lifecycle sweeps
+/// (#1558 tracing-target SSOT).
+const LIFECYCLE_TRACE_TARGET: &str = "transcripts.lifecycle";
+
 /// Default zstd compression level. Matches `cli::logs::zstd_compress`
 /// for cross-codebase consistency.
 const ZSTD_LEVEL: i32 = 3;
@@ -418,7 +422,7 @@ fn archive_phase(
                     params![stamp, id],
                 ) {
                     tracing::warn!(
-                        target: "transcripts.lifecycle",
+                        target: LIFECYCLE_TRACE_TARGET,
                         "archive UPDATE failed for transcript {id}: {e}"
                     );
                     report.errors += 1;
@@ -429,7 +433,7 @@ fn archive_phase(
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(
-                    target: "transcripts.lifecycle",
+                    target: LIFECYCLE_TRACE_TARGET,
                     "archive eligibility check failed for transcript {id}: {e}"
                 );
                 report.errors += 1;
@@ -474,7 +478,7 @@ fn prune_phase(
             Ok(t) => t.with_timezone(&Utc),
             Err(e) => {
                 tracing::warn!(
-                    target: "transcripts.lifecycle",
+                    target: LIFECYCLE_TRACE_TARGET,
                     "transcript {id} has unparseable archived_at {archived_at:?}: {e}"
                 );
                 report.errors += 1;
@@ -489,7 +493,7 @@ fn prune_phase(
             Ok(n) => report.pruned += n,
             Err(e) => {
                 tracing::warn!(
-                    target: "transcripts.lifecycle",
+                    target: LIFECYCLE_TRACE_TARGET,
                     "prune DELETE failed for transcript {id}: {e}"
                 );
                 report.errors += 1;

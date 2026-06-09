@@ -46,6 +46,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Tracing target for the forensic audit sink (#1558 tracing-target SSOT).
+const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
+
 /// Sentinel `prev_hash` for the first line of a fresh chain.
 pub const CHAIN_HEAD_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -183,7 +186,7 @@ fn run_writer(rx: Receiver<WriteOp>) {
                             Ok(file) => open_file = Some((path, file)),
                             Err(e) => {
                                 tracing::error!(
-                                    target: "ai_memory::governance::audit",
+                                    target: AUDIT_TRACE_TARGET,
                                     "forensic: opening {} failed: {e}",
                                     path.display()
                                 );
@@ -195,7 +198,7 @@ fn run_writer(rx: Receiver<WriteOp>) {
                     if let Some((path, file)) = open_file.as_mut() {
                         if let Err(e) = writeln!(file, "{line}") {
                             tracing::error!(
-                                target: "ai_memory::governance::audit",
+                                target: AUDIT_TRACE_TARGET,
                                 "forensic: appending to {} failed: {e}",
                                 path.display()
                             );
@@ -445,7 +448,7 @@ pub fn record_decision(
 ) {
     if let Err(e) = try_record_decision(actor, decision, kind, rule_id, payload) {
         tracing::error!(
-            target: "ai_memory::governance::audit",
+            target: AUDIT_TRACE_TARGET,
             "forensic: emission failed: {e}"
         );
     }

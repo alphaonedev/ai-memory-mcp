@@ -37,6 +37,11 @@ use crate::config::{PermissionsMode, active_permissions_mode};
 use crate::hooks::decision::HookDecision;
 use crate::hooks::events::MemoryDelta;
 
+/// Tracing target for governance-gate log lines (#1558 tracing-target
+/// SSOT). Distinct from the `governance` Family taxonomy name and the
+/// `metadata.governance` key (`crate::META_KEY_GOVERNANCE`).
+pub(crate) const GOVERNANCE_TRACE_TARGET: &str = "governance";
+
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 // The K9 pipeline below gates substrate-INTERNAL ops (memory_store,
 // memory_link, ...). `agent_action` adds the parallel engine for

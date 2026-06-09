@@ -140,7 +140,7 @@ pub(super) async fn post_once(
         match cred.to_header_value() {
             Ok(value) => req = req.header(CREDENTIAL_HEADER, value),
             Err(e) => {
-                tracing::warn!(target: "federation::signing", error = %e,
+                tracing::warn!(target: super::SIGNING_TRACE_TARGET, error = %e,
                     "failed to encode outbound federation credential header; omitting");
             }
         }
@@ -154,7 +154,7 @@ pub(super) async fn post_once(
             Ok(Some(value)) => req = req.header(CHAIN_HEADER, value),
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(target: "federation::signing", error = %e,
+                tracing::warn!(target: super::SIGNING_TRACE_TARGET, error = %e,
                     "failed to encode outbound federation chain header; omitting");
             }
         }
@@ -300,7 +300,7 @@ pub async fn broadcast_store_quorum(
     // operators tailing `docker logs alice | grep federation` see
     // it without flipping `RUST_LOG=debug`.
     tracing::info!(
-        target: "ai_memory::federation::sync",
+        target: super::SYNC_TRACE_TARGET,
         memory_id = %mem.id,
         namespace = %mem.namespace,
         peer_count = config.peers.len(),
@@ -528,7 +528,7 @@ pub async fn broadcast_store_quorum(
                 .await
             {
                 tracing::warn!(
-                    target: "ai_memory::federation::push_dlq",
+                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
                     memory_id = %mem.id,
                     peer_id = %peer_id,
                     "federation: failed to enqueue push-failure DLQ row \
@@ -537,7 +537,7 @@ pub async fn broadcast_store_quorum(
                 );
             } else {
                 tracing::info!(
-                    target: "ai_memory::federation::push_dlq",
+                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
                     memory_id = %mem.id,
                     peer_id = %peer_id,
                     reason = %reason,
