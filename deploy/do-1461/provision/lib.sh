@@ -84,7 +84,10 @@ FED_CRED_TTL_SECS="${FED_CRED_TTL_SECS:-604800}"   # 7 * SECS_PER_DAY
 #     different domain rejects it (TrustBundle::with_trust_domain isolation).
 FED_ISSUER_ID="${FED_ISSUER_ID:-$CAMPAIGN-ca}"
 FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
-GOLDEN_SHA256="${GOLDEN_SHA256:-f63e603fa05218d66ba03468b1d1eea021bd5ffc79cfb4919c3aaff9beb267d8}"
+# Golden ai-memory linux-x86_64 sha256, --features sal,sal-postgres,sqlite-bundled.
+# Re-pinned for release/v0.7.0 @ dc8666cc (PR #1523 merged: nomic asymmetric
+# search_document:/search_query: prefixes, #1520) — tree afa409bf, reproducible.
+GOLDEN_SHA256="${GOLDEN_SHA256:-2b5579104ad81b7241922d5163b9adb20c4c37c06013fdb967875267ba5718fe}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"
 
@@ -132,6 +135,10 @@ BATMAN_ENV_VALUES=(
 BATMAN_SEED_RULES=(R001 R002 R003 R004)
 BATMAN_CURATOR_INTERVAL_SECS="${BATMAN_CURATOR_INTERVAL_SECS:-300}"
 BATMAN_CURATOR_MAX_OPS="${BATMAN_CURATOR_MAX_OPS:-100}"
+# Curator-liveness gate (#1550): the curator daemon must be `active` with
+# at most this many systemd auto-restarts. A crash-loop (the #1547 unit
+# bug exited 2 → hundreds of restarts) trips the test harness curator group.
+CURATOR_HEALTH_MAX_RESTARTS="${CURATOR_HEALTH_MAX_RESTARTS:-3}"
 
 # ---------------------------------------------------------------------------
 # Pinned PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2 substrate — NATIVE

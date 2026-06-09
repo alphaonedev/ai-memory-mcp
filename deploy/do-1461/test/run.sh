@@ -605,6 +605,26 @@ SQL" 2>/dev/null | tail -1)"
   esac
 done
 
+# ====================== GROUP curator ========================================
+# #1550 — the recursive-IMPROVEMENT daemon (ai-memory-curator: ReflectionPass
+# + ConsolidationPass) MUST be live on every peer. The #1547 unit bug exited 2
+# and crash-looped (NRestarts in the hundreds) undetected across three
+# certification rounds because no check asserted curator liveness. This group
+# closes that gap: active + restart-count under CURATOR_HEALTH_MAX_RESTARTS.
+log "[curator] asserting ai-memory-curator daemon liveness on every peer (#1550)"
+for ip in $PEER_IPS; do
+  h="$(inv_name_for_ip "$ip")"
+  state="$(ssh_node "$ip" "systemctl is-active ai-memory-curator 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  assert_eq curator "curator_active[$h]" active "${state:-unknown}"
+  restarts="$(ssh_node "$ip" "systemctl show ai-memory-curator -p NRestarts --value 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  restarts="${restarts:-0}"
+  if [ "$restarts" -le "$CURATOR_HEALTH_MAX_RESTARTS" ] 2>/dev/null; then
+    pass curator "curator_no_crashloop[$h]" "NRestarts<=$CURATOR_HEALTH_MAX_RESTARTS" "$restarts"
+  else
+    fail curator "curator_no_crashloop[$h]" "NRestarts<=$CURATOR_HEALTH_MAX_RESTARTS" "$restarts (crash-loop)"
+  fi
+done
+
 # ---- assemble JSON report ---------------------------------------------------
 {
   printf '{\n  "campaign": "%s",\n  "timestamp": "%s",\n  "suite": "p3-full-spectrum",\n' "$CAMPAIGN" "$TS"
