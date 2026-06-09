@@ -55,7 +55,8 @@ pub fn handle_check_duplicate(
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            "similarity": (m.similarity * 1000.0).round() / 1000.0,
+            "similarity": (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                / crate::SCORE_DISPLAY_ROUND_FACTOR,
         })
     });
     let suggested_merge = if check.is_duplicate {

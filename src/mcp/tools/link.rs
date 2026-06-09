@@ -3,6 +3,7 @@
 
 //! MCP `memory_link` and `memory_get_links` handlers.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -235,7 +236,7 @@ pub(super) fn handle_link(
     let link_owner = db::get(conn, source_id).ok().flatten();
     let link_agent_id = link_owner.as_ref().and_then(|mem| {
         mem.metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string)
     });
@@ -293,7 +294,7 @@ pub(super) fn handle_link(
         Ok(Some(mem)) => {
             let owner = mem
                 .metadata
-                .get("agent_id")
+                .get(param_names::AGENT_ID)
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             (mem.namespace, owner)

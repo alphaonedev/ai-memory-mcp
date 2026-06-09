@@ -65,6 +65,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{Memory, MemoryKind, Tier};
 use crate::signed_events::{self, SignedEvent};
@@ -436,7 +437,7 @@ pub(crate) fn prepare_capture_turn(
     if let Some(meta_agent) = req
         .metadata
         .as_ref()
-        .and_then(|v| v.get("agent_id"))
+        .and_then(|v| v.get(param_names::AGENT_ID))
         .and_then(|v| v.as_str())
         && meta_agent != caller
     {

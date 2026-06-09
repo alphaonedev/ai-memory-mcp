@@ -18,6 +18,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::governance::rules_store::{self, Rule};
+use crate::mcp::param_names;
 
 /// Handler for `memory_rule_list`. Accepts:
 ///
@@ -37,7 +38,7 @@ use crate::governance::rules_store::{self, Rule};
 /// }
 /// ```
 pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Result<Value, String> {
-    let kind_filter = arguments.get("kind").and_then(Value::as_str);
+    let kind_filter = arguments.get(param_names::KIND).and_then(Value::as_str);
     let enabled_only = arguments
         .get("enabled_only")
         .and_then(Value::as_bool)

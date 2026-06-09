@@ -633,6 +633,12 @@ pub struct BenchArgs {
     pub history: Option<PathBuf>,
 }
 
+/// Default `--batch` page-size hint for `ai-memory migrate`. Currently
+/// an API-compatibility hint only — see the `MAX_ROWS` note in
+/// `src/migrate.rs::migrate`.
+#[cfg(feature = "sal")]
+const MIGRATE_BATCH_DEFAULT: usize = 1000;
+
 #[cfg(feature = "sal")]
 #[derive(Args)]
 pub struct MigrateArgs {
@@ -643,8 +649,10 @@ pub struct MigrateArgs {
     /// Destination URL. Same URL shape as `--from`.
     #[arg(long)]
     pub to: String,
-    /// Page size. Clamped to [1, 10000]. Default 1000.
-    #[arg(long, default_value_t = 1000)]
+    /// Page-size hint. Default 1000. Retained for API compatibility —
+    /// the current migrator reads one page capped at `MAX_ROWS`
+    /// (1,000,000) and refuses loudly past it; see `src/migrate.rs`.
+    #[arg(long, default_value_t = MIGRATE_BATCH_DEFAULT)]
     pub batch: usize,
     /// Only migrate memories in this namespace.
     #[arg(long)]
@@ -4290,9 +4298,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 // ---------------------------------------------------------------------------
 
 fn cmd_bench(args: &BenchArgs) -> Result<()> {
-    let iterations = args.iterations.clamp(1, 100_000);
-    let warmup = args.warmup.min(10_000);
-    let regression_threshold = args.regression_threshold.clamp(0.0, 1000.0);
+    let iterations = args.iterations.clamp(1, crate::bench::MAX_ITERATIONS);
+    let warmup = args.warmup.min(crate::bench::MAX_WARMUP);
+    let regression_threshold = args
+        .regression_threshold
+        .clamp(0.0, crate::bench::MAX_REGRESSION_THRESHOLD_PCT);
     // Bench always seeds a disposable in-memory DB so the operator's
     // main DB (and disk) are untouched. SQLite's `:memory:` URL and
     // WAL-less mode keep the workload bounded by RAM and CPU.

@@ -3,6 +3,7 @@
 
 //! MCP `memory_kg_invalidate` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -145,7 +146,7 @@ pub fn handle_kg_invalidate(
                 Ok(Some(mem)) => {
                     let owner = mem
                         .metadata
-                        .get("agent_id")
+                        .get(param_names::AGENT_ID)
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
                     (mem.namespace, owner)

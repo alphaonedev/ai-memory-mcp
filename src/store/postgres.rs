@@ -662,8 +662,8 @@ impl PostgresStore {
                     if stmt_secs == 0 {
                         return Ok(());
                     }
-                    let stmt_ms = stmt_secs.saturating_mul(1000);
-                    let lock_ms = lock_secs.saturating_mul(1000);
+                    let stmt_ms = stmt_secs.saturating_mul(crate::MILLIS_PER_SEC);
+                    let lock_ms = lock_secs.saturating_mul(crate::MILLIS_PER_SEC);
                     let sql =
                         format!("SET statement_timeout = {stmt_ms}; SET lock_timeout = {lock_ms};");
                     conn.execute(sql.as_str()).await.map(|_| ())
@@ -2807,7 +2807,11 @@ impl PostgresStore {
         filter: &Filter,
         source_uri: Option<&str>,
     ) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let limit: i64 = filter
+            .limit
+            .clamp(1, crate::storage::LIST_MAX_LIMIT)
+            .try_into()
+            .unwrap_or(LIST_FALLBACK_LIMIT_I64);
         let rows = sqlx::query(
             "SELECT m.*,
                     ts_rank(to_tsvector('english', m.title || ' ' || m.content),
@@ -2854,8 +2858,10 @@ impl PostgresStore {
         namespace: Option<&str>,
         limit: Option<usize>,
     ) -> StoreResult<Vec<Memory>> {
-        let cap_usize = limit.unwrap_or(200).min(1000);
-        let cap: i64 = i64::try_from(cap_usize).unwrap_or(200);
+        let cap_usize = limit
+            .unwrap_or(crate::storage::LIST_DEFAULT_CAP)
+            .min(crate::storage::LIST_MAX_LIMIT);
+        let cap: i64 = i64::try_from(cap_usize).unwrap_or(DEFAULT_LIST_CAP_I64);
         let rows = sqlx::query(
             "SELECT m.* FROM memories m
               WHERE m.source_uri = $1
@@ -4012,12 +4018,12 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v28 tx", e))?;
 
-        sqlx::query(
+        sqlx::query(&format!(
             "CREATE TABLE IF NOT EXISTS agent_quotas (
                 agent_id                TEXT PRIMARY KEY,
-                max_memories_per_day    BIGINT  NOT NULL DEFAULT 1000,
-                max_storage_bytes       BIGINT  NOT NULL DEFAULT 104857600,
-                max_links_per_day       BIGINT  NOT NULL DEFAULT 5000,
+                max_memories_per_day    BIGINT  NOT NULL DEFAULT {memories},
+                max_storage_bytes       BIGINT  NOT NULL DEFAULT {storage},
+                max_links_per_day       BIGINT  NOT NULL DEFAULT {links},
                 current_memories_today  BIGINT  NOT NULL DEFAULT 0,
                 current_storage_bytes   BIGINT  NOT NULL DEFAULT 0,
                 current_links_today     BIGINT  NOT NULL DEFAULT 0,
@@ -4025,7 +4031,10 @@ impl PostgresStore {
                 created_at              TIMESTAMPTZ NOT NULL,
                 updated_at              TIMESTAMPTZ NOT NULL
             )",
-        )
+            memories = crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY,
+            storage = crate::quotas::DEFAULT_MAX_STORAGE_BYTES,
+            links = crate::quotas::DEFAULT_MAX_LINKS_PER_DAY,
+        ))
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("create agent_quotas table", e))?;
@@ -6910,6 +6919,23 @@ const KG_TIMELINE_MAX_LIMIT_SAL: usize = 1000;
 /// cannot exhaust the connection pool with an unbounded fetch.
 const STORE_LIST_MAX_LIMIT_SAL: i64 = 10_000;
 
+/// Default page cap for [`PostgresStore::list_by_source_uri`] when the
+/// caller passes no limit. Mirrors `crate::storage::LIST_DEFAULT_CAP`.
+const DEFAULT_LIST_CAP_I64: i64 = 200;
+
+/// Post-clamp `usize → i64` conversion fallback for list/query limits.
+/// Mirrors `crate::storage::LIST_FALLBACK_LIMIT`; unreachable in
+/// practice (inputs are pre-clamped to `LIST_MAX_LIMIT`, which always
+/// fits `i64`).
+const LIST_FALLBACK_LIMIT_I64: i64 = 100;
+
+/// Conversion fallback page size for [`PostgresStore::list_archived_pg`].
+const ARCHIVED_LIST_FALLBACK_I64: i64 = 50;
+
+/// Page size used by [`PostgresStore::recall_hybrid`] when the caller
+/// passes `limit == 0` (also the conversion fallback on the same path).
+const RECALL_FALLBACK_LIMIT_I64: i64 = 10;
+
 /// Apply the published timeline page-size policy: default to
 /// [`KG_TIMELINE_DEFAULT_LIMIT_SAL`] when the caller didn't pass a
 /// limit, then clamp to the `[1, KG_TIMELINE_MAX_LIMIT_SAL]` band so a
@@ -8604,7 +8630,11 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let limit: i64 = filter
+            .limit
+            .clamp(1, crate::storage::LIST_MAX_LIMIT)
+            .try_into()
+            .unwrap_or(LIST_FALLBACK_LIMIT_I64);
         // #910 SAL-level scope=private gate — push the visibility
         // predicate into SQL so the row filter runs server-side and
         // the result-set size scales with what the caller can see,
@@ -8760,7 +8790,11 @@ impl MemoryStore for PostgresStore {
         query: &str,
         filter: &Filter,
     ) -> StoreResult<Vec<Memory>> {
-        let limit: i64 = filter.limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let limit: i64 = filter
+            .limit
+            .clamp(1, crate::storage::LIST_MAX_LIMIT)
+            .try_into()
+            .unwrap_or(LIST_FALLBACK_LIMIT_I64);
         let caller = ctx.effective_principal();
         // Adapter parity with SQLite (#302 item 3): threads the full
         // Filter (namespace, tier, tags_any, agent_id) into the query.
@@ -9458,9 +9492,10 @@ impl MemoryStore for PostgresStore {
         filter: &Filter,
     ) -> StoreResult<Vec<(Memory, f64)>> {
         let limit_eff: i64 = if filter.limit == 0 {
-            10
+            RECALL_FALLBACK_LIMIT_I64
         } else {
-            i64::try_from(filter.limit.min(1000)).unwrap_or(10)
+            i64::try_from(filter.limit.min(crate::storage::LIST_MAX_LIMIT))
+                .unwrap_or(RECALL_FALLBACK_LIMIT_I64)
         };
         // Pull a wider FTS candidate pool (3x limit) so the blend has
         // material to rank, mirroring sqlite at db.rs:4757.
@@ -11886,9 +11921,9 @@ impl MemoryStore for PostgresStore {
         limit: usize,
     ) -> StoreResult<crate::models::Taxonomy> {
         // Mirror the SQLite adapter's clamp semantics so callers see the
-        // same `truncated` behavior across backends.
-        const TAXONOMY_MAX_LIMIT: usize = 10_000;
-        let effective_limit = limit.min(TAXONOMY_MAX_LIMIT);
+        // same `truncated` behavior across backends — one shared knob,
+        // not a local re-declaration that can drift.
+        let effective_limit = limit.min(crate::storage::TAXONOMY_MAX_LIMIT);
         let effective_depth = max_depth.min(crate::models::MAX_NAMESPACE_DEPTH);
         let prefix = namespace_prefix.unwrap_or("");
         let now_dt = Utc::now();
@@ -12972,7 +13007,10 @@ impl PostgresStore {
         limit: usize,
         offset: usize,
     ) -> StoreResult<Vec<serde_json::Value>> {
-        let limit_i: i64 = limit.clamp(1, 1000).try_into().unwrap_or(50);
+        let limit_i: i64 = limit
+            .clamp(1, crate::storage::LIST_MAX_LIMIT)
+            .try_into()
+            .unwrap_or(ARCHIVED_LIST_FALLBACK_I64);
         let offset_i: i64 = offset.try_into().unwrap_or(0);
         let rows = sqlx::query(
             "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
@@ -13159,7 +13197,10 @@ impl PostgresStore {
         limit: usize,
     ) -> StoreResult<Vec<serde_json::Value>> {
         use sqlx::Row;
-        let limit_i: i64 = limit.clamp(1, 1000).try_into().unwrap_or(100);
+        let limit_i: i64 = limit
+            .clamp(1, crate::storage::LIST_MAX_LIMIT)
+            .try_into()
+            .unwrap_or(LIST_FALLBACK_LIMIT_I64);
         let rows = sqlx::query(
             "SELECT id, action_type, memory_id, namespace, payload, requested_by, \
                     requested_at, status, decided_by, decided_at, approvals, \

@@ -23,6 +23,7 @@
 use serde_json::{Value, json};
 
 use crate::governance::agent_action::{AgentAction, check_agent_action};
+use crate::mcp::param_names;
 
 /// Default `agent_id` echoed back when the caller (MCP or CLI) does
 /// not supply one. Kept as a `pub const` so the CLI `governance
@@ -51,12 +52,12 @@ pub fn handle_check_agent_action(
     arguments: &Value,
 ) -> Result<Value, String> {
     let kind = arguments
-        .get("kind")
+        .get(param_names::KIND)
         .and_then(Value::as_str)
         .ok_or_else(|| "kind is required".to_string())?;
     let action = build_action(kind, arguments)?;
     let agent_id = arguments
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_AGENT_ID)
         .to_string();
@@ -144,7 +145,9 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
                 .and_then(Value::as_str)
                 .ok_or_else(|| "filesystem_write kind requires `path`".to_string())?
                 .to_string();
-            let byte_estimate = arguments.get("byte_estimate").and_then(Value::as_u64);
+            let byte_estimate = arguments
+                .get(param_names::BYTE_ESTIMATE)
+                .and_then(Value::as_u64);
             Ok(AgentAction::FilesystemWrite {
                 path: PathBuf::from(path),
                 byte_estimate,
@@ -183,7 +186,7 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
         "custom" => {
             let custom_kind = arguments
                 .get("custom_kind")
-                .or_else(|| arguments.get("kind_inner"))
+                .or_else(|| arguments.get(param_names::KIND_INNER))
                 .and_then(Value::as_str)
                 .ok_or_else(|| "custom kind requires `custom_kind`".to_string())?
                 .to_string();

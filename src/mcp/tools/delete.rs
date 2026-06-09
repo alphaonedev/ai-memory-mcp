@@ -4,6 +4,7 @@
 //! MCP `memory_delete` handler.
 
 use crate::mcp::VectorIndex;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -112,7 +113,7 @@ pub(super) fn handle_delete(
     let snapshot_tier = target.tier.as_str().to_string();
     let snapshot_owner: Option<String> = target
         .metadata
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
@@ -155,7 +156,7 @@ pub(super) fn handle_delete(
             .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = json!({"id": target.id, "title": target.title});

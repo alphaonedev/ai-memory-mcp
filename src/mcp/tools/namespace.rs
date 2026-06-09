@@ -3,6 +3,7 @@
 
 //! MCP namespace standard-policy handlers and governance helpers.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::GovernancePolicy;
 use crate::{db, validate};
@@ -152,7 +153,7 @@ pub fn handle_namespace_set_standard(
             "namespace": namespace,
             "standard_id": id,
             "parent": parent,
-            "has_governance": params.get("governance").is_some_and(|v| !v.is_null()),
+            "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
         }),
     );
 
@@ -178,13 +179,13 @@ pub fn handle_namespace_set_standard(
     // remain gated by this check; daemon-internal callers and tests
     // that don't claim identity get the legacy posture.
     let identity_claimed = params
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
     if identity_claimed && let Ok(Some(existing_mem)) = db::get(conn, id) {
         let recorded_owner = existing_mem
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
@@ -253,7 +254,7 @@ pub fn handle_namespace_set_standard(
     // validate the merged blob's typed shape, and write the FULL merged
     // JSON back — so unknown-to-the-struct fields on either side survive
     // the round-trip.
-    let governance_val = params.get("governance").filter(|v| !v.is_null());
+    let governance_val = params.get(param_names::GOVERNANCE).filter(|v| !v.is_null());
     if let Some(g) = governance_val {
         // Load the standard memory first so we can read its existing
         // governance blob and merge.
@@ -262,7 +263,7 @@ pub fn handle_namespace_set_standard(
             .ok_or_else(|| format!("memory not found: {id}"))?;
         // Compute the merged governance JSON: existing fields preserved,
         // incoming overrides applied per-key.
-        let merged = merge_governance_fields(mem.metadata.get("governance"), g);
+        let merged = merge_governance_fields(mem.metadata.get(param_names::GOVERNANCE), g);
         // Validate the typed shape of the result. Deserialising drops
         // unknown fields but the typed sub-set must still parse + pass
         // policy validation — this catches operator typos in known
@@ -452,7 +453,10 @@ fn merge_governance_for_response(metadata: &Value) -> Value {
     // every key that wasn't already produced by the typed serialisation
     // (keys present in both are byte-equal because the typed struct
     // was deserialised from the same JSON).
-    if let Some(raw) = metadata.get("governance").and_then(Value::as_object) {
+    if let Some(raw) = metadata
+        .get(param_names::GOVERNANCE)
+        .and_then(Value::as_object)
+    {
         for (k, v) in raw {
             merged.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -470,7 +474,7 @@ fn merge_governance_for_response(metadata: &Value) -> Value {
 /// the typed [`GovernancePolicy`] whitelist, dropping every off-struct
 /// field. See [`merge_governance_for_response`] for the merge contract.
 pub(super) fn extract_governance(mem_val: &Value) -> Value {
-    let Some(meta) = mem_val.get("metadata") else {
+    let Some(meta) = mem_val.get(param_names::METADATA) else {
         return serde_json::to_value(GovernancePolicy::default()).unwrap_or(Value::Null);
     };
     merge_governance_for_response(meta)

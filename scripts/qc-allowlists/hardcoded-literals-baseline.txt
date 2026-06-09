@@ -195,7 +195,7 @@
 4	fts_classifier
 3	generated_at
 3	GOOGLE_API_KEY
-37	governance
+33	governance
 3	governance check failed
 3	governance error: {e}
 3	GOVERNANCE_REFUSED
@@ -440,7 +440,7 @@
 8	source_ids
 6	source_memory_id
 3	source memory not found
-7	source_span
+6	source_span
 11	source_uri
 18	standard_id
 3	{stem}.manifest.json

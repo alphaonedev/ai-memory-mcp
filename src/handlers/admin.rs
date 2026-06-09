@@ -125,7 +125,7 @@ pub async fn register_agent(
         let agent_mem = Memory {
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
-            namespace: "_agents".to_string(),
+            namespace: crate::models::AGENTS_NAMESPACE.to_string(),
             title: format!("agent:{}", &body.agent_id),
             content: format!("agent registration for {}", &body.agent_id),
             tags: vec!["_agent_registration".to_string()],

@@ -6,6 +6,7 @@
 use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::param_names;
 use crate::models::{GovernedAction, Tier};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -137,7 +138,9 @@ pub(crate) fn parse_reflect_input(
     } else {
         serde_json::json!({})
     };
-    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    let caller_depth: Option<i64> = params
+        .get(param_names::DEPTH)
+        .and_then(serde_json::Value::as_i64);
     if let Some(d) = caller_depth {
         if d < 0 {
             return Err(format!(
@@ -145,9 +148,11 @@ pub(crate) fn parse_reflect_input(
             ));
         }
     }
-    let explicit_agent_id = params["agent_id"]
-        .as_str()
-        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let explicit_agent_id = params["agent_id"].as_str().or_else(|| {
+        metadata
+            .get(param_names::AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+    });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
     let input = db::ReflectInput {
@@ -239,7 +244,9 @@ pub fn handle_reflect(
     // didn't. The fix surfaces a typed refusal slug that fits the
     // existing `REFLECTION_DEPTH_EXCEEDED` / `REFLECTION_HOOK_VETO`
     // family of stable string-prefix errors.
-    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    let caller_depth: Option<i64> = params
+        .get(param_names::DEPTH)
+        .and_then(serde_json::Value::as_i64);
     if let Some(d) = caller_depth {
         if d < 0 {
             return Err(format!(
@@ -251,9 +258,11 @@ pub fn handle_reflect(
     // NHI: resolve agent_id via the same precedence chain memory_store
     // uses, so the reflection memory's `metadata.agent_id` is consistent
     // with regular stores.
-    let explicit_agent_id = params["agent_id"]
-        .as_str()
-        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let explicit_agent_id = params["agent_id"].as_str().or_else(|| {
+        metadata
+            .get(param_names::AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+    });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
 

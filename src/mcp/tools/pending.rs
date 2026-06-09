@@ -128,9 +128,12 @@ pub fn handle_subscription_dlq_list(
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let subscription_id = params["subscription_id"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
-        .unwrap_or(100)
-        .clamp(1, 1000);
+    let limit = params["limit"]
+        .as_u64()
+        .map_or(crate::storage::PENDING_DEFAULT_PAGE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        })
+        .clamp(1, crate::storage::LIST_MAX_LIMIT);
 
     // v0.7.0 #1118 (SR-1 #6, HIGH) — caller-ownership gate.
     //
@@ -211,9 +214,12 @@ pub(super) fn handle_pending_list(
     params: &Value,
 ) -> Result<Value, String> {
     let status = params["status"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
-        .unwrap_or(usize::MAX)
-        .min(1000);
+    let limit = params["limit"]
+        .as_u64()
+        .map_or(crate::storage::PENDING_DEFAULT_PAGE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        })
+        .min(crate::storage::LIST_MAX_LIMIT);
     let items = db::list_pending_actions(conn, status, limit).map_err(|e| e.to_string())?;
     Ok(json!({"count": items.len(), "pending": items}))
 }

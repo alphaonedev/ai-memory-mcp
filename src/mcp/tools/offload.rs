@@ -22,6 +22,7 @@
 
 use serde_json::{Value, json};
 
+use crate::mcp::param_names;
 use crate::offload::{ContextOffloader, OffloadConfig};
 
 /// Resolve the namespace for an offload call. Falls back to
@@ -29,7 +30,7 @@ use crate::offload::{ContextOffloader, OffloadConfig};
 /// non-empty, audit-friendly bucket rather than a NULL violation.
 fn resolve_namespace(params: &Value) -> String {
     params
-        .get("namespace")
+        .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map_or_else(|| "auto".to_string(), str::to_string)
@@ -47,11 +48,11 @@ pub fn handle_offload(
     agent_id: &str,
 ) -> Result<Value, String> {
     let content = params
-        .get("content")
+        .get(param_names::CONTENT)
         .and_then(Value::as_str)
         .ok_or("content is required")?;
     let namespace = resolve_namespace(params);
-    let ttl_seconds = params.get("ttl_seconds").and_then(Value::as_u64);
+    let ttl_seconds = params.get(param_names::TTL_SECONDS).and_then(Value::as_u64);
 
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
