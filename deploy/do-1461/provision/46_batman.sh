@@ -141,8 +141,10 @@ Environment=HOME=/root
 EnvironmentFile=$REMOTE_ENVFILE
 # systemd does literal \${VAR} substitution (NOT shell :+ expansion); the
 # postgres peers always carry AI_MEMORY_STORE_URL (50_federation), so pass it
-# unconditionally — mirrors the serve unit's \${AI_MEMORY_STORE_URL} form.
-ExecStart=$BIN --store-url \\\${AI_MEMORY_STORE_URL} curator --daemon --interval-secs $BATMAN_CURATOR_INTERVAL_SECS --max-ops $BATMAN_CURATOR_MAX_OPS
+# unconditionally. #1547: --store-url is a `curator` subcommand flag, so it
+# MUST appear AFTER the `curator` token (clap rejects it as a global flag and
+# exits 2 -> crash-loop otherwise). Mirrors `curator --store-url ...` usage.
+ExecStart=$BIN curator --daemon --store-url \\\${AI_MEMORY_STORE_URL} --interval-secs $BATMAN_CURATOR_INTERVAL_SECS --max-ops $BATMAN_CURATOR_MAX_OPS
 Restart=on-failure
 RestartSec=30
 Nice=5
