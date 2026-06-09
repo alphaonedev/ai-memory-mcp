@@ -296,7 +296,10 @@ pub fn validate_source(source: &str) -> Result<()> {
 /// `CallerContext::for_admin(...)` directly and never traverses this
 /// validator):
 ///
-/// - `"daemon"` → `src/handlers/admin.rs:110,239,441`
+/// - `"daemon"` → `src/handlers/admin.rs` (single `for_admin` site at
+///   `register_agent`; this list previously cited three line numbers
+///   that drifted — sites are now grep-able via
+///   `sentinels::DAEMON_PRINCIPAL`)
 /// - `"subscription-dispatch"` → `src/handlers/subscriptions.rs::dispatch_approval_requested`
 /// - `"ai:http-internal"` → `src/handlers/{http,power,hook_subscribers}.rs`
 /// - `"ai:migrate"` → `src/migrate.rs`
@@ -307,15 +310,15 @@ pub fn validate_source(source: &str) -> Result<()> {
 ///   legacy-rewrite rows; also matched as the unowned-marker sentinel
 ///   in cross-tenant gates, so wire spoofing it would let the caller
 ///   silently claim ownership of legacy-unowned rows).
-const RESERVED_AGENT_IDS: &[&str] = &[
-    "daemon",
-    "system",
-    "federation-catchup",
-    "subscription-dispatch",
-    "ai:http-internal",
-    "ai:migrate",
-    "export-internal",
-    "governance-internal",
+pub const RESERVED_AGENT_IDS: &[&str] = &[
+    crate::identity::sentinels::DAEMON_PRINCIPAL,
+    crate::identity::sentinels::SYSTEM_PRINCIPAL,
+    crate::identity::sentinels::FEDERATION_CATCHUP,
+    crate::identity::sentinels::SUBSCRIPTION_DISPATCH,
+    crate::identity::sentinels::AI_HTTP_INTERNAL,
+    crate::identity::sentinels::AI_MIGRATE,
+    crate::identity::sentinels::EXPORT_INTERNAL,
+    crate::identity::sentinels::GOVERNANCE_INTERNAL,
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977

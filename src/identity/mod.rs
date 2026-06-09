@@ -65,6 +65,11 @@ pub mod replay;
 // to resolve metadata.attest_level (claimed / agent_attested) before
 // persisting. Permissive-default; fail-closed on a presented-but-bad sig.
 pub mod attest;
+// #1558 — reserved caller-identity sentinel SSOT. Every internal /
+// system principal string (privileged carve-outs, resolve-failure
+// sentinels, daemon agent ids) lives here as one named const;
+// `crate::validate::RESERVED_AGENT_IDS` is built from these.
+pub mod sentinels;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
@@ -282,6 +287,15 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
 /// envelope-attributed identity, gated by
 /// `AI_MEMORY_FED_TRUST_BODY_AGENT_ID`) and for backwards-compatible
 /// callers that want defense-in-depth checks at this layer.
+/// Synthesize the per-request anonymous HTTP principal —
+/// `anonymous:req-<uuid8>`. The ONE synthesis path for every HTTP
+/// fallback site (#1560: before this helper, eight handler sites
+/// drifted to a full 36-char uuid suffix while the documented contract
+/// and this module's resolver used uuid8).
+pub fn anonymous_request_id() -> String {
+    format!("{}{}", sentinels::ANONYMOUS_REQ_PREFIX, short_uuid())
+}
+
 pub fn resolve_http_agent_id(body: Option<&str>, header: Option<&str>) -> Result<String> {
     // 1. Header is authoritative — resolve it first (validate if
     //    present; synthesize anonymous fallback otherwise).
@@ -291,7 +305,7 @@ pub fn resolve_http_agent_id(body: Option<&str>, header: Option<&str>) -> Result
         validate::validate_agent_id(id)?;
         id.to_string()
     } else {
-        let anon = format!("anonymous:req-{}", short_uuid());
+        let anon = anonymous_request_id();
         tracing::warn!(
             "HTTP memory write without agent_id body field or X-Agent-Id header; assigned {anon}"
         );

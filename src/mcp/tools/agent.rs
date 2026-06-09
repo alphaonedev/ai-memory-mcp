@@ -32,7 +32,7 @@ pub(super) fn handle_agent_register(
     // storage write so the audit trail captures intent regardless of
     // downstream storage outcome. Mirrors the #911 HTTP fix.
     let caller = crate::identity::resolve_agent_id(params["caller_agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",

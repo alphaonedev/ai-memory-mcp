@@ -86,7 +86,7 @@ pub(super) fn handle_delete(
     // the SIEM-shaped enterprise row AFTER the delete commits.
     let caller_for_forensic =
         crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",

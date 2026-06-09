@@ -3,6 +3,7 @@
 
 //! MCP namespace standard-policy handlers and governance helpers.
 
+use crate::identity::sentinels;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::GovernancePolicy;
@@ -143,7 +144,7 @@ pub fn handle_namespace_set_standard(
     // audit trail captures intent even on validate/storage failure
     // downstream. MCP callers resolve via `identity::resolve_agent_id`.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -189,7 +190,7 @@ pub fn handle_namespace_set_standard(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
             return Err(format!(
                 "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
             ));
@@ -197,7 +198,7 @@ pub fn handle_namespace_set_standard(
         // Unowned-legacy claim — rewrite metadata.agent_id to caller
         // so subsequent calls are gated. No-op when caller is the
         // anonymous fallback (don't anchor ownership to anonymous).
-        if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+        if is_unowned && !caller.is_empty() && caller != sentinels::ANONYMOUS_INVALID {
             let mut new_meta = if existing_mem.metadata.is_object() {
                 existing_mem.metadata.clone()
             } else {
@@ -491,7 +492,7 @@ pub(crate) fn handle_namespace_clear_standard(
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",

@@ -19,6 +19,7 @@ use axum::{
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::models::{Tier, UpdateMemory};
 use crate::validate;
 
@@ -60,7 +61,7 @@ pub async fn get_memory(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id());
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.get(&ctx, &id).await {
             Ok(mem) => {
@@ -97,7 +98,7 @@ pub async fn get_memory(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
     // PERF-1 (FX-3): wrap the rusqlite read sequence in `db_op` so the
     // FTS5 + memory_links lookups run on the blocking pool, not on the
@@ -533,7 +534,7 @@ pub async fn delete_memory(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller_for_forensic = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",
@@ -560,7 +561,7 @@ pub async fn delete_memory(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| "ai:http".to_string());
+            .unwrap_or_else(|_| sentinels::AI_HTTP.to_string());
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
         let target = app.store.get(&ctx, &id).await.ok();
 

@@ -325,7 +325,7 @@ async fn recall_response(
         let ctx_caller = crate::store::CallerContext::for_agent(
             as_agent
                 .or(caller_principal)
-                .unwrap_or("daemon")
+                .unwrap_or(crate::identity::sentinels::DAEMON_PRINCIPAL)
                 .to_string(),
         );
         let mut filter = crate::store::Filter {

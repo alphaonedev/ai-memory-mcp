@@ -14,6 +14,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::models::{Memory, Tier};
 use crate::validate;
 
@@ -278,7 +279,7 @@ async fn set_namespace_standard_inner(
     let header_agent_id =
         headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -347,11 +348,12 @@ async fn set_namespace_standard_inner(
                 // scope=shared preserves multi-reader visibility under
                 // the SAL #910 filter so consumers across the
                 // namespace can read the governance policy.
-                let placeholder_agent_id = if caller.is_empty() || caller == "anonymous:invalid" {
-                    "system".to_string()
-                } else {
-                    caller.clone()
-                };
+                let placeholder_agent_id =
+                    if caller.is_empty() || caller == sentinels::ANONYMOUS_INVALID {
+                        sentinels::SYSTEM_PRINCIPAL.to_string()
+                    } else {
+                        caller.clone()
+                    };
                 let mut metadata = serde_json::json!({
                     "agent_id": placeholder_agent_id,
                     "scope": "shared",
@@ -410,9 +412,13 @@ async fn set_namespace_standard_inner(
                 .get("agent_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+            let is_unowned =
+                recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
             let caller_principal = ctx.effective_principal();
-            if !is_unowned && recorded_owner != caller_principal && caller_principal != "daemon" {
+            if !is_unowned
+                && recorded_owner != caller_principal
+                && caller_principal != sentinels::DAEMON_PRINCIPAL
+            {
                 tracing::warn!(
                     target: "ai_memory::authz",
                     "POST /namespaces/{{ns}}/standard 403 (postgres path): caller {caller_principal} != owner {recorded_owner} (ns={ns}, id={standard_id})"
@@ -429,7 +435,9 @@ async fn set_namespace_standard_inner(
             }
             // Unowned-legacy claim: rewrite metadata.agent_id to caller
             // so subsequent calls are properly gated.
-            if is_unowned && !caller_principal.is_empty() && caller_principal != "anonymous:invalid"
+            if is_unowned
+                && !caller_principal.is_empty()
+                && caller_principal != sentinels::ANONYMOUS_INVALID
             {
                 let mut new_meta = if resolved_mem.metadata.is_object() {
                     resolved_mem.metadata.clone()
@@ -575,8 +583,9 @@ async fn set_namespace_standard_inner(
                 .get("agent_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-            if !is_unowned && recorded_owner != caller && caller != "daemon" {
+            let is_unowned =
+                recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
+            if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
                 tracing::warn!(
                     target: "ai_memory::authz",
                     "POST /namespaces/{{ns}}/standard 403: caller {caller} != owner {recorded_owner} (ns={ns})"
@@ -594,7 +603,7 @@ async fn set_namespace_standard_inner(
             // Unowned-legacy fast path: claim ownership by rewriting
             // metadata.agent_id to the caller. Next request from a
             // different caller will be 403'd.
-            if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+            if is_unowned && !caller.is_empty() && caller != sentinels::ANONYMOUS_INVALID {
                 let mut new_meta = if m.metadata.is_object() {
                     m.metadata.clone()
                 } else {
@@ -635,11 +644,12 @@ async fn set_namespace_standard_inner(
             // #929 — first-write anchors ownership to the caller, not
             // the legacy "system" sentinel. scope=shared preserves
             // multi-reader visibility under the SAL #910 filter.
-            let placeholder_agent_id = if caller.is_empty() || caller == "anonymous:invalid" {
-                "system".to_string()
-            } else {
-                caller.clone()
-            };
+            let placeholder_agent_id =
+                if caller.is_empty() || caller == sentinels::ANONYMOUS_INVALID {
+                    sentinels::SYSTEM_PRINCIPAL.to_string()
+                } else {
+                    caller.clone()
+                };
             let placeholder = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
@@ -697,8 +707,8 @@ async fn set_namespace_standard_inner(
             .get("agent_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+        let is_unowned = recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
+        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
             tracing::warn!(
                 target: "ai_memory::authz",
                 "POST /namespaces/{{ns}}/standard 403 (body.id path): caller {caller} != owner {recorded_owner} (ns={ns}, id={resolved_id})"
@@ -864,7 +874,7 @@ pub async fn get_namespace_standard_qs(
         // the namespace itself. Use for_admin so the SAL #910
         // scope=private visibility filter doesn't drop the standard
         // memory when the requester is not the policy author.
-        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
+        let ctx = crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
         let inherit = q.inherit.unwrap_or(false);
         // Build chain leaf → root (most-specific first) by trimming
         // `/segment` until empty. The chain matches the SQLite
@@ -1019,7 +1029,7 @@ async fn clear_namespace_standard_inner(
     let header_agent_id =
         headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -1141,7 +1151,7 @@ pub async fn session_start(
     let caller = header_agent_id
         .map(str::to_string)
         .or_else(|| body.agent_id.clone())
-        .unwrap_or_else(|| format!("anonymous:req-{}", &Uuid::new_v4().to_string()[..8]));
+        .unwrap_or_else(crate::identity::anonymous_request_id);
     let mut params = json!({});
     if let Some(ref n) = body.namespace {
         params["namespace"] = json!(n);

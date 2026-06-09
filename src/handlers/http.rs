@@ -272,7 +272,8 @@ async fn fetch_namespace_candidates(
         // resolution is system-internal, not a user-visible read,
         // and we want the candidate pool to surface every memory in
         // the namespace regardless of who originally authored it.
-        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::AI_HTTP_INTERNAL);
         let filter = crate::store::Filter {
             namespace: Some(namespace.to_string()),
             limit: limit + 1,

@@ -231,7 +231,9 @@ pub(super) async fn catchup_once_with_store(
             // it MUST round-trip every row regardless of metadata.scope
             // so the receiving daemon has the full snapshot. Use the
             // admin builder to bypass the SAL visibility filter.
-            let ctx = crate::store::CallerContext::for_admin("federation-catchup");
+            let ctx = crate::store::CallerContext::for_admin(
+                crate::identity::sentinels::FEDERATION_CATCHUP,
+            );
             for raw in &memories {
                 let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,

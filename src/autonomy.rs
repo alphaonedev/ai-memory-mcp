@@ -401,7 +401,7 @@ fn consolidate_cluster(
         &namespace,
         &tier,
         "ai-memory curator (autonomy)",
-        "ai:curator",
+        crate::identity::sentinels::AI_CURATOR,
     )?;
 
     Ok(Some(RollbackEntry::Consolidate {
@@ -562,7 +562,7 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
         last_accessed_at: None,
         expires_at: None,
         metadata: serde_json::json!({
-            "agent_id": "ai:curator",
+            "agent_id": crate::identity::sentinels::AI_CURATOR,
             "action": entry.action_tag(),
         }),
         reflection_depth: 0,
@@ -628,7 +628,7 @@ pub fn persist_self_report(
         updated_at: ts,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::json!({"agent_id": "ai:curator"}),
+        metadata: serde_json::json!({"agent_id": crate::identity::sentinels::AI_CURATOR}),
         reflection_depth: 0,
         memory_kind: crate::models::MemoryKind::Observation,
         entity_id: None,

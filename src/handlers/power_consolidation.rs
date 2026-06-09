@@ -275,7 +275,7 @@ pub async fn consolidate_memories(
     // gating.
     let consolidate_caller_principal =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     let summary = match body.summary.clone() {
         Some(s) if !s.is_empty() => s,
         _ => {
@@ -550,7 +550,7 @@ pub async fn auto_tag_handler(
     // applies. Helper takes `&str` so non-sal builds compile.
     let auto_tag_caller_principal =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
 
     // Resolve (title, content). S51 sends `memory_id`; we fetch the
     // memory from the active backend. Ad-hoc callers may instead

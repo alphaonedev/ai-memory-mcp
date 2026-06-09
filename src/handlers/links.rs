@@ -35,6 +35,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::models::LinkBody;
 #[cfg(feature = "sal")]
 use crate::models::MemoryLink;
@@ -192,7 +193,7 @@ pub async fn verify_link_handler(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Link,
-                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::actor(sentinels::AI_HTTP, "http_body", None),
                         crate::audit::target_memory(
                             report.source_id.clone(),
                             String::new(),
@@ -378,7 +379,7 @@ pub async fn create_link(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Link,
-                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::actor(sentinels::AI_HTTP, "http_body", None),
                         crate::audit::target_memory(
                             source_id.clone(),
                             String::new(),
@@ -488,7 +489,10 @@ pub async fn create_link(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let is_unowned_legacy = source_owner.is_empty();
-    if !is_unowned_legacy && source_owner != caller && source_target != caller && caller != "daemon"
+    if !is_unowned_legacy
+        && source_owner != caller
+        && source_target != caller
+        && caller != sentinels::DAEMON_PRINCIPAL
     {
         tracing::warn!(
             target: "ai_memory::authz",
@@ -692,7 +696,7 @@ pub async fn delete_link(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -781,7 +785,7 @@ pub async fn delete_link(
         source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
     let owns_source = source_owner == caller || source_target == caller;
     let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
-    if !is_unowned_legacy && !owns_source && !owns_target && caller != "daemon" {
+    if !is_unowned_legacy && !owns_source && !owns_target && caller != sentinels::DAEMON_PRINCIPAL {
         drop(lock);
         tracing::warn!(
             target: "ai_memory::authz",
@@ -841,7 +845,7 @@ pub async fn get_links(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 

@@ -5824,7 +5824,7 @@ pub fn register_agent(
     agent_type: &str,
     capabilities: &[String],
 ) -> Result<String> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
 
     // Preserve original registered_at across re-registration.
@@ -5978,7 +5978,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
 /// - the agent is not registered (no `_agents` row for `agent_id`)
 /// - the underlying `UPDATE` fails
 pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) -> Result<()> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
     let affected = conn.execute(
         "UPDATE memories SET
@@ -6010,7 +6010,7 @@ pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) ->
 ///
 /// Surfaces only underlying query failures.
 pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let pubkey = conn
         .query_row(
             "SELECT json_extract(metadata, '$.agent_pubkey') FROM memories
@@ -6040,7 +6040,7 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
 /// - the agent is not registered (no `_agents` row for `agent_id`)
 /// - the underlying `UPDATE` fails
 pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
     let affected = conn.execute(
         "UPDATE memories SET
@@ -8751,7 +8751,7 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
 
 /// Return true if `agent_id` matches a registered agent in `_agents`.
 pub fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     conn.query_row(
         "SELECT 1 FROM memories WHERE namespace = ?1 AND title = ?2",
         params![AGENTS_NAMESPACE, &title],
