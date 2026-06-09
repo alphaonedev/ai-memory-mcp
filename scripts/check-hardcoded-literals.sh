@@ -78,8 +78,13 @@ find_test_boundary () {
         return
     fi
     line_mod=$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests?[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
-    line_cfg=$(awk '/^[[:space:]]*#\[cfg\(test\)\]/{attr=NR; next}
-                    attr && /^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+/{print attr; exit}
+    # #1577 — the attr+mod pairing must only fire on an INLINE module
+    # body (`mod x {`), never a `mod x;` declaration whose body lives
+    # in another file (e.g. mcp/mod.rs's `#[cfg(test)] pub(super) mod
+    # parity_test_helpers;` made the gate skip 13.9k production lines).
+    # Attr pattern also widened to catch `#[cfg(all(test, ...))]`.
+    line_cfg=$(awk '/^[[:space:]]*#\[cfg\((all\()?test[,)]/{attr=NR; next}
+                    attr && /^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{/{print attr; exit}
                     {attr=0}' "$f" 2>/dev/null)
     [[ -z "$line_mod" ]] && line_mod=999999999
     [[ -z "$line_cfg" ]] && line_cfg=999999999
