@@ -244,11 +244,11 @@ const ALLOWED_LINK_BODY_FIELDS: &[&str] = &[
 /// 0027). Used to surface a structured `invalid_relation` 400 from the
 /// HTTP handler before the INSERT crashes with a generic CHECK error.
 const ALLOWED_LINK_RELATIONS: &[&str] = &[
-    "related_to",
-    "supersedes",
-    "contradicts",
-    "derived_from",
-    "reflects_on",
+    crate::models::MemoryLinkRelation::RelatedTo.as_str(),
+    crate::models::MemoryLinkRelation::Supersedes.as_str(),
+    crate::models::MemoryLinkRelation::Contradicts.as_str(),
+    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
 ];
 
 /// Return the list of unknown fields in `raw` against
@@ -414,7 +414,7 @@ pub async fn create_link(
                         .ok();
                     super::dispatch_event_postgres(
                         &app,
-                        "memory_link_created",
+                        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
                         &source_id,
                         &ns,
                         link_owner.as_deref(),
@@ -546,7 +546,7 @@ pub async fn create_link(
         .ok();
         crate::subscriptions::dispatch_event_with_details(
             &lock.0,
-            "memory_link_created",
+            crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
             &source_id,
             &link_namespace,
             link_owner.as_deref(),

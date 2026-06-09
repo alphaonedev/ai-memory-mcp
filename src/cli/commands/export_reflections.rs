@@ -278,8 +278,8 @@ pub(crate) fn summarise_attest_level(edges: &[ReflectsOnEdge]) -> &'static str {
     for e in edges {
         let rank: u8 = match e.attest_level.as_str() {
             "signed" => 3,
-            "peer_attested" => 2,
-            "self_signed" => 1,
+            s if s == crate::models::AttestLevel::PeerAttested.as_str() => 2,
+            s if s == crate::models::AttestLevel::SelfSigned.as_str() => 1,
             _ => 0,
         };
         if rank > best {

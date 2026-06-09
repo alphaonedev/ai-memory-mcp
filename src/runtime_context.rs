@@ -114,7 +114,7 @@ impl std::fmt::Debug for RuntimeContext {
             .field(
                 "hooks_hmac_secret",
                 &if secret_present {
-                    "<redacted>"
+                    crate::REDACTED_PLACEHOLDER
                 } else {
                     "<unset>"
                 },

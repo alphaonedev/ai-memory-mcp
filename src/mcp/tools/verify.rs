@@ -117,7 +117,7 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
             let rel = params
                 .get(param_names::RELATION)
                 .and_then(Value::as_str)
-                .unwrap_or("related_to");
+                .unwrap_or(crate::models::MemoryLinkRelation::RelatedTo.as_str());
             (src.to_string(), dst.to_string(), rel.to_string())
         };
 

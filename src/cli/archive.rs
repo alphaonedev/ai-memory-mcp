@@ -102,7 +102,7 @@ pub fn run(
             crate::governance::audit::record_decision(
                 &caller,
                 "allow",
-                "archive_purge",
+                crate::governance::action_labels::ARCHIVE_PURGE,
                 "",
                 serde_json::json!({ "older_than_days": older_than_days }),
             );

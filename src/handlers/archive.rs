@@ -145,7 +145,7 @@ pub async fn restore_archive(
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "archive_restore",
+        crate::governance::action_labels::ARCHIVE_RESTORE,
         "",
         json!({ "id": &id }),
     );
@@ -300,7 +300,7 @@ pub async fn purge_archive(
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "archive_purge",
+        crate::governance::action_labels::ARCHIVE_PURGE,
         "",
         json!({
             "older_than_days": q.older_than_days,
@@ -499,8 +499,15 @@ pub async fn archive_by_ids(
             // namespace anchor — downstream subscribers match by
             // event_type + memory_id, not namespace, for archive
             // events.
-            super::dispatch_event_postgres(&app, "memory_archive", id, "", Some(&caller), None)
-                .await;
+            super::dispatch_event_postgres(
+                &app,
+                crate::governance::OP_MEMORY_ARCHIVE,
+                id,
+                "",
+                Some(&caller),
+                None,
+            )
+            .await;
         }
         return (
             StatusCode::OK,

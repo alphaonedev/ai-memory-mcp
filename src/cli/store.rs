@@ -301,7 +301,9 @@ pub fn run(
         crate::audit::AuditAction::Store,
         crate::audit::actor(
             agent_id.clone(),
-            cli_agent_id.map_or("default_fallback", |_| "explicit"),
+            cli_agent_id.map_or(crate::audit::synthesis_sources::DEFAULT_FALLBACK, |_| {
+                crate::audit::synthesis_sources::EXPLICIT
+            }),
             args.scope.clone(),
         ),
         crate::audit::target_memory(

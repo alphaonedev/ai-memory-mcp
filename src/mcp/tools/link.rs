@@ -101,7 +101,9 @@ pub(super) fn handle_link(
     let target_id = params["target_id"]
         .as_str()
         .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
-    let relation = params["relation"].as_str().unwrap_or("related_to");
+    let relation = params["relation"]
+        .as_str()
+        .unwrap_or(crate::models::MemoryLinkRelation::RelatedTo.as_str());
 
     validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
         .map_err(|e| e.to_string())?;
@@ -306,7 +308,7 @@ pub(super) fn handle_link(
     .ok();
     crate::subscriptions::dispatch_event_with_details(
         conn,
-        "memory_link_created",
+        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
         source_id,
         &event_namespace,
         event_agent_id.as_deref(),

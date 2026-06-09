@@ -12,6 +12,14 @@
 use serde_json::Value;
 use std::fmt::Write;
 
+/// #1558 batch 5 wave 3 — canonical wire name of the compact TOON
+/// output format (`format: "toon_compact"` on `memory_recall` /
+/// `memory_list` / `memory_search` / `memory_session_start`, and the
+/// MCP dispatch default when the caller omits `format`). The
+/// non-compact variant keeps its short `"toon"` literal at the
+/// dispatch sites.
+pub const FORMAT_TOON_COMPACT: &str = "toon_compact";
+
 /// Standard memory fields in TOON column order.
 const MEMORY_FIELDS: &[&str] = &[
     "id",

@@ -639,6 +639,16 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
 /// less specific error message). Operators who need the raw
 /// diagnostic still get it via the structured tracing log emitted at
 /// the call site.
+/// #1558 batch 5 wave 3 — sanitizer sentinel substituted for a leaked
+/// URL run (`scheme://…`) by [`sanitize_store_err_message`].
+#[cfg(feature = "sal")]
+const REDACTED_URL_SENTINEL: &str = "[redacted-url]";
+
+/// #1558 batch 5 wave 3 — sanitizer sentinel substituted for a leaked
+/// absolute filesystem path by [`sanitize_store_err_message`].
+#[cfg(feature = "sal")]
+const REDACTED_PATH_SENTINEL: &str = "[redacted-path]";
+
 #[cfg(feature = "sal")]
 #[must_use]
 pub fn sanitize_store_err_message(raw: &str) -> String {
@@ -663,7 +673,7 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
             }
             let pop = i - scheme_start;
             out.truncate(out.len().saturating_sub(pop));
-            out.push_str("[redacted-url]");
+            out.push_str(REDACTED_URL_SENTINEL);
             // Skip past "://" plus the rest of the URL run (anything
             // not whitespace/quote/brace/paren/comma/semicolon/angle).
             i += 3;
@@ -702,7 +712,7 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
                 || bytes[i + 1] == b'_'
                 || bytes[i + 1] == b'.')
         {
-            out.push_str("[redacted-path]");
+            out.push_str(REDACTED_PATH_SENTINEL);
             i += 1;
             while i < bytes.len() {
                 let c = bytes[i];
@@ -723,7 +733,7 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
 
 #[cfg(all(test, feature = "sal"))]
 mod store_err_sanitize_tests {
-    use super::sanitize_store_err_message;
+    use super::{REDACTED_PATH_SENTINEL, REDACTED_URL_SENTINEL, sanitize_store_err_message};
 
     #[test]
     fn sanitize_redacts_postgres_url() {
@@ -733,7 +743,7 @@ mod store_err_sanitize_tests {
         assert!(!clean.contains("hunter2"), "password leaked: {clean}");
         assert!(!clean.contains("db.internal"), "host leaked: {clean}");
         assert!(
-            clean.contains("[redacted-url]"),
+            clean.contains(REDACTED_URL_SENTINEL),
             "missing sentinel: {clean}"
         );
     }
@@ -744,7 +754,7 @@ mod store_err_sanitize_tests {
         let clean = sanitize_store_err_message(leak);
         assert!(!clean.contains("/var/lib"), "raw path leaked: {clean}");
         assert!(
-            clean.contains("[redacted-path]"),
+            clean.contains(REDACTED_PATH_SENTINEL),
             "missing sentinel: {clean}"
         );
     }
@@ -762,8 +772,8 @@ mod store_err_sanitize_tests {
         let clean = sanitize_store_err_message(leak);
         assert!(!clean.contains("postgres://"));
         assert!(!clean.contains("/etc/secret"));
-        assert!(clean.contains("[redacted-url]"));
-        assert!(clean.contains("[redacted-path]"));
+        assert!(clean.contains(REDACTED_URL_SENTINEL));
+        assert!(clean.contains(REDACTED_PATH_SENTINEL));
     }
 
     #[test]
@@ -786,7 +796,7 @@ mod store_err_sanitize_tests {
     fn sanitize_redacts_url_at_start_of_message() {
         let leak = "postgres://u:p@h/db is unreachable";
         let clean = sanitize_store_err_message(leak);
-        assert!(clean.starts_with("[redacted-url]"));
+        assert!(clean.starts_with(REDACTED_URL_SENTINEL));
     }
 }
 

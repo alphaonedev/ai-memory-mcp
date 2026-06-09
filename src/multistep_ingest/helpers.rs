@@ -371,7 +371,7 @@ pub fn fts_classifier_with(params: &HelperParams, ctx: &HelperContext<'_>) -> He
     let summary = format!("fts_classifier: kind={kind} (namespace={namespace})");
 
     let payload = json!({
-        "helper": "fts_classifier",
+        "helper": HelperKind::FtsClassifier.as_str(),
         "fact_kind": kind,
         "namespace": namespace,
         "tokens": tokenise(content).len(),

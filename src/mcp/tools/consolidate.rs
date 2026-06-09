@@ -121,7 +121,7 @@ pub(super) fn handle_consolidate(
         &summary,
         namespace,
         &Tier::Long,
-        "consolidation",
+        crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
     )
     .map_err(|e| e.to_string())?;
@@ -185,7 +185,7 @@ pub(super) fn handle_consolidate(
     .ok();
     crate::subscriptions::dispatch_event_with_details(
         conn,
-        "memory_consolidated",
+        crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED,
         &new_id,
         namespace,
         Some(&consolidator_agent_id),

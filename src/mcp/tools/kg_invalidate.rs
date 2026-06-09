@@ -110,7 +110,7 @@ pub fn handle_kg_invalidate(
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
                 return Err(crate::governance::deny_message(
-                    "kg_invalidate",
+                    crate::governance::action_labels::KG_INVALIDATE,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
                 ));
@@ -119,7 +119,7 @@ pub fn handle_kg_invalidate(
                 return Ok(json!({
                     "status": "ask",
                     "reason": prompt,
-                    "action": "kg_invalidate",
+                    "action": crate::governance::action_labels::KG_INVALIDATE,
                     "source_id": source_id,
                     "target_id": target_id,
                 }));
@@ -161,7 +161,7 @@ pub fn handle_kg_invalidate(
             .ok();
             crate::subscriptions::dispatch_event_with_details(
                 conn,
-                "memory_link_invalidated",
+                crate::subscriptions::webhook_events::MEMORY_LINK_INVALIDATED,
                 source_id,
                 &event_namespace,
                 event_agent_id.as_deref(),

@@ -489,7 +489,7 @@ pub fn build_files(
     } else {
         edges_raw
             .into_iter()
-            .filter(|e| e.relation != "derives_from")
+            .filter(|e| e.relation != crate::models::MemoryLinkRelation::DerivesFrom.as_str())
             .collect()
     };
     for edge in &edges {

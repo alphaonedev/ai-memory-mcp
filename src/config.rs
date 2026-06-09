@@ -1021,10 +1021,10 @@ fn default_webhook_events() -> Vec<String> {
         tn::MEMORY_STORE.to_string(),
         tn::MEMORY_PROMOTE.to_string(),
         tn::MEMORY_DELETE.to_string(),
-        "memory_link_created".to_string(),
-        "memory_link_invalidated".to_string(),
-        "memory_consolidated".to_string(),
-        "approval_requested".to_string(),
+        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED.to_string(),
+        crate::subscriptions::webhook_events::MEMORY_LINK_INVALIDATED.to_string(),
+        crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED.to_string(),
+        crate::subscriptions::webhook_events::APPROVAL_REQUESTED.to_string(),
     ]
 }
 
@@ -3005,7 +3005,10 @@ impl std::fmt::Debug for AppConfig {
             .field(config_keys::MAX_MEMORY_MB, &self.max_memory_mb)
             .field("ttl", &self.ttl)
             .field(config_keys::ARCHIVE_ON_GC, &self.archive_on_gc)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
             .field(config_keys::ARCHIVE_MAX_DAYS, &self.archive_max_days)
             .field("identity", &self.identity)
             .field("scoring", &self.scoring)
@@ -3284,7 +3287,10 @@ impl std::fmt::Debug for LlmSection {
             .field("base_url", &self.base_url)
             .field("api_key_env", &self.api_key_env)
             .field("api_key_file", &self.api_key_file)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
             .field("auto_tag", &self.auto_tag)
             .finish()
     }
@@ -3622,7 +3628,10 @@ impl std::fmt::Debug for ResolvedLlm {
             .field("backend", &self.backend)
             .field("model", &self.model)
             .field("base_url", &self.base_url)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
             .field("api_key_source", &self.api_key_source)
             .field("source", &self.source)
             .finish()
@@ -4021,7 +4030,10 @@ impl std::fmt::Debug for HooksSubscriptionConfig {
         f.debug_struct("HooksSubscriptionConfig")
             .field(
                 "hmac_secret",
-                &self.hmac_secret.as_ref().map(|_| "<redacted>"),
+                &self
+                    .hmac_secret
+                    .as_ref()
+                    .map(|_| crate::REDACTED_PLACEHOLDER),
             )
             .finish()
     }

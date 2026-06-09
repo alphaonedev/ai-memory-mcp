@@ -224,7 +224,7 @@ pub fn four_step_default() -> Pipeline {
                     .to_string(),
                 trust_inputs: vec![HelperOutputRef {
                     stage_index: 0,
-                    label: "fts_classifier".to_string(),
+                    label: HelperKind::FtsClassifier.as_str().to_string(),
                 }],
                 output_schema: json!({
                     "type": "object",
@@ -271,7 +271,7 @@ pub fn four_step_default() -> Pipeline {
                 trust_inputs: vec![
                     HelperOutputRef {
                         stage_index: 0,
-                        label: "fts_classifier".to_string(),
+                        label: HelperKind::FtsClassifier.as_str().to_string(),
                     },
                     HelperOutputRef {
                         stage_index: 1,

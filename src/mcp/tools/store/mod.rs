@@ -744,7 +744,9 @@ pub(crate) fn handle_store(
         crate::audit::AuditAction::Store,
         crate::audit::actor(
             agent_id.clone(),
-            mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+            mcp_client.map_or(crate::audit::synthesis_sources::HOST_FALLBACK, |_| {
+                crate::audit::synthesis_sources::MCP_CLIENT_INFO
+            }),
             explicit_scope.clone(),
         ),
         crate::audit::target_memory(

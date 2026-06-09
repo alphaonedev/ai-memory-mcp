@@ -146,7 +146,7 @@ pub fn run(
                     .get("agent_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default(),
-                "default_fallback",
+                crate::audit::synthesis_sources::DEFAULT_FALLBACK,
                 None,
             ),
             crate::audit::target_memory(

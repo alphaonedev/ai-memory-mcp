@@ -1861,7 +1861,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                         |r| r.get(0),
                     )
                     .unwrap_or_default();
-                let needs_rebuild = !existing_sql.contains("derives_from");
+                let needs_rebuild =
+                    !existing_sql.contains(crate::models::MemoryLinkRelation::DerivesFrom.as_str());
                 if needs_rebuild {
                     conn.execute_batch(MIGRATION_V36_REBUILD_LINKS_SQL)?;
                 }

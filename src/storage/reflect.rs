@@ -548,8 +548,12 @@ pub fn reflect_with_hooks(
         // failure with the txn rolled back so the reflection never
         // lands.
         for src_id in &input.source_ids {
-            validate::validate_link(&actual_id, src_id, "reflects_on")
-                .map_err(|e| ReflectError::Validation(e.to_string()))?;
+            validate::validate_link(
+                &actual_id,
+                src_id,
+                crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+            )
+            .map_err(|e| ReflectError::Validation(e.to_string()))?;
             // Issue #815 — the pre-#815 path called `create_link` here,
             // which always produced `attest_level='unsigned'` rows for
             // every reflects_on edge regardless of whether the caller
@@ -569,7 +573,7 @@ pub fn reflect_with_hooks(
                 conn,
                 &actual_id,
                 src_id,
-                "reflects_on",
+                crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
                 hooks.active_keypair,
             )
             .map_err(|e| ReflectError::Database(e.to_string()))?;
