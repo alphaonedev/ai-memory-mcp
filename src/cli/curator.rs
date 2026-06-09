@@ -1365,6 +1365,7 @@ mod tests {
 
     // ---------- C-1 coverage uplift: --reflect modes ----------
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_requires_namespace_or_all_namespaces() {
         let mut env = TestEnv::fresh();
@@ -1380,6 +1381,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_namespace_and_all_namespaces_mutually_exclusive() {
         let mut env = TestEnv::fresh();
@@ -1394,6 +1396,7 @@ mod tests {
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_no_llm_path_emits_error_in_report() {
         // Keyword tier → no LLM → run_reflect populates `errors` and prints report.
@@ -1414,6 +1417,7 @@ mod tests {
         assert!(s.contains("no LLM client configured"));
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_no_llm_path_emits_json_report() {
         // Same as above but with --json output.
@@ -1437,6 +1441,7 @@ mod tests {
         assert!(v["dry_run"].as_bool().unwrap());
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_all_namespaces_text_output() {
         // All-namespaces with no enabled namespaces is the default-safe path.
@@ -1510,6 +1515,7 @@ mod tests {
         let _ = build_curator_llm(config::FeatureTier::Autonomous);
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_with_seeded_observations_and_no_llm() {
         // Seed observations so list_namespaces returns a namespace,
