@@ -2410,11 +2410,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(super::connection::SQL_COMMIT)?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(super::connection::SQL_ROLLBACK);
             Err(e)
         }
     }

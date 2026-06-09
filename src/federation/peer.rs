@@ -68,7 +68,7 @@ impl FederationConfig {
                 // label space as deployment size grew.)
                 let trimmed = raw.trim_end_matches('/');
                 tracing::debug!(
-                    target = "federation",
+                    target: "federation",
                     peer_index = i,
                     url = trimmed,
                     "registered peer"

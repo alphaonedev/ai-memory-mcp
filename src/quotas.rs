@@ -470,7 +470,7 @@ pub fn check_and_record(
     // can begin a write transaction until we COMMIT or ROLLBACK. The
     // window between SELECT and UPDATE inside the transaction is
     // therefore safe from another writer's UPDATE racing past us.
-    conn.execute_batch("BEGIN IMMEDIATE")
+    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
         .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
 
     let result: std::result::Result<(), QuotaCheckError> = (|| {
@@ -583,14 +583,14 @@ pub fn check_and_record(
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
                 .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("quota commit failed: {e}")))?;
             Ok(())
         }
         Err(e) => {
             // Rollback is best-effort — even if it fails, the
             // transaction is implicitly aborted on connection drop.
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
             Err(e)
         }
     }

@@ -184,7 +184,6 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("GET", super::routes::EXPORT) => true,
         ("POST", super::routes::ARCHIVE) => true,
         ("DELETE", super::routes::ARCHIVE) => true,
-        ("POST", "/api/v1/archive/purge") => true,
         ("POST", p) if archive_restore_path(p) => true,
         // Wave-3 Continuation 3 — remaining write paths the sqlite path
         // already wires through `app.store` in their handlers (these
@@ -809,19 +808,19 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_always_passes_health_and_metrics() {
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::HEALTH
+            crate::handlers::routes::HEALTH
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::CAPABILITIES
+            crate::handlers::routes::CAPABILITIES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::METRICS_BARE
+            crate::handlers::routes::METRICS_BARE
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::METRICS
+            crate::handlers::routes::METRICS
         ));
     }
 
@@ -829,19 +828,19 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_core_crud() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORIES
+            crate::handlers::routes::MEMORIES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::MEMORIES
+            crate::handlers::routes::MEMORIES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::SEARCH
+            crate::handlers::routes::SEARCH
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::LINKS
+            crate::handlers::routes::LINKS
         ));
     }
 
@@ -851,15 +850,15 @@ mod transport_postgres_gate_tests {
         // are now SAL-routed on postgres and must pass the gate.
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORY_REFLECT
+            crate::handlers::routes::MEMORY_REFLECT
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORY_REFLECTION_ORIGIN
+            crate::handlers::routes::MEMORY_REFLECTION_ORIGIN
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORY_RECALL_OBSERVATIONS
+            crate::handlers::routes::MEMORY_RECALL_OBSERVATIONS
         ));
     }
 
@@ -886,7 +885,7 @@ mod transport_postgres_gate_tests {
         // /api/v1/memories/bulk is its own endpoint (not memory_id_path).
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORIES_BULK
+            crate::handlers::routes::MEMORIES_BULK
         ));
     }
 
@@ -904,19 +903,19 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_kg_paths() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::KG_QUERY
+            crate::handlers::routes::KG_QUERY
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::KG_TIMELINE
+            crate::handlers::routes::KG_TIMELINE
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::KG_INVALIDATE
+            crate::handlers::routes::KG_INVALIDATE
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::KG_FIND_PATHS
+            crate::handlers::routes::KG_FIND_PATHS
         ));
     }
 
@@ -924,19 +923,19 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_quota_verify_entities() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::LINKS_VERIFY
+            crate::handlers::routes::LINKS_VERIFY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::QUOTA_STATUS
+            crate::handlers::routes::QUOTA_STATUS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::ENTITIES
+            crate::handlers::routes::ENTITIES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::ENTITIES_BY_ALIAS
+            crate::handlers::routes::ENTITIES_BY_ALIAS
         ));
     }
 
@@ -944,21 +943,25 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_archive_paths() {
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::ARCHIVE
+            crate::handlers::routes::ARCHIVE
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::ARCHIVE_STATS
+            crate::handlers::routes::ARCHIVE_STATS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::ARCHIVE
+            crate::handlers::routes::ARCHIVE
         ));
         assert!(postgres_endpoint_supported(
             &Method::DELETE,
-            super::routes::ARCHIVE
+            crate::handlers::routes::ARCHIVE
         ));
-        assert!(postgres_endpoint_supported(
+        // #1563 — the gate previously allow-listed POST
+        // /api/v1/archive/purge, a path NO router registers (purge is
+        // DELETE /api/v1/archive). The dead arm is removed; pin that
+        // the unregistered path is now refused by the gate too.
+        assert!(!postgres_endpoint_supported(
             &Method::POST,
             "/api/v1/archive/purge"
         ));
@@ -1015,7 +1018,7 @@ mod transport_postgres_gate_tests {
         // /api/v1/approvals/stream is excluded from decide path.
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::APPROVALS_STREAM
+            crate::handlers::routes::APPROVALS_STREAM
         ));
     }
 
@@ -1035,123 +1038,123 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_remaining_write_paths() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::FORGET
+            crate::handlers::routes::FORGET
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::CONSOLIDATE
+            crate::handlers::routes::CONSOLIDATE
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::CONTRADICTIONS
+            crate::handlers::routes::CONTRADICTIONS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::AUTO_TAG
+            crate::handlers::routes::AUTO_TAG
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::EXPAND_QUERY
+            crate::handlers::routes::EXPAND_QUERY
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::TOOLS_LIST
+            crate::handlers::routes::TOOLS_LIST
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORY_LOAD_FAMILY
+            crate::handlers::routes::MEMORY_LOAD_FAMILY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::NOTIFY
+            crate::handlers::routes::NOTIFY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::GC
+            crate::handlers::routes::GC
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::IMPORT
+            crate::handlers::routes::IMPORT
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::EXPORT
+            crate::handlers::routes::EXPORT
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::AGENTS
+            crate::handlers::routes::AGENTS
         ));
         assert!(postgres_endpoint_supported(
             &Method::DELETE,
-            super::routes::LINKS
+            crate::handlers::routes::LINKS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::SUBSCRIPTIONS
+            crate::handlers::routes::SUBSCRIPTIONS
         ));
         assert!(postgres_endpoint_supported(
             &Method::DELETE,
-            super::routes::SUBSCRIPTIONS
+            crate::handlers::routes::SUBSCRIPTIONS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::SESSION_START
+            crate::handlers::routes::SESSION_START
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::SYNC_PUSH
+            crate::handlers::routes::SYNC_PUSH
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::SYNC_SINCE
+            crate::handlers::routes::SYNC_SINCE
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::PENDING
+            crate::handlers::routes::PENDING
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::AGENTS
+            crate::handlers::routes::AGENTS
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::NAMESPACES
+            crate::handlers::routes::NAMESPACES
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::NAMESPACES
+            crate::handlers::routes::NAMESPACES
         ));
         assert!(postgres_endpoint_supported(
             &Method::DELETE,
-            super::routes::NAMESPACES
+            crate::handlers::routes::NAMESPACES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::STATS
+            crate::handlers::routes::STATS
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::TAXONOMY
+            crate::handlers::routes::TAXONOMY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::CHECK_DUPLICATE
+            crate::handlers::routes::CHECK_DUPLICATE
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::SUBSCRIPTIONS
+            crate::handlers::routes::SUBSCRIPTIONS
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::INBOX
+            crate::handlers::routes::INBOX
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            super::routes::RECALL
+            crate::handlers::routes::RECALL
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            super::routes::RECALL
+            crate::handlers::routes::RECALL
         ));
     }
 
@@ -1204,7 +1207,7 @@ mod transport_postgres_gate_tests {
         // surface instead of a fabricated 501.
         assert!(!path_is_registered_route(
             &Method::PATCH,
-            super::routes::MEMORIES
+            crate::handlers::routes::MEMORIES
         ));
     }
 
@@ -1219,83 +1222,83 @@ mod transport_postgres_gate_tests {
         // Fixed paths.
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::HEALTH
+            crate::handlers::routes::HEALTH
         ));
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::METRICS_BARE
+            crate::handlers::routes::METRICS_BARE
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::MEMORIES
+            crate::handlers::routes::MEMORIES
         ));
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::MEMORIES
+            crate::handlers::routes::MEMORIES
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::MEMORIES_BULK
+            crate::handlers::routes::MEMORIES_BULK
         ));
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::SEARCH
+            crate::handlers::routes::SEARCH
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::FORGET
+            crate::handlers::routes::FORGET
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::CONSOLIDATE
+            crate::handlers::routes::CONSOLIDATE
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::SHARE
+            crate::handlers::routes::SHARE
         ));
         // route_1111 family — POST-only.
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::MEMORY_SMART_LOAD
+            crate::handlers::routes::MEMORY_SMART_LOAD
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::MEMORY_REFLECT
+            crate::handlers::routes::MEMORY_REFLECT
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::MEMORY_ATOMISE
+            crate::handlers::routes::MEMORY_ATOMISE
         ));
         // KG endpoints.
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::KG_TIMELINE
+            crate::handlers::routes::KG_TIMELINE
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::KG_QUERY
+            crate::handlers::routes::KG_QUERY
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::KG_FIND_PATHS
+            crate::handlers::routes::KG_FIND_PATHS
         ));
         // #934 alias.
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::FIND_PATHS
+            crate::handlers::routes::FIND_PATHS
         ));
         // Namespaces (qs form + path form).
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::NAMESPACES
+            crate::handlers::routes::NAMESPACES
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::NAMESPACES
+            crate::handlers::routes::NAMESPACES
         ));
         assert!(path_is_registered_route(
             &Method::DELETE,
-            super::routes::NAMESPACES
+            crate::handlers::routes::NAMESPACES
         ));
 
         // Path-parameter routes.
@@ -1387,7 +1390,7 @@ mod transport_postgres_gate_tests {
         // "list is not registered at all".
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::SKILL_LIST
+            crate::handlers::routes::SKILL_LIST
         ));
         // Trailing extras must not match.
         assert!(!path_is_registered_route(
@@ -1413,30 +1416,30 @@ mod transport_postgres_gate_tests {
         // pins the "404 case" half.
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::SHARE
+            crate::handlers::routes::SHARE
         ));
         assert!(!postgres_endpoint_supported(
             &Method::POST,
-            super::routes::SHARE
+            crate::handlers::routes::SHARE
         ));
         // Same shape — route_1111 family is registered but not
         // postgres-allowlisted.
         assert!(path_is_registered_route(
             &Method::POST,
-            super::routes::MEMORY_SMART_LOAD
+            crate::handlers::routes::MEMORY_SMART_LOAD
         ));
         assert!(!postgres_endpoint_supported(
             &Method::POST,
-            super::routes::MEMORY_SMART_LOAD
+            crate::handlers::routes::MEMORY_SMART_LOAD
         ));
         // Skill surface — registered but not postgres-allowlisted.
         assert!(path_is_registered_route(
             &Method::GET,
-            super::routes::SKILL_LIST
+            crate::handlers::routes::SKILL_LIST
         ));
         assert!(!postgres_endpoint_supported(
             &Method::GET,
-            super::routes::SKILL_LIST
+            crate::handlers::routes::SKILL_LIST
         ));
     }
 

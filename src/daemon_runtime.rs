@@ -4532,7 +4532,7 @@ pub async fn sync_cycle_once(
             local_agent_id,
         );
     if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
+        req = req.header(crate::HEADER_API_KEY, key);
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -4585,7 +4585,7 @@ pub async fn sync_cycle_once(
             .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
             .json(&body);
         if let Some(key) = api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {

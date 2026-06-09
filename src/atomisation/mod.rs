@@ -873,7 +873,7 @@ fn archive_source(
     atom_count: i64,
     archived_at: &str,
 ) -> anyhow::Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> anyhow::Result<()> {
         // Merge the existing metadata with the new
         // `atomisation_archived_at` key — never clobber other keys.
@@ -903,11 +903,11 @@ fn archive_source(
     })();
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
             Err(e)
         }
     }

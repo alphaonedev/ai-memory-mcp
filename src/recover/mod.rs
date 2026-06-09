@@ -532,7 +532,7 @@ fn write_recovered_turn(
         ..Memory::default()
     };
 
-    conn.execute_batch("BEGIN IMMEDIATE")
+    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> Result<String, String> {
@@ -558,12 +558,12 @@ fn write_recovered_turn(
 
     match tx_result {
         Ok(memory_id) => {
-            conn.execute_batch("COMMIT")
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
                 .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
             Ok(memory_id)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
             Err(e)
         }
     }

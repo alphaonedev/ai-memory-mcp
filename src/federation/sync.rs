@@ -101,7 +101,7 @@ pub(super) async fn post_once(
     // cross-host quorum can never converge. Backwards-compatible:
     // `None` means no header attached.
     if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
+        req = req.header(crate::HEADER_API_KEY, key);
     }
     // v0.7.0 #791 + #922 — Ed25519 signature header + nonce header
     // bound into signature input so byte-for-byte replays are refused.
@@ -1523,7 +1523,7 @@ pub async fn bulk_catchup_push(
             // catchup against a peer that runs with api-key auth fails
             // 401 and the row gap stays open.
             if let Some(key) = api_key.as_deref() {
-                req = req.header("x-api-key", key);
+                req = req.header(crate::HEADER_API_KEY, key);
             }
             // v0.7.0 #238 — attach `x-peer-id` so catchup batches
             // attest against the receiver's allowlist exactly like

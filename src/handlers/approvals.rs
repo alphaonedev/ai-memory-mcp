@@ -122,14 +122,14 @@ pub(crate) fn verify_approval_hmac(
         }
     };
     let sig_header = headers
-        .get("x-ai-memory-signature")
+        .get(crate::HEADER_AI_MEMORY_SIGNATURE)
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let sig_hex = sig_header
         .strip_prefix("sha256=")
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let timestamp = headers
-        .get("x-ai-memory-timestamp")
+        .get(crate::HEADER_AI_MEMORY_TIMESTAMP)
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     // Replay-window check: the timestamp MUST parse as a Unix epoch
