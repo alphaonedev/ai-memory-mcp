@@ -157,11 +157,10 @@ impl McpTool for ExportReflectionTool {
         "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ExportReflectionRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ExportReflectionRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

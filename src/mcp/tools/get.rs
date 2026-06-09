@@ -34,11 +34,10 @@ impl McpTool for GetTool {
         "Memory row + linked ids (in+out). Use memory_get_links for full link rows with attestation."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(GetRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<GetRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 

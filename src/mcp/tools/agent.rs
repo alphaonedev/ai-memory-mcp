@@ -112,11 +112,10 @@ impl McpTool for AgentRegisterTool {
         "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested — pair with attestation for security boundary."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(AgentRegisterRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<AgentRegisterRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 
@@ -141,11 +140,10 @@ impl McpTool for AgentListTool {
         "List agents (ordered by registered_at)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(AgentListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<AgentListRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

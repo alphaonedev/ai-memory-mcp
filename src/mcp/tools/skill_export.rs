@@ -345,11 +345,10 @@ impl McpTool for SkillExportTool {
         "L1-5: write SKILL.md + resources/ to target_folder. Round-trip identical SHA-256. Emits skill.exported signed_events row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillExportRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillExportRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

@@ -39,11 +39,10 @@ impl McpTool for PendingListTool {
         "Task 1.9: list governance-queued actions. status filter (default pending). Limit cap 1000."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PendingListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PendingListRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -74,11 +73,10 @@ impl McpTool for PendingApproveTool {
         "Task 1.9 approve. decided_by = caller. K10: remember (once|session|forever) writes a synthetic permit rule."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PendingApproveRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PendingApproveRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -109,11 +107,10 @@ impl McpTool for PendingRejectTool {
         "Task 1.9 reject. decided_by = caller. K10: remember writes a synthetic deny rule."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PendingRejectRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PendingRejectRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -390,11 +387,10 @@ impl McpTool for SubscriptionDlqListTool {
         "K7: DLQ inspector."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SubscriptionDlqListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SubscriptionDlqListRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

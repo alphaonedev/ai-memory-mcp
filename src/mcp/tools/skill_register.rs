@@ -443,11 +443,10 @@ impl McpTool for SkillRegisterTool {
         "L1-5: Ed25519-attested skill registration with version chaining. Re-register same (name, namespace) supersedes prior row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillRegisterRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillRegisterRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

@@ -114,11 +114,10 @@ impl McpTool for CheckDuplicateTool {
         "Pillar 2 / Stream D: pre-write near-dup check. Embeds title+content, returns highest-cosine match + is_duplicate + suggested_merge. Threshold floor 0.5. Requires semantic tier+."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(CheckDuplicateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<CheckDuplicateRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

@@ -87,11 +87,10 @@ impl McpTool for ReflectionOriginTool {
         "L2-2 (S6-M1): {memory_id, peer_origin, signing_agent, original_depth, local_depth_at_arrival, is_reflection}. Non-reflections return envelope with is_reflection=false. Unknown ids => error."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ReflectionOriginRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ReflectionOriginRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

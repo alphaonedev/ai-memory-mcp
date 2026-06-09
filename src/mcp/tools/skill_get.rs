@@ -181,11 +181,10 @@ impl McpTool for SkillGetTool {
         "L1-5: metadata + decompressed body (<5000 tok). Old version ids stay addressable."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillGetRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillGetRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

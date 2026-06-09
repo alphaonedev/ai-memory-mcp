@@ -95,11 +95,10 @@ impl McpTool for DependentsOfInvalidatedTool {
         "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade — dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(DependentsOfInvalidatedRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<DependentsOfInvalidatedRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

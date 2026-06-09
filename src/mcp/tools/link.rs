@@ -43,11 +43,10 @@ impl McpTool for LinkTool {
         "Directional link. Relations: related_to | supersedes | contradicts | derived_from | reflects_on (Task 3/8). H-track signs with active Ed25519 (verify via memory_verify)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(LinkRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<LinkRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -74,11 +73,10 @@ impl McpTool for GetLinksTool {
         "In + outbound links with relation, attest_level (unsigned/self_signed/peer_attested), valid_from/until/observed_by."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(GetLinksRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<GetLinksRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

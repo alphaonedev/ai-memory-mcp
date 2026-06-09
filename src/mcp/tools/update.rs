@@ -85,11 +85,10 @@ impl McpTool for UpdateTool {
         "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(UpdateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<UpdateRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 

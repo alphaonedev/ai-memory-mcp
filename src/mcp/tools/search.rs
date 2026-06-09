@@ -59,11 +59,10 @@ impl McpTool for SearchTool {
         "Exact keyword AND search. Deterministic; no fuzzy/semantic. Filters: namespace, tier, agent_id, as_agent (Task 1.5 scope). WT-1-E: atomised sources hidden by default."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SearchRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SearchRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 

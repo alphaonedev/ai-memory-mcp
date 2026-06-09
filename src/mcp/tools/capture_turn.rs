@@ -221,14 +221,13 @@ impl McpTool for MemoryCaptureTurnTool {
     }
 
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(MemoryCaptureTurnRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<MemoryCaptureTurnRequest>()
     }
 
     fn family() -> &'static str {
         // Lifecycle — capture is a substrate-lifecycle primitive
         // (every host-volunteered turn produces one memory row).
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 

@@ -114,11 +114,10 @@ impl McpTool for QuotaStatusTool {
          the single row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(QuotaStatusRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<QuotaStatusRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

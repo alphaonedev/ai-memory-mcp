@@ -378,11 +378,10 @@ impl McpTool for SkillPromoteFromReflectionTool {
         "L2-6 (#671): reflection (depth>=namespace.governance.skill_promotion_min_depth, default 1) -> SKILL.md. Each reflects_on source -> references/source_{i}.md. Frontmatter preserves derived_from_reflection_id + original_reflection_depth. Promote->export->register => identical SHA-256. Refuses depth-0."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillPromoteFromReflectionRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillPromoteFromReflectionRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

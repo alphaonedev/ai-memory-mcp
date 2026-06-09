@@ -133,11 +133,10 @@ impl McpTool for SkillResourceTool {
         "L1-5: SHA-256-verified resource fetch. Errors on mismatch."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillResourceRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillResourceRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

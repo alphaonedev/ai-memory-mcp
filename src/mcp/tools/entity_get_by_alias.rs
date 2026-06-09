@@ -38,11 +38,10 @@ impl McpTool for EntityGetByAliasTool {
         "Pillar 2 / Stream B: resolve alias to entity. Without namespace, most-recently-created wins. Null when no match."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(EntityGetByAliasRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<EntityGetByAliasRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

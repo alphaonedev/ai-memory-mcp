@@ -204,11 +204,10 @@ impl McpTool for PersonaTool {
         "QW-2: latest MemoryKind::Persona for (entity_id, namespace). Returns envelope {id, entity_id, namespace, body_md, sources, generated_at, version, attest_level}. null when none. Pair with memory_persona_generate."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PersonaRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PersonaRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 
@@ -242,11 +241,10 @@ impl McpTool for PersonaGenerateTool {
         "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PersonaGenerateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PersonaGenerateRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

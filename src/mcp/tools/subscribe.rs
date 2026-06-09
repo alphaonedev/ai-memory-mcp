@@ -54,11 +54,10 @@ impl McpTool for SubscribeTool {
         "Webhook subscription. HMAC-SHA256 signed via X-Ai-Memory-Signature when secret supplied. https required (http only for loopback). Secret stored hashed only."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SubscribeRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SubscribeRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -84,11 +83,10 @@ impl McpTool for UnsubscribeTool {
         "Delete subscription. DLQ rows retained for audit."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(UnsubscribeRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<UnsubscribeRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -284,11 +282,10 @@ impl McpTool for ListSubscriptionsTool {
         "List subscriptions. Secrets never returned."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ListSubscriptionsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ListSubscriptionsRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 
@@ -318,11 +315,10 @@ impl McpTool for SubscriptionReplayTool {
         "K7: replay events ordered by delivered_at asc."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SubscriptionReplayRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SubscriptionReplayRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

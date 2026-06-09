@@ -48,11 +48,10 @@ impl McpTool for VerifyTool {
         "H4: re-verify link signature. Returns {signature_verified, attest_level, signed_by, signed_at}. Pass link_id composite ('source--relation-->target') or explicit triple."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(VerifyRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<VerifyRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 

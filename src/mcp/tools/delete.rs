@@ -36,11 +36,10 @@ impl McpTool for DeleteTool {
         "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk pattern delete (archives first)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(DeleteRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<DeleteRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 

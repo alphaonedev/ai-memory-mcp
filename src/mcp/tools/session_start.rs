@@ -154,11 +154,10 @@ impl McpTool for SessionStartTool {
         "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SessionStartRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SessionStartRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

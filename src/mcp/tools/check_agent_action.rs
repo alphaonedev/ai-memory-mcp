@@ -282,11 +282,10 @@ impl McpTool for CheckAgentActionTool {
         "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled — use `ai-memory rules --sign` CLI or signed HTTP admin endpoints."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(CheckAgentActionRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<CheckAgentActionRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

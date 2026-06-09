@@ -170,11 +170,10 @@ impl McpTool for ShareTool {
         "#224/#311 MVP: point-to-point copy into `_shared/<from>→<to>/` with provenance."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ShareRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ShareRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 
