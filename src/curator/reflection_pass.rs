@@ -46,21 +46,94 @@
 //! flag wiring (see `src/cli/curator.rs`) consumes, plus
 //! [`run_reflection_pass`] which the CLI's `--reflect` mode invokes.
 
-use crate::models::ConfidenceSource;
+// The pass internals run only through the SAL-gated curator path; in a
+// non-sal build only the config/report structs are live, so relax the
+// dead-code / unused-import lints there only (sal builds enforce fully).
+#![cfg_attr(not(feature = "sal"), allow(dead_code, unused_imports))]
+
 use std::collections::HashSet;
 
-use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "sal")]
+use anyhow::Context;
+use anyhow::Result;
+
+#[cfg(feature = "sal")]
 use crate::autonomy::AutonomyLlm;
+#[cfg(feature = "sal")]
 use crate::identity::keypair::AgentKeypair;
 use crate::models::{Memory, MemoryKind, Tier};
-use crate::storage as db;
-use crate::storage::reflect::{ReflectError, ReflectInput, reflect_with_hooks};
+#[cfg(feature = "sal")]
+use crate::storage::reflect::{ReflectError, ReflectInput};
+#[cfg(feature = "sal")]
+use crate::store::{CallerContext, Filter, MemoryStore, StoreError};
 
-use super::pipeline::{CompactionPass, MemoryId};
+#[cfg(feature = "sal")]
+use super::pipeline::MemoryId;
+
+#[cfg(any(feature = "sal", test))]
+use crate::models::ConfidenceSource;
+
+/// Fetch a single memory by id through the SAL trait, mapping the
+/// `NotFound` verdict to `Ok(None)` so call sites keep the
+/// `Option`-shaped contract the pre-#1548 `db::get` free function
+/// returned. Any other [`StoreError`] propagates as an `anyhow` error.
+///
+/// The curator runs as an operator-class background sweep, so the
+/// supplied `ctx` carries `bypass_visibility` (see
+/// [`curator_caller_context`]) — preserving the pre-trait raw-connection
+/// behaviour where `db::get` applied no scope=private visibility filter.
+#[cfg(feature = "sal")]
+async fn store_get_opt(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    id: &str,
+) -> Result<Option<Memory>> {
+    match store.get(ctx, id).await {
+        Ok(mem) => Ok(Some(mem)),
+        Err(StoreError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
+/// Build the curator's operator-class caller context. The reflection
+/// pass is a background substrate-maintenance sweep, not a tenant-facing
+/// request, so it reads every row regardless of `metadata.scope` —
+/// exactly the posture the pre-#1548 raw-`rusqlite::Connection` path had
+/// (the legacy `db::*` free functions applied no SAL visibility filter).
+/// `agent_id` carries the curator's resolved signing identity so audit
+/// trails attribute the sweep correctly.
+#[cfg(feature = "sal")]
+fn curator_caller_context(agent_id: &str) -> CallerContext {
+    CallerContext::for_admin(agent_id)
+}
+
+/// List up to `limit` memories in `namespace` through the SAL trait.
+/// Replaces the pre-#1548 `db::list(conn, Some(ns), None, limit, 0, …)`
+/// free-function call with the backend-agnostic [`MemoryStore::list`]
+/// surface. The reflection pass only ever needs the namespace + limit
+/// dimensions of the legacy positional signature; the remaining
+/// (offset / tier / since / until / tags / agent_id) slots were always
+/// passed as `0` / `None`, so they are simply absent from [`Filter`].
+#[cfg(feature = "sal")]
+async fn store_list_namespace(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    namespace: &str,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let filter = Filter {
+        namespace: Some(namespace.to_string()),
+        limit,
+        ..Default::default()
+    };
+    store
+        .list(ctx, &filter)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+}
 
 // ---------------------------------------------------------------------------
 // Constants — per #666 spec ("≥3 members", "7-day temporal window", …)
@@ -132,21 +205,32 @@ impl Default for ReflectionPassConfig {
 }
 
 // ---------------------------------------------------------------------------
-// ReflectionPass — the CompactionPass impl
+// ReflectionPass — SAL-backed reflection synthesis (issue #1548)
 // ---------------------------------------------------------------------------
 
 /// Compaction pass that synthesises typed `Reflection` memories from
 /// clusters of co-occurring Observations.
 ///
-/// Implements [`CompactionPass`]. Wired into the curator's
-/// `--reflect` CLI mode via [`run_reflection_pass`]; not yet wired
-/// into the autonomy loop's per-cycle sweep (that's a v0.7.1+ pivot
-/// once the operator has had a chance to run the pass manually and
-/// vet the proposed reflections).
+/// Operates over the SAL [`MemoryStore`] trait (issue #1548) so it runs
+/// against the SQLite *or* Postgres adapter; gated on the `sal` feature
+/// (the trait itself is `sal`-gated). Wired into the curator's
+/// `--reflect` CLI mode via [`run_reflection_pass`] and the
+/// `--store-url --daemon` upkeep sweep; not yet wired into the autonomy
+/// loop's per-cycle sweep (that's a v0.7.1+ pivot once the operator has
+/// had a chance to run the pass manually and vet the proposed
+/// reflections).
+#[cfg(feature = "sal")]
 pub(crate) struct ReflectionPass<'a> {
-    /// SQLite connection. Reads through `db::list` / `db::get_links`;
-    /// writes through `storage::reflect_with_hooks`.
-    pub(crate) conn: &'a Connection,
+    /// SAL store handle. Reads through [`MemoryStore::list`] /
+    /// [`MemoryStore::get_links_for_anchor`]; writes through
+    /// [`MemoryStore::reflect`]. Works against the SQLite *or* Postgres
+    /// adapter (issue #1548) — the pass is backend-agnostic.
+    pub(crate) store: &'a dyn MemoryStore,
+    /// Operator-class caller context (see [`curator_caller_context`]).
+    /// Carries the curator's `agent_id` and `bypass_visibility` so the
+    /// background sweep reads every row regardless of `metadata.scope`,
+    /// matching the pre-trait raw-connection behaviour.
+    pub(crate) ctx: CallerContext,
     /// LLM trait object. Tests inject a deterministic stub; production
     /// passes an `&OllamaClient` (which implements [`AutonomyLlm`]).
     pub(crate) llm: &'a dyn AutonomyLlm,
@@ -169,20 +253,23 @@ pub(crate) struct ReflectionPass<'a> {
     pub(crate) dry_run: bool,
 }
 
+#[cfg(feature = "sal")]
 impl<'a> ReflectionPass<'a> {
     /// Construct a `ReflectionPass`. `keypair` is the curator's
     /// signing identity — used for `metadata.agent_id` and for
     /// `verify()`'s signature-trace check. `max_depth` is the optional
     /// curator-side ceiling; `dry_run` suppresses writes.
     pub(crate) fn new(
-        conn: &'a Connection,
+        store: &'a dyn MemoryStore,
         llm: &'a dyn AutonomyLlm,
         keypair: Option<&'a AgentKeypair>,
         max_depth: Option<u32>,
         dry_run: bool,
     ) -> Self {
+        let agent_id = keypair.map_or_else(|| "ai:curator".to_string(), |k| k.agent_id.clone());
         Self {
-            conn,
+            store,
+            ctx: curator_caller_context(&agent_id),
             llm,
             keypair,
             max_depth,
@@ -200,9 +287,11 @@ impl<'a> ReflectionPass<'a> {
         self.keypair
             .map_or_else(|| "ai:curator".to_string(), |k| k.agent_id.clone())
     }
-}
 
-impl<'a> CompactionPass for ReflectionPass<'a> {
+    /// Human-readable pass name used in log messages and reports.
+    /// Currently exercised by the unit tests; the daemon log lines use
+    /// the report fields directly.
+    #[allow(dead_code)]
     fn name(&self) -> &str {
         "reflection"
     }
@@ -370,15 +459,18 @@ impl<'a> CompactionPass for ReflectionPass<'a> {
     }
 
     /// Persist `summary` plus a `reflects_on` link to each id in
-    /// `sources`, via the substrate `reflect_with_hooks` path.
+    /// `sources`, via the substrate [`MemoryStore::reflect`] path.
     ///
     /// The substrate enforces (a) input validation, (b) depth-cap
     /// refusal with audit row, (c) transactional atomicity (all
     /// `reflects_on` links land or none do), (d) no-cycle guarantee
-    /// inherited from L1-2's `reflects_on` invariant.
+    /// inherited from L1-2's `reflects_on` invariant. The SQLite adapter
+    /// routes this through `storage::reflect_with_hooks`; the Postgres
+    /// adapter through its native sqlx `reflect` — both honour the same
+    /// [`ReflectInput`] contract (issue #1548).
     ///
     /// No-op when `self.dry_run = true`.
-    fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<()> {
+    async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<()> {
         if self.dry_run || sources.is_empty() {
             return Ok(());
         }
@@ -390,12 +482,12 @@ impl<'a> CompactionPass for ReflectionPass<'a> {
         // does (max source depth + 1) so the curator can refuse
         // *before* burning an LLM round-trip in the next cycle.
         if let Some(cap) = self.max_depth {
-            let max_src_depth: i32 = sources
-                .iter()
-                .filter_map(|id| db::get(self.conn, id).ok().flatten())
-                .map(|m| m.reflection_depth)
-                .max()
-                .unwrap_or(0);
+            let mut max_src_depth: i32 = 0;
+            for id in sources {
+                if let Some(m) = store_get_opt(self.store, &self.ctx, id).await? {
+                    max_src_depth = max_src_depth.max(m.reflection_depth);
+                }
+            }
             let new_depth =
                 u32::try_from(max_src_depth.max(0).saturating_add(1)).unwrap_or(u32::MAX);
             if new_depth > cap {
@@ -421,17 +513,14 @@ impl<'a> CompactionPass for ReflectionPass<'a> {
         };
 
         // Issue #815 — thread the curator's signing keypair into the
-        // hook bundle so the substrate's `create_link_signed` path
-        // sees it and produces `attest_level='self_signed'` rows for
-        // every `reflects_on` edge this pass writes. Pre-#815 the
-        // call site passed `ReflectHooks::empty()`, dropping
-        // `self.keypair` on the floor and writing unsigned edges
-        // despite the comment at `verify()` claiming otherwise.
-        let hooks = crate::storage::reflect::ReflectHooks {
-            active_keypair: self.keypair,
-            ..crate::storage::reflect::ReflectHooks::empty()
-        };
-        match reflect_with_hooks(self.conn, &input, &hooks) {
+        // reflect call so the substrate's signed-link path produces
+        // `attest_level='self_signed'` rows for every `reflects_on` edge
+        // this pass writes. The SAL `reflect(ctx, input, signing_key)`
+        // surface folds the keypair into the adapter's hook bundle (the
+        // SQLite adapter sets `ReflectHooks::active_keypair`; Postgres
+        // signs natively), so the wire shape is byte-identical across
+        // backends.
+        match self.store.reflect(&self.ctx, &input, self.keypair).await {
             Ok(_outcome) => Ok(()),
             Err(ReflectError::DepthExceeded {
                 attempted,
@@ -461,9 +550,14 @@ impl<'a> CompactionPass for ReflectionPass<'a> {
     /// re-verification belongs at the federation `sync_push` boundary,
     /// not the curator's verify step (the curator wrote the row
     /// itself, so it trivially trusts its own signature).
-    fn verify(&self, summary_id: MemoryId) -> Result<()> {
-        let mem =
-            db::get(self.conn, &summary_id).context("ReflectionPass::verify: db::get failed")?;
+    ///
+    /// Exercised by the unit tests; the run driver uses the inlined
+    /// [`verify_recent`] check on the live driver path.
+    #[allow(dead_code)]
+    async fn verify(&self, summary_id: MemoryId) -> Result<()> {
+        let mem = store_get_opt(self.store, &self.ctx, &summary_id)
+            .await
+            .context("ReflectionPass::verify: store.get failed")?;
         let mem = mem
             .ok_or_else(|| anyhow::anyhow!("verify: reflection {} not found in DB", summary_id))?;
         if mem.memory_kind != MemoryKind::Reflection {
@@ -474,8 +568,12 @@ impl<'a> CompactionPass for ReflectionPass<'a> {
             );
         }
 
-        let links = db::get_links(self.conn, &summary_id)
-            .context("ReflectionPass::verify: db::get_links failed")?;
+        let links = self
+            .store
+            .get_links_for_anchor(&summary_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("ReflectionPass::verify: store.get_links_for_anchor failed")?;
         let mut saw_reflects_on = false;
         for link in &links {
             // Only check outbound `reflects_on` edges originated at this
@@ -489,9 +587,9 @@ impl<'a> CompactionPass for ReflectionPass<'a> {
             }
             saw_reflects_on = true;
             // Confirm the target exists. Soft-deleted sources are still
-            // returned by db::get because the row is preserved; this is
+            // returned by store.get because the row is preserved; this is
             // the same contract `storage::reflect` relies on.
-            let target = db::get(self.conn, &link.target_id)?;
+            let target = store_get_opt(self.store, &self.ctx, &link.target_id).await?;
             if target.is_none() {
                 anyhow::bail!(
                     "verify: reflects_on edge target {} not found",
@@ -567,8 +665,9 @@ pub struct DryRunProposal {
 /// when the operator passes `--reflect`. The autonomy daemon's
 /// per-cycle sweep does NOT call this today (manual-only for v0.7.0
 /// per #666 acceptance).
-pub fn run_reflection_pass(
-    conn: &Connection,
+#[cfg(feature = "sal")]
+pub async fn run_reflection_pass(
+    store: &dyn MemoryStore,
     llm: &dyn AutonomyLlm,
     keypair: Option<&AgentKeypair>,
     namespace: Option<&str>,
@@ -582,13 +681,18 @@ pub fn run_reflection_pass(
         ..Default::default()
     };
 
+    let pass = ReflectionPass::new(store, llm, keypair, max_depth, dry_run);
+
     let namespaces: Vec<String> = match namespace {
         Some(ns) => vec![ns.to_string()],
         None => {
             // Enumerate every namespace with at least one row, then
             // filter via the operator's enabled_check at the call site.
-            let counts =
-                db::list_namespaces(conn).context("run_reflection_pass: list_namespaces failed")?;
+            let counts = store
+                .list_namespaces()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("run_reflection_pass: list_namespaces failed")?;
             counts
                 .into_iter()
                 .map(|nc| nc.namespace)
@@ -597,8 +701,6 @@ pub fn run_reflection_pass(
         }
     };
     report.namespaces_visited = namespaces.len();
-
-    let pass = ReflectionPass::new(conn, llm, keypair, max_depth, dry_run);
 
     for ns in &namespaces {
         if !enabled_check(ns) {
@@ -609,23 +711,19 @@ pub fn run_reflection_pass(
         // MAX_CLUSTER_SIZE * 16 so a runaway namespace doesn't OOM the
         // pass; the per-namespace load is bounded by the curator's
         // existing batch contract.
-        let candidates = match db::list(
-            conn,
-            Some(ns.as_str()),
-            None,
+        let candidates = match store_list_namespace(
+            store,
+            &pass.ctx,
+            ns.as_str(),
             MAX_CLUSTER_SIZE * 16,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ) {
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 report
                     .errors
-                    .push(format!("namespace '{ns}': db::list failed: {e}"));
+                    .push(format!("namespace '{ns}': store.list failed: {e}"));
                 continue;
             }
         };
@@ -673,14 +771,14 @@ pub fn run_reflection_pass(
                 continue;
             }
 
-            match pass.persist(&summary, &source_ids) {
+            match pass.persist(&summary, &source_ids).await {
                 Ok(()) => {
                     report.reflections_persisted += 1;
                     // Best-effort verify on the most recent reflection
                     // in this namespace. We re-derive the id by listing
                     // the namespace and finding the freshest Reflection
                     // whose `reflects_on` ids match our cluster.
-                    if let Err(e) = verify_recent(conn, ns, &source_ids) {
+                    if let Err(e) = verify_recent(store, &pass.ctx, ns, &source_ids).await {
                         report
                             .errors
                             .push(format!("namespace '{ns}': verify failed: {e}"));
@@ -707,26 +805,25 @@ pub fn run_reflection_pass(
 /// Best-effort verify helper used by [`run_reflection_pass`]. Looks up
 /// the most-recent Reflection in `namespace` and confirms its outbound
 /// `reflects_on` edges cover exactly the supplied `source_ids`.
-fn verify_recent(conn: &Connection, namespace: &str, source_ids: &[String]) -> Result<()> {
-    let candidates = db::list(
-        conn,
-        Some(namespace),
-        None,
-        16,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .context("verify_recent: db::list failed")?;
+#[cfg(feature = "sal")]
+async fn verify_recent(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    namespace: &str,
+    source_ids: &[String],
+) -> Result<()> {
+    let candidates = store_list_namespace(store, ctx, namespace, 16)
+        .await
+        .context("verify_recent: store.list failed")?;
     let target_set: HashSet<&str> = source_ids.iter().map(String::as_str).collect();
     for cand in candidates
         .iter()
         .filter(|m| m.memory_kind == MemoryKind::Reflection)
     {
-        let links = db::get_links(conn, &cand.id)?;
+        let links = store
+            .get_links_for_anchor(&cand.id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         let outbound: HashSet<&str> = links
             .iter()
             .filter(|l| {
@@ -837,7 +934,10 @@ pub(crate) fn temporal_window_seconds() -> i64 {
 // Unit tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// The reflection-pass suite exercises the SAL-gated `ReflectionPass` over a
+// `StubLlm: AutonomyLlm`; both are sal-only, so the whole module is gated
+// (non-sal builds have no ReflectionPass to test).
+#[cfg(all(test, feature = "sal"))]
 mod tests {
     use super::*;
     use crate::models::{Memory, MemoryKind, Tier};
@@ -1111,446 +1211,44 @@ mod tests {
     }
 
     // ---- ReflectionPass trait coverage (with real DB) ---------------------
+    //
+    // Issue #1548 — the reflection pass now operates over the SAL
+    // `MemoryStore` trait rather than a raw `rusqlite::Connection`. The
+    // trait is `sal`-gated, so this whole block is too. Tests open a
+    // `SqliteStore` (which thin-wraps `crate::db::open`) and pass
+    // `&store` into the pass. Seeding + assertions still go through the
+    // `crate::db::*` free functions over a raw connection opened at the
+    // same path (`conn_of`) so the test bodies stay close to the
+    // pre-trait shape — exercising the SAME underlying SQLite file the
+    // store reads. The pass methods are now `async`, so the trait-driving
+    // tests are `#[tokio::test]`.
+    #[cfg(feature = "sal")]
+    mod sal_pass_tests {
+        use super::*;
 
-    fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.db");
-        let conn = crate::db::open(&path).expect("db::open");
-        (conn, dir)
-    }
+        use crate::store::sqlite::SqliteStore;
 
-    fn insert_observation(
-        conn: &rusqlite::Connection,
-        ns: &str,
-        title: &str,
-        content: &str,
-        access_count: i64,
-    ) -> String {
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut metadata = crate::models::default_metadata();
-        if let Some(obj) = metadata.as_object_mut() {
-            obj.insert(
-                "agent_id".to_string(),
-                serde_json::Value::String("test-agent".to_string()),
-            );
+        fn open_db() -> (SqliteStore, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("test.db");
+            let store = SqliteStore::open(&path).expect("SqliteStore::open");
+            (store, dir)
         }
-        let mem = Memory {
-            id: uuid::Uuid::new_v4().to_string(),
-            tier: Tier::Long,
-            namespace: ns.to_string(),
-            title: title.to_string(),
-            content: content.to_string(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "test".to_string(),
-            access_count,
-            created_at: now.clone(),
-            updated_at: now,
-            last_accessed_at: None,
-            expires_at: None,
-            metadata,
-            reflection_depth: 0,
-            memory_kind: MemoryKind::Observation,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-        };
-        crate::db::insert(conn, &mem).unwrap()
-    }
 
-    #[test]
-    fn pass_name_is_reflection() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        assert_eq!(pass.name(), "reflection");
-    }
-
-    #[test]
-    fn agent_id_falls_back_to_ai_curator_without_keypair() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        assert_eq!(pass.agent_id(), "ai:curator");
-    }
-
-    #[test]
-    fn agent_id_uses_keypair_when_provided() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        use ed25519_dalek::{SigningKey, VerifyingKey};
-        let mut rng = rand_core::OsRng;
-        let sk = SigningKey::generate(&mut rng);
-        let vk: VerifyingKey = (&sk).into();
-        let kp = AgentKeypair {
-            agent_id: "test:agent-x".to_string(),
-            public: vk,
-            private: Some(sk),
-        };
-        let pass = ReflectionPass::new(&conn, &llm, Some(&kp), None, false);
-        assert_eq!(pass.agent_id(), "test:agent-x");
-    }
-
-    #[test]
-    fn cluster_excludes_zero_access_observations() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let m1 = make_obs("a", "ns", "t", "shared keyword tokens here", 0); // 0 access → skipped
-        let m2 = make_obs("b", "ns", "t", "shared keyword tokens here", 5);
-        let m3 = make_obs("c", "ns", "t", "shared keyword tokens here", 5);
-        let m4 = make_obs("d", "ns", "t", "shared keyword tokens here", 5);
-        let clusters = pass.cluster(&[m1, m2, m3, m4]);
-        assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].len(), 3);
-    }
-
-    #[test]
-    fn cluster_caps_at_max_cluster_size() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        // 15 mems with shared tokens → cluster capped at MAX_CLUSTER_SIZE = 12.
-        let mems: Vec<Memory> = (0..15)
-            .map(|i| {
-                make_obs(
-                    &format!("m{i:02}"),
-                    "ns",
-                    "t",
-                    "shared keyword tokens here pattern",
-                    1,
-                )
-            })
-            .collect();
-        let clusters = pass.cluster(&mems);
-        // First-seed cluster grows up to MAX_CLUSTER_SIZE.
-        for c in &clusters {
-            assert!(c.len() <= MAX_CLUSTER_SIZE);
+        /// Open a raw `rusqlite::Connection` at the store's backing file for
+        /// seeding + assertions via the legacy `crate::db::*` free functions.
+        fn conn_of(store: &SqliteStore) -> rusqlite::Connection {
+            crate::db::open(store.path()).expect("db::open at store path")
         }
-    }
 
-    #[test]
-    fn eligible_pass_method_accepts_valid() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
-            .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
-            .collect();
-        assert!(pass.eligible(&cluster));
-    }
-
-    #[test]
-    fn eligible_pass_method_rejects_oversize() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let cluster: Vec<Memory> = (0..(MAX_CLUSTER_SIZE + 1))
-            .map(|i| make_obs(&format!("m{i:02}"), "ns", "t", "c", 1))
-            .collect();
-        assert!(!pass.eligible(&cluster));
-    }
-
-    #[test]
-    fn eligible_pass_method_rejects_reflection_member() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let mut cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
-            .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
-            .collect();
-        cluster[0].memory_kind = MemoryKind::Reflection;
-        assert!(!pass.eligible(&cluster));
-    }
-
-    #[test]
-    fn eligible_pass_method_rejects_zero_access() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let mut cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
-            .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
-            .collect();
-        cluster[1].access_count = 0;
-        assert!(!pass.eligible(&cluster));
-    }
-
-    #[test]
-    fn summarize_below_min_errors() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let cluster: Vec<Memory> = (0..(MIN_CLUSTER_SIZE - 1))
-            .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
-            .collect();
-        let err = pass.summarize(&cluster).unwrap_err().to_string();
-        assert!(err.contains("< MIN_CLUSTER_SIZE"));
-    }
-
-    #[test]
-    fn summarize_returns_reflection_typed_memory() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("synth pattern");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
-            .map(|i| {
-                let mut m = make_obs(&format!("m{i}"), "ns", "Title-A", "shared content", 2);
-                m.tier = if i == 0 { Tier::Long } else { Tier::Mid };
-                m.priority = 5 + i32::try_from(i).unwrap();
-                m
-            })
-            .collect();
-        let summary = pass.summarize(&cluster).unwrap();
-        assert_eq!(summary.memory_kind, MemoryKind::Reflection);
-        assert!(summary.title.starts_with("[reflection]"));
-        assert_eq!(summary.content, "synth pattern");
-        assert_eq!(summary.tier, Tier::Long);
-        assert_eq!(summary.source, "system");
-        assert_eq!(summary.namespace, "ns");
-        // Priority = max of source priorities.
-        assert_eq!(
-            summary.priority,
-            5 + i32::try_from(MIN_CLUSTER_SIZE - 1).unwrap()
-        );
-    }
-
-    #[test]
-    fn persist_dry_run_is_noop() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, true);
-        let summary = make_obs("s", "ns", "[reflection]", "c", 1);
-        pass.persist(&summary, &["x".to_string()]).unwrap();
-    }
-
-    #[test]
-    fn persist_empty_sources_is_noop() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let summary = make_obs("s", "ns", "[reflection]", "c", 1);
-        pass.persist(&summary, &[]).unwrap();
-    }
-
-    #[test]
-    fn persist_refuses_when_max_depth_exceeded() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        // Pass max_depth=1; insert source at reflection_depth=1 → new depth = 2 → refused.
-        let pass = ReflectionPass::new(&conn, &llm, None, Some(1), false);
-        let mut source = make_obs("src", "ns", "t", "c", 1);
-        source.reflection_depth = 1;
-        let src_id = crate::db::insert(&conn, &source).unwrap();
-        let summary = make_obs("s", "ns", "[reflection]", "c", 0);
-        let err = pass.persist(&summary, &[src_id]).unwrap_err().to_string();
-        assert!(err.contains("exceeds"));
-        assert!(err.contains("--max-depth"));
-    }
-
-    #[test]
-    fn persist_writes_reflection_into_db() {
-        // Full happy-path: real sources, real reflect_with_hooks insert.
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("synthesised pattern");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        // Seed three observations in namespace 'app'.
-        let s1 = insert_observation(&conn, "app", "T1", "kubernetes deploy strategy notes", 2);
-        let s2 = insert_observation(&conn, "app", "T2", "kubernetes rolling deploy approach", 3);
-        let s3 = insert_observation(&conn, "app", "T3", "kubernetes canary deploy strategy", 1);
-        let summary = pass
-            .summarize(&[
-                crate::db::get(&conn, &s1).unwrap().unwrap(),
-                crate::db::get(&conn, &s2).unwrap().unwrap(),
-                crate::db::get(&conn, &s3).unwrap().unwrap(),
-            ])
-            .unwrap();
-        pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()])
-            .unwrap();
-
-        // Find the freshly-written reflection in the 'app' namespace.
-        let listed = crate::db::list(
-            &conn,
-            Some("app"),
-            None,
-            32,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let refl = listed
-            .iter()
-            .find(|m| m.memory_kind == MemoryKind::Reflection)
-            .expect("expected one reflection");
-        // verify() should succeed on it.
-        pass.verify(refl.id.clone()).unwrap();
-    }
-
-    #[test]
-    fn verify_missing_id_errors() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let err = pass.verify("no-such".to_string()).unwrap_err().to_string();
-        assert!(err.contains("not found in DB"));
-    }
-
-    #[test]
-    fn verify_wrong_kind_errors() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        // Insert an Observation and verify against its id — must error.
-        let id = insert_observation(&conn, "ns", "T", "c", 1);
-        let err = pass.verify(id).unwrap_err().to_string();
-        assert!(err.contains("expected Reflection"));
-    }
-
-    #[test]
-    fn verify_reflection_without_edges_errors() {
-        // Insert a Reflection directly via db::insert (no reflects_on links)
-        // and verify against it — must error with "no reflects_on edge".
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut metadata = crate::models::default_metadata();
-        if let Some(obj) = metadata.as_object_mut() {
-            obj.insert(
-                "agent_id".to_string(),
-                serde_json::Value::String("test-agent".to_string()),
-            );
-        }
-        let m = Memory {
-            id: uuid::Uuid::new_v4().to_string(),
-            tier: Tier::Mid,
-            namespace: "ns".to_string(),
-            title: "[reflection] orphan".to_string(),
-            content: "c".to_string(),
-            tags: vec![],
-            priority: 5,
-            confidence: 1.0,
-            source: "system".to_string(),
-            access_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-            last_accessed_at: None,
-            expires_at: None,
-            metadata,
-            reflection_depth: 1,
-            memory_kind: MemoryKind::Reflection,
-            entity_id: None,
-            persona_version: None,
-            citations: Vec::new(),
-            source_uri: None,
-            source_span: None,
-            confidence_source: ConfidenceSource::CallerProvided,
-            confidence_signals: None,
-            confidence_decayed_at: None,
-            version: 1,
-        };
-        let id = crate::db::insert(&conn, &m).unwrap();
-        let err = pass.verify(id).unwrap_err().to_string();
-        assert!(err.contains("no reflects_on edge"));
-    }
-
-    // ---- run_reflection_pass driver -------------------------------------
-
-    #[test]
-    fn run_reflection_pass_empty_db_dry_run_namespace() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let report =
-            run_reflection_pass(&conn, &llm, None, Some("nope"), None, true, |_| true).unwrap();
-        assert!(report.dry_run);
-        assert_eq!(report.namespaces_visited, 1);
-        assert_eq!(report.clusters_formed, 0);
-        assert_eq!(report.reflections_persisted, 0);
-    }
-
-    #[test]
-    fn run_reflection_pass_all_namespaces_with_disabled_check() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        // Seed an observation so list_namespaces sees one ns.
-        insert_observation(&conn, "ns1", "t", "shared content tokens here", 2);
-        let report = run_reflection_pass(&conn, &llm, None, None, None, true, |_| false).unwrap();
-        // namespace is enumerated but enabled_check returns false → no work.
-        assert_eq!(report.observations_scanned, 0);
-    }
-
-    #[test]
-    fn run_reflection_pass_dry_run_reports_proposals() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("synth");
-        // Seed three observations that should cluster.
-        insert_observation(
-            &conn,
-            "app",
-            "T1",
-            "kubernetes rolling deploy strategy notes",
-            2,
-        );
-        insert_observation(
-            &conn,
-            "app",
-            "T2",
-            "kubernetes rolling deploy strategy canary",
-            3,
-        );
-        insert_observation(
-            &conn,
-            "app",
-            "T3",
-            "kubernetes canary deploy strategy rolling",
-            1,
-        );
-        let report =
-            run_reflection_pass(&conn, &llm, None, Some("app"), None, true, |_| true).unwrap();
-        assert!(report.dry_run);
-        assert!(report.observations_scanned >= 3);
-        assert!(report.clusters_eligible >= 1);
-        assert!(!report.dry_run_proposals.is_empty());
-        assert_eq!(report.reflections_persisted, 0);
-    }
-
-    #[test]
-    fn run_reflection_pass_persists_reflections() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("persisted pattern");
-        insert_observation(&conn, "app", "T1", "shared keyword token strategy notes", 2);
-        insert_observation(&conn, "app", "T2", "shared keyword token strategy plan", 3);
-        insert_observation(
-            &conn,
-            "app",
-            "T3",
-            "shared keyword token strategy canary",
-            1,
-        );
-        let report =
-            run_reflection_pass(&conn, &llm, None, Some("app"), None, false, |_| true).unwrap();
-        assert_eq!(report.dry_run, false);
-        assert!(report.reflections_persisted >= 1);
-    }
-
-    #[test]
-    fn run_reflection_pass_depth_refusal_increments_counter() {
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("synth");
-        // Seed observations at depth=2 so a new reflection (depth=3)
-        // would exceed our curator max_depth=2.
-        let now = chrono::Utc::now().to_rfc3339();
-        for i in 0..3 {
+        fn insert_observation(
+            conn: &rusqlite::Connection,
+            ns: &str,
+            title: &str,
+            content: &str,
+            access_count: i64,
+        ) -> String {
+            let now = chrono::Utc::now().to_rfc3339();
             let mut metadata = crate::models::default_metadata();
             if let Some(obj) = metadata.as_object_mut() {
                 obj.insert(
@@ -1558,23 +1256,23 @@ mod tests {
                     serde_json::Value::String("test-agent".to_string()),
                 );
             }
-            let m = Memory {
+            let mem = Memory {
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Long,
-                namespace: "deep".to_string(),
-                title: format!("Tdeep-{i}"),
-                content: "shared keyword token deep strategy".to_string(),
+                namespace: ns.to_string(),
+                title: title.to_string(),
+                content: content.to_string(),
                 tags: vec![],
                 priority: 5,
                 confidence: 1.0,
                 source: "test".to_string(),
-                access_count: 2,
+                access_count,
                 created_at: now.clone(),
-                updated_at: now.clone(),
+                updated_at: now,
                 last_accessed_at: None,
                 expires_at: None,
                 metadata,
-                reflection_depth: 2,
+                reflection_depth: 0,
                 memory_kind: MemoryKind::Observation,
                 entity_id: None,
                 persona_version: None,
@@ -1586,167 +1284,624 @@ mod tests {
                 confidence_decayed_at: None,
                 version: 1,
             };
-            crate::db::insert(&conn, &m).unwrap();
+            crate::db::insert(conn, &mem).unwrap()
         }
-        let report = run_reflection_pass(
-            &conn,
-            &llm,
-            None,
-            Some("deep"),
-            Some(2), // cap=2; new depth would be 3 → refuse
-            false,
-            |_| true,
-        )
-        .unwrap();
-        assert!(report.depth_refusals >= 1);
-        // No reflection persisted.
-        assert_eq!(report.reflections_persisted, 0);
-    }
 
-    #[test]
-    fn dry_run_proposal_serialises() {
-        let p = DryRunProposal {
-            namespace: "ns".into(),
-            proposed_title: "[reflection] x".into(),
-            source_ids: vec!["a".into(), "b".into()],
-        };
-        let j = serde_json::to_string(&p).unwrap();
-        assert!(j.contains("source_ids"));
-        let back: DryRunProposal = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.namespace, "ns");
-    }
+        #[test]
+        fn pass_name_is_reflection() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            assert_eq!(pass.name(), "reflection");
+        }
 
-    // ---- pair_co_occurs unparseable timestamps fall through ----
+        #[test]
+        fn agent_id_falls_back_to_ai_curator_without_keypair() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            assert_eq!(pass.agent_id(), "ai:curator");
+        }
 
-    #[test]
-    fn pair_co_occurs_unparseable_timestamps_still_checks_jaccard() {
-        let mut a = make_obs("a", "ns", "t", "shared content tokens here", 1);
-        let mut b = make_obs("b", "ns", "t", "shared content tokens here", 1);
-        a.created_at = "not-a-timestamp".to_string();
-        b.created_at = "also-invalid".to_string();
-        // With invalid timestamps, the temporal check is skipped — Jaccard
-        // alone decides. These share tokens → co-occur returns true.
-        assert!(pair_co_occurs(&a, &b));
-    }
+        #[test]
+        fn agent_id_uses_keypair_when_provided() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            use ed25519_dalek::{SigningKey, VerifyingKey};
+            let mut rng = rand_core::OsRng;
+            let sk = SigningKey::generate(&mut rng);
+            let vk: VerifyingKey = (&sk).into();
+            let kp = AgentKeypair {
+                agent_id: "test:agent-x".to_string(),
+                public: vk,
+                private: Some(sk),
+            };
+            let pass = ReflectionPass::new(&store, &llm, Some(&kp), None, false);
+            assert_eq!(pass.agent_id(), "test:agent-x");
+        }
 
-    // ---- Additional coverage: trait impls + edge branches ----
+        #[test]
+        fn cluster_excludes_zero_access_observations() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let m1 = make_obs("a", "ns", "t", "shared keyword tokens here", 0); // 0 access → skipped
+            let m2 = make_obs("b", "ns", "t", "shared keyword tokens here", 5);
+            let m3 = make_obs("c", "ns", "t", "shared keyword tokens here", 5);
+            let m4 = make_obs("d", "ns", "t", "shared keyword tokens here", 5);
+            let clusters = pass.cluster(&[m1, m2, m3, m4]);
+            assert_eq!(clusters.len(), 1);
+            assert_eq!(clusters[0].len(), 3);
+        }
 
-    #[test]
-    fn stub_llm_auto_tag_and_contradiction_paths() {
-        let stub = StubLlm::new("S");
-        let tags = stub.auto_tag("t", "c").unwrap();
-        assert!(tags.is_empty());
-        let conflict = stub.detect_contradiction("a", "b").unwrap();
-        assert!(!conflict);
-    }
-
-    #[test]
-    fn eligible_pass_rejects_internal_namespace_directly() {
-        // Drives line 279 — internal namespace early-return.
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        let cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
-            .map(|i| make_obs(&format!("m{i}"), "_curator", "t", "c", 1))
-            .collect();
-        assert!(!pass.eligible(&cluster));
-    }
-
-    #[test]
-    fn jaccard_similarity_zero_union_returns_zero() {
-        // The else-branch where `union == 0`: ta non-empty but tb is — no.
-        // Actually if either has >=3 chars words there will be union.
-        // Build inputs where tokens are stripped to nothing.
-        let a = "a b c"; // every token <3 chars → tokens set is empty
-        let b = "x";
-        assert_eq!(jaccard_similarity(a, b), 0.0);
-    }
-
-    #[test]
-    fn tier_rank_all_variants() {
-        // Drives all three match arms.
-        assert_eq!(tier_rank(&Tier::Short), 0);
-        assert_eq!(tier_rank(&Tier::Mid), 1);
-        assert_eq!(tier_rank(&Tier::Long), 2);
-    }
-
-    #[test]
-    fn parse_rfc3339_invalid_returns_none() {
-        assert!(parse_rfc3339("garbage").is_none());
-        assert!(parse_rfc3339("2026-01-01T00:00:00Z").is_some());
-    }
-
-    #[test]
-    fn verify_skips_inbound_links() {
-        // verify() walks all links but `continue`s when source_id != summary_id.
-        // This exercises the `continue` branch at line 468.
-        let (conn, _dir) = open_db();
-        let llm = StubLlm::new("S");
-        let pass = ReflectionPass::new(&conn, &llm, None, None, false);
-        // Seed the reflection target via the full persist path.
-        let s1 = insert_observation(&conn, "vrf", "T1", "shared keyword pattern tokens here", 2);
-        let s2 = insert_observation(&conn, "vrf", "T2", "shared keyword pattern tokens here", 2);
-        let s3 = insert_observation(&conn, "vrf", "T3", "shared keyword pattern tokens here", 2);
-        let summary = pass
-            .summarize(&[
-                crate::db::get(&conn, &s1).unwrap().unwrap(),
-                crate::db::get(&conn, &s2).unwrap().unwrap(),
-                crate::db::get(&conn, &s3).unwrap().unwrap(),
-            ])
-            .unwrap();
-        pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()])
-            .unwrap();
-        let listed = crate::db::list(
-            &conn,
-            Some("vrf"),
-            None,
-            32,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let refl_id = listed
-            .iter()
-            .find(|m| m.memory_kind == MemoryKind::Reflection)
-            .unwrap()
-            .id
-            .clone();
-        // Create a foreign link with this reflection as TARGET (not source).
-        // verify() should still succeed because it ignores inbound links.
-        let _ = crate::db::create_link(&conn, &s1, &refl_id, "related_to");
-        pass.verify(refl_id).unwrap();
-    }
-
-    #[test]
-    fn run_reflection_pass_summarize_error_recorded() {
-        // Drive lines 640-644 (summarize failure path). Use a StubLlm that
-        // fails summarize. We need it implementing AutonomyLlm with an
-        // error return.
-        struct FailingLlm;
-        impl AutonomyLlm for FailingLlm {
-            fn auto_tag(&self, _t: &str, _c: &str) -> Result<Vec<String>> {
-                Ok(vec![])
-            }
-            fn detect_contradiction(&self, _a: &str, _b: &str) -> Result<bool> {
-                Ok(false)
-            }
-            fn summarize_memories(&self, _m: &[(String, String)]) -> Result<String> {
-                anyhow::bail!("forced llm failure")
+        #[test]
+        fn cluster_caps_at_max_cluster_size() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            // 15 mems with shared tokens → cluster capped at MAX_CLUSTER_SIZE = 12.
+            let mems: Vec<Memory> = (0..15)
+                .map(|i| {
+                    make_obs(
+                        &format!("m{i:02}"),
+                        "ns",
+                        "t",
+                        "shared keyword tokens here pattern",
+                        1,
+                    )
+                })
+                .collect();
+            let clusters = pass.cluster(&mems);
+            // First-seed cluster grows up to MAX_CLUSTER_SIZE.
+            for c in &clusters {
+                assert!(c.len() <= MAX_CLUSTER_SIZE);
             }
         }
-        let (conn, _dir) = open_db();
-        let llm = FailingLlm;
-        insert_observation(&conn, "ns", "T1", "shared keyword pattern tokens here", 2);
-        insert_observation(&conn, "ns", "T2", "shared keyword pattern tokens here", 2);
-        insert_observation(&conn, "ns", "T3", "shared keyword pattern tokens here", 2);
-        let report =
-            run_reflection_pass(&conn, &llm, None, Some("ns"), None, false, |_| true).unwrap();
-        // Summarize error was caught and recorded.
-        assert!(report.errors.iter().any(|e| e.contains("summarize failed")));
-        assert_eq!(report.reflections_persisted, 0);
-    }
+
+        #[test]
+        fn eligible_pass_method_accepts_valid() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
+                .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
+                .collect();
+            assert!(pass.eligible(&cluster));
+        }
+
+        #[test]
+        fn eligible_pass_method_rejects_oversize() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let cluster: Vec<Memory> = (0..(MAX_CLUSTER_SIZE + 1))
+                .map(|i| make_obs(&format!("m{i:02}"), "ns", "t", "c", 1))
+                .collect();
+            assert!(!pass.eligible(&cluster));
+        }
+
+        #[test]
+        fn eligible_pass_method_rejects_reflection_member() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let mut cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
+                .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
+                .collect();
+            cluster[0].memory_kind = MemoryKind::Reflection;
+            assert!(!pass.eligible(&cluster));
+        }
+
+        #[test]
+        fn eligible_pass_method_rejects_zero_access() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let mut cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
+                .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
+                .collect();
+            cluster[1].access_count = 0;
+            assert!(!pass.eligible(&cluster));
+        }
+
+        #[test]
+        fn summarize_below_min_errors() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let cluster: Vec<Memory> = (0..(MIN_CLUSTER_SIZE - 1))
+                .map(|i| make_obs(&format!("m{i}"), "ns", "t", "c", 1))
+                .collect();
+            let err = pass.summarize(&cluster).unwrap_err().to_string();
+            assert!(err.contains("< MIN_CLUSTER_SIZE"));
+        }
+
+        #[test]
+        fn summarize_returns_reflection_typed_memory() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("synth pattern");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
+                .map(|i| {
+                    let mut m = make_obs(&format!("m{i}"), "ns", "Title-A", "shared content", 2);
+                    m.tier = if i == 0 { Tier::Long } else { Tier::Mid };
+                    m.priority = 5 + i32::try_from(i).unwrap();
+                    m
+                })
+                .collect();
+            let summary = pass.summarize(&cluster).unwrap();
+            assert_eq!(summary.memory_kind, MemoryKind::Reflection);
+            assert!(summary.title.starts_with("[reflection]"));
+            assert_eq!(summary.content, "synth pattern");
+            assert_eq!(summary.tier, Tier::Long);
+            assert_eq!(summary.source, "system");
+            assert_eq!(summary.namespace, "ns");
+            // Priority = max of source priorities.
+            assert_eq!(
+                summary.priority,
+                5 + i32::try_from(MIN_CLUSTER_SIZE - 1).unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn persist_dry_run_is_noop() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, true);
+            let summary = make_obs("s", "ns", "[reflection]", "c", 1);
+            pass.persist(&summary, &["x".to_string()]).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn persist_empty_sources_is_noop() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let summary = make_obs("s", "ns", "[reflection]", "c", 1);
+            pass.persist(&summary, &[]).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn persist_refuses_when_max_depth_exceeded() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            // Pass max_depth=1; insert source at reflection_depth=1 → new depth = 2 → refused.
+            let pass = ReflectionPass::new(&store, &llm, None, Some(1), false);
+            let mut source = make_obs("src", "ns", "t", "c", 1);
+            source.reflection_depth = 1;
+            let src_id = crate::db::insert(&conn_of(&store), &source).unwrap();
+            let summary = make_obs("s", "ns", "[reflection]", "c", 0);
+            let err = pass
+                .persist(&summary, &[src_id])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("exceeds"));
+            assert!(err.contains("--max-depth"));
+        }
+
+        #[tokio::test]
+        async fn persist_writes_reflection_into_db() {
+            // Full happy-path: real sources, real reflect insert.
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("synthesised pattern");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            // Seed three observations in namespace 'app'.
+            let s1 = insert_observation(&conn, "app", "T1", "kubernetes deploy strategy notes", 2);
+            let s2 =
+                insert_observation(&conn, "app", "T2", "kubernetes rolling deploy approach", 3);
+            let s3 = insert_observation(&conn, "app", "T3", "kubernetes canary deploy strategy", 1);
+            let summary = pass
+                .summarize(&[
+                    crate::db::get(&conn, &s1).unwrap().unwrap(),
+                    crate::db::get(&conn, &s2).unwrap().unwrap(),
+                    crate::db::get(&conn, &s3).unwrap().unwrap(),
+                ])
+                .unwrap();
+            pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()])
+                .await
+                .unwrap();
+
+            // Find the freshly-written reflection in the 'app' namespace.
+            let listed = crate::db::list(
+                &conn,
+                Some("app"),
+                None,
+                32,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let refl = listed
+                .iter()
+                .find(|m| m.memory_kind == MemoryKind::Reflection)
+                .expect("expected one reflection");
+            // verify() should succeed on it.
+            pass.verify(refl.id.clone()).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn verify_missing_id_errors() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let err = pass
+                .verify("no-such".to_string())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not found in DB"));
+        }
+
+        #[tokio::test]
+        async fn verify_wrong_kind_errors() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            // Insert an Observation and verify against its id — must error.
+            let id = insert_observation(&conn, "ns", "T", "c", 1);
+            let err = pass.verify(id).await.unwrap_err().to_string();
+            assert!(err.contains("expected Reflection"));
+        }
+
+        #[tokio::test]
+        async fn verify_reflection_without_edges_errors() {
+            // Insert a Reflection directly via db::insert (no reflects_on links)
+            // and verify against it — must error with "no reflects_on edge".
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut metadata = crate::models::default_metadata();
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String("test-agent".to_string()),
+                );
+            }
+            let m = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Mid,
+                namespace: "ns".to_string(),
+                title: "[reflection] orphan".to_string(),
+                content: "c".to_string(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "system".to_string(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata,
+                reflection_depth: 1,
+                memory_kind: MemoryKind::Reflection,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+            };
+            let id = crate::db::insert(&conn, &m).unwrap();
+            let err = pass.verify(id).await.unwrap_err().to_string();
+            assert!(err.contains("no reflects_on edge"));
+        }
+
+        // ---- run_reflection_pass driver -------------------------------------
+
+        #[tokio::test]
+        async fn run_reflection_pass_empty_db_dry_run_namespace() {
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let report =
+                run_reflection_pass(&store, &llm, None, Some("nope"), None, true, |_| true)
+                    .await
+                    .unwrap();
+            assert!(report.dry_run);
+            assert_eq!(report.namespaces_visited, 1);
+            assert_eq!(report.clusters_formed, 0);
+            assert_eq!(report.reflections_persisted, 0);
+        }
+
+        #[tokio::test]
+        async fn run_reflection_pass_all_namespaces_with_disabled_check() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("S");
+            // Seed an observation so list_namespaces sees one ns.
+            insert_observation(&conn, "ns1", "t", "shared content tokens here", 2);
+            let report = run_reflection_pass(&store, &llm, None, None, None, true, |_| false)
+                .await
+                .unwrap();
+            // namespace is enumerated but enabled_check returns false → no work.
+            assert_eq!(report.observations_scanned, 0);
+        }
+
+        #[tokio::test]
+        async fn run_reflection_pass_dry_run_reports_proposals() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("synth");
+            // Seed three observations that should cluster.
+            insert_observation(
+                &conn,
+                "app",
+                "T1",
+                "kubernetes rolling deploy strategy notes",
+                2,
+            );
+            insert_observation(
+                &conn,
+                "app",
+                "T2",
+                "kubernetes rolling deploy strategy canary",
+                3,
+            );
+            insert_observation(
+                &conn,
+                "app",
+                "T3",
+                "kubernetes canary deploy strategy rolling",
+                1,
+            );
+            let report = run_reflection_pass(&store, &llm, None, Some("app"), None, true, |_| true)
+                .await
+                .unwrap();
+            assert!(report.dry_run);
+            assert!(report.observations_scanned >= 3);
+            assert!(report.clusters_eligible >= 1);
+            assert!(!report.dry_run_proposals.is_empty());
+            assert_eq!(report.reflections_persisted, 0);
+        }
+
+        #[tokio::test]
+        async fn run_reflection_pass_persists_reflections() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("persisted pattern");
+            insert_observation(&conn, "app", "T1", "shared keyword token strategy notes", 2);
+            insert_observation(&conn, "app", "T2", "shared keyword token strategy plan", 3);
+            insert_observation(
+                &conn,
+                "app",
+                "T3",
+                "shared keyword token strategy canary",
+                1,
+            );
+            let report =
+                run_reflection_pass(&store, &llm, None, Some("app"), None, false, |_| true)
+                    .await
+                    .unwrap();
+            assert_eq!(report.dry_run, false);
+            assert!(report.reflections_persisted >= 1);
+        }
+
+        #[tokio::test]
+        async fn run_reflection_pass_depth_refusal_increments_counter() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("synth");
+            // Seed observations at depth=2 so a new reflection (depth=3)
+            // would exceed our curator max_depth=2.
+            let now = chrono::Utc::now().to_rfc3339();
+            for i in 0..3 {
+                let mut metadata = crate::models::default_metadata();
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert(
+                        "agent_id".to_string(),
+                        serde_json::Value::String("test-agent".to_string()),
+                    );
+                }
+                let m = Memory {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    tier: Tier::Long,
+                    namespace: "deep".to_string(),
+                    title: format!("Tdeep-{i}"),
+                    content: "shared keyword token deep strategy".to_string(),
+                    tags: vec![],
+                    priority: 5,
+                    confidence: 1.0,
+                    source: "test".to_string(),
+                    access_count: 2,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    last_accessed_at: None,
+                    expires_at: None,
+                    metadata,
+                    reflection_depth: 2,
+                    memory_kind: MemoryKind::Observation,
+                    entity_id: None,
+                    persona_version: None,
+                    citations: Vec::new(),
+                    source_uri: None,
+                    source_span: None,
+                    confidence_source: ConfidenceSource::CallerProvided,
+                    confidence_signals: None,
+                    confidence_decayed_at: None,
+                    version: 1,
+                };
+                crate::db::insert(&conn, &m).unwrap();
+            }
+            let report = run_reflection_pass(
+                &store,
+                &llm,
+                None,
+                Some("deep"),
+                Some(2), // cap=2; new depth would be 3 → refuse
+                false,
+                |_| true,
+            )
+            .await
+            .unwrap();
+            assert!(report.depth_refusals >= 1);
+            // No reflection persisted.
+            assert_eq!(report.reflections_persisted, 0);
+        }
+
+        #[test]
+        fn dry_run_proposal_serialises() {
+            let p = DryRunProposal {
+                namespace: "ns".into(),
+                proposed_title: "[reflection] x".into(),
+                source_ids: vec!["a".into(), "b".into()],
+            };
+            let j = serde_json::to_string(&p).unwrap();
+            assert!(j.contains("source_ids"));
+            let back: DryRunProposal = serde_json::from_str(&j).unwrap();
+            assert_eq!(back.namespace, "ns");
+        }
+
+        // ---- pair_co_occurs unparseable timestamps fall through ----
+
+        #[test]
+        fn pair_co_occurs_unparseable_timestamps_still_checks_jaccard() {
+            let mut a = make_obs("a", "ns", "t", "shared content tokens here", 1);
+            let mut b = make_obs("b", "ns", "t", "shared content tokens here", 1);
+            a.created_at = "not-a-timestamp".to_string();
+            b.created_at = "also-invalid".to_string();
+            // With invalid timestamps, the temporal check is skipped — Jaccard
+            // alone decides. These share tokens → co-occur returns true.
+            assert!(pair_co_occurs(&a, &b));
+        }
+
+        // ---- Additional coverage: trait impls + edge branches ----
+
+        #[test]
+        fn stub_llm_auto_tag_and_contradiction_paths() {
+            let stub = StubLlm::new("S");
+            let tags = stub.auto_tag("t", "c").unwrap();
+            assert!(tags.is_empty());
+            let conflict = stub.detect_contradiction("a", "b").unwrap();
+            assert!(!conflict);
+        }
+
+        #[test]
+        fn eligible_pass_rejects_internal_namespace_directly() {
+            // Drives the internal-namespace early-return.
+            let (store, _dir) = open_db();
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            let cluster: Vec<Memory> = (0..MIN_CLUSTER_SIZE)
+                .map(|i| make_obs(&format!("m{i}"), "_curator", "t", "c", 1))
+                .collect();
+            assert!(!pass.eligible(&cluster));
+        }
+
+        #[test]
+        fn jaccard_similarity_zero_union_returns_zero() {
+            // The else-branch where `union == 0`: ta non-empty but tb is — no.
+            // Actually if either has >=3 chars words there will be union.
+            // Build inputs where tokens are stripped to nothing.
+            let a = "a b c"; // every token <3 chars → tokens set is empty
+            let b = "x";
+            assert_eq!(jaccard_similarity(a, b), 0.0);
+        }
+
+        #[test]
+        fn tier_rank_all_variants() {
+            // Drives all three match arms.
+            assert_eq!(tier_rank(&Tier::Short), 0);
+            assert_eq!(tier_rank(&Tier::Mid), 1);
+            assert_eq!(tier_rank(&Tier::Long), 2);
+        }
+
+        #[test]
+        fn parse_rfc3339_invalid_returns_none() {
+            assert!(parse_rfc3339("garbage").is_none());
+            assert!(parse_rfc3339("2026-01-01T00:00:00Z").is_some());
+        }
+
+        #[tokio::test]
+        async fn verify_skips_inbound_links() {
+            // verify() walks all links but `continue`s when source_id != summary_id.
+            // This exercises the inbound-link `continue` branch.
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = StubLlm::new("S");
+            let pass = ReflectionPass::new(&store, &llm, None, None, false);
+            // Seed the reflection target via the full persist path.
+            let s1 =
+                insert_observation(&conn, "vrf", "T1", "shared keyword pattern tokens here", 2);
+            let s2 =
+                insert_observation(&conn, "vrf", "T2", "shared keyword pattern tokens here", 2);
+            let s3 =
+                insert_observation(&conn, "vrf", "T3", "shared keyword pattern tokens here", 2);
+            let summary = pass
+                .summarize(&[
+                    crate::db::get(&conn, &s1).unwrap().unwrap(),
+                    crate::db::get(&conn, &s2).unwrap().unwrap(),
+                    crate::db::get(&conn, &s3).unwrap().unwrap(),
+                ])
+                .unwrap();
+            pass.persist(&summary, &[s1.clone(), s2.clone(), s3.clone()])
+                .await
+                .unwrap();
+            let listed = crate::db::list(
+                &conn,
+                Some("vrf"),
+                None,
+                32,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let refl_id = listed
+                .iter()
+                .find(|m| m.memory_kind == MemoryKind::Reflection)
+                .unwrap()
+                .id
+                .clone();
+            // Create a foreign link with this reflection as TARGET (not source).
+            // verify() should still succeed because it ignores inbound links.
+            let _ = crate::db::create_link(&conn, &s1, &refl_id, "related_to");
+            pass.verify(refl_id).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn run_reflection_pass_summarize_error_recorded() {
+            // Drive the summarize failure path. Use a StubLlm that
+            // fails summarize. We need it implementing AutonomyLlm with an
+            // error return.
+            struct FailingLlm;
+            impl AutonomyLlm for FailingLlm {
+                fn auto_tag(&self, _t: &str, _c: &str) -> Result<Vec<String>> {
+                    Ok(vec![])
+                }
+                fn detect_contradiction(&self, _a: &str, _b: &str) -> Result<bool> {
+                    Ok(false)
+                }
+                fn summarize_memories(&self, _m: &[(String, String)]) -> Result<String> {
+                    anyhow::bail!("forced llm failure")
+                }
+            }
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let llm = FailingLlm;
+            insert_observation(&conn, "ns", "T1", "shared keyword pattern tokens here", 2);
+            insert_observation(&conn, "ns", "T2", "shared keyword pattern tokens here", 2);
+            insert_observation(&conn, "ns", "T3", "shared keyword pattern tokens here", 2);
+            let report = run_reflection_pass(&store, &llm, None, Some("ns"), None, false, |_| true)
+                .await
+                .unwrap();
+            // Summarize error was caught and recorded.
+            assert!(report.errors.iter().any(|e| e.contains("summarize failed")));
+            assert_eq!(report.reflections_persisted, 0);
+        }
+    } // mod sal_pass_tests
 }

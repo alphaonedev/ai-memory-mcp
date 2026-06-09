@@ -7,6 +7,10 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc
 )]
+// #1548 — the `#[path]`-included runner mod drives the sal-gated
+// `run_reflection_pass` over the SAL `MemoryStore` trait, so this co-located
+// test file is sal-only; in a non-sal build it compiles to an empty target.
+#![cfg(feature = "sal")]
 
 //! v0.7.0 Layer 3 Task L3-1 — LongMemEval-Reflection bench unit tests.
 //!

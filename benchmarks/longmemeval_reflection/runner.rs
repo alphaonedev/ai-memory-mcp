@@ -623,18 +623,27 @@ where
         db::insert(&conn, obs)?;
     }
 
-    let report = run_reflection_pass(
-        &conn,
-        llm,
-        None,
-        Some(scenario.id.as_str()),
-        // No curator-side cap; substrate default
-        // (`max_reflection_depth = 3`) is well above what this
-        // scenario produces (depth 1 only).
-        None,
-        false,
-        |_ns| true,
-    )?;
+    // Issue #1548 — `run_reflection_pass` now operates over the SAL
+    // `MemoryStore` trait and is `async`. Open a `SqliteStore` at the
+    // same backing file the raw `conn` seeds + inspects, then drive the
+    // async pass on a single-threaded runtime (this bench's `main` is
+    // synchronous: `harness = false`).
+    let store = ai_memory::store::sqlite::SqliteStore::open(tmp.path())?;
+    let report = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_reflection_pass(
+            &store,
+            llm,
+            None,
+            Some(scenario.id.as_str()),
+            // No curator-side cap; substrate default
+            // (`max_reflection_depth = 3`) is well above what this
+            // scenario produces (depth 1 only).
+            None,
+            false,
+            |_ns| true,
+        ))?;
 
     // Inspect the reflections the pass left behind.
     let all_in_ns = db::list(

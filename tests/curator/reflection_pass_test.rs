@@ -38,10 +38,21 @@ use ai_memory::curator::reflection_pass::{self, ReflectionPassConfig, run_reflec
 use ai_memory::db;
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, MemoryKind, MemoryLinkRelation, Tier};
+use ai_memory::store::sqlite::SqliteStore;
 use anyhow::Result;
 use chrono::Utc;
+use std::path::Path;
 use std::sync::Mutex;
 use tempfile::NamedTempFile;
+
+/// Issue #1548 — `run_reflection_pass` now operates over the SAL
+/// `MemoryStore` trait. These acceptance tests open a `SqliteStore` at
+/// the same backing file the raw `conn` seeds + asserts against, so the
+/// pass reads the SAME SQLite database the test populates via the legacy
+/// `db::*` free functions.
+fn sqlite_store(path: &Path) -> SqliteStore {
+    SqliteStore::open(path).expect("SqliteStore::open at test db path")
+}
 
 // ---------------------------------------------------------------------------
 // Deterministic stub LLM
@@ -164,14 +175,15 @@ fn always_enabled(_ns: &str) -> bool {
 /// into three groups; the pass writes exactly three Reflection memories
 /// at `reflection_depth = 1`; each carries the correct number of
 /// outbound `reflects_on` edges; the LLM was called three times.
-#[test]
-fn ac1_thirty_observations_yield_three_reflections_at_depth_one() {
+#[tokio::test]
+async fn ac1_thirty_observations_yield_three_reflections_at_depth_one() {
     let tmp = seed_30_observations();
     let conn = db::open(tmp.path()).unwrap();
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("pattern summary text");
 
     let report = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None, // no keypair → agent_id falls back to "ai:curator"
         Some("ns-l2-1"),
@@ -179,6 +191,7 @@ fn ac1_thirty_observations_yield_three_reflections_at_depth_one() {
         false, // not dry-run
         always_enabled,
     )
+    .await
     .expect("run_reflection_pass");
 
     // The stub LLM was called once per eligible cluster.
@@ -275,15 +288,16 @@ fn ac1_thirty_observations_yield_three_reflections_at_depth_one() {
 /// the proposed depth. The substrate `signed_events` audit row is
 /// surfaced through the report's `depth_refusals` counter or via an
 /// "exceeds" error string.
-#[test]
-fn ac2_refuses_when_proposed_depth_exceeds_max_depth() {
+#[tokio::test]
+async fn ac2_refuses_when_proposed_depth_exceeds_max_depth() {
     let tmp = seed_30_observations();
     let conn = db::open(tmp.path()).unwrap();
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("level-1 pattern");
 
     // Pass 1 — lands depth-1 reflections.
     let report1 = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None,
         Some("ns-l2-1"),
@@ -291,6 +305,7 @@ fn ac2_refuses_when_proposed_depth_exceeds_max_depth() {
         false,
         always_enabled,
     )
+    .await
     .expect("pass 1");
     assert!(report1.reflections_persisted >= 3);
 
@@ -348,7 +363,7 @@ fn ac2_refuses_when_proposed_depth_exceeds_max_depth() {
 
     let llm2 = StubLlm::new("level-2 pattern");
     let report2 = run_reflection_pass(
-        &conn,
+        &store,
         &llm2,
         None,
         Some("ns-l2-1"),
@@ -356,6 +371,7 @@ fn ac2_refuses_when_proposed_depth_exceeds_max_depth() {
         false,
         always_enabled,
     )
+    .await
     .expect("pass 2");
     // Every cluster that survives eligibility must be refused by the
     // substrate cap (or by curator max_depth). Result: depth_refusals
@@ -437,15 +453,16 @@ fn set_namespace_max_reflection_depth(conn: &rusqlite::Connection, namespace: &s
 /// depth-1 → pass 2 depth-2 if max>=2." We verify the substrate path
 /// supports depth-2 by minting a depth-1 reflection then directly
 /// reflecting on it (and a peer observation) at depth-2.
-#[test]
-fn ac3_chain_pass_yields_depth_2_when_substrate_allows() {
+#[tokio::test]
+async fn ac3_chain_pass_yields_depth_2_when_substrate_allows() {
     let tmp = seed_30_observations();
     let conn = db::open(tmp.path()).unwrap();
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("level-1 pattern");
 
     // Pass 1 — depth-1 reflections.
     let _ = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None,
         Some("ns-l2-1"),
@@ -453,6 +470,7 @@ fn ac3_chain_pass_yields_depth_2_when_substrate_allows() {
         false,
         always_enabled,
     )
+    .await
     .expect("pass 1");
 
     // Find one depth-1 reflection.
@@ -518,14 +536,15 @@ fn ac3_chain_pass_yields_depth_2_when_substrate_allows() {
 /// **AC-4**: every persisted reflection's `reflects_on` edges round-trip
 /// through `db::get_links`. The relation is exactly `ReflectsOn`. Each
 /// target id resolves to an existing source memory.
-#[test]
-fn ac4_reflects_on_edges_are_verifiable() {
+#[tokio::test]
+async fn ac4_reflects_on_edges_are_verifiable() {
     let tmp = seed_30_observations();
     let conn = db::open(tmp.path()).unwrap();
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("verifiable summary");
 
     let report = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None,
         Some("ns-l2-1"),
@@ -533,6 +552,7 @@ fn ac4_reflects_on_edges_are_verifiable() {
         false,
         always_enabled,
     )
+    .await
     .unwrap();
     assert!(report.reflections_persisted >= 3);
 
@@ -591,14 +611,15 @@ fn ac4_reflects_on_edges_are_verifiable() {
 /// `--dry-run` mode emits proposal records and persists nothing. Pins
 /// the spec's "Dry-run produces proposal without persisting"
 /// acceptance.
-#[test]
-fn dry_run_produces_proposals_without_persisting() {
+#[tokio::test]
+async fn dry_run_produces_proposals_without_persisting() {
     let tmp = seed_30_observations();
     let conn = db::open(tmp.path()).unwrap();
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("dry-run pattern");
 
     let report = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None,
         Some("ns-l2-1"),
@@ -606,6 +627,7 @@ fn dry_run_produces_proposals_without_persisting() {
         true, // dry-run
         always_enabled,
     )
+    .await
     .unwrap();
 
     assert!(report.dry_run);
@@ -670,14 +692,14 @@ fn reflection_pass_config_default_is_disabled() {
 /// `enabled` flag is false. Without the config-file wiring (v0.7.1),
 /// this means `--all-namespaces` defaults to a no-op — which is the
 /// safe behaviour. Pin the contract via the run-pass entry point.
-#[test]
-fn run_pass_respects_enabled_gate_predicate() {
+#[tokio::test]
+async fn run_pass_respects_enabled_gate_predicate() {
     let tmp = seed_30_observations();
-    let conn = db::open(tmp.path()).unwrap();
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("never-called");
 
     let report = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None,
         None, // no specific namespace → walk every observable ns
@@ -685,6 +707,7 @@ fn run_pass_respects_enabled_gate_predicate() {
         false,
         |_ns| false, // every namespace disabled
     )
+    .await
     .unwrap();
     assert_eq!(
         report.reflections_persisted, 0,
@@ -701,8 +724,8 @@ fn run_pass_respects_enabled_gate_predicate() {
 /// Cluster eligibility refuses below `MIN_CLUSTER_SIZE = 3`. Two
 /// co-occurring observations are NOT enough for a reflection. This
 /// pins the "≥3 members" criterion from the spec.
-#[test]
-fn cluster_of_two_is_not_eligible_for_reflection() {
+#[tokio::test]
+async fn cluster_of_two_is_not_eligible_for_reflection() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = db::open(tmp.path()).unwrap();
     // Two observations only — same namespace, same topic.
@@ -713,9 +736,10 @@ fn cluster_of_two_is_not_eligible_for_reflection() {
         )
         .unwrap();
     }
+    let store = sqlite_store(tmp.path());
     let llm = StubLlm::new("should-not-be-called");
     let report = run_reflection_pass(
-        &conn,
+        &store,
         &llm,
         None,
         Some("ns-pair"),
@@ -723,6 +747,7 @@ fn cluster_of_two_is_not_eligible_for_reflection() {
         false,
         always_enabled,
     )
+    .await
     .unwrap();
     assert_eq!(
         report.reflections_persisted, 0,

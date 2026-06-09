@@ -16,5 +16,9 @@
 #[path = "curator/compaction_test.rs"]
 mod compaction_test;
 
+// Issue #1548 — `run_reflection_pass` now operates over the SAL
+// `MemoryStore` trait (`SqliteStore`), which is `sal`-gated. Compile the
+// acceptance suite only when the trait surface is available.
+#[cfg(feature = "sal")]
 #[path = "curator/reflection_pass_test.rs"]
 mod reflection_pass_test;

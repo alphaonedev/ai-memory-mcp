@@ -63,7 +63,11 @@
 //! Hermetic: tempdir DBs, in-memory SQLite, deterministic stub LLM,
 //! no live network, no live model loads.
 
+// Issue #1548 — the curator reflection pass + its stub LLM are only
+// referenced by the `sal`-gated `sg_rl_1` scenario below.
+#[cfg(feature = "sal")]
 use ai_memory::autonomy::AutonomyLlm;
+#[cfg(feature = "sal")]
 use ai_memory::curator::reflection_pass::run_reflection_pass;
 use ai_memory::db::{self, ReflectError, ReflectInput};
 use ai_memory::federation::reflection_bookkeeping;
@@ -73,10 +77,12 @@ use ai_memory::models::{
     MemoryKind, MemoryLinkRelation, Tier, default_metadata,
 };
 use ai_memory::signed_events::list_signed_events;
+#[cfg(feature = "sal")]
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
 use std::path::Path;
+#[cfg(feature = "sal")]
 use std::sync::Mutex;
 use tempfile::TempDir;
 
@@ -94,12 +100,15 @@ const FIXTURE_SOURCE: &str = "nhi";
 
 /// Deterministic LLM stub for the curator pass. Production tests pin
 /// this same shape via `StubLlm` in tests/curator/reflection_pass_test.rs
-/// — duplicated here so this binary has no cross-file mod deps.
+/// — duplicated here so this binary has no cross-file mod deps. Only the
+/// `sal`-gated `sg_rl_1` scenario uses it (issue #1548).
+#[cfg(feature = "sal")]
 struct StubLlm {
     summary: String,
     calls: Mutex<usize>,
 }
 
+#[cfg(feature = "sal")]
 impl StubLlm {
     fn new(summary: &str) -> Self {
         Self {
@@ -109,6 +118,7 @@ impl StubLlm {
     }
 }
 
+#[cfg(feature = "sal")]
 impl AutonomyLlm for StubLlm {
     fn auto_tag(&self, _title: &str, _content: &str) -> Result<Vec<String>> {
         Ok(vec![])
@@ -271,11 +281,21 @@ fn reflect_input(
 /// `MemoryKind::Reflection` typed enum (L1-1) and an audit chain.
 /// Composes L1-1 + L1-3 (depth-exceeded filterable event type) + L2-1
 /// (curator reflection-pass acceptance) into a single ship-gate scenario.
-#[test]
-fn sg_rl_1_curator_reflection_pass_typed_kind_and_audit_chain() {
+// Issue #1548 — `run_reflection_pass` operates over the SAL
+// `MemoryStore` trait (`sal`-gated); compile this scenario only when the
+// trait surface is available. The remaining `sg_rl_*` scenarios exercise
+// non-SAL substrate APIs and stay unconditional.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn sg_rl_1_curator_reflection_pass_typed_kind_and_audit_chain() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("sg-rl-1.db");
     let conn = db::open(&db_path).expect("open");
+    // Issue #1548 — `run_reflection_pass` runs over the SAL `MemoryStore`
+    // trait; open a `SqliteStore` at the same backing file the raw `conn`
+    // seeds + asserts against.
+    let store = ai_memory::store::sqlite::SqliteStore::open(&db_path)
+        .expect("SqliteStore::open at test db path");
     let ns = "ship-gate-rl-1";
 
     // Three topical clusters of 10 obs each — same Jaccard pattern as
@@ -293,7 +313,8 @@ fn sg_rl_1_curator_reflection_pass_typed_kind_and_audit_chain() {
     }
 
     let llm = StubLlm::new("synthesised pattern summary");
-    let report = run_reflection_pass(&conn, &llm, None, Some(ns), None, false, |_| true)
+    let report = run_reflection_pass(&store, &llm, None, Some(ns), None, false, |_| true)
+        .await
         .expect("curator reflection-pass must succeed");
 
     assert_eq!(report.observations_scanned, 30);
