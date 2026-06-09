@@ -1133,8 +1133,8 @@ fn run_remote(url: &str, db_path: &Path) -> Report {
     let mut sections = Vec::with_capacity(2);
 
     let base = url.trim_end_matches('/');
-    let cap_url = format!("{base}/api/v1/capabilities");
-    let stats_url = format!("{base}/api/v1/stats");
+    let cap_url = format!("{base}{}", crate::handlers::routes::CAPABILITIES);
+    let stats_url = format!("{base}{}", crate::handlers::routes::STATS);
 
     sections.push(section_capabilities_remote(&cap_url));
     sections.push(section_recall_remote(&cap_url));
