@@ -208,7 +208,7 @@ impl RecallRequest {
         // serde would surface "missing field `context`" instead; pin the
         // legacy wording here so the wire-level error envelope is stable.
         if params.get("context").and_then(Value::as_str).is_none() {
-            return Err("context is required".to_string());
+            return Err(crate::errors::msg::CONTEXT_REQUIRED.to_string());
         }
         // Clamp `limit` / `budget_tokens` so an unsigned overflow value
         // (e.g. `u64::MAX` per `limit_overflow_saturates`) doesn't

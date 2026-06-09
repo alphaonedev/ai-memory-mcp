@@ -385,7 +385,7 @@ pub fn handle_capture_turn(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "capture_turn",
                     "namespace": gate_namespace,
                 }));

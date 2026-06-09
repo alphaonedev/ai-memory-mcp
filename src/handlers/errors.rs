@@ -94,7 +94,35 @@ pub(crate) fn internal_error_response(
     tracing::error!("{context}: {err}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "internal server error"})),
+        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+    )
+        .into_response()
+}
+
+/// #1558 batch 5 wave 2 — the canonical "handler error" 500 path.
+///
+/// Replaces the 37 inline `tracing::error!("handler error: {e}")` +
+/// sanitized-body 500 sites across the handler modules with one
+/// definition. Log line and response body are BYTE-IDENTICAL to the
+/// prior inline pattern; only the spelling is centralised.
+pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {
+    tracing::error!("handler error: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+    )
+        .into_response()
+}
+
+/// #1558 batch 5 wave 2 — the canonical governance-consultation 500
+/// path: logs `"governance error: {e}"` and returns the sanitized
+/// `"governance check failed"` envelope. Byte-identical to the prior
+/// inline pattern at the create / update / bulk-update sites.
+pub(crate) fn governance_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {
+    tracing::error!("governance error: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": crate::errors::msg::GOVERNANCE_CHECK_FAILED})),
     )
         .into_response()
 }

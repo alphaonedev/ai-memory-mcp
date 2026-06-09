@@ -424,7 +424,7 @@ pub(crate) fn handle_store(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "store",
                     "namespace": mem.namespace,
                 }));
@@ -597,7 +597,7 @@ pub(crate) fn handle_store(
         .map_err(|e| e.to_string())?;
         // Regenerate embedding if content changed during dedup update
         if content_changed && let Some(emb) = embedder {
-            let text = format!("{} {}", mem.title, mem.content);
+            let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
             if let Ok(embedding) = emb.embed(&text) {
                 let _ = db::set_embedding(conn, &dup.id, &embedding);
                 if let Some(idx) = vector_index {
@@ -634,7 +634,7 @@ pub(crate) fn handle_store(
     // curator pass that intends to revise an earlier claim).
     let force_write = params["force"].as_bool().unwrap_or(false);
     if !force_write && let Some(emb) = embedder {
-        let text = format!("{} {}", mem.title, mem.content);
+        let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
         if let Ok(query_embedding) = emb.embed(&text)
             && let Ok(Some(conflict)) = db::proactive_conflict_check(conn, &mem, &query_embedding)
         {
@@ -705,7 +705,7 @@ pub(crate) fn handle_store(
                     bytes: payload_bytes,
                 },
             ) {
-                tracing::warn!("quota refund_op failed for agent {}: {}", &agent_id, re);
+                crate::quotas::log_refund_op_failed(&agent_id, &re);
             }
             // v0.7.0 L1-6 Deliverable E — surface the substrate
             // governance pre-write hook's refusal with a clearly-

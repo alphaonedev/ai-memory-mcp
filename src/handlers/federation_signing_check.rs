@@ -219,7 +219,8 @@ pub(super) async fn sync_push_via_store(
                 // queries against a peer that received the memory
                 // through sync_push would surface empty.
                 if let Some(emb) = app.embedder.as_ref().as_ref() {
-                    let embedding_text = format!("{} {}", mem.title, mem.content);
+                    let embedding_text =
+                        crate::embeddings::embedding_document(&mem.title, &mem.content);
                     if let Ok(vector) = emb.embed(&embedding_text) {
                         let _ = app
                             .store

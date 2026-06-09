@@ -118,7 +118,7 @@ pub async fn recall_memories_get(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid as_agent: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
     }
@@ -183,7 +183,7 @@ pub async fn recall_memories_post(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid as_agent: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
     }
@@ -712,13 +712,6 @@ async fn recall_response(
             }
             Json(resp).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

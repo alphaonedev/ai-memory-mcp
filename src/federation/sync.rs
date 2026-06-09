@@ -18,6 +18,11 @@ use crate::replication::{AckTracker, QuorumError};
 
 use super::FederationConfig;
 
+/// #1558 batch 5 wave 2 — `QuorumError::LocalWriteFailed` detail used
+/// at every `Arc::try_unwrap(tracker)` finalise point in this file
+/// (one per fanout variant). File-local const; byte-identical detail.
+const TRACKER_ARC_STILL_REFERENCED: &str = "tracker arc still referenced at finalise";
+
 #[derive(Debug)]
 pub(super) enum AckOutcome {
     Ack,
@@ -179,7 +184,7 @@ pub(super) async fn post_once(
             }
         }
         Ok(resp) => AckOutcome::Fail(format!("http {}", resp.status())),
-        Err(e) => AckOutcome::Fail(format!("network: {e}")),
+        Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
     }
 }
 
@@ -460,7 +465,7 @@ pub async fn broadcast_store_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     // H9 (v0.7.0 round-2) — partial-quorum WARN. When the leader returns
@@ -640,7 +645,7 @@ pub async fn broadcast_delete_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -738,7 +743,7 @@ pub async fn broadcast_archive_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -837,7 +842,7 @@ pub async fn broadcast_restore_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -931,7 +936,7 @@ pub async fn broadcast_link_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1028,7 +1033,7 @@ pub async fn broadcast_consolidate_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1127,7 +1132,7 @@ pub async fn broadcast_pending_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1225,7 +1230,7 @@ pub async fn broadcast_pending_decision_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1325,7 +1330,7 @@ pub async fn broadcast_namespace_meta_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1429,7 +1434,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1538,7 +1543,7 @@ pub async fn bulk_catchup_push(
             let outcome = match req.send().await {
                 Ok(resp) if resp.status().is_success() => Ok(()),
                 Ok(resp) => Err(format!("http {}", resp.status())),
-                Err(e) => Err(format!("network: {e}")),
+                Err(e) => Err(crate::errors::msg::network(e)),
             };
             (id, outcome)
         });

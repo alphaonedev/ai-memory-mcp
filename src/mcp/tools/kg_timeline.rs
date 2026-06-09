@@ -56,7 +56,7 @@ impl McpTool for KgTimelineTool {
 pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
     let since = params["since"]
         .as_str()

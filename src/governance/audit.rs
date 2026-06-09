@@ -671,7 +671,7 @@ pub fn verify_since(
                             line_number: line_no,
                             file: file.clone(),
                             kind: VerifyFailureKind::Signature,
-                            detail: format!("signature verify failed: {e}"),
+                            detail: crate::errors::msg::signature_verify_failed(e),
                         }),
                     });
                 }

@@ -428,6 +428,20 @@ impl std::fmt::Display for QuotaCheckError {
 
 impl std::error::Error for QuotaCheckError {}
 
+/// #1558 batch 5 wave 2 — canonical `"update failed: {e}"` →
+/// [`QuotaCheckError::Sql`] mapping for the four `agent_quotas`
+/// UPDATE statements in [`check_and_record`]. Byte-identical detail.
+fn quota_update_failed(e: impl std::fmt::Display) -> QuotaCheckError {
+    QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}"))
+}
+
+/// #1558 batch 5 wave 2 — canonical refund-failure WARN line shared by
+/// the three quota-refund rollback sites (HTTP create, MCP store, MCP
+/// link). Message bytes identical to the prior inline `tracing::warn!`.
+pub(crate) fn log_refund_op_failed(agent_id: &str, e: &dyn std::fmt::Display) {
+    tracing::warn!("quota refund_op failed for agent {agent_id}: {e}");
+}
+
 /// v0.7 K8 / H12 (#628 blocker) — atomic check + record. Combines the
 /// quota check with the counter increment under a single
 /// `BEGIN IMMEDIATE` SQLite transaction so concurrent writers cannot
@@ -530,7 +544,7 @@ pub fn check_and_record(
                          WHERE agent_id = ?3 AND namespace = ?4",
                         params![bytes, now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 } else {
                     conn.execute(
                         "UPDATE agent_quotas SET
@@ -540,7 +554,7 @@ pub fn check_and_record(
                          WHERE agent_id = ?3 AND namespace = ?4",
                         params![bytes, now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 }
             }
             QuotaOp::Link => {
@@ -565,7 +579,7 @@ pub fn check_and_record(
                          WHERE agent_id = ?2 AND namespace = ?3",
                         params![now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 } else {
                     conn.execute(
                         "UPDATE agent_quotas SET
@@ -574,7 +588,7 @@ pub fn check_and_record(
                          WHERE agent_id = ?2 AND namespace = ?3",
                         params![now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 }
             }
         }

@@ -99,11 +99,11 @@ pub fn handle_skill_compositional_context(
         },
     ) {
         Ok(t) => t,
-        Err(_) => return Err(format!("skill not found: {skill_id}")),
+        Err(_) => return Err(crate::errors::msg::skill_not_found(skill_id)),
     };
 
-    let body_bytes =
-        zstd::decode_all(body.as_slice()).map_err(|e| format!("zstd decompress body: {e}"))?;
+    let body_bytes = zstd::decode_all(body.as_slice())
+        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
     let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
     // -----------------------------------------------------------------------

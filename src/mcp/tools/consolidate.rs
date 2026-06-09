@@ -32,7 +32,9 @@ pub(super) fn handle_consolidate(
             None => return Err(format!("ids[{i}] must be a string")),
         }
     }
-    let title = params["title"].as_str().ok_or("title is required")?;
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
     let namespace = params["namespace"]
         .as_str()
         .unwrap_or(crate::DEFAULT_NAMESPACE);
@@ -46,7 +48,7 @@ pub(super) fn handle_consolidate(
         for id in &ids {
             match db::get(conn, id) {
                 Ok(Some(mem)) => memory_pairs.push((mem.title, mem.content)),
-                Ok(None) => return Err(format!("memory not found: {id}")),
+                Ok(None) => return Err(crate::errors::msg::memory_not_found(id)),
                 Err(e) => return Err(e.to_string()),
             }
         }

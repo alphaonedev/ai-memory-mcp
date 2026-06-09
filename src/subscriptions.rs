@@ -1396,7 +1396,7 @@ fn send(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("webhook POST to {url} failed: {e}");
-            return Err(format!("network: {e}"));
+            return Err(crate::errors::msg::network(e));
         }
     };
     if !resp.status().is_success() {

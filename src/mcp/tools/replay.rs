@@ -130,7 +130,7 @@ pub fn handle_replay(
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or("memory_id is required")?;
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
     validate::validate_id(memory_id).map_err(|e| e.to_string())?;
     let verbose = params
         .get("verbose")

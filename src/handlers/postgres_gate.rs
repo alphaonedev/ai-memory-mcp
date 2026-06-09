@@ -609,7 +609,7 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
             tracing::error!("store backend error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error".to_string(),
+                crate::errors::msg::INTERNAL_SERVER_ERROR.to_string(),
             )
         }
     };
@@ -779,7 +779,7 @@ mod store_err_sanitize_tests {
     fn sanitize_handles_unicode_in_clean_message() {
         let raw = "memory not found: \u{1F4DD}-id-with-emoji";
         let out = sanitize_store_err_message(raw);
-        assert!(out.contains("memory not found"));
+        assert!(out.contains(crate::errors::msg::MEMORY_NOT_FOUND));
     }
 
     #[test]

@@ -39,9 +39,9 @@ pub fn handle_reflection_origin(
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or("memory_id is required")?;
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
     if memory_id.is_empty() {
-        return Err("memory_id cannot be empty".to_string());
+        return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
     let origin = crate::federation::reflection_bookkeeping::reflection_origin(conn, memory_id)
         .map_err(|e| format!("reflection_origin substrate error: {e}"))?;
@@ -54,7 +54,7 @@ pub fn handle_reflection_origin(
             "local_depth_at_arrival": record.local_depth_at_arrival,
             "is_reflection": record.is_reflection,
         })),
-        None => Err(format!("memory not found: {memory_id}")),
+        None => Err(crate::errors::msg::memory_not_found(memory_id)),
     }
 }
 

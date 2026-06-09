@@ -1892,7 +1892,7 @@ pub trait MemoryStore: Send + Sync {
     /// signal.
     ///
     /// `query_text` MUST be the exact string used to produce
-    /// `query_embedding` (typically `format!("{title} {content}")`).
+    /// `query_embedding` (typically `crate::embeddings::embedding_document(title, content)`).
     ///
     /// # Errors
     ///

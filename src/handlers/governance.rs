@@ -151,14 +151,7 @@ pub async fn list_pending(
             }))
             .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -184,7 +177,7 @@ pub async fn approve_pending(
         return (
             status,
             Json(json!({
-                "error": "invalid or missing X-AI-Memory-Signature",
+                "error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
                 "hint": "POST /api/v1/pending/{id}/approve requires HMAC signing per K7's pattern. \
                         Set [hooks.subscription] hmac_secret in config and send \
                         X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \"<ts>.<METHOD>.<pending_id>.<body>\")> \
@@ -209,7 +202,7 @@ pub async fn approve_pending(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -292,14 +285,14 @@ pub async fn approve_pending(
                     "id": id,
                     "votes": votes,
                     "quorum": quorum,
-                    "reason": "consensus threshold not yet reached",
+                    "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
                     "storage_backend": "postgres",
                 })),
             )
                 .into_response(),
             Ok(SalOutcome::Rejected(reason)) => (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": format!("approve rejected: {reason}")})),
+                Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -375,23 +368,16 @@ pub async fn approve_pending(
                 "id": id,
                 "votes": votes,
                 "quorum": quorum,
-                "reason": "consensus threshold not yet reached",
+                "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
             })),
         )
             .into_response(),
         Ok(ApproveOutcome::Rejected(reason)) => (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": format!("approve rejected: {reason}")})),
+            Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -410,7 +396,7 @@ pub async fn reject_pending(
         return (
             status,
             Json(json!({
-                "error": "invalid or missing X-AI-Memory-Signature",
+                "error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
                 "hint": "POST /api/v1/pending/{id}/reject requires HMAC signing per K7's pattern. \
                         Set [hooks.subscription] hmac_secret in config and send \
                         X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \"<ts>.<METHOD>.<pending_id>.<body>\")> \
@@ -435,7 +421,7 @@ pub async fn reject_pending(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -475,7 +461,7 @@ pub async fn reject_pending(
             }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "pending action not found or already decided"})),
+                Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -511,16 +497,9 @@ pub async fn reject_pending(
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "pending action not found or already decided"})),
+            Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

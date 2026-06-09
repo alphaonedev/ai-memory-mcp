@@ -541,7 +541,9 @@ impl<'a> PersonaGenerator<'a> {
 /// rule stays symmetric.
 fn validate_entity_id(entity_id: &str) -> std::result::Result<(), PersonaError> {
     if entity_id.trim().is_empty() {
-        return Err(PersonaError::Validation("entity_id cannot be empty".into()));
+        return Err(PersonaError::Validation(
+            crate::errors::msg::ENTITY_ID_EMPTY.into(),
+        ));
     }
     if entity_id.len() > 128 {
         return Err(PersonaError::Validation(format!(

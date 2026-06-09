@@ -77,7 +77,7 @@ pub async fn list_memories(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -187,14 +187,7 @@ pub async fn list_memories(
                 .collect();
             Json(json!({"memories": &visible, "count": visible.len()})).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -229,7 +222,7 @@ pub async fn search_memories(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid as_agent: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
     }
@@ -348,14 +341,7 @@ pub async fn search_memories(
                 Ok(r) => {
                     Json(json!({"results": r, "count": r.len(), "source_uri": uri})).into_response()
                 }
-                Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response()
-                }
+                Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
         }
     }
@@ -375,14 +361,7 @@ pub async fn search_memories(
         source_uri,
     ) {
         Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 

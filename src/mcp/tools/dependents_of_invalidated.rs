@@ -41,9 +41,9 @@ pub fn handle_dependents_of_invalidated(
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or("memory_id is required")?;
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
     if memory_id.is_empty() {
-        return Err("memory_id cannot be empty".to_string());
+        return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
     let dependents =
         crate::notification::invalidation::list_dependents_of_invalidated(conn, memory_id)

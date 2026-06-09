@@ -64,10 +64,10 @@ pub fn handle_kg_invalidate(
 ) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     let target_id = params["target_id"]
         .as_str()
-        .ok_or("target_id is required")?;
+        .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
     let relation = params["relation"].as_str().ok_or("relation is required")?;
     validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
         .map_err(|e| e.to_string())?;

@@ -105,7 +105,7 @@ pub fn handle_ingest_multistep(
     // ── Argument validation ─────────────────────────────────────────
     let content = params
         .get(param_names::CONTENT)
-        .ok_or("content is required")?
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .as_str()
         .ok_or("content must be a string")?;
     if content.is_empty() {

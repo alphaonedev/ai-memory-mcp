@@ -49,7 +49,7 @@ pub fn cmd_promote(
     } else if let Some(m) = db::get_by_prefix(&conn, &args.id)? {
         m
     } else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     };
     let resolved_id = target.id.clone();
@@ -127,7 +127,7 @@ pub fn cmd_promote(
         None,
     )?;
     if !found {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
     if json_out {

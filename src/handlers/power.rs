@@ -247,7 +247,7 @@ pub async fn detect_contradictions(
             tracing::error!("detect_contradictions list error: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -412,14 +412,7 @@ pub async fn list_namespaces(
     let lock = app.db.lock().await;
     match db::list_namespaces(&lock.0) {
         Ok(ns) => Json(json!({"namespaces": ns})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -660,14 +653,7 @@ pub async fn get_taxonomy(
             "truncated": tax.truncated,
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -721,7 +707,7 @@ pub async fn check_duplicate(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid namespace: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
     }
@@ -731,7 +717,7 @@ pub async fn check_duplicate(
     // route through the canonical `MemoryStore::check_duplicate_with_text`
     // trait method. Mirrors the SQLite `db::check_duplicate_with_text`
     // shape byte-for-byte: SHA-256 exact-content short-circuit (returns
-    // `similarity=1.0` on byte-equal `format!("{title} {content}")`),
+    // `similarity=1.0` on byte-equal `crate::embeddings::embedding_document(title, content)`),
     // then pgvector cosine distance for nearest-neighbor on near hits.
     // Pre-fix branch was hand-rolled (`list` + client-side exact-match
     // walk + `recall_hybrid` fallback); the trait method consolidates
@@ -739,7 +725,7 @@ pub async fn check_duplicate(
     // identical across backends.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let embedding_text = format!("{} {}", body.title, body.content);
+        let embedding_text = crate::embeddings::embedding_document(&body.title, &body.content);
         // Best-effort: when the embedder is loaded, compute the query
         // vector so phase 2 (cosine nearest) is available. Without it
         // the trait method falls through to phase-1 hash-only.
@@ -779,7 +765,7 @@ pub async fn check_duplicate(
     // Embed before taking the DB lock — same rationale as create_memory
     // (issue #219). The embedder call is 10-200ms; we don't want it
     // serialised behind the connection mutex.
-    let embedding_text = format!("{} {}", body.title, body.content);
+    let embedding_text = crate::embeddings::embedding_document(&body.title, &body.content);
     let query_embedding = match app.embedder.as_ref().as_ref() {
         Some(emb) => match emb.embed(&embedding_text) {
             Ok(v) => v,
@@ -831,12 +817,7 @@ pub async fn check_duplicate(
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
 

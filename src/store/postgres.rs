@@ -1079,7 +1079,7 @@ impl PostgresStore {
             sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| to_store_err("read schema_version", e))?;
+                .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
 
         let current_version = current_version.unwrap_or(0);
 
@@ -2779,7 +2779,7 @@ impl PostgresStore {
         .bind(&new_content)
         .bind(
             serde_json::to_value(&new_tags).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize tags: {e}"),
+                detail: serialize_err("tags", e),
             })?,
         )
         .bind(new_priority)
@@ -2981,29 +2981,29 @@ impl PostgresStore {
             .map(|r| {
                 let created_at: DateTime<Utc> = r
                     .try_get("created_at")
-                    .map_err(|e| to_store_err("read created_at", e))?;
+                    .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
                 let valid_from: Option<DateTime<Utc>> = r
                     .try_get("valid_from")
-                    .map_err(|e| to_store_err("read valid_from", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
                     .try_get("valid_until")
-                    .map_err(|e| to_store_err("read valid_until", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
                     .try_get("observed_by")
-                    .map_err(|e| to_store_err("read observed_by", e))?;
+                    .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let attest_level: Option<String> = r
                     .try_get("attest_level")
-                    .map_err(|e| to_store_err("read attest_level", e))?;
+                    .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 let relation_str: String = r
                     .try_get("relation")
-                    .map_err(|e| to_store_err("read relation", e))?;
+                    .map_err(|e| to_store_err(READ_RELATION, e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get("source_id")
-                        .map_err(|e| to_store_err("read source_id", e))?,
+                        .map_err(|e| to_store_err(READ_SOURCE_ID, e))?,
                     target_id: r
                         .try_get("target_id")
-                        .map_err(|e| to_store_err("read target_id", e))?,
+                        .map_err(|e| to_store_err(READ_TARGET_ID, e))?,
                     relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
                         .unwrap_or_default(),
                     created_at: created_at.to_rfc3339(),
@@ -4417,10 +4417,10 @@ impl PostgresStore {
                 // agtype crate would balloon CI for one type tag.
                 let target_id: String = r
                     .try_get::<String, _>("target_id")
-                    .map_err(|e| to_store_err("read target_id", e))?;
+                    .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
                 let relation: String = r
                     .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err("read relation", e))?;
+                    .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let depth_raw: String = r
                     .try_get::<String, _>("depth")
                     .map_err(|e| to_store_err("read depth", e))?;
@@ -4529,10 +4529,10 @@ impl PostgresStore {
             .map(|r| {
                 let target_id: String = r
                     .try_get::<String, _>("target_id")
-                    .map_err(|e| to_store_err("read target_id", e))?;
+                    .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
                 let relation: String = r
                     .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err("read relation", e))?;
+                    .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let depth_i: i32 = r
                     .try_get::<i32, _>("depth")
                     .map_err(|e| to_store_err("read depth", e))?;
@@ -4723,19 +4723,19 @@ impl PostgresStore {
         for r in &rows {
             let target_id_raw: String = r
                 .try_get::<String, _>("target_id")
-                .map_err(|e| to_store_err("read target_id", e))?;
+                .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
             let relation_raw: String = r
                 .try_get::<String, _>("relation")
-                .map_err(|e| to_store_err("read relation", e))?;
+                .map_err(|e| to_store_err(READ_RELATION, e))?;
             let valid_from_raw: String = r
                 .try_get::<String, _>("valid_from")
-                .map_err(|e| to_store_err("read valid_from", e))?;
+                .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
             let valid_until_raw: String = r
                 .try_get::<String, _>("valid_until")
-                .map_err(|e| to_store_err("read valid_until", e))?;
+                .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
             let observed_by_raw: String = r
                 .try_get::<String, _>("observed_by")
-                .map_err(|e| to_store_err("read observed_by", e))?;
+                .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
 
             decoded.push(KgTimelineRow {
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
@@ -4777,10 +4777,10 @@ impl PostgresStore {
                     .map_err(|e| to_store_err("read id", e))?;
                 let title: String = r
                     .try_get::<String, _>("title")
-                    .map_err(|e| to_store_err("read title", e))?;
+                    .map_err(|e| to_store_err(READ_TITLE, e))?;
                 let namespace: String = r
                     .try_get::<String, _>("namespace")
-                    .map_err(|e| to_store_err("read namespace", e))?;
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?;
                 display.insert(id, (title, namespace));
             }
 
@@ -4869,25 +4869,25 @@ impl PostgresStore {
             .map(|r| {
                 let target_id: String = r
                     .try_get::<String, _>("target_id")
-                    .map_err(|e| to_store_err("read target_id", e))?;
+                    .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
                 let relation: String = r
                     .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err("read relation", e))?;
+                    .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let valid_from: DateTime<Utc> = r
                     .try_get::<DateTime<Utc>, _>("valid_from")
-                    .map_err(|e| to_store_err("read valid_from", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
                     .try_get::<Option<DateTime<Utc>>, _>("valid_until")
-                    .map_err(|e| to_store_err("read valid_until", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
                     .try_get::<Option<String>, _>("observed_by")
-                    .map_err(|e| to_store_err("read observed_by", e))?;
+                    .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let title: String = r
                     .try_get::<String, _>("title")
-                    .map_err(|e| to_store_err("read title", e))?;
+                    .map_err(|e| to_store_err(READ_TITLE, e))?;
                 let target_namespace: String = r
                     .try_get::<String, _>("namespace")
-                    .map_err(|e| to_store_err("read namespace", e))?;
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?;
                 Ok(KgTimelineRow {
                     target_id,
                     relation,
@@ -5770,7 +5770,7 @@ impl PostgresStore {
     fn row_to_memory(row: &sqlx::postgres::PgRow) -> StoreResult<Memory> {
         let created_at: DateTime<Utc> = row
             .try_get("created_at")
-            .map_err(|e| to_store_err("read created_at", e))?;
+            .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
         let updated_at: DateTime<Utc> = row
             .try_get("updated_at")
             .map_err(|e| to_store_err("read updated_at", e))?;
@@ -5814,10 +5814,10 @@ impl PostgresStore {
             tier,
             namespace: row
                 .try_get("namespace")
-                .map_err(|e| to_store_err("read namespace", e))?,
+                .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
             title: row
                 .try_get("title")
-                .map_err(|e| to_store_err("read title", e))?,
+                .map_err(|e| to_store_err(READ_TITLE, e))?,
             content: row
                 .try_get("content")
                 .map_err(|e| to_store_err("read content", e))?,
@@ -5863,7 +5863,7 @@ impl PostgresStore {
                 .try_get::<Option<String>, _>("source_uri")
                 .unwrap_or(None),
             source_span: row
-                .try_get::<Option<String>, _>("source_span")
+                .try_get::<Option<String>, _>(COL_SOURCE_SPAN)
                 .unwrap_or(None)
                 .and_then(|s| serde_json::from_str(&s).ok()),
             // v0.7.0 Form 5 — Postgres v38 confidence-provenance columns.
@@ -5876,7 +5876,7 @@ impl PostgresStore {
                 .and_then(|s| crate::models::ConfidenceSource::from_str(&s))
                 .unwrap_or_default(),
             confidence_signals: row
-                .try_get::<Option<String>, _>("confidence_signals")
+                .try_get::<Option<String>, _>(COL_CONFIDENCE_SIGNALS)
                 .unwrap_or(None)
                 .and_then(|s| serde_json::from_str(&s).ok()),
             confidence_decayed_at: row
@@ -6119,7 +6119,7 @@ impl PostgresStore {
             .map_err(|e| ReflectError::Database(format!("parse now: {e}")))?
             .with_timezone(&Utc);
         let tags_json = serde_json::to_value(&input.tags)
-            .map_err(|e| ReflectError::Database(format!("serialize tags: {e}")))?;
+            .map_err(|e| ReflectError::Database(serialize_err("tags", e)))?;
 
         // FX-C5 — substrate governance pre-write hook parity. The
         // postgres reflect path mints a fresh memory via a raw INSERT
@@ -6497,6 +6497,40 @@ async fn pg_append_signed_event_with_chain_in_tx(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// #1558 batch 5 wave 2 — shared sqlx `row.try_get` context labels.
+//
+// The high-traffic column-read labels passed to `to_store_err` were
+// previously spelled inline at 3-9 sites each. `&'static str` consts:
+// zero allocation, byte-identical error detail. Labels used at fewer
+// than 3 sites stay inline (below the no-hardcoded-literals ratchet
+// threshold).
+// ---------------------------------------------------------------------------
+const READ_NAMESPACE: &str = "read namespace";
+const READ_RELATION: &str = "read relation";
+const READ_TARGET_ID: &str = "read target_id";
+const READ_VALID_FROM: &str = "read valid_from";
+const READ_VALID_UNTIL: &str = "read valid_until";
+const READ_OBSERVED_BY: &str = "read observed_by";
+const READ_CREATED_AT: &str = "read created_at";
+const READ_TITLE: &str = "read title";
+const READ_SOURCE_ID: &str = "read source_id";
+const READ_ATTEST_LEVEL: &str = "read attest_level";
+const READ_RETURNED_ID: &str = "read returned id";
+
+/// #1558 batch 5 wave 2 — JSON-column field names shared by the
+/// `serialize_err` encode sites and the `row.try_get` decode sites.
+const COL_SOURCE_SPAN: &str = "source_span";
+const COL_CONFIDENCE_SIGNALS: &str = "confidence_signals";
+
+/// #1558 batch 5 wave 2 — canonical `"serialize {field}: {e}"` detail
+/// string for the serde-to-column encode failures (`tags`, `citations`,
+/// `source_span`, `confidence_signals`). Byte-identical to the prior
+/// inline `format!` at every site.
+fn serialize_err(field: &str, e: impl std::fmt::Display) -> String {
+    format!("serialize {field}: {e}")
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     StoreError::BackendUnavailable {
@@ -6855,7 +6889,7 @@ const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 5;
 fn validate_depth(max_depth: usize) -> StoreResult<()> {
     if max_depth == 0 {
         return Err(StoreError::InvalidInput {
-            detail: "max_depth must be >= 1".to_string(),
+            detail: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
         });
     }
     if max_depth > KG_QUERY_MAX_SUPPORTED_DEPTH {
@@ -6893,7 +6927,7 @@ const FIND_PATHS_MAX_LIMIT_SAL: usize = 50;
 fn validate_find_paths_depth(max_depth: usize) -> StoreResult<()> {
     if max_depth == 0 {
         return Err(StoreError::InvalidInput {
-            detail: "max_depth must be >= 1".to_string(),
+            detail: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
         });
     }
     if max_depth > FIND_PATHS_MAX_DEPTH_SAL {
@@ -7638,7 +7672,7 @@ impl MemoryStore for PostgresStore {
         let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize tags: {e}"),
+                detail: serialize_err("tags", e),
             })?;
 
         // v0.7.0.1 G1 — INSERT memories + record quota usage in a single
@@ -7672,13 +7706,13 @@ impl MemoryStore for PostgresStore {
         // `tests/store_parity_gaps.rs::pg_parity_gap_2_source_uri_column`.
         let citations_json =
             serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize citations: {e}"),
+                detail: serialize_err("citations", e),
             })?;
         let source_span_json = match memory.source_span {
             Some(span) => {
                 Some(
                     serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
-                        detail: format!("serialize source_span: {e}"),
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
                     })?,
                 )
             }
@@ -7687,7 +7721,7 @@ impl MemoryStore for PostgresStore {
         let confidence_signals_json = match &memory.confidence_signals {
             Some(s) => Some(
                 serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
-                    detail: format!("serialize confidence_signals: {e}"),
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
                 })?,
             ),
             None => None,
@@ -7787,7 +7821,7 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("insert memory", e))?
         .try_get::<String, _>("id")
-        .map_err(|e| to_store_err("read returned id", e))?;
+        .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
 
         // v0.7.0.1 G1 / v0.7.0 #1156 — record quota usage in the same
         // tx against the per-namespace accounting row (v50 PK
@@ -7906,7 +7940,7 @@ impl MemoryStore for PostgresStore {
                 Ok(v) => v,
                 Err(e) => {
                     push_err.get_or_insert(StoreError::IntegrityFailed {
-                        detail: format!("serialize tags: {e}"),
+                        detail: serialize_err("tags", e),
                     });
                     return;
                 }
@@ -7915,7 +7949,7 @@ impl MemoryStore for PostgresStore {
                 Ok(v) => v,
                 Err(e) => {
                     push_err.get_or_insert(StoreError::IntegrityFailed {
-                        detail: format!("serialize citations: {e}"),
+                        detail: serialize_err("citations", e),
                     });
                     return;
                 }
@@ -7925,7 +7959,7 @@ impl MemoryStore for PostgresStore {
                     Ok(v) => Some(v),
                     Err(e) => {
                         push_err.get_or_insert(StoreError::IntegrityFailed {
-                            detail: format!("serialize source_span: {e}"),
+                            detail: serialize_err(COL_SOURCE_SPAN, e),
                         });
                         return;
                     }
@@ -7937,7 +7971,7 @@ impl MemoryStore for PostgresStore {
                     Ok(v) => Some(v),
                     Err(e) => {
                         push_err.get_or_insert(StoreError::IntegrityFailed {
-                            detail: format!("serialize confidence_signals: {e}"),
+                            detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
                         });
                         return;
                     }
@@ -8133,17 +8167,17 @@ impl MemoryStore for PostgresStore {
         let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize tags: {e}"),
+                detail: serialize_err("tags", e),
             })?;
         let citations_json =
             serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize citations: {e}"),
+                detail: serialize_err("citations", e),
             })?;
         let source_span_json = match memory.source_span {
             Some(span) => {
                 Some(
                     serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
-                        detail: format!("serialize source_span: {e}"),
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
                     })?,
                 )
             }
@@ -8152,7 +8186,7 @@ impl MemoryStore for PostgresStore {
         let confidence_signals_json = match &memory.confidence_signals {
             Some(s) => Some(
                 serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
-                    detail: format!("serialize confidence_signals: {e}"),
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
                 })?,
             ),
             None => None,
@@ -8318,7 +8352,7 @@ impl MemoryStore for PostgresStore {
         let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize tags: {e}"),
+                detail: serialize_err("tags", e),
             })?;
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
 
@@ -8397,7 +8431,7 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
         .try_get::<String, _>("id")
-        .map_err(|e| to_store_err("read returned id", e))?;
+        .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
 
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
@@ -8992,32 +9026,32 @@ impl MemoryStore for PostgresStore {
             .map(|r| {
                 let created_at: DateTime<Utc> = r
                     .try_get::<DateTime<Utc>, _>("created_at")
-                    .map_err(|e| to_store_err("read created_at", e))?;
+                    .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
                 let valid_from: Option<DateTime<Utc>> = r
                     .try_get::<Option<DateTime<Utc>>, _>("valid_from")
-                    .map_err(|e| to_store_err("read valid_from", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
                     .try_get::<Option<DateTime<Utc>>, _>("valid_until")
-                    .map_err(|e| to_store_err("read valid_until", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
                     .try_get::<Option<String>, _>("observed_by")
-                    .map_err(|e| to_store_err("read observed_by", e))?;
+                    .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let signature: Option<Vec<u8>> = r
                     .try_get::<Option<Vec<u8>>, _>("signature")
                     .map_err(|e| to_store_err("read signature", e))?;
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err("read relation", e))?;
+                    .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let attest_level: Option<String> =
                     r.try_get::<Option<String>, _>("attest_level")
-                        .map_err(|e| to_store_err("read attest_level", e))?;
+                        .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get::<String, _>("source_id")
-                        .map_err(|e| to_store_err("read source_id", e))?,
+                        .map_err(|e| to_store_err(READ_SOURCE_ID, e))?,
                     target_id: r
                         .try_get::<String, _>("target_id")
-                        .map_err(|e| to_store_err("read target_id", e))?,
+                        .map_err(|e| to_store_err(READ_TARGET_ID, e))?,
                     // v0.7.0 fix campaign R1-M4 — parse closed-set
                     // relation. Unknown values fall back to default so
                     // the read path never errors; the SQL CHECK on the
@@ -9067,29 +9101,29 @@ impl MemoryStore for PostgresStore {
             .map(|r| {
                 let created_at: DateTime<Utc> = r
                     .try_get::<DateTime<Utc>, _>("created_at")
-                    .map_err(|e| to_store_err("read created_at", e))?;
+                    .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
                 let valid_from: Option<DateTime<Utc>> = r
                     .try_get::<Option<DateTime<Utc>>, _>("valid_from")
-                    .map_err(|e| to_store_err("read valid_from", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
                     .try_get::<Option<DateTime<Utc>>, _>("valid_until")
-                    .map_err(|e| to_store_err("read valid_until", e))?;
+                    .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
                     .try_get::<Option<String>, _>("observed_by")
-                    .map_err(|e| to_store_err("read observed_by", e))?;
+                    .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err("read relation", e))?;
+                    .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let attest_level: Option<String> =
                     r.try_get::<Option<String>, _>("attest_level")
-                        .map_err(|e| to_store_err("read attest_level", e))?;
+                        .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get::<String, _>("source_id")
-                        .map_err(|e| to_store_err("read source_id", e))?,
+                        .map_err(|e| to_store_err(READ_SOURCE_ID, e))?,
                     target_id: r
                         .try_get::<String, _>("target_id")
-                        .map_err(|e| to_store_err("read target_id", e))?,
+                        .map_err(|e| to_store_err(READ_TARGET_ID, e))?,
                     // Closed-set relation parse — unknown values fall
                     // back to the canonical default. Mirrors the SQLite
                     // path's `from_str(...).unwrap_or_default()` posture.
@@ -9206,7 +9240,7 @@ impl MemoryStore for PostgresStore {
         let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
         let tags_json =
             serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize tags: {e}"),
+                detail: serialize_err("tags", e),
             })?;
 
         // #1029 (HIGH, 2026-05-21): extend the federation upsert to
@@ -9225,13 +9259,13 @@ impl MemoryStore for PostgresStore {
         // `store` (~line 6758).
         let citations_json =
             serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("serialize citations: {e}"),
+                detail: serialize_err("citations", e),
             })?;
         let source_span_json = match &memory.source_span {
             Some(span) => {
                 Some(
                     serde_json::to_string(span).map_err(|e| StoreError::IntegrityFailed {
-                        detail: format!("serialize source_span: {e}"),
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
                     })?,
                 )
             }
@@ -9240,7 +9274,7 @@ impl MemoryStore for PostgresStore {
         let confidence_signals_json = match &memory.confidence_signals {
             Some(s) => Some(
                 serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
-                    detail: format!("serialize confidence_signals: {e}"),
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
                 })?,
             ),
             None => None,
@@ -9411,7 +9445,7 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
 
         row.try_get::<String, _>("id")
-            .map_err(|e| to_store_err("read returned id", e))
+            .map_err(|e| to_store_err(READ_RETURNED_ID, e))
     }
 
     async fn apply_remote_link(
@@ -9758,7 +9792,7 @@ impl MemoryStore for PostgresStore {
             memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
             namespace: r
                 .try_get::<String, _>("namespace")
-                .map_err(|e| to_store_err("read namespace", e))?,
+                .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
             payload: r
                 .try_get::<serde_json::Value, _>("payload")
                 .unwrap_or(serde_json::Value::Null),
@@ -10155,7 +10189,7 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<usize> {
         if namespace.is_none() && pattern.is_none() && tier.is_none() {
             return Err(StoreError::InvalidInput {
-                detail: "at least one of namespace, pattern, or tier is required".to_string(),
+                detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
             });
         }
         // Postgres uses ILIKE for the pattern match (no FTS5 here); the
@@ -10744,7 +10778,7 @@ impl MemoryStore for PostgresStore {
         if let Some(days) = older_than_days {
             if days < 0 {
                 return Err(StoreError::InvalidInput {
-                    detail: format!("older_than_days must be non-negative (got {days})"),
+                    detail: crate::errors::msg::older_than_days_negative(days),
                 });
             }
         }
@@ -11124,7 +11158,7 @@ impl MemoryStore for PostgresStore {
                     Ok(super::ApproveOutcome::Approved)
                 } else {
                     Ok(super::ApproveOutcome::Rejected(
-                        "decision write failed".to_string(),
+                        crate::errors::msg::DECISION_WRITE_FAILED.to_string(),
                     ))
                 }
             }
@@ -11141,7 +11175,7 @@ impl MemoryStore for PostgresStore {
                     Ok(super::ApproveOutcome::Approved)
                 } else {
                     Ok(super::ApproveOutcome::Rejected(
-                        "decision write failed".to_string(),
+                        crate::errors::msg::DECISION_WRITE_FAILED.to_string(),
                     ))
                 }
             }
@@ -11210,7 +11244,7 @@ impl MemoryStore for PostgresStore {
             Some(p) => p,
             None => {
                 return Err(StoreError::InvalidInput {
-                    detail: format!("pending action not found: {pending_id}"),
+                    detail: crate::errors::msg::pending_action_not_found(pending_id),
                 });
             }
         };
@@ -11645,7 +11679,7 @@ impl MemoryStore for PostgresStore {
     async fn verify_link(&self, filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
         if filter.source_id.is_none() && filter.link_id.is_none() {
             return Err(StoreError::InvalidInput {
-                detail: "verify_link requires either source_id or link_id".to_string(),
+                detail: crate::errors::msg::VERIFY_LINK_ARGS_REQUIRED.to_string(),
             });
         }
         // Resolve the (source, target?, relation?) triple identically
@@ -11721,28 +11755,28 @@ impl MemoryStore for PostgresStore {
 
         let src: String = row
             .try_get("source_id")
-            .map_err(|e| to_store_err("read source_id", e))?;
+            .map_err(|e| to_store_err(READ_SOURCE_ID, e))?;
         let tgt: String = row
             .try_get("target_id")
-            .map_err(|e| to_store_err("read target_id", e))?;
+            .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
         let rel: String = row
             .try_get("relation")
-            .map_err(|e| to_store_err("read relation", e))?;
+            .map_err(|e| to_store_err(READ_RELATION, e))?;
         let vf: Option<DateTime<Utc>> = row
             .try_get("valid_from")
-            .map_err(|e| to_store_err("read valid_from", e))?;
+            .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
         let vu: Option<DateTime<Utc>> = row
             .try_get("valid_until")
-            .map_err(|e| to_store_err("read valid_until", e))?;
+            .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
         let obs: Option<String> = row
             .try_get("observed_by")
-            .map_err(|e| to_store_err("read observed_by", e))?;
+            .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
         let sig: Option<Vec<u8>> = row
             .try_get("signature")
             .map_err(|e| to_store_err("read signature", e))?;
         let attest: Option<String> = row
             .try_get("attest_level")
-            .map_err(|e| to_store_err("read attest_level", e))?;
+            .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
 
         let attest_level =
             attest.unwrap_or_else(|| crate::models::AttestLevel::Unsigned.as_str().to_string());
@@ -11783,7 +11817,7 @@ impl MemoryStore for PostgresStore {
                     match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
                         Ok(()) => true,
                         Err(e) => {
-                            findings.push(format!("signature verify failed: {e}"));
+                            findings.push(crate::errors::msg::signature_verify_failed(e));
                             false
                         }
                     }
@@ -11911,7 +11945,7 @@ impl MemoryStore for PostgresStore {
             .map(|r| {
                 let namespace: String = r
                     .try_get::<String, _>("namespace")
-                    .map_err(|e| to_store_err("read namespace", e))?;
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?;
                 let c: i64 = r
                     .try_get::<i64, _>("c")
                     .map_err(|e| to_store_err("read count", e))?;
@@ -12120,7 +12154,7 @@ impl MemoryStore for PostgresStore {
                 memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
                 namespace: r
                     .try_get::<String, _>("namespace")
-                    .map_err(|e| to_store_err("read namespace", e))?,
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?,
                 payload: r
                     .try_get::<serde_json::Value, _>("payload")
                     .unwrap_or(serde_json::Value::Null),
@@ -12278,7 +12312,7 @@ impl MemoryStore for PostgresStore {
             .map(|r| {
                 let namespace: String = r
                     .try_get::<String, _>("namespace")
-                    .map_err(|e| to_store_err("read namespace", e))?;
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?;
                 let c: i64 = r
                     .try_get::<i64, _>("c")
                     .map_err(|e| to_store_err("read namespace count", e))?;
@@ -12476,14 +12510,14 @@ impl MemoryStore for PostgresStore {
             let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
             let title: String = r
                 .try_get("title")
-                .map_err(|e| to_store_err("read title", e))?;
+                .map_err(|e| to_store_err(READ_TITLE, e))?;
             let ns_v: String = r
                 .try_get("namespace")
-                .map_err(|e| to_store_err("read namespace", e))?;
+                .map_err(|e| to_store_err(READ_NAMESPACE, e))?;
             let content: String = r
                 .try_get("content")
                 .map_err(|e| to_store_err("read content", e))?;
-            let row_text = format!("{title} {content}");
+            let row_text = crate::embeddings::embedding_document(&title, &content);
             let mut row_hasher = Sha256::new();
             row_hasher.update(row_text.as_bytes());
             let row_hash = row_hasher.finalize();
@@ -12561,10 +12595,10 @@ impl MemoryStore for PostgresStore {
                 let id: String = r.try_get("id").map_err(|e| to_store_err("read id", e))?;
                 let title: String = r
                     .try_get("title")
-                    .map_err(|e| to_store_err("read title", e))?;
+                    .map_err(|e| to_store_err(READ_TITLE, e))?;
                 let ns_v: String = r
                     .try_get("namespace")
-                    .map_err(|e| to_store_err("read namespace", e))?;
+                    .map_err(|e| to_store_err(READ_NAMESPACE, e))?;
                 let sim: f64 = r.try_get("sim").map_err(|e| to_store_err("read sim", e))?;
                 #[allow(clippy::cast_possible_truncation)]
                 let sim_f32 = sim as f32;
@@ -12828,7 +12862,7 @@ fn row_to_quota_status(row: &sqlx::postgres::PgRow) -> StoreResult<QuotaStatus> 
         .map_err(|e| to_store_err("read day_started_at", e))?;
     let created_at: DateTime<Utc> = row
         .try_get("created_at")
-        .map_err(|e| to_store_err("read created_at", e))?;
+        .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
     let updated_at: DateTime<Utc> = row
         .try_get("updated_at")
         .map_err(|e| to_store_err("read updated_at", e))?;

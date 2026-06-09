@@ -126,9 +126,11 @@ pub fn handle_namespace_set_standard(
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let parent = params["parent"].as_str();
     if let Some(p) = parent {
@@ -258,7 +260,7 @@ pub fn handle_namespace_set_standard(
         // governance blob and merge.
         let mut mem = db::get(conn, id)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("memory not found: {id}"))?;
+            .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
         // Compute the merged governance JSON: existing fields preserved,
         // incoming overrides applied per-key.
         let merged = merge_governance_fields(mem.metadata.get(param_names::GOVERNANCE), g);
@@ -268,7 +270,7 @@ pub fn handle_namespace_set_standard(
         // fields without rejecting extras like
         // `require_approval_above_depth`.
         let policy: crate::models::GovernancePolicy = serde_json::from_value(merged.clone())
-            .map_err(|e| format!("invalid governance: {e}"))?;
+            .map_err(|e| crate::errors::msg::invalid(param_names::GOVERNANCE, e))?;
         validate::validate_governance_policy(&policy).map_err(|e| e.to_string())?;
 
         let mut metadata = if mem.metadata.is_object() {
@@ -316,7 +318,7 @@ pub fn handle_namespace_get_standard(
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
 
     // Task 1.6: --inherit returns the full resolved chain, most-general-first.
@@ -484,7 +486,7 @@ pub(crate) fn handle_namespace_clear_standard(
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.

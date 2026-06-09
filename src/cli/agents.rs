@@ -262,7 +262,7 @@ pub fn run_pending(
                                 "id": id,
                                 "votes": votes,
                                 "quorum": quorum,
-                                "reason": "consensus threshold not yet reached",
+                                "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
                             })
                         )?;
                     } else {
@@ -273,7 +273,11 @@ pub fn run_pending(
                     }
                 }
                 ApproveOutcome::Rejected(reason) => {
-                    writeln!(out.stderr, "approve rejected: {reason}")?;
+                    writeln!(
+                        out.stderr,
+                        "{}",
+                        crate::errors::msg::approve_rejected(&reason)
+                    )?;
                     std::process::exit(1);
                 }
             }

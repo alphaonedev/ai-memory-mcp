@@ -208,14 +208,7 @@ pub async fn register_agent(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -258,14 +251,7 @@ pub async fn list_agents(
             Json(json!({"count": agents.len(), "agents": agents})),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -319,7 +305,7 @@ pub async fn quota_status_handler(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -328,16 +314,14 @@ pub async fn quota_status_handler(
         if let Err(e) = validate::validate_agent_id(agent_id) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
         if agent_id != caller {
             return (
                 StatusCode::FORBIDDEN,
-                Json(
-                    json!({"error": "agent_id body parameter does not match authenticated caller"}),
-                ),
+                Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
             )
                 .into_response();
         }
@@ -369,7 +353,7 @@ pub async fn quota_status_handler(
                 tracing::error!("quota_status handler error: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
@@ -408,7 +392,7 @@ pub async fn quota_status_handler(
             tracing::error!("quota_status list handler error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -466,14 +450,7 @@ pub async fn get_stats(
     let lock = app.db.lock().await;
     match db::stats(&lock.0, &lock.1) {
         Ok(s) => Json(json!(s)).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -519,14 +496,7 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     let lock = app.db.lock().await;
     match db::gc(&lock.0, lock.3) {
         Ok(n) => Json(json!({"expired_deleted": n})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -601,7 +571,7 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             tracing::error!("export error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }

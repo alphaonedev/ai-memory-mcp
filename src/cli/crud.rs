@@ -83,7 +83,7 @@ pub fn cmd_get(
             }
         }
     } else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
     Ok(())
@@ -159,7 +159,7 @@ pub fn cmd_delete(
     let conn = db::open(db_path)?;
     let target = db::resolve_id(&conn, &args.id)?;
     let Some(target) = target else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     };
 
@@ -220,7 +220,7 @@ pub fn cmd_delete(
             writeln!(out.stdout, "deleted: {}", target.id)?;
         }
     } else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
     Ok(())

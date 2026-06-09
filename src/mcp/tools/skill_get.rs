@@ -86,12 +86,12 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         superseded_by,
     )) = row
     else {
-        return Err(format!("skill not found: {skill_id}"));
+        return Err(crate::errors::msg::skill_not_found(skill_id));
     };
 
     // Decompress body.
-    let body_bytes =
-        zstd::decode_all(body_blob.as_slice()).map_err(|e| format!("zstd decompress body: {e}"))?;
+    let body_bytes = zstd::decode_all(body_blob.as_slice())
+        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();

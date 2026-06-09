@@ -338,8 +338,8 @@ pub async fn handle_reflection_origin_http(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let memory_id = match body["memory_id"].as_str() {
             Some(s) if !s.is_empty() => s,
-            Some(_) => return err_response("memory_id cannot be empty".to_string()),
-            None => return err_response("memory_id is required".to_string()),
+            Some(_) => return err_response(crate::errors::msg::MEMORY_ID_EMPTY.to_string()),
+            None => return err_response(crate::errors::msg::MEMORY_ID_REQUIRED.to_string()),
         };
         return match app.store.get_reflection_origin(memory_id).await {
             Ok(Some(record)) => (
@@ -354,7 +354,7 @@ pub async fn handle_reflection_origin_http(
                 })),
             )
                 .into_response(),
-            Ok(None) => err_response(format!("memory not found: {memory_id}")),
+            Ok(None) => err_response(crate::errors::msg::memory_not_found(memory_id)),
             Err(e) => err_response(e.to_string()),
         };
     }

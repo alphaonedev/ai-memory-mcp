@@ -92,7 +92,7 @@ pub async fn notify(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response();
     }
@@ -272,7 +272,7 @@ pub async fn subscribe(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response();
     }
@@ -586,7 +586,7 @@ pub async fn unsubscribe(
         {
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+                Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
             )
                 .into_response();
         }
@@ -667,7 +667,7 @@ pub async fn unsubscribe(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
         )
             .into_response();
     }
@@ -684,10 +684,10 @@ pub async fn unsubscribe(
                 (StatusCode::OK, Json(json!({"id": id, "removed": removed}))).into_response()
             }
             Err(e) => {
-                tracing::error!("unsubscribe: {e}");
+                tracing::error!("{}", crate::errors::msg::unsubscribe(&e));
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
@@ -725,10 +725,10 @@ pub async fn unsubscribe(
             (StatusCode::OK, Json(json!({"id": id, "removed": removed}))).into_response()
         }
         Err(e) => {
-            tracing::error!("unsubscribe: {e}");
+            tracing::error!("{}", crate::errors::msg::unsubscribe(&e));
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -762,7 +762,7 @@ pub async fn list_subscriptions(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
         )
             .into_response();
     }
@@ -838,7 +838,7 @@ pub async fn list_subscriptions(
             tracing::error!("list_subscriptions: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }

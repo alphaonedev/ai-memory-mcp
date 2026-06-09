@@ -189,7 +189,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 Ok(None) => match db::get_by_prefix(conn, raw_id) {
                     Ok(Some(mem)) => mem.id,
                     Ok(None) => {
-                        let _ = writeln!(out.stderr, "not found: {raw_id}");
+                        let _ = writeln!(out.stderr, "{}", crate::errors::msg::not_found(raw_id));
                         return ShellAction::Continue;
                     }
                     Err(e) => {
