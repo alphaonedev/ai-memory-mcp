@@ -35,6 +35,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::validate;
 
 use super::AppState;
@@ -339,7 +340,7 @@ pub async fn entity_get_by_alias(
                         .get(crate::HEADER_AGENT_ID)
                         .and_then(|v| v.to_str().ok());
                     crate::identity::resolve_http_agent_id(None, header_agent_id)
-                        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+                        .unwrap_or_else(|_| crate::identity::anonymous_request_id())
                 };
                 let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
                 let ctx_admin =
@@ -437,7 +438,7 @@ pub async fn entity_get_by_alias(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
@@ -647,7 +648,11 @@ pub async fn kg_timeline(
             .into_response();
     };
     let is_unowned_legacy = owner.is_empty();
-    if !is_unowned_legacy && owner != caller && target != caller && caller != "daemon" {
+    if !is_unowned_legacy
+        && owner != caller
+        && target != caller
+        && caller != sentinels::DAEMON_PRINCIPAL
+    {
         tracing::warn!(
             target: "ai_memory::authz",
             "GET /api/v1/kg/timeline 403: caller {caller} != owner {owner} (source_id={})",
@@ -847,7 +852,11 @@ pub async fn kg_invalidate(
             .into_response();
     };
     let is_unowned_legacy = owner.is_empty();
-    if !is_unowned_legacy && owner != caller && target != caller && caller != "daemon" {
+    if !is_unowned_legacy
+        && owner != caller
+        && target != caller
+        && caller != sentinels::DAEMON_PRINCIPAL
+    {
         tracing::warn!(
             target: "ai_memory::authz",
             "POST /api/v1/kg/invalidate 403: caller {caller} != owner {owner} (source_id={})",
@@ -1036,7 +1045,7 @@ pub async fn kg_find_paths(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Recall,
-                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::actor(sentinels::AI_HTTP, "http_body", None),
                         crate::audit::target_memory(
                             body.source_id.clone(),
                             String::new(),

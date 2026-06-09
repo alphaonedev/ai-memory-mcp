@@ -132,7 +132,7 @@ pub async fn migrate(
     // #910 — migrate is an admin/operator surface that must round-
     // trip every row regardless of metadata.scope; use the admin
     // builder so the SAL-level visibility filter is bypassed.
-    let ctx = CallerContext::for_admin("ai:migrate");
+    let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
     let mut report = MigrationReport {
         memories_read: 0,
         memories_written: 0,

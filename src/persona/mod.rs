@@ -73,7 +73,7 @@ pub const DEFAULT_MAX_REFLECTION_SOURCES: usize = 20;
 
 /// Default curator family stamp on the Persona's `metadata.agent_id`
 /// when the engine is constructed without an explicit keypair (tests).
-const ANONYMOUS_CURATOR_AGENT_ID: &str = "ai:curator";
+const ANONYMOUS_CURATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 
 /// v0.7.0 issue #848 — sentinel namespace value reported in
 /// [`PersonaError::NoReflections`] when the caller asked for the

@@ -9931,7 +9931,7 @@ impl MemoryStore for PostgresStore {
         // every re-registration would reset it.
         use crate::models::AGENTS_NAMESPACE;
 
-        let title = format!("agent:{}", agent.agent_id);
+        let title = crate::models::agent_registration_title(&agent.agent_id);
         let now_rfc = Utc::now().to_rfc3339();
 
         // Preserve the original registered_at across re-registration.
@@ -10012,7 +10012,7 @@ impl MemoryStore for PostgresStore {
         // registered; re-binding rotates the key.
         use crate::models::AGENTS_NAMESPACE;
 
-        let title = format!("agent:{agent_id}");
+        let title = crate::models::agent_registration_title(agent_id);
         let now = Utc::now().to_rfc3339();
 
         let existing: Option<(serde_json::Value,)> =
@@ -10064,7 +10064,7 @@ impl MemoryStore for PostgresStore {
 
     async fn agent_pubkey(&self, agent_id: &str) -> StoreResult<Option<String>> {
         use crate::models::AGENTS_NAMESPACE;
-        let title = format!("agent:{agent_id}");
+        let title = crate::models::agent_registration_title(agent_id);
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT metadata->>'agent_pubkey' FROM memories
              WHERE namespace = $1 AND title = $2",
@@ -10086,7 +10086,7 @@ impl MemoryStore for PostgresStore {
         // registered; revoking an unbound agent is a no-op success.
         use crate::models::AGENTS_NAMESPACE;
 
-        let title = format!("agent:{agent_id}");
+        let title = crate::models::agent_registration_title(agent_id);
         let now = Utc::now().to_rfc3339();
 
         let existing: Option<(serde_json::Value,)> =
@@ -10891,7 +10891,7 @@ impl MemoryStore for PostgresStore {
         // returns the FULL corpus rather than silently dropping any row
         // whose `metadata.agent_id != "export"`. Reserved for operator
         // surfaces per the `for_admin` docs.
-        let ctx = CallerContext::for_admin("export-internal");
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EXPORT_INTERNAL);
         let filter = Filter {
             limit: 100_000,
             ..Filter::default()
@@ -11062,7 +11062,7 @@ impl MemoryStore for PostgresStore {
             // `for_agent("governance")` would mismatch the standard's
             // owner and drop the policy row when scope=private,
             // breaking governance resolution for private namespaces.
-            let ctx = CallerContext::for_admin("governance-internal");
+            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
             let mem = match self.get(&ctx, &standard_id).await {
                 Ok(m) => m,
                 Err(StoreError::NotFound { .. }) => continue,
@@ -11257,7 +11257,7 @@ impl MemoryStore for PostgresStore {
 
     async fn is_registered_agent(&self, agent_id: &str) -> StoreResult<bool> {
         use crate::models::AGENTS_NAMESPACE;
-        let title = format!("agent:{agent_id}");
+        let title = crate::models::agent_registration_title(agent_id);
         let row: Option<(String,)> =
             sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
                 .bind(AGENTS_NAMESPACE)
@@ -11378,7 +11378,7 @@ impl MemoryStore for PostgresStore {
         // helper takes &self.pool; we reproduce its single-row probe.
         let registered_agent_check = if matches!(level, GovernanceLevel::Registered) {
             use crate::models::AGENTS_NAMESPACE;
-            let title = format!("agent:{agent_id}");
+            let title = crate::models::agent_registration_title(agent_id);
             let row: Option<(String,)> =
                 sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
                     .bind(AGENTS_NAMESPACE)

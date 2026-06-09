@@ -515,7 +515,7 @@ pub async fn subscribe(
         .ok()
         .and_then(|rows| {
             rows.into_iter()
-                .find(|m| m.title == format!("agent:{caller}"))
+                .find(|m| m.title == crate::models::agent_registration_title(&caller))
         })
     };
     drop(lock);
@@ -913,7 +913,8 @@ pub async fn dispatch_event_postgres(
     // every matching subscriber's hook regardless of which tenant
     // registered it. The cross-tenant authorization gate lives at the
     // wire surface (subscribe/list/unsubscribe handlers).
-    let ctx = crate::store::CallerContext::for_admin("subscription-dispatch");
+    let ctx =
+        crate::store::CallerContext::for_admin(crate::identity::sentinels::SUBSCRIPTION_DISPATCH);
 
     // Pull only the subscription mirror rows (`_subscriptions/<agent>`)
     // via the sargable namespace-prefix scan. `Filter::namespace` is

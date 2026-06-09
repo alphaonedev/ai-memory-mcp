@@ -279,7 +279,7 @@ pub async fn search_memories(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id());
         let ctx = crate::store::CallerContext {
             agent_id: caller,
             as_agent: p.as_agent.clone(),
@@ -524,7 +524,7 @@ pub async fn bulk_create(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons stream each
     // row through `app.store.store(...)`. Federation fanout below stays
@@ -633,7 +633,7 @@ pub async fn bulk_create(
                 .metadata
                 .get("agent_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("daemon");
+                .unwrap_or(crate::identity::sentinels::DAEMON_PRINCIPAL);
             let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
             match app
                 .store

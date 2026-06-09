@@ -52,7 +52,7 @@ pub(super) fn handle_archive_purge(
     // permission-gate / storage outcome. Mirrors the #911 HTTP
     // `purge_archive` fix.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
     // The MCP entry is a second attack surface for the same gap the
     // HTTP `purge_archive` handler had: pre-#936 the dispatch reached

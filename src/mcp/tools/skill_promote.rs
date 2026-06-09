@@ -130,7 +130,7 @@ pub fn handle_skill_promote_from_reflection(
     // so the audit trail captures the caller + source reflection_id
     // regardless of downstream outcome.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",

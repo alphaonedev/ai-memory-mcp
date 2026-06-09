@@ -2293,21 +2293,10 @@ pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<V
 // v0.7 Track H — H2 active keypair loading
 // ---------------------------------------------------------------------------
 
-/// The well-known stable label used by the daemon when auto-generating
-/// and loading its outbound link-signing keypair.
-///
-/// Round-3 F12 fix — the daemon's signing identity is process-wide
-/// (one daemon = one signing key) and decoupled from the per-request
-/// `agent_id` resolution. Using a fixed label avoids two prior bugs:
-///   1. The pre-fix code resolved `agent_id` via
-///      [`crate::identity::resolve_agent_id`] which produces a
-///      hostname/PID-bearing default (`host:<host>:pid-…-<uuid>`).
-///      That value differs across daemon restarts, so `load_*` looked
-///      for a file that `ensure_keypair("daemon", …)` never created.
-///   2. The auto-gen call ran AFTER the load attempt, so even if the
-///      labels matched, the load would fire on a freshly-built
-///      deployment before the file existed.
-const DAEMON_KEYPAIR_LABEL: &str = "daemon";
+// Round-3 F12 — the daemon's fixed signing-key label. Canonical const
+// (with the full F12 rationale) now lives at
+// `crate::identity::keypair::DAEMON_KEYPAIR_LABEL` (#1558).
+use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 
 /// Round-3 F12 — ensure the daemon's signing keypair exists on disk and
 /// load it for the serve [`AppState`]. Returns the in-memory keypair

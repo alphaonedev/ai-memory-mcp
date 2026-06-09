@@ -156,12 +156,25 @@ pub fn default_key_dir() -> Result<PathBuf> {
 /// class + length) so callers cannot smuggle invalid characters into
 /// the on-disk filename. The reserved-name reject lives at the WIRE
 /// boundary ([`crate::validate::validate_agent_id`]) so internal
-/// callers using literal sentinels (e.g. the daemon's own
-/// `DAEMON_KEYPAIR_LABEL = "daemon"` self-signing keypair at
-/// `src/daemon_runtime.rs:1724`) can still load/generate cleanly. Wire
+/// callers using reserved sentinels (e.g. the daemon's own
+/// [`DAEMON_KEYPAIR_LABEL`] self-signing keypair) can still
+/// load/generate cleanly. Wire
 /// entry points that route caller-supplied agent_ids into this
 /// function must validate FIRST via `validate_agent_id` before
 /// reaching here.
+/// The well-known stable label used by the daemon when auto-generating
+/// and loading its outbound link-signing keypair (`<label>.priv` /
+/// `<label>.pub` under the key directory).
+///
+/// This is a key-file LABEL, deliberately distinct from
+/// [`crate::identity::sentinels::DAEMON_PRINCIPAL`] (a caller
+/// identity) even though both are `"daemon"` today — they govern
+/// different mechanisms. Round-3 F12: the daemon's signing identity is
+/// process-wide (one daemon = one signing key) and decoupled from
+/// per-request `agent_id` resolution; a fixed label keeps `load` and
+/// `ensure_keypair` pointed at the same file across restarts.
+pub const DAEMON_KEYPAIR_LABEL: &str = "daemon";
+
 pub fn generate(agent_id: &str) -> Result<AgentKeypair> {
     validate::validate_agent_id_shape(agent_id)?;
     // ed25519-dalek 2.x consumes a `CryptoRngCore` (rand_core 0.6).

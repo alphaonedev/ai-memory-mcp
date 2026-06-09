@@ -82,7 +82,7 @@ pub async fn register_agent(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -110,7 +110,8 @@ pub async fn register_agent(
         // #910 — admin surface (registration / list_agents / stats);
         // bypass the SAL visibility filter so admin endpoints see the
         // full row set regardless of metadata.scope.
-        let ctx = crate::store::CallerContext::for_admin("daemon");
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
         let now = Utc::now().to_rfc3339();
         let mut metadata = json!({
             "agent_id": &body.agent_id,
@@ -126,7 +127,7 @@ pub async fn register_agent(
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: crate::models::AGENTS_NAMESPACE.to_string(),
-            title: format!("agent:{}", &body.agent_id),
+            title: crate::models::agent_registration_title(&body.agent_id),
             content: format!("agent registration for {}", &body.agent_id),
             tags: vec!["_agent_registration".to_string()],
             priority: 5,

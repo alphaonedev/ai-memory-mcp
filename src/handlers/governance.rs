@@ -78,7 +78,7 @@ pub async fn list_pending(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     let is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
     // v0.7.0 Wave-3 Continuation 5 — postgres-backed daemons read

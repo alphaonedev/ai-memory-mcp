@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::validate;
 
 use super::AppState;
@@ -147,7 +148,7 @@ pub async fn restore_archive(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -287,7 +288,7 @@ pub async fn purge_archive(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
 
     // #936 (security-critical, 2026-05-20) — caller-vs-row-owner gate.
     // Pre-#936 the SAL trait method took NO caller and the handler
@@ -472,7 +473,7 @@ pub async fn archive_by_ids(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",

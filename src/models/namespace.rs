@@ -1126,6 +1126,15 @@ impl GovernancePolicy {
 /// Namespace reserved for agent registrations (Task 1.3).
 pub const AGENTS_NAMESPACE: &str = "_agents";
 
+/// Canonical title for an agent-registration row in
+/// [`AGENTS_NAMESPACE`] — `agent:<agent_id>`. Both storage backends
+/// CONSTRUCT registration rows with this title and the subscription
+/// path MATCHES on it, so the shape must come from one place (#1558).
+#[must_use]
+pub fn agent_registration_title(agent_id: &str) -> String {
+    format!("agent:{agent_id}")
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterAgentBody {
     pub agent_id: String,

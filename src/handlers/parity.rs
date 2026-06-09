@@ -180,7 +180,7 @@ pub(crate) fn http_caller_ctx(
             error = %e,
             "http_caller_ctx: invalid X-Agent-Id / body.agent_id, falling back to anonymous:invalid"
         );
-        "anonymous:invalid".to_string()
+        crate::identity::sentinels::ANONYMOUS_INVALID.to_string()
     });
     crate::store::CallerContext::for_agent(resolved)
 }
@@ -317,7 +317,8 @@ pub fn require_caller_owns_memory(
         .get("agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if owner.is_empty() || owner == caller || caller == "daemon" {
+    if owner.is_empty() || owner == caller || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+    {
         return None;
     }
     if allow_inbox {
