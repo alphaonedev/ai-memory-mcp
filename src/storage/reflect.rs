@@ -730,7 +730,7 @@ pub(crate) fn emit_reflection_depth_exceeded_audit(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
-                target: "signed_events",
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                 agent_id, attempted, cap, namespace,
                 "failed to encode canonical CBOR for reflection_depth_exceeded audit: {e}"
             );
@@ -760,7 +760,7 @@ pub(crate) fn emit_reflection_depth_exceeded_audit(
     };
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             agent_id, attempted, cap, namespace,
             "failed to append reflection_depth_exceeded audit row: {e}"
         );

@@ -654,7 +654,7 @@ pub async fn kg_timeline(
         && caller != sentinels::DAEMON_PRINCIPAL
     {
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "GET /api/v1/kg/timeline 403: caller {caller} != owner {owner} (source_id={})",
             p.source_id
         );
@@ -858,7 +858,7 @@ pub async fn kg_invalidate(
         && caller != sentinels::DAEMON_PRINCIPAL
     {
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/kg/invalidate 403: caller {caller} != owner {owner} (source_id={})",
             body.source_id
         );

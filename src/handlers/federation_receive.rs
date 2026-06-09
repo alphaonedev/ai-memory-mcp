@@ -25,6 +25,10 @@ use super::StorageBackend;
 use super::federation_signing_check::sync_push_via_store;
 use super::federation_signing_check::verify_signature_or_reject;
 
+/// Tracing target for receive-side peer-attestation checks
+/// (#1558 tracing-target SSOT).
+const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
+
 /// v0.7.0 federation security — extract the peer's self-claimed
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
 /// axum's `HeaderMap` lookup is case-insensitive so callers can send
@@ -328,7 +332,7 @@ pub async fn sync_push(
         let attest_cfg = peer_attestation::PeerAttestationConfig::from_env();
         if attest_cfg.has_allowlist() && attest_cfg.scope_for(peer_id).is_none() {
             tracing::warn!(
-                target: "federation::attestation",
+                target: ATTESTATION_TRACE_TARGET,
                 peer_id = %peer_id,
                 "sync_push: x-peer-id is not in operator allowlist — refusing (#1056 TOFU guard)"
             );
@@ -382,7 +386,7 @@ pub async fn sync_push(
             &attest_cfg,
         ) {
             tracing::warn!(
-                target: "federation::attestation",
+                target: ATTESTATION_TRACE_TARGET,
                 tag = e.tag(),
                 claimed = %body.sender_agent_id,
                 peer_header = %peer_header_owned.as_deref().unwrap_or(""),
@@ -394,7 +398,7 @@ pub async fn sync_push(
         // Bypass set — log once per request at WARN so the operator
         // can see the legacy posture is in effect.
         tracing::warn!(
-            target: "federation::attestation",
+            target: ATTESTATION_TRACE_TARGET,
             "sync_push: AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1 — bypassing #238 \
              sender_agent_id attestation (legacy compat)"
         );

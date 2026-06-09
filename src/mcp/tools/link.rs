@@ -205,7 +205,7 @@ pub(super) fn handle_link(
             };
             if let Err(e) = crate::signed_events::append_signed_event(conn, &audit_event) {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     source_id, target_id,
                     "failed to append reflects_on.cycle_refused audit row: {e}"
                 );

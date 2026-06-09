@@ -277,7 +277,7 @@ pub fn handle_namespace_set_standard(
             serde_json::json!({})
         };
         if let Some(obj) = metadata.as_object_mut() {
-            obj.insert("governance".to_string(), merged);
+            obj.insert(crate::META_KEY_GOVERNANCE.to_string(), merged);
         }
         let (found, _) = db::update(
             conn,

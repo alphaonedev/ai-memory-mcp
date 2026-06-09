@@ -891,7 +891,7 @@ impl GovernancePolicy {
     /// `None` when the field is missing/null. Parse errors propagate so
     /// callers can surface them to the user instead of silently defaulting.
     pub fn from_metadata(metadata: &Value) -> Option<Result<Self, serde_json::Error>> {
-        let gov = metadata.get("governance")?;
+        let gov = metadata.get(crate::META_KEY_GOVERNANCE)?;
         if gov.is_null() {
             return None;
         }

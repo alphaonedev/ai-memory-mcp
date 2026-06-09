@@ -878,7 +878,7 @@ async fn create_memory_postgres(
     let (id, quorum_outcome) = match app.federation.as_ref() {
         Some(fed) => {
             tracing::debug!(
-                target: "ai_memory::federation::sync",
+                target: crate::federation::SYNC_TRACE_TARGET,
                 memory_id = %mem.id,
                 namespace = %mem.namespace,
                 peer_count = fed.peer_count(),
@@ -900,7 +900,7 @@ async fn create_memory_postgres(
         }
         None => {
             tracing::debug!(
-                target: "ai_memory::federation::sync",
+                target: crate::federation::SYNC_TRACE_TARGET,
                 memory_id = %mem.id,
                 namespace = %mem.namespace,
                 backend = "postgres",

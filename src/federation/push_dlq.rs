@@ -58,6 +58,11 @@ use std::time::Duration;
 use super::FederationConfig;
 use super::sync::{AckOutcome, post_once};
 
+/// Tracing target for the push-DLQ enqueue + replay surface (this
+/// module plus the enqueue branch in `sync::broadcast_store_quorum`).
+/// #1558 tracing-target SSOT.
+pub(crate) const PUSH_DLQ_TRACE_TARGET: &str = "ai_memory::federation::push_dlq";
+
 /// A single pending DLQ row, surfaced to the replay worker.
 ///
 /// `payload_json` is captured as the exact body the leader originally
@@ -202,7 +207,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
-                target: "ai_memory::federation::push_dlq",
+                target: PUSH_DLQ_TRACE_TARGET,
                 "replay_federation_push_dlq: failed to load pending rows: {e}"
             );
             return;
@@ -218,7 +223,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
     }
 
     tracing::info!(
-        target: "ai_memory::federation::push_dlq",
+        target: PUSH_DLQ_TRACE_TARGET,
         rows = rows.len(),
         "federation: replay_federation_push_dlq draining {} row(s)",
         rows.len(),
@@ -234,7 +239,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 .federation_push_dlq_quarantined
                 .inc();
             tracing::warn!(
-                target: "ai_memory::federation::push_dlq",
+                target: PUSH_DLQ_TRACE_TARGET,
                 row_id = row.id,
                 peer_id = %row.peer_id,
                 memory_id = %row.memory_id,
@@ -256,7 +261,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 .bump_dlq_attempt(row.id, "peer no longer in FederationConfig")
                 .await;
             tracing::warn!(
-                target: "ai_memory::federation::push_dlq",
+                target: PUSH_DLQ_TRACE_TARGET,
                 row_id = row.id,
                 peer_id = %row.peer_id,
                 "replay: peer {} not in FederationConfig — leaving row pending",
@@ -280,14 +285,14 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             AckOutcome::Ack => {
                 if let Err(e) = sink.mark_dlq_row_replayed(row.id).await {
                     tracing::warn!(
-                        target: "ai_memory::federation::push_dlq",
+                        target: PUSH_DLQ_TRACE_TARGET,
                         row_id = row.id,
                         "replay: peer {} acked but mark_dlq_row_replayed failed: {e}",
                         row.peer_id,
                     );
                 } else {
                     tracing::info!(
-                        target: "ai_memory::federation::push_dlq",
+                        target: PUSH_DLQ_TRACE_TARGET,
                         row_id = row.id,
                         memory_id = %row.memory_id,
                         peer_id = %row.peer_id,
@@ -306,7 +311,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                     .bump_dlq_attempt(row.id, "replay observed id_drift on peer ack")
                     .await;
                 tracing::warn!(
-                    target: "ai_memory::federation::push_dlq",
+                    target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
                     "replay: peer {} returned id_drift on row {} — leaving pending",
                     row.peer_id,
@@ -316,7 +321,7 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             AckOutcome::Fail(reason) => {
                 let _ = sink.bump_dlq_attempt(row.id, &reason).await;
                 tracing::debug!(
-                    target: "ai_memory::federation::push_dlq",
+                    target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
                     "replay: peer {} still failing on row {}: {reason}",
                     row.peer_id,
@@ -340,7 +345,7 @@ async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
         }
         Err(e) => {
             tracing::warn!(
-                target: "ai_memory::federation::push_dlq",
+                target: PUSH_DLQ_TRACE_TARGET,
                 "replay: failed to refresh federation_push_dlq_depth: {e}"
             );
         }

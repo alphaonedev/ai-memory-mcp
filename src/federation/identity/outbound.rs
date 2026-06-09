@@ -134,7 +134,7 @@ impl OutboundCredentialHolder {
 /// daemon or partition the hive.
 fn load_from_env_logged() -> Option<SignedCredential> {
     SignedCredential::load_from_env().unwrap_or_else(|e| {
-        tracing::warn!(target: "federation::signing", error = %e,
+        tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,
             "failed to load outbound federation credential; presenting per-message signature only");
         None
     })
@@ -146,7 +146,7 @@ fn load_from_env_logged() -> Option<SignedCredential> {
 /// the daemon.
 fn load_intermediates_from_env_logged() -> Vec<SignedCredential> {
     super::chain::load_intermediates_from_env().unwrap_or_else(|e| {
-        tracing::warn!(target: "federation::signing", error = %e,
+        tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,
             "failed to load outbound federation intermediate chain; presenting a direct leaf only");
         Vec::new()
     })

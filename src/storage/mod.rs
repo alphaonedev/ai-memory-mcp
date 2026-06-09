@@ -3460,7 +3460,7 @@ pub fn create_link_signed(
                 };
                 if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
                     tracing::warn!(
-                        target: "signed_events",
+                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                         source_id, target_id, relation,
                         "failed to append memory_link.created audit row: {e}"
                     );
@@ -3468,7 +3468,7 @@ pub fn create_link_signed(
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     source_id, target_id, relation,
                     "failed to encode canonical CBOR for memory_link.created audit: {e}"
                 );
@@ -3691,7 +3691,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
                 };
                 if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
                     tracing::warn!(
-                        target: "signed_events",
+                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                         source_id = %link.source_id,
                         target_id = %link.target_id,
                         relation = %link.relation,
@@ -3701,7 +3701,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     source_id = %link.source_id,
                     target_id = %link.target_id,
                     relation = %link.relation,
@@ -8649,7 +8649,7 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
             _ => continue,
         };
         // Governance blob must exist and not be null.
-        let gov = match mem.metadata.get("governance") {
+        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
             Some(g) if !g.is_null() => g,
             _ => continue,
         };
@@ -8717,7 +8717,7 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
             Ok(Some(m)) => m,
             _ => continue,
         };
-        let gov = match mem.metadata.get("governance") {
+        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
             Some(g) if !g.is_null() => g,
             _ => continue,
         };
@@ -9232,7 +9232,7 @@ fn emit_pending_action_event(
     let mut cbor: Vec<u8> = Vec::with_capacity(128);
     if let Err(e) = ciborium::ser::into_writer(&value, &mut cbor) {
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             pending_id = %pa.id,
             event_type,
             "failed to encode canonical CBOR for pending_action event: {e}"
@@ -9266,7 +9266,7 @@ fn emit_pending_action_event(
     );
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             pending_id = %pa.id,
             event_type,
             "failed to append pending_action audit row: {e}"

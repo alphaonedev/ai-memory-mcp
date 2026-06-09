@@ -81,6 +81,18 @@ pub use push_dlq::{
 
 use crate::replication::QuorumPolicy;
 
+/// Tracing target for the quorum-broadcast / fan-out sync path
+/// (`sync.rs` + the postgres create-path branch in
+/// `handlers::create`). #1558 tracing-target SSOT.
+pub(crate) const SYNC_TRACE_TARGET: &str = "ai_memory::federation::sync";
+
+/// Tracing target for per-message Ed25519 federation signing —
+/// outbound header attachment (`sync.rs`, `identity::outbound`),
+/// credential renewal (`identity::renewal`), and the receive-side
+/// verification branch (`handlers::federation_signing_check`).
+/// #1558 tracing-target SSOT.
+pub(crate) const SIGNING_TRACE_TARGET: &str = "federation::signing";
+
 /// Configured-at-serve federation state. Parsed from
 /// `--quorum-writes` + `--quorum-peers` + `--quorum-timeout-ms`.
 #[derive(Clone)]

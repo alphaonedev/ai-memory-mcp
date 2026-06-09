@@ -6332,7 +6332,7 @@ impl PostgresStore {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     agent_id, attempted, cap, namespace,
                     "failed to encode canonical CBOR for reflection_depth_exceeded audit: {e}"
                 );
@@ -6366,7 +6366,7 @@ impl PostgresStore {
         };
         if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
             tracing::warn!(
-                target: "signed_events",
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                 agent_id, attempted, cap, namespace,
                 "failed to append reflection_depth_exceeded audit row: {e}"
             );

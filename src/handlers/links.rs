@@ -495,7 +495,7 @@ pub async fn create_link(
         && caller != sentinels::DAEMON_PRINCIPAL
     {
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/links 403: caller {caller} != source owner {source_owner} (source_id={source_id})"
         );
         return (
@@ -788,7 +788,7 @@ pub async fn delete_link(
     if !is_unowned_legacy && !owns_source && !owns_target && caller != sentinels::DAEMON_PRINCIPAL {
         drop(lock);
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
             target_mem_owner.as_deref().unwrap_or("")
         );

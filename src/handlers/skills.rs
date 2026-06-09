@@ -55,6 +55,9 @@ use serde_json::json;
 
 use super::AppState;
 
+/// Tracing target for the skills HTTP handlers (#1558 tracing-target SSOT).
+const SKILLS_TRACE_TARGET: &str = "ai_memory::handlers::skills";
+
 /// `POST /api/v1/skill` — register a new skill from an inline body.
 pub async fn skill_register_route(
     State(app): State<AppState>,
@@ -114,7 +117,7 @@ pub async fn skill_list_route(
             // HTTP wire. Log the raw text for operators, surface a
             // generic "internal server error" to the caller.
             tracing::error!(
-                target: "ai_memory::handlers::skills",
+                target: SKILLS_TRACE_TARGET,
                 error = %e,
                 "skill_list_route: substrate error (sanitized for wire response, #1261)"
             );
@@ -153,7 +156,7 @@ pub async fn skill_get_route(
                 // the HTTP wire. Log the raw text; emit a generic
                 // "internal server error" to the caller.
                 tracing::error!(
-                    target: "ai_memory::handlers::skills",
+                    target: SKILLS_TRACE_TARGET,
                     error = %e,
                     "skill_get_route: substrate error (sanitized for wire response, #1261)"
                 );
@@ -332,7 +335,7 @@ pub async fn skill_compose_route(
                 // the HTTP wire. Log the raw text; emit a generic
                 // "internal server error" to the caller.
                 tracing::error!(
-                    target: "ai_memory::handlers::skills",
+                    target: SKILLS_TRACE_TARGET,
                     error = %e,
                     "skill_compose_route: substrate error (sanitized for wire response, #1261)"
                 );

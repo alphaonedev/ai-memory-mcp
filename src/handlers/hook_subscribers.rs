@@ -361,7 +361,7 @@ async fn set_namespace_standard_inner(
                 if let Some(g) = body.governance.clone()
                     && let Some(obj) = metadata.as_object_mut()
                 {
-                    obj.insert("governance".to_string(), g);
+                    obj.insert(crate::META_KEY_GOVERNANCE.to_string(), g);
                 }
                 let placeholder = Memory {
                     id: Uuid::new_v4().to_string(),
@@ -420,7 +420,7 @@ async fn set_namespace_standard_inner(
                 && caller_principal != sentinels::DAEMON_PRINCIPAL
             {
                 tracing::warn!(
-                    target: "ai_memory::authz",
+                    target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403 (postgres path): caller {caller_principal} != owner {recorded_owner} (ns={ns}, id={standard_id})"
                 );
                 return (
@@ -485,7 +485,10 @@ async fn set_namespace_standard_inner(
                 Ok(m) => m,
                 Err(e) => return store_err_to_response(e),
             };
-            let merged = merge_governance_fields_http(standard_mem.metadata.get("governance"), &g);
+            let merged = merge_governance_fields_http(
+                standard_mem.metadata.get(crate::META_KEY_GOVERNANCE),
+                &g,
+            );
             // Validate the merged blob's typed shape. Deserialising
             // drops unknown fields but the typed sub-set must still
             // parse + pass policy validation. Mirrors the SQLite path
@@ -514,7 +517,7 @@ async fn set_namespace_standard_inner(
                 json!({})
             };
             if let Some(obj) = metadata.as_object_mut() {
-                obj.insert("governance".to_string(), merged);
+                obj.insert(crate::META_KEY_GOVERNANCE.to_string(), merged);
             }
             let patch = crate::store::UpdatePatch {
                 metadata: Some(metadata),
@@ -587,7 +590,7 @@ async fn set_namespace_standard_inner(
                 recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
             if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
                 tracing::warn!(
-                    target: "ai_memory::authz",
+                    target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403: caller {caller} != owner {recorded_owner} (ns={ns})"
                 );
                 return (
@@ -710,7 +713,7 @@ async fn set_namespace_standard_inner(
         let is_unowned = recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
         if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
             tracing::warn!(
-                target: "ai_memory::authz",
+                target: super::AUTHZ_TRACE_TARGET,
                 "POST /namespaces/{{ns}}/standard 403 (body.id path): caller {caller} != owner {recorded_owner} (ns={ns}, id={resolved_id})"
             );
             return (
@@ -914,7 +917,7 @@ pub async fn get_namespace_standard_qs(
                             "content": m.content,
                             "priority": m.priority,
                             "parent_namespace": parent,
-                            "governance": m.metadata.get("governance").cloned()
+                            "governance": m.metadata.get(crate::META_KEY_GOVERNANCE).cloned()
                                 .unwrap_or(serde_json::Value::Null),
                         }),
                         Err(_) => json!({
