@@ -91,6 +91,9 @@ pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String 
 /// # Errors
 /// Returns a wire-ready error string when a required field is missing
 /// or malformed (`source_ids`, `title`, `content`, `tier`, `depth`).
+// Only the postgres SAL HTTP branch (sal-gated) calls this in a non-test
+// build; the unit tests below exercise it in every feature set.
+#[cfg_attr(not(feature = "sal"), allow(dead_code))]
 pub(crate) fn parse_reflect_input(
     params: &Value,
     mcp_client: Option<&str>,
@@ -604,6 +607,98 @@ mod tests {
     use crate::models::{Memory, MemoryKind};
     use crate::storage as db;
     use serde_json::json;
+
+    // ── #1549 parse_reflect_input coverage ──────────────────────────
+    #[test]
+    fn parse_reflect_input_happy_path() {
+        let params = json!({
+            "source_ids": ["a", "b"],
+            "title": "t",
+            "content": "c",
+            "namespace": "ns",
+            "tier": "long",
+            "priority": 7,
+            "confidence": 0.5,
+            "tags": ["x", "y"],
+            "agent_id": "ai:tester@host",
+        });
+        let (input, caller_depth) = parse_reflect_input(&params, None).expect("parse ok");
+        assert_eq!(input.source_ids, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(input.title, "t");
+        assert_eq!(input.content, "c");
+        assert_eq!(input.namespace.as_deref(), Some("ns"));
+        assert_eq!(input.tier, Tier::Long);
+        assert_eq!(input.priority, 7);
+        assert!((input.confidence - 0.5).abs() < f64::EPSILON);
+        assert_eq!(input.tags, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(input.agent_id, "ai:tester@host");
+        assert_eq!(caller_depth, None);
+    }
+
+    #[test]
+    fn parse_reflect_input_defaults_when_optional_fields_absent() {
+        let params = json!({ "source_ids": ["a"], "title": "t", "content": "c" });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        // tier defaults to Mid; priority 5; confidence 1.0; namespace None.
+        assert_eq!(input.tier, Tier::Mid);
+        assert_eq!(input.priority, 5);
+        assert!((input.confidence - 1.0).abs() < f64::EPSILON);
+        assert!(input.namespace.is_none());
+        assert!(input.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_reflect_input_missing_source_ids_errors() {
+        let err = parse_reflect_input(&json!({ "title": "t", "content": "c" }), None).unwrap_err();
+        assert!(err.contains("source_ids is required"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_empty_source_ids_errors() {
+        let err = parse_reflect_input(
+            &json!({ "source_ids": [], "title": "t", "content": "c" }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("source_ids cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_non_string_source_errors() {
+        let err = parse_reflect_input(
+            &json!({ "source_ids": [1], "title": "t", "content": "c" }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("must be a string"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_missing_title_errors() {
+        let err =
+            parse_reflect_input(&json!({ "source_ids": ["a"], "content": "c" }), None).unwrap_err();
+        assert!(err.contains("title is required"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_negative_depth_is_caller_depth_mismatch() {
+        let err = parse_reflect_input(
+            &json!({ "source_ids": ["a"], "title": "t", "content": "c", "depth": -1 }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("CALLER_DEPTH_MISMATCH"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_returns_caller_depth_when_present() {
+        let (_, caller_depth) = parse_reflect_input(
+            &json!({ "source_ids": ["a"], "title": "t", "content": "c", "depth": 3 }),
+            None,
+        )
+        .expect("parse ok");
+        assert_eq!(caller_depth, Some(3));
+    }
 
     fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");

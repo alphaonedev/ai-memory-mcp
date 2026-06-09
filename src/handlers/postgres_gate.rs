@@ -831,6 +831,24 @@ mod transport_postgres_gate_tests {
     }
 
     #[test]
+    fn postgres_gate_passes_recursive_learning_routes() {
+        // #1548/#1549 — reflect / reflection_origin / recall_observations
+        // are now SAL-routed on postgres and must pass the gate.
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_reflect"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_reflection_origin"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_recall_observations"
+        ));
+    }
+
+    #[test]
     fn postgres_gate_passes_memory_id_paths() {
         // GET / PUT / DELETE on /api/v1/memories/{id} are supported.
         assert!(postgres_endpoint_supported(
