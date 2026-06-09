@@ -753,9 +753,27 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Two script-based lint gates run in CI alongside the four cargo gates
-(fmt / clippy / test / audit). Both are HARD-BLOCK and are wired into
+Three script-based lint gates run in CI alongside the four cargo gates
+(fmt / clippy / test / audit). All are HARD-BLOCK and are wired into
 `.github/workflows/c8-precheck.yml`.
+
+**0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
+`scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
+operator's standing "no hardcoded literal values; no literals baked into
+variable/constant names" directive (in force ~6mo; instructions alone did
+not stop the regression). HARD-BLOCKS any double-quoted string literal
+≥ 10 chars that appears on ≥ 3 production sites (a magic value that should
+be one named `const`) **when its site-count rises above the frozen
+baseline** at `scripts/qc-allowlists/hardcoded-literals-baseline.txt`. It
+is a ratchet: existing duplications are grandfathered, new duplication
+fails, and the baseline may only shrink ("thresholds rise, never fall").
+Fix a violation by defining/reusing one named `const` (or an existing
+helper) referenced by name at every site — NOT by scattering the literal.
+Intentional, irreducible repetition is bumped via `--update-baseline`
+(operator-gated, justified in the commit). `--self-test` proves it is
+load-bearing. Magic numbers are out of scope here (the SECS_PER_* class is
+gated by #2; a general numeric gate is too noisy). Burn the baseline down
+over time.
 
 **1. C8 caller-context allowlist** —
 `scripts/qc-codegraph-precheck.sh`. Blocks any new
