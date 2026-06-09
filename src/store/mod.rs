@@ -1273,7 +1273,8 @@ pub trait MemoryStore: Send + Sync {
         _ctx: &CallerContext,
         _input: &crate::storage::reflect::ReflectInput,
         _signing_key: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError> {
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
         Err(crate::storage::reflect::ReflectError::Database(
             "reflect is not supported on this storage backend".to_string(),
         ))

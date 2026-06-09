@@ -679,7 +679,8 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         input: &crate::storage::reflect::ReflectInput,
         signing_key: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError> {
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
         let conn = self.state.lock().await;
         let mut hooks = db::ReflectHooks::empty();
         hooks.active_keypair = signing_key;

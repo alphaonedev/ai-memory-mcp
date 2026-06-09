@@ -1199,6 +1199,25 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             cli::backup::run_restore(&db_path, &a, j, &mut out)
         }
         Command::Curator(a) => {
+            // v0.7.0 #1548 — `--db` and `--store-url` are mutually
+            // exclusive when both are explicitly supplied, mirroring the
+            // `serve` arm above. The global `--db` carries a non-`None`
+            // `default_value`, so we approximate explicit operator
+            // intent through the `AI_MEMORY_DB` env var (which clap
+            // resolves into the same field) or a non-default path.
+            #[cfg(feature = "sal")]
+            if let Some(ref url) = a.store_url {
+                let db_was_explicit =
+                    std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
+                if db_was_explicit {
+                    anyhow::bail!(
+                        "--db and --store-url are mutually exclusive. \
+                         Pass exactly one. Got --db={} and --store-url={}",
+                        db_path.display(),
+                        url,
+                    );
+                }
+            }
             // Initialize the tracing subscriber so the daemon-start
             // banner and per-cycle `tracing::info!` lines in
             // `curator::run_daemon` actually emit. Previously only the
@@ -2717,6 +2736,38 @@ fn resolve_configured_embedding_dim(
                 .map(|m| u32::try_from(m.dim()).unwrap_or(384))
         })
         .or_else(|| preset.map(|m| u32::try_from(m.dim()).unwrap_or(384)))
+}
+
+/// v0.7.0 #1548 — resolve the curator's SAL store handle from the same
+/// URL-scheme dispatch the HTTP `serve` path uses. When `store_url` is
+/// `Some`, the adapter is bound to the URL-resolved backend (SQLite *or*
+/// Postgres); when `None`, it falls through to a SQLite store at the
+/// `--db` path. The embedder dim + Postgres pool sizing are resolved
+/// from `app_config` exactly as in `serve` so a postgres-backed curator
+/// bootstraps an identically-shaped schema/pool to the HTTP daemon
+/// pointed at the same federated store.
+///
+/// Returns only the `Arc<dyn MemoryStore>` — the curator passes do not
+/// need the [`crate::handlers::StorageBackend`] tag the HTTP daemon
+/// threads into its `AppState`.
+#[cfg(feature = "sal")]
+pub(crate) async fn build_curator_store(
+    store_url: Option<&str>,
+    db_path: &Path,
+    app_config: &crate::config::AppConfig,
+) -> Result<Arc<dyn crate::store::MemoryStore>> {
+    let tier_config = app_config.effective_tier(None).config();
+    let configured_embedding_dim = resolve_configured_embedding_dim(app_config, &tier_config);
+    let (_backend, store) = build_store_handle(
+        store_url,
+        db_path,
+        app_config.postgres_statement_timeout_secs,
+        configured_embedding_dim,
+        app_config.resolve_pg_pool(),
+    )
+    .await
+    .context("build SAL store handle for curator")?;
+    Ok(store)
 }
 
 #[cfg(feature = "sal")]
