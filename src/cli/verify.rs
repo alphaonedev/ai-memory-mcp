@@ -454,7 +454,7 @@ fn verify_edge(
     let link = SignableLink {
         src_id: source_id,
         dst_id: target_id,
-        relation: "reflects_on",
+        relation: crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
         observed_by: Some(agent_id),
         valid_from,
         valid_until,

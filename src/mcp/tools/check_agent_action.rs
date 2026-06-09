@@ -22,7 +22,7 @@
 
 use serde_json::{Value, json};
 
-use crate::governance::agent_action::{AgentAction, check_agent_action};
+use crate::governance::agent_action::{AgentAction, action_kinds as ak, check_agent_action};
 use crate::mcp::param_names;
 
 /// Default `agent_id` echoed back when the caller (MCP or CLI) does
@@ -127,7 +127,7 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
     use std::path::PathBuf;
 
     match kind {
-        "bash" => {
+        ak::BASH => {
             let command = arguments
                 .get("command")
                 .and_then(Value::as_str)
@@ -139,7 +139,7 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
                 .map(PathBuf::from);
             Ok(AgentAction::Bash { command, cwd })
         }
-        "filesystem_write" => {
+        ak::FILESYSTEM_WRITE => {
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
@@ -153,7 +153,7 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
                 byte_estimate,
             })
         }
-        "network_request" => {
+        ak::NETWORK_REQUEST => {
             let host = arguments
                 .get("host")
                 .and_then(Value::as_str)
@@ -166,7 +166,7 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
                 .to_string();
             Ok(AgentAction::NetworkRequest { host, scheme })
         }
-        "process_spawn" => {
+        ak::PROCESS_SPAWN => {
             let binary = arguments
                 .get("binary")
                 .and_then(Value::as_str)

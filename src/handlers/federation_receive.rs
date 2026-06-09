@@ -745,7 +745,7 @@ pub async fn sync_push(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
-                "quota_refused": quota_refused,
+                (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 "reset_at": reset_at,
             })),
         )
@@ -1121,7 +1121,7 @@ pub async fn sync_push(
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,
             "skipped": skipped,
-            "quota_refused": quota_refused,
+            (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
             "receiver_clock": receiver_clock,

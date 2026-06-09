@@ -542,9 +542,10 @@ pub async fn approvals_sse(
                             continue;
                         }
                         let (event_name, json_value) = match &evt {
-                            crate::approvals::ApprovalEvent::ApprovalRequested { .. } => {
-                                ("approval_requested", serde_json::to_value(&evt))
-                            }
+                            crate::approvals::ApprovalEvent::ApprovalRequested { .. } => (
+                                crate::subscriptions::webhook_events::APPROVAL_REQUESTED,
+                                serde_json::to_value(&evt),
+                            ),
                             crate::approvals::ApprovalEvent::ApprovalDecided { .. } => {
                                 ("approval_decided", serde_json::to_value(&evt))
                             }

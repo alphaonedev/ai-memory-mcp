@@ -87,6 +87,14 @@ pub const RECALL_PRIMARY_CTX_BLEND: f32 = 0.7;
 /// scenario-18; load-bearing per CLAUDE.md §"Recall Pipeline").
 pub const RECALL_COSINE_GATE: f64 = 0.2;
 
+/// #1558 batch 5 wave 3 — canonical secret-redaction placeholder
+/// rendered by every `Debug` impl that masks credential material
+/// (`AppConfig.api_key`, `[llm].api_key`, `ResolvedLlm.api_key`,
+/// `HooksSubscriptionConfig.hmac_secret`, x25519 `Keypair.secret`,
+/// `RuntimeContext.hooks_hmac_secret`). One spelling, hoist-only;
+/// `src/llm.rs` keeps its own site per the vendor carve-out.
+pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
 // canonical HTTP route-path consts. The substrate's HTTP router

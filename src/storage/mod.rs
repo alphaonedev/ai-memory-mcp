@@ -2880,7 +2880,12 @@ pub fn promote_to_namespace(
     let actual_id = insert(conn, &clone)?;
     // Clone → source: derived_from. Safe to ignore if the link layer
     // short-circuits on self-link (impossible here — distinct IDs).
-    create_link(conn, &actual_id, source_id, "derived_from")?;
+    create_link(
+        conn,
+        &actual_id,
+        source_id,
+        crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    )?;
     Ok(actual_id)
 }
 
@@ -3840,6 +3845,12 @@ pub fn get_link_for_verify(
 
 // --- Consolidation ---
 
+/// #1558 batch 5 wave 3 — canonical `source` value stamped on rows
+/// minted by [`consolidate`] (MCP `memory_consolidate` + the HTTP
+/// power-consolidation handler pass it verbatim). Listed in
+/// `validate::VALID_SOURCES`; one spelling, hoist-only.
+pub const CONSOLIDATION_SOURCE: &str = "consolidation";
+
 /// Consolidate multiple memories into one. Returns the new memory ID.
 /// Deletes the source memories and creates links from new → old (`derived_from`).
 #[allow(clippy::too_many_arguments)]
@@ -3918,7 +3929,9 @@ pub fn consolidate(
         let tags_json = serde_json::to_string(&all_tags)?;
         // Record source IDs in metadata for provenance (links would be CASCADE-deleted)
         merged_metadata.insert(
-            "derived_from".to_string(),
+            crate::models::MemoryLinkRelation::DerivedFrom
+                .as_str()
+                .to_string(),
             serde_json::Value::Array(
                 ids.iter()
                     .map(|id| serde_json::Value::String(id.clone()))
@@ -5856,7 +5869,7 @@ pub fn register_agent(
         // registered (consensus voting, peer attestation, etc.). Stamp
         // scope=collective so the SAL visibility filter doesn't drop
         // them on cross-agent reads.
-        "scope": "collective",
+        "scope": crate::models::MemoryScope::Collective.as_str(),
     });
 
     let content = serde_json::to_string(&metadata)

@@ -199,7 +199,9 @@ pub fn cmd_delete(
             crate::audit::AuditAction::Delete,
             crate::audit::actor(
                 identity::resolve_agent_id(cli_agent_id, None).unwrap_or_default(),
-                cli_agent_id.map_or("default_fallback", |_| "explicit"),
+                cli_agent_id.map_or(crate::audit::synthesis_sources::DEFAULT_FALLBACK, |_| {
+                    crate::audit::synthesis_sources::EXPLICIT
+                }),
                 None,
             ),
             crate::audit::target_memory(

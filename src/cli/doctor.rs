@@ -53,6 +53,16 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
+/// #1558 batch 5 wave 3 — placeholder fact value rendered when the
+/// probed capabilities payload does not carry the requested feature
+/// key (older daemons).
+const NOT_IN_RESPONSE: &str = "not_in_response";
+
+/// #1558 batch 5 wave 3 — placeholder fact value for the recall-mode /
+/// reranker distribution rows, which need the P3 rolling counter that
+/// has not landed yet.
+const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
+
 /// Severity bucket attached to every doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -654,11 +664,11 @@ fn section_recall_local() -> ReportSection {
         facts: vec![
             (
                 "recall_mode_distribution".into(),
-                "not_observed (pre-P3 rolling counter)".into(),
+                NOT_OBSERVED_PRE_P3.into(),
             ),
             (
                 "reranker_used_distribution".into(),
-                "not_observed (pre-P3 rolling counter)".into(),
+                NOT_OBSERVED_PRE_P3.into(),
             ),
             (
                 "hint".into(),
@@ -1221,14 +1231,14 @@ fn section_capabilities_remote(url: &str) -> ReportSection {
                 .get("features")
                 .and_then(|f| f.get("recall_mode_active"))
                 .and_then(Value::as_str)
-                .unwrap_or("not_in_response");
+                .unwrap_or(NOT_IN_RESPONSE);
             facts.push(("recall_mode_active".into(), recall_mode.to_string()));
 
             let reranker = v
                 .get("features")
                 .and_then(|f| f.get("reranker_active"))
                 .and_then(Value::as_str)
-                .unwrap_or("not_in_response");
+                .unwrap_or(NOT_IN_RESPONSE);
             facts.push(("reranker_active".into(), reranker.to_string()));
 
             // Severity hints. recall_mode in {"degraded", "disabled",
@@ -1236,7 +1246,13 @@ fn section_capabilities_remote(url: &str) -> ReportSection {
             // to support hybrid (semantic / smart / autonomous).
             if matches!(recall_mode, "degraded" | "disabled" | "keyword_only") {
                 let tier = v.get("feature_tier").and_then(Value::as_str).unwrap_or("");
-                if matches!(tier, "semantic" | "smart" | "autonomous") {
+                if [
+                    crate::config::FeatureTier::Semantic.as_str(),
+                    crate::config::FeatureTier::Smart.as_str(),
+                    crate::config::FeatureTier::Autonomous.as_str(),
+                ]
+                .contains(&tier)
+                {
                     severity = Severity::Warning;
                     note = Some(format!(
                         "tier={tier} but recall_mode_active={recall_mode} — silent degradation"
@@ -1268,17 +1284,17 @@ fn section_recall_remote(cap_url: &str) -> ReportSection {
             .get("features")
             .and_then(|f| f.get("recall_mode_active"))
             .and_then(Value::as_str)
-            .unwrap_or("not_in_response");
+            .unwrap_or(NOT_IN_RESPONSE);
         facts.push(("active_recall_mode".into(), recall_mode.to_string()));
         let reranker = v
             .get("features")
             .and_then(|f| f.get("reranker_active"))
             .and_then(Value::as_str)
-            .unwrap_or("not_in_response");
+            .unwrap_or(NOT_IN_RESPONSE);
         facts.push(("active_reranker".into(), reranker.to_string()));
         facts.push((
             "recall_mode_distribution".into(),
-            "not_observed (pre-P3 rolling counter)".into(),
+            NOT_OBSERVED_PRE_P3.into(),
         ));
     } else {
         facts.push(("error".into(), "could not fetch capabilities".into()));

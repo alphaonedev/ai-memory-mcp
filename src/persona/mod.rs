@@ -422,7 +422,7 @@ impl<'a> PersonaGenerator<'a> {
                 self.conn,
                 &persona_id,
                 &source.id,
-                "derived_from",
+                crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
                 self.signer,
             )
             .with_context(|| format!("linking persona {persona_id} -> source {}", source.id))?;

@@ -266,25 +266,26 @@ impl Default for CaptureNagWatcher {
 /// happened").
 #[must_use]
 pub fn classify_tool(tool_name: &str) -> ToolKind {
+    use crate::mcp::registry::tool_names as tn;
     match tool_name {
-        "memory_store"
-        | "memory_update"
-        | "memory_link"
-        | "memory_atomise"
-        | "memory_ingest_multistep"
-        | "memory_consolidate"
-        | "memory_promote"
-        | "memory_reflect"
-        | "memory_persona_generate"
-        | "memory_entity_register"
-        | "memory_share"
-        | "memory_subscribe"
-        | "memory_notify"
-        | "memory_skill_register"
-        | "memory_skill_promote_from_reflection"
-        | "memory_namespace_set_standard"
-        | "memory_kg_invalidate"
-        | "memory_capture_turn" => ToolKind::MemoryWrite,
+        tn::MEMORY_STORE
+        | tn::MEMORY_UPDATE
+        | tn::MEMORY_LINK
+        | tn::MEMORY_ATOMISE
+        | tn::MEMORY_INGEST_MULTISTEP
+        | tn::MEMORY_CONSOLIDATE
+        | tn::MEMORY_PROMOTE
+        | tn::MEMORY_REFLECT
+        | tn::MEMORY_PERSONA_GENERATE
+        | tn::MEMORY_ENTITY_REGISTER
+        | tn::MEMORY_SHARE
+        | tn::MEMORY_SUBSCRIBE
+        | tn::MEMORY_NOTIFY
+        | tn::MEMORY_SKILL_REGISTER
+        | tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION
+        | tn::MEMORY_NAMESPACE_SET_STANDARD
+        | tn::MEMORY_KG_INVALIDATE
+        | tn::MEMORY_CAPTURE_TURN => ToolKind::MemoryWrite,
         _ => ToolKind::Other,
     }
 }

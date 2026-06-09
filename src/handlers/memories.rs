@@ -619,7 +619,11 @@ pub async fn delete_memory(
                         .unwrap_or_else(|| (String::new(), None, None));
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Delete,
-                        crate::audit::actor(&agent_id, "http_header", None),
+                        crate::audit::actor(
+                            &agent_id,
+                            crate::audit::synthesis_sources::HTTP_HEADER,
+                            None,
+                        ),
                         crate::audit::target_memory(id.clone(), namespace, title, tier, None),
                     ));
                 }
@@ -832,7 +836,7 @@ pub async fn delete_memory(
                 });
             crate::audit::emit(crate::audit::EventBuilder::new(
                 crate::audit::AuditAction::Delete,
-                crate::audit::actor(owner, "http_header", None),
+                crate::audit::actor(owner, crate::audit::synthesis_sources::HTTP_HEADER, None),
                 crate::audit::target_memory(
                     target.id.clone(),
                     target.namespace.clone(),

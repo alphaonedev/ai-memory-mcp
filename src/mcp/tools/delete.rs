@@ -206,7 +206,9 @@ pub(super) fn handle_delete(
                 snapshot_owner
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+                mcp_client.map_or(crate::audit::synthesis_sources::HOST_FALLBACK, |_| {
+                    crate::audit::synthesis_sources::MCP_CLIENT_INFO
+                }),
                 None,
             ),
             crate::audit::target_memory(

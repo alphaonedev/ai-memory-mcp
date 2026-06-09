@@ -135,7 +135,7 @@ impl BootFormat {
         match s {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
-            "toon" | "toon-compact" | "toon_compact" => Ok(Self::Toon),
+            "toon" | "toon-compact" | crate::toon::FORMAT_TOON_COMPACT => Ok(Self::Toon),
             other => Err(anyhow::anyhow!(
                 "unknown --format value: {other} (expected: text | json | toon)"
             )),

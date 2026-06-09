@@ -119,16 +119,16 @@ pub const DEFAULT_NHI_SOURCE: &str = "nhi";
 //                      label — operators tracing reflection chains see them
 //                      surface alongside the other relations.
 const VALID_RELATIONS: &[&str] = &[
-    "related_to",
-    "supersedes",
-    "contradicts",
-    "derived_from",
-    "reflects_on",
+    crate::models::MemoryLinkRelation::RelatedTo.as_str(),
+    crate::models::MemoryLinkRelation::Supersedes.as_str(),
+    crate::models::MemoryLinkRelation::Contradicts.as_str(),
+    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
     // v0.7.0 WT-1-A — atomisation-provenance edge (atom -> parent). The
     // typed, signable, federation-safe expression of the structural
     // `memories.atom_of` FK. Distinct from `derived_from` (consolidation
-    // provenance). Mirrors `crate::models::MemoryLinkRelation::DerivesFrom`.
-    "derives_from",
+    // provenance).
+    crate::models::MemoryLinkRelation::DerivesFrom.as_str(),
 ];
 
 fn is_valid_rfc3339(s: &str) -> bool {

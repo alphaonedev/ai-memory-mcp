@@ -332,7 +332,7 @@ impl LinkBody {
 }
 
 fn default_relation() -> String {
-    "related_to".to_string()
+    MemoryLinkRelation::RelatedTo.as_str().to_string()
 }
 
 /// Tag stamped on entity-typed memories so `(title, namespace)` can be

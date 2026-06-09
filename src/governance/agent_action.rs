@@ -81,6 +81,25 @@ use crate::signed_events::{append_signed_event, payload_hash};
 /// runs. Audit-side dashboards filter on this string.
 pub const GOVERNANCE_CHECK_EVENT_TYPE: &str = "governance.check";
 
+/// #1558 batch 5 wave 3 — canonical [`AgentAction::kind`] wire tags.
+/// One spelling per action kind; the `kind()` match arms below, the
+/// CLI `rules test` payload parser, and the MCP
+/// `memory_check_agent_action` argument parser all reference these
+/// consts so the `governance_rules.kind` lookup vocabulary cannot
+/// drift across surfaces.
+pub mod action_kinds {
+    /// [`AgentAction::Bash`] wire tag.
+    pub const BASH: &str = "bash";
+    /// [`AgentAction::FilesystemWrite`] wire tag.
+    pub const FILESYSTEM_WRITE: &str = "filesystem_write";
+    /// [`AgentAction::NetworkRequest`] wire tag.
+    pub const NETWORK_REQUEST: &str = "network_request";
+    /// [`AgentAction::ProcessSpawn`] wire tag.
+    pub const PROCESS_SPAWN: &str = "process_spawn";
+    /// [`AgentAction::Custom`] wire tag.
+    pub const CUSTOM: &str = "custom";
+}
+
 // ---------------------------------------------------------------------------
 // AgentAction — the agent-external action vocabulary
 // ---------------------------------------------------------------------------
@@ -150,11 +169,11 @@ impl AgentAction {
     #[must_use]
     pub fn kind(&self) -> &str {
         match self {
-            AgentAction::Bash { .. } => "bash",
-            AgentAction::FilesystemWrite { .. } => "filesystem_write",
-            AgentAction::NetworkRequest { .. } => "network_request",
-            AgentAction::ProcessSpawn { .. } => "process_spawn",
-            AgentAction::Custom { .. } => "custom",
+            AgentAction::Bash { .. } => action_kinds::BASH,
+            AgentAction::FilesystemWrite { .. } => action_kinds::FILESYSTEM_WRITE,
+            AgentAction::NetworkRequest { .. } => action_kinds::NETWORK_REQUEST,
+            AgentAction::ProcessSpawn { .. } => action_kinds::PROCESS_SPAWN,
+            AgentAction::Custom { .. } => action_kinds::CUSTOM,
         }
     }
 

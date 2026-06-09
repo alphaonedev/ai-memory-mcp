@@ -1058,12 +1058,17 @@ pub fn handle_recall_dto(
                         session_tracker,
                     );
                     let memories = scored_memories(ce_reranked, conn);
-                    record_recall_observations(conn, &recall_id, &memories, "hybrid+rerank");
+                    record_recall_observations(
+                        conn,
+                        &recall_id,
+                        &memories,
+                        crate::models::RECALL_MODE_HYBRID_RERANK,
+                    );
                     let mut resp = json!({
                         "recall_id": recall_id,
                         "memories": memories,
                         "count": memories.len(),
-                        "mode": "hybrid+rerank",
+                        "mode": crate::models::RECALL_MODE_HYBRID_RERANK,
                     });
                     decorate_budget(&mut resp, &outcome);
                     attach_meta(&mut resp, "hybrid", &telemetry);

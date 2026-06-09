@@ -248,7 +248,11 @@ pub async fn approve_pending(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Approve,
-                        crate::audit::actor(agent_id.clone(), "http_header", None),
+                        crate::audit::actor(
+                            agent_id.clone(),
+                            crate::audit::synthesis_sources::HTTP_HEADER,
+                            None,
+                        ),
                         crate::audit::target_memory(id.clone(), String::new(), None, None, None),
                     ));
                 }
@@ -447,7 +451,11 @@ pub async fn reject_pending(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Reject,
-                        crate::audit::actor(agent_id.clone(), "http_header", None),
+                        crate::audit::actor(
+                            agent_id.clone(),
+                            crate::audit::synthesis_sources::HTTP_HEADER,
+                            None,
+                        ),
                         crate::audit::target_memory(id.clone(), String::new(), None, None, None),
                     ));
                 }

@@ -43,7 +43,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
 
 use crate::cli::CliOutput;
-use crate::governance::agent_action::{AgentAction, check_agent_action};
+use crate::governance::agent_action::{AgentAction, action_kinds as ak, check_agent_action};
 use crate::governance::rules_store::{self, Rule};
 use crate::identity::keypair as kp;
 
@@ -951,7 +951,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
     let payload: serde_json::Value = serde_json::from_str(payload_json)
         .with_context(|| format!("rules check: payload is not valid JSON: {payload_json}"))?;
     match kind {
-        "bash" => {
+        ak::BASH => {
             let command = payload
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -963,7 +963,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
                 .map(PathBuf::from);
             Ok(AgentAction::Bash { command, cwd })
         }
-        "filesystem_write" => {
+        ak::FILESYSTEM_WRITE => {
             let path = payload
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -977,7 +977,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
                 byte_estimate,
             })
         }
-        "network_request" => {
+        ak::NETWORK_REQUEST => {
             let host = payload
                 .get("host")
                 .and_then(|v| v.as_str())
@@ -990,7 +990,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
                 .to_string();
             Ok(AgentAction::NetworkRequest { host, scheme })
         }
-        "process_spawn" => {
+        ak::PROCESS_SPAWN => {
             let binary = payload
                 .get("binary")
                 .and_then(|v| v.as_str())

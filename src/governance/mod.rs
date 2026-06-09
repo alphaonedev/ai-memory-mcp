@@ -131,6 +131,28 @@ pub use refusal::GovernanceRefusal;
 /// deliberately different so a config-file misuse is a typed loader
 /// error, not a silent fall-through. See
 /// `docs/internal/enum-proliferation-audit-970.md`.
+/// #1558 batch 5 wave 3 — `Op::MemoryArchive` wire name. A governance
+/// op identifier covering the 4-tool archive family
+/// (list/purge/restore/stats); NOT itself an MCP tool name (see the
+/// `Op::as_str` doc below), so it owns its spelling here. Also reused
+/// as the archive-event slug fired by the postgres archive handler.
+pub const OP_MEMORY_ARCHIVE: &str = "memory_archive";
+
+/// #1558 batch 5 wave 3 — cross-surface action labels passed to
+/// [`deny_message`] / `governance::audit::record_decision` / the AGE
+/// fallback warn path. One spelling per label; CLI, HTTP, and MCP
+/// surfaces reference these consts.
+pub mod action_labels {
+    /// Archive-purge admin action (CLI `archive purge`, HTTP
+    /// `DELETE /api/v1/archive`, MCP `memory_archive_purge`).
+    pub const ARCHIVE_PURGE: &str = "archive_purge";
+    /// Archive-restore action (HTTP `POST /api/v1/archive/{id}/restore`).
+    pub const ARCHIVE_RESTORE: &str = "archive_restore";
+    /// KG edge-invalidation action (MCP `memory_kg_invalidate` deny
+    /// label + the postgres AGE-fallback warn label).
+    pub const KG_INVALIDATE: &str = "kg_invalidate";
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
@@ -164,7 +186,7 @@ impl Op {
             Op::MemoryStore => tn::MEMORY_STORE,
             Op::MemoryLink => tn::MEMORY_LINK,
             Op::MemoryDelete => tn::MEMORY_DELETE,
-            Op::MemoryArchive => "memory_archive",
+            Op::MemoryArchive => OP_MEMORY_ARCHIVE,
             Op::MemoryConsolidate => tn::MEMORY_CONSOLIDATE,
             Op::MemoryReplay => tn::MEMORY_REPLAY,
         }
@@ -178,7 +200,7 @@ impl Op {
             tn::MEMORY_STORE => Some(Op::MemoryStore),
             tn::MEMORY_LINK => Some(Op::MemoryLink),
             tn::MEMORY_DELETE => Some(Op::MemoryDelete),
-            "memory_archive" => Some(Op::MemoryArchive),
+            OP_MEMORY_ARCHIVE => Some(Op::MemoryArchive),
             tn::MEMORY_CONSOLIDATE => Some(Op::MemoryConsolidate),
             tn::MEMORY_REPLAY => Some(Op::MemoryReplay),
             _ => None,

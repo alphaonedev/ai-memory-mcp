@@ -1156,7 +1156,7 @@ pub fn dispatch_approval_requested(conn: &Connection, pending_id: &str, db_path:
     });
     dispatch_event_with_details(
         conn,
-        "approval_requested",
+        webhook_events::APPROVAL_REQUESTED,
         &pa.id,
         &pa.namespace,
         Some(&pa.requested_by),

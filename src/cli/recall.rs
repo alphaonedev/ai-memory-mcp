@@ -401,7 +401,11 @@ pub(crate) fn run_with_embedder(
                     args.source_uri_prefix.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
-                    (ce.rerank(&args.context, results), outcome, "hybrid+rerank")
+                    (
+                        ce.rerank(&args.context, results),
+                        outcome,
+                        crate::models::RECALL_MODE_HYBRID_RERANK,
+                    )
                 } else {
                     (results, outcome, "hybrid")
                 }

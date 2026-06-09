@@ -198,7 +198,7 @@ pub async fn detect_contradictions(
                     synth_links.push(json!({
                         "source_id": a.id,
                         "target_id": b.id,
-                        "relation": "contradicts",
+                        "relation": crate::models::MemoryLinkRelation::Contradicts.as_str(),
                         "synthesized": true,
                     }));
                 }
@@ -362,7 +362,7 @@ pub async fn detect_contradictions(
                 synth_links.push(json!({
                     "source_id": a.id,
                     "target_id": b.id,
-                    "relation": "contradicts",
+                    "relation": crate::models::MemoryLinkRelation::Contradicts.as_str(),
                     "synthesized": true,
                 }));
             }

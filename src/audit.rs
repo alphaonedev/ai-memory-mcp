@@ -110,6 +110,25 @@ pub struct AuditActor {
     pub synthesis_source: String,
 }
 
+/// #1558 batch 5 wave 3 — canonical [`AuditActor::synthesis_source`]
+/// provenance values. One spelling per value; every production writer
+/// (MCP dispatch, MCP store/delete tools, HTTP handlers, CLI
+/// crud/store/update) references these consts instead of scattering
+/// the literal. The vocabulary doc on `synthesis_source` above stays
+/// the narrative SSOT; this mod is the mechanical one.
+pub mod synthesis_sources {
+    /// Caller passed an explicit `--agent-id` / `agent_id` param.
+    pub const EXPLICIT: &str = "explicit";
+    /// Resolved from `initialize.clientInfo.name` (MCP stdio).
+    pub const MCP_CLIENT_INFO: &str = "mcp_client_info";
+    /// Synthesized `host:<hostname>:pid-…` fallback (no client info).
+    pub const HOST_FALLBACK: &str = "host_fallback";
+    /// Taken from the `X-Agent-Id` HTTP request header.
+    pub const HTTP_HEADER: &str = "http_header";
+    /// No explicit caller identity — default resolution ladder.
+    pub const DEFAULT_FALLBACK: &str = "default_fallback";
+}
+
 /// Canonical action vocabulary. Adding a variant is a non-breaking
 /// schema change; renaming or removing one IS breaking.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -50,6 +50,13 @@
 /// (#1558 tracing-target SSOT).
 pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
 
+/// #1558 batch 5 wave 3 — `quota_refused` count field on the
+/// federation `/sync/push` response envelope (sqlite + postgres
+/// arms, quota-413 + success shapes). One spelling across the four
+/// production emit sites in `federation_receive` /
+/// `federation_signing_check`.
+pub(crate) const QUOTA_REFUSED_FIELD: &str = "quota_refused";
+
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;

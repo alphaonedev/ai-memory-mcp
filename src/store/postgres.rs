@@ -4961,7 +4961,11 @@ impl PostgresStore {
                 {
                     Ok(row) => Ok(row),
                     Err(err) if is_age_runtime_failure(&err) => {
-                        warn_age_fallback("kg_invalidate", source_id, &err);
+                        warn_age_fallback(
+                            crate::governance::action_labels::KG_INVALIDATE,
+                            source_id,
+                            &err,
+                        );
                         self.kg_invalidate_cte(source_id, target_id, relation, valid_until)
                             .await
                     }
@@ -6243,7 +6247,7 @@ impl PostgresStore {
         .bind(created_at_dt)
         .bind(&metadata_value)
         .bind(new_depth_i32)
-        .bind("reflection")
+        .bind(crate::models::MemoryKind::Reflection.as_str())
         .bind(mentioned_entity_id.as_deref())
         .fetch_one(&mut *tx)
         .await
@@ -6253,8 +6257,12 @@ impl PostgresStore {
 
         // Write each `reflects_on` link inside the same tx.
         for src_id in &input.source_ids {
-            validate::validate_link(&actual_id, src_id, "reflects_on")
-                .map_err(|e| ReflectError::Validation(e.to_string()))?;
+            validate::validate_link(
+                &actual_id,
+                src_id,
+                crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+            )
+            .map_err(|e| ReflectError::Validation(e.to_string()))?;
             // Inline a minimal `memory_links` INSERT — full
             // `link_internal` runs its own queries on the pool and
             // wouldn't share the tx. SQLite parity calls
@@ -6269,7 +6277,7 @@ impl PostgresStore {
             )
             .bind(&actual_id)
             .bind(src_id)
-            .bind("reflects_on")
+            .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
             .bind(created_at_dt)
             .execute(&mut *tx)
             .await
@@ -10000,7 +10008,7 @@ impl MemoryStore for PostgresStore {
             "last_seen_at": now_rfc,
             // #910 (SAL-level enforcement) — agent-registration rows
             // are a public roster. Mirrors the sqlite path's stamp.
-            "scope": "collective",
+            "scope": crate::models::MemoryScope::Collective.as_str(),
         });
 
         let content =
@@ -10334,7 +10342,9 @@ impl MemoryStore for PostgresStore {
         all_tags.dedup();
 
         merged_metadata.insert(
-            "derived_from".to_string(),
+            crate::models::MemoryLinkRelation::DerivedFrom
+                .as_str()
+                .to_string(),
             serde_json::Value::Array(
                 ids.iter()
                     .map(|id| serde_json::Value::String(id.clone()))

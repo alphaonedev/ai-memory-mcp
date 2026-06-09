@@ -491,7 +491,7 @@ pub fn handle_reflect(
     // events on top of this baseline.
     crate::subscriptions::dispatch_event(
         conn,
-        "memory_store",
+        crate::mcp::registry::tool_names::MEMORY_STORE,
         &outcome.id,
         &outcome.namespace,
         Some(&input.agent_id),

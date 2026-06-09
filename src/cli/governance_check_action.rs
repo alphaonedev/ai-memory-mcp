@@ -170,7 +170,7 @@ pub fn run(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             serde_json::json!({
-                "error": "GOVERNANCE_REFUSED",
+                "error": crate::errors::error_codes::GOVERNANCE_REFUSED,
                 "decision": "deny",
                 "rule_id": rule_id,
                 "reason": reason,

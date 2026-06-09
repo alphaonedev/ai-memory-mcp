@@ -353,7 +353,7 @@ pub async fn consolidate_memories(
                 &summary,
                 &body.namespace,
                 &tier,
-                "consolidation",
+                crate::db::CONSOLIDATION_SOURCE,
                 &consolidator_agent_id,
             )
             .await
@@ -417,7 +417,7 @@ pub async fn consolidate_memories(
         &summary,
         &body.namespace,
         &tier,
-        "consolidation",
+        crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
     );
     // Read the newly consolidated memory back so we can fanout — must do
@@ -438,7 +438,7 @@ pub async fn consolidate_memories(
         .ok();
         crate::subscriptions::dispatch_event_with_details(
             &lock.0,
-            "memory_consolidated",
+            crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED,
             new_id,
             &body.namespace,
             Some(&consolidator_agent_id),

@@ -151,7 +151,7 @@ pub fn error_slug(err: &AtomiseError) -> &'static str {
         // this site emitted lowercase `governance_refused` which
         // diverged from the two other surfaces; operators parsing
         // `--json` output couldn't grep `GOVERNANCE_REFUSED` uniformly.
-        AtomiseError::GovernanceRefused(_) => "GOVERNANCE_REFUSED",
+        AtomiseError::GovernanceRefused(_) => crate::errors::error_codes::GOVERNANCE_REFUSED,
         AtomiseError::DbError(_) => "db_error",
         AtomiseError::SignerError(_) => "signer_error",
         // ARCH-5 (FX-6) — stable slug matches the

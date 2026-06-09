@@ -82,6 +82,11 @@ use crate::signed_events::{self, SignedEvent};
 /// in CLAUDE.md §"Environment Variables".
 pub(crate) const L4_HOST_PUBKEY_ALLOWLIST_ENV: &str = "AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST";
 
+/// #1558 batch 5 wave 3 — action label for the L4 capture-turn write
+/// gate (deny-message verb + the `action` field on ask/pending
+/// envelopes). File-local: no other surface uses this label.
+const ACTION_CAPTURE_TURN: &str = "capture_turn";
+
 /// `memory_capture_turn` request body per RFC-0001 §"Tool input schema".
 ///
 /// Field-by-field doc comments become the schemars-generated
@@ -346,7 +351,7 @@ pub fn handle_capture_turn(
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
                 return Err(crate::governance::deny_message(
-                    "capture_turn",
+                    ACTION_CAPTURE_TURN,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
                 ));
@@ -355,7 +360,7 @@ pub fn handle_capture_turn(
                 return Ok(json!({
                     "status": "ask",
                     "reason": prompt,
-                    "action": "capture_turn",
+                    "action": ACTION_CAPTURE_TURN,
                     "namespace": gate_namespace,
                 }));
             }
@@ -376,7 +381,7 @@ pub fn handle_capture_turn(
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
                 return Err(crate::governance::deny_message(
-                    "capture_turn",
+                    ACTION_CAPTURE_TURN,
                     crate::governance::DenyGate::Governance,
                     &refusal.reason,
                 ));
@@ -386,7 +391,7 @@ pub fn handle_capture_turn(
                     "status": "pending",
                     "pending_id": pending_id,
                     "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
-                    "action": "capture_turn",
+                    "action": ACTION_CAPTURE_TURN,
                     "namespace": gate_namespace,
                 }));
             }

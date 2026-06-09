@@ -181,7 +181,9 @@ fn audit_emit_for_mcp_dispatch(
         action,
         crate::audit::actor(
             agent_id,
-            mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+            mcp_client.map_or(crate::audit::synthesis_sources::HOST_FALLBACK, |_| {
+                crate::audit::synthesis_sources::MCP_CLIENT_INFO
+            }),
             None,
         ),
         crate::audit::AuditTarget {
@@ -282,7 +284,11 @@ fn emit_capture_lag(
     );
     let mut builder = crate::audit::EventBuilder::new(
         crate::audit::AuditAction::CaptureLag,
-        crate::audit::actor(agent_id.to_string(), "mcp_client_info", None),
+        crate::audit::actor(
+            agent_id.to_string(),
+            crate::audit::synthesis_sources::MCP_CLIENT_INFO,
+            None,
+        ),
         crate::audit::AuditTarget {
             memory_id: "*".to_string(),
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
@@ -2250,7 +2256,7 @@ fn handle_request(
                     let format_str = arguments
                         .get("format")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("toon_compact");
+                        .unwrap_or(crate::toon::FORMAT_TOON_COMPACT);
                     use crate::mcp::registry::tool_names as tn;
                     let text = match format_str {
                         "toon"
@@ -2261,7 +2267,7 @@ fn handle_request(
                         {
                             crate::toon::memories_to_toon(&val, false)
                         }
-                        "toon_compact"
+                        crate::toon::FORMAT_TOON_COMPACT
                             if matches!(
                                 tool_name,
                                 tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
@@ -2272,7 +2278,7 @@ fn handle_request(
                         "toon" if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, false)
                         }
-                        "toon_compact" if tool_name == tn::MEMORY_SEARCH => {
+                        crate::toon::FORMAT_TOON_COMPACT if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, true)
                         }
                         _ => serde_json::to_string_pretty(&val).unwrap_or_default(),
