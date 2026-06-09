@@ -113,16 +113,24 @@ async fn reflect_fanout(
 /// dispatch uses.
 pub async fn handle_smart_load_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #1555 — resolve the caller from headers so the forwarded load_family read
+    // applies the scope=private visibility filter (the always-on intent loader
+    // must not surface another tenant's private family-tagged rows). Reuses the
+    // shared `resolve_caller_agent_id` helper (non-sal-safe, anonymous-fallback
+    // handling lives inside it, not duplicated here); the empty principal owns
+    // no private row.
+    let caller =
+        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
     let lock = app.db.lock().await;
     let embedder = app
         .embedder
         .as_ref()
         .as_ref()
         .map(|e| e as &dyn crate::embeddings::Embed);
-    let result = crate::mcp::handle_smart_load(&lock.0, &body, embedder);
+    let result = crate::mcp::handle_smart_load(&lock.0, &body, embedder, Some(caller.as_str()));
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),

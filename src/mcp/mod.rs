@@ -1221,11 +1221,15 @@ fn dispatch_memory_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_load_family(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_load_family(ctx.conn, ctx.arguments)
+    // v0.7.0 #1555 — scope=private visibility gate, parity with recall/list/search.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_load_family(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_smart_load(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_smart_load(ctx.conn, ctx.arguments, ctx.embedder)
+    // v0.7.0 #1555 — the always-on intent loader forwards to load_family; gate it too.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_smart_load(ctx.conn, ctx.arguments, ctx.embedder, caller.as_deref())
 }
 
 fn dispatch_memory_get_taxonomy(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1305,7 +1309,9 @@ fn dispatch_memory_update(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_get(ctx.conn, ctx.arguments)
+    // v0.7.0 #1553 — scope=private visibility gate, parity with recall/list/search.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_get(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1313,7 +1319,10 @@ fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_get_links(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_get_links(ctx.conn, ctx.arguments)
+    // v0.7.0 #1553 — visibility gate so neighbor-id enumeration / existence
+    // oracling of another tenant's scope=private row is blocked.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_get_links(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1552,7 +1561,10 @@ fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_inbox(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // v0.7.0 #1557 — bind the inbox owner to the resolved caller so a
+    // multi-tenant caller cannot read another agent's private inbox.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_inbox(ctx.conn, ctx.arguments, ctx.mcp_client, caller.as_deref())
 }
 
 fn dispatch_memory_subscribe(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -11428,6 +11440,122 @@ mod tests {
 
     /// Insert a memory tagged with `metadata.family` so the
     /// `memory_load_family` query catches it.
+    /// #1555 — seed a family-tagged row owned by `owner` with an explicit
+    /// `scope`, so the visibility post-filter on the family loaders can be
+    /// exercised across the owner / other-tenant / trust-all axes.
+    fn seed_family_owned(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        family: &str,
+        owner: &str,
+        scope: &str,
+    ) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: namespace.to_string(),
+            title: format!("{family}-{owner}"),
+            content: format!("owned by {owner}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"family": family, "agent_id": owner, "scope": scope}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        db::insert(conn, &mem).unwrap()
+    }
+
+    #[test]
+    fn load_family_filters_other_agents_private_1555() {
+        // Fixtures bound once (owners + namespace + family) so no literal is
+        // scattered across the assertions.
+        let (owner_a, owner_b) = ("alice", "bob");
+        let (ns, fam) = ("shared-fam-ns", "core");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let a_id = seed_family_owned(&conn, ns, fam, owner_a, "private");
+        let b_id = seed_family_owned(&conn, ns, fam, owner_b, "private");
+        let q = json!({"family": fam, "namespace": ns, "k": 100});
+        let ids = |resp: &Value| -> Vec<String> {
+            resp["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // owner_b caller: sees only their own private row; owner_a's is filtered.
+        let r_b = crate::mcp::handle_load_family(&conn, &q, Some(owner_b)).unwrap();
+        let b_ids = ids(&r_b);
+        assert!(b_ids.contains(&b_id), "{owner_b} sees own row");
+        assert!(
+            !b_ids.contains(&a_id),
+            "{owner_a}'s private row filtered for {owner_b}"
+        );
+        assert_eq!(
+            r_b["count"].as_u64(),
+            Some(1),
+            "count recomputed post-filter"
+        );
+        // owner_a caller: sees their own row.
+        let r_a = crate::mcp::handle_load_family(&conn, &q, Some(owner_a)).unwrap();
+        assert!(ids(&r_a).contains(&a_id));
+        // None caller: single-tenant trust-all sees both, unchanged.
+        let r_all = crate::mcp::handle_load_family(&conn, &q, None).unwrap();
+        assert_eq!(
+            r_all["count"].as_u64(),
+            Some(2),
+            "None == trust-all (legacy)"
+        );
+    }
+
+    #[test]
+    fn smart_load_filters_other_agents_private_1555() {
+        let (owner_a, owner_b) = ("alice", "bob");
+        let (ns, fam) = ("shared-fam-ns2", "core");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let a_id = seed_family_owned(&conn, ns, fam, owner_a, "private");
+        let b_id = seed_family_owned(&conn, ns, fam, owner_b, "collective");
+        // Empty intent routes to Core → forwards to load_family with the caller.
+        let resp = crate::mcp::handle_smart_load(
+            &conn,
+            &json!({"intent": "", "namespace": ns, "k": 100}),
+            None,
+            Some(owner_b),
+        )
+        .unwrap();
+        let ids: Vec<String> = resp["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !ids.contains(&a_id),
+            "{owner_a}'s private row filtered via smart_load for {owner_b}"
+        );
+        assert!(
+            ids.contains(&b_id),
+            "{owner_b}'s own collective row is visible"
+        );
+    }
+
     fn chunkc_seed_family_memory(
         conn: &rusqlite::Connection,
         namespace: &str,
@@ -12555,7 +12683,7 @@ mod tests {
             ] {
                 let _ = chunkc_seed_family_memory(&conn, "ns", fam);
             }
-            let resp = handle_smart_load(&conn, &json!({"intent": intent}), None)
+            let resp = handle_smart_load(&conn, &json!({"intent": intent}), None, None)
                 .expect("smart_load must succeed");
             assert_eq!(
                 resp["chosen_family"], *expected,
@@ -12575,6 +12703,7 @@ mod tests {
         let resp = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "ns", "k": 0}),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["k"], 1);
@@ -12588,6 +12717,7 @@ mod tests {
         let err = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "bad ns with spaces!"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("namespace") || err.contains("invalid"));
@@ -12635,6 +12765,7 @@ mod tests {
         let resp = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "ns-exp"}),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["count"], 1, "expired row must be filtered");
@@ -12667,6 +12798,7 @@ mod tests {
             &conn,
             &json!({"intent": "blortzfribblequx zarflargle"}),
             Some(&embedder as &dyn Embed),
+            None,
         )
         .expect("smart_load must succeed");
         // Either the embedder pick took precedence (source = "embedder")
@@ -13313,6 +13445,7 @@ mod tests {
             &conn,
             &json!({"intent": "call memory_notify on the other agent"}),
             Some(&embedder as &dyn Embed),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["chosen_family"], "other");
@@ -13335,6 +13468,7 @@ mod tests {
             &conn,
             &json!({"intent": "   ", "namespace": "ns-empty", "k": 5}),
             None,
+            None,
         )
         .expect("smart_load must succeed on whitespace intent");
         assert_eq!(resp["chosen_family"], "core");
@@ -13352,8 +13486,9 @@ mod tests {
     fn chunkc_smart_load_punctuation_only_intent_keyword_fallback() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_family_memory(&conn, "ns-punct", "core");
-        let resp = crate::mcp::handle_smart_load(&conn, &json!({"intent": "!!!---???"}), None)
-            .expect("smart_load must succeed on punctuation-only intent");
+        let resp =
+            crate::mcp::handle_smart_load(&conn, &json!({"intent": "!!!---???"}), None, None)
+                .expect("smart_load must succeed on punctuation-only intent");
         assert_eq!(resp["chosen_family"], "core");
         assert_eq!(resp["chosen_family_source"], "fallback");
     }
@@ -13392,6 +13527,7 @@ mod tests {
             &conn,
             &json!({"intent": "delete and forget stale memories"}),
             Some(&embedder as &dyn Embed),
+            None,
         )
         .expect("smart_load must succeed even when embedder fails");
         // When embedder fails, kw_pick wins — keyword scorer routes
@@ -13409,6 +13545,7 @@ mod tests {
         let resp = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "ns-cap", "k": 5_000}),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["k"], 100);
@@ -13419,8 +13556,8 @@ mod tests {
     #[test]
     fn chunkc_load_family_unknown_family_rejected() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let err =
-            crate::mcp::handle_load_family(&conn, &json!({"family": "not-a-family"})).unwrap_err();
+        let err = crate::mcp::handle_load_family(&conn, &json!({"family": "not-a-family"}), None)
+            .unwrap_err();
         assert!(
             err.to_lowercase().contains("family") || err.to_lowercase().contains("unknown"),
             "expected an UnknownFamily diagnostic, got: {err}"
@@ -13431,7 +13568,7 @@ mod tests {
     #[test]
     fn chunkc_load_family_missing_family_rejected() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let err = crate::mcp::handle_load_family(&conn, &json!({"k": 5})).unwrap_err();
+        let err = crate::mcp::handle_load_family(&conn, &json!({"k": 5}), None).unwrap_err();
         assert!(err.contains("family"));
     }
 

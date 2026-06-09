@@ -64,6 +64,10 @@ pub(super) async fn sync_push_via_store(
         || body.pending_decisions.len() > cap
         || body.namespace_meta.len() > cap
         || body.namespace_meta_clears.len() > cap
+        // #1556 — `links` was previously omitted from this predicate (the same
+        // gap as the sqlite twin); cap it so a peer cannot bypass the batch
+        // bound via an oversized links array.
+        || body.links.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -1320,13 +1324,20 @@ mod fed_p2d_credential_resolution_tests {
             fixed_signing_key(71),
             IssuerConfig::new("region/nyc/ca", TEST_TRUST_DOMAIN),
         );
+        // #1554 — the leaf MUST be within the region CA's delegated namespace
+        // (`region/nyc`, i.e. the CA id minus the `/ca` marker). A regional
+        // intermediate may only vouch for subjects in its own region; this is a
+        // legitimate in-namespace delegation. (The flat P2/P3 path with generic
+        // ids like `host:peer-a` is unaffected — `verify_link` runs only for
+        // chained certs.)
+        let leaf_id = "region/nyc/peer-a";
         let anchor = root
             .issue_intermediate(region.issuer_id(), &region.verifying_key(), TEST_NOW_UNIX)
             .expect("issue intermediate");
 
         let node_pub = fixed_signing_key(72).verifying_key();
         let chain = region
-            .issue_chained(TEST_PEER_ID, &node_pub, vec![anchor], TEST_NOW_UNIX)
+            .issue_chained(leaf_id, &node_pub, vec![anchor], TEST_NOW_UNIX)
             .expect("issue chained");
 
         let bundle = TrustBundle::new().with_issuer("ca:root", root.verifying_key());
@@ -1349,7 +1360,7 @@ mod fed_p2d_credential_resolution_tests {
         );
 
         let resolved =
-            resolve_peer_verifying_key(&headers, Some(TEST_PEER_ID), &bundle, TEST_NOW_UNIX);
+            resolve_peer_verifying_key(&headers, Some(leaf_id), &bundle, TEST_NOW_UNIX);
         assert_eq!(
             resolved.map(|k| k.to_bytes()),
             Some(node_pub.to_bytes()),

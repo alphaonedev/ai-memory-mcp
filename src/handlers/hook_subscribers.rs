@@ -158,10 +158,10 @@ pub async fn get_inbox(
         params["limit"] = json!(l);
     }
     let lock = app.db.lock().await;
-    // Pass the resolved owner as `mcp_client` too so `handle_inbox`'s
-    // identity-resolution fallback lands on the same id whichever branch
-    // it consults (it prefers `params["agent_id"]` when present).
-    let result = crate::mcp::handle_inbox(&lock.0, &params, None);
+    // #1557 — pass the authenticated, already-403-checked `owner` as the
+    // visibility caller so the `handle_inbox` owner-bind double-enforces it
+    // (defense-in-depth; the upstream X-Agent-Id 403 remains the primary gate).
+    let result = crate::mcp::handle_inbox(&lock.0, &params, None, Some(owner.as_str()));
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),

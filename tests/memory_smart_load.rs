@@ -104,6 +104,7 @@ fn smart_load_intent_matching_graph_routes_to_graph_family() {
         &conn,
         &json!({"intent": "I'm about to debug a flaky test"}),
         None,
+        None,
     )
     .expect("memory_smart_load must succeed");
 
@@ -143,6 +144,7 @@ fn smart_load_intent_matching_lifecycle_routes_to_lifecycle_family() {
         &conn,
         &json!({"intent": "delete and forget the stale memories then promote the survivors"}),
         None,
+        None,
     )
     .expect("memory_smart_load must succeed");
 
@@ -169,7 +171,7 @@ fn smart_load_empty_intent_returns_core_fallback() {
     let core_id = seed_family_memory(&conn, "core-mem", "ns", "core", 5);
 
     let resp: Value =
-        handle_smart_load(&conn, &json!({"intent": "   "}), None).expect("must succeed");
+        handle_smart_load(&conn, &json!({"intent": "   "}), None, None).expect("must succeed");
 
     assert_eq!(resp["chosen_family"], "core");
     assert_eq!(
@@ -201,6 +203,7 @@ fn smart_load_embedder_unavailable_falls_back_to_core() {
         &conn,
         &json!({"intent": "blortzfribblequx zarflargle"}),
         None,
+        None,
     )
     .expect("must succeed even with no embedder + no descriptor match");
 
@@ -223,7 +226,7 @@ fn smart_load_embedder_unavailable_falls_back_to_core() {
 #[test]
 fn smart_load_missing_intent_arg_errors() {
     let conn = open_db();
-    let err = handle_smart_load(&conn, &json!({}), None).unwrap_err();
+    let err = handle_smart_load(&conn, &json!({}), None, None).unwrap_err();
     assert!(
         err.contains("intent"),
         "error must mention missing arg; got: {err}"

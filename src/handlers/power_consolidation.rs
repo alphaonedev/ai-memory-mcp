@@ -795,8 +795,6 @@ pub async fn load_family_handler(
     headers: HeaderMap,
     Json(body): Json<LoadFamilyBody>,
 ) -> impl IntoResponse {
-    #[cfg(not(feature = "sal"))]
-    let _ = &headers;
     use std::str::FromStr;
 
     let family = match Family::from_str(&body.family) {
@@ -879,13 +877,26 @@ pub async fn load_family_handler(
 
     // Sqlite path — reuse the MCP `handle_load_family` SQL verbatim by
     // calling it through with the same parameter shape (a `Value`).
+    //
+    // #1555 — resolve the caller from headers and pass it so the SAME
+    // scope=private visibility filter the postgres branch gets via the SAL
+    // `list` applies on the sqlite (default) backend too. Without this the
+    // multi-tenant HTTP daemon leaked other tenants' private family-tagged
+    // rows in a shared namespace. Reuses the shared `resolve_caller_agent_id`
+    // helper (non-sal-safe; the postgres branch's `http_caller_ctx` is sal-gated
+    // and unavailable on this default-backend path) — the anonymous-fallback
+    // handling lives inside it, not duplicated here. On the rare resolution
+    // error the empty principal owns no private row, so it sees only
+    // scope=shared/public rows.
+    let caller =
+        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
     let lock = app.db.lock().await;
     let params = json!({
         "family": family_name,
         "namespace": body.namespace,
         "k": k,
     });
-    match crate::mcp::handle_load_family(&lock.0, &params) {
+    match crate::mcp::handle_load_family(&lock.0, &params, Some(caller.as_str())) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }

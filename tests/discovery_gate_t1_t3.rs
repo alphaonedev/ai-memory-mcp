@@ -369,8 +369,12 @@ fn t3_use_memory_load_family_loads_graph_family_at_runtime() {
     let _ = models::default_metadata();
     db::insert(&conn, &seed).expect("seed graph-family memory");
 
-    let resp = handle_load_family(&conn, &json!({"family": "graph", "namespace": "ns-t3"}))
-        .expect("memory_load_family must succeed");
+    let resp = handle_load_family(
+        &conn,
+        &json!({"family": "graph", "namespace": "ns-t3"}),
+        None,
+    )
+    .expect("memory_load_family must succeed");
 
     assert_eq!(resp["family"], "graph", "family echoed; got: {resp}");
     assert_eq!(resp["namespace"], "ns-t3", "namespace echoed; got: {resp}");
@@ -398,8 +402,13 @@ fn t3_use_memory_smart_load_intent_routes_store_request_to_core_family() {
 
     let conn = fresh_conn();
 
-    let resp = handle_smart_load(&conn, &json!({"intent": "store a new observation"}), None)
-        .expect("memory_smart_load must succeed");
+    let resp = handle_smart_load(
+        &conn,
+        &json!({"intent": "store a new observation"}),
+        None,
+        None,
+    )
+    .expect("memory_smart_load must succeed");
 
     assert_eq!(
         resp["chosen_family"], "core",
@@ -472,8 +481,8 @@ fn t3_use_memory_load_family_is_idempotent_under_repeated_calls() {
     db::insert(&conn, &seed).expect("seed");
 
     let payload = json!({"family": "graph", "namespace": "ns-idem"});
-    let first = handle_load_family(&conn, &payload).expect("first call");
-    let second = handle_load_family(&conn, &payload).expect("second call");
+    let first = handle_load_family(&conn, &payload, None).expect("first call");
+    let second = handle_load_family(&conn, &payload, None).expect("second call");
 
     assert_eq!(
         first, second,
@@ -501,7 +510,7 @@ fn t3_use_memory_smart_load_rejects_ambiguous_intent_without_silent_default() {
     // Empty intent is the canonical no-signal case. The handler MUST
     // NOT silently pick a family — it must surface the fallback
     // posture so the caller knows to ask the user for a better intent.
-    let resp = handle_smart_load(&conn, &json!({"intent": "   "}), None)
+    let resp = handle_smart_load(&conn, &json!({"intent": "   "}), None, None)
         .expect("memory_smart_load must succeed on whitespace intent");
 
     assert_eq!(
