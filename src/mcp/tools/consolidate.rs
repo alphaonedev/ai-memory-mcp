@@ -84,7 +84,7 @@ pub(super) fn handle_consolidate(
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
                 return Err(crate::governance::deny_message(
-                    "consolidate",
+                    crate::audit::OP_CONSOLIDATE,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
                 ));
@@ -93,7 +93,7 @@ pub(super) fn handle_consolidate(
                 return Ok(json!({
                     "status": "ask",
                     "reason": prompt,
-                    "action": "consolidate",
+                    "action": crate::audit::OP_CONSOLIDATE,
                     "namespace": namespace,
                     "source_count": ids.len(),
                 }));

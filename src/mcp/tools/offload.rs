@@ -60,7 +60,7 @@ pub fn handle_offload(
         .map_err(|e| e.to_string())?;
     Ok(json!({
         "ref_id": result.ref_id,
-        "content_sha256": result.content_sha256,
+        (crate::models::field_names::CONTENT_SHA256): result.content_sha256,
         "stored_at": result.stored_at,
         "namespace": namespace,
     }))

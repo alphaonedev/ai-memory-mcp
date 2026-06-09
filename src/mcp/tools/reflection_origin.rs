@@ -50,10 +50,10 @@ pub fn handle_reflection_origin(
         Some(record) => Ok(json!({
             "memory_id": record.memory_id,
             (field_names::PEER_ORIGIN): record.peer_origin,
-            "signing_agent": record.signing_agent,
-            "original_depth": record.original_depth,
-            "local_depth_at_arrival": record.local_depth_at_arrival,
-            "is_reflection": record.is_reflection,
+            (field_names::SIGNING_AGENT): record.signing_agent,
+            (field_names::ORIGINAL_DEPTH): record.original_depth,
+            (field_names::LOCAL_DEPTH_AT_ARRIVAL): record.local_depth_at_arrival,
+            (field_names::IS_REFLECTION): record.is_reflection,
         })),
         None => Err(crate::errors::msg::memory_not_found(memory_id)),
     }

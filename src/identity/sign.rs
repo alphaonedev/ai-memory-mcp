@@ -232,7 +232,7 @@ pub fn canonical_cbor_persona(p: &SignablePersona<'_>) -> Result<Vec<u8>> {
         ciborium::Value::Integer(ciborium::value::Integer::from(p.version)),
     );
     map.insert(
-        "generated_at",
+        field_names::GENERATED_AT,
         ciborium::Value::Text(p.generated_at.to_string()),
     );
     let sources_val = ciborium::Value::Array(
@@ -367,7 +367,7 @@ pub fn canonical_cbor_write(w: &SignableWrite<'_>) -> Result<Vec<u8>> {
         ciborium::Value::Text(w.created_at.to_string()),
     );
     map.insert(
-        "content_sha256",
+        field_names::CONTENT_SHA256,
         ciborium::Value::Bytes(w.content_sha256.to_vec()),
     );
 

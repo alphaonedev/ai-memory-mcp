@@ -249,7 +249,7 @@ pub fn handle_skill_compositional_context(
         "reflections": emitted,
         (field_names::BUDGET_TOKENS): budget_tokens,
         (field_names::TOKENS_USED): tokens_used,
-        "memories_dropped": dropped,
+        (field_names::MEMORIES_DROPPED): dropped,
     }))
 }
 

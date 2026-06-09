@@ -2124,9 +2124,10 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
     // blocking is not allowed." Move the whole construction onto the blocking
     // pool so the inner runtime is owned by a dedicated thread.
     let build = match tokio::task::spawn_blocking(move || {
-        let embed_client = llm::OllamaClient::new_with_url(&embed_url, "nomic-embed-text")
-            .ok()
-            .map(Arc::new);
+        let embed_client =
+            llm::OllamaClient::new_with_url(&embed_url, crate::embeddings::NOMIC_OLLAMA_MODEL)
+                .ok()
+                .map(Arc::new);
         embeddings::Embedder::for_model(emb_model, embed_client)
     })
     .await

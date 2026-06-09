@@ -297,7 +297,7 @@ fn batman_policy(
 ) -> Result<()> {
     let policy = json!({
         "auto_atomise": true,
-        "auto_atomise_mode": "synchronous",
+        "auto_atomise_mode": crate::models::namespace::AUTO_ATOMISE_SYNCHRONOUS,
         "auto_atomise_threshold_cl100k": atomise_threshold,
         "auto_atomise_max_atom_tokens": atom_max_tokens,
         "auto_classify_kind": classify_mode,

@@ -15,6 +15,14 @@ use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
 
+// ── #1558 batch 6 — file-local SQL SSOT (pm-v3.1 hardcoded-literal gate) ──
+const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
+const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
+    "DELETE FROM namespace_meta WHERE standard_id = ?1";
+const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
+const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
+const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
+
 /// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
 /// precision. Companion of the same-named helper in
 /// `store/postgres.rs:3539` (G3 fix); both ends of the link sign/verify
@@ -307,7 +315,7 @@ fn archived_source_clause(include_archived: bool, table_alias: &str) -> &'static
 /// path.
 fn is_archived_source(mem: &Memory) -> bool {
     mem.metadata
-        .get("atomisation_archived_at")
+        .get(field_names::ATOMISATION_ARCHIVED_AT)
         .is_some_and(|v| !v.is_null())
 }
 
@@ -519,13 +527,13 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // of pre-v39 row reads (no panic when migrate hasn't fired
         // yet).
         confidence_source: row
-            .get::<_, String>("confidence_source")
+            .get::<_, String>(field_names::CONFIDENCE_SOURCE)
             .ok()
             .and_then(|s| crate::models::ConfidenceSource::from_str(&s))
             .unwrap_or_default(),
         confidence_signals,
         confidence_decayed_at: row
-            .get::<_, Option<String>>("confidence_decayed_at")
+            .get::<_, Option<String>>(field_names::CONFIDENCE_DECAYED_AT)
             .unwrap_or(None),
         // v0.7.0 Provenance Gap 1 (#884) — schema v45 optimistic-
         // concurrency column. Pre-v45 rows lack the column entirely
@@ -1013,7 +1021,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     match rows.next() {
         Some(Ok(m)) => Ok(Some(m)),
@@ -1314,7 +1322,7 @@ pub fn update_with_expected_version(
     source_uri: Option<&str>,
     expected_version: Option<i64>,
 ) -> Result<(bool, bool)> {
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         return Ok((false, false));
@@ -1536,7 +1544,7 @@ pub fn update_with_archive_on_supersede(
     edit_source: crate::models::EditSource,
 ) -> Result<SupersedeResult> {
     // Read the existing row so we can compose the patched NEW row.
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
@@ -1681,11 +1689,8 @@ pub fn update_with_archive_on_supersede(
 
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     // Clean up namespace_meta if this memory was a namespace standard
-    conn.execute(
-        "DELETE FROM namespace_meta WHERE standard_id = ?1",
-        params![id],
-    )?;
-    let changed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+    conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+    let changed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
     Ok(changed > 0)
 }
 
@@ -1710,11 +1715,7 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
             .unwrap_or(false);
         if !exists {
             return Ok(false);
@@ -1745,11 +1746,8 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
         )?;
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
-        conn.execute(
-            "DELETE FROM namespace_meta WHERE standard_id = ?1",
-            params![id],
-        )?;
-        let removed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
     match result {
@@ -1837,11 +1835,8 @@ pub fn archive_memory_for_caller(
         )?;
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
-        conn.execute(
-            "DELETE FROM namespace_meta WHERE standard_id = ?1",
-            params![id],
-        )?;
-        let removed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
     match result {
@@ -3329,11 +3324,7 @@ pub fn create_link_signed(
     )?;
     // Verify both IDs exist before creating link
     let source_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![source_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![source_id], |r| r.get(0))
         .unwrap_or(false);
     if !source_exists {
         // #962 typed envelope — MemoryNotFound{role=Source}.
@@ -3343,11 +3334,7 @@ pub fn create_link_signed(
         }));
     }
     let target_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![target_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![target_id], |r| r.get(0))
         .unwrap_or(false);
     if !target_exists {
         // #962 typed envelope — MemoryNotFound{role=Target}.
@@ -3604,11 +3591,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
     // peer raced ahead of us; we surface that to the caller's warn log
     // rather than papering over with INSERT OR IGNORE silently.
     let source_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![link.source_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![link.source_id], |r| r.get(0))
         .unwrap_or(false);
     if !source_exists {
         // #962 typed envelope — MemoryNotFound{role=Source}.
@@ -3618,11 +3601,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         }));
     }
     let target_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![link.target_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![link.target_id], |r| r.get(0))
         .unwrap_or(false);
     if !target_exists {
         // #962 typed envelope — MemoryNotFound{role=Target}.
@@ -5867,7 +5846,7 @@ pub fn register_agent(
         (field_names::AGENT_TYPE): agent_type,
         (field_names::CAPABILITIES): caps_json,
         (field_names::REGISTERED_AT): registered_at,
-        "last_seen_at": now,
+        (field_names::LAST_SEEN_AT): now,
         // #910 (SAL-level enforcement) — agent-registration rows live
         // in the `_agents` namespace and are a public roster: every
         // agent has a legitimate need to know which other agents are
@@ -5956,7 +5935,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
             .unwrap_or_default()
             .to_string();
         let last_seen_at = meta
-            .get("last_seen_at")
+            .get(field_names::LAST_SEEN_AT)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
@@ -6294,7 +6273,7 @@ pub fn list_archived(
             (field_names::LAST_ACCESSED_AT): row.get::<_, Option<String>>(12)?,
             (field_names::EXPIRES_AT): row.get::<_, Option<String>>(13)?,
             (field_names::ARCHIVED_AT): row.get::<_, String>(14)?,
-            "archive_reason": row.get::<_, String>(15)?,
+            (field_names::ARCHIVE_REASON): row.get::<_, String>(15)?,
             "metadata": metadata,
         }))
     })?;
@@ -6318,11 +6297,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         }
         // Check if ID already exists in active memories to prevent silent overwrite
         let active_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
             .unwrap_or(false);
         if active_exists {
             // #962 typed envelope — ArchiveRestoreCollision (409).
@@ -6456,11 +6431,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         }
         // Check if ID already exists in active memories to prevent silent overwrite.
         let active_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
             .unwrap_or(false);
         if active_exists {
             // #962 typed envelope — ArchiveRestoreCollision (409).
@@ -6669,7 +6640,7 @@ pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(serde_json::json!({
         "archived_total": total,
-        "by_namespace": by_ns,
+        (field_names::BY_NAMESPACE): by_ns,
     }))
 }
 
@@ -9537,7 +9508,11 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
         }
         "promote" => {
             if let Some(mid) = pa.memory_id.clone() {
-                if let Some(to_ns) = pa.payload.get("to_namespace").and_then(|v| v.as_str()) {
+                if let Some(to_ns) = pa
+                    .payload
+                    .get(field_names::TO_NAMESPACE)
+                    .and_then(|v| v.as_str())
+                {
                     // Vertical promotion to ancestor.
                     let clone_id = promote_to_namespace(conn, &mid, to_ns)?;
                     Some(clone_id)

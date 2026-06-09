@@ -39,6 +39,18 @@ use super::{fanout_or_503, resolve_caller_agent_id};
 #[cfg(feature = "sal")]
 const SUBSCRIPTION_NS_PREFIX: &str = "_subscriptions/";
 
+/// Memory `kind` marker for subscription rows (#1558 batch 6).
+#[cfg(feature = "sal")]
+const KIND_SUBSCRIPTION: &str = "subscription";
+
+/// `_subscriptions/<caller>` — the per-caller subscription namespace.
+/// (Single synthesis site; `SUBSCRIPTION_NS_PREFIX` above is the sargable
+/// range form and is `sal`-gated, so the template stays self-contained.)
+#[cfg(feature = "sal")]
+fn caller_subscription_ns(caller: impl std::fmt::Display) -> String {
+    format!("_subscriptions/{caller}")
+}
+
 /// Upper bound on subscription rows pulled per dispatch tick. Matches
 /// the sqlite path's implicit ceiling; production deployments rarely
 /// exceed dozens of subscribers.
@@ -366,7 +378,7 @@ pub async fn subscribe(
         }
         let sub_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let ns = format!("_subscriptions/{caller}");
+        let ns = caller_subscription_ns(&caller);
         // #932 (v0.7.0 Track D, 2026-05-20) — persist the SHA-256
         // hash of the per-subscription secret in the metadata blob
         // so `dispatch_event_postgres` can resolve it back without
@@ -382,7 +394,7 @@ pub async fn subscribe(
             .filter(|s| !s.is_empty())
             .map(crate::subscriptions::sha256_hex);
         let metadata = json!({
-            "kind": "subscription",
+            "kind": KIND_SUBSCRIPTION,
             "agent_id": caller,
             (field_names::SUBSCRIPTION_ID): sub_id,
             "url": url,
@@ -402,7 +414,7 @@ pub async fn subscribe(
                 "subscription for {caller} -> {} (events={events})",
                 namespace_filter.as_deref().unwrap_or("*")
             ),
-            tags: vec!["subscription".to_string()],
+            tags: vec![KIND_SUBSCRIPTION.to_string()],
             priority: 5,
             confidence: 1.0,
             source: "subscribe".to_string(),
@@ -604,7 +616,7 @@ pub async fn unsubscribe(
                 )
                     .into_response();
             };
-            let sub_ns = format!("_subscriptions/{caller}");
+            let sub_ns = caller_subscription_ns(&caller);
             let filter = crate::store::Filter {
                 namespace: Some(sub_ns),
                 limit: crate::storage::LIST_MAX_LIMIT,
@@ -784,7 +796,7 @@ pub async fn list_subscriptions(
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(&caller);
-        let namespaces: Vec<String> = vec![format!("_subscriptions/{caller}")];
+        let namespaces: Vec<String> = vec![caller_subscription_ns(&caller)];
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for ns in namespaces {
             let filter = crate::store::Filter {
@@ -796,7 +808,7 @@ pub async fn list_subscriptions(
                 Ok(memories) => {
                     for m in memories {
                         let meta = m.metadata;
-                        if meta.get("kind").and_then(|v| v.as_str()) != Some("subscription") {
+                        if meta.get("kind").and_then(|v| v.as_str()) != Some(KIND_SUBSCRIPTION) {
                             continue;
                         }
                         let sub_id = meta
@@ -947,7 +959,7 @@ pub async fn dispatch_event_postgres(
             continue;
         }
         let meta = &m.metadata;
-        if meta.get("kind").and_then(|v| v.as_str()) != Some("subscription") {
+        if meta.get("kind").and_then(|v| v.as_str()) != Some(KIND_SUBSCRIPTION) {
             continue;
         }
         let sub_id = meta

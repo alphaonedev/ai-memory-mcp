@@ -704,7 +704,7 @@ pub async fn expand_query_handler(
         StatusCode::OK,
         Json(json!({
             "original": query,
-            "expanded_terms": expanded_terms,
+            (field_names::EXPANDED_TERMS): expanded_terms,
         })),
     )
         .into_response()

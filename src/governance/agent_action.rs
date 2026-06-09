@@ -76,6 +76,12 @@ use crate::governance::rule_cache::RuleCache;
 use crate::governance::rules_store::Rule;
 use crate::signed_events::{append_signed_event, payload_hash};
 
+/// Canonical bash-matcher field (#767 SEC-12) — shared with the CLI
+/// `rules add` validation path (#1558 batch 6).
+pub(crate) const MATCHER_COMMAND_SUBSTRING: &str = "command_substring";
+/// Legacy matcher-field alias accepted through the rename cycle.
+pub(crate) const MATCHER_COMMAND_REGEX: &str = "command_regex";
+
 /// Wire-name for the `governance.check` event_type recorded in the
 /// `signed_events` audit chain every time [`check_agent_action`]
 /// runs. Audit-side dashboards filter on this string.
@@ -375,8 +381,8 @@ fn match_bash(matcher: &serde_json::Value, command: &str) -> bool {
     // `command_substring`; the CLI add path warns when it sees the
     // legacy name.
     let needle = matcher
-        .get("command_substring")
-        .or_else(|| matcher.get("command_regex"))
+        .get(MATCHER_COMMAND_SUBSTRING)
+        .or_else(|| matcher.get(MATCHER_COMMAND_REGEX))
         .and_then(|v| v.as_str());
     let Some(needle) = needle else {
         return false;

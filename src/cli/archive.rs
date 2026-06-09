@@ -121,7 +121,7 @@ pub fn run(
                 writeln!(out.stdout, "{stats}")?;
             } else {
                 writeln!(out.stdout, "archived: {} total", stats["archived_total"])?;
-                if let Some(by_ns) = stats["by_namespace"].as_array() {
+                if let Some(by_ns) = stats[field_names::BY_NAMESPACE].as_array() {
                     for ns in by_ns {
                         writeln!(
                             out.stdout,

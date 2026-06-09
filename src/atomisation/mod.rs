@@ -890,7 +890,7 @@ fn archive_source(
         let mut meta: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&existing_metadata_str).unwrap_or_default();
         meta.insert(
-            "atomisation_archived_at".to_string(),
+            crate::models::field_names::ATOMISATION_ARCHIVED_AT.to_string(),
             serde_json::Value::String(archived_at.to_string()),
         );
         let merged = serde_json::Value::Object(meta).to_string();
@@ -934,7 +934,7 @@ fn emit_atomisation_complete_event(
         "event_type": "atomisation_complete",
         "source_id": source_id,
         "atom_ids": atom_ids,
-        "atom_count": atom_count,
+        (crate::models::field_names::ATOM_COUNT): atom_count,
         "calling_agent_id": calling_agent_id,
         "atomisation_timestamp": archived_at,
         "curator_model": curator_model,

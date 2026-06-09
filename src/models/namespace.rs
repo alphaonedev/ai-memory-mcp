@@ -4,6 +4,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Canonical `collective` scope spelling — referenced from `all_strs`,
+/// `from_str`, and `as_str` (#1558 batch 6).
+const COLLECTIVE: &str = "collective";
+/// `auto_atomise_mode` value for [`AutoAtomiseMode::Synchronous`] — shared
+/// with the CLI namespace policy template (#1558 batch 6).
+pub(crate) const AUTO_ATOMISE_SYNCHRONOUS: &str = "synchronous";
+
 /// Closed set of visibility scopes stamped into `metadata.scope` (Task 1.5).
 /// Controls which agents can see a memory via hierarchical namespace matching.
 /// Memories without a `scope` field are treated as `private` by the query layer.
@@ -73,7 +80,7 @@ impl MemoryScope {
     /// Parity-test-asserted against the `VALID_SCOPES` const.
     #[must_use]
     pub const fn all_strs() -> &'static [&'static str; Self::COUNT] {
-        &["private", "team", "unit", "org", "collective"]
+        &["private", "team", "unit", "org", COLLECTIVE]
     }
 
     /// Parse the string form stored in `metadata.scope`.
@@ -88,7 +95,7 @@ impl MemoryScope {
             "team" => Some(Self::Team),
             "unit" => Some(Self::Unit),
             "org" => Some(Self::Org),
-            "collective" => Some(Self::Collective),
+            COLLECTIVE => Some(Self::Collective),
             _ => None,
         }
     }
@@ -103,7 +110,7 @@ impl MemoryScope {
             Self::Team => "team",
             Self::Unit => "unit",
             Self::Org => "org",
-            Self::Collective => "collective",
+            Self::Collective => COLLECTIVE,
         }
     }
 }
@@ -810,7 +817,7 @@ impl AutoAtomiseMode {
         match self {
             Self::Off => "off",
             Self::Deferred => "deferred",
-            Self::Synchronous => "synchronous",
+            Self::Synchronous => AUTO_ATOMISE_SYNCHRONOUS,
         }
     }
 }

@@ -60,7 +60,7 @@ pub fn handle_check_duplicate(
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            "similarity": (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
                 / crate::SCORE_DISPLAY_ROUND_FACTOR,
         })
     });
@@ -71,11 +71,11 @@ pub fn handle_check_duplicate(
     };
 
     Ok(json!({
-        "is_duplicate": check.is_duplicate,
+        (field_names::IS_DUPLICATE): check.is_duplicate,
         "threshold": check.threshold,
         "nearest": nearest_json,
         (field_names::SUGGESTED_MERGE): suggested_merge,
-        "candidates_scanned": check.candidates_scanned,
+        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
     }))
 }
 

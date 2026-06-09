@@ -717,7 +717,7 @@ fn op_matches_action_type(op: Op, action_type: &str) -> bool {
         (Op::MemoryStore, "store")
         | (Op::MemoryDelete, "delete")
         | (Op::MemoryArchive, "archive" | "promote")
-        | (Op::MemoryConsolidate, "consolidate")
+        | (Op::MemoryConsolidate, crate::audit::OP_CONSOLIDATE)
         | (Op::MemoryLink, "link") => true,
         _ => false,
     }
@@ -938,7 +938,7 @@ impl DenyGate {
     pub fn as_str(self) -> &'static str {
         match self {
             DenyGate::PermissionRule => "permission rule",
-            DenyGate::Governance => "governance",
+            DenyGate::Governance => crate::models::field_names::GOVERNANCE,
         }
     }
 }

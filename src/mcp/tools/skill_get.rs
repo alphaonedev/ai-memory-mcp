@@ -112,15 +112,15 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         response["license"] = json!(lic);
     }
     if let Some(compat) = compatibility {
-        response["compatibility"] = json!(compat);
+        response[field_names::COMPATIBILITY] = json!(compat);
     }
     if let Some(tools_json) = allowed_tools {
         if let Ok(v) = serde_json::from_str::<Value>(&tools_json) {
-            response["allowed_tools"] = v;
+            response[field_names::ALLOWED_TOOLS] = v;
         }
     }
     if let Some(agent) = signing_agent {
-        response["signing_agent"] = json!(agent);
+        response[field_names::SIGNING_AGENT] = json!(agent);
     }
     if let Some(sup_id) = superseded_by {
         response["superseded_by"] = json!(sup_id);

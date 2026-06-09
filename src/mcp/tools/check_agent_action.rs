@@ -185,7 +185,7 @@ pub fn build_action(kind: &str, arguments: &Value) -> Result<AgentAction, String
         }
         "custom" => {
             let custom_kind = arguments
-                .get("custom_kind")
+                .get(crate::models::field_names::CUSTOM_KIND)
                 .or_else(|| arguments.get(param_names::KIND_INNER))
                 .and_then(Value::as_str)
                 .ok_or_else(|| "custom kind requires `custom_kind`".to_string())?

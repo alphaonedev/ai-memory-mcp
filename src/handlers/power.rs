@@ -151,7 +151,7 @@ pub async fn detect_contradictions(
                         "source_id": link.source_id,
                         "target_id": link.target_id,
                         "relation": link.relation,
-                        "synthesized": false,
+                        (field_names::SYNTHESIZED): false,
                     }));
                 }
             }
@@ -200,7 +200,7 @@ pub async fn detect_contradictions(
                         "source_id": a.id,
                         "target_id": b.id,
                         "relation": crate::models::MemoryLinkRelation::Contradicts.as_str(),
-                        "synthesized": true,
+                        (field_names::SYNTHESIZED): true,
                     }));
                 }
             }
@@ -308,7 +308,7 @@ pub async fn detect_contradictions(
                         "source_id": link.source_id,
                         "target_id": link.target_id,
                         "relation": link.relation,
-                        "synthesized": false,
+                        (field_names::SYNTHESIZED): false,
                     }));
                 }
             }
@@ -364,7 +364,7 @@ pub async fn detect_contradictions(
                     "source_id": a.id,
                     "target_id": b.id,
                     "relation": crate::models::MemoryLinkRelation::Contradicts.as_str(),
-                    "synthesized": true,
+                    (field_names::SYNTHESIZED): true,
                 }));
             }
         }
@@ -404,7 +404,7 @@ pub async fn list_namespaces(
         return match app.store.list_namespaces().await {
             Ok(rows) => {
                 let v: Vec<String> = rows.into_iter().map(|r| r.namespace).collect();
-                Json(json!({"namespaces": v})).into_response()
+                Json(json!({(field_names::NAMESPACES): v})).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -412,7 +412,7 @@ pub async fn list_namespaces(
 
     let lock = app.db.lock().await;
     match db::list_namespaces(&lock.0) {
-        Ok(ns) => Json(json!({"namespaces": ns})).into_response(),
+        Ok(ns) => Json(json!({(field_names::NAMESPACES): ns})).into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
@@ -494,7 +494,7 @@ pub async fn get_taxonomy(
         {
             Ok(tax) => Json(json!({
                 "tree": tax.tree,
-                "total_count": tax.total_count,
+                (field_names::TOTAL_COUNT): tax.total_count,
                 "truncated": tax.truncated,
                 (field_names::STORAGE_BACKEND): "postgres",
             }))
@@ -636,7 +636,7 @@ pub async fn get_taxonomy(
         let root_node = build_node(&root_ns, &nodes, depth);
         return Json(json!({
             "tree": root_node,
-            "total_count": total_count,
+            (field_names::TOTAL_COUNT): total_count,
             "truncated": truncated,
             (field_names::STORAGE_BACKEND): "postgres",
         }))
@@ -650,7 +650,7 @@ pub async fn get_taxonomy(
     match db::get_taxonomy(&lock.0, prefix_owned.as_deref(), depth, limit) {
         Ok(tax) => Json(json!({
             "tree": tax.tree,
-            "total_count": tax.total_count,
+            (field_names::TOTAL_COUNT): tax.total_count,
             "truncated": tax.truncated,
         }))
         .into_response(),
@@ -750,11 +750,11 @@ pub async fn check_duplicate(
                     None => serde_json::Value::Null,
                 };
                 Json(json!({
-                    "is_duplicate": check.is_duplicate,
+                    (field_names::IS_DUPLICATE): check.is_duplicate,
                     "threshold": check.threshold,
                     "nearest": near_json,
                     (field_names::SUGGESTED_MERGE): check.is_duplicate,
-                    "candidates_scanned": check.candidates_scanned,
+                    (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
                     (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
@@ -841,7 +841,7 @@ pub async fn check_duplicate(
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            "similarity": (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
                 / crate::SCORE_DISPLAY_ROUND_FACTOR,
         })
     });
@@ -852,11 +852,11 @@ pub async fn check_duplicate(
     };
 
     Json(json!({
-        "is_duplicate": check.is_duplicate,
+        (field_names::IS_DUPLICATE): check.is_duplicate,
         "threshold": check.threshold,
         "nearest": nearest_json,
         (field_names::SUGGESTED_MERGE): suggested_merge,
-        "candidates_scanned": check.candidates_scanned,
+        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
     }))
     .into_response()
 }

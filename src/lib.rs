@@ -411,6 +411,10 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// underscore prefix is the reserved-namespace convention.
 pub const DEFAULT_NAMESPACE: &str = "global";
 
+/// Per-user ai-memory data directory name (`~/.ai-memory`) — home of
+/// reflection exports + persona artefacts (#1558 batch 6).
+pub const AI_MEMORY_HOME_DIR_NAME: &str = ".ai-memory";
+
 /// v0.7.x (issue #1174 PR5) — re-export of the system-reserved
 /// namespace constant defined originally at `src/quotas.rs:70`.
 /// Centralised here so other modules don't independently re-define

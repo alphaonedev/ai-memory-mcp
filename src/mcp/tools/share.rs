@@ -135,7 +135,7 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
         (field_names::SOURCE_MEMORY_ID): source_memory_id,
         (field_names::TARGET_NAMESPACE): target_namespace,
         (field_names::TARGET_AGENT_ID): target_agent_id,
-        "from_agent_id": from_agent_id,
+        (field_names::FROM_AGENT_ID): from_agent_id,
     }))
 }
 

@@ -64,7 +64,7 @@ pub fn cmd_promote(
             .map(str::to_string);
         let payload = serde_json::json!({
             "id": resolved_id,
-            "to_namespace": args.to_namespace,
+            (crate::models::field_names::TO_NAMESPACE): args.to_namespace,
         });
         match enforce_governance(
             &conn,
@@ -98,7 +98,7 @@ pub fn cmd_promote(
                     "mode": "vertical",
                     "source_id": resolved_id,
                     "clone_id": clone_id,
-                    "to_namespace": to_ns,
+                    (crate::models::field_names::TO_NAMESPACE): to_ns,
                 }))?
             )?;
         } else {

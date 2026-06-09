@@ -41,7 +41,7 @@ pub(super) fn handle_detect_contradiction(
         .detect_contradiction(&mem_a.content, &mem_b.content)
         .map_err(|e| e.to_string())?;
     Ok(json!({
-        "contradicts": contradicts,
+        (crate::models::link::REL_CONTRADICTS): contradicts,
         "memory_a": {"id": id_a, "title": mem_a.title},
         "memory_b": {"id": id_b, "title": mem_b.title}
     }))

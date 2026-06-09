@@ -363,7 +363,7 @@ fn build_migrated_table(
         }
         rerank.insert(
             "model".to_string(),
-            toml::Value::String("ms-marco-MiniLM-L-6-v2".to_string()),
+            toml::Value::String(crate::reranker::DEFAULT_RERANKER_MODEL.to_string()),
         );
         migrated.insert("reranker".to_string(), toml::Value::Table(rerank));
     }

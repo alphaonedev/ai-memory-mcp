@@ -436,7 +436,7 @@ pub async fn get_stats(
                 Json(json!({
                     (field_names::TOTAL_MEMORIES): s.total,
                     "by_tier": by_tier_map,
-                    "by_namespace": by_namespace_map,
+                    (field_names::BY_NAMESPACE): by_namespace_map,
                     "expiring_soon": s.expiring_soon,
                     "links_count": s.links_count,
                     "db_size_bytes": s.db_size_bytes,
@@ -488,7 +488,7 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
         };
         return match app.store.run_gc(archive_flag).await {
             Ok(n) => {
-                Json(json!({"expired_deleted": n, (field_names::STORAGE_BACKEND): "postgres"}))
+                Json(json!({(field_names::EXPIRED_DELETED): n, (field_names::STORAGE_BACKEND): "postgres"}))
                     .into_response()
             }
             Err(e) => store_err_to_response(e),
@@ -497,7 +497,7 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
 
     let lock = app.db.lock().await;
     match db::gc(&lock.0, lock.3) {
-        Ok(n) => Json(json!({"expired_deleted": n})).into_response(),
+        Ok(n) => Json(json!({(field_names::EXPIRED_DELETED): n})).into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
@@ -556,7 +556,7 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             "memories": mems,
             "links": links,
             "count": count,
-            "exported_at": Utc::now().to_rfc3339(),
+            (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
             (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
@@ -567,7 +567,7 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
     match (db::export_all(&lock.0), db::export_links(&lock.0)) {
         (Ok(memories), Ok(links)) => {
             let count = memories.len();
-            Json(json!({"memories": memories, "links": links, "count": count, "exported_at": Utc::now().to_rfc3339()})).into_response()
+            Json(json!({"memories": memories, "links": links, "count": count, (field_names::EXPORTED_AT): Utc::now().to_rfc3339()})).into_response()
         }
         (Err(e), _) | (_, Err(e)) => {
             tracing::error!("export error: {e}");
@@ -657,7 +657,7 @@ pub async fn import_memories(
                 && orig != caller
             {
                 obj.insert(
-                    "imported_from_agent_id".to_string(),
+                    field_names::IMPORTED_FROM_AGENT_ID.to_string(),
                     serde_json::Value::String(orig),
                 );
             }

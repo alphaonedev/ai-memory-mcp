@@ -119,7 +119,7 @@ pub fn cmd_share(
         .and_then(Value::as_str)
         .unwrap_or("?");
     let from_agent = envelope
-        .get("from_agent_id")
+        .get(field_names::FROM_AGENT_ID)
         .and_then(Value::as_str)
         .unwrap_or("?");
     writeln!(

@@ -28,6 +28,11 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
+/// Canonical schema-version probe — shared by both SAL adapters,
+/// `ai-memory boot`, and `schema-init` (#1558 batch 6).
+pub(crate) const SELECT_SCHEMA_VERSION_SQL: &str =
+    "SELECT COALESCE(MAX(version), 0) FROM schema_version";
+
 /// Column-introspection statement shared by the additive-column
 /// migration arms (one spelling; pm-v3.1 hardcoded-literal gate,
 /// #1558 wave 4).
@@ -1059,11 +1064,7 @@ const MIGRATION_V55_SQLITE: &str =
 #[allow(clippy::too_many_lines)]
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |r| r.get(0),
-        )
+        .query_row(SELECT_SCHEMA_VERSION_SQL, [], |r| r.get(0))
         .unwrap_or(0);
 
     if version >= CURRENT_SCHEMA_VERSION {
@@ -1960,9 +1961,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 match col?.as_str() {
-                    "confidence_source" => has_source = true,
+                    field_names::CONFIDENCE_SOURCE => has_source = true,
                     field_names::CONFIDENCE_SIGNALS => has_signals = true,
-                    "confidence_decayed_at" => has_decayed_at = true,
+                    field_names::CONFIDENCE_DECAYED_AT => has_decayed_at = true,
                     _ => {}
                 }
             }
@@ -2242,9 +2243,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     ("citations", "TEXT"),
                     (field_names::SOURCE_URI, "TEXT"),
                     (field_names::SOURCE_SPAN, "TEXT"),
-                    ("confidence_source", "TEXT"),
+                    (field_names::CONFIDENCE_SOURCE, "TEXT"),
                     (field_names::CONFIDENCE_SIGNALS, "TEXT"),
-                    ("confidence_decayed_at", "TEXT"),
+                    (field_names::CONFIDENCE_DECAYED_AT, "TEXT"),
                     ("mentioned_entity_id", "TEXT"),
                     ("version", "INTEGER"),
                 ] {

@@ -1218,7 +1218,7 @@ pub async fn create_memory(
                         "code": crate::errors::error_codes::CONFLICT,
                         "existing_id": conflict.existing_id,
                         "existing_title": conflict.existing_title,
-                        "similarity": conflict.similarity,
+                        (field_names::SIMILARITY): conflict.similarity,
                         "reason": conflict.reason,
                         "hint": "pass force=true to insert anyway",
                     })),

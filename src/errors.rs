@@ -215,6 +215,24 @@ pub mod msg {
     pub fn unsubscribe(e: impl std::fmt::Display) -> String {
         format!("unsubscribe: {e}")
     }
+
+    /// `"opening {path}"` — fs-open `.with_context` label (#1558 batch 6).
+    #[must_use]
+    pub fn opening(path: impl std::fmt::Display) -> String {
+        format!("opening {path}")
+    }
+
+    /// `"reading {path}"` — fs-read `.with_context` label (#1558 batch 6).
+    #[must_use]
+    pub fn reading(path: impl std::fmt::Display) -> String {
+        format!("reading {path}")
+    }
+
+    /// `"writing {path}"` — fs-write `.with_context` label (#1558 batch 6).
+    #[must_use]
+    pub fn writing(path: impl std::fmt::Display) -> String {
+        format!("writing {path}")
+    }
 }
 
 #[cfg(test)]

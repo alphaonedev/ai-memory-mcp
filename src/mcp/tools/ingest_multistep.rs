@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 
 use crate::config::FeatureTier;
 use crate::mcp::param_names;
+use crate::models::field_names;
 #[cfg(test)]
 use crate::multistep_ingest::MockLlmDispatch;
 use crate::multistep_ingest::{
@@ -120,9 +121,9 @@ pub fn handle_ingest_multistep(
     // ── Tier gate ───────────────────────────────────────────────────
     if tier == FeatureTier::Keyword || handler.is_none() {
         return Ok(json!({
-            "tier-locked": "memory_ingest_multistep requires smart tier or higher",
-            "current_tier": tier.as_str(),
-            "required_tier": REQUIRED_TIER,
+            (field_names::TIER_LOCKED): "memory_ingest_multistep requires smart tier or higher",
+            (field_names::CURRENT_TIER): tier.as_str(),
+            (field_names::REQUIRED_TIER): REQUIRED_TIER,
         }));
     }
     let handler = handler.expect("checked above");

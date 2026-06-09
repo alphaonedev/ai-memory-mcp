@@ -881,7 +881,7 @@ pub async fn kg_invalidate(
                     "target_id": body.target_id,
                     "relation": body.relation,
                     (field_names::VALID_UNTIL): res.valid_until,
-                    "previous_valid_until": res.previous_valid_until,
+                    (field_names::PREVIOUS_VALID_UNTIL): res.previous_valid_until,
                 })),
             )
                 .into_response(),
@@ -915,7 +915,7 @@ pub async fn kg_invalidate(
                 "target_id": body.target_id,
                 "relation": body.relation,
                 (field_names::VALID_UNTIL): res.valid_until,
-                "previous_valid_until": res.previous_valid_until,
+                (field_names::PREVIOUS_VALID_UNTIL): res.previous_valid_until,
             })),
         )
             .into_response(),

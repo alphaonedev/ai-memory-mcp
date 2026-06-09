@@ -49,6 +49,11 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime_context::RuntimeContext;
 
+/// Canonical `consolidate` operation label — shared by the audit op
+/// vocabulary, the autonomy rollback tags, and the governance action
+/// adapter (#1558 batch 6).
+pub(crate) const OP_CONSOLIDATE: &str = "consolidate";
+
 /// Stable schema version stamped on every emitted line. Bump only when
 /// a field's semantics change in a way SIEM parsers care about
 /// (renaming, removing, or repurposing). Adding optional fields does
@@ -167,7 +172,7 @@ impl AuditAction {
             Self::Link => "link",
             Self::Promote => "promote",
             Self::Forget => "forget",
-            Self::Consolidate => "consolidate",
+            Self::Consolidate => OP_CONSOLIDATE,
             Self::Export => "export",
             Self::Import => "import",
             Self::Approve => "approve",
@@ -768,7 +773,7 @@ impl VerifyReport {
 /// # Errors
 /// - The file cannot be opened or read.
 pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     verify_chain_from_reader(file)
 }
 

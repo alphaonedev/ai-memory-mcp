@@ -25,7 +25,7 @@ pub fn handle_expand_query(llm: Option<&OllamaClient>, params: &Value) -> Result
     // cases below; real-LLM behaviour is validated end-to-end via
     // the LongMemEval benchmark (see `benchmarks/longmemeval/`).
     let terms = llm.expand_query(query).map_err(|e| e.to_string())?;
-    Ok(json!({"original": query, "expanded_terms": terms}))
+    Ok(json!({"original": query, (crate::models::field_names::EXPANDED_TERMS): terms}))
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_expand_query ---

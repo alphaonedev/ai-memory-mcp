@@ -473,13 +473,16 @@ pub fn reflect_with_hooks(
         serde_json::Value::String(input.agent_id.clone()),
     );
     // Splice reflection_metadata only when the caller didn't pre-set it.
-    if !metadata.contains_key("reflection_metadata") {
+    if !metadata.contains_key(field_names::REFLECTION_METADATA) {
         let reflection_meta = serde_json::json!({
             "reflected_on_source_ids": input.source_ids,
             (field_names::REFLECTION_DEPTH): new_depth_i32,
             "reflection_created_at": now,
         });
-        metadata.insert("reflection_metadata".to_string(), reflection_meta);
+        metadata.insert(
+            field_names::REFLECTION_METADATA.to_string(),
+            reflection_meta,
+        );
     }
     let metadata_value = serde_json::Value::Object(metadata);
     // Re-validate the merged metadata so an oversized splice surfaces

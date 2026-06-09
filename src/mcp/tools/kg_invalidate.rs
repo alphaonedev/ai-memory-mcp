@@ -176,7 +176,7 @@ pub fn handle_kg_invalidate(
                 "target_id": target_id,
                 "relation": relation,
                 (field_names::VALID_UNTIL): res.valid_until,
-                "previous_valid_until": res.previous_valid_until,
+                (field_names::PREVIOUS_VALID_UNTIL): res.previous_valid_until,
             }))
         }
         None => Ok(json!({

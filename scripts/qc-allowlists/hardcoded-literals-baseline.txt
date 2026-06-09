@@ -1,151 +1,31 @@
 # hardcoded-literal duplication baseline (ratchet; counts may only DECREASE).
 # Regenerate with: scripts/check-hardcoded-literals.sh --update-baseline
 # Format: <site-count><TAB><literal>. Burn this down; never grow it.
-4	agent_pubkey
-5	.ai-memory
 3	AI_MEMORY_LLM_API_KEY
 3	AI_MEMORY_LLM_BACKEND
 4	AI_MEMORY_LLM_BASE_URL
-3	allowed_tools
-3	already exists
 3	ANTHROPIC_API_KEY
 4	{}/api/tags
 3	application/json
-4	archived_memories
-4	archive_reason
-3	atom_count
-3	atomisation_archived_at
-3	autonomous
-4	begin AGE tx
-4	by_namespace
-3	by_source_uri
-4	candidates_scanned
-4	checked above
-3	collective
-3	command_regex
-3	command_substring
-5	commit AGE tx
-3	compatibility
 3	confidence
-4	confidence_decayed_at
-4	confidence_source
-4	config.json
-6	consolidate
-4	content_len
-4	content_sha256
 3	content-type
-3	contradicts
 4	create_time
-3	current_tier
-3	custom_kind
-4	decided_at
 4	{decision}
-3	default_timeout_seconds
-5	DELETE FROM memories WHERE id = $1
-3	DELETE FROM memories WHERE id = ?1
-3	DELETE FROM namespace_meta WHERE standard_id = ?1
-3	derives_from
-4	dim_violations
-3	earliest_updated_at
-4	elapsed_ms
-4	event_types
-3	excluded_for_scope
-3	excluded_for_scope_private
-4	expanded_terms
-3	expired_at
-3	expired_deleted
-3	exported_at
-4	from_agent_id
-3	generated_at
 3	GOOGLE_API_KEY
-5	governance
 9	http://localhost:11434
-3	imported_from_agent_id
-4	include_invalidated
-3	invalid id: {e}
-4	is_duplicate
-3	is_reflection
-3	just-inserted array
-7	just-inserted object
-4	key_source
-4	last_seen_at
-4	latency_ms
-3	latest_updated_at
-3	LLM Reachability (#1146)
-6	LOAD 'age'
-4	local_depth_at_arrival
-3	manifest.json
-3	max_skew_secs
-3	memories_dropped
 5	mini_lm_l6_v2
-3	model.safetensors
-3	ms-marco-MiniLM-L-6-v2
-4	must be a string
-4	namespaces
-4	_namespace_standard
 3	nomic-ai/nomic-embed-text-v1.5
-4	nomic-embed-text
 4	nomic-embed-text-v1.5
 4	nomic_embed_v15
-3	observation
-4	observations
 3	OPENAI_API_KEY
-6	opening {}
 6	openrouter
-4	operator.key
-3	operator_signed
-4	original_depth
-3	parameters_schema
-3	previous_valid_until
-3	public_key
-4	public_key_b64
-4	raw SQL section — only available in --db mode
-3	reading {}
-3	recall_mode_active
-4	reflection
-4	reflection_id
-4	reflection_metadata
-4	reflections
-4	reflects_on
-4	requested_at
-3	required_tier
-3	reranker_active
-4	resource_path
 3	schema_version
-3	scope_status
-5	SELECT COALESCE(MAX(version), 0) FROM schema_version
-3	SELECT COUNT(*) > 0 FROM memories WHERE id = ?1
-3	SELECT create_graph('memory_graph')
-4	SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)
-3	SELECT * FROM memories WHERE id = ?1
-3	SELECT id FROM memories WHERE id = $1
-3	SELECT metadata FROM memories WHERE namespace = $1 AND title = $2
 4	sentence-transformers/all-MiniLM-L6-v2
-6	SET LOCAL search_path = ag_catalog, \
-4	set search_path
-4	signing_agent
-4	similarity
-3	skill_description
-3	{stem}.manifest.json
-4	subscription
-3	subscriptions
-3	_subscriptions/{caller}
-3	synchronous
-4	synthesized
 5	T0-A1-CORE
 4	T0-A2-CORE
 3	T0-A2-FULL
 3	T0-A2-GRAPH
 3	T0-CONTRACT
-4	tier-locked
 6	to_describe_to_user
-3	tokenizer.json
-3	to_namespace
-4	total_count
-4	unread_only
-3	updated_since
-3	verify_link select
 3	What tools do you have available right now? Answer in one sentence to a non-technical user.
-3	write chain report
-3	writing {}
 3	XAI_API_KEY

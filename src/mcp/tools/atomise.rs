@@ -188,9 +188,9 @@ pub fn handle_atomise(
     // and the rest of the v0.7 tier-gated surface).
     if tier == FeatureTier::Keyword || handler.is_none() {
         return Ok(json!({
-            "tier-locked": "memory_atomise requires smart tier or higher",
-            "current_tier": tier.as_str(),
-            "required_tier": REQUIRED_TIER,
+            (field_names::TIER_LOCKED): "memory_atomise requires smart tier or higher",
+            (field_names::CURRENT_TIER): tier.as_str(),
+            (field_names::REQUIRED_TIER): REQUIRED_TIER,
         }));
     }
     let handler = handler.expect("checked above");
@@ -211,7 +211,7 @@ pub fn handle_atomise(
         Ok(result) => Ok(json!({
             "source_id": result.source_id,
             "atom_ids": result.atom_ids,
-            "atom_count": result.atom_count,
+            (field_names::ATOM_COUNT): result.atom_count,
             (field_names::ARCHIVED_AT): result.archived_at,
         })),
         Err(AtomiseError::NotFound) => Err(format!("MEMORY_NOT_FOUND: {memory_id}")),
@@ -222,12 +222,12 @@ pub fn handle_atomise(
             "already_atomised": true,
             "source_id": source_id,
             "existing_atom_ids": existing_atom_ids,
-            "atom_count": existing_atom_ids.len(),
+            (field_names::ATOM_COUNT): existing_atom_ids.len(),
         })),
         Err(AtomiseError::TierLocked) => Ok(json!({
-            "tier-locked": "memory_atomise requires smart tier or higher",
-            "current_tier": tier.as_str(),
-            "required_tier": REQUIRED_TIER,
+            (field_names::TIER_LOCKED): "memory_atomise requires smart tier or higher",
+            (field_names::CURRENT_TIER): tier.as_str(),
+            (field_names::REQUIRED_TIER): REQUIRED_TIER,
         })),
         Err(AtomiseError::CuratorFailed(detail)) => Err(format!("CURATOR_FAILED: {detail}")),
         Err(AtomiseError::SourceTooSmall) => Ok(json!({

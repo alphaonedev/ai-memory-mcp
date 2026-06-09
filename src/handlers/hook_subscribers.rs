@@ -26,6 +26,9 @@ use super::store_err_to_response;
 use super::{AppState, Db};
 use super::{fanout_or_503, list_namespaces, resolve_caller_agent_id};
 
+/// Marker tag on namespace-standard rows (#1558 batch 6).
+const NAMESPACE_STANDARD_TAG: &str = "_namespace_standard";
+
 #[derive(Deserialize)]
 pub struct InboxQuery {
     #[serde(default)]
@@ -117,8 +120,8 @@ pub async fn get_inbox(
                                 .get("agent_id")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
-                            "from_agent_id": m.metadata
-                                .get("from_agent_id")
+                            (field_names::FROM_AGENT_ID): m.metadata
+                                .get(field_names::FROM_AGENT_ID)
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
                             (field_names::TARGET_AGENT_ID): m.metadata
@@ -154,7 +157,7 @@ pub async fn get_inbox(
 
     let mut params = json!({"agent_id": owner});
     if let Some(u) = q.unread_only {
-        params["unread_only"] = json!(u);
+        params[field_names::UNREAD_ONLY] = json!(u);
     }
     if let Some(l) = q.limit {
         params["limit"] = json!(l);
@@ -333,7 +336,7 @@ async fn set_namespace_standard_inner(
             let existing = match app.store.list(&ctx, &filter).await {
                 Ok(rows) => rows
                     .into_iter()
-                    .find(|m| m.tags.iter().any(|t| t == "_namespace_standard"))
+                    .find(|m| m.tags.iter().any(|t| t == NAMESPACE_STANDARD_TAG))
                     .map(|m| m.id),
                 Err(_) => None,
             };
@@ -370,7 +373,7 @@ async fn set_namespace_standard_inner(
                     namespace: ns.to_string(),
                     title: format!("_standard:{ns}"),
                     content: format!("namespace standard for {ns}"),
-                    tags: vec!["_namespace_standard".to_string()],
+                    tags: vec![NAMESPACE_STANDARD_TAG.to_string()],
                     priority: 5,
                     confidence: 1.0,
                     source: "api".into(),
@@ -566,7 +569,7 @@ async fn set_namespace_standard_inner(
             None,
             None,
             None,
-            Some("_namespace_standard"),
+            Some(NAMESPACE_STANDARD_TAG),
             None,
         )
         .ok()
@@ -661,7 +664,7 @@ async fn set_namespace_standard_inner(
                 namespace: ns.to_string(),
                 title: format!("_standard:{ns}"),
                 content: format!("namespace standard for {ns}"),
-                tags: vec!["_namespace_standard".to_string()],
+                tags: vec![NAMESPACE_STANDARD_TAG.to_string()],
                 priority: 5,
                 confidence: 1.0,
                 source: "api".into(),

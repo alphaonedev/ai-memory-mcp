@@ -44,7 +44,7 @@ pub fn handle_recall_observations(
         .map_err(|e| e.to_string())?;
     let count = rows.len();
     Ok(json!({
-        "observations": rows,
+        (crate::models::field_names::OBSERVATIONS): rows,
         "count": count,
     }))
 }

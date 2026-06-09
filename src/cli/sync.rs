@@ -77,7 +77,7 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
             && orig != caller_id
         {
             obj.insert(
-                "imported_from_agent_id".to_string(),
+                crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
                 serde_json::Value::String(orig),
             );
         }

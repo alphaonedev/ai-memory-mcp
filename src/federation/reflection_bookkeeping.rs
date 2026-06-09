@@ -128,8 +128,8 @@ pub fn stamp_reflection_origin(mem: &Memory, sender_agent_id: &str, local_cap: u
     if !meta_map.contains_key(REFLECTION_ORIGIN_KEY) {
         let stamp = serde_json::json!({
             (field_names::PEER_ORIGIN): sender_agent_id,
-            "original_depth": mem.reflection_depth,
-            "local_depth_at_arrival": local_cap,
+            (field_names::ORIGINAL_DEPTH): mem.reflection_depth,
+            (field_names::LOCAL_DEPTH_AT_ARRIVAL): local_cap,
         });
         meta_map.insert(REFLECTION_ORIGIN_KEY.to_string(), stamp);
     }
@@ -176,7 +176,7 @@ pub fn reflection_origin_from_memory(mem: &Memory) -> ReflectionOrigin {
         .and_then(Value::as_str)
         .map(str::to_string);
     let local_depth_at_arrival = origin_obj
-        .and_then(|v| v.get("local_depth_at_arrival"))
+        .and_then(|v| v.get(field_names::LOCAL_DEPTH_AT_ARRIVAL))
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok());
     ReflectionOrigin {

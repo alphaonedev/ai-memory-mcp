@@ -54,7 +54,7 @@ pub fn cmd_inbox(
         params["agent_id"] = json!(a);
     }
     if args.unread_only {
-        params["unread_only"] = json!(true);
+        params[crate::models::field_names::UNREAD_ONLY] = json!(true);
     }
     if let Some(l) = args.limit {
         params["limit"] = json!(l);

@@ -5,6 +5,7 @@
 
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -88,7 +89,7 @@ pub(super) fn handle_get_taxonomy(
         db::get_taxonomy(conn, prefix_owned.as_deref(), depth, limit).map_err(|e| e.to_string())?;
     Ok(json!({
         "tree": tax.tree,
-        "total_count": tax.total_count,
+        (field_names::TOTAL_COUNT): tax.total_count,
         "truncated": tax.truncated,
     }))
 }

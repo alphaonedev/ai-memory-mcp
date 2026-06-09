@@ -240,6 +240,9 @@ const ORIGINAL_WEIGHT: f64 = 0.6;
 const CROSS_ENCODER_WEIGHT: f64 = 0.4;
 
 const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+/// Bare configured-model spelling for the default reranker — shared with
+/// the `ai-memory config migrate` template (#1558 batch 6).
+pub(crate) const DEFAULT_RERANKER_MODEL: &str = "ms-marco-MiniLM-L-6-v2";
 const CROSS_ENCODER_MAX_SEQ: usize = 512;
 const CROSS_ENCODER_HIDDEN_DIM: usize = 384;
 
@@ -435,13 +438,13 @@ impl CrossEncoder {
         ));
 
         let config_path = repo
-            .get("config.json")
+            .get(crate::embeddings::HF_CONFIG_FILE)
             .context("failed to download config.json")?;
         let tokenizer_path = repo
-            .get("tokenizer.json")
+            .get(crate::embeddings::HF_TOKENIZER_FILE)
             .context("failed to download tokenizer.json")?;
         let weights_path = repo
-            .get("model.safetensors")
+            .get(crate::embeddings::HF_WEIGHTS_FILE)
             .context("failed to download model.safetensors")?;
 
         // Load BERT config
