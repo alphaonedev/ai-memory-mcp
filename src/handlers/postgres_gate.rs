@@ -200,6 +200,13 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("POST", "/api/v1/session/start") => true,
         ("POST", p) if memory_promote_path(p) => true,
         ("POST", p) if approvals_decide_path(p) => true,
+        // #1548/#1549 — recursive-learning surfaces now routed through
+        // the SAL trait on postgres (`MemoryStore::reflect` /
+        // `get_reflection_origin` / `list_recall_observations`), so the
+        // gate permits them to reach the handler's postgres branch.
+        ("POST", "/api/v1/memory_reflect") => true,
+        ("POST", "/api/v1/memory_reflection_origin") => true,
+        ("POST", "/api/v1/memory_recall_observations") => true,
         _ => false,
     }
 }
@@ -821,6 +828,24 @@ mod transport_postgres_gate_tests {
         ));
         assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/search"));
         assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/links"));
+    }
+
+    #[test]
+    fn postgres_gate_passes_recursive_learning_routes() {
+        // #1548/#1549 — reflect / reflection_origin / recall_observations
+        // are now SAL-routed on postgres and must pass the gate.
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_reflect"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_reflection_origin"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/memory_recall_observations"
+        ));
     }
 
     #[test]

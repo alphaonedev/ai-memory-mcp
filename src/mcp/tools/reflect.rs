@@ -50,7 +50,7 @@ use std::path::Path;
 ///   registered) but pinned so the wire-shape can't drift under a
 ///   future MCP-side hook wire-in.
 /// * `Database(m)` → raw `m`.
-fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
+pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
     match err {
         db::ReflectError::Validation(m) => m,
         db::ReflectError::SourceNotFound(id) => format!("source memory not found: {id}"),
@@ -80,6 +80,92 @@ fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
         }
         db::ReflectError::Database(m) => m,
     }
+}
+
+/// Parse a `memory_reflect` request `Value` into a [`db::ReflectInput`]
+/// plus the optional caller-asserted `depth` (#1325). Shared by the
+/// sqlite MCP path ([`handle_reflect`]) and the postgres SAL HTTP path
+/// ([`crate::handlers::route_1111::handle_reflect_http`]) so the wire
+/// argument contract lives in exactly one place.
+///
+/// # Errors
+/// Returns a wire-ready error string when a required field is missing
+/// or malformed (`source_ids`, `title`, `content`, `tier`, `depth`).
+// Only the postgres SAL HTTP branch (sal-gated) calls this in a non-test
+// build; the unit tests below exercise it in every feature set.
+#[cfg_attr(not(feature = "sal"), allow(dead_code))]
+pub(crate) fn parse_reflect_input(
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<(db::ReflectInput, Option<i64>), String> {
+    let source_ids_arr = params["source_ids"]
+        .as_array()
+        .ok_or("source_ids is required (array of memory IDs)")?;
+    if source_ids_arr.is_empty() {
+        return Err("source_ids cannot be empty".to_string());
+    }
+    let mut source_ids: Vec<String> = Vec::with_capacity(source_ids_arr.len());
+    for (i, v) in source_ids_arr.iter().enumerate() {
+        match v.as_str() {
+            Some(s) => source_ids.push(s.to_string()),
+            None => return Err(format!("source_ids[{i}] must be a string")),
+        }
+    }
+    let title = params["title"]
+        .as_str()
+        .ok_or("title is required")?
+        .to_string();
+    let content = params["content"]
+        .as_str()
+        .ok_or("content is required")?
+        .to_string();
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
+    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let namespace = params["namespace"].as_str().map(str::to_string);
+    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
+    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let tags: Vec<String> = params["tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let metadata = if params["metadata"].is_object() {
+        params["metadata"].clone()
+    } else {
+        serde_json::json!({})
+    };
+    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    if let Some(d) = caller_depth {
+        if d < 0 {
+            return Err(format!(
+                "CALLER_DEPTH_MISMATCH: depth must be a non-negative integer (got depth={d})"
+            ));
+        }
+    }
+    let explicit_agent_id = params["agent_id"]
+        .as_str()
+        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
+        .map_err(|e| e.to_string())?;
+    let input = db::ReflectInput {
+        source_ids,
+        title,
+        content,
+        namespace,
+        tier,
+        tags,
+        priority,
+        confidence,
+        // Vendor-neutral substrate default (#1175) — role-categorical,
+        // not vendor; NHI identity lives in `metadata.agent_id`.
+        source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
+        agent_id,
+        metadata,
+    };
+    Ok((input, caller_depth))
 }
 
 pub fn handle_reflect(
@@ -521,6 +607,98 @@ mod tests {
     use crate::models::{Memory, MemoryKind};
     use crate::storage as db;
     use serde_json::json;
+
+    // ── #1549 parse_reflect_input coverage ──────────────────────────
+    #[test]
+    fn parse_reflect_input_happy_path() {
+        let params = json!({
+            "source_ids": ["a", "b"],
+            "title": "t",
+            "content": "c",
+            "namespace": "ns",
+            "tier": "long",
+            "priority": 7,
+            "confidence": 0.5,
+            "tags": ["x", "y"],
+            "agent_id": "ai:tester@host",
+        });
+        let (input, caller_depth) = parse_reflect_input(&params, None).expect("parse ok");
+        assert_eq!(input.source_ids, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(input.title, "t");
+        assert_eq!(input.content, "c");
+        assert_eq!(input.namespace.as_deref(), Some("ns"));
+        assert_eq!(input.tier, Tier::Long);
+        assert_eq!(input.priority, 7);
+        assert!((input.confidence - 0.5).abs() < f64::EPSILON);
+        assert_eq!(input.tags, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(input.agent_id, "ai:tester@host");
+        assert_eq!(caller_depth, None);
+    }
+
+    #[test]
+    fn parse_reflect_input_defaults_when_optional_fields_absent() {
+        let params = json!({ "source_ids": ["a"], "title": "t", "content": "c" });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        // tier defaults to Mid; priority 5; confidence 1.0; namespace None.
+        assert_eq!(input.tier, Tier::Mid);
+        assert_eq!(input.priority, 5);
+        assert!((input.confidence - 1.0).abs() < f64::EPSILON);
+        assert!(input.namespace.is_none());
+        assert!(input.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_reflect_input_missing_source_ids_errors() {
+        let err = parse_reflect_input(&json!({ "title": "t", "content": "c" }), None).unwrap_err();
+        assert!(err.contains("source_ids is required"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_empty_source_ids_errors() {
+        let err = parse_reflect_input(
+            &json!({ "source_ids": [], "title": "t", "content": "c" }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("source_ids cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_non_string_source_errors() {
+        let err = parse_reflect_input(
+            &json!({ "source_ids": [1], "title": "t", "content": "c" }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("must be a string"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_missing_title_errors() {
+        let err =
+            parse_reflect_input(&json!({ "source_ids": ["a"], "content": "c" }), None).unwrap_err();
+        assert!(err.contains("title is required"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_negative_depth_is_caller_depth_mismatch() {
+        let err = parse_reflect_input(
+            &json!({ "source_ids": ["a"], "title": "t", "content": "c", "depth": -1 }),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("CALLER_DEPTH_MISMATCH"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_reflect_input_returns_caller_depth_when_present() {
+        let (_, caller_depth) = parse_reflect_input(
+            &json!({ "source_ids": ["a"], "title": "t", "content": "c", "depth": 3 }),
+            None,
+        )
+        .expect("parse ok");
+        assert_eq!(caller_depth, Some(3));
+    }
 
     fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");

@@ -154,7 +154,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // justified: it collapses the postgres bulk_create path from 2N
     // round-trips to 1+G on the canonical SAL surface, no speculative
     // surface. 16_080 = 15_998 + 82 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 16_080),
+    // #1549 — postgres SAL coverage for the recursive-learning surfaces
+    // (reflect / get_reflection_origin / list_recall_observations trait
+    // impls) added ~76 LOC of native-sqlx methods. Bumped in lockstep.
+    ("src/store/postgres.rs", 16_200),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
@@ -208,7 +211,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // existing [embeddings] config block into the daemon embedder build
     // path (no speculative surface). 7850 = 7766 + 84 headroom; far under
     // the 1.5x cap.
-    ("src/daemon_runtime.rs", 7_850),
+    // #1548 — the curator `--store-url` SAL store-build path
+    // (`build_curator_store` + the Curator dispatch arm) added ~34 LOC.
+    // Bumped in lockstep.
+    ("src/daemon_runtime.rs", 7_950),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

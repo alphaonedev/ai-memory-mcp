@@ -21,6 +21,12 @@
 //! All items are at most `pub(crate)` — nothing escapes the crate
 //! boundary through this module.
 
+// Most clustering strategies here are exercised only by the SAL-gated
+// curator passes (ConsolidationPass / ReflectionPass); in a non-sal build
+// the config-default threshold const is the only live item, so relax the
+// dead-code lint there only — sal builds still enforce it fully.
+#![cfg_attr(not(feature = "sal"), allow(dead_code))]
+
 use std::collections::HashSet;
 
 use crate::embeddings::Embedder;

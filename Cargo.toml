@@ -382,6 +382,9 @@ harness = false
 [[bench]]
 name = "longmemeval_reflection"
 harness = false
+# Issue #1548 — the curator reflection pass it drives operates over the
+# SAL `MemoryStore` trait (`run_reflection_pass`), which is `sal`-gated.
+required-features = ["sal"]
 
 # v0.7.0 Wave-2 Tier-C3 (issue #968) — HNSW async-rebuild micro-bench.
 # Measures p95 search latency DURING a `rebuild_async` call to pin the

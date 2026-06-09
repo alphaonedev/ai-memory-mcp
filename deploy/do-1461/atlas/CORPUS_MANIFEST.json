@@ -1,0 +1,12 @@
+{
+  "corpus": "atlas-clean-memories.jsonl",
+  "sha256": "b0b61fa5fcda0f4760a13573ebbde350cade2c1ca3ed4670b2cff57b93042143",
+  "rows": 7912,
+  "distinct_title_namespace": 7855,
+  "namespace": "atlas-corpus",
+  "scrub_report_sha256": "c70a6f4a0ecc19a5db9be59690bdd596d012abf7b74f65e9ffd80d4cb0ca9fe6",
+  "provenance": "copyright-clean derived-facts-only (LLM paraphrase + provenance metadata); verbatim quotes/transcripts dropped+scrubbed; leak_guard_residual_verbatim=0",
+  "kinds": {"claim": 4212, "concept": 3700},
+  "source": "knowledge-atlas video cards (1014 files, 7971 entries -> 7912 emitted)",
+  "note": "Pinned for peer-review reproducibility (#1535). The corpus file is gitignored (7.3MB); this manifest commits its identity. Loaded into the max-secure hive via an ATTESTED bulk loader (atlas/ingest), since the hive enforces AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1."
+}

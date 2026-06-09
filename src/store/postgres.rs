@@ -10416,6 +10416,118 @@ impl MemoryStore for PostgresStore {
         Ok(new_id)
     }
 
+    async fn reflect(
+        &self,
+        ctx: &CallerContext,
+        input: &crate::storage::reflect::ReflectInput,
+        signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
+        // Delegate to the fully-implemented inherent native-sqlx port
+        // (validation → source load → depth → governance cap →
+        // depth-exceeded signed_events audit → atomic memory + signed
+        // reflects_on links). `signing_key` threads through to
+        // `create_link_signed` so the edges land `self_signed`.
+        let mut hooks = crate::db::ReflectHooks::empty();
+        hooks.active_keypair = signing_key;
+        self.reflect_with_hooks(ctx, input, &hooks).await
+    }
+
+    async fn get_reflection_origin(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<crate::federation::reflection_bookkeeping::ReflectionOrigin>> {
+        // Parity with the sqlite path: `reflection_origin` derives the
+        // record from an UNSCOPED row fetch (it returns only provenance
+        // metadata — peer-origin, signing agent, depth — never content),
+        // so fetch the raw row directly rather than through the
+        // visibility-gated `get`.
+        let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("select for reflection_origin", e))?;
+        match row {
+            Some(r) => {
+                let mem = Self::row_to_memory(&r)?;
+                Ok(Some(
+                    crate::federation::reflection_bookkeeping::reflection_origin_from_memory(&mem),
+                ))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn list_recall_observations(
+        &self,
+        recall_id: Option<&str>,
+        consumed: Option<bool>,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::observations::Observation>> {
+        use sqlx::Row;
+        // Postgres twin of `crate::observations::list_observations`.
+        // Dynamic filters via QueryBuilder so each predicate is a bound
+        // parameter (no string interpolation of caller input).
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT recall_id, memory_id, retriever, rank, score, consumed, \
+                    observed_at, consumed_at, consumed_by_memory_id \
+               FROM recall_observations WHERE TRUE",
+        );
+        if let Some(rid) = recall_id {
+            qb.push(" AND recall_id = ").push_bind(rid.to_string());
+        }
+        if let Some(c) = consumed {
+            qb.push(" AND consumed = ").push_bind(c);
+        }
+        if let Some(s) = since {
+            qb.push(" AND observed_at >= ").push_bind(s.to_string());
+        }
+        if let Some(u) = until {
+            qb.push(" AND observed_at <= ").push_bind(u.to_string());
+        }
+        let lim_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(" ORDER BY observed_at DESC LIMIT ")
+            .push_bind(lim_i64);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list_recall_observations", e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let observed_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("observed_at")
+                .map_err(|e| to_store_err("obs.observed_at", e))?;
+            let consumed_at: Option<chrono::DateTime<chrono::Utc>> = r
+                .try_get("consumed_at")
+                .map_err(|e| to_store_err("obs.consumed_at", e))?;
+            out.push(crate::observations::Observation {
+                recall_id: r
+                    .try_get("recall_id")
+                    .map_err(|e| to_store_err("obs.recall_id", e))?,
+                memory_id: r
+                    .try_get("memory_id")
+                    .map_err(|e| to_store_err("obs.memory_id", e))?,
+                retriever: r
+                    .try_get("retriever")
+                    .map_err(|e| to_store_err("obs.retriever", e))?,
+                rank: r.try_get("rank").map_err(|e| to_store_err("obs.rank", e))?,
+                score: r
+                    .try_get("score")
+                    .map_err(|e| to_store_err("obs.score", e))?,
+                consumed: r
+                    .try_get("consumed")
+                    .map_err(|e| to_store_err("obs.consumed", e))?,
+                observed_at: observed_at.to_rfc3339(),
+                consumed_at: consumed_at.map(|t| t.to_rfc3339()),
+                consumed_by_memory_id: r.try_get("consumed_by_memory_id").ok(),
+            });
+        }
+        Ok(out)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed

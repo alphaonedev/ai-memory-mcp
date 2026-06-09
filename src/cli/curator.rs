@@ -5,6 +5,12 @@
 //! `daemon_runtime::run_curator_daemon_with_primitives` (W3 work);
 //! this module owns only the outer wrapper and the report printer.
 
+// The SAL store-build helpers (`curator_store_url`, the `--store-url`
+// path) and their `anyhow::Result` import are only live under the
+// sal-gated curator path; relax dead-code / unused-import in a non-sal
+// build only (sal builds enforce both fully).
+#![cfg_attr(not(feature = "sal"), allow(dead_code, unused_imports))]
+
 use crate::cli::CliOutput;
 use crate::curator::reflection_pass;
 use crate::identity::keypair as identity_keypair;
@@ -73,6 +79,27 @@ pub struct CuratorArgs {
     /// flags still gate participation. Pairs with `--reflect`.
     #[arg(long)]
     pub all_namespaces: bool,
+    /// v0.7.0 #1548 — full SAL store URL. When set, the curator binds
+    /// its [`crate::store::MemoryStore`] handle to the URL-resolved
+    /// adapter instead of the SQLite path derived from `--db`, so the
+    /// reflection / consolidation passes run against a **Postgres**
+    /// (or SQLite) federated store. Mirrors `serve --store-url`.
+    ///
+    /// Accepted shapes:
+    ///
+    /// - `sqlite:///absolute/path/to/file.db` — SQLite adapter (same
+    ///   semantics as `--db`).
+    /// - `postgres://user:pass@host:port/dbname` — Postgres adapter.
+    /// - `postgresql://...` — alias for the Postgres scheme.
+    ///
+    /// `--db` and `--store-url` are mutually exclusive: passing both is
+    /// rejected at startup with a clear error (mirrors `serve`).
+    ///
+    /// Postgres-backed curators require `--features sal,sal-postgres`
+    /// at build time; otherwise the URL is rejected at startup.
+    #[cfg(feature = "sal")]
+    #[arg(long, value_name = "URL")]
+    pub store_url: Option<String>,
 }
 
 /// #1143: honor `AI_MEMORY_LLM_BACKEND` env so the `ai-memory curator`
@@ -149,13 +176,24 @@ pub async fn run(
     }
 
     if args.reflect {
-        return run_reflect(db_path, args, app_config, out);
+        return run_reflect(db_path, args, app_config, out).await;
     }
 
     if !args.once && !args.daemon {
         anyhow::bail!(
             "curator requires --once, --daemon, --reflect, --rollback <id>, or --rollback-last N"
         );
+    }
+
+    // v0.7.0 #1548 — when `--store-url` selects a Postgres adapter, the
+    // `--once` / `--daemon` upkeep sweep runs against the federated
+    // store through the SAL `MemoryStore` trait (reflection-pass
+    // upkeep). The SQLite path keeps the full pre-#1548 conn-bound
+    // daemon (auto_tag + contradiction + autonomy + persona) for exact
+    // behaviour parity, since that subsystem is not yet trait-ported.
+    #[cfg(feature = "sal")]
+    if curator_store_url(args).is_some() {
+        return run_store_backed_sweep(db_path, args, app_config, out).await;
     }
 
     let cfg = curator::CuratorConfig {
@@ -208,6 +246,211 @@ pub async fn run(
     .await
 }
 
+/// v0.7.0 #1548 — resolve the operator-supplied `--store-url` (env
+/// `AI_MEMORY_STORE_URL`) in a feature-flag-aware way. Returns `None`
+/// on builds without the `sal` feature (where the field does not exist)
+/// so the curator falls through to the legacy SQLite path.
+#[must_use]
+fn curator_store_url(args: &CuratorArgs) -> Option<&str> {
+    #[cfg(feature = "sal")]
+    {
+        args.store_url.as_deref()
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        let _ = args;
+        None
+    }
+}
+
+/// v0.7.0 #1548 — `--once` / `--daemon` upkeep against a SAL store
+/// (Postgres or SQLite by `--store-url` scheme). Runs the reflection
+/// pass over every operator-enabled namespace through the
+/// [`crate::store::MemoryStore`] trait, so a federated Postgres-backed
+/// curator performs the same recursive-refinement upkeep the SQLite
+/// daemon does via `run_reflection_pass`.
+///
+/// `--once` runs a single sweep and prints the report; `--daemon` loops
+/// every `--interval-secs` until SIGINT / SIGTERM, logging each cycle.
+///
+/// The reflection pass is LLM-backed; when no LLM client is configured
+/// the sweep returns a populated report carrying the configured-but-
+/// unreachable error (matching the `--reflect` no-LLM contract) rather
+/// than hard-failing the daemon.
+#[cfg(feature = "sal")]
+async fn run_store_backed_sweep(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let store =
+        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
+            .await?;
+
+    let keypair = load_curator_keypair_best_effort();
+    let feature_tier = app_config.effective_tier(None);
+    let llm = build_curator_llm(feature_tier);
+
+    if args.once {
+        let report = store_backed_reflection_sweep(
+            store.as_ref(),
+            llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+            keypair.as_ref(),
+            args,
+        )
+        .await;
+        if args.json {
+            writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        } else {
+            print_reflection_report(&report, out)?;
+        }
+        return Ok(());
+    }
+
+    // Daemon mode — loop the SAL reflection sweep until shutdown.
+    // SIGINT / SIGTERM flip the shared shutdown flag; the loop checks it
+    // before each cycle and the `select!` wakes the interval sleep early.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_for_signal = shutdown.clone();
+    let flag_for_signal = shutdown_flag.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        flag_for_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+        shutdown_for_signal.notify_one();
+    });
+
+    // Clamp the interval to the same [60, 86400] band the SQLite
+    // `curator::run_daemon` loop enforces, so a stray small / huge value
+    // can't busy-spin or stall the federated upkeep sweep.
+    let interval_secs = args.interval_secs.clamp(60, crate::SECS_PER_DAY as u64);
+    tracing::info!(
+        "curator SAL daemon started (store-url backend, interval={interval_secs}s, \
+         max_ops={}, dry_run={})",
+        args.max_ops,
+        args.dry_run,
+    );
+
+    while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        let report = store_backed_reflection_sweep(
+            store.as_ref(),
+            llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+            keypair.as_ref(),
+            args,
+        )
+        .await;
+        tracing::info!(
+            "curator SAL cycle: namespaces={} observations={} clusters_eligible={} \
+             reflections_persisted={} depth_refusals={} errors={} (dry_run={})",
+            report.namespaces_visited,
+            report.observations_scanned,
+            report.clusters_eligible,
+            report.reflections_persisted,
+            report.depth_refusals,
+            report.errors.len(),
+            report.dry_run,
+        );
+
+        // Sleep the interval, waking early on shutdown.
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+            () = shutdown.notified() => break,
+        }
+    }
+
+    tracing::info!("curator SAL daemon shutdown");
+    Ok(())
+}
+
+/// Run a single reflection-pass sweep over a SAL store. Shared by the
+/// `--once` and `--daemon` arms of [`run_store_backed_sweep`]. Returns
+/// a populated [`reflection_pass::ReflectionPassReport`] regardless of
+/// outcome — an unreachable LLM is surfaced as a report error, not a
+/// propagated failure, so the daemon loop never aborts on a transient
+/// provider outage.
+///
+/// All non-reserved namespaces are swept (the `--daemon` upkeep
+/// contract); per-namespace `reflection_pass.enabled` config-file
+/// gating is a v0.7.1 follow-up, identical to the `--reflect
+/// --all-namespaces` posture.
+#[cfg(feature = "sal")]
+async fn store_backed_reflection_sweep(
+    store: &dyn crate::store::MemoryStore,
+    llm: Option<&dyn crate::autonomy::AutonomyLlm>,
+    keypair: Option<&identity_keypair::AgentKeypair>,
+    args: &CuratorArgs,
+) -> reflection_pass::ReflectionPassReport {
+    // Upkeep mode sweeps every non-reserved namespace (matching the
+    // `--all-namespaces` reflection contract).
+    run_reflection_pass_with_optional_llm(
+        store,
+        llm,
+        keypair,
+        None,
+        args.max_depth,
+        args.dry_run,
+        |_ns: &str| true,
+    )
+    .await
+}
+
+/// v0.7.0 #1548 — run the reflection pass over a SAL store with an
+/// OPTIONAL LLM, folding any pass error into the returned report rather
+/// than propagating it (so a daemon sweep never aborts on a transient
+/// provider outage); when `llm` is `None` the report carries the
+/// no-LLM-configured error. Shared by [`run_reflect`] +
+/// [`store_backed_reflection_sweep`]; taking `&dyn AutonomyLlm` lets the
+/// unit tests drive it with a deterministic stub instead of a live
+/// Ollama (which `build_curator_llm` cannot construct in CI).
+#[cfg(feature = "sal")]
+async fn run_reflection_pass_with_optional_llm(
+    store: &dyn crate::store::MemoryStore,
+    llm: Option<&dyn crate::autonomy::AutonomyLlm>,
+    keypair: Option<&identity_keypair::AgentKeypair>,
+    namespace: Option<&str>,
+    max_depth: Option<u32>,
+    dry_run: bool,
+    enabled_check: impl Fn(&str) -> bool,
+) -> reflection_pass::ReflectionPassReport {
+    let stamp = || chrono::Utc::now().to_rfc3339();
+    let Some(llm_client) = llm else {
+        let mut empty = reflection_pass::ReflectionPassReport {
+            started_at: stamp(),
+            completed_at: stamp(),
+            dry_run,
+            ..Default::default()
+        };
+        empty.errors.push(
+            "no LLM client configured — set a feature tier that provides an llm_model".into(),
+        );
+        return empty;
+    };
+    match reflection_pass::run_reflection_pass(
+        store,
+        llm_client,
+        keypair,
+        namespace,
+        max_depth,
+        dry_run,
+        enabled_check,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            let mut report = reflection_pass::ReflectionPassReport {
+                started_at: stamp(),
+                completed_at: stamp(),
+                dry_run,
+                ..Default::default()
+            };
+            report.errors.push(format!("reflection pass failed: {e}"));
+            report
+        }
+    }
+}
+
 /// v0.7.0 L2-1 — reflection-pass entry point. Wires the operator's
 /// CLI flags to [`reflection_pass::run_reflection_pass`] and prints
 /// the structured report.
@@ -229,7 +472,14 @@ pub async fn run(
 /// * `--dry-run` reports proposed clusters without writing anything.
 /// * `--max-depth` is the curator-side guard rail on top of the
 ///   substrate's per-namespace policy cap.
-fn run_reflect(
+///
+/// v0.7.0 #1548 — the reflection pass operates over the SAL
+/// [`crate::store::MemoryStore`] trait, which is `sal`-gated. The
+/// `not(sal)` variant below returns a clear capability error so a
+/// binary built without `--features sal` fails loudly rather than
+/// silently dropping `--reflect`.
+#[cfg(feature = "sal")]
+async fn run_reflect(
     db_path: &Path,
     args: &CuratorArgs,
     app_config: &config::AppConfig,
@@ -242,7 +492,12 @@ fn run_reflect(
         anyhow::bail!("--reflect: --namespace and --all-namespaces are mutually exclusive");
     }
 
-    let conn = db::open(db_path).context("--reflect: db::open failed")?;
+    // v0.7.0 #1548 — resolve the SAL store handle from `--store-url`
+    // (Postgres or SQLite) when supplied, else a SQLite store at the
+    // `--db` path. The reflection pass operates over the
+    // `MemoryStore` trait so `--reflect` works against a federated
+    // Postgres store identically to the local SQLite path.
+    let store = build_reflect_store(db_path, args, app_config).await?;
 
     // Resolve the curator's signing keypair. We rely on the
     // process-wide identity (the same one `serve` uses) so every
@@ -265,29 +520,16 @@ fn run_reflect(
     let scope_single = args.namespace.is_some();
     let enabled_check = |_ns: &str| -> bool { scope_single };
 
-    let report = if let Some(llm_client) = llm.as_ref() {
-        reflection_pass::run_reflection_pass(
-            &conn,
-            llm_client,
-            keypair.as_ref(),
-            args.namespace.as_deref(),
-            args.max_depth,
-            args.dry_run,
-            enabled_check,
-        )?
-    } else {
-        // No LLM available — surface as a populated report with the
-        // configured-but-unreachable error, matching the existing
-        // `run_once` no-LLM behaviour.
-        let mut empty = reflection_pass::ReflectionPassReport {
-            dry_run: args.dry_run,
-            ..Default::default()
-        };
-        empty.errors.push(
-            "no LLM client configured — set a feature tier that provides an llm_model".into(),
-        );
-        empty
-    };
+    let report = run_reflection_pass_with_optional_llm(
+        store.as_ref(),
+        llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+        keypair.as_ref(),
+        args.namespace.as_deref(),
+        args.max_depth,
+        args.dry_run,
+        enabled_check,
+    )
+    .await;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
@@ -297,11 +539,43 @@ fn run_reflect(
     Ok(())
 }
 
+/// `not(sal)` companion of [`run_reflect`]. The reflection pass requires
+/// the SAL `MemoryStore` trait, which is `sal`-gated; a binary built
+/// without `--features sal` cannot run `--reflect`, so surface a clear
+/// capability error rather than silently dropping the mode.
+#[cfg(not(feature = "sal"))]
+#[allow(clippy::unused_async)]
+async fn run_reflect(
+    _db_path: &Path,
+    _args: &CuratorArgs,
+    _app_config: &config::AppConfig,
+    _out: &mut CliOutput<'_>,
+) -> Result<()> {
+    anyhow::bail!(
+        "curator --reflect requires a binary built with --features sal \
+         (the reflection pass operates over the SAL MemoryStore trait)"
+    )
+}
+
+/// v0.7.0 #1548 — resolve the SAL store handle for the `--reflect` mode.
+/// Mirrors [`run_store_backed_sweep`]'s builder: binds to the
+/// `--store-url` adapter (Postgres or SQLite) when supplied, else a
+/// SQLite store at the `--db` path.
+#[cfg(feature = "sal")]
+async fn build_reflect_store(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+) -> Result<std::sync::Arc<dyn crate::store::MemoryStore>> {
+    crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config).await
+}
+
 /// Load the curator's per-process signing keypair. Best-effort — if the
 /// keypair file is missing or unreadable we return `None` and the pass
 /// stamps `ai:curator` as `agent_id`. Errors are deliberately not
 /// surfaced; an operator who wants a strict-mode "fail if keypair
 /// missing" can run `ai-memory identity list` first.
+#[cfg_attr(not(feature = "sal"), allow(dead_code))]
 fn load_curator_keypair_best_effort() -> Option<identity_keypair::AgentKeypair> {
     let dir = identity_keypair::default_key_dir().ok()?;
     // We don't know which agent_id the operator wants the curator to
@@ -314,6 +588,7 @@ fn load_curator_keypair_best_effort() -> Option<identity_keypair::AgentKeypair> 
     identity_keypair::load(&first.agent_id, &dir).ok()
 }
 
+#[cfg_attr(not(feature = "sal"), allow(dead_code))]
 fn print_reflection_report(
     r: &reflection_pass::ReflectionPassReport,
     out: &mut CliOutput<'_>,
@@ -470,6 +745,8 @@ mod tests {
             namespace: None,
             max_depth: None,
             all_namespaces: false,
+            #[cfg(feature = "sal")]
+            store_url: None,
         }
     }
 
@@ -1110,6 +1387,7 @@ mod tests {
 
     // ---------- C-1 coverage uplift: --reflect modes ----------
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_requires_namespace_or_all_namespaces() {
         let mut env = TestEnv::fresh();
@@ -1125,6 +1403,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_namespace_and_all_namespaces_mutually_exclusive() {
         let mut env = TestEnv::fresh();
@@ -1139,6 +1418,7 @@ mod tests {
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_no_llm_path_emits_error_in_report() {
         // Keyword tier → no LLM → run_reflect populates `errors` and prints report.
@@ -1159,6 +1439,7 @@ mod tests {
         assert!(s.contains("no LLM client configured"));
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_no_llm_path_emits_json_report() {
         // Same as above but with --json output.
@@ -1182,6 +1463,7 @@ mod tests {
         assert!(v["dry_run"].as_bool().unwrap());
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_all_namespaces_text_output() {
         // All-namespaces with no enabled namespaces is the default-safe path.
@@ -1199,6 +1481,175 @@ mod tests {
         }
         let s = env.stdout_str();
         assert!(s.contains("reflection pass report"));
+    }
+
+    // ── #1548 coverage — the SAL `--store-url` curator path ──────────
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_url_sqlite_once_text_runs_sweep() {
+        // `--store-url sqlite:///<db> --once` routes through
+        // build_curator_store + run_store_backed_sweep (--once arm) +
+        // the no-LLM store_backed_reflection_sweep.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string()); // no LLM client
+        let mut args = default_args();
+        args.store_url = Some(format!("sqlite://{}", db.display()));
+        args.once = true;
+        args.dry_run = true;
+        {
+            let mut out = env.output();
+            run(&db, &args, &cfg, &mut out).await.unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("reflection pass report"));
+        assert!(s.contains("no LLM client configured"));
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_url_sqlite_once_json_runs_sweep() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = default_args();
+        args.store_url = Some(format!("sqlite://{}", db.display()));
+        args.once = true;
+        args.dry_run = true;
+        args.json = true;
+        {
+            let mut out = env.output();
+            run(&db, &args, &cfg, &mut out).await.unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        let errs = v["errors"].as_array().unwrap();
+        assert!(errs.iter().any(|e| e.as_str().unwrap().contains("no LLM")));
+        assert!(v["dry_run"].as_bool().unwrap());
+    }
+
+    // ── #1548 coverage — the shared with-LLM reflection helper ───────
+    // `build_curator_llm` returns None in hermetic CI (no reachable
+    // Ollama), so the with-LLM branch of run_reflection_pass_with_optional_llm
+    // is only reachable by injecting a deterministic AutonomyLlm stub —
+    // the same pattern the reflection_pass unit suite uses.
+    #[cfg(feature = "sal")]
+    struct CovStubLlm;
+    #[cfg(feature = "sal")]
+    impl crate::autonomy::AutonomyLlm for CovStubLlm {
+        fn auto_tag(&self, _title: &str, _content: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn detect_contradiction(&self, _a: &str, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn summarize_memories(&self, _memories: &[(String, String)]) -> anyhow::Result<String> {
+            Ok("stub reflection summary".to_string())
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn reflection_helper_with_stub_llm_runs_with_llm_branch() {
+        // Drives the with-LLM arm of run_reflection_pass_with_optional_llm
+        // (the run_reflection_pass dispatch) via an injected stub over a
+        // real SqliteStore — the branch build_curator_llm can't reach in CI.
+        let env = TestEnv::fresh();
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        let args = default_args();
+        let report = run_reflection_pass_with_optional_llm(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            None,
+            None,
+            args.max_depth,
+            true,
+            |_ns: &str| true,
+        )
+        .await;
+        // Empty store → an empty (but successfully produced) report; the
+        // point is the with-LLM dispatch arm executed without error.
+        assert!(report.dry_run);
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        // Exercise the stub's AutonomyLlm contract directly so the impl is
+        // covered even when an empty store forms no clusters to summarize.
+        use crate::autonomy::AutonomyLlm;
+        assert!(stub.auto_tag("t", "c").unwrap().is_empty());
+        assert!(!stub.detect_contradiction("a", "b").unwrap());
+        assert_eq!(
+            stub.summarize_memories(&[("a".to_string(), "b".to_string())])
+                .unwrap(),
+            "stub reflection summary"
+        );
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn reflection_helper_with_none_llm_reports_configured_error() {
+        // The None arm — surfaced as a populated report (not a hard error).
+        let env = TestEnv::fresh();
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let report = run_reflection_pass_with_optional_llm(
+            &store,
+            None,
+            None,
+            Some("ns"),
+            None,
+            false,
+            |_ns: &str| true,
+        )
+        .await;
+        assert!(!report.dry_run);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("no LLM client configured"))
+        );
+    }
+
+    #[cfg(all(feature = "sal", unix))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_url_sqlite_daemon_loop_returns_on_shutdown() {
+        // Covers the SAL daemon-loop arm of run_store_backed_sweep. The
+        // ctrl_c watcher is spawned AFTER build_curator_store, so the
+        // SIGINT kick waits 3s — long enough for the watcher to register
+        // even under llvm-cov instrumentation (the 200ms legacy delay
+        // races the slower instrumented store build).
+        use std::path::PathBuf;
+        let env = TestEnv::fresh();
+        let db: PathBuf = env.db_path.clone();
+        let mut cfg = config::AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = default_args();
+        args.store_url = Some(format!("sqlite://{}", db.display()));
+        args.daemon = true;
+        args.interval_secs = 60;
+        args.dry_run = true;
+        let kicker = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+            // SAFETY: kill(getpid, SIGINT) is well-defined on POSIX.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGINT);
+            }
+        });
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            run(&db, &args, &cfg, &mut out),
+        )
+        .await;
+        let _ = kicker.await;
+        assert!(res.is_ok(), "SAL daemon did not return within timeout");
+        assert!(res.unwrap().is_ok());
     }
 
     #[test]
@@ -1255,6 +1706,7 @@ mod tests {
         let _ = build_curator_llm(config::FeatureTier::Autonomous);
     }
 
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflect_with_seeded_observations_and_no_llm() {
         // Seed observations so list_namespaces returns a namespace,

@@ -153,6 +153,16 @@ pub fn reflection_origin(conn: &Connection, id: &str) -> Result<Option<Reflectio
         Some(m) => m,
         None => return Ok(None),
     };
+    Ok(Some(reflection_origin_from_memory(&mem)))
+}
+
+/// Pure derivation of a [`ReflectionOrigin`] from an already-fetched
+/// [`Memory`] — the storage-agnostic half of [`reflection_origin`].
+/// Shared by the sqlite path (which fetches via `storage::get`) and the
+/// postgres SAL path (which fetches via the `MemoryStore` trait) so the
+/// origin-metadata derivation lives in exactly one place.
+#[must_use]
+pub fn reflection_origin_from_memory(mem: &Memory) -> ReflectionOrigin {
     let is_reflection = mem.reflection_depth > 0;
     let signing_agent = mem
         .metadata
@@ -168,14 +178,14 @@ pub fn reflection_origin(conn: &Connection, id: &str) -> Result<Option<Reflectio
         .and_then(|v| v.get("local_depth_at_arrival"))
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok());
-    Ok(Some(ReflectionOrigin {
-        memory_id: mem.id,
+    ReflectionOrigin {
+        memory_id: mem.id.clone(),
         peer_origin,
         signing_agent,
         original_depth: mem.reflection_depth,
         local_depth_at_arrival,
         is_reflection,
-    }))
+    }
 }
 
 /// v0.7.0 L2-2 — enforcement hook for the LOCAL `max_reflection_depth`
@@ -299,6 +309,35 @@ mod tests {
             confidence_decayed_at: None,
             version: 1,
         }
+    }
+
+    // ── #1549 reflection_origin_from_memory coverage ─────────────────
+    #[test]
+    fn reflection_origin_from_memory_derives_all_fields() {
+        let mut mem = reflection_memory("m-derive", 2);
+        let mut meta = serde_json::Map::new();
+        meta.insert("agent_id".to_string(), serde_json::json!("ai:signer@host"));
+        meta.insert(
+            REFLECTION_ORIGIN_KEY.to_string(),
+            serde_json::json!({ "peer_origin": "peer-x", "local_depth_at_arrival": 5 }),
+        );
+        mem.metadata = serde_json::Value::Object(meta);
+        let origin = reflection_origin_from_memory(&mem);
+        assert_eq!(origin.memory_id, "m-derive");
+        assert!(origin.is_reflection);
+        assert_eq!(origin.original_depth, 2);
+        assert_eq!(origin.signing_agent.as_deref(), Some("ai:signer@host"));
+        assert_eq!(origin.peer_origin.as_deref(), Some("peer-x"));
+        assert_eq!(origin.local_depth_at_arrival, Some(5));
+    }
+
+    #[test]
+    fn reflection_origin_from_memory_non_reflection_is_flagged_false() {
+        let origin = reflection_origin_from_memory(&reflection_memory("m-base", 0));
+        assert!(!origin.is_reflection);
+        assert_eq!(origin.original_depth, 0);
+        assert!(origin.peer_origin.is_none());
+        assert!(origin.local_depth_at_arrival.is_none());
     }
 
     #[test]
