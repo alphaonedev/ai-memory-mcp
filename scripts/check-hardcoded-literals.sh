@@ -60,11 +60,23 @@ MIN_LEN=10
 # Distinct production sites at/above which a literal is "duplicated".
 DUP_THRESHOLD=3
 
-# find_test_boundary <file> — first `mod tests {` line, or a huge sentinel.
+# find_test_boundary <file> — first `mod tests {` line OR first
+# `#[cfg(test)]` attribute that introduces a MODULE (attr line whose
+# next line starts a `mod`), whichever comes first; huge sentinel when
+# neither exists. The attr+mod pairing catches test modules with
+# non-standard names (e.g. `#[cfg(test)] mod l2_2_audit_tests` in
+# src/storage/reflect.rs) that leaked test literals into the baseline
+# (#1561), while a `#[cfg(test)]` on a single mid-file item does NOT
+# truncate the production region below it.
 find_test_boundary () {
-    local f="$1" line
-    line=$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests?[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
-    [[ -z "$line" ]] && echo 999999999 || echo "$line"
+    local f="$1" line_mod line_cfg
+    line_mod=$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests?[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
+    line_cfg=$(awk '/^[[:space:]]*#\[cfg\(test\)\]/{attr=NR; next}
+                    attr && /^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+/{print attr; exit}
+                    {attr=0}' "$f" 2>/dev/null)
+    [[ -z "$line_mod" ]] && line_mod=999999999
+    [[ -z "$line_cfg" ]] && line_cfg=999999999
+    if (( line_cfg < line_mod )); then echo "$line_cfg"; else echo "$line_mod"; fi
 }
 
 # emit_literals <file> — print one `<literal>` per production occurrence
