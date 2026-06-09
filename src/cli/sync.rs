@@ -391,7 +391,7 @@ pub async fn run_daemon(
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("ai_memory=info".parse()?)
+                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?)
                 .add_directive("tower_http=info".parse()?),
         )
         .try_init();

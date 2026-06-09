@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -110,8 +111,8 @@ pub async fn get_inbox(
                             "tier": m.tier.as_str(),
                             "namespace": m.namespace,
                             "metadata": m.metadata,
-                            "created_at": m.created_at,
-                            "updated_at": m.updated_at,
+                            (field_names::CREATED_AT): m.created_at,
+                            (field_names::UPDATED_AT): m.updated_at,
                             "agent_id": m.metadata
                                 .get("agent_id")
                                 .and_then(|v| v.as_str())
@@ -120,8 +121,8 @@ pub async fn get_inbox(
                                 .get("from_agent_id")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
-                            "target_agent_id": m.metadata
-                                .get("target_agent_id")
+                            (field_names::TARGET_AGENT_ID): m.metadata
+                                .get(field_names::TARGET_AGENT_ID)
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
                         })
@@ -142,7 +143,7 @@ pub async fn get_inbox(
                         "agent_id": owner,
                         "messages": messages,
                         "unread_count": unread_count,
-                        "storage_backend": "postgres",
+                        (field_names::STORAGE_BACKEND): "postgres",
                     })),
                 )
                     .into_response()
@@ -229,7 +230,7 @@ fn namespace_standard_params(ns: &str, body: &NamespaceStandardBody) -> serde_js
         params["parent"] = json!(p);
     }
     if let Some(ref g) = body.governance {
-        params["governance"] = g.clone();
+        params[field_names::GOVERNANCE] = g.clone();
     }
     params
 }
@@ -287,7 +288,7 @@ async fn set_namespace_standard_inner(
         "",
         json!({
             "namespace": ns,
-            "standard_id": body.id.clone(),
+            (field_names::STANDARD_ID): body.id.clone(),
             "parent": body.parent.clone(),
             "has_governance": body.governance.is_some(),
         }),
@@ -537,9 +538,9 @@ async fn set_namespace_standard_inner(
                 StatusCode::CREATED,
                 Json(json!({
                     "namespace": ns,
-                    "standard_id": standard_id,
+                    (field_names::STANDARD_ID): standard_id,
                     "parent": body.parent,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -912,20 +913,20 @@ pub async fn get_namespace_standard_qs(
                     let mem_doc = match app.store.get(&ctx, &standard_id).await {
                         Ok(m) => json!({
                             "namespace": candidate,
-                            "standard_id": standard_id,
+                            (field_names::STANDARD_ID): standard_id,
                             "id": standard_id,
                             "title": m.title,
                             "content": m.content,
                             "priority": m.priority,
-                            "parent_namespace": parent,
-                            "governance": m.metadata.get(crate::META_KEY_GOVERNANCE).cloned()
+                            (field_names::PARENT_NAMESPACE): parent,
+                            (field_names::GOVERNANCE): m.metadata.get(crate::META_KEY_GOVERNANCE).cloned()
                                 .unwrap_or(serde_json::Value::Null),
                         }),
                         Err(_) => json!({
                             "namespace": candidate,
-                            "standard_id": standard_id,
+                            (field_names::STANDARD_ID): standard_id,
                             "id": standard_id,
-                            "parent_namespace": parent,
+                            (field_names::PARENT_NAMESPACE): parent,
                         }),
                     };
                     standards.push(mem_doc);
@@ -944,13 +945,13 @@ pub async fn get_namespace_standard_qs(
                     "standards": standards,
                     "resolved_namespace": closest.get("namespace").cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "standard_id": closest.get("standard_id").cloned()
+                    (field_names::STANDARD_ID): closest.get(field_names::STANDARD_ID).cloned()
                         .unwrap_or(serde_json::Value::Null),
                     "id": closest.get("id").cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "parent_namespace": closest.get("parent_namespace").cloned()
+                    (field_names::PARENT_NAMESPACE): closest.get(field_names::PARENT_NAMESPACE).cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response();
@@ -963,10 +964,10 @@ pub async fn get_namespace_standard_qs(
                     Json(json!({
                         "namespace": ns,
                         "resolved_namespace": ns,
-                        "standard_id": standard_id,
+                        (field_names::STANDARD_ID): standard_id,
                         "id": standard_id,
-                        "parent_namespace": parent,
-                        "storage_backend": "postgres",
+                        (field_names::PARENT_NAMESPACE): parent,
+                        (field_names::STORAGE_BACKEND): "postgres",
                     })),
                 )
                     .into_response();
@@ -978,10 +979,10 @@ pub async fn get_namespace_standard_qs(
             StatusCode::OK,
             Json(json!({
                 "namespace": ns,
-                "standard_id": serde_json::Value::Null,
+                (field_names::STANDARD_ID): serde_json::Value::Null,
                 "id": serde_json::Value::Null,
-                "parent_namespace": serde_json::Value::Null,
-                "storage_backend": "postgres",
+                (field_names::PARENT_NAMESPACE): serde_json::Value::Null,
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -1059,7 +1060,7 @@ async fn clear_namespace_standard_inner(
                 Json(json!({
                     "cleared": true,
                     "namespace": ns,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),

@@ -11,6 +11,8 @@
 //! A `signed_events` row is appended for the export action (Bucket 1
 //! attestation).
 
+use crate::mcp::param_names;
+use crate::models::field_names;
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -30,7 +32,7 @@ pub fn handle_skill_export(
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_export requires 'skill_id'")?;
 
-    let target_str = params["target_folder"]
+    let target_str = params[param_names::TARGET_FOLDER]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_export requires 'target_folder'")?;
@@ -264,7 +266,7 @@ pub fn handle_skill_export(
         "namespace": namespace,
         "name": name,
         "action": "export",
-        "target_folder": target_str,
+        (field_names::TARGET_FOLDER): target_str,
     });
     let ev_bytes = serde_json::to_vec(&event_payload).unwrap_or_default();
     let ev_hash = payload_hash(&ev_bytes);
@@ -289,7 +291,7 @@ pub fn handle_skill_export(
     Ok(json!({
         "exported": true,
         "skill_id": skill_id,
-        "target_folder": target_str,
+        (field_names::TARGET_FOLDER): target_str,
         "digest": digest_hex,
         "resources_exported": exported_resources.len(),
         "files": exported_resources,

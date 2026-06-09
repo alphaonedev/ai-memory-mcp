@@ -10,6 +10,7 @@
 //! landed previously; this module wires the CLI surface so operators
 //! can replay events from a webhook subscription's delivery log.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -47,7 +48,7 @@ pub fn cmd_subscription_replay(
 ) -> Result<()> {
     let conn = db::open(db_path)?;
     let params = json!({
-        "subscription_id": args.subscription_id,
+        (field_names::SUBSCRIPTION_ID): args.subscription_id,
         "since": args.since,
     });
     let envelope = crate::mcp::handle_subscription_replay(&conn, &params, None)

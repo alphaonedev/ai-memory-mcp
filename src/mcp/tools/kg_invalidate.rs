@@ -5,6 +5,7 @@
 
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -71,7 +72,7 @@ pub fn handle_kg_invalidate(
     let relation = params["relation"].as_str().ok_or("relation is required")?;
     validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
         .map_err(|e| e.to_string())?;
-    let valid_until = params["valid_until"]
+    let valid_until = params[param_names::VALID_UNTIL]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -174,7 +175,7 @@ pub fn handle_kg_invalidate(
                 "source_id": source_id,
                 "target_id": target_id,
                 "relation": relation,
-                "valid_until": res.valid_until,
+                (field_names::VALID_UNTIL): res.valid_until,
                 "previous_valid_until": res.previous_valid_until,
             }))
         }

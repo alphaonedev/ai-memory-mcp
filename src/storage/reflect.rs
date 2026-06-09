@@ -11,6 +11,7 @@
 
 use crate::identity::keypair::AgentKeypair;
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use anyhow::Context;
 use chrono::Utc;
 use rusqlite::Connection;
@@ -475,7 +476,7 @@ pub fn reflect_with_hooks(
     if !metadata.contains_key("reflection_metadata") {
         let reflection_meta = serde_json::json!({
             "reflected_on_source_ids": input.source_ids,
-            "reflection_depth": new_depth_i32,
+            (field_names::REFLECTION_DEPTH): new_depth_i32,
             "reflection_created_at": now,
         });
         metadata.insert("reflection_metadata".to_string(), reflection_meta);
@@ -659,21 +660,27 @@ pub fn canonical_cbor_reflection_depth_exceeded(
     map.insert("agent_id", ciborium::Value::Text(agent_id.to_string()));
     map.insert("attempted", ciborium::Value::Integer(attempted.into()));
     map.insert("cap", ciborium::Value::Integer(cap.into()));
-    map.insert("created_at", ciborium::Value::Text(created_at.to_string()));
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Text(created_at.to_string()),
+    );
     map.insert("namespace", ciborium::Value::Text(namespace.to_string()));
     // v0.7.0 L2-2 — conditional inclusion preserves pre-L2-2 payload
     // hashes on the purely-local refusal path (no `peer_origin` key
     // present at all in the encoded map). Cross-peer refusals carry the
     // peer claim as a tamper-evident structured field.
     if let Some(peer) = peer_origin {
-        map.insert("peer_origin", ciborium::Value::Text(peer.to_string()));
+        map.insert(
+            field_names::PEER_ORIGIN,
+            ciborium::Value::Text(peer.to_string()),
+        );
     }
     map.insert(
         "proposed_title",
         ciborium::Value::Text(proposed_title.to_string()),
     );
     map.insert(
-        "source_ids",
+        field_names::SOURCE_IDS,
         ciborium::Value::Array(
             source_ids
                 .iter()

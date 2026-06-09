@@ -10,6 +10,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+#[cfg(feature = "sal")]
+use crate::models::field_names;
 use axum::{
     Json,
     http::{HeaderMap, StatusCode},
@@ -294,7 +296,7 @@ pub(super) async fn sync_push_via_store(
                 "applied_before_refusal": applied,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 "reset_at": reset_at,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -414,7 +416,7 @@ pub(super) async fn sync_push_via_store(
             "unsupported_on_postgres": unsupported_on_postgres,
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
             "note": "pendings / archives / restores / namespace_meta are sqlite-only \
                      in v0.7.0; memories / deletions / links round-trip via the SAL trait",
         })),

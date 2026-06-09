@@ -25,6 +25,7 @@
 //! Regression test: `share_copies_memory_into_shared_namespace`.
 
 use crate::mcp::param_names;
+use crate::models::field_names;
 use crate::{models::Memory, storage as db, validate};
 use serde_json::{Value, json};
 
@@ -55,10 +56,10 @@ pub fn shared_namespace(from_agent_id: &str, to_agent_id: &str) -> String {
 /// ```
 #[allow(dead_code)]
 pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let source_memory_id = params["source_memory_id"]
+    let source_memory_id = params[param_names::SOURCE_MEMORY_ID]
         .as_str()
         .ok_or("source_memory_id is required")?;
-    let target_agent_id = params["target_agent_id"]
+    let target_agent_id = params[param_names::TARGET_AGENT_ID]
         .as_str()
         .ok_or("target_agent_id is required")?;
 
@@ -131,9 +132,9 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
 
     Ok(json!({
         "shared_memory_id": shared_id,
-        "source_memory_id": source_memory_id,
-        "target_namespace": target_namespace,
-        "target_agent_id": target_agent_id,
+        (field_names::SOURCE_MEMORY_ID): source_memory_id,
+        (field_names::TARGET_NAMESPACE): target_namespace,
+        (field_names::TARGET_AGENT_ID): target_agent_id,
         "from_agent_id": from_agent_id,
     }))
 }

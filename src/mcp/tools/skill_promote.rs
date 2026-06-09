@@ -57,6 +57,8 @@
 //! produces it on disk. The accompanying integration test pins the
 //! contract.
 
+use crate::mcp::param_names;
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -108,7 +110,7 @@ pub fn handle_skill_promote_from_reflection(
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'reflection_id'")?;
-    let skill_name = params["skill_name"]
+    let skill_name = params[param_names::SKILL_NAME]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'skill_name'")?;
@@ -138,7 +140,7 @@ pub fn handle_skill_promote_from_reflection(
         "",
         serde_json::json!({
             "reflection_id": reflection_id,
-            "skill_name": skill_name,
+            (field_names::SKILL_NAME): skill_name,
         }),
     );
     if skill_description.len() > 1024 {
@@ -330,7 +332,7 @@ pub fn handle_skill_promote_from_reflection(
         "signed": active_keypair.is_some(),
     });
     if let Some(prev) = outcome.superseded {
-        response["superseded_id"] = json!(prev);
+        response[field_names::SUPERSEDED_ID] = json!(prev);
     }
     Ok(response)
 }

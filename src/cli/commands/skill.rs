@@ -32,6 +32,7 @@
 //! `Profile::full().expected_tool_count()` reports (canonical SSOT in
 //! `src/profile.rs`; pinned by `profile_full_matches_registry_all`).
 
+use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -293,7 +294,7 @@ fn run_register(
                     "registered skill {ns}/{name} id={id} digest={} signed={signed}",
                     &digest[..digest.len().min(16)],
                 )?;
-                if let Some(prev) = v.get("superseded_id").and_then(Value::as_str) {
+                if let Some(prev) = v.get(field_names::SUPERSEDED_ID).and_then(Value::as_str) {
                     writeln!(out.stdout, "  superseded previous id={prev}")?;
                 }
             }
@@ -327,7 +328,7 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
                     let ns = s["namespace"].as_str().unwrap_or("");
                     let name = s["name"].as_str().unwrap_or("");
                     let id = s["id"].as_str().unwrap_or("");
-                    let desc = s["description"].as_str().unwrap_or("");
+                    let desc = s[field_names::DESCRIPTION].as_str().unwrap_or("");
                     writeln!(out.stdout, "  {ns}/{name} ({id})\n    {desc}")?;
                 }
             }
@@ -399,7 +400,7 @@ fn run_export(
 ) -> Result<i32> {
     let params = json!({
         "skill_id": args.id,
-        "target_folder": args.output.to_string_lossy(),
+        (field_names::TARGET_FOLDER): args.output.to_string_lossy(),
     });
     match crate::mcp::handle_skill_export(conn, &params, active_keypair) {
         Ok(v) => {
@@ -407,7 +408,9 @@ fn run_export(
                 emit_json(out, &v)?;
             } else {
                 let fallback_folder = args.output.to_string_lossy();
-                let folder = v["target_folder"].as_str().unwrap_or(&fallback_folder);
+                let folder = v[field_names::TARGET_FOLDER]
+                    .as_str()
+                    .unwrap_or(&fallback_folder);
                 writeln!(out.stdout, "exported skill {} → {folder}", args.id)?;
             }
             Ok(0)
@@ -428,7 +431,7 @@ fn run_promote(
 ) -> Result<i32> {
     let mut params = json!({
         "reflection_id": args.id,
-        "skill_name": args.name,
+        (field_names::SKILL_NAME): args.name,
         "skill_description": args.description,
     });
     if let Some(ref p) = args.parameters_schema {
@@ -466,7 +469,7 @@ fn run_compose(
 ) -> Result<i32> {
     let mut params = json!({ "skill_id": args.id });
     if let Some(b) = args.budget_tokens {
-        params["budget_tokens"] = json!(b);
+        params[field_names::BUDGET_TOKENS] = json!(b);
     }
     match crate::mcp::handle_skill_compositional_context(conn, &params) {
         Ok(v) => {

@@ -150,6 +150,12 @@ pub mod msg {
         format!("invalid {field}: {e}")
     }
 
+    /// `"error: {e}"` — the canonical CLI stderr error line.
+    #[must_use]
+    pub fn error_line(e: impl std::fmt::Display) -> String {
+        format!("error: {e}")
+    }
+
     /// `"memory not found: {id}"`.
     #[must_use]
     pub fn memory_not_found(id: impl std::fmt::Display) -> String {

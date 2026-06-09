@@ -10,6 +10,7 @@
 //! [`crate::federation::reflection_bookkeeping`] for the substrate
 //! contract.
 
+use crate::models::field_names;
 use serde_json::{Value, json};
 
 /// MCP `memory_reflection_origin` handler. Returns the structured
@@ -48,7 +49,7 @@ pub fn handle_reflection_origin(
     match origin {
         Some(record) => Ok(json!({
             "memory_id": record.memory_id,
-            "peer_origin": record.peer_origin,
+            (field_names::PEER_ORIGIN): record.peer_origin,
             "signing_agent": record.signing_agent,
             "original_depth": record.original_depth,
             "local_depth_at_arrival": record.local_depth_at_arrival,

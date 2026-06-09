@@ -1252,7 +1252,7 @@ impl CapabilityReflection {
             depth_bounded: true,
             max_default: crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP,
             attestation: "Ed25519".to_string(),
-            curator_mode: "implemented".to_string(),
+            curator_mode: IMPLEMENTED.to_string(),
         }
     }
 }
@@ -1331,6 +1331,12 @@ fn default_capability_skills() -> CapabilitySkills {
     CapabilitySkills::current()
 }
 
+/// Capability-matrix value string — a surface is reported as
+/// `"implemented"` once its engine/hook/wrapper code is live. One named
+/// const so the 18 matrix cells share a single spelling (pm-v3.1
+/// hardcoded-literal gate, #1558 wave 4).
+const IMPLEMENTED: &str = "implemented";
+
 /// v0.7.0 L3-5 — forensic-evidence capability surface.
 ///
 /// Each label names a CLI / function pair that **exists** in this binary:
@@ -1358,9 +1364,9 @@ impl CapabilityForensic {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            verify_reflection_chain: "implemented".to_string(),
-            export_forensic_bundle: "implemented".to_string(),
-            verify_forensic_bundle: "implemented".to_string(),
+            verify_reflection_chain: IMPLEMENTED.to_string(),
+            export_forensic_bundle: IMPLEMENTED.to_string(),
+            verify_forensic_bundle: IMPLEMENTED.to_string(),
         }
     }
 }
@@ -1540,12 +1546,12 @@ impl CapabilityAtomisation {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            tool: "implemented".to_string(),
-            cli: "implemented".to_string(),
-            auto: "implemented".to_string(),
-            recall_preference: "implemented".to_string(),
-            forensic: "implemented".to_string(),
-            curator: "implemented".to_string(),
+            tool: IMPLEMENTED.to_string(),
+            cli: IMPLEMENTED.to_string(),
+            auto: IMPLEMENTED.to_string(),
+            recall_preference: IMPLEMENTED.to_string(),
+            forensic: IMPLEMENTED.to_string(),
+            curator: IMPLEMENTED.to_string(),
             link_relation: "derives_from".to_string(),
         }
     }
@@ -1613,9 +1619,9 @@ impl CapabilityMemoryKindVocab {
                 .iter()
                 .map(|k| k.as_str().to_string())
                 .collect(),
-            recall_filter: "implemented".to_string(),
-            cli_filter: "implemented".to_string(),
-            auto_classify: "implemented".to_string(),
+            recall_filter: IMPLEMENTED.to_string(),
+            cli_filter: IMPLEMENTED.to_string(),
+            auto_classify: IMPLEMENTED.to_string(),
             auto_classify_modes: vec![
                 "off".to_string(),
                 "regex_only".to_string(),
@@ -1699,11 +1705,11 @@ impl CapabilityConfidenceCalibration {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            auto_derive: "implemented".to_string(),
-            shadow_mode: "implemented".to_string(),
-            freshness_decay: "implemented".to_string(),
-            calibration_cli: "implemented".to_string(),
-            calibration_tool: "implemented".to_string(),
+            auto_derive: IMPLEMENTED.to_string(),
+            shadow_mode: IMPLEMENTED.to_string(),
+            freshness_decay: IMPLEMENTED.to_string(),
+            calibration_cli: IMPLEMENTED.to_string(),
+            calibration_tool: IMPLEMENTED.to_string(),
             signals_schema: "v1".to_string(),
             default_half_life_days: crate::confidence::DEFAULT_HALF_LIFE_DAYS,
             tier_thresholds: ConfidenceTierThresholds::default(),

@@ -3,7 +3,9 @@
 
 //! MCP subscription management handlers.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -98,8 +100,8 @@ pub fn handle_subscribe(
     let url = params["url"].as_str().ok_or("url is required")?;
     let events = params["events"].as_str().unwrap_or("*");
     let secret = params["secret"].as_str();
-    let namespace_filter = params["namespace_filter"].as_str();
-    let agent_filter = params["agent_filter"].as_str();
+    let namespace_filter = params[param_names::NAMESPACE_FILTER].as_str();
+    let agent_filter = params[param_names::AGENT_FILTER].as_str();
     let created_by =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
 
@@ -167,9 +169,9 @@ pub fn handle_subscribe(
         "id": id,
         "url": url,
         "events": events,
-        "namespace_filter": namespace_filter,
-        "agent_filter": agent_filter,
-        "created_by": created_by,
+        (field_names::NAMESPACE_FILTER): namespace_filter,
+        (field_names::AGENT_FILTER): agent_filter,
+        (field_names::CREATED_BY): created_by,
     });
     if let Some(et) = &event_types {
         response["event_types"] = json!(et);
@@ -205,7 +207,7 @@ pub fn handle_list_subscriptions(
     // returned every tenant's rows.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
     let subs = crate::subscriptions::list(conn, Some(&caller)).map_err(|e| e.to_string())?;
-    Ok(json!({"count": subs.len(), "subscriptions": subs}))
+    Ok(json!({"count": subs.len(), (field_names::SUBSCRIPTIONS): subs}))
 }
 
 /// v0.7 K7 — MCP handler for `memory_subscription_replay`. Thin
@@ -217,7 +219,7 @@ pub fn handle_subscription_replay(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let subscription_id = params["subscription_id"]
+    let subscription_id = params[param_names::SUBSCRIPTION_ID]
         .as_str()
         .ok_or("subscription_id is required")?;
     let since = params["since"]
@@ -241,7 +243,7 @@ pub fn handle_subscription_replay(
         // id is owned by someone else" from "this id doesn't exist"
         // from "this id exists but no events since `since`".
         return Ok(json!({
-            "subscription_id": subscription_id,
+            (field_names::SUBSCRIPTION_ID): subscription_id,
             "since": since,
             "count": 0,
             "events": Vec::<Value>::new(),

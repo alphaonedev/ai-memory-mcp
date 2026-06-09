@@ -32,6 +32,7 @@
 //! are generic over `&dyn AutonomyLlm`.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -427,7 +428,7 @@ fn forget_if_superseded(
     // flagged this pair.
     let contradictions = mem
         .metadata
-        .get("confirmed_contradictions")
+        .get(field_names::CONFIRMED_CONTRADICTIONS)
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();

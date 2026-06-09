@@ -4,6 +4,7 @@
 //! Quorum-broadcast fan-out logic: post_once, post_and_classify,
 //! broadcast_*_quorum, bulk_catchup_push.
 
+use crate::models::field_names;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -128,7 +129,7 @@ pub(super) async fn post_once(
     // results in no header attached + the receiver enforces via the
     // body field alone.
     if let Some(peer_id) = body
-        .get("sender_agent_id")
+        .get(field_names::SENDER_AGENT_ID)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
@@ -320,7 +321,7 @@ pub async fn broadcast_store_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [mem],
         "dry_run": false,
     });
@@ -575,7 +576,7 @@ pub async fn broadcast_delete_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "deletions": [id],
         "dry_run": false,
@@ -673,7 +674,7 @@ pub async fn broadcast_archive_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "archives": [id],
         "dry_run": false,
@@ -772,7 +773,7 @@ pub async fn broadcast_restore_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "restores": [id],
         "dry_run": false,
@@ -865,7 +866,7 @@ pub async fn broadcast_link_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "links": [link],
         "dry_run": false,
@@ -960,7 +961,7 @@ pub async fn broadcast_consolidate_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [new_mem],
         "deletions": source_ids,
         "dry_run": false,
@@ -1059,7 +1060,7 @@ pub async fn broadcast_pending_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "pendings": [pending],
         "dry_run": false,
@@ -1157,7 +1158,7 @@ pub async fn broadcast_pending_decision_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "pending_decisions": [decision],
         "dry_run": false,
@@ -1256,7 +1257,7 @@ pub async fn broadcast_namespace_meta_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "namespace_meta": [entry],
         "dry_run": false,
@@ -1358,7 +1359,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "namespace_meta_clears": namespaces,
         "dry_run": false,
@@ -1482,7 +1483,7 @@ pub async fn bulk_catchup_push(
         return Vec::new();
     }
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": memories,
         "dry_run": false,
     });
@@ -1534,7 +1535,7 @@ pub async fn bulk_catchup_push(
             // attest against the receiver's allowlist exactly like
             // the per-row fanout in `post_once`.
             if let Some(peer_id) = payload
-                .get("sender_agent_id")
+                .get(field_names::SENDER_AGENT_ID)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {

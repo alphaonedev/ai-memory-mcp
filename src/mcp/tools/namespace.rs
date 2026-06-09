@@ -7,6 +7,7 @@ use crate::identity::sentinels;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::GovernancePolicy;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -151,7 +152,7 @@ pub fn handle_namespace_set_standard(
         "",
         serde_json::json!({
             "namespace": namespace,
-            "standard_id": id,
+            (field_names::STANDARD_ID): id,
             "parent": parent,
             "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
         }),
@@ -302,12 +303,12 @@ pub fn handle_namespace_set_standard(
     }
 
     db::set_namespace_standard(conn, namespace, id, parent).map_err(|e| e.to_string())?;
-    let mut resp = json!({"set": true, "namespace": namespace, "standard_id": id});
+    let mut resp = json!({"set": true, "namespace": namespace, (field_names::STANDARD_ID): id});
     if let Some(p) = parent {
         resp["parent"] = json!(p);
     }
     if let Some(g) = governance_val {
-        resp["governance"] = g.clone();
+        resp[field_names::GOVERNANCE] = g.clone();
     }
     Ok(resp)
 }
@@ -331,11 +332,11 @@ pub fn handle_namespace_get_standard(
                 let gov = extract_governance(&std);
                 let entry = json!({
                     "namespace": link,
-                    "standard_id": std["id"].clone(),
+                    (field_names::STANDARD_ID): std["id"].clone(),
                     "title": std["title"].clone(),
                     "content": std["content"].clone(),
                     "priority": std["priority"].clone(),
-                    "governance": gov,
+                    (field_names::GOVERNANCE): gov,
                 });
                 standards.push(entry);
             }
@@ -370,19 +371,19 @@ pub fn handle_namespace_get_standard(
                     let gov = merge_governance_for_response(&m.metadata);
                     Ok(json!({
                         "namespace": namespace,
-                        "standard_id": id,
+                        (field_names::STANDARD_ID): id,
                         "title": m.title,
                         "content": m.content,
                         "priority": m.priority,
-                        "governance": gov,
+                        (field_names::GOVERNANCE): gov,
                     }))
                 }
                 None => Ok(
-                    json!({"namespace": namespace, "standard_id": id, "warning": "standard memory not found — may have been deleted"}),
+                    json!({"namespace": namespace, (field_names::STANDARD_ID): id, "warning": "standard memory not found — may have been deleted"}),
                 ),
             }
         }
-        None => Ok(json!({"namespace": namespace, "standard_id": null})),
+        None => Ok(json!({"namespace": namespace, (field_names::STANDARD_ID): null})),
     }
 }
 

@@ -8,6 +8,7 @@
 // file are caught by the lint at PR-time instead of silently growing.
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
@@ -432,23 +433,23 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         None => Vec::new(),
     };
     let source_span: Option<SourceSpan> = row
-        .get::<_, Option<String>>("source_span")
+        .get::<_, Option<String>>(field_names::SOURCE_SPAN)
         .unwrap_or(None)
         .and_then(|s| match serde_json::from_str::<SourceSpan>(&s) {
             Ok(span) => Some(span),
             Err(e) => {
                 tracing::warn!(
                     row_id = %row_id,
-                    column = "source_span",
+                    column = field_names::SOURCE_SPAN,
                     error = %e,
                     "corrupt source_span JSON in DB row, defaulting to None"
                 );
-                crate::metrics::record_corrupt_provenance("source_span");
+                crate::metrics::record_corrupt_provenance(field_names::SOURCE_SPAN);
                 None
             }
         });
     let confidence_signals = row
-        .get::<_, Option<String>>("confidence_signals")
+        .get::<_, Option<String>>(field_names::CONFIDENCE_SIGNALS)
         .unwrap_or(None)
         .and_then(
             |s| match serde_json::from_str::<crate::models::ConfidenceSignals>(&s) {
@@ -456,11 +457,11 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
                 Err(e) => {
                     tracing::warn!(
                         row_id = %row_id,
-                        column = "confidence_signals",
+                        column = field_names::CONFIDENCE_SIGNALS,
                         error = %e,
                         "corrupt confidence_signals JSON in DB row, defaulting to None"
                     );
-                    crate::metrics::record_corrupt_provenance("confidence_signals");
+                    crate::metrics::record_corrupt_provenance(field_names::CONFIDENCE_SIGNALS);
                     None
                 }
             },
@@ -473,24 +474,24 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         content: row.get("content")?,
         tags,
         priority: row.get("priority")?,
-        confidence: row.get("confidence").unwrap_or(1.0),
+        confidence: row.get(field_names::CONFIDENCE).unwrap_or(1.0),
         source: row.get("source").unwrap_or_else(|_| "api".to_string()),
-        access_count: row.get("access_count")?,
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
-        last_accessed_at: row.get("last_accessed_at")?,
-        expires_at: row.get("expires_at")?,
+        access_count: row.get(field_names::ACCESS_COUNT)?,
+        created_at: row.get(field_names::CREATED_AT)?,
+        updated_at: row.get(field_names::UPDATED_AT)?,
+        last_accessed_at: row.get(field_names::LAST_ACCESSED_AT)?,
+        expires_at: row.get(field_names::EXPIRES_AT)?,
         metadata,
         // v0.7.0 Task 1/8 — schema v29 column. `.unwrap_or(0)` keeps the
         // reader tolerant of pre-v29 row reads (no panic if the migration
         // ladder hasn't reached this DB yet) and is consistent with the
         // SQL-side `DEFAULT 0`.
-        reflection_depth: row.get("reflection_depth").unwrap_or(0_i32),
+        reflection_depth: row.get(field_names::REFLECTION_DEPTH).unwrap_or(0_i32),
         // v0.7.0 L1-1 — schema v30 column. Falls back to `Observation` on
         // pre-v30 rows (column absent) and on any unrecognised value from a
         // future schema (forward-compat).
         memory_kind: row
-            .get::<_, String>("memory_kind")
+            .get::<_, String>(field_names::MEMORY_KIND)
             .ok()
             .and_then(|s| crate::models::MemoryKind::from_str(&s))
             .unwrap_or_default(),
@@ -499,14 +500,18 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // every observation/reflection row. Pre-v36 rows lack the
         // column entirely — the `.ok()` fallthrough yields None.
         entity_id: row.get::<_, Option<String>>("entity_id").unwrap_or(None),
-        persona_version: row.get::<_, Option<i32>>("persona_version").unwrap_or(None),
+        persona_version: row
+            .get::<_, Option<i32>>(field_names::PERSONA_VERSION)
+            .unwrap_or(None),
         // v0.7.0 Form 4 — schema v38 fact-provenance columns. `citations`
         // / `source_span` corruption now logs WARN + bumps the
         // `corrupt_provenance_rows_total` counter above so silent JSON
         // drops surface in operator observability (Cluster-A COR-3 fix).
         // `source_uri` is a plain TEXT column (NULL on legacy rows).
         citations,
-        source_uri: row.get::<_, Option<String>>("source_uri").unwrap_or(None),
+        source_uri: row
+            .get::<_, Option<String>>(field_names::SOURCE_URI)
+            .unwrap_or(None),
         source_span,
         // v0.7.0 Form 5 — schema v39 columns. Legacy rows resolve
         // to `CallerProvided` (SQL DEFAULT), NULL signals, NULL
@@ -1599,7 +1604,7 @@ pub fn update_with_archive_on_supersede(
             serde_json::Value::String(edit_source.as_str().to_string()),
         );
         m.insert(
-            "superseded_id".to_string(),
+            field_names::SUPERSEDED_ID.to_string(),
             serde_json::Value::String(existing.id.clone()),
         );
     }
@@ -5859,9 +5864,9 @@ pub fn register_agent(
 
     let metadata = serde_json::json!({
         "agent_id": agent_id,
-        "agent_type": agent_type,
-        "capabilities": caps_json,
-        "registered_at": registered_at,
+        (field_names::AGENT_TYPE): agent_type,
+        (field_names::CAPABILITIES): caps_json,
+        (field_names::REGISTERED_AT): registered_at,
         "last_seen_at": now,
         // #910 (SAL-level enforcement) — agent-registration rows live
         // in the `_agents` namespace and are a public roster: every
@@ -5932,12 +5937,12 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
             .unwrap_or_default()
             .to_string();
         let agent_type = meta
-            .get("agent_type")
+            .get(field_names::AGENT_TYPE)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
         let capabilities: Vec<String> = meta
-            .get("capabilities")
+            .get(field_names::CAPABILITIES)
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -5946,7 +5951,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
             })
             .unwrap_or_default();
         let registered_at = meta
-            .get("registered_at")
+            .get(field_names::REGISTERED_AT)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
@@ -6281,14 +6286,14 @@ pub fn list_archived(
             "content": row.get::<_, String>(4)?,
             "tags": tags,
             "priority": row.get::<_, i32>(6)?,
-            "confidence": row.get::<_, f64>(7)?,
+            (field_names::CONFIDENCE): row.get::<_, f64>(7)?,
             "source": row.get::<_, String>(8)?,
-            "access_count": row.get::<_, i64>(9)?,
-            "created_at": row.get::<_, String>(10)?,
-            "updated_at": row.get::<_, String>(11)?,
-            "last_accessed_at": row.get::<_, Option<String>>(12)?,
-            "expires_at": row.get::<_, Option<String>>(13)?,
-            "archived_at": row.get::<_, String>(14)?,
+            (field_names::ACCESS_COUNT): row.get::<_, i64>(9)?,
+            (field_names::CREATED_AT): row.get::<_, String>(10)?,
+            (field_names::UPDATED_AT): row.get::<_, String>(11)?,
+            (field_names::LAST_ACCESSED_AT): row.get::<_, Option<String>>(12)?,
+            (field_names::EXPIRES_AT): row.get::<_, Option<String>>(13)?,
+            (field_names::ARCHIVED_AT): row.get::<_, String>(14)?,
             "archive_reason": row.get::<_, String>(15)?,
             "metadata": metadata,
         }))
@@ -9227,14 +9232,23 @@ fn emit_pending_action_event(
         .unwrap_or_default();
     let timestamp = Utc::now().to_rfc3339();
     let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
-    map.insert("pending_id", ciborium::Value::Text(pa.id.clone()));
-    map.insert("action_type", ciborium::Value::Text(pa.action_type.clone()));
+    map.insert(
+        field_names::PENDING_ID,
+        ciborium::Value::Text(pa.id.clone()),
+    );
+    map.insert(
+        field_names::ACTION_TYPE,
+        ciborium::Value::Text(pa.action_type.clone()),
+    );
     map.insert("namespace", ciborium::Value::Text(pa.namespace.clone()));
     map.insert(
-        "requested_by",
+        field_names::REQUESTED_BY,
         ciborium::Value::Text(pa.requested_by.clone()),
     );
-    map.insert("decided_by", ciborium::Value::Text(decided_by.clone()));
+    map.insert(
+        field_names::DECIDED_BY,
+        ciborium::Value::Text(decided_by.clone()),
+    );
     map.insert("status", ciborium::Value::Text(pa.status.clone()));
     map.insert("timestamp", ciborium::Value::Text(timestamp.clone()));
     let entries: Vec<(ciborium::Value, ciborium::Value)> = map
@@ -9599,7 +9613,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
     let payload = &pa.payload;
     let source_ids: Vec<String> = payload
-        .get("source_ids")
+        .get(field_names::SOURCE_IDS)
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -9660,7 +9674,7 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
     )
     .unwrap_or(5);
     let confidence = payload
-        .get("confidence")
+        .get(field_names::CONFIDENCE)
         .and_then(|v| v.as_f64())
         .unwrap_or(1.0);
     // Use the queued payload's agent_id when present (already verified

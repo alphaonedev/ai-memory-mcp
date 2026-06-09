@@ -90,6 +90,7 @@
 //! JSON serialisation of the initialize response itself. The 50 ms
 //! recall p95 budget is untouched.
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -144,7 +145,7 @@ pub struct DaemonIdentityToSign<'a> {
 /// for the field set above, but surfaced for completeness).
 pub fn canonical_bytes_for_identity(identity: &DaemonIdentityToSign<'_>) -> Result<Vec<u8>> {
     let canonical = json!({
-        "schema_version": identity.schema_version,
+        (field_names::SCHEMA_VERSION): identity.schema_version,
         "daemon_id": identity.daemon_id,
         "public_key": identity.public_key,
         "signed_at": identity.signed_at,
@@ -197,7 +198,7 @@ pub fn build_signed_identity(
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     Ok(Some(json!({
-        "schema_version": schema_version,
+        (field_names::SCHEMA_VERSION): schema_version,
         "daemon_id": kp.agent_id,
         "public_key": public_key,
         "signed_at": now_rfc3339,
@@ -232,7 +233,7 @@ pub fn verify_signed_identity(block: &Value) -> Result<(), ed25519_dalek::Signat
 
     let obj = block.as_object().ok_or_else(make_err)?;
     let schema_version = obj
-        .get("schema_version")
+        .get(field_names::SCHEMA_VERSION)
         .and_then(Value::as_str)
         .ok_or_else(make_err)?;
     let daemon_id = obj

@@ -16,6 +16,7 @@
 //! semantics live in [`crate::mcp::handle_replay`]. The MCP, HTTP, and
 //! CLI surfaces all share that one implementation.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -94,17 +95,23 @@ pub fn cmd_replay(
     }
 
     let count = envelope
-        .get("transcripts")
+        .get(field_names::TRANSCRIPTS)
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     writeln!(out.stdout, "replay: {count} transcript(s)")?;
-    if let Some(arr) = envelope.get("transcripts").and_then(Value::as_array) {
+    if let Some(arr) = envelope
+        .get(field_names::TRANSCRIPTS)
+        .and_then(Value::as_array)
+    {
         for t in arr {
             let tid = t
                 .get("transcript_id")
                 .and_then(Value::as_str)
                 .unwrap_or("?");
-            let created = t.get("created_at").and_then(Value::as_str).unwrap_or("");
+            let created = t
+                .get(field_names::CREATED_AT)
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let truncated = t.get("truncated").and_then(Value::as_bool).unwrap_or(false);
             let osize = t.get("original_size").and_then(Value::as_u64).unwrap_or(0);
             writeln!(

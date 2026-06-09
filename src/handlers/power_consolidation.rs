@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -383,7 +384,7 @@ pub async fn consolidate_memories(
             StatusCode::CREATED,
             Json(json!({
                 "id": new_id,
-                "consolidated": body.ids.len(),
+                (field_names::CONSOLIDATED): body.ids.len(),
                 "summary": summary,
                 // v0.7.0 L7-followup — also emit the materialised summary
                 // as `content` and inside a nested `memory` object so the
@@ -403,7 +404,7 @@ pub async fn consolidate_memories(
                     "content": summary,
                     "namespace": body.namespace,
                 },
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -465,7 +466,7 @@ pub async fn consolidate_memories(
                 StatusCode::CREATED,
                 Json(json!({
                     "id": new_id,
-                    "consolidated": body.ids.len(),
+                    (field_names::CONSOLIDATED): body.ids.len(),
                     "summary": summary,
                     // v0.7.0 L7-followup — see postgres branch above for
                     // the rationale. Mirroring `content` and a nested

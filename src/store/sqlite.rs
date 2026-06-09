@@ -8,6 +8,7 @@
 //! fits the shape of the shipped code.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1250,7 +1251,7 @@ impl MemoryStore for SqliteStore {
         let priority = priority.unwrap_or(5);
         let metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
-            "target_agent_id": target_agent,
+            (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
         let mem = Memory {

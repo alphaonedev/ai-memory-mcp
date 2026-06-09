@@ -59,6 +59,7 @@
 //! `crate::mcp::tools::reflect`'s `REFLECTION_DEPTH_EXCEEDED`
 //! convention.
 
+use crate::models::field_names;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -211,7 +212,7 @@ pub fn handle_atomise(
             "source_id": result.source_id,
             "atom_ids": result.atom_ids,
             "atom_count": result.atom_count,
-            "archived_at": result.archived_at,
+            (field_names::ARCHIVED_AT): result.archived_at,
         })),
         Err(AtomiseError::NotFound) => Err(format!("MEMORY_NOT_FOUND: {memory_id}")),
         Err(AtomiseError::AlreadyAtomised {

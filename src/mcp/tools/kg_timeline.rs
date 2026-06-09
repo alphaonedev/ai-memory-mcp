@@ -4,6 +4,7 @@
 //! MCP `memory_kg_timeline` handler.
 
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -85,11 +86,11 @@ pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result
             json!({
                 "target_id": e.target_id,
                 "relation": e.relation,
-                "valid_from": e.valid_from,
-                "valid_until": e.valid_until,
-                "observed_by": e.observed_by,
+                (field_names::VALID_FROM): e.valid_from,
+                (field_names::VALID_UNTIL): e.valid_until,
+                (field_names::OBSERVED_BY): e.observed_by,
                 "title": e.title,
-                "target_namespace": e.target_namespace,
+                (field_names::TARGET_NAMESPACE): e.target_namespace,
             })
         })
         .collect();

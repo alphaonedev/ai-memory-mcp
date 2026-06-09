@@ -39,6 +39,7 @@
 use crate::cli::CliOutput;
 use crate::cli::helpers::{auto_namespace, human_age, id_short};
 use crate::config::AppConfig;
+use crate::models::field_names;
 use crate::{db, models, toon};
 use anyhow::Result;
 use clap::Args;
@@ -733,9 +734,9 @@ fn emit_status_header(
                     "status": manifest.status.label(),
                     "version": manifest.version,
                     "db_path": manifest.db_path,
-                    "schema_version": manifest.schema_version,
+                    (field_names::SCHEMA_VERSION): manifest.schema_version,
                     "schema_supported": manifest.schema_supported,
-                    "total_memories": manifest.total_memories,
+                    (field_names::TOTAL_MEMORIES): manifest.total_memories,
                     "tier": manifest.tier,
                     "embedder": manifest.embedder,
                     "reranker": manifest.reranker,
@@ -868,9 +869,9 @@ fn emit_json_with_status(
         "status": manifest.status.label(),
         "version": manifest.version,
         "db_path": manifest.db_path,
-        "schema_version": manifest.schema_version,
+        (field_names::SCHEMA_VERSION): manifest.schema_version,
         "schema_supported": manifest.schema_supported,
-        "total_memories": manifest.total_memories,
+        (field_names::TOTAL_MEMORIES): manifest.total_memories,
         "tier": manifest.tier,
         "embedder": manifest.embedder,
         "reranker": manifest.reranker,

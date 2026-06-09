@@ -137,7 +137,7 @@ pub(super) fn parse_and_build_memory(
     // the stdio MCP server pre-fix. `validate_priority` below enforces the
     // semantic 1-10 range, so the clamp is purely a panic guard.
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(i32::MAX);
-    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
     let tags: Vec<String> = params["tags"]
         .as_array()
         .map(|a| {
@@ -237,7 +237,7 @@ pub(super) fn parse_and_build_memory(
     crate::validate::validate_kind(kind_param).map_err(|e| e.to_string())?;
     let caller_kind = kind_param.and_then(crate::models::MemoryKind::from_str);
 
-    let source_uri = match params["source_uri"].as_str().map(str::trim) {
+    let source_uri = match params[param_names::SOURCE_URI].as_str().map(str::trim) {
         Some(s) if !s.is_empty() => {
             crate::validate::validate_source_uri(s).map_err(|e| e.to_string())?;
             Some(s.to_string())

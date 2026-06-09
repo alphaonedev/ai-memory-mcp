@@ -7,6 +7,7 @@ use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
 use crate::models::Tier;
+use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -76,7 +77,7 @@ pub(super) fn handle_consolidate(
             payload: json!({
                 "title": title,
                 "summary_chars": summary.len(),
-                "source_ids": ids,
+                (field_names::SOURCE_IDS): ids,
             }),
         };
         match Permissions::evaluate(&ctx, &[]) {
@@ -156,7 +157,7 @@ pub(super) fn handle_consolidate(
         }
     }
 
-    let mut result = json!({"id": new_id, "consolidated": ids.len()});
+    let mut result = json!({"id": new_id, (field_names::CONSOLIDATED): ids.len()});
     if auto_generated {
         result["auto_summary"] = json!(true);
         result["summary_preview"] = json!(summary.chars().take(200).collect::<String>());

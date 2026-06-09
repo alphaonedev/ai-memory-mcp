@@ -6,6 +6,7 @@
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::auto_namespace;
+use crate::models::field_names;
 use crate::{db, identity, models, validate};
 use anyhow::Result;
 use clap::Args;
@@ -72,7 +73,7 @@ pub fn run(
         writeln!(
             out.stdout,
             "{}",
-            serde_json::json!({"id": new_id, "consolidated": ids.len()})
+            serde_json::json!({"id": new_id, (field_names::CONSOLIDATED): ids.len()})
         )?;
     } else {
         writeln!(
@@ -200,7 +201,11 @@ pub fn run_auto(
                 serde_json::json!({"dry_run": true, "groups": groups})
             )?;
         } else {
-            writeln!(out.stdout, "{}", serde_json::json!({"consolidated": total}))?;
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({(field_names::CONSOLIDATED): total})
+            )?;
         }
     } else if args.dry_run {
         writeln!(out.stdout, "dry run — would consolidate:")?;

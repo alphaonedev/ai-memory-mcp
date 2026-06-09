@@ -39,6 +39,12 @@ use crate::log_paths;
 /// rotated filenames look like `ai-memory.log.2026-04-30`.
 const DEFAULT_PREFIX: &str = "ai-memory.log";
 
+/// Default `tracing` EnvFilter directive applied when `RUST_LOG` is
+/// unset — INFO-level for the substrate's own crate only. One spelling
+/// for every fallback-filter construction site (pm-v3.1 gate, #1558
+/// wave 4).
+pub const DEFAULT_LOG_DIRECTIVE: &str = "ai_memory=info";
+
 /// Initialise the file logging facility. Returns a [`WorkerGuard`] that
 /// the caller MUST keep alive for the lifetime of the process — when
 /// dropped it flushes the in-memory buffer to disk. Returns `None`

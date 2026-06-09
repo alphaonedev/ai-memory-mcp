@@ -45,6 +45,7 @@
 //! helpers that don't need a running Postgres.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -2667,7 +2668,7 @@ impl PostgresStore {
                 serde_json::Value::String(edit_source.as_str().to_string()),
             );
             m.insert(
-                "superseded_id".to_string(),
+                field_names::SUPERSEDED_ID.to_string(),
                 serde_json::Value::String(existing.id.clone()),
             );
         }
@@ -2980,19 +2981,19 @@ impl PostgresStore {
         rows.iter()
             .map(|r| {
                 let created_at: DateTime<Utc> = r
-                    .try_get("created_at")
+                    .try_get(field_names::CREATED_AT)
                     .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
                 let valid_from: Option<DateTime<Utc>> = r
-                    .try_get("valid_from")
+                    .try_get(field_names::VALID_FROM)
                     .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
-                    .try_get("valid_until")
+                    .try_get(field_names::VALID_UNTIL)
                     .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
-                    .try_get("observed_by")
+                    .try_get(field_names::OBSERVED_BY)
                     .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let attest_level: Option<String> = r
-                    .try_get("attest_level")
+                    .try_get(field_names::ATTEST_LEVEL)
                     .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 let relation_str: String = r
                     .try_get("relation")
@@ -3830,7 +3831,7 @@ impl PostgresStore {
         add_column_if_missing(
             &mut tx,
             "memory_transcripts",
-            "archived_at",
+            field_names::ARCHIVED_AT,
             "ALTER TABLE memory_transcripts ADD COLUMN archived_at TIMESTAMPTZ",
         )
         .await?;
@@ -4728,13 +4729,13 @@ impl PostgresStore {
                 .try_get::<String, _>("relation")
                 .map_err(|e| to_store_err(READ_RELATION, e))?;
             let valid_from_raw: String = r
-                .try_get::<String, _>("valid_from")
+                .try_get::<String, _>(field_names::VALID_FROM)
                 .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
             let valid_until_raw: String = r
-                .try_get::<String, _>("valid_until")
+                .try_get::<String, _>(field_names::VALID_UNTIL)
                 .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
             let observed_by_raw: String = r
-                .try_get::<String, _>("observed_by")
+                .try_get::<String, _>(field_names::OBSERVED_BY)
                 .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
 
             decoded.push(KgTimelineRow {
@@ -4874,13 +4875,13 @@ impl PostgresStore {
                     .try_get::<String, _>("relation")
                     .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let valid_from: DateTime<Utc> = r
-                    .try_get::<DateTime<Utc>, _>("valid_from")
+                    .try_get::<DateTime<Utc>, _>(field_names::VALID_FROM)
                     .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>("valid_until")
+                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_UNTIL)
                     .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
-                    .try_get::<Option<String>, _>("observed_by")
+                    .try_get::<Option<String>, _>(field_names::OBSERVED_BY)
                     .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let title: String = r
                     .try_get::<String, _>("title")
@@ -5532,7 +5533,7 @@ impl PostgresStore {
                 let ids: Vec<String> = nodes
                     .iter()
                     .filter_map(|v| {
-                        v.get("properties")
+                        v.get(field_names::PROPERTIES)
                             .and_then(|p| p.get("id"))
                             .and_then(|i| i.as_str())
                             .map(String::from)
@@ -5773,16 +5774,16 @@ impl PostgresStore {
 
     fn row_to_memory(row: &sqlx::postgres::PgRow) -> StoreResult<Memory> {
         let created_at: DateTime<Utc> = row
-            .try_get("created_at")
+            .try_get(field_names::CREATED_AT)
             .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
         let updated_at: DateTime<Utc> = row
-            .try_get("updated_at")
+            .try_get(field_names::UPDATED_AT)
             .map_err(|e| to_store_err("read updated_at", e))?;
         let last_accessed_at: Option<DateTime<Utc>> = row
-            .try_get("last_accessed_at")
+            .try_get(field_names::LAST_ACCESSED_AT)
             .map_err(|e| to_store_err("read last_accessed_at", e))?;
         let expires_at: Option<DateTime<Utc>> = row
-            .try_get("expires_at")
+            .try_get(field_names::EXPIRES_AT)
             .map_err(|e| to_store_err("read expires_at", e))?;
 
         let tier_str: String = row
@@ -5804,11 +5805,11 @@ impl PostgresStore {
         // v0.7.0 Task 1/8 — read the v31 column; tolerate pre-v31 reads
         // (column missing on a freshly-restored backup, for instance) by
         // falling back to 0, which matches the SQL-side `DEFAULT 0`.
-        let reflection_depth: i32 = row.try_get("reflection_depth").unwrap_or(0);
+        let reflection_depth: i32 = row.try_get(field_names::REFLECTION_DEPTH).unwrap_or(0);
         // L1-1 — read the Postgres-side memory_kind column. Falls back to
         // Observation on pre-v30 rows and on any unrecognised value.
         let memory_kind: crate::models::MemoryKind = row
-            .try_get::<String, _>("memory_kind")
+            .try_get::<String, _>(field_names::MEMORY_KIND)
             .ok()
             .and_then(|s| crate::models::MemoryKind::from_str(&s))
             .unwrap_or_default();
@@ -5830,13 +5831,13 @@ impl PostgresStore {
                 .try_get("priority")
                 .map_err(|e| to_store_err("read priority", e))?,
             confidence: row
-                .try_get("confidence")
+                .try_get(field_names::CONFIDENCE)
                 .map_err(|e| to_store_err("read confidence", e))?,
             source: row
                 .try_get("source")
                 .map_err(|e| to_store_err("read source", e))?,
             access_count: row
-                .try_get("access_count")
+                .try_get(field_names::ACCESS_COUNT)
                 .map_err(|e| to_store_err("read access_count", e))?,
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
@@ -5852,7 +5853,7 @@ impl PostgresStore {
                 .try_get::<Option<String>, _>("entity_id")
                 .unwrap_or(None),
             persona_version: row
-                .try_get::<Option<i32>, _>("persona_version")
+                .try_get::<Option<i32>, _>(field_names::PERSONA_VERSION)
                 .unwrap_or(None),
             // v0.7.0 Form 4 — Postgres v37 fact-provenance columns. The
             // SQL DEFAULT '[]' on `citations` keeps legacy rows visible
@@ -5864,7 +5865,7 @@ impl PostgresStore {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
             source_uri: row
-                .try_get::<Option<String>, _>("source_uri")
+                .try_get::<Option<String>, _>(field_names::SOURCE_URI)
                 .unwrap_or(None),
             source_span: row
                 .try_get::<Option<String>, _>(COL_SOURCE_SPAN)
@@ -6109,7 +6110,7 @@ impl PostgresStore {
         if !metadata.contains_key("reflection_metadata") {
             let reflection_meta = serde_json::json!({
                 "reflected_on_source_ids": input.source_ids,
-                "reflection_depth": new_depth_i32,
+                (field_names::REFLECTION_DEPTH): new_depth_i32,
                 "reflection_created_at": now,
             });
             metadata.insert("reflection_metadata".to_string(), reflection_meta);
@@ -9033,16 +9034,16 @@ impl MemoryStore for PostgresStore {
         rows.iter()
             .map(|r| {
                 let created_at: DateTime<Utc> = r
-                    .try_get::<DateTime<Utc>, _>("created_at")
+                    .try_get::<DateTime<Utc>, _>(field_names::CREATED_AT)
                     .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
                 let valid_from: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>("valid_from")
+                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_FROM)
                     .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>("valid_until")
+                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_UNTIL)
                     .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
-                    .try_get::<Option<String>, _>("observed_by")
+                    .try_get::<Option<String>, _>(field_names::OBSERVED_BY)
                     .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let signature: Option<Vec<u8>> = r
                     .try_get::<Option<Vec<u8>>, _>("signature")
@@ -9050,9 +9051,9 @@ impl MemoryStore for PostgresStore {
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
                     .map_err(|e| to_store_err(READ_RELATION, e))?;
-                let attest_level: Option<String> =
-                    r.try_get::<Option<String>, _>("attest_level")
-                        .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
+                let attest_level: Option<String> = r
+                    .try_get::<Option<String>, _>(field_names::ATTEST_LEVEL)
+                    .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get::<String, _>("source_id")
@@ -9108,23 +9109,23 @@ impl MemoryStore for PostgresStore {
         rows.iter()
             .map(|r| {
                 let created_at: DateTime<Utc> = r
-                    .try_get::<DateTime<Utc>, _>("created_at")
+                    .try_get::<DateTime<Utc>, _>(field_names::CREATED_AT)
                     .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
                 let valid_from: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>("valid_from")
+                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_FROM)
                     .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
                 let valid_until: Option<DateTime<Utc>> = r
-                    .try_get::<Option<DateTime<Utc>>, _>("valid_until")
+                    .try_get::<Option<DateTime<Utc>>, _>(field_names::VALID_UNTIL)
                     .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
                 let observed_by: Option<String> = r
-                    .try_get::<Option<String>, _>("observed_by")
+                    .try_get::<Option<String>, _>(field_names::OBSERVED_BY)
                     .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
                 let relation_str: String = r
                     .try_get::<String, _>("relation")
                     .map_err(|e| to_store_err(READ_RELATION, e))?;
-                let attest_level: Option<String> =
-                    r.try_get::<Option<String>, _>("attest_level")
-                        .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
+                let attest_level: Option<String> = r
+                    .try_get::<Option<String>, _>(field_names::ATTEST_LEVEL)
+                    .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
                 Ok(MemoryLink {
                     source_id: r
                         .try_get::<String, _>("source_id")
@@ -9795,7 +9796,7 @@ impl MemoryStore for PostgresStore {
                 .try_get::<String, _>("id")
                 .map_err(|e| to_store_err("read id", e))?,
             action_type: r
-                .try_get::<String, _>("action_type")
+                .try_get::<String, _>(field_names::ACTION_TYPE)
                 .map_err(|e| to_store_err("read action_type", e))?,
             memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
             namespace: r
@@ -9805,13 +9806,15 @@ impl MemoryStore for PostgresStore {
                 .try_get::<serde_json::Value, _>("payload")
                 .unwrap_or(serde_json::Value::Null),
             requested_by: r
-                .try_get::<String, _>("requested_by")
+                .try_get::<String, _>(field_names::REQUESTED_BY)
                 .map_err(|e| to_store_err("read requested_by", e))?,
             requested_at: requested_at.to_rfc3339(),
             status: r
                 .try_get::<String, _>("status")
                 .map_err(|e| to_store_err("read status", e))?,
-            decided_by: r.try_get::<Option<String>, _>("decided_by").unwrap_or(None),
+            decided_by: r
+                .try_get::<Option<String>, _>(field_names::DECIDED_BY)
+                .unwrap_or(None),
             decided_at: decided_at.map(|d| d.to_rfc3339()),
             approvals,
         }))
@@ -9996,15 +9999,15 @@ impl MemoryStore for PostgresStore {
 
         let registered_at = existing
             .as_ref()
-            .and_then(|(m,)| m.get("registered_at"))
+            .and_then(|(m,)| m.get(field_names::REGISTERED_AT))
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| now_rfc.clone(), str::to_string);
 
         let metadata = serde_json::json!({
             "agent_id": agent.agent_id,
-            "agent_type": agent.agent_type,
-            "capabilities": agent.capabilities,
-            "registered_at": registered_at,
+            (field_names::AGENT_TYPE): agent.agent_type,
+            (field_names::CAPABILITIES): agent.capabilities,
+            (field_names::REGISTERED_AT): registered_at,
             "last_seen_at": now_rfc,
             // #910 (SAL-level enforcement) — agent-registration rows
             // are a public roster. Mirrors the sqlite path's stamp.
@@ -10311,7 +10314,7 @@ impl MemoryStore for PostgresStore {
             };
             let priority: i32 = row.try_get("priority").unwrap_or(5);
             max_priority = max_priority.max(priority);
-            let access_count: i64 = row.try_get("access_count").unwrap_or(0);
+            let access_count: i64 = row.try_get(field_names::ACCESS_COUNT).unwrap_or(0);
             total_access = total_access.saturating_add(access_count);
             let tags_json: serde_json::Value = row.try_get("tags").unwrap_or(serde_json::json!([]));
             if let Some(arr) = tags_json.as_array() {
@@ -10972,7 +10975,7 @@ impl MemoryStore for PostgresStore {
         let priority = priority.unwrap_or(5);
         let metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
-            "target_agent_id": target_agent,
+            (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
         let mem = Memory {
@@ -11773,19 +11776,19 @@ impl MemoryStore for PostgresStore {
             .try_get("relation")
             .map_err(|e| to_store_err(READ_RELATION, e))?;
         let vf: Option<DateTime<Utc>> = row
-            .try_get("valid_from")
+            .try_get(field_names::VALID_FROM)
             .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
         let vu: Option<DateTime<Utc>> = row
-            .try_get("valid_until")
+            .try_get(field_names::VALID_UNTIL)
             .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
         let obs: Option<String> = row
-            .try_get("observed_by")
+            .try_get(field_names::OBSERVED_BY)
             .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
         let sig: Option<Vec<u8>> = row
             .try_get("signature")
             .map_err(|e| to_store_err("read signature", e))?;
         let attest: Option<String> = row
-            .try_get("attest_level")
+            .try_get(field_names::ATTEST_LEVEL)
             .map_err(|e| to_store_err(READ_ATTEST_LEVEL, e))?;
 
         let attest_level =
@@ -12087,12 +12090,12 @@ impl MemoryStore for PostgresStore {
                 .unwrap_or_default()
                 .to_string();
             let agent_type = meta
-                .get("agent_type")
+                .get(field_names::AGENT_TYPE)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string();
             let capabilities: Vec<String> = meta
-                .get("capabilities")
+                .get(field_names::CAPABILITIES)
                 .and_then(serde_json::Value::as_array)
                 .map(|arr| {
                     arr.iter()
@@ -12101,7 +12104,7 @@ impl MemoryStore for PostgresStore {
                 })
                 .unwrap_or_default();
             let registered_at = meta
-                .get("registered_at")
+                .get(field_names::REGISTERED_AT)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string();
@@ -12159,7 +12162,7 @@ impl MemoryStore for PostgresStore {
                     .try_get::<String, _>("id")
                     .map_err(|e| to_store_err("read id", e))?,
                 action_type: r
-                    .try_get::<String, _>("action_type")
+                    .try_get::<String, _>(field_names::ACTION_TYPE)
                     .map_err(|e| to_store_err("read action_type", e))?,
                 memory_id: r.try_get::<Option<String>, _>("memory_id").unwrap_or(None),
                 namespace: r
@@ -12169,13 +12172,15 @@ impl MemoryStore for PostgresStore {
                     .try_get::<serde_json::Value, _>("payload")
                     .unwrap_or(serde_json::Value::Null),
                 requested_by: r
-                    .try_get::<String, _>("requested_by")
+                    .try_get::<String, _>(field_names::REQUESTED_BY)
                     .map_err(|e| to_store_err("read requested_by", e))?,
                 requested_at: requested_at.to_rfc3339(),
                 status: r
                     .try_get::<String, _>("status")
                     .map_err(|e| to_store_err("read status", e))?,
-                decided_by: r.try_get::<Option<String>, _>("decided_by").unwrap_or(None),
+                decided_by: r
+                    .try_get::<Option<String>, _>(field_names::DECIDED_BY)
+                    .unwrap_or(None),
                 decided_at: decided_at.map(|d| d.to_rfc3339()),
                 approvals,
             });
@@ -12871,10 +12876,10 @@ fn row_to_quota_status(row: &sqlx::postgres::PgRow) -> StoreResult<QuotaStatus> 
         .try_get("day_started_at")
         .map_err(|e| to_store_err("read day_started_at", e))?;
     let created_at: DateTime<Utc> = row
-        .try_get("created_at")
+        .try_get(field_names::CREATED_AT)
         .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
     let updated_at: DateTime<Utc> = row
-        .try_get("updated_at")
+        .try_get(field_names::UPDATED_AT)
         .map_err(|e| to_store_err("read updated_at", e))?;
     Ok(QuotaStatus {
         agent_id,
@@ -13109,19 +13114,19 @@ impl PostgresStore {
                 .try_get("metadata")
                 .map_err(|e| to_store_err("list_archived metadata decode", e))?;
             let last_accessed_at: Option<DateTime<Utc>> = row
-                .try_get("last_accessed_at")
+                .try_get(field_names::LAST_ACCESSED_AT)
                 .map_err(|e| to_store_err("list_archived last_accessed_at decode", e))?;
             let expires_at: Option<DateTime<Utc>> = row
-                .try_get("expires_at")
+                .try_get(field_names::EXPIRES_AT)
                 .map_err(|e| to_store_err("list_archived expires_at decode", e))?;
             let archived_at: DateTime<Utc> = row
-                .try_get("archived_at")
+                .try_get(field_names::ARCHIVED_AT)
                 .map_err(|e| to_store_err("list_archived archived_at decode", e))?;
             let created_at: DateTime<Utc> = row
-                .try_get("created_at")
+                .try_get(field_names::CREATED_AT)
                 .map_err(|e| to_store_err("list_archived created_at decode", e))?;
             let updated_at: DateTime<Utc> = row
-                .try_get("updated_at")
+                .try_get(field_names::UPDATED_AT)
                 .map_err(|e| to_store_err("list_archived updated_at decode", e))?;
             let id: String = row
                 .try_get("id")
@@ -13142,13 +13147,13 @@ impl PostgresStore {
                 .try_get("priority")
                 .map_err(|e| to_store_err("list_archived priority decode", e))?;
             let confidence: f64 = row
-                .try_get("confidence")
+                .try_get(field_names::CONFIDENCE)
                 .map_err(|e| to_store_err("list_archived confidence decode", e))?;
             let source: String = row
                 .try_get("source")
                 .map_err(|e| to_store_err("list_archived source decode", e))?;
             let access_count: i64 = row
-                .try_get("access_count")
+                .try_get(field_names::ACCESS_COUNT)
                 .map_err(|e| to_store_err("list_archived access_count decode", e))?;
             let archive_reason: String = row
                 .try_get("archive_reason")
@@ -13161,14 +13166,14 @@ impl PostgresStore {
                 "content": content,
                 "tags": tags_string,
                 "priority": priority,
-                "confidence": confidence,
+                (field_names::CONFIDENCE): confidence,
                 "source": source,
-                "access_count": access_count,
-                "created_at": created_at.to_rfc3339(),
-                "updated_at": updated_at.to_rfc3339(),
-                "last_accessed_at": last_accessed_at.map(|d| d.to_rfc3339()),
-                "expires_at": expires_at.map(|d| d.to_rfc3339()),
-                "archived_at": archived_at.to_rfc3339(),
+                (field_names::ACCESS_COUNT): access_count,
+                (field_names::CREATED_AT): created_at.to_rfc3339(),
+                (field_names::UPDATED_AT): updated_at.to_rfc3339(),
+                (field_names::LAST_ACCESSED_AT): last_accessed_at.map(|d| d.to_rfc3339()),
+                (field_names::EXPIRES_AT): expires_at.map(|d| d.to_rfc3339()),
+                (field_names::ARCHIVED_AT): archived_at.to_rfc3339(),
                 "archive_reason": archive_reason,
                 "metadata": metadata,
             }));
@@ -13273,17 +13278,17 @@ impl PostgresStore {
         let mut out: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
         for r in &rows {
             let id: String = r.try_get("id").unwrap_or_default();
-            let action_type: String = r.try_get("action_type").unwrap_or_default();
+            let action_type: String = r.try_get(field_names::ACTION_TYPE).unwrap_or_default();
             let memory_id: Option<String> = r.try_get("memory_id").ok();
             let ns: String = r.try_get("namespace").unwrap_or_default();
             let payload: serde_json::Value =
                 r.try_get("payload").unwrap_or(serde_json::Value::Null);
-            let requested_by: String = r.try_get("requested_by").unwrap_or_default();
+            let requested_by: String = r.try_get(field_names::REQUESTED_BY).unwrap_or_default();
             let requested_at: chrono::DateTime<chrono::Utc> = r
                 .try_get("requested_at")
                 .unwrap_or_else(|_| chrono::Utc::now());
             let status_v: String = r.try_get("status").unwrap_or_default();
-            let decided_by: Option<String> = r.try_get("decided_by").ok();
+            let decided_by: Option<String> = r.try_get(field_names::DECIDED_BY).ok();
             let decided_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("decided_at").ok();
             let approvals: serde_json::Value = r
                 .try_get("approvals")
@@ -13292,14 +13297,14 @@ impl PostgresStore {
             let expired_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("expired_at").ok();
             out.push(serde_json::json!({
                 "id": id,
-                "action_type": action_type,
+                (field_names::ACTION_TYPE): action_type,
                 "memory_id": memory_id,
                 "namespace": ns,
                 "payload": payload,
-                "requested_by": requested_by,
+                (field_names::REQUESTED_BY): requested_by,
                 "requested_at": requested_at.to_rfc3339(),
                 "status": status_v,
-                "decided_by": decided_by,
+                (field_names::DECIDED_BY): decided_by,
                 "decided_at": decided_at.map(|t| t.to_rfc3339()),
                 "approvals": approvals,
                 "default_timeout_seconds": default_timeout_seconds,

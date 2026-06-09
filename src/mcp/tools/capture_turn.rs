@@ -56,6 +56,7 @@
 //! `dedup_hit: false` + a placeholder memory_id so the wire shape
 //! is exercisable from MCP clients during the implementation cycle.
 
+use crate::models::field_names;
 use std::time::Instant;
 
 use base64::Engine;
@@ -389,7 +390,7 @@ pub fn handle_capture_turn(
             GovernanceDecision::Pending(pending_id) => {
                 return Ok(json!({
                     "status": "pending",
-                    "pending_id": pending_id,
+                    (field_names::PENDING_ID): pending_id,
                     "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": ACTION_CAPTURE_TURN,
                     "namespace": gate_namespace,
@@ -413,7 +414,7 @@ pub fn handle_capture_turn(
             "memory_id": result.memory_id,
             "dedup_hit": false,
             "layer": "L4",
-            "attest_level": attest_level,
+            (field_names::ATTEST_LEVEL): attest_level,
             "elapsed_ms": elapsed_ms,
         }))
     }

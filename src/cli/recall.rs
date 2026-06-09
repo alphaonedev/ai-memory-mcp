@@ -13,6 +13,7 @@ use crate::cli::CliOutput;
 use crate::cli::helpers::{human_age, id_short};
 use crate::config::AppConfig;
 use crate::embeddings::Embed;
+use crate::models::field_names;
 use crate::{color, daemon_runtime, db, embeddings, hnsw, reranker, validate};
 use anyhow::Result;
 use clap::Args;
@@ -489,10 +490,10 @@ pub(crate) fn run_with_embedder(
             "memories": scored,
             "count": results.len(),
             "mode": mode,
-            "tokens_used": outcome.tokens_used,
+            (field_names::TOKENS_USED): outcome.tokens_used,
         });
         if let Some(b) = args.budget_tokens {
-            body["budget_tokens"] = serde_json::json!(b);
+            body[field_names::BUDGET_TOKENS] = serde_json::json!(b);
             // Phase P6 (R1) meta block — same shape as MCP / HTTP paths.
             body["meta"] = serde_json::json!({
                 "budget_tokens_used": outcome.tokens_used,

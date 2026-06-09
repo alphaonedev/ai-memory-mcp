@@ -10,6 +10,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+#[cfg(feature = "sal")]
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{OriginalUri, Query, State},
@@ -253,7 +255,7 @@ pub async fn sync_since(
                 "earliest_updated_at": earliest_updated_at,
                 "latest_updated_at": latest_updated_at,
                 "memories": filtered,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
                 "excluded_for_scope": excluded,
                 "excluded_for_scope_private": excluded_for_scope_private,
                 "scope_status": if allow_all_legacy { "legacy_bypass" } else { "scoped" },

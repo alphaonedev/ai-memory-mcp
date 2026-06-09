@@ -30,6 +30,7 @@
 //! |   3  | parse error — file is not valid TOML                     |
 //! |   4  | write error — could not write `.bak` or new file         |
 
+use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -145,7 +146,7 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
     // Detect idempotent no-op: schema_version >= 2 AND no legacy
     // fields present.
     let v2_already = original_table
-        .get("schema_version")
+        .get(field_names::SCHEMA_VERSION)
         .and_then(toml::Value::as_integer)
         .is_some_and(|v| v >= 2);
     let has_legacy = LEGACY_FIELDS
@@ -296,7 +297,10 @@ fn build_migrated_table(
     take!(config_keys::AUTO_TAG_MODEL, auto_tag_model);
 
     // schema_version = 2 (highest priority on insert).
-    migrated.insert("schema_version".to_string(), toml::Value::Integer(2));
+    migrated.insert(
+        field_names::SCHEMA_VERSION.to_string(),
+        toml::Value::Integer(2),
+    );
 
     // [llm] section — synthesise only if a legacy LLM field was present
     // OR the existing [llm] section is missing. (When the existing

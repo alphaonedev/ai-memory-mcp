@@ -9,6 +9,7 @@
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::human_age;
+use crate::models::field_names;
 use crate::{color, db, models, validate};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -86,7 +87,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                     let _ = writeln!(out.stdout, "  {} result(s)", results.len());
                 }
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                 }
             }
         }
@@ -112,7 +113,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                     let _ = writeln!(out.stdout, "  {} result(s)", results.len());
                 }
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                 }
             }
         }
@@ -134,7 +135,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                     let _ = writeln!(out.stdout, "  {} memory(ies)", results.len());
                 }
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                 }
             }
         }
@@ -160,7 +161,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                     let _ = writeln!(out.stderr, "not found");
                 }
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                 }
             }
         }
@@ -193,12 +194,12 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                         return ShellAction::Continue;
                     }
                     Err(e) => {
-                        let _ = writeln!(out.stderr, "error: {e}");
+                        let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                         return ShellAction::Continue;
                     }
                 },
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                     return ShellAction::Continue;
                 }
             };
@@ -245,14 +246,14 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                             break;
                         }
                     },
-                    "confidence" => match v.parse::<f64>() {
+                    field_names::CONFIDENCE => match v.parse::<f64>() {
                         Ok(c) => confidence = Some(c),
                         Err(_) => {
                             parse_err = Some(format!("invalid confidence '{v}' (0.0..=1.0)"));
                             break;
                         }
                     },
-                    "expires_at" => expires_at = Some(v.to_string()),
+                    field_names::EXPIRES_AT => expires_at = Some(v.to_string()),
                     unknown => {
                         parse_err = Some(format!(
                             "unknown field '{unknown}' (one of: title, content, tier, namespace, tags, priority, confidence, expires_at)"
@@ -328,7 +329,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                     let _ = writeln!(out.stderr, "  not found");
                 }
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                 }
             }
         }
@@ -345,7 +346,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 }
             }
             Err(e) => {
-                let _ = writeln!(out.stderr, "error: {e}");
+                let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
             }
         },
         "namespaces" | "ns" => match db::list_namespaces(conn) {
@@ -355,7 +356,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 }
             }
             Err(e) => {
-                let _ = writeln!(out.stderr, "error: {e}");
+                let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
             }
         },
         "delete" | "del" | "rm" => {
@@ -376,7 +377,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                     let _ = writeln!(out.stderr, "  not found");
                 }
                 Err(e) => {
-                    let _ = writeln!(out.stderr, "error: {e}");
+                    let _ = writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e));
                 }
             }
         }

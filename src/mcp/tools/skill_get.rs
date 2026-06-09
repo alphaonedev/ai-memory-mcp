@@ -7,6 +7,7 @@
 //! decompressed markdown body. Durable history: `_get(<old_id>)` returns
 //! the old version even after it has been superseded.
 
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -100,9 +101,9 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         "id": id,
         "namespace": namespace,
         "name": name,
-        "description": description,
+        (field_names::DESCRIPTION): description,
         "digest": digest_hex,
-        "created_at": created_at,
+        (field_names::CREATED_AT): created_at,
         "body": body,
         "current": superseded_by.is_none(),
     });

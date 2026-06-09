@@ -5,6 +5,7 @@
 
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -218,7 +219,7 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
 
     Ok(json!({
         "signature_verified": verified,
-        "attest_level": attest_out.as_str(),
+        (field_names::ATTEST_LEVEL): attest_out.as_str(),
         "signed_by": signed_by,
         "signed_at": signed_at,
     }))

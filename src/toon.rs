@@ -9,6 +9,7 @@
 //!
 //! Reference: <https://www.tensorlake.ai/blog-posts/toon-vs-json>
 
+use crate::models::field_names;
 use serde_json::Value;
 use std::fmt::Write;
 
@@ -27,13 +28,13 @@ const MEMORY_FIELDS: &[&str] = &[
     "tier",
     "namespace",
     "priority",
-    "confidence",
+    field_names::CONFIDENCE,
     "score",
-    "access_count",
+    field_names::ACCESS_COUNT,
     "tags",
     "source",
-    "created_at",
-    "updated_at",
+    field_names::CREATED_AT,
+    field_names::UPDATED_AT,
     "metadata",
 ];
 
@@ -81,10 +82,10 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
         meta.push(format!("mode:{mode}"));
     }
     // Task 1.11: surface token budget info in the meta line when present.
-    if let Some(used) = response.get("tokens_used") {
+    if let Some(used) = response.get(field_names::TOKENS_USED) {
         meta.push(format!("tokens_used:{used}"));
     }
-    if let Some(budget) = response.get("budget_tokens") {
+    if let Some(budget) = response.get(field_names::BUDGET_TOKENS) {
         meta.push(format!("budget_tokens:{budget}"));
     }
     if !meta.is_empty() {

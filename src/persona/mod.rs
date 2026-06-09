@@ -47,6 +47,7 @@
 //! distinct, signed event.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -366,7 +367,7 @@ impl<'a> PersonaGenerator<'a> {
                 "entity_id": entity_id,
                 "sources": source_ids.clone(),
                 "version": version,
-                "attest_level": crate::models::AttestLevel::Unsigned.as_str(),
+                (field_names::ATTEST_LEVEL): crate::models::AttestLevel::Unsigned.as_str(),
                 "generated_at": now,
             }
         });
@@ -493,7 +494,7 @@ impl<'a> PersonaGenerator<'a> {
             .and_then(serde_json::Value::as_object_mut)
         {
             env.insert(
-                "attest_level".to_string(),
+                field_names::ATTEST_LEVEL.to_string(),
                 serde_json::Value::String(attest_level.clone()),
             );
             if let Some(sig) = signature_bytes.as_ref() {
@@ -603,7 +604,7 @@ pub fn get_latest_persona(
         })
         .unwrap_or_default();
     let attest_level = envelope
-        .get("attest_level")
+        .get(field_names::ATTEST_LEVEL)
         .and_then(|v| v.as_str())
         .unwrap_or(crate::models::AttestLevel::Unsigned.as_str())
         .to_string();
@@ -838,7 +839,7 @@ pub fn render_persona_json(persona: &Persona) -> String {
         serde_json::Value::String(persona.namespace.clone()),
     );
     map.insert(
-        "persona_version",
+        field_names::PERSONA_VERSION,
         serde_json::Value::Number(serde_json::Number::from(persona.version)),
     );
     map.insert(
@@ -846,7 +847,7 @@ pub fn render_persona_json(persona: &Persona) -> String {
         serde_json::Value::String(persona.generated_at.clone()),
     );
     map.insert(
-        "attest_level",
+        field_names::ATTEST_LEVEL,
         serde_json::Value::String(persona.attest_level.clone()),
     );
     map.insert(

@@ -11,6 +11,8 @@
 #![allow(clippy::too_many_lines)]
 
 #[cfg(feature = "sal")]
+use crate::models::field_names;
+#[cfg(feature = "sal")]
 use axum::{
     Json,
     extract::{Request, State},
@@ -67,7 +69,7 @@ pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
         Json(json!({
             "error": "endpoint not yet implemented for postgres-backed daemon",
             "endpoint": endpoint,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
             "remediation": remediation,
         })),
     )
@@ -556,7 +558,7 @@ pub async fn postgres_route_gate(
             "error": "endpoint not yet implemented for postgres-backed daemon",
             "endpoint": path,
             "method": method.as_str(),
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
             "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage; \
                             see docs/postgres-age-guide.md for the supported endpoint inventory",
         })),

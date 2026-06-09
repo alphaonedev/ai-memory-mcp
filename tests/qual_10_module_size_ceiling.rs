@@ -176,7 +176,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 16_206. Growth is justified: named knobs REPLACING scattered
     // magic literals per the operator no-hardcoded-literals directive.
     // 16_250 = 16_206 + 44 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 16_250),
+    //
+    // 2026-06-09 (later) — bumped 16_250 → 16_300 by #1558 batch 5
+    // wave 4: routing the sqlx row-label/json-key literals through
+    // models::field_names (multi-line const-arg reflows + imports)
+    // pushed the file to 16_255. Same justification class: named SSOT
+    // refs replacing scattered literals. 16_300 = 16_255 + 45 headroom.
+    ("src/store/postgres.rs", 16_300),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /

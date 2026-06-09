@@ -10,6 +10,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -158,16 +159,16 @@ pub async fn notify(
             StatusCode::CREATED,
             Json(json!({
                 "id": new_id,
-                "target_agent_id": body.target_agent_id,
+                (field_names::TARGET_AGENT_ID): body.target_agent_id,
                 "namespace": crate::inbox_namespace(&body.target_agent_id),
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
     }
 
     let mut params = json!({
-        "target_agent_id": body.target_agent_id,
+        (field_names::TARGET_AGENT_ID): body.target_agent_id,
         "title": body.title,
         "payload": payload,
     });
@@ -383,14 +384,14 @@ pub async fn subscribe(
         let metadata = json!({
             "kind": "subscription",
             "agent_id": caller,
-            "subscription_id": sub_id,
+            (field_names::SUBSCRIPTION_ID): sub_id,
             "url": url,
             "events": events,
-            "namespace_filter": namespace_filter,
-            "agent_filter": agent_filter,
+            (field_names::NAMESPACE_FILTER): namespace_filter,
+            (field_names::AGENT_FILTER): agent_filter,
             "secret_hash": secret_hash_for_metadata,
-            "created_by": caller,
-            "created_at": now,
+            (field_names::CREATED_BY): caller,
+            (field_names::CREATED_AT): now,
         });
         let mem = Memory {
             id: sub_id.clone(),
@@ -443,11 +444,11 @@ pub async fn subscribe(
                 "url": url,
                 "events": events,
                 "namespace": namespace_filter,
-                "namespace_filter": namespace_filter,
-                "agent_filter": agent_filter,
+                (field_names::NAMESPACE_FILTER): namespace_filter,
+                (field_names::AGENT_FILTER): agent_filter,
                 "agent_id": caller,
-                "created_by": caller,
-                "storage_backend": "postgres",
+                (field_names::CREATED_BY): caller,
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -489,9 +490,9 @@ pub async fn subscribe(
             "id": id,
             "url": url,
             "events": events,
-            "namespace_filter": namespace_filter,
-            "agent_filter": agent_filter,
-            "created_by": caller,
+            (field_names::NAMESPACE_FILTER): namespace_filter,
+            (field_names::AGENT_FILTER): agent_filter,
+            (field_names::CREATED_BY): caller,
         }))
     })();
     // Federate the `_agents` write we may have just done so registration is
@@ -613,12 +614,14 @@ pub async fn unsubscribe(
                 Ok(rows) => rows
                     .into_iter()
                     .find(|m| {
-                        m.metadata.get("namespace_filter").and_then(|v| v.as_str())
+                        m.metadata
+                            .get(field_names::NAMESPACE_FILTER)
+                            .and_then(|v| v.as_str())
                             == Some(ns.as_str())
                     })
                     .map(|m| {
                         m.metadata
-                            .get("subscription_id")
+                            .get(field_names::SUBSCRIPTION_ID)
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .unwrap_or(m.id)
@@ -630,12 +633,12 @@ pub async fn unsubscribe(
             Some(id) => match app.store.delete(&ctx, &id).await {
                 Ok(()) => (
                     StatusCode::OK,
-                    Json(json!({"id": id, "removed": true, "storage_backend": "postgres"})),
+                    Json(json!({"id": id, "removed": true, (field_names::STORAGE_BACKEND): "postgres"})),
                 )
                     .into_response(),
                 Err(crate::store::StoreError::NotFound { .. }) => (
                     StatusCode::OK,
-                    Json(json!({"id": id, "removed": false, "storage_backend": "postgres"})),
+                    Json(json!({"id": id, "removed": false, (field_names::STORAGE_BACKEND): "postgres"})),
                 )
                     .into_response(),
                 Err(e) => store_err_to_response(e),
@@ -645,7 +648,7 @@ pub async fn unsubscribe(
                 Json(json!({
                     "id": "",
                     "removed": false,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -797,19 +800,19 @@ pub async fn list_subscriptions(
                             continue;
                         }
                         let sub_id = meta
-                            .get("subscription_id")
+                            .get(field_names::SUBSCRIPTION_ID)
                             .cloned()
                             .unwrap_or_else(|| serde_json::Value::String(m.id.clone()));
                         rows.push(json!({
                             "id": sub_id,
                             "url": meta.get("url").cloned().unwrap_or(serde_json::Value::Null),
                             "events": meta.get("events").cloned().unwrap_or(serde_json::Value::Null),
-                            "namespace": meta.get("namespace_filter").cloned().unwrap_or(serde_json::Value::Null),
-                            "namespace_filter": meta.get("namespace_filter").cloned().unwrap_or(serde_json::Value::Null),
-                            "agent_filter": meta.get("agent_filter").cloned().unwrap_or(serde_json::Value::Null),
+                            "namespace": meta.get(field_names::NAMESPACE_FILTER).cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::NAMESPACE_FILTER): meta.get(field_names::NAMESPACE_FILTER).cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::AGENT_FILTER): meta.get(field_names::AGENT_FILTER).cloned().unwrap_or(serde_json::Value::Null),
                             "agent_id": meta.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
-                            "created_by": meta.get("created_by").cloned().unwrap_or(serde_json::Value::Null),
-                            "created_at": meta.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::CREATED_BY): meta.get(field_names::CREATED_BY).cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::CREATED_AT): meta.get(field_names::CREATED_AT).cloned().unwrap_or(serde_json::Value::Null),
                             "dispatch_count": 0,
                             "failure_count": 0,
                         }));
@@ -823,8 +826,8 @@ pub async fn list_subscriptions(
             StatusCode::OK,
             Json(json!({
                 "count": count,
-                "subscriptions": rows,
-                "storage_backend": "postgres",
+                (field_names::SUBSCRIPTIONS): rows,
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -855,11 +858,11 @@ pub async fn list_subscriptions(
                 "url": s.url,
                 "events": s.events,
                 "namespace": s.namespace_filter,
-                "namespace_filter": s.namespace_filter,
-                "agent_filter": s.agent_filter,
+                (field_names::NAMESPACE_FILTER): s.namespace_filter,
+                (field_names::AGENT_FILTER): s.agent_filter,
                 "agent_id": s.agent_filter.clone().or(s.created_by.clone()),
-                "created_by": s.created_by,
-                "created_at": s.created_at,
+                (field_names::CREATED_BY): s.created_by,
+                (field_names::CREATED_AT): s.created_at,
                 "dispatch_count": s.dispatch_count,
                 "failure_count": s.failure_count,
             })
@@ -868,7 +871,7 @@ pub async fn list_subscriptions(
     let count = rows.len();
     (
         StatusCode::OK,
-        Json(json!({"count": count, "subscriptions": rows})),
+        Json(json!({"count": count, (field_names::SUBSCRIPTIONS): rows})),
     )
         .into_response()
 }
@@ -948,7 +951,7 @@ pub async fn dispatch_event_postgres(
             continue;
         }
         let sub_id = meta
-            .get("subscription_id")
+            .get(field_names::SUBSCRIPTION_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| m.id.clone());
@@ -962,19 +965,19 @@ pub async fn dispatch_event_postgres(
             .unwrap_or("*")
             .to_string();
         let namespace_filter = meta
-            .get("namespace_filter")
+            .get(field_names::NAMESPACE_FILTER)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let agent_filter = meta
-            .get("agent_filter")
+            .get(field_names::AGENT_FILTER)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let created_by = meta
-            .get("created_by")
+            .get(field_names::CREATED_BY)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let created_at = meta
-            .get("created_at")
+            .get(field_names::CREATED_AT)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();

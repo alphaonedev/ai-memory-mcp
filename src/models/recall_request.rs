@@ -29,6 +29,7 @@
 //! runtime DTO are now the same type — option (a) in the issue rubric.
 
 use crate::models::MemoryKind;
+use crate::models::field_names;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -225,7 +226,7 @@ impl RecallRequest {
         // behaviour — only that it doesn't crash.
         let mut owned = params.clone();
         if let Some(obj) = owned.as_object_mut() {
-            for key in ["limit", "budget_tokens"] {
+            for key in ["limit", field_names::BUDGET_TOKENS] {
                 if let Some(v) = obj.get(key)
                     && let Some(n) = v.as_u64()
                     && n > i64::MAX as u64

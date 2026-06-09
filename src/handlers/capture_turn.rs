@@ -16,6 +16,7 @@
 //! the single `app.store` path serves both backends; standard builds
 //! fall back to the sqlite SSOT free function.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -51,7 +52,7 @@ fn capture_turn_ok(result: &crate::models::CaptureTurnResult, attest_level: &str
                 "memory_id": result.memory_id,
                 "dedup_hit": false,
                 "layer": "L4",
-                "attest_level": attest_level,
+                (field_names::ATTEST_LEVEL): attest_level,
             })),
         )
             .into_response()

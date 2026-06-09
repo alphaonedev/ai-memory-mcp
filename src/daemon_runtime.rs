@@ -33,6 +33,7 @@
 //! - [`run_curator_daemon_with_shutdown`],
 //!   [`run_curator_daemon_with_primitives`] — the curator-daemon body.
 
+use crate::models::field_names;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -3222,7 +3223,7 @@ pub async fn bootstrap_serve(
                     payload: serde_json::json!({
                         "namespace": mem.namespace,
                         "tier": mem.tier.as_str(),
-                        "memory_kind": mem.memory_kind.as_str(),
+                        (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
                         "title": mem.title,
                     }),
                 };
@@ -4101,7 +4102,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("ai_memory=info".parse().unwrap())
+                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse().unwrap())
                 .add_directive("tower_http=info".parse().unwrap()),
         )
         .try_init();
@@ -4577,7 +4578,7 @@ pub async fn sync_cycle_once(
 
     if !outgoing.is_empty() {
         let body = serde_json::json!({
-            "sender_agent_id": local_agent_id,
+            (field_names::SENDER_AGENT_ID): local_agent_id,
             "sender_clock": { "entries": {} },
             "memories": outgoing,
             "dry_run": false,

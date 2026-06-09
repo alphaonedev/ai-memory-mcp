@@ -23,6 +23,7 @@
 //! Extracted from `src/handlers/mod.rs` as part of the issue #650
 //! file-architecture cleanup.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, State},
@@ -270,7 +271,7 @@ pub async fn approval_decide(
         decision_outcome,
         decision_kind,
         "",
-        json!({ "pending_id": &id }),
+        json!({ (field_names::PENDING_ID): &id }),
     );
 
     let lock = app.db.lock().await;
@@ -286,7 +287,7 @@ pub async fn approval_decide(
                         Ok(memory_id) => json!({
                             "approved": true,
                             "id": id,
-                            "decided_by": agent_id,
+                            (field_names::DECIDED_BY): agent_id,
                             "executed": true,
                             "memory_id": memory_id,
                             "remember": format!("{:?}", body.remember).to_lowercase(),
@@ -326,7 +327,7 @@ pub async fn approval_decide(
                 Ok(true) => json!({
                     "rejected": true,
                     "id": id,
-                    "decided_by": agent_id,
+                    (field_names::DECIDED_BY): agent_id,
                     "remember": format!("{:?}", body.remember).to_lowercase(),
                 }),
                 Ok(false) => {

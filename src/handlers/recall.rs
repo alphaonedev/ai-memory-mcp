@@ -11,6 +11,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -458,12 +459,12 @@ async fn recall_response(
                 let mut resp = json!({
                     "memories": scored,
                     "count": scored.len(),
-                    "tokens_used": 0,
+                    (field_names::TOKENS_USED): 0,
                     "mode": mode,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 });
                 if let Some(b) = budget_tokens {
-                    resp["budget_tokens"] = json!(b);
+                    resp[field_names::BUDGET_TOKENS] = json!(b);
                 }
                 Json(resp).into_response()
             }
@@ -697,11 +698,11 @@ async fn recall_response(
             let mut resp = json!({
                 "memories": scored,
                 "count": scored.len(),
-                "tokens_used": outcome.tokens_used,
+                (field_names::TOKENS_USED): outcome.tokens_used,
                 "mode": mode,
             });
             if let Some(b) = budget_tokens {
-                resp["budget_tokens"] = json!(b);
+                resp[field_names::BUDGET_TOKENS] = json!(b);
                 // Phase P6 (R1) meta block — same shape as the MCP path.
                 resp["meta"] = json!({
                     "budget_tokens_used": outcome.tokens_used,

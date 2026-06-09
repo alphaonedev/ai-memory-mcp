@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -341,7 +342,7 @@ async fn enforce_create_governance<'a>(
                 StatusCode::ACCEPTED,
                 Json(json!({
                     "status": "pending",
-                    "pending_id": pending_id,
+                    (field_names::PENDING_ID): pending_id,
                     "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "store",
                     "namespace": namespace,
@@ -828,9 +829,9 @@ async fn create_memory_postgres(
                 StatusCode::ACCEPTED,
                 Json(json!({
                     "status": "pending",
-                    "pending_id": pending_id,
+                    (field_names::PENDING_ID): pending_id,
                     "namespace": mem.namespace,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response();

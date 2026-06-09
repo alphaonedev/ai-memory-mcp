@@ -3,7 +3,9 @@
 
 //! MCP pending-approval handlers and decision recording.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -124,7 +126,7 @@ pub fn handle_subscription_dlq_list(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let subscription_id = params["subscription_id"].as_str();
+    let subscription_id = params[param_names::SUBSCRIPTION_ID].as_str();
     let limit = params["limit"]
         .as_u64()
         .map_or(crate::storage::PENDING_DEFAULT_PAGE_LIMIT, |v| {
@@ -161,7 +163,7 @@ pub fn handle_subscription_dlq_list(
             // not-found.
             return Ok(json!({
                 "count": 0,
-                "subscription_id": subscription_id,
+                (field_names::SUBSCRIPTION_ID): subscription_id,
                 "limit": limit,
                 "entries": Vec::<Value>::new(),
             }));
@@ -200,7 +202,7 @@ pub fn handle_subscription_dlq_list(
     }
     Ok(json!({
         "count": rows.len(),
-        "subscription_id": subscription_id,
+        (field_names::SUBSCRIPTION_ID): subscription_id,
         "limit": limit,
         "entries": rows,
     }))
@@ -318,7 +320,7 @@ pub fn handle_pending_approve(
         "allow",
         "pending_approve",
         "",
-        json!({ "pending_id": id }),
+        json!({ (field_names::PENDING_ID): id }),
     );
 
     match db::approve_with_approver_type(conn, id, &agent_id).map_err(|e| e.to_string())? {
@@ -329,7 +331,7 @@ pub fn handle_pending_approve(
             Ok(json!({
                 "approved": true,
                 "id": id,
-                "decided_by": agent_id,
+                (field_names::DECIDED_BY): agent_id,
                 "executed": true,
                 "memory_id": executed,
                 "remember": match remember {

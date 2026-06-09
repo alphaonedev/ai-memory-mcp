@@ -10,6 +10,7 @@
 //! operators can register a canonical entity (with aliases) from a
 //! terminal.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -57,7 +58,7 @@ pub fn cmd_entity_register(
     let conn = db::open(db_path)?;
 
     let mut params = json!({
-        "canonical_name": args.canonical_name,
+        (field_names::CANONICAL_NAME): args.canonical_name,
         "namespace": args.namespace,
     });
     if !args.aliases.is_empty() {

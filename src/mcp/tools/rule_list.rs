@@ -14,6 +14,7 @@
 //! HTTP admin endpoints (`POST /api/v1/governance/rules` with the
 //! `X-AI-Memory-Operator-Signature` header).
 
+use crate::models::field_names;
 use base64::Engine;
 use serde_json::{Value, json};
 
@@ -102,11 +103,11 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
             "severity": r.severity,
             "reason": r.reason,
             "namespace": r.namespace,
-            "created_by": r.created_by,
-            "created_at": r.created_at,
+            (field_names::CREATED_BY): r.created_by,
+            (field_names::CREATED_AT): r.created_at,
             "enabled": r.enabled,
             "signature_b64": sig_b64,
-            "attest_level": r.attest_level,
+            (field_names::ATTEST_LEVEL): r.attest_level,
         }));
     }
     Ok(json!({
