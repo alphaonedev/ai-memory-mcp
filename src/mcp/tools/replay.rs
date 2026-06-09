@@ -5,6 +5,7 @@
 
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::transcripts::replay::{ReplayEntry, replay_transcript_union};
 use crate::validate;
 use schemars::JsonSchema;
@@ -198,7 +199,7 @@ pub fn handle_replay(
             None => {
                 return Ok(json!({
                     "memory_id": memory_id,
-                    "transcripts": Vec::<Value>::new(),
+                    (field_names::TRANSCRIPTS): Vec::<Value>::new(),
                     "count": 0,
                 }));
             }
@@ -206,7 +207,7 @@ pub fn handle_replay(
         if !crate::visibility::is_visible_to_caller(&anchor, &agent_id) {
             return Ok(json!({
                 "memory_id": memory_id,
-                "transcripts": Vec::<Value>::new(),
+                (field_names::TRANSCRIPTS): Vec::<Value>::new(),
                 "count": 0,
             }));
         }
@@ -221,7 +222,7 @@ pub fn handle_replay(
             payload: json!({
                 "memory_id": memory_id,
                 "transcript_id": entry.meta.id,
-                "source_memory_id": entry.memory_id,
+                (field_names::SOURCE_MEMORY_ID): entry.memory_id,
             }),
         };
         match Permissions::evaluate(&ctx, &[]) {
@@ -254,7 +255,10 @@ pub fn handle_replay(
         let truncate = !verbose && meta.original_size > REPLAY_VERBOSE_THRESHOLD_BYTES;
         let mut obj = serde_json::Map::new();
         obj.insert("id".into(), Value::String(meta.id.clone()));
-        obj.insert("created_at".into(), Value::String(meta.created_at.clone()));
+        obj.insert(
+            field_names::CREATED_AT.into(),
+            Value::String(meta.created_at.clone()),
+        );
         obj.insert("compressed_size".into(), json!(meta.compressed_size));
         obj.insert("original_size".into(), json!(meta.original_size));
         obj.insert(
@@ -272,7 +276,7 @@ pub fn handle_replay(
         // from. For a non-reflection replay this is always equal to
         // the input `memory_id`, but emitting it unconditionally
         // keeps the wire shape uniform.
-        obj.insert("source_memory_id".into(), Value::String(src_mid));
+        obj.insert(field_names::SOURCE_MEMORY_ID.into(), Value::String(src_mid));
         if truncate {
             // Honest gate: announce the omission so the caller knows to
             // re-issue with `verbose=true` rather than silently
@@ -294,7 +298,7 @@ pub fn handle_replay(
 
     Ok(json!({
         "memory_id": memory_id,
-        "transcripts": transcripts_json,
+        (field_names::TRANSCRIPTS): transcripts_json,
         "count": transcripts_json.len(),
     }))
 }

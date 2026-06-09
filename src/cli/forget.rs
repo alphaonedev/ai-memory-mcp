@@ -93,7 +93,7 @@ pub fn cmd_forget(
             }
         }
         Err(e) => {
-            writeln!(out.stderr, "error: {e}")?;
+            writeln!(out.stderr, "{}", crate::errors::msg::error_line(&e))?;
             std::process::exit(1);
         }
     }

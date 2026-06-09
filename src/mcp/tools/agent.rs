@@ -3,6 +3,8 @@
 
 //! MCP agent-registration and agent-list handlers.
 
+use crate::mcp::param_names;
+use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 pub(super) fn handle_agent_register(
@@ -10,10 +12,10 @@ pub(super) fn handle_agent_register(
     params: &Value,
 ) -> Result<Value, String> {
     let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
-    let agent_type = params["agent_type"]
+    let agent_type = params[param_names::AGENT_TYPE]
         .as_str()
         .ok_or("agent_type is required")?;
-    let capabilities: Vec<String> = params["capabilities"]
+    let capabilities: Vec<String> = params[param_names::CAPABILITIES]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -40,8 +42,8 @@ pub(super) fn handle_agent_register(
         "",
         json!({
             "new_agent_id": agent_id,
-            "agent_type": agent_type,
-            "capabilities": &capabilities,
+            (field_names::AGENT_TYPE): agent_type,
+            (field_names::CAPABILITIES): &capabilities,
         }),
     );
 
@@ -49,11 +51,11 @@ pub(super) fn handle_agent_register(
         db::register_agent(conn, agent_id, agent_type, &capabilities).map_err(|e| e.to_string())?;
 
     Ok(json!({
-        "registered": true,
+        (field_names::REGISTERED): true,
         "id": id,
         "agent_id": agent_id,
-        "agent_type": agent_type,
-        "capabilities": capabilities,
+        (field_names::AGENT_TYPE): agent_type,
+        (field_names::CAPABILITIES): capabilities,
     }))
 }
 

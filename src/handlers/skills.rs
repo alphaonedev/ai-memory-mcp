@@ -44,6 +44,7 @@
 //! safe-by-default posture, every skill HTTP surface MUST be admin-
 //! only until a future cluster lands a richer skill-ACL model.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -232,7 +233,7 @@ pub async fn skill_export_route(
     }
     let params = json!({
         "skill_id": id,
-        "target_folder": body.target_folder,
+        (field_names::TARGET_FOLDER): body.target_folder,
     });
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
@@ -276,7 +277,7 @@ pub async fn skill_promote_route(
     }
     let mut params = json!({
         "reflection_id": id,
-        "skill_name": body.name,
+        (field_names::SKILL_NAME): body.name,
         "skill_description": body.description,
     });
     if let Some(ps) = body.parameters_schema {
@@ -322,7 +323,7 @@ pub async fn skill_compose_route(
     let Json(body) = body.unwrap_or(Json(SkillComposeBody::default()));
     let mut params = json!({"skill_id": id});
     if let Some(b) = body.budget_tokens {
-        params["budget_tokens"] = json!(b);
+        params[field_names::BUDGET_TOKENS] = json!(b);
     }
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_compositional_context(&lock.0, &params) {

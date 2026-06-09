@@ -28,6 +28,7 @@
 //! can drive reflections without re-implementing the keypair-load
 //! ceremony.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -104,7 +105,7 @@ pub fn cmd_reflect(
     let conn = db::open(db_path)?;
 
     let mut params = json!({
-        "source_ids": args.source_ids,
+        (field_names::SOURCE_IDS): args.source_ids,
         "title": args.title,
         "content": args.content,
     });
@@ -118,7 +119,7 @@ pub fn cmd_reflect(
         params["priority"] = json!(p);
     }
     if let Some(c) = args.confidence {
-        params["confidence"] = json!(c);
+        params[field_names::CONFIDENCE] = json!(c);
     }
     if !args.tags.is_empty() {
         params["tags"] = json!(args.tags);
@@ -144,7 +145,7 @@ pub fn cmd_reflect(
 
     let id = envelope.get("id").and_then(Value::as_str).unwrap_or("?");
     let depth = envelope
-        .get("reflection_depth")
+        .get(field_names::REFLECTION_DEPTH)
         .and_then(Value::as_i64)
         .unwrap_or(0);
     writeln!(out.stdout, "reflect: id={id}  depth={depth}")?;

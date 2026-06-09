@@ -51,6 +51,7 @@
 //! the MCP `memory_reflection_origin` handler calls
 //! [`reflection_origin`] for read-side queries.
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -126,7 +127,7 @@ pub fn stamp_reflection_origin(mem: &Memory, sender_agent_id: &str, local_cap: u
     // peer; later re-fans never overwrite the substrate-of-record.
     if !meta_map.contains_key(REFLECTION_ORIGIN_KEY) {
         let stamp = serde_json::json!({
-            "peer_origin": sender_agent_id,
+            (field_names::PEER_ORIGIN): sender_agent_id,
             "original_depth": mem.reflection_depth,
             "local_depth_at_arrival": local_cap,
         });
@@ -171,7 +172,7 @@ pub fn reflection_origin_from_memory(mem: &Memory) -> ReflectionOrigin {
         .map(str::to_string);
     let origin_obj = mem.metadata.get(REFLECTION_ORIGIN_KEY);
     let peer_origin = origin_obj
-        .and_then(|v| v.get("peer_origin"))
+        .and_then(|v| v.get(field_names::PEER_ORIGIN))
         .and_then(Value::as_str)
         .map(str::to_string);
     let local_depth_at_arrival = origin_obj
@@ -222,7 +223,7 @@ pub fn enforce_local_cap_on_derived(
     let imported_peer = sources.iter().find_map(|m| {
         m.metadata
             .get(REFLECTION_ORIGIN_KEY)
-            .and_then(|v| v.get("peer_origin"))
+            .and_then(|v| v.get(field_names::PEER_ORIGIN))
             .and_then(Value::as_str)
             .map(str::to_string)
     });

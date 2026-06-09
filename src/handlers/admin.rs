@@ -11,6 +11,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -90,8 +91,8 @@ pub async fn register_agent(
         "",
         json!({
             "new_agent_id": body.agent_id,
-            "agent_type": body.agent_type,
-            "capabilities": capabilities,
+            (field_names::AGENT_TYPE): body.agent_type,
+            (field_names::CAPABILITIES): capabilities,
         }),
     );
 
@@ -115,11 +116,11 @@ pub async fn register_agent(
         let now = Utc::now().to_rfc3339();
         let mut metadata = json!({
             "agent_id": &body.agent_id,
-            "agent_type": &body.agent_type,
+            (field_names::AGENT_TYPE): &body.agent_type,
         });
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert(
-                "capabilities".to_string(),
+                field_names::CAPABILITIES.to_string(),
                 serde_json::to_value(&capabilities).unwrap_or_else(|_| json!([])),
             );
         }
@@ -157,9 +158,9 @@ pub async fn register_agent(
                 Json(json!({
                     "id": id,
                     "agent_id": body.agent_id,
-                    "agent_type": body.agent_type,
-                    "capabilities": capabilities,
-                    "storage_backend": "postgres",
+                    (field_names::AGENT_TYPE): body.agent_type,
+                    (field_names::CAPABILITIES): capabilities,
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -199,11 +200,11 @@ pub async fn register_agent(
             (
                 StatusCode::CREATED,
                 Json(json!({
-                    "registered": true,
+                    (field_names::REGISTERED): true,
                     "id": id,
                     "agent_id": body.agent_id,
-                    "agent_type": body.agent_type,
-                    "capabilities": capabilities,
+                    (field_names::AGENT_TYPE): body.agent_type,
+                    (field_names::CAPABILITIES): capabilities,
                 })),
             )
                 .into_response()
@@ -433,13 +434,13 @@ pub async fn get_stats(
                     by_namespace_map.insert(nc.namespace.clone(), json!(nc.count));
                 }
                 Json(json!({
-                    "total_memories": s.total,
+                    (field_names::TOTAL_MEMORIES): s.total,
                     "by_tier": by_tier_map,
                     "by_namespace": by_namespace_map,
                     "expiring_soon": s.expiring_soon,
                     "links_count": s.links_count,
                     "db_size_bytes": s.db_size_bytes,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -487,7 +488,8 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
         };
         return match app.store.run_gc(archive_flag).await {
             Ok(n) => {
-                Json(json!({"expired_deleted": n, "storage_backend": "postgres"})).into_response()
+                Json(json!({"expired_deleted": n, (field_names::STORAGE_BACKEND): "postgres"}))
+                    .into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -555,7 +557,7 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             "links": links,
             "count": count,
             "exported_at": Utc::now().to_rfc3339(),
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
@@ -746,7 +748,7 @@ pub async fn import_memories(
                     pending.push(json!({
                         "id": mem.id,
                         "namespace": mem.namespace,
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                     }));
                     continue;
                 }
@@ -789,7 +791,7 @@ pub async fn import_memories(
             "imported": imported,
             "errors": errors,
             "pending": pending,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }

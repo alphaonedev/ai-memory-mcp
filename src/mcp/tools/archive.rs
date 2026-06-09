@@ -4,6 +4,8 @@
 //! MCP archive management handlers (list, restore, purge, stats, gc).
 
 use crate::db;
+use crate::mcp::param_names;
+use crate::models::field_names;
 use serde_json::{Value, json};
 pub(super) fn handle_archive_list(
     conn: &rusqlite::Connection,
@@ -45,7 +47,7 @@ pub(super) fn handle_archive_purge(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let older_than_days = params["older_than_days"].as_i64();
+    let older_than_days = params[param_names::OLDER_THAN_DAYS].as_i64();
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // state-change audit. Archive purge permanently deletes archived
@@ -74,8 +76,8 @@ pub(super) fn handle_archive_purge(
         crate::governance::action_labels::ARCHIVE_PURGE,
         "",
         json!({
-            "older_than_days": older_than_days,
-            "owner_scope": if as_admin { "admin" } else { "caller" },
+            (field_names::OLDER_THAN_DAYS): older_than_days,
+            (field_names::OWNER_SCOPE): if as_admin { "admin" } else { "caller" },
         }),
     );
 
@@ -92,7 +94,7 @@ pub(super) fn handle_archive_purge(
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
             agent_id,
             payload: json!({
-                "older_than_days": older_than_days,
+                (field_names::OLDER_THAN_DAYS): older_than_days,
                 "as_admin": as_admin,
             }),
         };
@@ -122,7 +124,7 @@ pub(super) fn handle_archive_purge(
     };
     Ok(json!({
         "purged": purged,
-        "owner_scope": if as_admin { "admin" } else { "caller" },
+        (field_names::OWNER_SCOPE): if as_admin { "admin" } else { "caller" },
     }))
 }
 

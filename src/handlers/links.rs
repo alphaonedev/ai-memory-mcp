@@ -23,6 +23,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, State},
@@ -429,7 +430,7 @@ pub async fn create_link(
                         "source_id": source_id,
                         "target_id": target_id,
                         "relation": relation,
-                        "attest_level": attest_level,
+                        (field_names::ATTEST_LEVEL): attest_level,
                     })),
                 )
                     .into_response()
@@ -485,7 +486,7 @@ pub async fn create_link(
         .unwrap_or("");
     let source_target = source_mem
         .metadata
-        .get("target_agent_id")
+        .get(field_names::TARGET_AGENT_ID)
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let is_unowned_legacy = source_owner.is_empty();
@@ -604,7 +605,7 @@ pub async fn create_link(
             // can tell signed vs unsigned without re-querying.
             (
                 StatusCode::CREATED,
-                Json(json!({"linked": true, "attest_level": attest_level})),
+                Json(json!({"linked": true, (field_names::ATTEST_LEVEL): attest_level})),
             )
                 .into_response()
         }
@@ -765,7 +766,7 @@ pub async fn delete_link(
         .to_string();
     let source_target = source_mem
         .metadata
-        .get("target_agent_id")
+        .get(field_names::TARGET_AGENT_ID)
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();

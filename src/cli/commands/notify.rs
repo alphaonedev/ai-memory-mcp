@@ -15,6 +15,7 @@
 //! in [`crate::mcp::handle_notify`]. The MCP, HTTP, and CLI surfaces
 //! share that one implementation.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -68,7 +69,7 @@ pub fn cmd_notify(
     let resolved_ttl = app_config.effective_ttl();
 
     let mut params = json!({
-        "target_agent_id": args.target_agent_id,
+        (field_names::TARGET_AGENT_ID): args.target_agent_id,
         "title": args.title,
         "payload": args.payload,
     });

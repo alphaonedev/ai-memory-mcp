@@ -47,6 +47,7 @@
 
 use crate::cli::CliOutput;
 use crate::db;
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -235,7 +236,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
         // Always include the full per-tool table when --raw-table is
         // set; --json gives the rolled-up view.
         let payload = serde_json::json!({
-            "schema_version": "v0.6.4-tokens-1",
+            (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
             "tokenizer": "cl100k_base",
             "active_profile": profile.families().iter().map(|f| f.name()).collect::<Vec<_>>(),
             "active_total_tokens": active_total,
@@ -369,7 +370,7 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
 
     if args.json {
         let payload = serde_json::json!({
-            "schema_version": "v0.7-hooks-1",
+            (field_names::SCHEMA_VERSION): "v0.7-hooks-1",
             "config_path": path_opt.as_ref().map(|p| p.display().to_string()),
             "hooks_loaded": hooks.len(),
             "executors": hooks.iter().map(|h| serde_json::json!({
@@ -554,7 +555,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
 
     match db::stats(conn, db_path) {
         Ok(stats) => {
-            facts.push(("total_memories".into(), stats.total.to_string()));
+            facts.push((field_names::TOTAL_MEMORIES.into(), stats.total.to_string()));
             facts.push(("expiring_within_1h".into(), stats.expiring_soon.to_string()));
             facts.push(("links".into(), stats.links_count.to_string()));
             facts.push(("db_size_bytes".into(), stats.db_size_bytes.to_string()));
@@ -840,7 +841,7 @@ fn section_capabilities_local() -> ReportSection {
         name: "Capabilities".into(),
         severity: Severity::NotAvailable,
         facts: vec![(
-            "capabilities".into(),
+            field_names::CAPABILITIES.into(),
             "use --remote <url> to query the live capabilities endpoint".into(),
         )],
         note: None,
@@ -1219,10 +1220,10 @@ fn section_capabilities_remote(url: &str) -> ReportSection {
         Ok(v) => {
             // schema_version: "1" (legacy v0.6.3) or "2" (post-P1).
             let schema = v
-                .get("schema_version")
+                .get(field_names::SCHEMA_VERSION)
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            facts.push(("schema_version".into(), schema.to_string()));
+            facts.push((field_names::SCHEMA_VERSION.into(), schema.to_string()));
 
             // P1 v2 fields — best-effort lookup. The legacy v1 shape
             // doesn't carry these; we render the missing ones as
@@ -1315,7 +1316,7 @@ fn section_storage_remote(stats_url: &str) -> ReportSection {
     match http_get_json(stats_url) {
         Ok(v) => {
             if let Some(total) = v.get("total").and_then(Value::as_u64) {
-                facts.push(("total_memories".into(), total.to_string()));
+                facts.push((field_names::TOTAL_MEMORIES.into(), total.to_string()));
             }
             if let Some(exp) = v.get("expiring_soon").and_then(Value::as_u64) {
                 facts.push(("expiring_within_1h".into(), exp.to_string()));

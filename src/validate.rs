@@ -324,9 +324,9 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
 /// Shape-only validation for an agent identifier — the pre-#977
 /// behaviour, separated so internal callers that legitimately need to
 /// load/generate keypairs with reserved-sentinel labels (e.g. the
-/// daemon's own `"daemon"` self-signing keypair at
-/// `src/daemon_runtime.rs:1724 DAEMON_KEYPAIR_LABEL`) can opt into the
-/// looser check.
+/// daemon's own self-signing keypair under
+/// [`crate::identity::keypair::DAEMON_KEYPAIR_LABEL`]) can opt into
+/// the looser check.
 ///
 /// Allowed characters: alphanumeric plus `_`, `-`, `:`, `@`, `.`, `/`.
 /// Length: 1..=128 bytes. Rejects whitespace, null bytes, control

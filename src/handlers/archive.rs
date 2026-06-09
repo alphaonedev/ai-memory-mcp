@@ -16,6 +16,7 @@
 //! * `POST   /api/v1/archive/{id}/restore` → [`restore_archive`]
 //! * `GET    /api/v1/archive/stats`        → [`archive_stats`]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -183,8 +184,10 @@ pub async fn restore_archive(
                     )
                     .await;
                 }
-                Json(json!({"restored": true, "id": id, "storage_backend": "postgres"}))
-                    .into_response()
+                Json(
+                    json!({"restored": true, "id": id, (field_names::STORAGE_BACKEND): "postgres"}),
+                )
+                .into_response()
             }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
@@ -303,8 +306,8 @@ pub async fn purge_archive(
         crate::governance::action_labels::ARCHIVE_PURGE,
         "",
         json!({
-            "older_than_days": q.older_than_days,
-            "owner_scope": if is_admin { "admin" } else { "caller" },
+            (field_names::OLDER_THAN_DAYS): q.older_than_days,
+            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
         }),
     );
 
@@ -323,8 +326,8 @@ pub async fn purge_archive(
         return match app.store.archive_purge(&ctx, q.older_than_days).await {
             Ok(n) => Json(json!({
                 "purged": n,
-                "owner_scope": if is_admin { "admin" } else { "caller" },
-                "storage_backend": "postgres",
+                (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
+                (field_names::STORAGE_BACKEND): "postgres",
             }))
             .into_response(),
             Err(e) => store_err_to_response(e),
@@ -347,7 +350,7 @@ pub async fn purge_archive(
     match purge_result {
         Ok(n) => Json(json!({
             "purged": n,
-            "owner_scope": if is_admin { "admin" } else { "caller" },
+            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
         }))
         .into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),
@@ -516,7 +519,7 @@ pub async fn archive_by_ids(
                 "missing": missing,
                 "count": archived.len(),
                 "reason": reason,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();

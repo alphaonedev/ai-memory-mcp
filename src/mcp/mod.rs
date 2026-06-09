@@ -12,6 +12,7 @@
 // budget while the deferred-registration substrate threads through.
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
@@ -309,18 +310,18 @@ pub fn prompt_definitions() -> Value {
         "prompts": [
             {
                 "name": "recall-first",
-                "description": "System prompt for AI clients: proactive memory recall, TOON format, tier strategy.",
+                (field_names::DESCRIPTION): "System prompt for AI clients: proactive memory recall, TOON format, tier strategy.",
                 "arguments": [
                     {
                         "name": "namespace",
-                        "description": "Optional namespace to scope recall.",
+                        (field_names::DESCRIPTION): "Optional namespace to scope recall.",
                         "required": false
                     }
                 ]
             },
             {
                 "name": "memory-workflow",
-                "description": "Quick reference card for memory tool usage patterns."
+                (field_names::DESCRIPTION): "Quick reference card for memory tool usage patterns."
             }
         ]
     })
@@ -1466,9 +1467,12 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
         }
         if matches!(accept, CapabilitiesAccept::V1)
             && let Some(obj) = value.as_object_mut()
-            && !obj.contains_key("schema_version")
+            && !obj.contains_key(field_names::SCHEMA_VERSION)
         {
-            obj.insert("schema_version".to_string(), Value::String("1".to_string()));
+            obj.insert(
+                field_names::SCHEMA_VERSION.to_string(),
+                Value::String("1".to_string()),
+            );
         }
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tier".to_string(), Value::String(runtime_tier.to_string()));
@@ -2061,7 +2065,7 @@ fn handle_request(
                 id,
                 json!({
                     "protocolVersion": jsonrpc::PROTOCOL_REVISION,
-                    "capabilities": { "tools": {}, "prompts": {} },
+                    (field_names::CAPABILITIES): { "tools": {}, "prompts": {} },
                     "serverInfo": server_info,
                 }),
             )
@@ -2617,8 +2621,9 @@ pub fn run_mcp_server(
     // command in the same process.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ai_memory=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(crate::logging::DEFAULT_LOG_DIRECTIVE)
+            }),
         )
         .with_writer(std::io::stderr)
         .try_init();

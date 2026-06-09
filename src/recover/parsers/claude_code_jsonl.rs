@@ -12,6 +12,7 @@
 //! implementation slice §C2 for the verbatim line-shape reference
 //! and the surviving `f755c061-...jsonl` example dossier path.
 
+use crate::models::field_names;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -152,7 +153,7 @@ fn tool_use_brief(b: &Value) -> String {
             .and_then(Value::as_str)
             .map(ToString::to_string)
     };
-    let brief = pick("description")
+    let brief = pick(field_names::DESCRIPTION)
         .or_else(|| pick("command"))
         .or_else(|| pick("file_path"))
         .or_else(|| pick("query"))

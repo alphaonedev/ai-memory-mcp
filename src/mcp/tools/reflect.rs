@@ -7,6 +7,7 @@ use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::mcp::param_names;
+use crate::models::field_names;
 use crate::models::{GovernedAction, Tier};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -99,7 +100,7 @@ pub(crate) fn parse_reflect_input(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<(db::ReflectInput, Option<i64>), String> {
-    let source_ids_arr = params["source_ids"]
+    let source_ids_arr = params[param_names::SOURCE_IDS]
         .as_array()
         .ok_or("source_ids is required (array of memory IDs)")?;
     if source_ids_arr.is_empty() {
@@ -125,7 +126,7 @@ pub(crate) fn parse_reflect_input(
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
     let tags: Vec<String> = params["tags"]
         .as_array()
         .map(|a| {
@@ -192,7 +193,7 @@ pub fn handle_reflect(
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<Value, String> {
     // ─── Argument parsing ───────────────────────────────────────────
-    let source_ids_arr = params["source_ids"]
+    let source_ids_arr = params[param_names::SOURCE_IDS]
         .as_array()
         .ok_or("source_ids is required (array of memory IDs)")?;
     if source_ids_arr.is_empty() {
@@ -218,7 +219,7 @@ pub fn handle_reflect(
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
     let tags: Vec<String> = params["tags"]
         .as_array()
         .map(|a| {
@@ -375,14 +376,14 @@ pub fn handle_reflect(
                     // pending → execute round-trip — sibling defect
                     // to #1172, surfaced by the Block 1 QC audit.
                     let payload = json!({
-                        "source_ids": input.source_ids,
+                        (field_names::SOURCE_IDS): input.source_ids,
                         "title": input.title,
                         "content": input.content,
                         "namespace": ns,
                         "tier": input.tier.as_str(),
                         "tags": input.tags,
                         "priority": input.priority,
-                        "confidence": input.confidence,
+                        (field_names::CONFIDENCE): input.confidence,
                         "agent_id": input.agent_id,
                         "metadata": input.metadata,
                         "proposed_depth": new_depth_u32,
@@ -399,7 +400,7 @@ pub fn handle_reflect(
                     crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
                     return Ok(json!({
                         "status": "pending",
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                         "reason": "governance requires approval for reflections above depth threshold",
                         "action": "reflect",
                         "namespace": ns,
@@ -500,7 +501,7 @@ pub fn handle_reflect(
 
     Ok(json!({
         "id": outcome.id,
-        "reflection_depth": outcome.reflection_depth,
+        (field_names::REFLECTION_DEPTH): outcome.reflection_depth,
         "reflects_on": outcome.reflects_on,
         "namespace": outcome.namespace,
     }))

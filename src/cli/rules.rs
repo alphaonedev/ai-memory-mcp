@@ -35,6 +35,7 @@
 //! mutation tools are explicitly disabled (return
 //! `governance.not_available_over_mcp`).
 
+use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -756,7 +757,7 @@ fn sign_seed_rules(
         }
         summary.push(serde_json::json!({
             "id": rule.id,
-            "attest_level": OPERATOR_SIGNED_LEVEL,
+            (field_names::ATTEST_LEVEL): OPERATOR_SIGNED_LEVEL,
             "signed_now": !already_signed,
         }));
     }
@@ -1039,11 +1040,11 @@ fn rule_to_json(rule: &Rule) -> serde_json::Value {
         "severity": rule.severity,
         "reason": rule.reason,
         "namespace": rule.namespace,
-        "created_by": rule.created_by,
-        "created_at": rule.created_at,
+        (field_names::CREATED_BY): rule.created_by,
+        (field_names::CREATED_AT): rule.created_at,
         "enabled": rule.enabled,
         "signature_b64": sig_b64,
-        "attest_level": rule.attest_level,
+        (field_names::ATTEST_LEVEL): rule.attest_level,
     })
 }
 

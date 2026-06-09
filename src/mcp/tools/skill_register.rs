@@ -21,6 +21,7 @@
 //! The matching `signed_events` row is appended for the Bucket 1
 //! attestation chain.
 
+use crate::models::field_names;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,7 +106,7 @@ pub(super) fn register_core(
     let canonical_fm = serde_json::to_vec(&json!({
         "namespace": namespace,
         "name": name,
-        "description": description,
+        (field_names::DESCRIPTION): description,
         "license": license,
         "compatibility": compatibility,
         "allowed_tools": allowed_tools,
@@ -328,7 +329,7 @@ pub fn handle_skill_register(
 
     let digest_hex = hex::encode(&result.digest);
     let mut response = json!({
-        "registered": true,
+        (field_names::REGISTERED): true,
         "id": result.id,
         "namespace": manifest.namespace,
         "name": manifest.name,
@@ -336,7 +337,7 @@ pub fn handle_skill_register(
         "signed": active_keypair.is_some(),
     });
     if let Some(prev) = result.superseded {
-        response["superseded_id"] = json!(prev);
+        response[field_names::SUPERSEDED_ID] = json!(prev);
     }
     Ok(response)
 }

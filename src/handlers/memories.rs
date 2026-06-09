@@ -10,6 +10,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, State},
@@ -591,11 +592,11 @@ pub async fn delete_memory(
                         StatusCode::ACCEPTED,
                         Json(json!({
                             "status": "pending",
-                            "pending_id": pending_id,
+                            (field_names::PENDING_ID): pending_id,
                             "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "delete",
                             "memory_id": mem.id,
-                            "storage_backend": "postgres",
+                            (field_names::STORAGE_BACKEND): "postgres",
                         })),
                     )
                         .into_response();
@@ -773,7 +774,7 @@ pub async fn delete_memory(
                     StatusCode::ACCEPTED,
                     Json(json!({
                         "status": "pending",
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                         "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                         "action": "delete",
                         "memory_id": target_id,
@@ -958,11 +959,11 @@ pub async fn promote_memory(
                         StatusCode::ACCEPTED,
                         Json(json!({
                             "status": "pending",
-                            "pending_id": pending_id,
+                            (field_names::PENDING_ID): pending_id,
                             "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "promote",
                             "memory_id": target.id,
-                            "storage_backend": "postgres",
+                            (field_names::STORAGE_BACKEND): "postgres",
                         })),
                     )
                         .into_response();
@@ -1038,7 +1039,7 @@ pub async fn promote_memory(
                     "promoted": true,
                     "id": target.id,
                     "tier": Tier::Long.as_str(),
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -1164,7 +1165,7 @@ pub async fn promote_memory(
                     StatusCode::ACCEPTED,
                     Json(json!({
                         "status": "pending",
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                         "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                         "action": "promote",
                         "memory_id": target_id,

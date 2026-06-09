@@ -25,6 +25,7 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::models::Memory;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -195,11 +196,11 @@ pub async fn entity_register(
                         StatusCode::ACCEPTED,
                         Json(json!({
                             "status": "pending",
-                            "pending_id": pending_id,
+                            (field_names::PENDING_ID): pending_id,
                             "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "store",
                             "namespace": body.namespace,
-                            "storage_backend": "postgres",
+                            (field_names::STORAGE_BACKEND): "postgres",
                         })),
                     )
                         .into_response();
@@ -228,7 +229,7 @@ pub async fn entity_register(
                 },
                 Json(json!({
                     "entity_id": reg.entity_id,
-                    "canonical_name": reg.canonical_name,
+                    (field_names::CANONICAL_NAME): reg.canonical_name,
                     "namespace": reg.namespace,
                     "aliases": reg.aliases,
                     "created": reg.created,
@@ -258,7 +259,7 @@ pub async fn entity_register(
                 status,
                 Json(json!({
                     "entity_id": reg.entity_id,
-                    "canonical_name": reg.canonical_name,
+                    (field_names::CANONICAL_NAME): reg.canonical_name,
                     "namespace": reg.namespace,
                     "aliases": reg.aliases,
                     "created": reg.created,
@@ -352,7 +353,7 @@ pub async fn entity_get_by_alias(
                     return Json(json!({
                         "found": true,
                         "entity_id": rec.entity_id,
-                        "canonical_name": rec.canonical_name,
+                        (field_names::CANONICAL_NAME): rec.canonical_name,
                         "namespace": rec.namespace,
                         "aliases": rec.aliases,
                     }))
@@ -404,7 +405,7 @@ pub async fn entity_get_by_alias(
                         return Json(json!({
                             "found": true,
                             "entity_id": m.id,
-                            "canonical_name": m.title,
+                            (field_names::CANONICAL_NAME): m.title,
                             "namespace": m.namespace,
                             "aliases": aliases,
                         }))
@@ -414,7 +415,7 @@ pub async fn entity_get_by_alias(
                 Json(json!({
                     "found": false,
                     "entity_id": null,
-                    "canonical_name": null,
+                    (field_names::CANONICAL_NAME): null,
                     "namespace": null,
                     "aliases": [],
                 }))
@@ -458,7 +459,7 @@ pub async fn entity_get_by_alias(
                 return Json(json!({
                     "found": false,
                     "entity_id": null,
-                    "canonical_name": null,
+                    (field_names::CANONICAL_NAME): null,
                     "namespace": null,
                     "aliases": [],
                 }))
@@ -467,7 +468,7 @@ pub async fn entity_get_by_alias(
             Json(json!({
                 "found": true,
                 "entity_id": rec.entity_id,
-                "canonical_name": rec.canonical_name,
+                (field_names::CANONICAL_NAME): rec.canonical_name,
                 "namespace": rec.namespace,
                 "aliases": rec.aliases,
             }))
@@ -476,7 +477,7 @@ pub async fn entity_get_by_alias(
         Ok(None) => Json(json!({
             "found": false,
             "entity_id": null,
-            "canonical_name": null,
+            (field_names::CANONICAL_NAME): null,
             "namespace": null,
             "aliases": [],
         }))
@@ -566,7 +567,7 @@ pub async fn kg_timeline(
             .to_string();
         let target = mem
             .metadata
-            .get("target_agent_id")
+            .get(field_names::TARGET_AGENT_ID)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -681,11 +682,11 @@ pub async fn kg_timeline(
                         json!({
                             "target_id": e.target_id,
                             "relation": e.relation,
-                            "valid_from": e.valid_from,
-                            "valid_until": e.valid_until,
-                            "observed_by": e.observed_by,
+                            (field_names::VALID_FROM): e.valid_from,
+                            (field_names::VALID_UNTIL): e.valid_until,
+                            (field_names::OBSERVED_BY): e.observed_by,
                             "title": e.title,
-                            "target_namespace": e.target_namespace,
+                            (field_names::TARGET_NAMESPACE): e.target_namespace,
                         })
                     })
                     .collect();
@@ -709,11 +710,11 @@ pub async fn kg_timeline(
                     json!({
                         "target_id": e.target_id,
                         "relation": e.relation,
-                        "valid_from": e.valid_from,
-                        "valid_until": e.valid_until,
-                        "observed_by": e.observed_by,
+                        (field_names::VALID_FROM): e.valid_from,
+                        (field_names::VALID_UNTIL): e.valid_until,
+                        (field_names::OBSERVED_BY): e.observed_by,
                         "title": e.title,
-                        "target_namespace": e.target_namespace,
+                        (field_names::TARGET_NAMESPACE): e.target_namespace,
                     })
                 })
                 .collect();
@@ -802,7 +803,7 @@ pub async fn kg_invalidate(
                     .to_string();
                 let target = mem
                     .metadata
-                    .get("target_agent_id")
+                    .get(field_names::TARGET_AGENT_ID)
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -879,7 +880,7 @@ pub async fn kg_invalidate(
                     "source_id": body.source_id,
                     "target_id": body.target_id,
                     "relation": body.relation,
-                    "valid_until": res.valid_until,
+                    (field_names::VALID_UNTIL): res.valid_until,
                     "previous_valid_until": res.previous_valid_until,
                 })),
             )
@@ -913,7 +914,7 @@ pub async fn kg_invalidate(
                 "source_id": body.source_id,
                 "target_id": body.target_id,
                 "relation": body.relation,
-                "valid_until": res.valid_until,
+                (field_names::VALID_UNTIL): res.valid_until,
                 "previous_valid_until": res.previous_valid_until,
             })),
         )
@@ -1363,11 +1364,11 @@ pub async fn kg_query(
                     json!({
                         "target_id": n.target_id,
                         "relation": n.relation,
-                        "valid_from": n.valid_from,
-                        "valid_until": n.valid_until,
-                        "observed_by": n.observed_by,
+                        (field_names::VALID_FROM): n.valid_from,
+                        (field_names::VALID_UNTIL): n.valid_until,
+                        (field_names::OBSERVED_BY): n.observed_by,
                         "title": n.title,
-                        "target_namespace": n.target_namespace,
+                        (field_names::TARGET_NAMESPACE): n.target_namespace,
                         "depth": n.depth,
                         "path": n.path,
                     })

@@ -20,6 +20,7 @@
 //!   shared secret; the plaintext is returned **once** at
 //!   subscription time and never leaves the DB after.
 
+use crate::models::field_names;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -2182,7 +2183,7 @@ pub fn memory_subscription_replay(
 ) -> Result<serde_json::Value> {
     let events = replay_subscription_events(conn, subscription_id, since_rfc3339)?;
     Ok(serde_json::json!({
-        "subscription_id": subscription_id,
+        (field_names::SUBSCRIPTION_ID): subscription_id,
         "since": since_rfc3339,
         "count": events.len(),
         "events": events,

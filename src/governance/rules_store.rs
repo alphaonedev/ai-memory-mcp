@@ -24,6 +24,7 @@
 //! [`get`]; mutation tools over MCP are explicitly disabled per
 //! issue #691 design revision 2026-05-13.
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -647,8 +648,8 @@ pub fn canonical_bytes(rule: &Rule) -> Result<Vec<u8>> {
         "severity": rule.severity,
         "reason": rule.reason,
         "namespace": rule.namespace,
-        "created_by": rule.created_by,
-        "created_at": rule.created_at,
+        (field_names::CREATED_BY): rule.created_by,
+        (field_names::CREATED_AT): rule.created_at,
     });
     serde_json::to_vec(&canonical).context("rules_store::canonical_bytes: serialize")
 }
@@ -694,7 +695,7 @@ pub fn canonical_bytes_for_signing(rule: &Rule) -> Result<Vec<u8>> {
         "severity": rule.severity,
         "reason": rule.reason,
         "namespace": rule.namespace,
-        "created_by": rule.created_by,
+        (field_names::CREATED_BY): rule.created_by,
         "enabled": rule.enabled,
     });
     serde_json::to_vec(&canonical).context("rules_store::canonical_bytes_for_signing: serialize")

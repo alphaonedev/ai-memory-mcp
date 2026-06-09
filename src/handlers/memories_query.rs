@@ -12,6 +12,7 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -339,7 +340,8 @@ pub async fn search_memories(
                 effective_as_agent.as_deref(),
             ) {
                 Ok(r) => {
-                    Json(json!({"results": r, "count": r.len(), "source_uri": uri})).into_response()
+                    Json(json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}))
+                        .into_response()
                 }
                 Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
@@ -639,7 +641,7 @@ pub async fn bulk_create(
                     pending.push(json!({
                         "title": mem.title,
                         "namespace": mem.namespace,
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                     }));
                     continue;
                 }

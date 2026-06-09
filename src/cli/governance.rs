@@ -56,6 +56,7 @@
 //!   helper returns — exiting stays inline so this module is testable.
 
 use crate::cli::CliOutput;
+use crate::models::field_names;
 use crate::{db, models};
 use anyhow::Result;
 use models::{GovernanceDecision, GovernedAction};
@@ -126,7 +127,7 @@ pub fn enforce(
             if json_out {
                 let mut payload_obj = serde_json::json!({
                     "status": "pending",
-                    "pending_id": pending_id,
+                    (field_names::PENDING_ID): pending_id,
                     "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": action.as_str(),
                     "namespace": namespace,

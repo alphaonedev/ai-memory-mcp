@@ -3,6 +3,7 @@
 
 //! MCP `memory_search` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::Tier;
 use crate::{db, validate};
@@ -105,7 +106,7 @@ pub(super) fn handle_search(
     // The partial `idx_memories_source_uri` index (v38) covers the
     // lookup so the reciprocal "everything from this document"
     // query is O(log N), not O(N) JSON-path scan.
-    let source_uri = params["source_uri"]
+    let source_uri = params[param_names::SOURCE_URI]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());

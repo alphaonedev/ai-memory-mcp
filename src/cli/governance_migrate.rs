@@ -39,6 +39,7 @@
 //!   array is appended (existing `[[permissions.rules]]` entries are
 //!   preserved as well — this is an additive append, NOT a replace).
 
+use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -184,7 +185,7 @@ pub fn translate(legacy: &LegacyGovernance) -> PermissionsBlock {
 /// `result.policy.is_empty()`.
 pub fn parse_legacy_governance(raw: &str) -> Result<LegacyGovernance> {
     let value: toml::Value = toml::from_str(raw).context("parse config.toml")?;
-    let Some(gov) = value.get("governance") else {
+    let Some(gov) = value.get(field_names::GOVERNANCE) else {
         return Ok(LegacyGovernance::default());
     };
     let parsed: LegacyGovernance = gov.clone().try_into().context("parse [governance] block")?;

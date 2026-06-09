@@ -6,6 +6,7 @@
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::id_short;
+use crate::models::field_names;
 use crate::{db, identity, validate};
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -134,11 +135,11 @@ pub fn run_agents(
                     out.stdout,
                     "{}",
                     serde_json::json!({
-                        "registered": true,
+                        (field_names::REGISTERED): true,
                         "id": id,
                         "agent_id": agent_id,
-                        "agent_type": agent_type,
-                        "capabilities": caps,
+                        (field_names::AGENT_TYPE): agent_type,
+                        (field_names::CAPABILITIES): caps,
                     })
                 )?;
             } else {
@@ -242,7 +243,7 @@ pub fn run_pending(
                             serde_json::json!({
                                 "approved": true,
                                 "id": id,
-                                "decided_by": agent,
+                                (field_names::DECIDED_BY): agent,
                                 "executed": true,
                                 "memory_id": executed,
                             })
@@ -297,7 +298,7 @@ pub fn run_pending(
                 writeln!(
                     out.stdout,
                     "{}",
-                    serde_json::json!({"rejected": true, "id": id, "decided_by": agent})
+                    serde_json::json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent})
                 )?;
             } else {
                 writeln!(out.stdout, "rejected: {id} (by {agent})")?;

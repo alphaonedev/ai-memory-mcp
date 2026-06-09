@@ -4,6 +4,7 @@
 //! MCP `memory_check_duplicate` handler.
 
 use crate::embeddings::Embed;
+use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 // v0.7.0 ARCH-3 / FX-12 — promoted from `pub(super)` to `pub` so the
@@ -73,7 +74,7 @@ pub fn handle_check_duplicate(
         "is_duplicate": check.is_duplicate,
         "threshold": check.threshold,
         "nearest": nearest_json,
-        "suggested_merge": suggested_merge,
+        (field_names::SUGGESTED_MERGE): suggested_merge,
         "candidates_scanned": check.candidates_scanned,
     }))
 }

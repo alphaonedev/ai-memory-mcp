@@ -4,6 +4,7 @@
 //! MCP `memory_entity_get_by_alias` handler.
 
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -62,14 +63,14 @@ pub fn handle_entity_get_by_alias(
         Some(rec) => Ok(json!({
             "found": true,
             "entity_id": rec.entity_id,
-            "canonical_name": rec.canonical_name,
+            (field_names::CANONICAL_NAME): rec.canonical_name,
             "namespace": rec.namespace,
             "aliases": rec.aliases,
         })),
         None => Ok(json!({
             "found": false,
             "entity_id": null,
-            "canonical_name": null,
+            (field_names::CANONICAL_NAME): null,
             "namespace": null,
             "aliases": [],
         })),

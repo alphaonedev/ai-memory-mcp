@@ -5,6 +5,7 @@
 
 use crate::mcp::param_names;
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use crate::models::{Memory, Tier};
 use crate::{db, validate};
 use serde_json::{Value, json};
@@ -14,7 +15,7 @@ pub fn handle_notify(
     resolved_ttl: &crate::config::ResolvedTtl,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let target = params["target_agent_id"]
+    let target = params[param_names::TARGET_AGENT_ID]
         .as_str()
         .ok_or("target_agent_id is required")?;
     let title = params["title"]
@@ -159,9 +160,9 @@ pub fn handle_inbox(
                 "payload": m.content,
                 "priority": m.priority,
                 "tier": m.tier,
-                "created_at": m.created_at,
+                (field_names::CREATED_AT): m.created_at,
                 "read": m.access_count > 0,
-                "access_count": m.access_count,
+                (field_names::ACCESS_COUNT): m.access_count,
             })
         })
         .collect();

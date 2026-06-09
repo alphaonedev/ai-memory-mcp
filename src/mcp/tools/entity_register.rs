@@ -3,7 +3,9 @@
 
 //! MCP `memory_entity_register` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -61,7 +63,7 @@ pub fn handle_entity_register(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let canonical_name = params["canonical_name"]
+    let canonical_name = params[param_names::CANONICAL_NAME]
         .as_str()
         .ok_or("canonical_name is required")?;
     let namespace = params["namespace"]
@@ -103,7 +105,7 @@ pub fn handle_entity_register(
 
     Ok(json!({
         "entity_id": reg.entity_id,
-        "canonical_name": reg.canonical_name,
+        (field_names::CANONICAL_NAME): reg.canonical_name,
         "namespace": reg.namespace,
         "aliases": reg.aliases,
         "created": reg.created,

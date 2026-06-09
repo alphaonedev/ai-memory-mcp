@@ -11,6 +11,7 @@
 //! can inspect the cross-peer federation provenance of a reflection
 //! memory from a terminal.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -58,7 +59,7 @@ pub fn cmd_reflection_origin(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let peer = envelope
-        .get("peer_origin")
+        .get(field_names::PEER_ORIGIN)
         .and_then(Value::as_str)
         .unwrap_or("");
     let depth = envelope

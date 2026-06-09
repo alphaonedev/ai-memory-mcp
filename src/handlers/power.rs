@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -209,7 +210,7 @@ pub async fn detect_contradictions(
         return Json(json!({
             "memories": candidates,
             "links": links,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
@@ -495,7 +496,7 @@ pub async fn get_taxonomy(
                 "tree": tax.tree,
                 "total_count": tax.total_count,
                 "truncated": tax.truncated,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             }))
             .into_response(),
             Err(e) => store_err_to_response(e),
@@ -637,7 +638,7 @@ pub async fn get_taxonomy(
             "tree": root_node,
             "total_count": total_count,
             "truncated": truncated,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
@@ -752,9 +753,9 @@ pub async fn check_duplicate(
                     "is_duplicate": check.is_duplicate,
                     "threshold": check.threshold,
                     "nearest": near_json,
-                    "suggested_merge": check.is_duplicate,
+                    (field_names::SUGGESTED_MERGE): check.is_duplicate,
                     "candidates_scanned": check.candidates_scanned,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -854,7 +855,7 @@ pub async fn check_duplicate(
         "is_duplicate": check.is_duplicate,
         "threshold": check.threshold,
         "nearest": nearest_json,
-        "suggested_merge": suggested_merge,
+        (field_names::SUGGESTED_MERGE): suggested_merge,
         "candidates_scanned": check.candidates_scanned,
     }))
     .into_response()

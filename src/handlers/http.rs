@@ -594,6 +594,9 @@ mod cov897_tests {
         let v = serde_json::to_value(&r).expect("serialize");
         assert_eq!(v["id"], "mem-id-123");
         assert_eq!(v["title"], "conflicting title");
-        assert!(v["suggested_merge"].is_null(), "None ⇒ null on the wire");
+        assert!(
+            v[crate::models::field_names::SUGGESTED_MERGE].is_null(),
+            "None ⇒ null on the wire"
+        );
     }
 }

@@ -10,6 +10,7 @@
 //! operators can resolve an alias to its canonical entity from a
 //! terminal.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -71,7 +72,7 @@ pub fn cmd_entity_get_by_alias(
             .and_then(Value::as_str)
             .unwrap_or("?");
         let name = envelope
-            .get("canonical_name")
+            .get(field_names::CANONICAL_NAME)
             .and_then(Value::as_str)
             .unwrap_or("?");
         writeln!(

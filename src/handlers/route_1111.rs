@@ -41,6 +41,8 @@
 //! `X-Agent-Id` header semantics apply across the existing 60 routes
 //! and these 14 new ones.
 
+#[cfg(feature = "sal")]
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -207,7 +209,7 @@ pub async fn handle_reflect_http(
             StatusCode::OK,
             Json(json!({
                 "id": outcome.id,
-                "reflection_depth": outcome.reflection_depth,
+                (field_names::REFLECTION_DEPTH): outcome.reflection_depth,
                 "reflects_on": outcome.reflects_on,
                 "namespace": outcome.namespace,
             })),
@@ -346,7 +348,7 @@ pub async fn handle_reflection_origin_http(
                 StatusCode::OK,
                 Json(json!({
                     "memory_id": record.memory_id,
-                    "peer_origin": record.peer_origin,
+                    (field_names::PEER_ORIGIN): record.peer_origin,
                     "signing_agent": record.signing_agent,
                     "original_depth": record.original_depth,
                     "local_depth_at_arrival": record.local_depth_at_arrival,

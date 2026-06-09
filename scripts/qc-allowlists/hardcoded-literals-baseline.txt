@@ -1,13 +1,8 @@
 # hardcoded-literal duplication baseline (ratchet; counts may only DECREASE).
 # Regenerate with: scripts/check-hardcoded-literals.sh --update-baseline
 # Format: <site-count><TAB><literal>. Burn this down; never grow it.
-9	access_count
-5	action_type
-10	agent_filter
 4	agent_pubkey
-12	agent_type
 5	.ai-memory
-3	ai_memory=info
 3	AI_MEMORY_LLM_API_KEY
 3	AI_MEMORY_LLM_BACKEND
 4	AI_MEMORY_LLM_BASE_URL
@@ -16,70 +11,55 @@
 3	ANTHROPIC_API_KEY
 4	{}/api/tags
 3	application/json
-6	archived_at
 4	archived_memories
 4	archive_reason
 3	atom_count
 3	atomisation_archived_at
-17	attest_level
 3	autonomous
 4	begin AGE tx
-9	budget_tokens
 4	by_namespace
 3	by_source_uri
 4	candidates_scanned
-14	canonical_name
-15	capabilities
 4	checked above
 3	collective
 3	command_regex
 3	command_substring
 5	commit AGE tx
 3	compatibility
-19	confidence
+3	confidence
 4	confidence_decayed_at
-5	confidence_signals
 4	confidence_source
 4	config.json
-5	confirmed_contradictions
 6	consolidate
-5	consolidated
 4	content_len
 4	content_sha256
 3	content-type
 3	contradicts
-29	created_at
-12	created_by
 4	create_time
 3	current_tier
 3	custom_kind
 4	decided_at
-14	decided_by
 4	{decision}
 3	default_timeout_seconds
 5	DELETE FROM memories WHERE id = $1
 3	DELETE FROM memories WHERE id = ?1
 3	DELETE FROM namespace_meta WHERE standard_id = ?1
 3	derives_from
-8	description
 4	dim_violations
 3	earliest_updated_at
 4	elapsed_ms
-11	error: {e}
 4	event_types
 3	excluded_for_scope
 3	excluded_for_scope_private
 4	expanded_terms
 3	expired_at
 3	expired_deleted
-6	expires_at
 3	exported_at
 4	from_agent_id
 3	generated_at
 3	GOOGLE_API_KEY
-14	governance
+5	governance
 9	http://localhost:11434
-18	implemented
 3	imported_from_agent_id
 4	include_invalidated
 3	invalid id: {e}
@@ -88,7 +68,6 @@
 3	just-inserted array
 7	just-inserted object
 4	key_source
-5	last_accessed_at
 4	last_seen_at
 4	latency_ms
 3	latest_updated_at
@@ -98,12 +77,10 @@
 3	manifest.json
 3	max_skew_secs
 3	memories_dropped
-5	memory_kind
 5	mini_lm_l6_v2
 3	model.safetensors
 3	ms-marco-MiniLM-L-6-v2
 4	must be a string
-12	namespace_filter
 4	namespaces
 4	_namespace_standard
 3	nomic-ai/nomic-embed-text-v1.5
@@ -112,42 +89,29 @@
 4	nomic_embed_v15
 3	observation
 4	observations
-12	observed_by
-5	older_than_days
 3	OPENAI_API_KEY
 6	opening {}
 6	openrouter
 4	operator.key
 3	operator_signed
 4	original_depth
-7	owner_scope
 3	parameters_schema
-6	parent_namespace
-7	peer_origin
-17	pending_id
-5	persona_version
-9	PRAGMA table_info(memories)
 3	previous_valid_until
-5	properties
 3	public_key
 4	public_key_b64
 4	raw SQL section — only available in --db mode
 3	reading {}
 3	recall_mode_active
 4	reflection
-9	reflection_depth
 4	reflection_id
 4	reflection_metadata
 4	reflections
 4	reflects_on
-5	registered
-5	registered_at
 4	requested_at
-6	requested_by
 3	required_tier
 3	reranker_active
 4	resource_path
-16	schema_version
+3	schema_version
 3	scope_status
 5	SELECT COALESCE(MAX(version), 0) FROM schema_version
 3	SELECT COUNT(*) > 0 FROM memories WHERE id = ?1
@@ -156,27 +120,16 @@
 3	SELECT * FROM memories WHERE id = ?1
 3	SELECT id FROM memories WHERE id = $1
 3	SELECT metadata FROM memories WHERE namespace = $1 AND title = $2
-14	sender_agent_id
 4	sentence-transformers/all-MiniLM-L6-v2
 6	SET LOCAL search_path = ag_catalog, \
 4	set search_path
 4	signing_agent
 4	similarity
 3	skill_description
-5	skill_name
-7	source_ids
-6	source_memory_id
-5	source_span
-8	source_uri
-18	standard_id
 3	{stem}.manifest.json
-41	storage_backend
 4	subscription
-12	subscription_id
-7	subscriptions
+3	subscriptions
 3	_subscriptions/{caller}
-5	suggested_merge
-5	superseded_id
 3	synchronous
 4	synthesized
 5	T0-A1-CORE
@@ -184,23 +137,13 @@
 3	T0-A2-FULL
 3	T0-A2-GRAPH
 3	T0-CONTRACT
-16	target_agent_id
-6	target_folder
-8	target_namespace
 4	tier-locked
 6	to_describe_to_user
 3	tokenizer.json
-5	tokens_used
 3	to_namespace
 4	total_count
-5	total_lines
-5	total_memories
-7	transcripts
 4	unread_only
-8	updated_at
 3	updated_since
-13	valid_from
-18	valid_until
 3	verify_link select
 3	What tools do you have available right now? Answer in one sentence to a non-technical user.
 3	write chain report

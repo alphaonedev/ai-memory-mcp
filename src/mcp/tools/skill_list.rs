@@ -8,6 +8,7 @@
 //! metadata (name, description, id, namespace, created_at, digest_hex)
 //! but does NOT decompress or return the `body_blob`.
 
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -81,9 +82,9 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
             "id": id,
             "namespace": ns,
             "name": name,
-            "description": description,
+            (field_names::DESCRIPTION): description,
             "digest": digest_hex,
-            "created_at": created_at,
+            (field_names::CREATED_AT): created_at,
         });
 
         if let Some(lic) = license {

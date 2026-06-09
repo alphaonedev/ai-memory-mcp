@@ -34,6 +34,7 @@
 //! * namespace must NOT start with `_` (internal/system namespaces
 //!   would feed into self-reinforcing loops)
 
+use crate::models::field_names;
 use serde_json::{Value, json};
 
 use crate::llm::OllamaClient;
@@ -139,7 +140,7 @@ pub(super) fn maybe_run_autonomy_hooks(
             }
             if !confirmed_contradictions.is_empty() {
                 obj.insert(
-                    "confirmed_contradictions".to_string(),
+                    field_names::CONFIRMED_CONTRADICTIONS.to_string(),
                     json!(confirmed_contradictions),
                 );
             }
@@ -183,7 +184,7 @@ pub(super) fn merge_autonomy_outcome_into_response(
         response["auto_tags"] = json!(outcome.auto_tags);
     }
     if !outcome.confirmed_contradictions.is_empty() {
-        response["confirmed_contradictions"] = json!(outcome.confirmed_contradictions);
+        response[field_names::CONFIRMED_CONTRADICTIONS] = json!(outcome.confirmed_contradictions);
     }
 }
 

@@ -9,6 +9,7 @@
 //! to resolve). The K10 SSE approval stream lives in [`super::approvals`]
 //! because it carries its own state (subscriber map).
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -110,7 +111,7 @@ pub async fn list_pending(
                     items
                         .into_iter()
                         .filter(|row| {
-                            row.get("requested_by")
+                            row.get(field_names::REQUESTED_BY)
                                 .and_then(serde_json::Value::as_str)
                                 .is_some_and(|rb| rb == caller)
                         })
@@ -119,8 +120,8 @@ pub async fn list_pending(
                 Json(json!({
                     "count": filtered.len(),
                     "pending": filtered,
-                    "storage_backend": "postgres",
-                    "owner_scope": if is_admin { "admin" } else { "caller" },
+                    (field_names::STORAGE_BACKEND): "postgres",
+                    (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
                 }))
                 .into_response()
             }
@@ -147,7 +148,7 @@ pub async fn list_pending(
             Json(json!({
                 "count": filtered.len(),
                 "pending": filtered,
-                "owner_scope": if is_admin { "admin" } else { "caller" },
+                (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
             }))
             .into_response()
         }
@@ -218,7 +219,7 @@ pub async fn approve_pending(
         "allow",
         "pending_approve",
         "",
-        json!({ "pending_id": &id }),
+        json!({ (field_names::PENDING_ID): &id }),
     );
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — postgres-backed approve
@@ -274,10 +275,10 @@ pub async fn approve_pending(
                 Json(json!({
                     "approved": true,
                     "id": id,
-                    "decided_by": agent_id,
+                    (field_names::DECIDED_BY): agent_id,
                     "executed": executed_id.is_some(),
                     "memory_id": executed_id,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -290,7 +291,7 @@ pub async fn approve_pending(
                     "votes": votes,
                     "quorum": quorum,
                     "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -349,7 +350,7 @@ pub async fn approve_pending(
                 Json(json!({
                     "approved": true,
                     "id": id,
-                    "decided_by": agent_id,
+                    (field_names::DECIDED_BY): agent_id,
                     "executed": true,
                     "memory_id": memory_id,
                 }))
@@ -439,7 +440,7 @@ pub async fn reject_pending(
         "refuse",
         "pending_reject",
         "",
-        json!({ "pending_id": &id }),
+        json!({ (field_names::PENDING_ID): &id }),
     );
 
     // v0.7.0 Wave-3 Continuation 2 (Phase 11) — postgres-backed reject.
@@ -462,8 +463,8 @@ pub async fn reject_pending(
                 Json(json!({
                     "rejected": true,
                     "id": id,
-                    "decided_by": agent_id,
-                    "storage_backend": "postgres",
+                    (field_names::DECIDED_BY): agent_id,
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -501,7 +502,8 @@ pub async fn reject_pending(
                     }
                 }
             }
-            Json(json!({"rejected": true, "id": id, "decided_by": agent_id})).into_response()
+            Json(json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent_id}))
+                .into_response()
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
