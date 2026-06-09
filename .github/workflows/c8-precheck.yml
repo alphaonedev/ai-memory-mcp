@@ -71,6 +71,26 @@ jobs:
         # allowlist, a broken test-boundary heuristic) trips here.
         run: bash scripts/check-vendor-literals.sh --self-test
 
+  hardcoded-literal-gate:
+    name: Hardcoded-literal duplication ratchet (pm-v3.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Operator directive (~6mo, escalated 2026-06-09): no hardcoded literal
+    # values; no literals embedded in variable/constant names. Instructions
+    # alone did not stop the regression — this gate makes it mechanical.
+    # HARD-BLOCKS any string literal (>= 10 chars) duplicated across >= 3
+    # production sites whose count rose above the frozen baseline (a ratchet:
+    # existing rot is grandfathered, new duplication fails, baseline only
+    # shrinks). See ai-memory `no-hardcoded-literals-enforcement`.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hardcoded-literal gate
+        run: bash scripts/check-hardcoded-literals.sh
+      - name: Self-test the gate (regression evidence)
+        # Injects a brand-new triplicated magic string at a production site,
+        # confirms the gate exits non-zero + names the offender, cleans up.
+        run: bash scripts/check-hardcoded-literals.sh --self-test
+
   docs-vs-ssot-drift:
     # v0.7.0 (operator directive 2026-05-31: "can we use variables in
     # documentation for versions instead of literals?") — Markdown has

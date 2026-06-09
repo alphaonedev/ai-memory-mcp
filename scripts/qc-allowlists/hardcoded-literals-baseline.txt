@@ -1,0 +1,500 @@
+# hardcoded-literal duplication baseline (ratchet; counts may only DECREASE).
+# Regenerate with: scripts/check-hardcoded-literals.sh --update-baseline
+# Format: <site-count><TAB><literal>. Burn this down; never grow it.
+5	2026-05-13T00:00:00+00:00
+9	access_count
+5	action_type
+10	agent:{agent_id}
+10	agent_filter
+5	agent_id body parameter does not match authenticated caller
+4	agent_id query parameter does not match authenticated caller
+4	agent_pubkey
+12	agent_type
+5	ai:curator
+3	ai:http-internal
+5	.ai-memory
+3	AI_MEMORY_ANONYMIZE
+8	ai_memory::authz
+3	ai-memory curator (autonomy)
+11	ai_memory::federation::push_dlq
+3	ai_memory::federation::sync
+3	ai_memory::governance::audit
+3	AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR
+3	ai_memory::handlers::skills
+3	ai_memory=info
+3	AI_MEMORY_LLM_API_KEY
+3	AI_MEMORY_LLM_BACKEND
+4	AI_MEMORY_LLM_BASE_URL
+3	ai_memory::subscriptions
+3	allowed_tools
+3	already exists
+3	<anonymous>
+24	anonymous:invalid
+11	anonymous:req-{}
+3	ANTHROPIC_API_KEY
+4	{}/api/tags
+8	/api/v1/agents
+4	/api/v1/approvals/stream
+12	/api/v1/archive
+4	/api/v1/archive/stats
+4	/api/v1/auto_tag
+4	/api/v1/capabilities
+4	/api/v1/check_duplicate
+5	/api/v1/consolidate
+4	/api/v1/contradictions
+4	/api/v1/entities
+4	/api/v1/entities/by_alias
+4	/api/v1/expand_query
+4	/api/v1/export
+4	/api/v1/find_paths
+5	/api/v1/forget
+4	/api/v1/gc
+6	/api/v1/health
+4	/api/v1/import
+4	/api/v1/inbox
+5	/api/v1/kg/find_paths
+4	/api/v1/kg/invalidate
+5	/api/v1/kg/query
+5	/api/v1/kg/timeline
+8	/api/v1/links
+4	/api/v1/links/verify
+11	/api/v1/memories
+7	/api/v1/memories/abc-123
+5	/api/v1/memories/bulk
+3	/api/v1/memories/{id}
+3	/api/v1/memory_atomise
+4	/api/v1/memory_load_family
+4	/api/v1/memory_recall_observations
+5	/api/v1/memory_reflect
+4	/api/v1/memory_reflection_origin
+5	/api/v1/memory_smart_load
+4	/api/v1/metrics
+15	/api/v1/namespaces
+3	/api/v1/namespaces/{ns}/standard
+5	/api/v1/namespaces/proj/standard
+4	/api/v1/notify
+4	/api/v1/pending
+4	/api/v1/quota/status
+7	/api/v1/recall
+5	/api/v1/search
+4	/api/v1/session/start
+5	/api/v1/share
+5	/api/v1/skill/list
+4	/api/v1/stats
+12	/api/v1/subscriptions
+7	/api/v1/sync/push
+4	/api/v1/sync/since
+4	/api/v1/taxonomy
+4	/api/v1/tools/list
+3	application/json
+3	approval_requested
+5	approve rejected: {reason}
+6	archived_at
+4	archived_memories
+5	archive_max_days
+5	archive_on_gc
+3	archive_purge
+4	archive_reason
+4	at least one of namespace, pattern, or tier is required
+3	atom_count
+3	atomisation_archived_at
+17	attest_level
+5	autonomous
+4	auto_tag_model
+3	{base}/api/v1/sync/since?peer={local_id}
+4	begin AGE tx
+16	BEGIN IMMEDIATE
+3	budget_overflow
+10	budget_tokens
+3	budget_tokens_remaining
+3	budget_tokens_used
+4	by_namespace
+3	by_source_uri
+3	caller does not own this namespace standard
+3	caller does not own this source memory
+4	candidates_scanned
+14	canonical_name
+16	capabilities
+4	capture_turn
+8	CARGO_PKG_VERSION
+3	catchup: peer {} returned HTTP {} — skipping this tick
+3	catchup: peer {} returned unparseable body: {e}
+3	catchup: peer {} unreachable: {e}
+3	catchup: pull: {} ok ({} row(s) returned)
+3	catchup: sync_state_observe failed for {}: {e}
+3	catchup: unparseable memory from peer {}: {e}
+4	checked above
+4	claude-code
+3	claude_desktop_config.json
+6	collective
+3	command_regex
+3	command_substring
+5	commit AGE tx
+3	compatibility
+20	confidence
+4	confidence_decayed_at
+6	confidence_signals
+4	confidence_source
+4	config.json
+5	confirmed_contradictions
+4	consensus threshold not yet reached
+6	consolidate
+5	consolidated
+5	consolidation
+6	content is required
+4	content_len
+4	content_sha256
+3	content-type
+3	context is required
+7	contradicts
+30	created_at
+12	created_by
+4	create_time
+4	cross_encoder
+3	current_tier
+3	custom_kind
+3	daemon:wire_action
+4	decided_at
+14	decided_by
+4	{decision}
+4	decision write failed
+3	default_fallback
+5	default_namespace
+3	default_timeout_seconds
+3	/definitions/{}/properties
+5	DELETE FROM memories WHERE id = $1
+3	DELETE FROM memories WHERE id = ?1
+3	DELETE FROM namespace_meta WHERE standard_id = ?1
+8	derived_from
+8	derives_from
+25	description
+4	dim_violations
+3	earliest_updated_at
+5	edit_source
+4	elapsed_ms
+4	embedding_model
+5	embeddings
+3	entity_id cannot be empty
+11	error: {e}
+3	event_type
+4	event_types
+3	excluded_for_scope
+3	excluded_for_scope_private
+4	expanded_terms
+3	expected_version
+3	experimental
+3	expired_at
+3	expired_deleted
+7	expires_at
+3	exported_at
+3	federation::attestation
+33	federation::signing
+3	filesystem_write
+3	folder_path
+4	from_agent_id
+4	fts_classifier
+3	generated_at
+3	GOOGLE_API_KEY
+37	governance
+3	governance check failed
+3	governance error: {e}
+3	GOVERNANCE_REFUSED
+12	governance requires approval
+37	handler error: {e}
+3	hnsw.eviction
+3	host_fallback
+11	host_session_id
+10	host_turn_index
+4	http_header
+9	http://localhost:11434
+3	hybrid+rerank
+10	id is required
+18	implemented
+3	imported_from_agent_id
+4	include_invalidated
+7	include_schema
+3	inline_skill
+6	inputSchema
+6	/inputSchema/properties
+62	internal server error
+18	invalid agent_id: {e}
+3	invalid as_agent: {e}
+3	invalid governance: {e}
+3	invalid id: {e}
+4	invalid namespace: {e}
+3	invalid or missing X-AI-Memory-Signature
+4	invalid source_id: {e}
+4	invalid tier: {tier_str}
+4	is_duplicate
+3	is_reflection
+4	issue credential
+3	just-inserted array
+7	just-inserted object
+4	key_source
+4	kg_invalidate
+5	last_accessed_at
+4	last_seen_at
+4	latency_ms
+3	latest_updated_at
+3	LLM Reachability (#1146)
+6	LOAD 'age'
+3	loaded_under_active_profile
+4	local_depth_at_arrival
+3	manifest.json
+4	max_depth must be >= 1
+5	max_memory_mb
+3	max_skew_secs
+4	mcp_client_info
+5	mcpServers
+4	memories_dropped
+4	memory_agent_list
+4	memory_agent_register
+3	memory_archive
+4	memory_archive_list
+4	memory_archive_purge
+4	memory_archive_restore
+4	memory_archive_stats
+5	memory_atomise
+4	memory_auto_tag
+4	memory_calibrate_confidence
+4	memory_capabilities
+4	memory_check_agent_action
+4	memory_check_duplicate
+5	memory_consolidate
+3	memory_consolidated
+4	memory_delete
+4	memory_dependents_of_invalidated
+4	memory_deref
+4	memory_detect_contradiction
+4	memory_entity_get_by_alias
+4	memory_expand_query
+4	memory_export_reflection
+4	memory_find_paths
+4	memory_forget
+4	memory_get_taxonomy
+4	memory_id cannot be empty
+6	memory_id is required
+4	memory_inbox
+5	memory_ingest_multistep
+5	memory_kg_invalidate
+4	memory_kg_query
+5	memory_kg_timeline
+5	memory_kind
+4	memory_link_created
+4	memory_list_subscriptions
+6	memory_load_family
+9	memory not found
+7	memory not found: {id}
+3	memory not found: {memory_id}
+5	memory_notify
+4	memory_offload
+4	memory_persona
+5	memory_persona_generate
+6	memory_promote
+4	memory_quota_status
+4	memory_recall
+4	memory_recall_observations
+5	memory_reflect
+4	memory_reflection_origin
+4	memory_rule_list
+4	memory_search
+4	memory_session_start
+5	memory_share
+4	memory_skill_compositional_context
+4	memory_skill_export
+4	memory_skill_get
+4	memory_skill_list
+5	memory_skill_promote_from_reflection
+5	memory_skill_register
+4	memory_skill_resource
+7	memory_smart_load
+4	memory_stats
+7	memory_store
+4	memory_subscription_dlq_list
+4	memory_subscription_replay
+5	memory_update
+4	memory_verify
+5	mini_lm_l6_v2
+3	modelContextProtocolServers
+3	model.safetensors
+3	ms-marco-MiniLM-L-6-v2
+4	must be a string
+12	namespace_filter
+6	namespace is required
+4	namespaces
+4	_namespace_standard
+3	network: {e}
+3	network_request
+3	nomic-ai/nomic-embed-text-v1.5
+4	nomic-embed-text
+4	nomic-embed-text-v1.5
+4	nomic_embed_v15
+7	not found: {}
+3	not found in archive
+4	not_in_response
+3	not_observed (pre-P3 rolling counter)
+3	observation
+5	observations
+12	observed_by
+5	older_than_days
+3	older_than_days must be non-negative (got {days})
+4	ollama_url
+3	OPENAI_API_KEY
+6	opening {}
+6	openrouter
+4	operator.key
+3	operator_signed
+4	original_depth
+7	owner_scope
+3	parameters_schema
+6	parent_namespace
+3	peer_attested
+7	peer_origin
+3	pending action not found or already decided
+3	pending action not found: {pending_id}
+21	pending_id
+5	persona_version
+4	post-D1.6 missing tool {name}
+5	postgres://
+3	postgresql://
+3	potential_contradictions
+9	PRAGMA table_info(memories)
+8	pre_store.auto_atomise
+5	pre_store.auto_atomise.sync
+3	PreToolUse
+3	previous_valid_until
+3	process_spawn
+16	properties
+3	public_key
+4	public_key_b64
+3	query is required
+3	quorum_not_met
+3	quota refund_op failed for agent {}: {}
+4	quota_refused
+4	raw SQL section — only available in --db mode
+4	read attest_level
+5	read created_at
+3	reading {}
+9	read namespace
+6	read observed_by
+8	read relation
+3	read returned id
+3	read schema_version
+4	read source_id
+8	read target_id
+5	read title
+6	read valid_from
+6	read valid_until
+3	recall_mode_active
+3	recall response is always a JSON object
+7	<redacted>
+3	[redacted-path]
+4	[redacted-url]
+5	reflection
+9	reflection_depth
+4	reflection_id
+4	reflection_metadata
+4	reflections
+11	reflects_on
+5	registered
+5	registered_at
+9	related_to
+4	requested_at
+6	requested_by
+3	required_tier
+3	reranker_active
+4	resource_path
+3	rollback-log write failed: {e}
+3	schema_init
+4	schemars schema must have properties at a known path
+74	schemars schema must serialize to Value
+4	schema → value
+19	schema_version
+3	scope_status
+5	SELECT COALESCE(MAX(version), 0) FROM schema_version
+3	SELECT COUNT(*) > 0 FROM memories WHERE id = ?1
+3	SELECT create_graph('memory_graph')
+4	SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)
+3	SELECT * FROM memories WHERE id = ?1
+3	SELECT id FROM memories WHERE id = $1
+3	SELECT metadata FROM memories WHERE namespace = $1 AND title = $2
+3	self_signed
+14	sender_agent_id
+4	sentence-transformers/all-MiniLM-L6-v2
+4	serialize citations: {e}
+4	serialize confidence_signals: {e}
+4	serialize source_span: {e}
+7	serialize tags: {e}
+3	SessionStart
+6	SET LOCAL search_path = ag_catalog, \
+4	set search_path
+3	signature verify failed: {e}
+12	signed_events
+4	signing_agent
+4	similarity
+3	skill_description
+5	skill_name
+3	skill not found
+3	skill not found: {skill_id}
+5	source_id is required
+8	source_ids
+6	source_memory_id
+3	source memory not found
+7	source_span
+11	source_uri
+18	standard_id
+3	{stem}.manifest.json
+41	storage_backend
+49	store::postgres
+3	store::postgres::kg
+4	subscription
+12	subscription_id
+7	subscriptions
+3	_subscriptions/{caller}
+5	suggested_merge
+6	superseded_id
+6	supersedes
+4	synchronous
+4	synthesized
+5	T0-A1-CORE
+4	T0-A2-CORE
+3	T0-A2-FULL
+3	T0-A2-GRAPH
+3	T0-CONTRACT
+20	target_agent_id
+6	target_folder
+3	target_id is required
+8	target_namespace
+4	tier-locked
+8	{title} {content}
+6	title is required
+6	to_describe_to_user
+3	tokenizer.json
+6	tokens_used
+7	to_namespace
+4	tool_definitions emits `tools` array
+4	{tool_name}.inputSchema.properties must be object
+4	{tool_name} must be in legacy catalog
+4	{tool_name}.{name}: description must match legacy byte-for-byte
+4	{tool_name}: property set drift; diff = {:?}
+4	toon_compact
+4	total_count
+5	total_lines
+5	total_memories
+10	tracker arc still referenced at finalise
+7	transcripts
+4	transcripts.lifecycle
+4	unread_only
+3	unsubscribe: {e}
+8	updated_at
+3	updated_since
+4	update failed: {e}
+13	valid_from
+18	valid_until
+3	verify_link requires either source_id or link_id
+3	verify_link select
+3	What tools do you have available right now? Answer in one sentence to a non-technical user.
+3	write chain report
+3	writing {}
+3	XAI_API_KEY
+3	zstd decompress body: {e}
