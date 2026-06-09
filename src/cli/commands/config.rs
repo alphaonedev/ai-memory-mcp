@@ -36,6 +36,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::cli::CliOutput;
+use crate::config::config_keys;
 
 /// Args for `ai-memory config <subcommand>`.
 #[derive(Args, Debug, Clone)]
@@ -245,15 +246,15 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
 /// Legacy v1 flat-field names that the migrator folds into v2 sections.
 const LEGACY_FIELDS: &[&str] = &[
     "llm_model",
-    "ollama_url",
+    config_keys::OLLAMA_URL,
     "embed_url",
-    "embedding_model",
-    "cross_encoder",
-    "default_namespace",
-    "archive_on_gc",
-    "archive_max_days",
-    "max_memory_mb",
-    "auto_tag_model",
+    config_keys::EMBEDDING_MODEL,
+    config_keys::CROSS_ENCODER,
+    config_keys::DEFAULT_NAMESPACE,
+    config_keys::ARCHIVE_ON_GC,
+    config_keys::ARCHIVE_MAX_DAYS,
+    config_keys::MAX_MEMORY_MB,
+    config_keys::AUTO_TAG_MODEL,
 ];
 
 /// Construct the v2 migrated table from a parsed v1 table. Pure (no
@@ -276,7 +277,7 @@ fn build_migrated_table(
     let mut auto_tag_model: Option<toml::Value> = None;
 
     macro_rules! take {
-        ($name:literal, $target:ident) => {
+        ($name:expr, $target:ident) => {
             if let Some(v) = migrated.remove($name) {
                 $target = Some(v);
             }
@@ -284,15 +285,15 @@ fn build_migrated_table(
     }
 
     take!("llm_model", llm_model);
-    take!("ollama_url", ollama_url);
+    take!(config_keys::OLLAMA_URL, ollama_url);
     take!("embed_url", embed_url);
-    take!("embedding_model", embedding_model);
-    take!("cross_encoder", cross_encoder);
-    take!("default_namespace", default_namespace);
-    take!("archive_on_gc", archive_on_gc);
-    take!("archive_max_days", archive_max_days);
-    take!("max_memory_mb", max_memory_mb);
-    take!("auto_tag_model", auto_tag_model);
+    take!(config_keys::EMBEDDING_MODEL, embedding_model);
+    take!(config_keys::CROSS_ENCODER, cross_encoder);
+    take!(config_keys::DEFAULT_NAMESPACE, default_namespace);
+    take!(config_keys::ARCHIVE_ON_GC, archive_on_gc);
+    take!(config_keys::ARCHIVE_MAX_DAYS, archive_max_days);
+    take!(config_keys::MAX_MEMORY_MB, max_memory_mb);
+    take!(config_keys::AUTO_TAG_MODEL, auto_tag_model);
 
     // schema_version = 2 (highest priority on insert).
     migrated.insert("schema_version".to_string(), toml::Value::Integer(2));
@@ -328,7 +329,9 @@ fn build_migrated_table(
     }
 
     // [embeddings] section.
-    if !migrated.contains_key("embeddings") && (embed_url.is_some() || embedding_model.is_some()) {
+    if !migrated.contains_key(config_keys::SECTION_EMBEDDINGS)
+        && (embed_url.is_some() || embedding_model.is_some())
+    {
         let mut emb = toml::map::Map::new();
         // Same legacy implication for embeddings — pre-v0.7.x configs
         // only spoke to Ollama for embedding generation.
@@ -342,7 +345,10 @@ fn build_migrated_table(
         if let Some(v) = embedding_model {
             emb.insert("model".to_string(), v);
         }
-        migrated.insert("embeddings".to_string(), toml::Value::Table(emb));
+        migrated.insert(
+            config_keys::SECTION_EMBEDDINGS.to_string(),
+            toml::Value::Table(emb),
+        );
     }
 
     // [reranker] section.
@@ -367,16 +373,16 @@ fn build_migrated_table(
     {
         let mut storage = toml::map::Map::new();
         if let Some(v) = default_namespace {
-            storage.insert("default_namespace".to_string(), v);
+            storage.insert(config_keys::DEFAULT_NAMESPACE.to_string(), v);
         }
         if let Some(v) = archive_on_gc {
-            storage.insert("archive_on_gc".to_string(), v);
+            storage.insert(config_keys::ARCHIVE_ON_GC.to_string(), v);
         }
         if let Some(v) = archive_max_days {
-            storage.insert("archive_max_days".to_string(), v);
+            storage.insert(config_keys::ARCHIVE_MAX_DAYS.to_string(), v);
         }
         if let Some(v) = max_memory_mb {
-            storage.insert("max_memory_mb".to_string(), v);
+            storage.insert(config_keys::MAX_MEMORY_MB.to_string(), v);
         }
         migrated.insert("storage".to_string(), toml::Value::Table(storage));
     }
@@ -400,7 +406,7 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
 
     let mut changed = false;
     if let Some(servers) = value
-        .get_mut("mcpServers")
+        .get_mut(crate::cli::install::KEY_MCP_SERVERS)
         .and_then(serde_json::Value::as_object_mut)
     {
         for (_name, entry) in servers.iter_mut() {

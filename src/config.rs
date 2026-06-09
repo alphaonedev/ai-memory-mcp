@@ -117,6 +117,40 @@ const NOMIC_CANONICAL_ALIASES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Config key names
+// ---------------------------------------------------------------------------
+
+/// Canonical name strings for the legacy v1 flat config keys (plus the
+/// `[embeddings]` section name) that appear on multiple production
+/// sites (#1558). Shared between the `AppConfig` surface in this file
+/// (the manual `Debug` impl + `warn_unknown_top_level_keys`) and the
+/// `ai-memory config migrate` rewriter in
+/// `src/cli/commands/config.rs`, so each key spelling has one source
+/// of truth. The serde wire names themselves derive from the
+/// `AppConfig` field identifiers (no `#[serde(rename)]`), so serde
+/// needs no literal at all.
+pub mod config_keys {
+    /// Legacy flat `archive_max_days` key (v2: `[storage].archive_max_days`).
+    pub const ARCHIVE_MAX_DAYS: &str = "archive_max_days";
+    /// Legacy flat `archive_on_gc` key (v2: `[storage].archive_on_gc`).
+    pub const ARCHIVE_ON_GC: &str = "archive_on_gc";
+    /// Legacy flat `auto_tag_model` key (v2: `[llm.auto_tag].model`).
+    pub const AUTO_TAG_MODEL: &str = "auto_tag_model";
+    /// Legacy flat `cross_encoder` key (v2: `[reranker].enabled`).
+    pub const CROSS_ENCODER: &str = "cross_encoder";
+    /// Legacy flat `default_namespace` key (v2: `[storage].default_namespace`).
+    pub const DEFAULT_NAMESPACE: &str = "default_namespace";
+    /// Legacy flat `embedding_model` key (v2: `[embeddings].model`).
+    pub const EMBEDDING_MODEL: &str = "embedding_model";
+    /// Legacy flat `max_memory_mb` key (v2: resolved via `[storage]`).
+    pub const MAX_MEMORY_MB: &str = "max_memory_mb";
+    /// Legacy flat `ollama_url` key (v2: `[llm].base_url` / `[embeddings].url`).
+    pub const OLLAMA_URL: &str = "ollama_url";
+    /// `[embeddings]` config-section name (#1146 sectioned schema).
+    pub const SECTION_EMBEDDINGS: &str = "embeddings";
+}
+
+// ---------------------------------------------------------------------------
 // LLM model defaults
 // ---------------------------------------------------------------------------
 
@@ -322,7 +356,7 @@ impl TierConfig {
             // Capabilities schema v2 — see `Capabilities` doc comment.
             schema_version: "2".to_string(),
             tier: self.tier.as_str().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
                 keyword_search: true,
                 semantic_search: has_embeddings,
@@ -1110,7 +1144,7 @@ impl CapabilityTranscripts {
         Self {
             status: PlannedFeature {
                 planned: false,
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: crate::PKG_VERSION.to_string(),
                 enabled: false,
             },
             total_count: 0,
@@ -2961,18 +2995,18 @@ impl std::fmt::Debug for AppConfig {
         f.debug_struct("AppConfig")
             .field("tier", &self.tier)
             .field("db", &self.db)
-            .field("ollama_url", &self.ollama_url)
+            .field(config_keys::OLLAMA_URL, &self.ollama_url)
             .field("embed_url", &self.embed_url)
-            .field("embedding_model", &self.embedding_model)
+            .field(config_keys::EMBEDDING_MODEL, &self.embedding_model)
             .field("llm_model", &self.llm_model)
-            .field("auto_tag_model", &self.auto_tag_model)
-            .field("cross_encoder", &self.cross_encoder)
-            .field("default_namespace", &self.default_namespace)
-            .field("max_memory_mb", &self.max_memory_mb)
+            .field(config_keys::AUTO_TAG_MODEL, &self.auto_tag_model)
+            .field(config_keys::CROSS_ENCODER, &self.cross_encoder)
+            .field(config_keys::DEFAULT_NAMESPACE, &self.default_namespace)
+            .field(config_keys::MAX_MEMORY_MB, &self.max_memory_mb)
             .field("ttl", &self.ttl)
-            .field("archive_on_gc", &self.archive_on_gc)
+            .field(config_keys::ARCHIVE_ON_GC, &self.archive_on_gc)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
-            .field("archive_max_days", &self.archive_max_days)
+            .field(config_keys::ARCHIVE_MAX_DAYS, &self.archive_max_days)
             .field("identity", &self.identity)
             .field("scoring", &self.scoring)
             .field("autonomous_hooks", &self.autonomous_hooks)
@@ -3013,7 +3047,7 @@ impl std::fmt::Debug for AppConfig {
             .field("admin", &self.admin)
             .field("schema_version", &self.schema_version)
             .field("llm", &self.llm)
-            .field("embeddings", &self.embeddings)
+            .field(config_keys::SECTION_EMBEDDINGS, &self.embeddings)
             .field("reranker", &self.reranker)
             .field("storage", &self.storage)
             .field("limits", &self.limits)
@@ -4455,7 +4489,7 @@ pub fn active_permissions_mode() -> PermissionsMode {
             static UNINIT_GATE_WARN_ONCE: std::sync::Once = std::sync::Once::new();
             UNINIT_GATE_WARN_ONCE.call_once(|| {
                 tracing::warn!(
-                    target: "governance",
+                    target: crate::governance::GOVERNANCE_TRACE_TARGET,
                     fallback = UNINITIALIZED_PERMISSIONS_MODE_FALLBACK.as_str(),
                     "permissions mode consulted before boot installed it; using the \
                      pre-init fallback. Production entry points install the resolved \
@@ -5545,18 +5579,18 @@ impl AppConfig {
         const EXPECTED_KEYS: &[&str] = &[
             "tier",
             "db",
-            "ollama_url",
+            config_keys::OLLAMA_URL,
             "embed_url",
-            "embedding_model",
+            config_keys::EMBEDDING_MODEL,
             "llm_model",
-            "auto_tag_model",
-            "cross_encoder",
-            "default_namespace",
-            "max_memory_mb",
+            config_keys::AUTO_TAG_MODEL,
+            config_keys::CROSS_ENCODER,
+            config_keys::DEFAULT_NAMESPACE,
+            config_keys::MAX_MEMORY_MB,
             "ttl",
-            "archive_on_gc",
+            config_keys::ARCHIVE_ON_GC,
             "api_key",
-            "archive_max_days",
+            config_keys::ARCHIVE_MAX_DAYS,
             "identity",
             "scoring",
             "autonomous_hooks",
@@ -5583,7 +5617,7 @@ impl AppConfig {
             // v0.7.x (#1146) — enterprise configuration sections.
             "schema_version",
             "llm",
-            "embeddings",
+            config_keys::SECTION_EMBEDDINGS,
             "reranker",
             "storage",
             "limits",
