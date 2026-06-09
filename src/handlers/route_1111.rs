@@ -61,6 +61,51 @@ fn err_response(e: String) -> axum::response::Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
 }
 
+/// #1552 — shared federation fanout for the reflect write path, called by both
+/// the postgres SAL branch and the sqlite branch of [`handle_reflect_http`].
+///
+/// The reflect path previously returned WITHOUT broadcasting, so on a federated
+/// hive a reflection (and its `reflects_on` edges) reached cross-region peers
+/// only via async catch-up (`/sync/since`) instead of the synchronous W-quorum
+/// every regular `POST /memories` write gets. This helper broadcasts the new
+/// reflection memory to the quorum (gating the response exactly like a normal
+/// write) and then best-effort broadcasts each outbound `reflects_on` edge —
+/// peers reconcile a missed edge from the local row via catch-up, and the edge
+/// wire row is unsigned here (matching the `links.rs` create-path precedent
+/// where receivers land it unsigned until `export_links` reconciliation pulls
+/// the signed row).
+///
+/// Returns `Some(response)` when the memory quorum is NOT met (a typed 503 the
+/// caller must return verbatim), or `None` on success / when federation is
+/// disabled (the single-node no-op path) so the caller proceeds to its 200
+/// envelope.
+async fn reflect_fanout(
+    fed: Option<&crate::federation::FederationConfig>,
+    mem: &crate::models::Memory,
+    links: &[crate::models::MemoryLink],
+) -> Option<axum::response::Response> {
+    let fed = fed?;
+    match crate::federation::broadcast_store_quorum(fed, mem).await {
+        Ok(tracker) => {
+            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                return Some(super::quorum_not_met_response(&payload));
+            }
+        }
+        Err(e) => {
+            tracing::warn!("reflect memory fanout error (local committed): {e:?}");
+        }
+    }
+    for link in links.iter().filter(|l| {
+        l.relation == crate::models::MemoryLinkRelation::ReflectsOn && l.source_id == mem.id
+    }) {
+        if let Err(e) = crate::federation::broadcast_link_quorum(fed, link).await {
+            tracing::warn!("reflect edge fanout error (local committed): {e:?}");
+        }
+    }
+    None
+}
+
 /// `POST /api/v1/memory_smart_load` — substrate-routed family
 /// load with intent-string keyword + embedder voting. Wraps
 /// [`crate::mcp::handle_smart_load`]; embedder is pulled from
@@ -129,19 +174,37 @@ pub async fn handle_reflect_http(
             }
         }
         let active_keypair = app.active_keypair.as_ref().as_ref();
-        return match app.store.reflect(&caller, &input, active_keypair).await {
-            Ok(outcome) => (
-                StatusCode::OK,
-                Json(json!({
-                    "id": outcome.id,
-                    "reflection_depth": outcome.reflection_depth,
-                    "reflects_on": outcome.reflects_on,
-                    "namespace": outcome.namespace,
-                })),
-            )
-                .into_response(),
-            Err(e) => err_response(crate::mcp::map_reflect_error_to_wire_string(e)),
+        let outcome = match app.store.reflect(&caller, &input, active_keypair).await {
+            Ok(outcome) => outcome,
+            Err(e) => return err_response(crate::mcp::map_reflect_error_to_wire_string(e)),
         };
+        // #1552 — federation fanout parity (shared `reflect_fanout` helper,
+        // covered by the sqlite-branch fanout test). Read the reflection memory
+        // + its edges back through the trait, then broadcast.
+        if app.federation.is_some() {
+            if let Ok(mem) = app.store.get(&caller, &outcome.id).await {
+                let links = app
+                    .store
+                    .get_links_for_anchor(&outcome.id)
+                    .await
+                    .unwrap_or_default();
+                if let Some(resp) =
+                    reflect_fanout(app.federation.as_ref().as_ref(), &mem, &links).await
+                {
+                    return resp;
+                }
+            }
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "id": outcome.id,
+                "reflection_depth": outcome.reflection_depth,
+                "reflects_on": outcome.reflects_on,
+                "namespace": outcome.namespace,
+            })),
+        )
+            .into_response();
     }
     let lock = app.db.lock().await;
     let db_path = lock.1.clone();
@@ -165,7 +228,25 @@ pub async fn handle_reflect_http(
         active_keypair,
     );
     drop(vec_lock);
+    // #1552 — federation fanout parity for the sqlite reflect path. Capture
+    // the reflection memory + its `reflects_on` edges WHILE the db lock is
+    // held; the fanout itself must run AFTER the lock drops because peers POST
+    // back to our `/sync/push` and we would deadlock on the shared `Db` Mutex
+    // otherwise (same ordering the consolidate sqlite branch documents).
+    let fanout = match &result {
+        Ok(v) => v.get("id").and_then(|x| x.as_str()).and_then(|id| {
+            let mem = crate::db::get(&lock.0, id).ok().flatten();
+            let links = crate::db::get_links(&lock.0, id).unwrap_or_default();
+            mem.map(|m| (m, links))
+        }),
+        Err(_) => None,
+    };
     drop(lock);
+    if let Some((mem, links)) = fanout.as_ref() {
+        if let Some(resp) = reflect_fanout(app.federation.as_ref().as_ref(), mem, links).await {
+            return resp;
+        }
+    }
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => err_response(e),

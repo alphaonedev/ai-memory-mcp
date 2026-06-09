@@ -224,6 +224,36 @@ async fn fetch_consolidate_source_pairs(
     Ok(out)
 }
 
+/// #1552 / #326 — shared federation fanout for the consolidate write path,
+/// called by both the postgres SAL branch and the sqlite branch of
+/// [`consolidate_memories`]. Broadcasts the merged memory + the source-id
+/// deletions to the W-quorum so peers converge `metadata.consolidated_from_agents`
+/// + the deleted sources synchronously instead of waiting on async catch-up.
+///
+/// Returns `Some(response)` when the quorum is NOT met (a typed 503 the caller
+/// must return verbatim), or `None` on success / when federation is disabled
+/// (the single-node no-op path) so the caller proceeds to its 201 envelope.
+async fn consolidate_fanout(
+    fed: Option<&crate::federation::FederationConfig>,
+    mem: &crate::models::Memory,
+    source_ids: &[String],
+) -> Option<axum::response::Response> {
+    let fed = fed?;
+    match crate::federation::broadcast_consolidate_quorum(fed, mem, source_ids).await {
+        Ok(tracker) => {
+            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                // #869 — typed 503 envelope via the shared helper.
+                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                return Some(super::quorum_not_met_response(&payload));
+            }
+        }
+        Err(e) => {
+            tracing::warn!("consolidate fanout error (local committed): {e:?}");
+        }
+    }
+    None
+}
+
 pub async fn consolidate_memories(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -314,7 +344,7 @@ pub async fn consolidate_memories(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(&consolidator_agent_id);
-        return match app
+        let new_id = match app
             .store
             .consolidate(
                 &ctx,
@@ -328,36 +358,55 @@ pub async fn consolidate_memories(
             )
             .await
         {
-            Ok(new_id) => (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": new_id,
-                    "consolidated": body.ids.len(),
-                    "summary": summary,
-                    // v0.7.0 L7-followup — also emit the materialised summary
-                    // as `content` and inside a nested `memory` object so the
-                    // S51 scenario reader (which falls through
-                    // `cbody.get("summary") or cbody.get("content") or
-                    // (cbody.get("memory") or {}).get("content")` under a
-                    // ternary that requires `memory` to be a dict) sees a
-                    // non-empty string regardless of which branch its
-                    // operator precedence resolves to. Without the `memory`
-                    // dict the whole expression collapses to `""` even
-                    // though `summary` is set — see
-                    // `scenarios/51_autonomous_tier_suite.py:140-145`.
-                    "content": summary,
-                    "memory": {
-                        "id": new_id,
-                        "title": body.title,
-                        "content": summary,
-                        "namespace": body.namespace,
-                    },
-                    "storage_backend": "postgres",
-                })),
-            )
-                .into_response(),
-            Err(e) => store_err_to_response(e),
+            Ok(new_id) => new_id,
+            Err(e) => return store_err_to_response(e),
         };
+        // #1552 — federation fanout parity (shared `consolidate_fanout` helper,
+        // covered by the sqlite-branch fanout test). The SAL-ported postgres
+        // branch previously returned here WITHOUT broadcasting, so on a
+        // postgres-backed federated hive a consolidation only reached
+        // cross-region peers via async catch-up (`/sync/since`) rather than the
+        // synchronous W-quorum. Read the merged row back through the trait, then
+        // broadcast it + the source-id deletions; a quorum miss surfaces a typed
+        // 503 exactly like the regular create path. A read-back failure logs +
+        // falls through to the success envelope (catch-up reconciles peers).
+        if app.federation.is_some() {
+            if let Ok(mem) = app.store.get(&ctx, &new_id).await {
+                if let Some(resp) =
+                    consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &source_ids).await
+                {
+                    return resp;
+                }
+            }
+        }
+        return (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": new_id,
+                "consolidated": body.ids.len(),
+                "summary": summary,
+                // v0.7.0 L7-followup — also emit the materialised summary
+                // as `content` and inside a nested `memory` object so the
+                // S51 scenario reader (which falls through
+                // `cbody.get("summary") or cbody.get("content") or
+                // (cbody.get("memory") or {}).get("content")` under a
+                // ternary that requires `memory` to be a dict) sees a
+                // non-empty string regardless of which branch its
+                // operator precedence resolves to. Without the `memory`
+                // dict the whole expression collapses to `""` even
+                // though `summary` is set — see
+                // `scenarios/51_autonomous_tier_suite.py:140-145`.
+                "content": summary,
+                "memory": {
+                    "id": new_id,
+                    "title": body.title,
+                    "content": summary,
+                    "namespace": body.namespace,
+                },
+                "storage_backend": "postgres",
+            })),
+        )
+            .into_response();
     }
 
     let lock = app.db.lock().await;
@@ -402,22 +451,14 @@ pub async fn consolidate_memories(
     drop(lock);
     match consolidate_result {
         Ok(new_id) => {
-            // v0.6.2 (#326): propagate consolidation to peers so
+            // v0.6.2 (#326) / #1552: propagate consolidation to peers so
             // `metadata.consolidated_from_agents` and the deleted sources
-            // are in sync across the mesh.
-            if let (Some(fed), Some(mem)) = (app.federation.as_ref(), new_mem) {
-                match crate::federation::broadcast_consolidate_quorum(fed, &mem, &source_ids).await
+            // are in sync across the mesh (shared `consolidate_fanout` helper).
+            if let Some(mem) = new_mem {
+                if let Some(resp) =
+                    consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &source_ids).await
                 {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("consolidate fanout error (local committed): {e:?}");
-                    }
+                    return resp;
                 }
             }
             (

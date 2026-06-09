@@ -9141,6 +9141,155 @@ async fn http_consolidate_two_into_one_happy_path() {
 }
 
 #[tokio::test]
+async fn http_consolidate_fans_out_to_peer_1552() {
+    // #1552 — the consolidate write path must broadcast the merged memory +
+    // source deletions to the federation quorum (shared `consolidate_fanout`
+    // helper, exercised here through the sqlite branch). With W=2 and one
+    // Ack-ing peer the quorum is met → 201, and the peer's `/sync/push` must
+    // have received at least one fanout POST.
+    use std::sync::atomic::Ordering;
+    let state = test_state();
+    let now = Utc::now().to_rfc3339();
+    let (id_a, id_b) = {
+        let lock = state.lock().await;
+        let mk = |title: &str| Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "merge-fed-ns".into(),
+            title: title.into(),
+            content: format!("body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"agent_id": "alice"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let a = db::insert(&lock.0, &mk("fed-draft-a")).unwrap();
+        let b = db::insert(&lock.0, &mk("fed-draft-b")).unwrap();
+        (a, b)
+    };
+    let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+    let app_state = h8d_app_state_with_fed(state.clone(), vec![peer_url], 2, 1500);
+    let app = Router::new()
+        .route("/api/v1/consolidate", axum_post(consolidate_memories))
+        .with_state(app_state);
+    let body = serde_json::json!({
+        "ids": [id_a, id_b],
+        "title": "fed-merged-result",
+        "summary": "a merge of two drafts that must federate",
+        "namespace": "merge-fed-ns",
+        "tier": Tier::Long.as_str()
+    });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/consolidate")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", "consolidator")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(
+        count.load(Ordering::Relaxed) >= 1,
+        "consolidate must broadcast the merged memory to the federation quorum"
+    );
+}
+
+#[tokio::test]
+async fn http_reflect_fans_out_to_peer_1552() {
+    // #1552 — the reflect write path must broadcast the new reflection memory
+    // (and its `reflects_on` edges) to the federation quorum (shared
+    // `reflect_fanout` helper, exercised here through the sqlite branch).
+    // Previously the reflect handler returned WITHOUT any fanout, leaving the
+    // reflection to converge only via async catch-up. With W=2 and one Ack-ing
+    // peer the quorum is met → 200, and the peer must have received ≥1 POST.
+    use std::sync::atomic::Ordering;
+    let state = test_state();
+    let now = Utc::now().to_rfc3339();
+    let base_id = {
+        let lock = state.lock().await;
+        let base = Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "reflect-fed-ns".into(),
+            title: "reflect-base".into(),
+            content: "base observation to reflect upon".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"agent_id": "alice"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        db::insert(&lock.0, &base).unwrap()
+    };
+    let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
+    let app_state = h8d_app_state_with_fed(state.clone(), vec![peer_url], 2, 1500);
+    let app = Router::new()
+        .route("/api/v1/memory_reflect", axum_post(handle_reflect_http))
+        .with_state(app_state);
+    let body = serde_json::json!({
+        "source_ids": [base_id],
+        "title": "reflection-1",
+        "content": "a reflection on the base observation",
+        "namespace": "reflect-fed-ns",
+        "agent_id": "alice",
+    });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/memory_reflect")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", "alice")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        count.load(Ordering::Relaxed) >= 1,
+        "reflect must broadcast the reflection to the federation quorum"
+    );
+}
+
+#[tokio::test]
 async fn http_consolidate_single_id_400() {
     // validate_consolidate requires ≥2 ids — single-id calls are
     // rejected up front with 400.
