@@ -49,7 +49,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use super::AppState;
+use super::{AppState, StorageBackend};
 
 /// Build the `Bad Request` envelope used by every #1111 handler when
 /// the substrate primitive returns `Err(String)`. Kept as a free
@@ -93,6 +93,53 @@ pub async fn handle_reflect_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Postgres SAL path (#1549): route the recursive-learning reflect
+    // through `MemoryStore::reflect` (the inherent native-sqlx port —
+    // governance cap, depth-exceeded signed_events audit, atomic memory
+    // + signed reflects_on links). Mirrors the sqlite MCP path's
+    // argument contract + `REFLECTION_DEPTH_EXCEEDED` / `CALLER_DEPTH_MISMATCH`
+    // wire slugs + `{id, reflection_depth, reflects_on, namespace}` shape.
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let (input, caller_depth) = match crate::mcp::parse_reflect_input(&body, None) {
+            Ok(parsed) => parsed,
+            Err(e) => return err_response(e),
+        };
+        let caller = crate::store::CallerContext::for_agent(&input.agent_id);
+        // #1325 caller-asserted depth pre-check (parity with the sqlite
+        // MCP path): compare the asserted `depth` to the substrate-
+        // computed `max(source depths) + 1` before the write.
+        if let Some(caller_d) = caller_depth {
+            let mut max_src_depth: i32 = 0;
+            for sid in &input.source_ids {
+                if let Ok(m) = app.store.get(&caller, sid).await {
+                    max_src_depth = max_src_depth.max(m.reflection_depth);
+                }
+            }
+            let computed = i64::from(max_src_depth.max(0).saturating_add(1));
+            if caller_d != computed {
+                return err_response(format!(
+                    "CALLER_DEPTH_MISMATCH: caller asserted depth={caller_d} but \
+                     substrate computed reflection_depth={computed} from sources \
+                     (max(source_depths)+1). Omit the `depth` field to defer to the \
+                     substrate, or pass the matching value."
+                ));
+            }
+        }
+        let active_keypair = app.active_keypair.as_ref().as_ref();
+        return match app.store.reflect(&caller, &input, active_keypair).await {
+            Ok(outcome) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": outcome.id,
+                    "reflection_depth": outcome.reflection_depth,
+                    "reflects_on": outcome.reflects_on,
+                    "namespace": outcome.namespace,
+                })),
+            )
+                .into_response(),
+            Err(e) => err_response(crate::mcp::map_reflect_error_to_wire_string(e)),
+        };
+    }
     let lock = app.db.lock().await;
     let db_path = lock.1.clone();
     let embedder = app
@@ -131,6 +178,49 @@ pub async fn handle_recall_observations_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Postgres SAL path (#1549): read the recall-consumption ledger
+    // through `MemoryStore::list_recall_observations`. Mirrors the
+    // sqlite MCP path's filter parsing + `{observations, count}` shape.
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let recall_id = body
+            .get("recall_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let consumed = body.get("consumed").and_then(Value::as_bool);
+        let since = body
+            .get("since")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let until = body
+            .get("until")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let limit = body
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .map_or(crate::mcp::RECALL_OBS_DEFAULT_LIMIT, |n| {
+                n.min(crate::mcp::RECALL_OBS_MAX_LIMIT)
+            });
+        return match app
+            .store
+            .list_recall_observations(recall_id, consumed, since, until, limit)
+            .await
+        {
+            Ok(rows) => {
+                let count = rows.len();
+                (
+                    StatusCode::OK,
+                    Json(json!({ "observations": rows, "count": count })),
+                )
+                    .into_response()
+            }
+            Err(e) => err_response(e.to_string()),
+        };
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_recall_observations(&lock.0, &body);
     drop(lock);
@@ -148,6 +238,32 @@ pub async fn handle_reflection_origin_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Postgres SAL path (#1549): walk reflection origin metadata through
+    // `MemoryStore::get_reflection_origin`. Mirrors the sqlite MCP path's
+    // `memory_id` validation + response shape + "memory not found" 4xx.
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let memory_id = match body["memory_id"].as_str() {
+            Some(s) if !s.is_empty() => s,
+            Some(_) => return err_response("memory_id cannot be empty".to_string()),
+            None => return err_response("memory_id is required".to_string()),
+        };
+        return match app.store.get_reflection_origin(memory_id).await {
+            Ok(Some(record)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "memory_id": record.memory_id,
+                    "peer_origin": record.peer_origin,
+                    "signing_agent": record.signing_agent,
+                    "original_depth": record.original_depth,
+                    "local_depth_at_arrival": record.local_depth_at_arrival,
+                    "is_reflection": record.is_reflection,
+                })),
+            )
+                .into_response(),
+            Ok(None) => err_response(format!("memory not found: {memory_id}")),
+            Err(e) => err_response(e.to_string()),
+        };
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_reflection_origin(&lock.0, &body);
     drop(lock);

@@ -608,6 +608,9 @@ pub use recall::decorate_memory_many;
 // (sibling-agent landing); the function is dispatched via
 // `dispatch_memory_recall_observations` below.
 pub use recall_observations::handle_recall_observations;
+pub(crate) use recall_observations::{
+    DEFAULT_LIMIT as RECALL_OBS_DEFAULT_LIMIT, MAX_LIMIT as RECALL_OBS_MAX_LIMIT,
+};
 pub use replay::handle_replay;
 pub use rule_list::handle_rule_list;
 pub(crate) use session_start::handle_session_start;
@@ -654,6 +657,7 @@ pub use dependents_of_invalidated::handle_dependents_of_invalidated;
 pub use export_reflection::handle_export_reflection;
 pub use pending::handle_subscription_dlq_list;
 pub use reflect::handle_reflect;
+pub(crate) use reflect::{map_reflect_error_to_wire_string, parse_reflect_input};
 pub use reflection_origin::handle_reflection_origin;
 pub use subscribe::handle_subscription_replay;
 

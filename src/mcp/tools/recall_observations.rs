@@ -8,8 +8,8 @@
 use crate::observations;
 use serde_json::{Value, json};
 
-const DEFAULT_LIMIT: usize = 200;
-const MAX_LIMIT: usize = 1000;
+pub(crate) const DEFAULT_LIMIT: usize = 200;
+pub(crate) const MAX_LIMIT: usize = 1000;
 
 /// MCP handler. Filters compose with AND. Returns the ledger rows
 /// most-recent-first, JSON-shaped via `observations::Observation`.

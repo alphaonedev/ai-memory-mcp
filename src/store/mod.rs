@@ -1247,6 +1247,69 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// Recursive-learning primitive (#655 Task 4/8): mint a reflection
+    /// memory over `input.source_ids`, computing
+    /// `reflection_depth = max(source depths) + 1`, refusing with
+    /// `ReflectionDepthExceeded` when the proposed depth exceeds the
+    /// namespace `effective_max_reflection_depth` (and appending the
+    /// `reflection.depth_exceeded` row to the tamper-evident
+    /// `signed_events` chain), then persisting the new memory plus one
+    /// `reflects_on` edge per source in a single atomic transaction.
+    /// When `signing_key` is `Some`, each `reflects_on` edge is signed
+    /// (Ed25519) so it lands `attest_level='self_signed'` (#815).
+    ///
+    /// Mirrors the sqlite `storage::reflect_with_hooks` contract.
+    /// Returns the rich [`crate::storage::reflect::ReflectError`] (not
+    /// `StoreError`) so callers can render the stable
+    /// `REFLECTION_DEPTH_EXCEEDED` / `CALLER_DEPTH_MISMATCH` /
+    /// `REFLECTION_HOOK_VETO` wire slugs uniformly across backends via
+    /// `crate::mcp::map_reflect_error_to_wire_string`.
+    ///
+    /// Default returns a backend-unsupported `ReflectError::Database`
+    /// (only `SqliteStore` + `PostgresStore` override this in
+    /// production).
+    async fn reflect(
+        &self,
+        _ctx: &CallerContext,
+        _input: &crate::storage::reflect::ReflectInput,
+        _signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError> {
+        Err(crate::storage::reflect::ReflectError::Database(
+            "reflect is not supported on this storage backend".to_string(),
+        ))
+    }
+
+    /// Recursive-learning provenance (L2-2): walk a reflection memory's
+    /// origin metadata, returning the `ReflectionOrigin` record
+    /// (peer-origin, signing agent, original depth, local cap at
+    /// arrival, is-reflection flag) or `None` when the id is unknown.
+    /// Read-only. Default returns `UnsupportedCapability`.
+    async fn get_reflection_origin(
+        &self,
+        _id: &str,
+    ) -> StoreResult<Option<crate::federation::reflection_bookkeeping::ReflectionOrigin>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REFLECTION_ORIGIN".to_string(),
+        })
+    }
+
+    /// Recall-consumption ledger read (Provenance Gap 3): list
+    /// `recall_observations` rows filtered by recall id / consumed flag
+    /// / time window, capped at `limit`. Read-only. Default returns
+    /// `UnsupportedCapability`.
+    async fn list_recall_observations(
+        &self,
+        _recall_id: Option<&str>,
+        _consumed: Option<bool>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::observations::Observation>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECALL_OBSERVATIONS".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///

@@ -200,6 +200,13 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("POST", "/api/v1/session/start") => true,
         ("POST", p) if memory_promote_path(p) => true,
         ("POST", p) if approvals_decide_path(p) => true,
+        // #1548/#1549 — recursive-learning surfaces now routed through
+        // the SAL trait on postgres (`MemoryStore::reflect` /
+        // `get_reflection_origin` / `list_recall_observations`), so the
+        // gate permits them to reach the handler's postgres branch.
+        ("POST", "/api/v1/memory_reflect") => true,
+        ("POST", "/api/v1/memory_reflection_origin") => true,
+        ("POST", "/api/v1/memory_recall_observations") => true,
         _ => false,
     }
 }

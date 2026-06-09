@@ -50,7 +50,7 @@ use std::path::Path;
 ///   registered) but pinned so the wire-shape can't drift under a
 ///   future MCP-side hook wire-in.
 /// * `Database(m)` → raw `m`.
-fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
+pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
     match err {
         db::ReflectError::Validation(m) => m,
         db::ReflectError::SourceNotFound(id) => format!("source memory not found: {id}"),
@@ -80,6 +80,89 @@ fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
         }
         db::ReflectError::Database(m) => m,
     }
+}
+
+/// Parse a `memory_reflect` request `Value` into a [`db::ReflectInput`]
+/// plus the optional caller-asserted `depth` (#1325). Shared by the
+/// sqlite MCP path ([`handle_reflect`]) and the postgres SAL HTTP path
+/// ([`crate::handlers::route_1111::handle_reflect_http`]) so the wire
+/// argument contract lives in exactly one place.
+///
+/// # Errors
+/// Returns a wire-ready error string when a required field is missing
+/// or malformed (`source_ids`, `title`, `content`, `tier`, `depth`).
+pub(crate) fn parse_reflect_input(
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<(db::ReflectInput, Option<i64>), String> {
+    let source_ids_arr = params["source_ids"]
+        .as_array()
+        .ok_or("source_ids is required (array of memory IDs)")?;
+    if source_ids_arr.is_empty() {
+        return Err("source_ids cannot be empty".to_string());
+    }
+    let mut source_ids: Vec<String> = Vec::with_capacity(source_ids_arr.len());
+    for (i, v) in source_ids_arr.iter().enumerate() {
+        match v.as_str() {
+            Some(s) => source_ids.push(s.to_string()),
+            None => return Err(format!("source_ids[{i}] must be a string")),
+        }
+    }
+    let title = params["title"]
+        .as_str()
+        .ok_or("title is required")?
+        .to_string();
+    let content = params["content"]
+        .as_str()
+        .ok_or("content is required")?
+        .to_string();
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
+    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let namespace = params["namespace"].as_str().map(str::to_string);
+    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
+    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let tags: Vec<String> = params["tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let metadata = if params["metadata"].is_object() {
+        params["metadata"].clone()
+    } else {
+        serde_json::json!({})
+    };
+    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    if let Some(d) = caller_depth {
+        if d < 0 {
+            return Err(format!(
+                "CALLER_DEPTH_MISMATCH: depth must be a non-negative integer (got depth={d})"
+            ));
+        }
+    }
+    let explicit_agent_id = params["agent_id"]
+        .as_str()
+        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
+        .map_err(|e| e.to_string())?;
+    let input = db::ReflectInput {
+        source_ids,
+        title,
+        content,
+        namespace,
+        tier,
+        tags,
+        priority,
+        confidence,
+        // Vendor-neutral substrate default (#1175) — role-categorical,
+        // not vendor; NHI identity lives in `metadata.agent_id`.
+        source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
+        agent_id,
+        metadata,
+    };
+    Ok((input, caller_depth))
 }
 
 pub fn handle_reflect(

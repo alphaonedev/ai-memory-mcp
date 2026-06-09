@@ -153,6 +153,16 @@ pub fn reflection_origin(conn: &Connection, id: &str) -> Result<Option<Reflectio
         Some(m) => m,
         None => return Ok(None),
     };
+    Ok(Some(reflection_origin_from_memory(&mem)))
+}
+
+/// Pure derivation of a [`ReflectionOrigin`] from an already-fetched
+/// [`Memory`] — the storage-agnostic half of [`reflection_origin`].
+/// Shared by the sqlite path (which fetches via `storage::get`) and the
+/// postgres SAL path (which fetches via the `MemoryStore` trait) so the
+/// origin-metadata derivation lives in exactly one place.
+#[must_use]
+pub fn reflection_origin_from_memory(mem: &Memory) -> ReflectionOrigin {
     let is_reflection = mem.reflection_depth > 0;
     let signing_agent = mem
         .metadata
@@ -168,14 +178,14 @@ pub fn reflection_origin(conn: &Connection, id: &str) -> Result<Option<Reflectio
         .and_then(|v| v.get("local_depth_at_arrival"))
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok());
-    Ok(Some(ReflectionOrigin {
-        memory_id: mem.id,
+    ReflectionOrigin {
+        memory_id: mem.id.clone(),
         peer_origin,
         signing_agent,
         original_depth: mem.reflection_depth,
         local_depth_at_arrival,
         is_reflection,
-    }))
+    }
 }
 
 /// v0.7.0 L2-2 — enforcement hook for the LOCAL `max_reflection_depth`
