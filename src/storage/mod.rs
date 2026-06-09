@@ -2245,7 +2245,7 @@ pub fn list_by_source_uri(
     limit: Option<usize>,
     as_agent: Option<&str>,
 ) -> Result<Vec<Memory>> {
-    let cap = limit.unwrap_or(200).min(1000);
+    let cap = limit.unwrap_or(LIST_DEFAULT_CAP).min(LIST_MAX_LIMIT);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
     // Placeholder layout: ?1 = uri, ?2 = namespace, ?3 = limit,
     // ?4..?7 = visibility prefixes (private/team/unit/org).
@@ -4112,7 +4112,14 @@ pub fn list_namespaces(conn: &Connection) -> Result<Vec<NamespaceCount>> {
 /// Hard cap on input groups walked when assembling a taxonomy tree.
 /// Even when callers pass a wildly large `limit`, we never walk more
 /// than this many `(namespace, count)` rows — bounds memory + time.
-const TAXONOMY_MAX_LIMIT: usize = 10_000;
+/// Shared by the sqlite + postgres taxonomy paths and the HTTP / MCP
+/// taxonomy surfaces so all four clamp identically.
+pub const TAXONOMY_MAX_LIMIT: usize = 10_000;
+
+/// Default group budget for taxonomy listings when the caller passes
+/// no explicit `limit` (HTTP `/api/v1/namespaces`, MCP
+/// `memory_get_taxonomy`).
+pub const TAXONOMY_DEFAULT_LIMIT: usize = 1000;
 
 /// Build a hierarchical namespace taxonomy (Pillar 1 / Stream A).
 ///
@@ -4406,6 +4413,32 @@ pub fn fold_taxonomy_groups(
         truncated,
     }
 }
+
+/// Default row cap for memory list/search surfaces when the caller
+/// passes no explicit limit. Mirrored by the postgres SAL adapter
+/// (`src/store/postgres.rs::list_by_source_uri`) so both backends
+/// page identically.
+pub const LIST_DEFAULT_CAP: usize = 200;
+
+/// Hard ceiling on rows returned by the memory list/search surfaces.
+/// One shared knob across the sqlite + postgres SAL adapters; same
+/// family as `KG_TIMELINE_MAX_LIMIT` / `KG_QUERY_MAX_LIMIT`.
+pub const LIST_MAX_LIMIT: usize = 1000;
+
+/// Post-clamp `usize → i64` conversion fallback for list/query limits.
+/// Unreachable in practice (values are already clamped to at most
+/// `LIST_MAX_LIMIT`, which always fits `i64`); kept as a named knob so
+/// the fallback page size is explicit rather than magic.
+pub const LIST_FALLBACK_LIMIT: usize = 100;
+
+/// Default page size for archive listings (HTTP `/api/v1/archive` and
+/// MCP `memory_archive_list`) when the caller passes no explicit
+/// `limit` — one knob so both surfaces page identically.
+pub const ARCHIVE_DEFAULT_PAGE_LIMIT: usize = 50;
+
+/// Default page size for governance pending-action listings (MCP
+/// `memory_pending_list` / subscription approval feeds).
+pub const PENDING_DEFAULT_PAGE_LIMIT: usize = 100;
 
 /// Hard floor for duplicate-check threshold. Below this, anything can match
 /// random unrelated content — refuse to honor the lookup so callers don't

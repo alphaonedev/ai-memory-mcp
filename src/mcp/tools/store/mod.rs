@@ -30,6 +30,7 @@ use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -608,7 +609,7 @@ pub(crate) fn handle_store(
         }
         // #196: echo the preserved agent_id (original on dedup, not the caller's)
         let echoed_agent_id = preserved_metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         return Ok(json!({

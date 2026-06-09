@@ -72,6 +72,17 @@ pub const DEFAULT_ITERATIONS: usize = 200;
 /// Default warmup iterations discarded from the percentile sample.
 pub const DEFAULT_WARMUP: usize = 20;
 
+/// Hard ceiling on `--iterations` — bounds bench wall-clock on a
+/// mistyped flag.
+pub const MAX_ITERATIONS: usize = 100_000;
+
+/// Hard ceiling on `--warmup` iterations.
+pub const MAX_WARMUP: usize = 10_000;
+
+/// Hard ceiling on `--regression-threshold` (percent) — values above
+/// this are clamped; a 1000% allowance already means "no gate".
+pub const MAX_REGRESSION_THRESHOLD_PCT: f64 = 1000.0;
+
 /// Default tolerance applied when comparing a fresh run against a
 /// `--baseline` JSON file: a measured p95 may grow by this percentage
 /// before the run is flagged as a regression. Independent of

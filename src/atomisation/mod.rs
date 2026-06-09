@@ -260,6 +260,17 @@ impl std::error::Error for AtomiseError {}
 /// without strangling legitimate two-step curator hand-offs.
 pub const MAX_ATOMISATION_DEPTH: u32 = 3;
 
+/// Smallest accepted `max_atom_tokens` — below this an "atom" can't
+/// hold a self-contained proposition.
+pub const MIN_ATOM_TOKENS: u32 = 50;
+
+/// Largest accepted `max_atom_tokens` — above this an "atom" is no
+/// longer atomic.
+pub const MAX_ATOM_TOKENS: u32 = 1000;
+
+/// Default `max_atom_tokens` when the caller passes none (or null).
+pub const DEFAULT_ATOM_TOKENS: u32 = 200;
+
 thread_local! {
     /// Per-thread counter tracking how deep into the
     /// atomisation-pass call stack the current `atomise_sync*`

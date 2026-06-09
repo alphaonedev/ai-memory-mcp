@@ -9,6 +9,8 @@
 //! and `OnConflict` variant is byte-identical to the pre-#881 inline
 //! code path.
 
+use crate::mcp::param_names;
+
 /// v0.6.3.1 P2 (G6) — `on_conflict` modes for `memory_store`.
 ///
 /// * `Error`   — refuse the write with a typed CONFLICT error. This is
@@ -159,9 +161,11 @@ pub(super) fn parse_and_build_memory(
     //   2. embedded `metadata.agent_id` (backward compatible with callers
     //      that supply it inline)
     //   3. env / MCP clientInfo / host / anonymous (handled inside `identity`)
-    let explicit_agent_id = params["agent_id"]
-        .as_str()
-        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let explicit_agent_id = params["agent_id"].as_str().or_else(|| {
+        metadata
+            .get(param_names::AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+    });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
     if let Some(obj) = metadata.as_object_mut() {
@@ -173,7 +177,11 @@ pub(super) fn parse_and_build_memory(
     // #151 scope: top-level `scope` param OR inline metadata.scope
     let explicit_scope = params["scope"]
         .as_str()
-        .or_else(|| metadata.get("scope").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            metadata
+                .get(param_names::SCOPE)
+                .and_then(serde_json::Value::as_str)
+        })
         .map(str::to_string);
     if let Some(ref s) = explicit_scope {
         validate::validate_scope(s).map_err(|e| e.to_string())?;
@@ -237,7 +245,7 @@ pub(super) fn parse_and_build_memory(
     // `source_span: None` even when the caller supplied them in the
     // request — silently dropping the validated Form-4 provenance
     // fields. Parse, validate, then thread through.
-    let citations: Vec<crate::models::Citation> = match params.get("citations") {
+    let citations: Vec<crate::models::Citation> = match params.get(param_names::CITATIONS) {
         Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| {
             format!(
                 "invalid `citations` (expected array of {{uri, accessed_at, hash?, span?}}): {e}"
@@ -248,7 +256,8 @@ pub(super) fn parse_and_build_memory(
     if !citations.is_empty() {
         crate::validate::validate_citations(&citations).map_err(|e| e.to_string())?;
     }
-    let source_span: Option<crate::models::SourceSpan> = match params.get("source_span") {
+    let source_span: Option<crate::models::SourceSpan> = match params.get(param_names::SOURCE_SPAN)
+    {
         Some(v) if !v.is_null() => Some(
             serde_json::from_value(v.clone())
                 .map_err(|e| format!("invalid `source_span` (expected {{start, end}}): {e}"))?,

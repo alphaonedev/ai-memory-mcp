@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use crate::autonomy::AutonomyLlm;
 use crate::config::FeatureTier;
+use crate::mcp::param_names;
 use crate::persona::{PersonaConfig, PersonaError, PersonaGenerator, get_latest_persona};
 
 /// Wire shape (read-only):
@@ -128,7 +129,7 @@ pub fn handle_persona_generate(
     //   across every namespace the entity has touched, and the new
     //   persona row lands in `"global"` so subsequent
     //   `memory_persona(entity_id)` calls have a deterministic find.
-    let scoped_single: Option<&str> = match params.get("namespace") {
+    let scoped_single: Option<&str> = match params.get(param_names::NAMESPACE) {
         None => None,
         Some(v) if v.is_null() => None,
         Some(v) => match v.as_str() {

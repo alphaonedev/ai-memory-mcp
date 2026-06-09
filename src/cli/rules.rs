@@ -98,7 +98,7 @@ pub enum RulesAction {
         #[arg(long)]
         reason: String,
         /// Optional namespace scope. Defaults to `_global`.
-        #[arg(long, default_value = "_global")]
+        #[arg(long, default_value = crate::quotas::GLOBAL_NAMESPACE)]
         namespace: String,
         /// Land the rule with `enabled = 0` (operator activates
         /// later via `ai-memory rules enable <id> --sign`).

@@ -65,6 +65,7 @@ use serde_json::{Value, json};
 
 use crate::atomisation::{AtomiseError, Atomiser};
 use crate::config::FeatureTier;
+use crate::mcp::param_names;
 
 /// Handler-side bundle. Keeps the [`Atomiser`] (the WT-1-B engine)
 /// behind an `Arc` so the dispatcher can construct one at server boot
@@ -127,7 +128,7 @@ pub fn handle_atomise(
 ) -> Result<Value, String> {
     // ── Argument validation ─────────────────────────────────────────
     let memory_id = params
-        .get("memory_id")
+        .get(param_names::MEMORY_ID)
         .ok_or("memory_id is required")?
         .as_str()
         .ok_or("memory_id must be a string")?;
@@ -138,26 +139,38 @@ pub fn handle_atomise(
     // max_atom_tokens — default 200, range [50, 1000]. We reject
     // non-integer (string, bool, null) values explicitly so the agent
     // sees a clean validation error rather than a silent default.
-    let max_atom_tokens: u32 = if let Some(v) = params.get("max_atom_tokens") {
+    let max_atom_tokens: u32 = if let Some(v) = params.get(param_names::MAX_ATOM_TOKENS) {
         if v.is_null() {
-            200
+            crate::atomisation::DEFAULT_ATOM_TOKENS
         } else {
-            let n = v
-                .as_i64()
-                .ok_or("max_atom_tokens must be an integer in [50, 1000] (default 200)")?;
-            if !(50..=1000).contains(&n) {
-                return Err(format!("max_atom_tokens out of range [50, 1000]: {n}"));
+            let n = v.as_i64().ok_or_else(|| {
+                format!(
+                    "max_atom_tokens must be an integer in [{}, {}] (default {})",
+                    crate::atomisation::MIN_ATOM_TOKENS,
+                    crate::atomisation::MAX_ATOM_TOKENS,
+                    crate::atomisation::DEFAULT_ATOM_TOKENS
+                )
+            })?;
+            if !(i64::from(crate::atomisation::MIN_ATOM_TOKENS)
+                ..=i64::from(crate::atomisation::MAX_ATOM_TOKENS))
+                .contains(&n)
+            {
+                return Err(format!(
+                    "max_atom_tokens out of range [{}, {}]: {n}",
+                    crate::atomisation::MIN_ATOM_TOKENS,
+                    crate::atomisation::MAX_ATOM_TOKENS
+                ));
             }
             u32::try_from(n).expect("range-checked above")
         }
     } else {
-        200
+        crate::atomisation::DEFAULT_ATOM_TOKENS
     };
 
     // force_re_atomise — default false. Type-strict: reject anything
     // that isn't a JSON bool (the brief calls out `force_re_atomise="yes"`
     // as an explicit rejection case).
-    let force_re_atomise: bool = if let Some(v) = params.get("force_re_atomise") {
+    let force_re_atomise: bool = if let Some(v) = params.get(param_names::FORCE_RE_ATOMISE) {
         if v.is_null() {
             false
         } else {
@@ -182,7 +195,7 @@ pub fn handle_atomise(
     let handler = handler.expect("checked above");
 
     // ── Calling agent resolution (NHI) ──────────────────────────────
-    let explicit_agent_id = params.get("agent_id").and_then(Value::as_str);
+    let explicit_agent_id = params.get(param_names::AGENT_ID).and_then(Value::as_str);
     let calling_agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
 

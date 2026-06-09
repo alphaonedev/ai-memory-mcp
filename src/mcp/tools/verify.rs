@@ -3,6 +3,7 @@
 
 //! MCP `memory_verify` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -98,7 +99,7 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
     //   1. link_id="<src>--<rel>-->\<dst>"
     //   2. source_id=… target_id=… [relation="related_to"]
     let (source_id, target_id, relation): (String, String, String) =
-        if let Some(lid) = params.get("link_id").and_then(Value::as_str) {
+        if let Some(lid) = params.get(param_names::LINK_ID).and_then(Value::as_str) {
             super::link::parse_link_id(lid).ok_or_else(|| {
                 format!(
                     "link_id '{lid}' is not in the expected form \
@@ -107,15 +108,15 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
             })?
         } else {
             let src = params
-                .get("source_id")
+                .get(param_names::SOURCE_ID)
                 .and_then(Value::as_str)
                 .ok_or("link_id or source_id+target_id is required")?;
             let dst = params
-                .get("target_id")
+                .get(param_names::TARGET_ID)
                 .and_then(Value::as_str)
                 .ok_or("link_id or source_id+target_id is required")?;
             let rel = params
-                .get("relation")
+                .get(param_names::RELATION)
                 .and_then(Value::as_str)
                 .unwrap_or("related_to");
             (src.to_string(), dst.to_string(), rel.to_string())

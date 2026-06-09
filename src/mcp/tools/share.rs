@@ -24,6 +24,7 @@
 //!
 //! Regression test: `share_copies_memory_into_shared_namespace`.
 
+use crate::mcp::param_names;
 use crate::{models::Memory, storage as db, validate};
 use serde_json::{Value, json};
 
@@ -72,7 +73,7 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
     // to `unknown` if absent.
     let from_agent_id = source
         .metadata
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();

@@ -3,6 +3,7 @@
 
 //! MCP `memory_get_taxonomy` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -68,12 +69,21 @@ pub(super) fn handle_get_taxonomy(
     if let Some(p) = prefix_owned.as_deref() {
         validate::validate_namespace(p).map_err(|e| e.to_string())?;
     }
-    let depth = usize::try_from(params.get("depth").and_then(Value::as_u64).unwrap_or(8))
-        .unwrap_or(usize::MAX)
-        .min(crate::models::MAX_NAMESPACE_DEPTH);
-    let limit = usize::try_from(params.get("limit").and_then(Value::as_u64).unwrap_or(1000))
-        .unwrap_or(usize::MAX)
-        .clamp(1, 10_000);
+    let depth = usize::try_from(
+        params
+            .get(param_names::DEPTH)
+            .and_then(Value::as_u64)
+            .unwrap_or(8),
+    )
+    .unwrap_or(usize::MAX)
+    .min(crate::models::MAX_NAMESPACE_DEPTH);
+    let limit = params
+        .get(param_names::LIMIT)
+        .and_then(Value::as_u64)
+        .map_or(crate::storage::TAXONOMY_DEFAULT_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        })
+        .clamp(1, crate::storage::TAXONOMY_MAX_LIMIT);
 
     let tax =
         db::get_taxonomy(conn, prefix_owned.as_deref(), depth, limit).map_err(|e| e.to_string())?;

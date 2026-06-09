@@ -502,9 +502,9 @@ pub async fn subscribe(
     } else {
         db::list(
             &lock.0,
-            Some("_agents"),
+            Some(crate::models::AGENTS_NAMESPACE),
             None,
-            1000,
+            crate::storage::LIST_MAX_LIMIT,
             0,
             None,
             None,
@@ -606,7 +606,7 @@ pub async fn unsubscribe(
             let sub_ns = format!("_subscriptions/{caller}");
             let filter = crate::store::Filter {
                 namespace: Some(sub_ns),
-                limit: 1000,
+                limit: crate::storage::LIST_MAX_LIMIT,
                 ..Default::default()
             };
             match app.store.list(&ctx, &filter).await {
@@ -786,7 +786,7 @@ pub async fn list_subscriptions(
         for ns in namespaces {
             let filter = crate::store::Filter {
                 namespace: Some(ns),
-                limit: 1000,
+                limit: crate::storage::LIST_MAX_LIMIT,
                 ..Default::default()
             };
             match app.store.list(&ctx, &filter).await {

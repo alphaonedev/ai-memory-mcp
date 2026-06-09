@@ -3,6 +3,7 @@
 
 //! MCP `memory_promote` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::Tier;
 use crate::{db, validate};
@@ -97,7 +98,7 @@ pub(super) fn handle_promote(
     let snapshot_namespace = target.namespace.clone();
     let snapshot_owner: Option<String> = target
         .metadata
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
@@ -108,7 +109,7 @@ pub(super) fn handle_promote(
             .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = json!({

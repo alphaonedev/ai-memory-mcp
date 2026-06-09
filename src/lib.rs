@@ -31,6 +31,17 @@ pub const SECS_PER_HOUR: i64 = 3_600;
 pub const SECS_PER_DAY: i64 = 86_400;
 pub const SECS_PER_WEEK: i64 = 604_800;
 
+/// Milliseconds per second — for secs→ms conversions feeding wire/SQL
+/// surfaces that take milliseconds (e.g. postgres `statement_timeout`).
+/// `u64` matches the `*_timeout_secs` config field type; `i64`/`u128`
+/// callers cast at the use site like the `SECS_PER_*` family above.
+pub const MILLIS_PER_SEC: u64 = 1_000;
+
+/// Rounding factor for similarity/score values surfaced on wire
+/// responses (HTTP handlers + MCP tools) — `1000.0` keeps three
+/// decimal places via `(score * FACTOR).round() / FACTOR`.
+pub const SCORE_DISPLAY_ROUND_FACTOR: f64 = 1000.0;
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner B finding F-B7) — byte-unit
 // consts so substrate-wide size math is grep-able and refactor-safe.

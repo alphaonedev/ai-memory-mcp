@@ -47,6 +47,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::config::FeatureTier;
+use crate::mcp::param_names;
 #[cfg(test)]
 use crate::multistep_ingest::MockLlmDispatch;
 use crate::multistep_ingest::{
@@ -103,7 +104,7 @@ pub fn handle_ingest_multistep(
 ) -> Result<Value, String> {
     // ── Argument validation ─────────────────────────────────────────
     let content = params
-        .get("content")
+        .get(param_names::CONTENT)
         .ok_or("content is required")?
         .as_str()
         .ok_or("content must be a string")?;
@@ -112,7 +113,7 @@ pub fn handle_ingest_multistep(
     }
 
     let namespace = params
-        .get("namespace")
+        .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
         .unwrap_or(crate::DEFAULT_NAMESPACE);
 
@@ -127,7 +128,7 @@ pub fn handle_ingest_multistep(
     let handler = handler.expect("checked above");
 
     // ── Pipeline resolution ─────────────────────────────────────────
-    let pipeline = if let Some(override_value) = params.get("pipeline_override") {
+    let pipeline = if let Some(override_value) = params.get(param_names::PIPELINE_OVERRIDE) {
         if !override_value.is_null() {
             serde_json::from_value::<Pipeline>(override_value.clone())
                 .map_err(|e| format!("pipeline_override is malformed: {e}"))?

@@ -4,6 +4,7 @@
 //! MCP `memory_load_family` and `memory_smart_load` handlers and routing helpers.
 
 use crate::embeddings::{Embed, Embedder};
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::Memory;
 use crate::{db, validate};
@@ -250,7 +251,7 @@ pub fn handle_load_family(
     let family = Family::from_str(family_raw).map_err(|e| e.to_string())?;
     let family_name = family.name();
 
-    let namespace = params.get("namespace").and_then(Value::as_str);
+    let namespace = params.get(param_names::NAMESPACE).and_then(Value::as_str);
     if let Some(ns) = namespace {
         validate::validate_namespace(ns).map_err(|e| e.to_string())?;
     }
@@ -259,7 +260,10 @@ pub fn handle_load_family(
     // — calling `memory_load_family(k=0)` is almost always a bug, and
     // the always-return-at-least-one shape lines up with R1's recall
     // budget guarantee.
-    let k_raw = params.get("k").and_then(Value::as_u64).unwrap_or(20);
+    let k_raw = params
+        .get(param_names::K)
+        .and_then(Value::as_u64)
+        .unwrap_or(20);
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -431,23 +435,30 @@ fn forward_to_load_family(
     // Build the payload memory_load_family expects: family + the
     // forwarded namespace + k from the caller.
     let mut forward = json!({"family": family_name});
-    if let Some(ns) = params.get("namespace").and_then(Value::as_str) {
+    if let Some(ns) = params.get(param_names::NAMESPACE).and_then(Value::as_str) {
         forward["namespace"] = json!(ns);
     }
-    if let Some(k) = params.get("k").and_then(Value::as_u64) {
+    if let Some(k) = params.get(param_names::K).and_then(Value::as_u64) {
         forward["k"] = json!(k);
     }
 
     let inner = handle_load_family(conn, &forward, caller)?;
     let memories = inner.get("memories").cloned().unwrap_or_else(|| json!([]));
     let count = inner.get("count").cloned().unwrap_or_else(|| json!(0));
-    let k = inner.get("k").cloned().unwrap_or_else(|| json!(20));
-    let namespace = inner.get("namespace").cloned().unwrap_or(Value::Null);
+    let k = inner
+        .get(param_names::K)
+        .cloned()
+        .unwrap_or_else(|| json!(20));
+    let namespace = inner
+        .get(param_names::NAMESPACE)
+        .cloned()
+        .unwrap_or(Value::Null);
 
     // Round score to 3 decimals at the wire — keeps the JSON readable
     // without leaking f32 quantisation noise (same convention as
     // memory_check_duplicate).
-    let score_rounded = (f64::from(score) * 1000.0).round() / 1000.0;
+    let score_rounded = (f64::from(score) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+        / crate::SCORE_DISPLAY_ROUND_FACTOR;
 
     Ok(json!({
         "chosen_family": family_name,

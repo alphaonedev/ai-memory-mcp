@@ -478,7 +478,10 @@ pub async fn get_taxonomy(
         .depth
         .unwrap_or(crate::models::MAX_NAMESPACE_DEPTH)
         .min(crate::models::MAX_NAMESPACE_DEPTH);
-    let limit = p.limit.unwrap_or(1000).clamp(1, 10_000);
+    let limit = p
+        .limit
+        .unwrap_or(crate::storage::TAXONOMY_DEFAULT_LIMIT)
+        .clamp(1, crate::storage::TAXONOMY_MAX_LIMIT);
 
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
     // now route taxonomy reads through `MemoryStore::get_taxonomy`.
@@ -856,7 +859,8 @@ pub async fn check_duplicate(
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            "similarity": (m.similarity * 1000.0).round() / 1000.0,
+            "similarity": (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                / crate::SCORE_DISPLAY_ROUND_FACTOR,
         })
     });
     let suggested_merge = if check.is_duplicate {

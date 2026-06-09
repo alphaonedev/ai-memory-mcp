@@ -3,6 +3,7 @@
 
 //! MCP `memory_notify` and `memory_inbox` handlers.
 
+use crate::mcp::param_names;
 use crate::models::ConfidenceSource;
 use crate::models::{Memory, Tier};
 use crate::{db, validate};
@@ -145,7 +146,7 @@ pub fn handle_inbox(
         .map(|m| {
             let sender = m
                 .metadata
-                .get("agent_id")
+                .get(param_names::AGENT_ID)
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             json!({

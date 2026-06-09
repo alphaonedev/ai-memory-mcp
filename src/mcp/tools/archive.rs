@@ -10,10 +10,19 @@ pub(super) fn handle_archive_list(
     params: &Value,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(50)).unwrap_or(usize::MAX);
+    let limit = params["limit"]
+        .as_u64()
+        .map_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        });
     let offset = usize::try_from(params["offset"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
-    let items =
-        db::list_archived(conn, namespace, limit.min(1000), offset).map_err(|e| e.to_string())?;
+    let items = db::list_archived(
+        conn,
+        namespace,
+        limit.min(crate::storage::LIST_MAX_LIMIT),
+        offset,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(json!({"archived": items, "count": items.len()}))
 }
 

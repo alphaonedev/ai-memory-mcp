@@ -5,6 +5,7 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
@@ -309,7 +310,9 @@ pub(crate) fn decorate_memory(
     };
     obj.insert(
         "score".to_string(),
-        json!((score * 1000.0).round() / 1000.0),
+        json!(
+            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round() / crate::SCORE_DISPLAY_ROUND_FACTOR
+        ),
     );
     if !verbose_provenance {
         return val;
@@ -540,7 +543,10 @@ pub fn decorate_memory_many(
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert(
                         "score".to_string(),
-                        json!((score * 1000.0).round() / 1000.0),
+                        json!(
+                            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                / crate::SCORE_DISPLAY_ROUND_FACTOR
+                        ),
                     );
                 }
                 val
@@ -557,7 +563,10 @@ pub fn decorate_memory_many(
             };
             obj.insert(
                 "score".to_string(),
-                json!((score * 1000.0).round() / 1000.0),
+                json!(
+                    (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                        / crate::SCORE_DISPLAY_ROUND_FACTOR
+                ),
             );
             obj.insert(
                 "confidence_tier".to_string(),
@@ -590,7 +599,7 @@ fn record_recall_observations(
     let mut candidates: Vec<observations::Candidate<'_>> = Vec::with_capacity(memories_json.len());
     let mut id_holders: Vec<&str> = Vec::with_capacity(memories_json.len());
     for (idx, m) in memories_json.iter().enumerate() {
-        if let Some(id) = m.get("id").and_then(Value::as_str) {
+        if let Some(id) = m.get(param_names::ID).and_then(Value::as_str) {
             id_holders.push(id);
             let score = m.get("score").and_then(Value::as_f64).unwrap_or(0.0);
             #[allow(clippy::cast_possible_wrap)]
@@ -955,7 +964,8 @@ pub fn handle_recall_dto(
         // Round blend_weight to 3 decimals — matches the score field
         // precision and keeps the wire shape stable regardless of f64
         // representation jitter.
-        let blend_weight = (telemetry.blend_weight_avg * 1000.0).round() / 1000.0;
+        let blend_weight = (telemetry.blend_weight_avg * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+            / crate::SCORE_DISPLAY_ROUND_FACTOR;
         let meta = RecallMeta {
             recall_mode: recall_mode.to_string(),
             reranker_used: reranker_used.to_string(),

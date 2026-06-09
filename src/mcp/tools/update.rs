@@ -5,6 +5,7 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{EditSource, Tier};
 use crate::storage::VersionConflict;
@@ -227,7 +228,7 @@ pub(super) fn handle_update(
             .map_err(|e| e.to_string())?;
         let mem_owner = existing
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let gate_payload = json!({

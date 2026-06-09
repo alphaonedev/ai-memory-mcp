@@ -3,6 +3,7 @@
 
 //! MCP `memory_replay` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::transcripts::replay::{ReplayEntry, replay_transcript_union};
 use crate::validate;
@@ -144,7 +145,7 @@ pub fn handle_replay(
     // substrate signature). Negative values are treated as `0`
     // (self-only) rather than rejected so a sloppy client doesn't
     // need to special-case the floor.
-    let depth: Option<u32> = match params.get("depth") {
+    let depth: Option<u32> = match params.get(param_names::DEPTH) {
         None | Some(Value::Null) => None,
         Some(v) => match v.as_i64() {
             Some(n) if n < 0 => Some(0),

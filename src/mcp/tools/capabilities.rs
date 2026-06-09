@@ -5,6 +5,7 @@
 
 use crate::config::{RerankerMode, ResolvedModels, TierConfig};
 use crate::db;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::reranker::BatchedReranker;
 use schemars::JsonSchema;
@@ -982,7 +983,10 @@ pub fn overlay_tool_payloads(
             tools
                 .iter()
                 .filter_map(|t| {
-                    let name = t.get("name").and_then(Value::as_str)?.to_string();
+                    let name = t
+                        .get(param_names::NAME)
+                        .and_then(Value::as_str)?
+                        .to_string();
                     let docs = t.get("docs").cloned();
                     let schema = t.get("inputSchema").cloned();
                     Some((name, (docs, schema)))
@@ -1001,7 +1005,7 @@ pub fn overlay_tool_payloads(
             let Some(tool_obj) = tool.as_object_mut() else {
                 continue;
             };
-            let Some(name) = tool_obj.get("name").and_then(Value::as_str) else {
+            let Some(name) = tool_obj.get(param_names::NAME).and_then(Value::as_str) else {
                 continue;
             };
             let Some((docs, schema)) = lookup.get(name) else {

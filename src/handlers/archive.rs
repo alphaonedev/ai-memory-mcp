@@ -46,7 +46,7 @@ pub struct ArchiveListQuery {
 
 #[allow(clippy::unnecessary_wraps)]
 fn default_archive_limit() -> Option<usize> {
-    Some(50)
+    Some(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
 }
 
 pub async fn list_archive(
@@ -83,7 +83,10 @@ pub async fn list_archive(
     // via the `as_any_for_postgres` hatch.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+        let limit = q
+            .limit
+            .unwrap_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+            .clamp(1, crate::storage::LIST_MAX_LIMIT);
         let offset = q.offset.unwrap_or(0);
         return match app
             .store
@@ -95,7 +98,10 @@ pub async fn list_archive(
         };
     }
 
-    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let limit = q
+        .limit
+        .unwrap_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+        .clamp(1, crate::storage::LIST_MAX_LIMIT);
     let offset = q.offset.unwrap_or(0);
     // PERF-1 (FX-3): wrap rusqlite scan in `db_op`. archived_memories
     // can carry hundreds of thousands of rows on long-running daemons;

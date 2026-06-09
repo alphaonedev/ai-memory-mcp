@@ -79,7 +79,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // justified: pure regression coverage that lifts the file back over
     // its 94% floor, zero new production surface. 16_400 = 16_370 + 30
     // headroom; far under the 1.5x cap.
-    ("src/storage/mod.rs", 16_400),
+    //
+    // 2026-06-09 — bumped 16_400 → 16_450 by the #1558 batch-1
+    // hardcoded-literal remediation: the shared list/page-size const
+    // family (LIST_DEFAULT_CAP / LIST_MAX_LIMIT / LIST_FALLBACK_LIMIT /
+    // ARCHIVE_DEFAULT_PAGE_LIMIT / PENDING_DEFAULT_PAGE_LIMIT /
+    // TAXONOMY_DEFAULT_LIMIT + doc comments) landed here as the SSOT
+    // both backends and the HTTP/MCP surfaces route through, pushing
+    // the file to 16_405. Growth is justified: it REPLACES scattered
+    // magic numbers across ~10 files with one named knob set per the
+    // operator's no-hardcoded-literals directive. 16_450 = 16_405 + 45
+    // headroom; far under the 1.5x cap.
+    ("src/storage/mod.rs", 16_450),
     ("src/mcp/mod.rs", 14_000),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations

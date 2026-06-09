@@ -431,7 +431,10 @@ async fn recall_response(
                             if let Some(obj) = v.as_object_mut() {
                                 obj.insert(
                                     "score".to_string(),
-                                    json!((*s * 1000.0).round() / 1000.0),
+                                    json!(
+                                        (*s * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                            / crate::SCORE_DISPLAY_ROUND_FACTOR
+                                    ),
                                 );
                             }
                             Some(v)
@@ -673,7 +676,10 @@ async fn recall_response(
                             if let Some(obj) = v.as_object_mut() {
                                 obj.insert(
                                     "score".to_string(),
-                                    json!((*s * 1000.0).round() / 1000.0),
+                                    json!(
+                                        (*s * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                            / crate::SCORE_DISPLAY_ROUND_FACTOR
+                                    ),
                                 );
                             }
                             Some(v)
