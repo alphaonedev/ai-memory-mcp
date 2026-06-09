@@ -1948,9 +1948,11 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
 pub fn apply_anonymize_default(app_config: &AppConfig) {
     // #198: config → env mapping for agent_id anonymization. Env var already
     // set by the caller wins; config is only applied when the env is unset.
-    if app_config.effective_anonymize_default() && std::env::var("AI_MEMORY_ANONYMIZE").is_err() {
+    if app_config.effective_anonymize_default()
+        && std::env::var(crate::identity::ENV_ANONYMIZE).is_err()
+    {
         // SAFETY: single-threaded startup before any worker threads spawn.
-        unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "1") };
+        unsafe { std::env::set_var(crate::identity::ENV_ANONYMIZE, "1") };
     }
 }
 
@@ -2794,7 +2796,7 @@ async fn build_store_handle(
     match store_url {
         Some(url) => {
             let lowered = url.to_ascii_lowercase();
-            if lowered.starts_with("postgres://") || lowered.starts_with("postgresql://") {
+            if crate::migrate::is_postgres_url(&lowered) {
                 #[cfg(feature = "sal-postgres")]
                 {
                     let timeout = postgres_statement_timeout_secs
@@ -2885,11 +2887,18 @@ async fn build_store_handle(
 /// `false` keeps the fail-CLOSED secure default. Shared by the storage
 /// pre-write hook and the wire-check hook so the two read the same
 /// override identically.
+/// Actor/queue label for wire-action governance consultations.
+const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
+
 fn governance_fail_open_on_error() -> bool {
-    std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+    std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
+
+/// #1455 legacy fail-open opt-out env var — one spelling shared by the
+/// reader above and the operator-facing log hints below (#1558).
+const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR";
 
 /// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
 /// where a governance hook's rule-consultation connection could not be
@@ -2944,14 +2953,14 @@ fn governance_consultation_unavailable_inner(
     if fail_open {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); \
-             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — degrading to ALLOW (UNSAFE, legacy posture)",
+             {ENV_GOVERNANCE_FAIL_OPEN}=1 — degrading to ALLOW (UNSAFE, legacy posture)",
             rules_db_path.display(),
         );
         Ok(())
     } else {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
-             (#1455 secure default — set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+             (#1455 secure default — set {ENV_GOVERNANCE_FAIL_OPEN}=1 to revert)",
             rules_db_path.display(),
         );
         Err(reason)
@@ -3400,7 +3409,7 @@ pub async fn bootstrap_serve(
                     // open. Same secure default + escape hatch.
                     return governance_consultation_unavailable(
                         &queue_for_wire_check,
-                        "daemon:wire_action",
+                        WIRE_ACTION_ACTOR,
                         action,
                         &rules_db_path,
                         "wire_check",
@@ -3420,7 +3429,7 @@ pub async fn bootstrap_serve(
                 match check_agent_action_deferred_cached(
                     conn_for_check,
                     Some(&cache_for_wire_check),
-                    "daemon:wire_action",
+                    WIRE_ACTION_ACTOR,
                     action,
                     &queue_for_wire_check,
                 ) {
@@ -3455,7 +3464,7 @@ pub async fn bootstrap_serve(
                             reason: reason.clone(),
                         };
                         queue_for_wire_check.submit_refusal(
-                            "daemon:wire_action",
+                            WIRE_ACTION_ACTOR,
                             action,
                             &synthetic_refusal,
                         );

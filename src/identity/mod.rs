@@ -78,10 +78,12 @@ const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 /// Environment variable opt-out for the hostname-revealing default (#198).
 /// When truthy (`1`, `true`, `yes`, `on`), the `host:<hostname>:pid-...`
 /// fallback is skipped and `anonymous:pid-...` is used instead.
+/// `pub` since #1558 so the daemon bootstrap (which maps the config
+/// flag onto this env var) shares the spelling.
 /// `AppConfig::effective_anonymize_default()` mirrors the same semantics
 /// from the config file, and CLI startup maps config → this env var so
 /// the downstream resolution stays env-only.
-const ENV_ANONYMIZE: &str = "AI_MEMORY_ANONYMIZE";
+pub const ENV_ANONYMIZE: &str = "AI_MEMORY_ANONYMIZE";
 
 /// Returns true when the hostname-revealing default should be suppressed.
 fn anonymize_default_enabled() -> bool {

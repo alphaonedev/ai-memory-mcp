@@ -245,11 +245,11 @@ pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn is_sqlite_url(url: &str) -> bool {
-    url.starts_with("sqlite://")
+    url.starts_with(crate::migrate::SQLITE_URL_SCHEME)
 }
 
 fn is_postgres_url(url: &str) -> bool {
-    url.starts_with("postgres://") || url.starts_with("postgresql://")
+    crate::migrate::is_postgres_url(url)
 }
 
 /// Strip the `sqlite://` prefix and the optional third slash so the

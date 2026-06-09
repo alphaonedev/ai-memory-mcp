@@ -2042,7 +2042,7 @@ fn handle_request(
             // response fields, so this is zero-risk on wire compat.
             let mut server_info = json!({
                 "name": "ai-memory",
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::PKG_VERSION,
             });
             let now_rfc3339 = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             if let Ok(Some(identity_block)) =
