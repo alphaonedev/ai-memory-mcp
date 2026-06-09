@@ -75,6 +75,10 @@ use serde::Serialize;
 use crate::cli::CliOutput;
 use crate::migrate;
 
+/// Tracing target for schema-init events (#1562 — was emitted as a
+/// field via `target = `; now the real metadata target).
+const TRACE_TARGET: &str = "schema_init";
+
 // ---------------------------------------------------------------------------
 // CLI arg surface
 // ---------------------------------------------------------------------------
@@ -538,7 +542,7 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                target = "schema_init",
+                target: TRACE_TARGET,
                 error = %e,
                 "acquire connection for AGE bootstrap"
             );
@@ -551,7 +555,7 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
         .await
     {
         tracing::warn!(
-            target = "schema_init",
+            target: TRACE_TARGET,
             error = %e,
             "set ag_catalog search_path"
         );
@@ -574,7 +578,7 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
                 true
             } else {
                 tracing::warn!(
-                    target = "schema_init",
+                    target: TRACE_TARGET,
                     error = %e,
                     "create_graph('memory_graph') failed (continuing without AGE projection)"
                 );

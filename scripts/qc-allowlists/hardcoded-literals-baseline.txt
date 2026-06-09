@@ -27,7 +27,6 @@
 4	{}/api/tags
 7	/api/v1/memories/abc-123
 5	/api/v1/namespaces/proj/standard
-3	/api/v1/sync/push
 3	application/json
 3	approval_requested
 5	approve rejected: {reason}
@@ -43,9 +42,7 @@
 17	attest_level
 3	autonomous
 4	auto_tag_model
-3	{base}/api/v1/sync/since?peer={local_id}
 4	begin AGE tx
-16	BEGIN IMMEDIATE
 9	budget_tokens
 4	by_namespace
 3	by_source_uri
@@ -128,7 +125,7 @@
 4	fts_classifier
 3	generated_at
 3	GOOGLE_API_KEY
-31	governance
+23	governance
 3	governance check failed
 3	governance error: {e}
 8	governance requires approval
@@ -263,8 +260,6 @@
 3	reranker_active
 4	resource_path
 3	rollback-log write failed: {e}
-3	schema_init
-74	schemars schema must serialize to Value
 14	schema_version
 3	scope_status
 5	SELECT COALESCE(MAX(version), 0) FROM schema_version
@@ -301,8 +296,6 @@
 18	standard_id
 3	{stem}.manifest.json
 41	storage_backend
-49	store::postgres
-3	store::postgres::kg
 4	subscription
 12	subscription_id
 7	subscriptions

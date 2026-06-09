@@ -117,7 +117,7 @@ pub(super) async fn catchup_once_with_store(
         // /api/v1/sync/since endpoint without recomputing peer config.
         let base = peer
             .sync_push_url
-            .trim_end_matches("/api/v1/sync/push")
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
 
         // Load our local vector-clock entry for this peer so we only pull
@@ -131,13 +131,7 @@ pub(super) async fn catchup_once_with_store(
             }
         };
 
-        let url = match since_opt.as_deref() {
-            Some(s) => format!(
-                "{base}/api/v1/sync/since?since={}&peer={local_id}",
-                urlencoding_encode(s)
-            ),
-            None => format!("{base}/api/v1/sync/since?peer={local_id}"),
-        };
+        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
 
         // v0.7.0 #239 — attach `x-peer-id` to the outbound /sync/since
         // GET so the peer's per-peer namespace allowlist can scope
@@ -168,7 +162,7 @@ pub(super) async fn catchup_once_with_store(
                 local_id.as_str(),
             );
         if let Some(ref key) = config.api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
@@ -318,7 +312,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
     for peer in &config.peers {
         let base = peer
             .sync_push_url
-            .trim_end_matches("/api/v1/sync/push")
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
 
         let since_opt: Option<String> = {
@@ -329,13 +323,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             }
         };
 
-        let url = match since_opt.as_deref() {
-            Some(s) => format!(
-                "{base}/api/v1/sync/since?since={}&peer={local_id}",
-                urlencoding_encode(s)
-            ),
-            None => format!("{base}/api/v1/sync/since?peer={local_id}"),
-        };
+        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
 
         // v0.7.0 #239 — attach `x-peer-id` so the peer's per-peer
         // namespace allowlist can scope the returned rows (sqlite
@@ -354,7 +342,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 local_id.as_str(),
             );
         if let Some(ref key) = config.api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
@@ -462,9 +450,9 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
     for peer in &config.peers {
         let base = peer
             .sync_push_url
-            .trim_end_matches("/api/v1/sync/push")
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
-        let url = format!("{base}/api/v1/sync/since?peer={local_id}");
+        let url = sync_since_url(&base, &local_id, None);
 
         let mut req = config
             .client
@@ -475,7 +463,7 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
                 local_id.as_str(),
             );
         if let Some(ref key) = config.api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
@@ -510,6 +498,25 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
             peer.id,
             memories.len(),
         );
+    }
+}
+
+/// Build the outbound `/api/v1/sync/since` catch-up URL for `base`
+/// (the peer base URL with the push suffix already trimmed): optional
+/// `since` vector-clock cursor + the local peer id. ONE builder so the
+/// three catch-up paths (store-backed, legacy, test harness) cannot
+/// drift on the query shape (#1558 batch 4).
+fn sync_since_url(base: &str, local_id: &str, since: Option<&str>) -> String {
+    match since {
+        Some(s) => format!(
+            "{base}{}?since={}&peer={local_id}",
+            crate::handlers::routes::SYNC_SINCE,
+            urlencoding_encode(s)
+        ),
+        None => format!(
+            "{base}{}?peer={local_id}",
+            crate::handlers::routes::SYNC_SINCE
+        ),
     }
 }
 

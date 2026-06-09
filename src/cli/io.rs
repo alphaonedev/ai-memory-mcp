@@ -346,12 +346,12 @@ pub fn mine(
         }
 
         if imported.is_multiple_of(100) && imported > 0 {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)?;
             conn.execute_batch("BEGIN")?;
         }
     }
 
-    conn.execute_batch("COMMIT")?;
+    conn.execute_batch(crate::storage::connection::SQL_COMMIT)?;
 
     if json_out {
         writeln!(

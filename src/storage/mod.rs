@@ -829,7 +829,7 @@ pub fn capture_turn_idempotent(
         });
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE")
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
@@ -860,7 +860,7 @@ pub fn capture_turn_idempotent(
 
     match tx_result {
         Ok(memory_id) => {
-            conn.execute_batch("COMMIT")
+            conn.execute_batch(connection::SQL_COMMIT)
                 .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
             Ok(crate::models::CaptureTurnResult {
                 memory_id,
@@ -868,7 +868,7 @@ pub fn capture_turn_idempotent(
             })
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -1105,7 +1105,7 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
     let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
     let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<()> {
         conn.execute(
@@ -1139,11 +1139,11 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(())
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in touch: {}", rb);
             }
             Err(e)
@@ -1183,7 +1183,7 @@ pub fn touch_many(
     let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
     let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<()> {
         // Cache the three prepared statements once for the whole
@@ -1219,11 +1219,11 @@ pub fn touch_many(
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(ids.len())
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in touch_many: {}", rb);
             }
             Err(e)
@@ -1702,7 +1702,7 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or("archive");
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
             .query_row(
@@ -1749,11 +1749,11 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
     })();
     match result {
         Ok(moved) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(moved)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -1788,7 +1788,7 @@ pub fn archive_memory_for_caller(
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or("archive");
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
         // inbox-target row whose recipient is the caller).
@@ -1841,11 +1841,11 @@ pub fn archive_memory_for_caller(
     })();
     match result {
         Ok(moved) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(moved)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -3856,7 +3856,7 @@ pub fn consolidate(
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<String> {
         // Verify all IDs exist and collect metadata in one pass
@@ -4011,11 +4011,11 @@ pub fn consolidate(
 
     match result {
         Ok(id) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(id)
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in consolidate: {}", rb);
             }
             Err(e)
@@ -5270,10 +5270,10 @@ pub fn invalidate_link(
     // signature) and the audit INSERT leaves H5's silent-supersession
     // state — the exact thing H5 was added to prevent. RESERVED-lock
     // semantics also serialise concurrent writers across processes.
-    conn.execute("BEGIN IMMEDIATE", [])?;
+    conn.execute(connection::SQL_BEGIN_IMMEDIATE, [])?;
     // From here on, every early return MUST `ROLLBACK` first.
     let rollback = || {
-        let _ = conn.execute("ROLLBACK", []);
+        let _ = conn.execute(connection::SQL_ROLLBACK, []);
     };
 
     // Pull the prior `valid_until` AND the signing surface so the
@@ -5406,7 +5406,7 @@ pub fn invalidate_link(
         }
     }
 
-    conn.execute("COMMIT", [])?;
+    conn.execute(connection::SQL_COMMIT, [])?;
     Ok(Some(InvalidateResult {
         valid_until: stamp,
         previous_valid_until: prior,
@@ -6148,7 +6148,7 @@ pub fn auto_purge_archive(conn: &Connection, max_days: Option<i64>) -> Result<us
 
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<usize> {
         if archive {
             // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
@@ -6183,7 +6183,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     })();
     match result {
         Ok(n) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             // Clean up namespace_meta rows pointing to deleted memories
             let _ = conn.execute(
                 "DELETE FROM namespace_meta WHERE standard_id NOT IN (SELECT id FROM memories)",
@@ -6192,7 +6192,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
             Ok(n)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -6286,7 +6286,7 @@ pub fn list_archived(
 
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
             .query_row(
@@ -6385,11 +6385,11 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     })();
     match result {
         Ok(v) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -6413,7 +6413,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 /// surface cannot be used to probe other owners' archived ids.
 pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
         // inbox-target row whose recipient is the caller, or be a
@@ -6514,11 +6514,11 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
     })();
     match result {
         Ok(v) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }

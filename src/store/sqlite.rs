@@ -546,7 +546,7 @@ impl MemoryStore for SqliteStore {
         // v0.7.0 #1079 — wrap the per-id decay-touch loop in a single
         // BEGIN/COMMIT pair so each id pays only the UPDATE cost.
         if crate::confidence::decay::decay_enabled() {
-            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE) {
                 tracing::warn!("decay-touch BEGIN failed: {e}");
             } else {
                 for id in ids {
@@ -554,9 +554,9 @@ impl MemoryStore for SqliteStore {
                         tracing::warn!("confidence decay touch failed for memory {id}: {e}");
                     }
                 }
-                if let Err(e) = conn.execute_batch("COMMIT") {
+                if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_COMMIT) {
                     tracing::warn!("decay-touch COMMIT failed: {e}");
-                    let _ = conn.execute_batch("ROLLBACK");
+                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
                 }
             }
         }

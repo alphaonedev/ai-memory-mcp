@@ -105,7 +105,7 @@ pub async fn get_capabilities(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
-                target = "capabilities",
+                target: "capabilities",
                 error = %e,
                 "schema_version lookup via SAL failed; reporting 0"
             );

@@ -176,7 +176,7 @@ pub(crate) fn http_caller_ctx(
         // handler can map to a 4xx) is tracked as a v0.7.1 follow-up
         // since it requires touching every call site.
         tracing::warn!(
-            target = "handlers::parity",
+            target: "handlers::parity",
             error = %e,
             "http_caller_ctx: invalid X-Agent-Id / body.agent_id, falling back to anonymous:invalid"
         );

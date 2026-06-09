@@ -821,7 +821,7 @@ pub async fn api_key_auth(
     }
 
     // Check X-API-Key header
-    if let Some(header_val) = req.headers().get("x-api-key")
+    if let Some(header_val) = req.headers().get(crate::HEADER_API_KEY)
         && let Ok(val) = header_val.to_str()
         && constant_time_eq(val.as_bytes(), expected.as_bytes())
     {

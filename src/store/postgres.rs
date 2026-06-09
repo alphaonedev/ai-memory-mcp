@@ -58,6 +58,15 @@ use super::{
     VerifyFilter, VerifyLinkReport, VerifyReport, is_visible_to_caller,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+
+/// Tracing target for postgres-SAL events. Pre-#1562 these were
+/// emitted as a FIELD (`target = `), which RUST_LOG target filtering
+/// cannot match; now the real metadata target via `target:`.
+const TRACE_TARGET: &str = "store::postgres";
+
+/// Tracing target for the postgres KG (Apache AGE) subsystem.
+const TRACE_TARGET_KG: &str = "store::postgres::kg";
+
 use crate::quotas::{QuotaStatus, quota_defaults};
 
 /// Bootstrap schema run at adapter init — idempotent via IF NOT EXISTS.
@@ -797,7 +806,7 @@ impl PostgresStore {
             && !(ver.starts_with("0.7") || ver.starts_with("0.8"))
         {
             tracing::warn!(
-                target = "store::postgres",
+                target: TRACE_TARGET,
                 version = %ver,
                 "pgvector version outside the tested range 0.7.x–0.8.x; HNSW recall may differ"
             );
@@ -827,7 +836,7 @@ impl PostgresStore {
             && typmod != expected_dim
         {
             tracing::warn!(
-                target = "store::postgres",
+                target: TRACE_TARGET,
                 dim = typmod,
                 expected = expected_dim,
                 "memories.embedding column dimension ({typmod}) does not match the requested embedder dim ({expected_dim}); run `ai-memory schema-init --store-url <url> --embedding-dim {expected_dim}` to convert in place"
@@ -842,7 +851,7 @@ impl PostgresStore {
         // handle via [`Self::kg_backend`] for J2-J7.
         let kg_backend = detect_kg_backend(&pool).await;
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             kg_backend = %kg_backend,
             "Postgres KG backend: {}",
             match kg_backend {
@@ -870,7 +879,7 @@ impl PostgresStore {
             && let Err(e) = ensure_memory_graph(&pool).await
         {
             tracing::warn!(
-                target = "store::postgres",
+                target: TRACE_TARGET,
                 error = %e,
                 "ensure memory_graph projection failed at connect; KG link projection will degrade silently"
             );
@@ -948,7 +957,7 @@ impl PostgresStore {
             Some(cur) if cur == target_i32 => Ok(store),
             _ => {
                 tracing::warn!(
-                    target = "store::postgres",
+                    target: TRACE_TARGET,
                     current = ?current,
                     target = target_i32,
                     "issue #877 auto-migrate: existing memories.embedding column dim disagrees \
@@ -1298,7 +1307,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v30 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v30 applied (memories_metadata_is_object CHECK)"
         );
         Ok(())
@@ -1338,7 +1347,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v31 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v31 applied (memories.reflection_depth column)"
         );
         Ok(())
@@ -1376,7 +1385,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v32 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v32 applied (memory_links.relation CHECK constraint)"
         );
         Ok(())
@@ -1480,7 +1489,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v33 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v33 applied (signed_events prev_hash + sequence chain)"
         );
         Ok(())
@@ -1511,7 +1520,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v34 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v34 applied (offloaded_blobs context-offload substrate)"
         );
         Ok(())
@@ -1556,7 +1565,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v35 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v35 applied (memories.atomised_into + atom_of columns; \
              memory_links.relation CHECK extended with derives_from)"
         );
@@ -1590,7 +1599,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v36 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v36 applied (persona-as-artifact entity_id + persona_version)"
         );
         Ok(())
@@ -1626,7 +1635,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v37 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v37 applied (form4 fact-provenance citations + source_uri + source_span)"
         );
         Ok(())
@@ -1662,7 +1671,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v38 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v38 applied (form5 auto-confidence + shadow-mode + calibration)"
         );
         Ok(())
@@ -1694,7 +1703,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v39 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v39 applied (signed_events_dlq dead-letter queue)"
         );
         Ok(())
@@ -1729,7 +1738,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v40 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v40 applied (cluster-G shadow retention + denormalised source + compound index)"
         );
         Ok(())
@@ -1768,7 +1777,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v41 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v41 applied (PERF-8 auto_persona mentioned_entity_id + partial index)"
         );
         Ok(())
@@ -1795,7 +1804,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v42 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v42 applied (Provenance Gap 1: memories.version)"
         );
         Ok(())
@@ -1824,7 +1833,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v43 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v43 applied (Provenance Gap 2: source_uri upgrade + backfill)"
         );
         Ok(())
@@ -1851,7 +1860,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v44 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v44 applied (Gap 3: recall_observations ledger)"
         );
         Ok(())
@@ -1878,7 +1887,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v45 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v45 applied (Provenance Gap 5: archive_reason indexes)"
         );
         Ok(())
@@ -1905,7 +1914,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v46 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v46 applied (#860: memory_links temporal + attest columns)"
         );
         Ok(())
@@ -1935,7 +1944,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v47 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v47 applied (#902: memory_links attest+signature atomic CHECK)"
         );
         Ok(())
@@ -1969,7 +1978,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v48 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v48 applied (#933: federation_push_dlq table)"
         );
         Ok(())
@@ -2015,7 +2024,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v49 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v49 applied (#1025: archived_memories full v0.7.0 column carry)"
         );
         Ok(())
@@ -2102,7 +2111,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v50 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v50 applied (#1156: agent_quotas per-namespace dimension)"
         );
         Ok(())
@@ -2136,7 +2145,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v51 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v51 applied (#1255: federation_nonce_cache lives in sqlite; no-op postgres DDL)"
         );
         Ok(())
@@ -2213,7 +2222,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v52 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v52 applied (#1389: transcript_line_dedup table + indexes for layered-capture idempotency)"
         );
         Ok(())
@@ -2260,7 +2269,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v53 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v53 applied (#1418: memories_au column-scope is sqlite-only; no-op postgres DDL)"
         );
         Ok(())
@@ -2308,7 +2317,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v54 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v54 applied (#1466: backfilled tier-default expiry on NULL-expiry mid/short rows)"
         );
         Ok(())
@@ -2352,7 +2361,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v55 migration", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v55 applied (#1476: sargable federation-catchup rewrite; existing memories_updated_at_idx DESC serves the range scan — no new postgres index)"
         );
         Ok(())
@@ -3075,7 +3084,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v29 stamp", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             "schema migration v29 stamped (operator-initiated vector(N) conversion available via ai-memory schema-init --embedding-dim)"
         );
         Ok(())
@@ -3145,7 +3154,7 @@ impl PostgresStore {
             && cur == target_i32
         {
             tracing::info!(
-                target = "store::postgres",
+                target: TRACE_TARGET,
                 dim = target_i32,
                 "v29 embedding-dim migration: column already vector({target_i32}); no-op"
             );
@@ -3153,7 +3162,7 @@ impl PostgresStore {
         }
 
         tracing::warn!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             current = ?current,
             target = target_i32,
             "v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; existing embeddings will be NULLed — operators MUST re-run embeddings after this conversion completes"
@@ -3235,7 +3244,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit v29 conversion", e))?;
 
         tracing::warn!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             target_dim = target_i32,
             "v29 embedding-dim migration committed; re-run embeddings (e.g. via memory_store with the matching embedder configured)"
         );
@@ -3291,7 +3300,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v23 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v23 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v23 applied");
         Ok(())
     }
 
@@ -3432,7 +3441,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v24 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v24 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v24 applied");
         Ok(())
     }
 
@@ -3490,7 +3499,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v17 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v17 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v17 applied");
         Ok(())
     }
 
@@ -3606,7 +3615,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v18 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v18 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v18 applied");
         Ok(())
     }
 
@@ -3646,7 +3655,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v19 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v19 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v19 applied");
         Ok(())
     }
 
@@ -3704,7 +3713,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v20 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v20 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v20 applied");
         Ok(())
     }
 
@@ -3752,7 +3761,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v21 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v21 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v21 applied");
         Ok(())
     }
 
@@ -3800,7 +3809,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v22 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v22 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v22 applied");
         Ok(())
     }
 
@@ -3841,7 +3850,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v25 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v25 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v25 applied");
         Ok(())
     }
 
@@ -3900,7 +3909,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v26 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v26 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v26 applied");
         Ok(())
     }
 
@@ -4000,7 +4009,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v27 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v27 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v27 applied");
         Ok(())
     }
 
@@ -4053,7 +4062,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v28 migration", e))?;
 
-        tracing::info!(target = "store::postgres", "schema migration v28 applied");
+        tracing::info!(target: TRACE_TARGET, "schema migration v28 applied");
         Ok(())
     }
 
@@ -4199,7 +4208,7 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit migration transaction", e))?;
 
         tracing::info!(
-            target = "store::postgres",
+            target: TRACE_TARGET,
             version = 15,
             "schema migration v15 applied"
         );
@@ -5735,7 +5744,7 @@ impl PostgresStore {
             {
                 if is_age_runtime_failure(&e) {
                     tracing::warn!(
-                        target = "store::postgres::kg",
+                        target: TRACE_TARGET_KG,
                         source_id = %link.source_id,
                         target_id = %link.target_id,
                         relation = link.relation.as_str(),
@@ -6647,7 +6656,7 @@ fn is_age_runtime_failure(err: &StoreError) -> bool {
 /// `docs/kg-backend-fallback.md`.
 fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
     tracing::warn!(
-        target = "store::postgres::kg",
+        target: TRACE_TARGET_KG,
         op = op,
         source_id = source_id,
         backend = "age",
@@ -6662,7 +6671,7 @@ fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
 /// needs both `source_id` and `target_id`.
 fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &StoreError) {
     tracing::warn!(
-        target = "store::postgres::kg",
+        target: TRACE_TARGET_KG,
         op = op,
         source_id = source_id,
         target_id = target_id,
@@ -7398,7 +7407,7 @@ pub(crate) async fn detect_kg_backend(pool: &PgPool) -> KgBackend {
         Ok(None) => KgBackend::Cte,
         Err(e) => {
             tracing::debug!(
-                target = "store::postgres",
+                target: TRACE_TARGET,
                 error = %e,
                 "AGE detection probe failed; defaulting to CTE backend"
             );

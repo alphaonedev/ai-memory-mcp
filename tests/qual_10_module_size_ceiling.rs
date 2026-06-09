@@ -168,7 +168,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #1549 — postgres SAL coverage for the recursive-learning surfaces
     // (reflect / get_reflection_origin / list_recall_observations trait
     // impls) added ~76 LOC of native-sqlx methods. Bumped in lockstep.
-    ("src/store/postgres.rs", 16_200),
+    //
+    // 2026-06-09 — bumped 16_200 → 16_250 by #1558 batch 4/5: the
+    // DEFAULT_LIST_CAP_I64/LIST_FALLBACK/ARCHIVED_LIST_FALLBACK/
+    // RECALL_FALLBACK const cluster + TRACE_TARGET/TRACE_TARGET_KG
+    // (#1562 target-syntax fix) + doc comments pushed the file to
+    // 16_206. Growth is justified: named knobs REPLACING scattered
+    // magic literals per the operator no-hardcoded-literals directive.
+    // 16_250 = 16_206 + 44 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 16_250),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /

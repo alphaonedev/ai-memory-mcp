@@ -1383,10 +1383,10 @@ fn send(
             "user-agent",
             format!("ai-memory/{}", env!("CARGO_PKG_VERSION")),
         )
-        .header("x-ai-memory-timestamp", timestamp)
+        .header(crate::HEADER_AI_MEMORY_TIMESTAMP, timestamp)
         .header("x-ai-memory-correlation-id", correlation_id);
     if let Some(sig) = signature {
-        req = req.header("x-ai-memory-signature", format!("sha256={sig}"));
+        req = req.header(crate::HEADER_AI_MEMORY_SIGNATURE, format!("sha256={sig}"));
     }
     let resp = match req.body(body.to_string()).send() {
         Ok(r) => r,
