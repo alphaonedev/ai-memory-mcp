@@ -42,11 +42,32 @@ impl McpTool for GetTool {
     }
 }
 
-pub(super) fn handle_get(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+/// Existence-hiding error returned both when the id resolves to no row and
+/// when the resolved row is not visible to the caller. Reusing one constant
+/// for both arms keeps the wire response byte-identical so `memory_get` cannot
+/// be used as a presence oracle for another tenant's `scope=private` rows
+/// (#1553 — matches the HTTP GET /memories/{id} 404-mask, `memories.rs`).
+pub(super) const NOT_FOUND_MSG: &str = "memory not found";
+
+pub(super) fn handle_get(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     match db::resolve_id(conn, id).map_err(|e| e.to_string())? {
         Some(mem) => {
+            // #1553 — scope=private visibility gate, parity with the sibling
+            // read tools (recall/list/search) and the HTTP GET-by-id path. A
+            // resolved-but-not-visible row is masked as not-found rather than
+            // 403'd so existence is not disclosed. `caller == None` is the
+            // single-tenant trust-all posture and is preserved unchanged.
+            if let Some(c) = caller {
+                if !crate::visibility::is_visible_to_caller(&mem, c) {
+                    return Err(NOT_FOUND_MSG.into());
+                }
+            }
             let links = db::get_links(conn, &mem.id).unwrap_or_default();
             // Flatten: merge memory fields with links at top level (#96)
             let mut val = serde_json::to_value(&mem).map_err(|e| e.to_string())?;
@@ -55,7 +76,7 @@ pub(super) fn handle_get(conn: &rusqlite::Connection, params: &Value) -> Result<
             }
             Ok(val)
         }
-        None => Err("memory not found".into()),
+        None => Err(NOT_FOUND_MSG.into()),
     }
 }
 
@@ -116,7 +137,7 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("hello");
         let id = db::insert(&conn, &mem).expect("insert");
-        let out = handle_get(&conn, &json!({"id": id})).expect("ok");
+        let out = handle_get(&conn, &json!({"id": id}), None).expect("ok");
         assert_eq!(out["title"].as_str(), Some("hello"));
         assert!(out["links"].is_array(), "links must be flattened in");
         assert_eq!(out["links"].as_array().unwrap().len(), 0);
@@ -131,7 +152,7 @@ mod tests {
         let a_id = db::insert(&conn, &a).expect("ins a");
         let b_id = db::insert(&conn, &b).expect("ins b");
         db::create_link(&conn, &a_id, &b_id, "related_to").expect("link");
-        let out = handle_get(&conn, &json!({"id": a_id})).expect("ok");
+        let out = handle_get(&conn, &json!({"id": a_id}), None).expect("ok");
         let links = out["links"].as_array().expect("links arr");
         assert_eq!(links.len(), 1);
     }
@@ -143,7 +164,7 @@ mod tests {
         let mut mem = make_mem("prefixed");
         mem.id = "01234567-aaaa-bbbb-cccc-ddddeeeeffff".to_string();
         let _ = db::insert(&conn, &mem).expect("insert");
-        let out = handle_get(&conn, &json!({"id": "01234567"})).expect("prefix resolve");
+        let out = handle_get(&conn, &json!({"id": "01234567"}), None).expect("prefix resolve");
         assert_eq!(out["id"].as_str(), Some(mem.id.as_str()));
     }
 
@@ -151,7 +172,7 @@ mod tests {
     #[test]
     fn missing_id_returns_error() {
         let conn = fresh_conn();
-        let err = handle_get(&conn, &json!({})).unwrap_err();
+        let err = handle_get(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("id is required"), "got: {err}");
     }
 
@@ -160,7 +181,7 @@ mod tests {
     fn invalid_id_format_returns_error() {
         let conn = fresh_conn();
         // bad chars (space, control) → validate_id rejects
-        let err = handle_get(&conn, &json!({"id": " "})).unwrap_err();
+        let err = handle_get(&conn, &json!({"id": " "}), None).unwrap_err();
         assert!(!err.is_empty(), "validation error expected, got empty");
     }
 
@@ -171,6 +192,7 @@ mod tests {
         let err = handle_get(
             &conn,
             &json!({"id": "11111111-2222-3333-4444-555555555555"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
@@ -182,10 +204,56 @@ mod tests {
         let conn = fresh_conn();
         let mem = make_mem("idem");
         let id = db::insert(&conn, &mem).expect("insert");
-        let one = handle_get(&conn, &json!({"id": &id})).expect("ok 1");
-        let two = handle_get(&conn, &json!({"id": &id})).expect("ok 2");
+        let one = handle_get(&conn, &json!({"id": &id}), None).expect("ok 1");
+        let two = handle_get(&conn, &json!({"id": &id}), None).expect("ok 2");
         assert_eq!(one["id"], two["id"]);
         assert_eq!(one["title"], two["title"]);
+    }
+
+    // #1553 — scope=private visibility gate (multi-tenant caller posture).
+    fn make_private_mem_owned_by(owner: &str, title: &str) -> Memory {
+        let mut m = make_mem(title);
+        m.metadata = json!({"agent_id": owner, "scope": "private"});
+        m
+    }
+
+    #[test]
+    fn caller_cannot_get_other_agents_private_row() {
+        let conn = fresh_conn();
+        let alice = make_private_mem_owned_by("alice", "alice-secret");
+        let id = db::insert(&conn, &alice).expect("insert");
+        // Bob (a different resolved caller) is masked with the not-found error.
+        let err = handle_get(&conn, &json!({"id": id}), Some("bob")).unwrap_err();
+        assert_eq!(err, NOT_FOUND_MSG, "must 404-mask, not 403 / not leak");
+    }
+
+    #[test]
+    fn caller_cannot_get_other_agents_private_row_by_prefix() {
+        let conn = fresh_conn();
+        let mut alice = make_private_mem_owned_by("alice", "alice-secret");
+        alice.id = "0a1b2c3d-aaaa-bbbb-cccc-ddddeeeeffff".to_string();
+        db::insert(&conn, &alice).expect("insert");
+        let err = handle_get(&conn, &json!({"id": "0a1b2c3d"}), Some("bob")).unwrap_err();
+        assert_eq!(err, NOT_FOUND_MSG, "prefix path must mask too");
+    }
+
+    #[test]
+    fn owner_can_get_their_own_private_row() {
+        let conn = fresh_conn();
+        let alice = make_private_mem_owned_by("alice", "alice-secret");
+        let id = db::insert(&conn, &alice).expect("insert");
+        let out = handle_get(&conn, &json!({"id": id}), Some("alice")).expect("owner reads own");
+        assert_eq!(out["title"].as_str(), Some("alice-secret"));
+    }
+
+    #[test]
+    fn none_caller_is_trust_all_unchanged() {
+        let conn = fresh_conn();
+        let alice = make_private_mem_owned_by("alice", "alice-secret");
+        let id = db::insert(&conn, &alice).expect("insert");
+        // Single-tenant (env unset → None) preserves the legacy trust-all read.
+        let out = handle_get(&conn, &json!({"id": id}), None).expect("trust-all read");
+        assert_eq!(out["title"].as_str(), Some("alice-secret"));
     }
 }
 

@@ -235,7 +235,11 @@ mod d1_3_984_tests {
 ///   "memories": [<MemoryRow>, ...]
 /// }
 
-pub fn handle_load_family(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+pub fn handle_load_family(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     use crate::profile::Family;
     use std::str::FromStr;
 
@@ -281,6 +285,20 @@ pub fn handle_load_family(conn: &rusqlite::Connection, params: &Value) -> Result
     let memories: Vec<Memory> = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
+
+    // #1555 — scope=private visibility post-filter, parity with the sibling
+    // read tools (list/search/recall) and applied through the canonical
+    // `is_visible_to_caller` predicate so the inbox / target_agent_id carve-out
+    // is honored (a naive `metadata.scope != 'private'` SQL clause would miss
+    // it). `caller == None` is the single-tenant trust-all posture (unchanged).
+    // `count` is recomputed from the filtered set so the wire count stays honest.
+    let memories: Vec<Memory> = match caller {
+        Some(c) => memories
+            .into_iter()
+            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
+            .collect(),
+        None => memories,
+    };
 
     Ok(json!({
         "family": family_name,
@@ -333,6 +351,7 @@ pub fn handle_smart_load(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let intent_raw = params["intent"].as_str().ok_or("intent is required")?;
     let intent = intent_raw.trim();
@@ -348,6 +367,7 @@ pub fn handle_smart_load(
             "fallback",
             intent,
             params,
+            caller,
         )?;
         return Ok(resp);
     }
@@ -382,7 +402,7 @@ pub fn handle_smart_load(
         None => kw_pick,
     };
 
-    forward_to_load_family(conn, family, score, source, intent, params)
+    forward_to_load_family(conn, family, score, source, intent, params, caller)
 }
 
 /// Build the `memory_smart_load` response by forwarding to
@@ -396,6 +416,7 @@ fn forward_to_load_family(
     source: &str,
     intent: &str,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let family_name = family.name();
     tracing::info!(
@@ -417,7 +438,7 @@ fn forward_to_load_family(
         forward["k"] = json!(k);
     }
 
-    let inner = handle_load_family(conn, &forward)?;
+    let inner = handle_load_family(conn, &forward, caller)?;
     let memories = inner.get("memories").cloned().unwrap_or_else(|| json!([]));
     let count = inner.get("count").cloned().unwrap_or_else(|| json!(0));
     let k = inner.get("k").cloned().unwrap_or_else(|| json!(20));

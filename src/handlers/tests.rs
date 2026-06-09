@@ -708,6 +708,62 @@ async fn http_sync_push_applies_and_advances_clock() {
 }
 
 #[tokio::test]
+async fn http_sync_push_links_over_cap_rejected_1556() {
+    // #1556 — `links` was the sole /sync/push subcollection missing the
+    // max_page_size cap, leaving an unbounded per-link insert+verify loop under
+    // the shared write Mutex (DoS). A body with > max_page_size links must be
+    // rejected with 400 BEFORE the lock is taken, like every sibling collection.
+    let state = test_state();
+    let app_state = test_app_state(state.clone());
+    let cap = app_state.max_page_size;
+    let app = Router::new()
+        .route("/api/v1/sync/push", axum_post(sync_push))
+        .with_state(app_state);
+    let link_created_at = Utc::now().to_rfc3339();
+    let over_cap: Vec<serde_json::Value> = (0..=cap)
+        .map(|i| {
+            serde_json::json!({
+                "source_id": format!("s{i}"),
+                "target_id": format!("t{i}"),
+                "relation": "related_to",
+                "created_at": link_created_at,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "sender_agent_id": "peer-alice",
+        "sender_clock": {"entries": {}},
+        "memories": [],
+        "links": over_cap,
+        "dry_run": false
+    });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/sync/push")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", "local-receiver")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("links per request"),
+        "expected links-cap rejection; got: {v}"
+    );
+}
+
+#[tokio::test]
 async fn http_sync_push_applies_archives() {
     // S29 — sync_push must accept an `archives` field and move matching
     // rows from `memories` to `archived_memories` via

@@ -504,6 +504,24 @@ pub async fn sync_push(
         )
             .into_response();
     }
+    // #1556 — `links` was the sole subcollection missing this cap. The link
+    // loop below does a synchronous insert (and an Ed25519 verify when the
+    // link carries signature+observed_by) per element while holding the shared
+    // write Mutex; without a bound a peer could send ~15-20k links per 2 MiB
+    // body (15-20x every sibling cap) to saturate the lock — the red-team #242
+    // DoS the other caps exist to prevent. Checked pre-lock like its siblings.
+    if body.links.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} links per request",
+                    app.max_page_size
+                )
+            })),
+        )
+            .into_response();
+    }
     // Receiver's local identity — default to the caller-supplied header,
     // fall back to the anonymous placeholder. Recorded in sync_state rows.
     let header_agent_id = headers

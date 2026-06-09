@@ -406,10 +406,24 @@ pub(super) fn handle_link(
 pub(super) fn handle_get_links(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"].as_str().ok_or("id is required")?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    let links = db::get_links(conn, id).map_err(|e| e.to_string())?;
+    // #1553 — visibility gate. `memory_get_links` is both an id-leak primitive
+    // (neighbor ids) and a relationship oracle for a row's existence. Resolve
+    // the anchor row and, in the multi-tenant posture, return the same empty
+    // shape an unknown id yields when the caller cannot see the anchor — so it
+    // cannot confirm a private row's existence or enumerate its neighbors.
+    // `caller == None` is the single-tenant trust-all posture (unchanged).
+    let resolved = db::resolve_id(conn, id).map_err(|e| e.to_string())?;
+    if let (Some(c), Some(mem)) = (caller, resolved.as_ref()) {
+        if !crate::visibility::is_visible_to_caller(mem, c) {
+            return Ok(json!({"links": [], "count": 0}));
+        }
+    }
+    let anchor = resolved.as_ref().map_or(id, |m| m.id.as_str());
+    let links = db::get_links(conn, anchor).map_err(|e| e.to_string())?;
     Ok(json!({"links": links, "count": links.len()}))
 }
 
@@ -657,7 +671,7 @@ mod tests {
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         db::create_link(&conn, &a, &b, "related_to").unwrap();
-        let out = handle_get_links(&conn, &json!({"id": a})).expect("ok");
+        let out = handle_get_links(&conn, &json!({"id": a}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
         let links = out["links"].as_array().unwrap();
         assert_eq!(links.len(), 1);
@@ -667,7 +681,7 @@ mod tests {
     #[test]
     fn handle_get_links_missing_id_errors() {
         let conn = fresh_conn();
-        let err = handle_get_links(&conn, &json!({})).unwrap_err();
+        let err = handle_get_links(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("id"));
     }
 
@@ -675,8 +689,38 @@ mod tests {
     #[test]
     fn handle_get_links_invalid_id_errors() {
         let conn = fresh_conn();
-        let err = handle_get_links(&conn, &json!({"id": ""})).unwrap_err();
+        let err = handle_get_links(&conn, &json!({"id": ""}), None).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    // #1553 — visibility gate: a caller who cannot see the anchor row gets the
+    // same empty shape an unknown id yields (no neighbor-id leak / existence oracle).
+    #[test]
+    fn handle_get_links_masks_other_agents_private_anchor() {
+        let conn = fresh_conn();
+        let (a, b) = insert_two(&conn);
+        db::create_link(&conn, &a, &b, "related_to").unwrap();
+        // Mark the anchor row `a` scope=private owned by alice.
+        conn.execute(
+            "UPDATE memories SET metadata = json_object('agent_id','alice','scope','private') WHERE id = ?1",
+            [&a],
+        )
+        .unwrap();
+        // Bob sees the empty shape; alice (owner) and None (trust-all) see the edge.
+        let bob = handle_get_links(&conn, &json!({"id": a}), Some("bob")).expect("ok");
+        assert_eq!(
+            bob["count"].as_u64(),
+            Some(0),
+            "neighbor ids must be hidden"
+        );
+        let alice = handle_get_links(&conn, &json!({"id": &a}), Some("alice")).expect("ok");
+        assert_eq!(alice["count"].as_u64(), Some(1), "owner still sees edges");
+        let trust_all = handle_get_links(&conn, &json!({"id": &a}), None).expect("ok");
+        assert_eq!(
+            trust_all["count"].as_u64(),
+            Some(1),
+            "single-tenant unchanged"
+        );
     }
 
     // parse_link_id — happy

@@ -88,8 +88,9 @@ fn load_family_returns_only_matching_family() {
     let _graph_id = seed_family_memory(&conn, "graph-mem", "ns-a", "graph", 5);
     let _power_id = seed_family_memory(&conn, "power-mem", "ns-a", "power", 5);
 
-    let resp: Value = handle_load_family(&conn, &json!({"family": "core", "namespace": "ns-a"}))
-        .expect("memory_load_family must succeed");
+    let resp: Value =
+        handle_load_family(&conn, &json!({"family": "core", "namespace": "ns-a"}), None)
+            .expect("memory_load_family must succeed");
 
     assert_eq!(resp["family"], "core");
     assert_eq!(resp["namespace"], "ns-a");
@@ -115,8 +116,9 @@ fn load_family_namespace_filter_narrows_result_set() {
     let here_id = seed_family_memory(&conn, "here-core", "ns-a", "core", 5);
     let _there_id = seed_family_memory(&conn, "there-core", "ns-b", "core", 5);
 
-    let resp: Value = handle_load_family(&conn, &json!({"family": "core", "namespace": "ns-a"}))
-        .expect("memory_load_family must succeed");
+    let resp: Value =
+        handle_load_family(&conn, &json!({"family": "core", "namespace": "ns-a"}), None)
+            .expect("memory_load_family must succeed");
 
     assert_eq!(
         resp["count"], 1,
@@ -126,8 +128,8 @@ fn load_family_namespace_filter_narrows_result_set() {
     assert_eq!(memories[0]["id"], here_id);
 
     // Without the namespace filter, both rows must come back.
-    let resp_all: Value =
-        handle_load_family(&conn, &json!({"family": "core"})).expect("must succeed without ns");
+    let resp_all: Value = handle_load_family(&conn, &json!({"family": "core"}), None)
+        .expect("must succeed without ns");
     assert_eq!(
         resp_all["count"], 2,
         "no-namespace must span all; got: {resp_all}"
@@ -147,7 +149,7 @@ fn load_family_orders_by_priority_then_recency_and_caps_k() {
     let _mid = seed_family_memory(&conn, "mid", "ns", "core", 5);
     let _hi = seed_family_memory(&conn, "hi", "ns", "core", 9);
 
-    let resp: Value = handle_load_family(&conn, &json!({"family": "core", "k": 2})).unwrap();
+    let resp: Value = handle_load_family(&conn, &json!({"family": "core", "k": 2}), None).unwrap();
     assert_eq!(resp["count"], 2, "k=2 must cap to two rows");
     let memories = resp["memories"].as_array().unwrap();
     assert_eq!(memories[0]["title"], "hi");
@@ -157,7 +159,8 @@ fn load_family_orders_by_priority_then_recency_and_caps_k() {
     // k clamps silently at 100 — passing 9999 is treated as 100, not an
     // error. We only have 3 rows so the count is 3 either way; the
     // payload's reported `k` is the clamped value.
-    let resp_big: Value = handle_load_family(&conn, &json!({"family": "core", "k": 9999})).unwrap();
+    let resp_big: Value =
+        handle_load_family(&conn, &json!({"family": "core", "k": 9999}), None).unwrap();
     assert_eq!(resp_big["k"], 100, "k must clamp to 100");
     assert_eq!(resp_big["count"], 3);
 }
@@ -169,7 +172,7 @@ fn load_family_orders_by_priority_then_recency_and_caps_k() {
 #[test]
 fn load_family_unknown_family_yields_diagnostic_error() {
     let conn = open_db();
-    let err = handle_load_family(&conn, &json!({"family": "xyz"})).unwrap_err();
+    let err = handle_load_family(&conn, &json!({"family": "xyz"}), None).unwrap_err();
     assert!(
         err.contains("xyz"),
         "diagnostic must echo the bad value; got: {err}"
@@ -190,7 +193,7 @@ fn load_family_unknown_family_yields_diagnostic_error() {
 #[test]
 fn load_family_missing_family_arg_errors() {
     let conn = open_db();
-    let err = handle_load_family(&conn, &json!({})).unwrap_err();
+    let err = handle_load_family(&conn, &json!({}), None).unwrap_err();
     assert!(
         err.contains("family"),
         "error must mention missing arg; got: {err}"

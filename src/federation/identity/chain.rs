@@ -86,6 +86,18 @@ pub enum ChainError {
     /// not-yet-valid, unknown/anchor issuer, bad subject key, unsupported
     /// version).
     Link(CredentialError),
+    /// #1554 — an intermediate signed a child whose `subject_agent_id` falls
+    /// OUTSIDE the namespace that intermediate is delegated to (e.g.
+    /// `region/nyc/ca` minting `region/sfo/node-1`). The key + name chain link,
+    /// but the parent has no authority to vouch for this subject. Enforcing
+    /// this inside `verify` (not as caller-optional policy) closes the
+    /// delegation-confinement bypass.
+    DelegationOutOfNamespace {
+        /// The child subject the parent had no authority to sign.
+        subject: String,
+        /// The namespace the issuing intermediate is confined to.
+        delegated_namespace: String,
+    },
 }
 
 impl ChainError {
@@ -97,6 +109,7 @@ impl ChainError {
             Self::ChainTooDeep { .. } => "chain_too_deep",
             Self::NameMismatch => "chain_name_mismatch",
             Self::DomainMismatch => "chain_domain_mismatch",
+            Self::DelegationOutOfNamespace { .. } => "chain_delegation_out_of_namespace",
             Self::Link(e) => e.tag(),
         }
     }
@@ -275,7 +288,38 @@ fn verify_link(
     }
     let parent_key: VerifyingKey = parent.subject_verifying_key()?;
     child.verify_against(&parent_key, now_unix)?;
+    // #1554 — delegation-namespace confinement. The name + key chain now
+    // links, but an intermediate may only vouch for subjects WITHIN the
+    // namespace it is delegated to. Enforcing this here (rather than leaving it
+    // as caller-optional policy) is what closes the cross-namespace
+    // identity-spoof: the only production caller never applied the check, so a
+    // `region/nyc/ca` intermediate could mint a leaf for `region/sfo/node-1`.
+    let delegated = delegated_namespace_of(&parent.subject_agent_id);
+    if !subject_in_delegated_namespace(&c.subject_agent_id, delegated) {
+        return Err(ChainError::DelegationOutOfNamespace {
+            subject: c.subject_agent_id.clone(),
+            delegated_namespace: delegated.to_string(),
+        });
+    }
     Ok(())
+}
+
+/// Suffix marking an intermediate-CA identity (e.g. `region/nyc/ca`). The
+/// namespace such an intermediate is delegated to is its `subject_agent_id`
+/// with this suffix stripped (`region/nyc`); a non-suffixed parent delegates
+/// only its own subtree. Centralised so the convention is not a scattered
+/// literal (pm-v3.1).
+pub const CA_MARKER_SUFFIX: &str = "/ca";
+
+/// Derive the namespace an intermediate is confined to from its
+/// `subject_agent_id`. `region/nyc/ca` → `region/nyc` (may sign `region/nyc/*`);
+/// a parent without the CA marker delegates only its own subtree
+/// (`subject_agent_id/*`). The root anchor is verified by the trust bundle, not
+/// this path, so it is unconstrained by design.
+fn delegated_namespace_of(parent_subject: &str) -> &str {
+    parent_subject
+        .strip_suffix(CA_MARKER_SUFFIX)
+        .unwrap_or(parent_subject)
 }
 
 /// Whether `subject_agent_id` falls within the namespace an intermediate CA
@@ -627,6 +671,91 @@ mod tests {
             .verify(&bundle, NOW, DEFAULT_MAX_CHAIN_DEPTH)
             .unwrap_err();
         assert_eq!(err, ChainError::NameMismatch);
+    }
+
+    #[test]
+    fn intermediate_minting_out_of_namespace_leaf_is_rejected() {
+        // #1554 — the core spoof: a region intermediate (or its compromise)
+        // mints a leaf for a subject OUTSIDE its delegated namespace. The name
+        // chain binds (leaf.issuer_id == intermediate.subject == region/nyc/ca)
+        // and the signature is valid, so only the delegation-namespace check
+        // can stop it. Pre-fix, `verify` returned Ok and the receiver trusted
+        // the attacker key for region/sfo/node-1.
+        // Fixtures bound once: the intermediate CA, the foreign subject it has
+        // no authority over, and the namespace it IS delegated to (= its id with
+        // the CA marker stripped — the value `delegated_namespace_of` derives).
+        let ca_id = "region/nyc/ca";
+        let foreign_subject = "region/sfo/node-1";
+        let expected_ns = ca_id.strip_suffix(CA_MARKER_SUFFIX).unwrap();
+
+        let root = signing_key(50);
+        let intermediate = signing_key(51);
+        let node = signing_key(52);
+        let inter_cert = mint(
+            &root,
+            "root",
+            ca_id,
+            &intermediate.verifying_key(),
+            DOMAIN,
+            NOW + 7200,
+        );
+        // ca_id vouches for a foreign-region subject — name binds (leaf.issuer_id
+        // == intermediate.subject), but the intermediate has no authority there.
+        let leaf = mint(
+            &intermediate,
+            ca_id,
+            foreign_subject,
+            &node.verifying_key(),
+            DOMAIN,
+            NOW + 3600,
+        );
+        let bundle = TrustBundle::new().with_issuer("root", root.verifying_key());
+        let err = CertChain::new(leaf, vec![inter_cert])
+            .verify(&bundle, NOW, DEFAULT_MAX_CHAIN_DEPTH)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ChainError::DelegationOutOfNamespace {
+                subject: foreign_subject.to_string(),
+                delegated_namespace: expected_ns.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn intermediate_minting_in_namespace_leaf_is_accepted() {
+        // #1554 positive case: a leaf WITHIN the intermediate's delegated
+        // namespace verifies, so the confinement check does not regress the
+        // legitimate hierarchical path.
+        let (bundle, inter_cert, leaf) = two_level_setup(); // region/nyc/ca → region/nyc/node-1
+        let verified = CertChain::new(leaf, vec![inter_cert])
+            .verify(&bundle, NOW, DEFAULT_MAX_CHAIN_DEPTH)
+            .expect("in-namespace leaf must verify");
+        assert_eq!(verified.subject_agent_id, "region/nyc/node-1");
+    }
+
+    #[test]
+    fn delegated_namespace_of_strips_ca_marker_else_self() {
+        // region/nyc/ca delegates region/nyc; a non-CA-marked parent delegates
+        // only its own subtree (its full subject).
+        let ca_id = format!("region/nyc{CA_MARKER_SUFFIX}");
+        assert_eq!(delegated_namespace_of(&ca_id), "region/nyc");
+        assert_eq!(delegated_namespace_of("region/nyc"), "region/nyc");
+        // A subject is within its own delegated namespace and its children's,
+        // but a sibling prefix is NOT (trailing-slash boundary).
+        let ns = delegated_namespace_of(&ca_id);
+        assert!(subject_in_delegated_namespace("region/nyc/node-1", ns));
+        assert!(!subject_in_delegated_namespace("region/nyceast/node-2", ns));
+        assert!(!subject_in_delegated_namespace("region/sfo/node-1", ns));
+    }
+
+    #[test]
+    fn delegation_violation_has_stable_tag() {
+        let err = ChainError::DelegationOutOfNamespace {
+            subject: "region/sfo/node-1".to_string(),
+            delegated_namespace: "region/nyc".to_string(),
+        };
+        assert_eq!(err.tag(), "chain_delegation_out_of_namespace");
     }
 
     #[test]
