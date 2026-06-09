@@ -22,11 +22,13 @@ pub(super) fn handle_auto_tag(
     params: &Value,
 ) -> Result<Value, String> {
     let llm = llm.ok_or("auto-tagging requires smart or autonomous tier (Ollama LLM)")?;
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let mem = db::get(conn, id)
         .map_err(|e| e.to_string())?
-        .ok_or("memory not found")?;
+        .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
     // COVERAGE: LLM response variability. The call below produces a
     // Vec<String> derived from the model's response; envelope is
     // tested at ≥95% via wiremock-driven success / error / shape

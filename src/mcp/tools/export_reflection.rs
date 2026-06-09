@@ -50,16 +50,16 @@ pub fn handle_export_reflection(
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or("memory_id is required")?;
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
     if memory_id.is_empty() {
-        return Err("memory_id cannot be empty".to_string());
+        return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
     let format_str = params["format"].as_str().unwrap_or("md");
     let format = parse_format_for_mcp(format_str)?;
 
     let mem = db::get(conn, memory_id)
         .map_err(|e| format!("memory_export_reflection substrate error: {e}"))?
-        .ok_or_else(|| format!("memory not found: {memory_id}"))?;
+        .ok_or_else(|| crate::errors::msg::memory_not_found(memory_id))?;
     if !matches!(mem.memory_kind, MemoryKind::Reflection) {
         return Err(format!("memory is not a reflection: {memory_id}"));
     }

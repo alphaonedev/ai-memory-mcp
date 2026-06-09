@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(code, 2);
         drop(out);
         let err = String::from_utf8(stderr).unwrap();
-        assert!(err.contains("skill not found"));
+        assert!(err.contains(crate::errors::msg::SKILL_NOT_FOUND));
     }
 
     #[test]

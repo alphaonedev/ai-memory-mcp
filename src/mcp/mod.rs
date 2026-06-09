@@ -2538,7 +2538,7 @@ pub fn run_embedding_backfill_with_batch_size(
                 chunk.len()
             );
             for (id, title, content) in chunk {
-                let text = format!("{title} {content}");
+                let text = crate::embeddings::embedding_document(title, content);
                 if let Ok(v) = emb.embed(&text)
                     && db::set_embedding(conn, id, &v).is_ok()
                 {

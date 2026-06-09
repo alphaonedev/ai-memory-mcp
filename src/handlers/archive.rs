@@ -115,14 +115,7 @@ pub async fn list_archive(
     .await;
     match result {
         Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -195,7 +188,7 @@ pub async fn restore_archive(
             }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "not found in archive"})),
+                Json(json!({"error": crate::errors::msg::NOT_FOUND_IN_ARCHIVE})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -226,18 +219,13 @@ pub async fn restore_archive(
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
     if !restored {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "not found in archive"})),
+            Json(json!({"error": crate::errors::msg::NOT_FOUND_IN_ARCHIVE})),
         )
             .into_response();
     }
@@ -362,14 +350,7 @@ pub async fn purge_archive(
             "owner_scope": if is_admin { "admin" } else { "caller" },
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -401,14 +382,7 @@ pub async fn archive_stats(
     let result = super::db_op(app.db.clone(), move |guard| db::archive_stats(&guard.0)).await;
     match result {
         Ok(archive_stats) => Json(archive_stats).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -564,7 +538,7 @@ pub async fn archive_by_ids(
                     tracing::error!("archive_by_ids: archive_memory({id}) failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }

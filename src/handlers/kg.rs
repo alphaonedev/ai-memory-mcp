@@ -89,7 +89,7 @@ pub async fn entity_register(
     if let Err(e) = validate::validate_namespace(&body.namespace) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid namespace: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
     }
@@ -110,7 +110,7 @@ pub async fn entity_register(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid agent_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
     }
@@ -196,7 +196,7 @@ pub async fn entity_register(
                         Json(json!({
                             "status": "pending",
                             "pending_id": pending_id,
-                            "reason": "governance requires approval",
+                            "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "store",
                             "namespace": body.namespace,
                             "storage_backend": "postgres",
@@ -274,12 +274,7 @@ pub async fn entity_register(
             if msg.contains("non-entity memory") {
                 return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }
@@ -314,7 +309,7 @@ pub async fn entity_get_by_alias(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid namespace: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
     }
@@ -486,14 +481,7 @@ pub async fn entity_get_by_alias(
             "aliases": [],
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -517,7 +505,7 @@ pub async fn kg_timeline(
     if let Err(e) = validate::validate_id(&p.source_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -598,7 +586,7 @@ pub async fn kg_timeline(
                         tracing::error!("kg_timeline: source lookup failed (postgres): {e:?}");
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": "internal server error"})),
+                            Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                         )
                             .into_response();
                     }
@@ -613,7 +601,7 @@ pub async fn kg_timeline(
                     tracing::error!("kg_timeline: source lookup failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }
@@ -629,7 +617,7 @@ pub async fn kg_timeline(
                     tracing::error!("kg_timeline: source lookup failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }
@@ -642,7 +630,7 @@ pub async fn kg_timeline(
             Json(json!({
                 "found": false,
                 "source_id": p.source_id,
-                "error": "source memory not found",
+                "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
             })),
         )
             .into_response();
@@ -661,7 +649,7 @@ pub async fn kg_timeline(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "caller does not own this source memory",
+                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
                 "owner": owner,
                 "caller": caller,
                 "source_id": p.source_id,
@@ -736,14 +724,7 @@ pub async fn kg_timeline(
             }))
             .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -832,7 +813,7 @@ pub async fn kg_invalidate(
                 tracing::error!("kg_invalidate: source lookup failed: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response();
             }
@@ -846,7 +827,7 @@ pub async fn kg_invalidate(
                 "source_id": body.source_id,
                 "target_id": body.target_id,
                 "relation": body.relation,
-                "error": "source memory not found",
+                "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
             })),
         )
             .into_response();
@@ -865,7 +846,7 @@ pub async fn kg_invalidate(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "caller does not own this source memory",
+                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
                 "owner": owner,
                 "caller": caller,
                 "source_id": body.source_id,
@@ -947,14 +928,7 @@ pub async fn kg_invalidate(
             })),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -997,7 +971,7 @@ pub async fn kg_find_paths(
     if let Err(e) = validate::validate_id(&body.source_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -1021,7 +995,7 @@ pub async fn kg_find_paths(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -1194,7 +1168,7 @@ pub async fn kg_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -1215,7 +1189,7 @@ pub async fn kg_query(
     if let Err(e) = validate::validate_id(&source_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -1421,12 +1395,7 @@ pub async fn kg_query(
                 )
                     .into_response();
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }

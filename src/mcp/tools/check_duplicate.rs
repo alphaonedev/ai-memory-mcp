@@ -16,8 +16,12 @@ pub fn handle_check_duplicate(
     params: &Value,
     embedder: Option<&dyn Embed>,
 ) -> Result<Value, String> {
-    let title = params["title"].as_str().ok_or("title is required")?;
-    let content = params["content"].as_str().ok_or("content is required")?;
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
+    let content = params["content"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
     let namespace = params["namespace"]
         .as_str()
         .map(str::trim)
@@ -38,7 +42,7 @@ pub fn handle_check_duplicate(
 
     let emb = embedder
         .ok_or("memory_check_duplicate requires the embedder; enable semantic tier or above")?;
-    let text = format!("{title} {content}");
+    let text = crate::embeddings::embedding_document(title, content);
     let query_embedding = emb.embed(&text).map_err(|e| e.to_string())?;
 
     // Round-2 F18 — short-circuit on raw-content hash equality before

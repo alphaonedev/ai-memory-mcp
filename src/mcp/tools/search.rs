@@ -127,7 +127,7 @@ pub(super) fn handle_search(
             let results = filter_visible(results, caller);
             return Ok(json!({"results": results, "count": results.len()}));
         }
-        return Err("query is required".into());
+        return Err(crate::errors::msg::QUERY_REQUIRED.into());
     }
 
     let results = db::search_with_source_uri(

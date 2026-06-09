@@ -547,7 +547,7 @@ impl CrossEncoder {
         content: &str,
     ) -> Result<f32> {
         // Cross-encoder input: "[CLS] query [SEP] title content [SEP]"
-        let document = format!("{title} {content}");
+        let document = crate::embeddings::embedding_document(title, content);
 
         let encoding = tokenizer
             .encode((query, document.as_str()), true)
@@ -797,7 +797,7 @@ impl CrossEncoder {
         let mut pairs: Vec<(&str, String)> = Vec::new();
         for (q, cands) in queries {
             for (mem, _) in cands {
-                let document = format!("{} {}", mem.title, mem.content);
+                let document = crate::embeddings::embedding_document(&mem.title, &mem.content);
                 pairs.push((q.as_str(), document));
             }
         }

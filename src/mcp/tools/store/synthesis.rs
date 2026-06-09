@@ -313,7 +313,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
             }
         };
         if content_changed && let Some(emb) = embedder {
-            let text = format!("{} {}", target.title, merged_content);
+            let text = crate::embeddings::embedding_document(&target.title, &merged_content);
             if let Ok(embedding) = emb.embed(&text) {
                 let _ = db::set_embedding(conn, cand_id, &embedding);
                 if let Some(idx) = vector_index {

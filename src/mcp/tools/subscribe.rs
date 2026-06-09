@@ -182,7 +182,9 @@ pub fn handle_unsubscribe(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     // Cross-tenant authorization (#870, security-high, 2026-05-18):
     // scope the DELETE to the caller's resolved agent_id. Without this
     // any tenant could enumerate ids (via lucky guess or by exfiltrating

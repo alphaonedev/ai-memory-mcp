@@ -81,7 +81,9 @@ pub(super) fn handle_promote(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // Resolve prefix if exact ID not found; capture the memory so governance
     // has owner context (Task 1.9).
@@ -90,7 +92,7 @@ pub(super) fn handle_promote(
     } else if let Some(m) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
         m
     } else {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
     let resolved_id = target.id.clone();
     // P5 (G9): snapshot fields needed for the post-success webhook.
@@ -140,7 +142,7 @@ pub(super) fn handle_promote(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "promote",
                     "memory_id": resolved_id,
                 }));
@@ -246,7 +248,7 @@ pub(super) fn handle_promote(
     )
     .map_err(|e| e.to_string())?;
     if !found {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
     // P5 (G9): fire `memory_promote` webhook for the default tier-upgrade
     // path AFTER the update commits. The webhook `tier` field reflects

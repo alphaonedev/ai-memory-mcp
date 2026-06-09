@@ -103,10 +103,15 @@ pub(super) fn parse_and_build_memory(
     use crate::models::{ConfidenceSource, Memory, Tier};
     use crate::{db, validate};
 
-    let title = params["title"].as_str().ok_or("title is required")?;
-    let content = params["content"].as_str().ok_or("content is required")?;
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
+    let content = params["content"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"]
         .as_str()
         .unwrap_or(crate::DEFAULT_NAMESPACE)

@@ -114,14 +114,15 @@ pub(crate) fn parse_reflect_input(
     }
     let title = params["title"]
         .as_str()
-        .ok_or("title is required")?
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?
         .to_string();
     let content = params["content"]
         .as_str()
-        .ok_or("content is required")?
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
     let confidence = params["confidence"].as_f64().unwrap_or(1.0);
@@ -206,14 +207,15 @@ pub fn handle_reflect(
     }
     let title = params["title"]
         .as_str()
-        .ok_or("title is required")?
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?
         .to_string();
     let content = params["content"]
         .as_str()
-        .ok_or("content is required")?
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
     let confidence = params["confidence"].as_f64().unwrap_or(1.0);
@@ -459,7 +461,7 @@ pub fn handle_reflect(
     // semantic recall can find it. Failure is logged, not fatal — the
     // memory is already committed.
     if let Some(emb) = embedder {
-        let text = format!("{title} {content}");
+        let text = crate::embeddings::embedding_document(title, content);
         match emb.embed(&text) {
             Ok(embedding) => {
                 if let Err(e) = db::set_embedding(conn, &outcome.id, &embedding) {

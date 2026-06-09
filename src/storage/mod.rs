@@ -1861,7 +1861,7 @@ pub fn forget_count(
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "at least one of namespace, pattern, or tier is required".to_string(),
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
         }));
     }
     if let Some(pat) = pattern {
@@ -1901,7 +1901,7 @@ pub fn forget(
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "at least one of namespace, pattern, or tier is required".to_string(),
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
         }));
     }
 
@@ -4578,7 +4578,7 @@ pub fn check_duplicate(
 /// similarity from saturating at 1.0.
 ///
 /// The input is the *exact* text the MCP/HTTP layer hands to the
-/// embedder — `format!("{title} {content}")` — and we hash its raw
+/// embedder — `crate::embeddings::embedding_document(title, content)` — and we hash its raw
 /// UTF-8 bytes with no normalization. Lower-casing or whitespace
 /// stripping at this layer would re-introduce the very ambiguity we
 /// are trying to short-circuit (two semantically-identical strings
@@ -4799,7 +4799,7 @@ pub fn proactive_conflict_check(
 /// candidate via an index — flagged for a separate migration PR.
 ///
 /// `query_text` MUST be the exact string used to produce
-/// `query_embedding` (typically `format!("{title} {content}")`).
+/// `query_embedding` (typically `crate::embeddings::embedding_document(title, content)`).
 /// Passing a different string is not a correctness bug — the function
 /// just falls through to the embedding-similarity path — but it
 /// defeats the point of the short-circuit.
@@ -4851,12 +4851,12 @@ pub fn check_duplicate_with_text(
     };
 
     // Phase 1 — SHA-256 exact-match short-circuit. We hash the same
-    // `format!("{title} {content}")` shape the MCP/HTTP layers use to
+    // `crate::embeddings::embedding_document(title, content)` shape the MCP/HTTP layers use to
     // build the embedding text so an identical store-then-check sequence
     // surfaces as similarity=1.0 even when the embedding pipeline would
     // otherwise cap at ~0.92 due to prefix asymmetry.
     for (id, title, ns, content) in &rows {
-        let row_text = format!("{title} {content}");
+        let row_text = crate::embeddings::embedding_document(title, content);
         let row_hash = canonical_content_hash(&row_text);
         if row_hash == query_hash {
             return Ok(DuplicateCheck {
@@ -5474,7 +5474,7 @@ pub fn kg_query(
     if max_depth == 0 {
         // #962 typed envelope.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "max_depth must be >= 1".to_string(),
+            reason: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
         }));
     }
     if max_depth > KG_QUERY_MAX_SUPPORTED_DEPTH {
@@ -5702,7 +5702,7 @@ pub fn find_paths(
     if depth == 0 {
         // #962 typed envelope.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "max_depth must be >= 1".to_string(),
+            reason: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
         }));
     }
     if depth > FIND_PATHS_MAX_DEPTH {
@@ -6559,7 +6559,7 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
         Some(days) if days < 0 => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                reason: format!("older_than_days must be non-negative (got {days})"),
+                reason: crate::errors::msg::older_than_days_negative(days),
             }));
         }
         Some(days) => {
@@ -6607,7 +6607,7 @@ pub fn purge_archive_for_caller(
         Some(days) if days < 0 => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                reason: format!("older_than_days must be non-negative (got {days})"),
+                reason: crate::errors::msg::older_than_days_negative(days),
             }));
         }
         Some(days) => {
@@ -9339,9 +9339,9 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
 ) -> Result<ApproveOutcome> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
-        return Ok(ApproveOutcome::Rejected(format!(
-            "pending action not found: {pending_id}"
-        )));
+        return Ok(ApproveOutcome::Rejected(
+            crate::errors::msg::pending_action_not_found(pending_id),
+        ));
     };
     if pa.status != "pending" {
         return Ok(ApproveOutcome::Rejected(format!(
@@ -9362,7 +9362,9 @@ pub fn approve_with_approver_type(
             if ok {
                 Ok(ApproveOutcome::Approved)
             } else {
-                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+                Ok(ApproveOutcome::Rejected(
+                    crate::errors::msg::DECISION_WRITE_FAILED.into(),
+                ))
             }
         }
         ApproverType::Agent(required) => {
@@ -9375,7 +9377,9 @@ pub fn approve_with_approver_type(
             if ok {
                 Ok(ApproveOutcome::Approved)
             } else {
-                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+                Ok(ApproveOutcome::Rejected(
+                    crate::errors::msg::DECISION_WRITE_FAILED.into(),
+                ))
             }
         }
         ApproverType::Consensus(quorum) => {

@@ -101,7 +101,7 @@ fn resolve_create_agent_id(
     let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid agent_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response()
     })?;
@@ -110,7 +110,7 @@ fn resolve_create_agent_id(
     {
         return Err((
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response());
     }
@@ -164,7 +164,7 @@ fn embed_create_before_lock(
     title: &str,
     content: &str,
 ) -> (Option<Vec<f32>>, EmbedStatus) {
-    let embedding_text = format!("{title} {content}");
+    let embedding_text = crate::embeddings::embedding_document(title, content);
     match app.embedder.as_ref().as_ref() {
         None => (None, EmbedStatus::Indexed),
         Some(emb) => emb.embed_with_status(&embedding_text),
@@ -342,21 +342,14 @@ async fn enforce_create_governance<'a>(
                 Json(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "store",
                     "namespace": namespace,
                 })),
             )
                 .into_response())
         }
-        Err(e) => {
-            tracing::error!("governance error: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "governance check failed"})),
-            )
-                .into_response())
-        }
+        Err(e) => Err(crate::handlers::errors::governance_error_500(&e)),
     }
 }
 
@@ -496,11 +489,7 @@ fn insert_create_with_quota(
                 if let Err(re) =
                     crate::quotas::refund_op(&lock.0, &quota_agent_id, &mem.namespace, quota_op)
                 {
-                    tracing::warn!(
-                        "quota refund_op failed for agent {}: {}",
-                        &quota_agent_id,
-                        re
-                    );
+                    crate::quotas::log_refund_op_failed(&quota_agent_id, &re);
                 }
             }
             // v0.7.0 L1-6 Deliverable E — surface the substrate
@@ -533,12 +522,7 @@ fn insert_create_with_quota(
                 )
                     .into_response());
             }
-            tracing::error!("handler error: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response())
+            Err(crate::handlers::errors::handler_error_500(&e))
         }
     }
 }
@@ -809,7 +793,7 @@ async fn create_memory_postgres(
     // before the SAL store so the postgres `embedding` column lands
     // populated; otherwise `recall_hybrid` filters every row out via
     // `WHERE embedding IS NOT NULL`.
-    let embedding_text = format!("{} {}", mem.title, mem.content);
+    let embedding_text = crate::embeddings::embedding_document(&mem.title, &mem.content);
     let embedding: Option<Vec<f32>> = match app.embedder.as_ref().as_ref() {
         None => None,
         Some(emb) => emb.embed(&embedding_text).ok(),

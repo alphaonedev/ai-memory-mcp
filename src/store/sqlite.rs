@@ -642,7 +642,7 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<usize> {
         if namespace.is_none() && pattern.is_none() && tier.is_none() {
             return Err(StoreError::InvalidInput {
-                detail: "at least one of namespace, pattern, or tier is required".to_string(),
+                detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
             });
         }
         let conn = self.state.lock().await;
@@ -879,7 +879,7 @@ impl MemoryStore for SqliteStore {
         // honors the same convention so the wire shape is stable.
         if filter.source_id.is_none() && filter.link_id.is_none() {
             return Err(StoreError::InvalidInput {
-                detail: "verify_link requires either source_id or link_id".to_string(),
+                detail: crate::errors::msg::VERIFY_LINK_ARGS_REQUIRED.to_string(),
             });
         }
 
@@ -1036,7 +1036,7 @@ impl MemoryStore for SqliteStore {
                     match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
                         Ok(()) => true,
                         Err(e) => {
-                            findings.push(format!("signature verify failed: {e}"));
+                            findings.push(crate::errors::msg::signature_verify_failed(e));
                             false
                         }
                     }

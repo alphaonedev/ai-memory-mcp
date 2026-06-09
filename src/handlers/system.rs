@@ -149,7 +149,7 @@ pub async fn get_capabilities(
             tracing::error!("capabilities: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }

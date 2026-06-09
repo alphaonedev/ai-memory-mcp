@@ -30,11 +30,13 @@ pub(super) fn handle_archive_restore(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     crate::validate::validate_id(id).map_err(|e| e.to_string())?;
     let restored = db::restore_archived(conn, id).map_err(|e| e.to_string())?;
     if !restored {
-        return Err("not found in archive".into());
+        return Err(crate::errors::msg::NOT_FOUND_IN_ARCHIVE.into());
     }
     Ok(json!({"restored": true, "id": id}))
 }

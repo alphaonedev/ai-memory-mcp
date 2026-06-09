@@ -127,7 +127,7 @@ pub fn enforce(
                 let mut payload_obj = serde_json::json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": action.as_str(),
                     "namespace": namespace,
                 });

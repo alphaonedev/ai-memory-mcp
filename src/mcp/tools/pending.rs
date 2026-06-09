@@ -300,7 +300,9 @@ pub fn handle_pending_approve(
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     use crate::db::ApproveOutcome;
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;
@@ -343,9 +345,9 @@ pub fn handle_pending_approve(
             "id": id,
             "votes": votes,
             "quorum": quorum,
-            "reason": "consensus threshold not yet reached",
+            "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
         })),
-        ApproveOutcome::Rejected(reason) => Err(format!("approve rejected: {reason}")),
+        ApproveOutcome::Rejected(reason) => Err(crate::errors::msg::approve_rejected(reason)),
     }
 }
 
@@ -701,7 +703,9 @@ pub fn handle_pending_reject(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;

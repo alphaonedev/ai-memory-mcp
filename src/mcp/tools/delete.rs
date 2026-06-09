@@ -73,7 +73,9 @@ pub(super) fn handle_delete(
     vector_index: Option<&VectorIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
@@ -101,7 +103,7 @@ pub(super) fn handle_delete(
         db::get_by_prefix(conn, id).map_err(|e| e.to_string())?
     };
     let Some(target) = target else {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
 
     // P5 (G9): snapshot fields the dispatcher needs BEFORE delete frees
@@ -184,7 +186,7 @@ pub(super) fn handle_delete(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "delete",
                     "memory_id": target.id,
                 }));
@@ -233,7 +235,7 @@ pub(super) fn handle_delete(
         );
         Ok(json!({"deleted": true}))
     } else {
-        Err("memory not found".into())
+        Err(crate::errors::msg::MEMORY_NOT_FOUND.into())
     }
 }
 

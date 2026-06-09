@@ -50,7 +50,7 @@ pub fn handle_offload(
     let content = params
         .get(param_names::CONTENT)
         .and_then(Value::as_str)
-        .ok_or("content is required")?;
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
     let namespace = resolve_namespace(params);
     let ttl_seconds = params.get(param_names::TTL_SECONDS).and_then(Value::as_u64);
 

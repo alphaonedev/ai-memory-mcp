@@ -189,9 +189,7 @@ pub fn run_autonomy_passes(
         match consolidate_cluster(conn, llm, &cluster, dry_run) {
             Ok(Some(entry)) => {
                 if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report
-                        .errors
-                        .push(format!("rollback-log write failed: {e}"));
+                    report.errors.push(rollback_log_write_failed(&e));
                 } else {
                     report.rollback_entries_written += 1;
                 }
@@ -209,9 +207,7 @@ pub fn run_autonomy_passes(
         match forget_if_superseded(conn, mem, candidates, dry_run) {
             Ok(Some(entry)) => {
                 if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report
-                        .errors
-                        .push(format!("rollback-log write failed: {e}"));
+                    report.errors.push(rollback_log_write_failed(&e));
                 } else {
                     report.rollback_entries_written += 1;
                 }
@@ -228,9 +224,7 @@ pub fn run_autonomy_passes(
         match apply_priority_feedback(conn, mem, dry_run) {
             Ok(Some(entry)) => {
                 if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report
-                        .errors
-                        .push(format!("rollback-log write failed: {e}"));
+                    report.errors.push(rollback_log_write_failed(&e));
                 } else {
                     report.rollback_entries_written += 1;
                 }
@@ -541,6 +535,13 @@ fn apply_priority_feedback(
         before,
         after,
     }))
+}
+
+/// #1558 batch 5 wave 2 — canonical `"rollback-log write failed: {e}"`
+/// report-error line shared by the three [`persist_rollback_entry`]
+/// failure sites in the autonomy passes. Byte-identical message.
+fn rollback_log_write_failed(e: &dyn std::fmt::Display) -> String {
+    format!("rollback-log write failed: {e}")
 }
 
 fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()> {

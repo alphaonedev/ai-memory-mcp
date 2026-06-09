@@ -11,6 +11,24 @@ use tokenizers::Tokenizer;
 
 use crate::config::EmbeddingModel;
 
+/// #1558 batch 5 wave 2 — the canonical embedding/rerank document
+/// template: `"{title} {content}"`.
+///
+/// LOAD-BEARING: every surface that embeds a memory (store / update /
+/// dedup-check / reflect / federation refresh / backfill) and the
+/// cross-encoder reranker must build the document text with this exact
+/// template — a drifted spelling at any one site would silently skew
+/// similarity scores between write-time vectors and query-time
+/// comparisons. One definition; byte-identical to the prior inline
+/// `format!` at every routed site.
+#[must_use]
+pub fn embedding_document(
+    title: impl std::fmt::Display,
+    content: impl std::fmt::Display,
+) -> String {
+    format!("{title} {content}")
+}
+
 const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 #[allow(dead_code)]
 const MINILM_DIM: usize = 384;

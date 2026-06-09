@@ -93,7 +93,7 @@ pub async fn verify_link_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "verify_link requires either source_id or link_id",
+                "error": crate::errors::msg::VERIFY_LINK_ARGS_REQUIRED,
                 "fields": ["source_id", "link_id"],
             })),
         )
@@ -104,7 +104,7 @@ pub async fn verify_link_handler(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -465,7 +465,7 @@ pub async fn create_link(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "source memory not found", "source_id": source_id})),
+                Json(json!({"error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND, "source_id": source_id})),
             )
                 .into_response();
         }
@@ -473,7 +473,7 @@ pub async fn create_link(
             tracing::error!("create_link: source lookup failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -501,7 +501,7 @@ pub async fn create_link(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "caller does not own this source memory",
+                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
                 "owner": source_owner,
                 "caller": caller,
                 "source_id": source_id,
@@ -636,12 +636,7 @@ pub async fn create_link(
                     _ => {}
                 }
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }
@@ -737,7 +732,7 @@ pub async fn delete_link(
             tracing::error!("delete_link: source lookup failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -752,14 +747,7 @@ pub async fn delete_link(
             drop(lock);
             return match delete_result {
                 Ok(removed) => Json(json!({"deleted": removed})).into_response(),
-                Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response()
-                }
+                Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
         }
     };
@@ -810,14 +798,7 @@ pub async fn delete_link(
     drop(lock);
     match delete_result {
         Ok(removed) => Json(json!({"deleted": removed})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -972,13 +953,6 @@ pub async fn get_links(
             };
             Json(json!({"links": visible})).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

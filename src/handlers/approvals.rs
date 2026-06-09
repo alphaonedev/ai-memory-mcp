@@ -216,7 +216,7 @@ pub async fn approval_decide(
     if let Err(status) = verify_approval_hmac(&headers, &body_bytes, "POST", &id) {
         return (
             status,
-            Json(json!({"error": "invalid or missing X-AI-Memory-Signature"})),
+            Json(json!({"error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE})),
         )
             .into_response();
     }
@@ -245,7 +245,7 @@ pub async fn approval_decide(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -312,17 +312,12 @@ pub async fn approval_decide(
                 Ok(crate::db::ApproveOutcome::Rejected(reason)) => {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(json!({"error": format!("approve rejected: {reason}")})),
+                        Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
                     )
                         .into_response();
                 }
                 Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response();
+                    return crate::handlers::errors::handler_error_500(&e);
                 }
             }
         }
@@ -337,17 +332,12 @@ pub async fn approval_decide(
                 Ok(false) => {
                     return (
                         StatusCode::NOT_FOUND,
-                        Json(json!({"error": "pending action not found or already decided"})),
+                        Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
                     )
                         .into_response();
                 }
                 Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response();
+                    return crate::handlers::errors::handler_error_500(&e);
                 }
             }
         }

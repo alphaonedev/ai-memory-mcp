@@ -701,7 +701,10 @@ pub async fn sync_push(
         match db::insert_if_newer(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
-                embedding_refresh.push((actual_id, format!("{} {}", mem.title, mem.content)));
+                embedding_refresh.push((
+                    actual_id,
+                    crate::embeddings::embedding_document(&mem.title, &mem.content),
+                ));
             }
             Err(e) => {
                 // Best-effort refund so a downstream insert failure

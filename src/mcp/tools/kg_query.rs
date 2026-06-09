@@ -124,7 +124,7 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
 
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
 
     let max_depth = params["max_depth"]

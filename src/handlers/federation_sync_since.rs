@@ -269,7 +269,7 @@ pub async fn sync_since(
             tracing::error!("sync_since: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }

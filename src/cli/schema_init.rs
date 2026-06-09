@@ -353,7 +353,7 @@ fn read_schema_version_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
             [],
             |row| row.get(0),
         )
-        .context("read schema_version")?;
+        .context(crate::errors::msg::READ_SCHEMA_VERSION)?;
     Ok(v)
 }
 
@@ -488,7 +488,7 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         sqlx::query_as("SELECT COALESCE(MAX(version), 0)::int FROM schema_version")
             .fetch_optional(&pool)
             .await
-            .context("read schema_version")?;
+            .context(crate::errors::msg::READ_SCHEMA_VERSION)?;
     let schema_version = i64::from(schema_version_row.map_or(0, |(v,)| v));
 
     // AGE bootstrap: only attempt when the extension is actually

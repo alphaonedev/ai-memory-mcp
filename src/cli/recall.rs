@@ -322,7 +322,7 @@ pub(crate) fn run_with_embedder(
         )?;
         let mut ok = 0usize;
         for (id, title, content) in &unembedded {
-            let text = format!("{title} {content}");
+            let text = crate::embeddings::embedding_document(title, content);
             if let Ok(embedding) = emb.embed(&text)
                 && db::set_embedding(conn, id, &embedding).is_ok()
             {

@@ -175,12 +175,7 @@ pub async fn get_memory(
                 )
                     .into_response();
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }
@@ -359,12 +354,7 @@ pub async fn update_memory(
                 )
                     .into_response();
             }
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
     // #930 — owner gate. Fetch the row's recorded `metadata.agent_id`
@@ -424,7 +414,7 @@ pub async fn update_memory(
             let content_changed = body.title.is_some() || body.content.is_some();
             let mut lock_opt = Some(lock);
             if content_changed && let Some(ref m) = mem {
-                let text = format!("{} {}", m.title, m.content);
+                let text = crate::embeddings::embedding_document(&m.title, &m.content);
                 if let Some(emb) = app.embedder.as_ref().as_ref() {
                     match emb.embed(&text) {
                         Ok(vec) => {
@@ -498,12 +488,7 @@ pub async fn update_memory(
             if msg.contains("already exists in namespace") {
                 return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }
@@ -607,7 +592,7 @@ pub async fn delete_memory(
                         Json(json!({
                             "status": "pending",
                             "pending_id": pending_id,
-                            "reason": "governance requires approval",
+                            "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "delete",
                             "memory_id": mem.id,
                             "storage_backend": "postgres",
@@ -692,12 +677,7 @@ pub async fn delete_memory(
                 )
                     .into_response();
             }
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
 
@@ -712,7 +692,7 @@ pub async fn delete_memory(
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
                 )
                     .into_response();
             }
@@ -790,7 +770,7 @@ pub async fn delete_memory(
                     Json(json!({
                         "status": "pending",
                         "pending_id": pending_id,
-                        "reason": "governance requires approval",
+                        "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                         "action": "delete",
                         "memory_id": target_id,
                     })),
@@ -798,12 +778,7 @@ pub async fn delete_memory(
                     .into_response();
             }
             Err(e) => {
-                tracing::error!("governance error: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "governance check failed"})),
-                )
-                    .into_response();
+                return crate::handlers::errors::governance_error_500(&e);
             }
         }
     }
@@ -913,7 +888,7 @@ pub async fn promote_memory(
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
                 )
                     .into_response();
             }
@@ -980,7 +955,7 @@ pub async fn promote_memory(
                         Json(json!({
                             "status": "pending",
                             "pending_id": pending_id,
-                            "reason": "governance requires approval",
+                            "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "promote",
                             "memory_id": target.id,
                             "storage_backend": "postgres",
@@ -1095,12 +1070,7 @@ pub async fn promote_memory(
                 )
                     .into_response();
             }
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
     // Task 1.9: governance enforcement (promote-side).
@@ -1114,7 +1084,7 @@ pub async fn promote_memory(
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("invalid agent_id: {e}")})),
+                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
                 )
                     .into_response();
             }
@@ -1191,7 +1161,7 @@ pub async fn promote_memory(
                     Json(json!({
                         "status": "pending",
                         "pending_id": pending_id,
-                        "reason": "governance requires approval",
+                        "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                         "action": "promote",
                         "memory_id": target_id,
                     })),
@@ -1199,12 +1169,7 @@ pub async fn promote_memory(
                     .into_response();
             }
             Err(e) => {
-                tracing::error!("governance error: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "governance check failed"})),
-                )
-                    .into_response();
+                return crate::handlers::errors::governance_error_500(&e);
             }
         }
     }
@@ -1231,7 +1196,7 @@ pub async fn promote_memory(
                 tracing::error!("promote clear expiry failed: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response();
             }
@@ -1277,13 +1242,6 @@ pub async fn promote_memory(
         Ok((false, _)) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

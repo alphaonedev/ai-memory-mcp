@@ -119,7 +119,7 @@ pub(crate) fn resolve_caller_agent_id(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let resolved = crate::identity::resolve_http_agent_id(body, header_val)
-        .map_err(|e| format!("invalid agent_id: {e}"))?;
+        .map_err(|e| crate::errors::msg::invalid("agent_id", e))?;
 
     // 2. Query refinement — same posture as body: when non-empty it
     //    MUST match the authoritative resolved id. Validate first so a
@@ -128,7 +128,8 @@ pub(crate) fn resolve_caller_agent_id(
     if let Some(claim) = query
         && !claim.is_empty()
     {
-        validate::validate_agent_id(claim).map_err(|e| format!("invalid agent_id: {e}"))?;
+        validate::validate_agent_id(claim)
+            .map_err(|e| crate::errors::msg::invalid("agent_id", e))?;
         if claim != resolved {
             return Err(format!(
                 "agent_id_query_header_mismatch: query-supplied agent_id {claim:?} disagrees \

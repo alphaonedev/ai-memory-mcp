@@ -204,7 +204,9 @@ pub async fn handle_recall_with_pre_recall_hook(
 ) -> Result<Value, String> {
     // Resolve the (query, namespace, k) triple once so the hook
     // sees exactly what the recall would see.
-    let context = params["context"].as_str().ok_or("context is required")?;
+    let context = params["context"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTEXT_REQUIRED)?;
     let namespace = params["namespace"].as_str().unwrap_or("");
     let k = u32::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(u32::MAX);
 
@@ -797,7 +799,7 @@ pub fn handle_recall_dto(
     let _ = db::gc_if_needed(conn, archive_on_gc);
     let context = req.context.as_str();
     if context.is_empty() {
-        return Err("context is required".to_string());
+        return Err(crate::errors::msg::CONTEXT_REQUIRED.to_string());
     }
     // v0.7.0 (issue #518) — when the caller passed
     // `session_default=true` AND a given filter axis is absent,

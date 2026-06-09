@@ -129,7 +129,7 @@ pub fn handle_atomise(
     // ── Argument validation ─────────────────────────────────────────
     let memory_id = params
         .get(param_names::MEMORY_ID)
-        .ok_or("memory_id is required")?
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?
         .as_str()
         .ok_or("memory_id must be a string")?;
     if memory_id.is_empty() {

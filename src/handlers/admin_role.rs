@@ -177,7 +177,7 @@ pub fn require_admin(
             );
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response());
         }

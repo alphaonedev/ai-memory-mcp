@@ -121,7 +121,9 @@ pub(super) fn handle_update(
     vector_index: Option<&VectorIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // Resolve prefix if exact ID not found
     let resolved_id = if db::get(conn, id).map_err(|e| e.to_string())?.is_some() {
@@ -129,7 +131,7 @@ pub(super) fn handle_update(
     } else if let Some(mem) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
         mem.id
     } else {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
     let title = params["title"].as_str();
     let content = params["content"].as_str();
@@ -221,7 +223,7 @@ pub(super) fn handle_update(
     {
         let existing = db::get(conn, &resolved_id)
             .map_err(|e| e.to_string())?
-            .ok_or("memory not found")?;
+            .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
         let effective_namespace = namespace.unwrap_or(existing.namespace.as_str()).to_string();
         let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
             .map_err(|e| e.to_string())?;
@@ -286,7 +288,7 @@ pub(super) fn handle_update(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "update",
                     "memory_id": resolved_id,
                 }));
@@ -322,7 +324,7 @@ pub(super) fn handle_update(
             let new_id = &result.new_id;
             let mem = db::get(conn, new_id).map_err(|e| e.to_string())?;
             if let Some(ref m) = mem {
-                let text = format!("{} {}", m.title, m.content);
+                let text = crate::embeddings::embedding_document(&m.title, &m.content);
                 if let Ok(embedding) = emb.embed(&text) {
                     let _ = db::set_embedding(conn, new_id, &embedding);
                     if let Some(idx) = vector_index {
@@ -360,14 +362,14 @@ pub(super) fn handle_update(
     .map_err(|e| conflict_or_string(&e))?;
 
     if !found {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
 
     // Regenerate embedding when title or content changed
     if content_changed && let Some(emb) = embedder {
         let mem = db::get(conn, &resolved_id).map_err(|e| e.to_string())?;
         if let Some(ref m) = mem {
-            let text = format!("{} {}", m.title, m.content);
+            let text = crate::embeddings::embedding_document(&m.title, &m.content);
             if let Ok(embedding) = emb.embed(&text) {
                 let _ = db::set_embedding(conn, &resolved_id, &embedding);
                 if let Some(idx) = vector_index {

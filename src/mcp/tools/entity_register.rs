@@ -66,7 +66,7 @@ pub fn handle_entity_register(
         .ok_or("canonical_name is required")?;
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     let aliases: Vec<String> = params["aliases"]
         .as_array()
         .map(|arr| {

@@ -179,7 +179,7 @@ async fn fetch_consolidate_source_pairs(
                 Err(crate::store::StoreError::NotFound { .. }) => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(json!({"error": format!("memory not found: {id}")})),
+                        Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
                     )
                         .into_response());
                 }
@@ -207,7 +207,7 @@ async fn fetch_consolidate_source_pairs(
             Ok(None) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("memory not found: {id}")})),
+                    Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
                 )
                     .into_response());
             }
@@ -215,7 +215,7 @@ async fn fetch_consolidate_source_pairs(
                 tracing::error!("consolidate source lookup failed: {e}");
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response());
             }
@@ -319,7 +319,7 @@ pub async fn consolidate_memories(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -329,7 +329,7 @@ pub async fn consolidate_memories(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response();
     }
@@ -483,14 +483,7 @@ pub async fn consolidate_memories(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -667,7 +660,7 @@ pub async fn expand_query_handler(
     if query.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "query is required"})),
+            Json(json!({"error": crate::errors::msg::QUERY_REQUIRED})),
         )
             .into_response();
     }
@@ -736,7 +729,7 @@ async fn fetch_memory_for_handler(
             Ok(mem) => Ok(mem),
             Err(crate::store::StoreError::NotFound { .. }) => Err((
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("memory not found: {id}")})),
+                Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
             )
                 .into_response()),
             Err(e) => Err(store_err_to_response(e)),
@@ -753,14 +746,14 @@ async fn fetch_memory_for_handler(
         Ok(Some(mem)) => Ok(mem),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("memory not found: {id}")})),
+            Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
         )
             .into_response()),
         Err(e) => {
             tracing::error!("memory lookup failed: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response())
         }

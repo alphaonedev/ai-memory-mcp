@@ -58,7 +58,7 @@ pub(super) fn handle_persona(conn: &rusqlite::Connection, params: &Value) -> Res
         .as_str()
         .ok_or("entity_id is required")?;
     if entity_id.is_empty() {
-        return Err("entity_id cannot be empty".to_string());
+        return Err(crate::errors::msg::ENTITY_ID_EMPTY.to_string());
     }
     let namespace = params["namespace"]
         .as_str()
@@ -110,7 +110,7 @@ pub fn handle_persona_generate(
         .as_str()
         .ok_or("entity_id is required")?;
     if entity_id.is_empty() {
-        return Err("entity_id cannot be empty".to_string());
+        return Err(crate::errors::msg::ENTITY_ID_EMPTY.to_string());
     }
     // v0.7.0 issue #848 — namespace handling.
     //

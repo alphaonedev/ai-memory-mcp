@@ -17,7 +17,9 @@ pub fn handle_notify(
     let target = params["target_agent_id"]
         .as_str()
         .ok_or("target_agent_id is required")?;
-    let title = params["title"].as_str().ok_or("title is required")?;
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
     let payload = params["payload"].as_str().ok_or("payload is required")?;
     // B4 (R2-LOW) — clamp instead of panic on out-of-range JSON; the
     // `.clamp(1, 10)` below enforces the semantic priority range, but
@@ -27,7 +29,8 @@ pub fn handle_notify(
         .unwrap_or(i32::MAX)
         .clamp(1, 10);
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
 
     validate::validate_agent_id(target).map_err(|e| e.to_string())?;
     validate::validate_title(title).map_err(|e| e.to_string())?;

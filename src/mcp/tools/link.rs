@@ -97,10 +97,10 @@ pub(super) fn handle_link(
 ) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     let target_id = params["target_id"]
         .as_str()
-        .ok_or("target_id is required")?;
+        .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
     let relation = params["relation"].as_str().unwrap_or("related_to");
 
     validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
@@ -276,7 +276,7 @@ pub(super) fn handle_link(
                         &link_namespace,
                         crate::quotas::QuotaOp::Link,
                     ) {
-                        tracing::warn!("quota refund_op failed for agent {}: {}", aid, re);
+                        crate::quotas::log_refund_op_failed(aid, &re);
                     }
                 }
                 return Err(e.to_string());
@@ -407,7 +407,9 @@ pub(super) fn handle_get_links(
     params: &Value,
     caller: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // #1553 — visibility gate. `memory_get_links` is both an id-leak primitive
     // (neighbor ids) and a relationship oracle for a row's existence. Resolve

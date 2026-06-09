@@ -56,7 +56,7 @@ pub async fn get_inbox(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
         )
             .into_response();
     }
@@ -426,7 +426,7 @@ async fn set_namespace_standard_inner(
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "error": "caller does not own this namespace standard",
+                        "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
                         "owner": recorded_owner,
                         "caller": caller_principal
                     })),
@@ -493,21 +493,22 @@ async fn set_namespace_standard_inner(
             // drops unknown fields but the typed sub-set must still
             // parse + pass policy validation. Mirrors the SQLite path
             // at `mcp::tools::namespace`.
-            let policy: crate::models::GovernancePolicy =
-                match serde_json::from_value(merged.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return (
+            let policy: crate::models::GovernancePolicy = match serde_json::from_value(
+                merged.clone(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
                             StatusCode::BAD_REQUEST,
-                            Json(json!({"error": format!("invalid governance: {e}")})),
+                            Json(json!({"error": crate::errors::msg::invalid(crate::META_KEY_GOVERNANCE, e)})),
                         )
                             .into_response();
-                    }
-                };
+                }
+            };
             if let Err(e) = validate::validate_governance_policy(&policy) {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("invalid governance: {e}")})),
+                    Json(json!({"error": crate::errors::msg::invalid(crate::META_KEY_GOVERNANCE, e)})),
                 )
                     .into_response();
             }
@@ -596,7 +597,7 @@ async fn set_namespace_standard_inner(
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "error": "caller does not own this namespace standard",
+                        "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
                         "owner": recorded_owner,
                         "caller": caller
                     })),
@@ -690,7 +691,7 @@ async fn set_namespace_standard_inner(
                     tracing::error!("namespace_standard: placeholder insert failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }
@@ -719,7 +720,7 @@ async fn set_namespace_standard_inner(
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
-                    "error": "caller does not own this namespace standard",
+                    "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
                     "owner": recorded_owner,
                     "caller": caller
                 })),
@@ -838,7 +839,7 @@ pub async fn set_namespace_standard_qs(
     else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "namespace is required"})),
+            Json(json!({"error": crate::errors::msg::NAMESPACE_REQUIRED})),
         )
             .into_response();
     };
@@ -1007,7 +1008,7 @@ pub async fn clear_namespace_standard_qs(
     let Some(ns) = q.namespace else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "namespace is required"})),
+            Json(json!({"error": crate::errors::msg::NAMESPACE_REQUIRED})),
         )
             .into_response();
     };
@@ -1123,7 +1124,7 @@ pub async fn session_start(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid agent_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
     }

@@ -123,7 +123,7 @@ pub async fn skill_list_route(
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -148,7 +148,7 @@ pub async fn skill_get_route(
         Err(e) => {
             // Substrate uses a "skill not found:" prefix for the missing
             // case; surface that as 404. Everything else is 500.
-            if e.starts_with("skill not found") {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
                 // #1261 — never forward the raw substrate error (often
@@ -162,7 +162,7 @@ pub async fn skill_get_route(
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
@@ -239,7 +239,7 @@ pub async fn skill_export_route(
     match crate::mcp::handle_skill_export(&lock.0, &params, kp) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            if e.starts_with("skill not found") {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
                 (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
@@ -328,7 +328,7 @@ pub async fn skill_compose_route(
     match crate::mcp::handle_skill_compositional_context(&lock.0, &params) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            if e.starts_with("skill not found") {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
                 // #1261 — never forward the raw substrate error on
@@ -341,7 +341,7 @@ pub async fn skill_compose_route(
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
