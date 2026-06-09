@@ -1,0 +1,312 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  ai-memory v0.7.0 — Reproducible baselines (Phase-4 GA deliverable, #836 Tier 7)
+
+  Documents the project's three reproducibility contracts with citations:
+    1. do-1461 two-round clean-room 0→60 fleet reproduction
+       (verify-20260608T231547Z / verify-20260609T133956Z TSV evidence)
+    2. bench performance baselines (src/bench.rs P95_TOLERANCE, --baseline
+       JSON + DEFAULT_REGRESSION_THRESHOLD_PCT, PERFORMANCE.md budgets,
+       the committed BASELINE-v0.6.3.1.md precedent)
+    3. release-gate full-suite reproducibility contract
+       (docs/v0.7.0/test-campaign-2026-05-22-release-gate-final/README.md)
+
+  Convention note: per the reference-architecture page's PHASE-3E SHA note,
+  this page carries NO literal golden-binary sha256 in visible text — the
+  pinning MECHANISM (named constants, fleet-asserted verify rows) is the
+  contract; the values rotate with scheduled redeploys.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory — Reproducible Baselines</title>
+<meta name="description" content="ai-memory v0.7.0 reproducibility contracts: the do-1461 two-round clean-room 0→60 fleet reproduction (119/119 verify checks green on both independent rounds), the bench p95 baseline + regression-gate mechanism, and the release-gate full-suite reproducibility contract.">
+<meta name="theme-color" content="#0d1117">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reproducible-baselines.html">
+<style>
+:root {
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666;
+  --good:#6ee7ff; --warn:#ffb86b; --bad:#ff6b9d; --p3:#c8a2ff;
+  --font-mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  --max-w:1200px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--good);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.84rem;background:var(--bg-code);padding:.12em .35em;border-radius:4px;word-break:break-word}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1{font-weight:800;letter-spacing:-0.03em;font-size:2.5rem;line-height:1.1;margin-bottom:.75rem}
+h2{font-weight:700;letter-spacing:-0.02em;font-size:1.8rem;line-height:1.2;margin-bottom:.75rem}
+h3{font-weight:700;font-size:1.15rem;margin:1.25rem 0 .5rem;color:var(--text)}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text);text-decoration:none}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;align-items:center}
+@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 0 2.75rem;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;padding:.3rem .8rem;border-radius:999px;background:rgba(110,231,255,0.1);color:var(--good);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:1rem;border:1px solid rgba(110,231,255,0.25)}
+.hero .tagline{font-size:1.05rem;color:var(--text-muted);max-width:74ch}
+.hero-pills{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.4rem}
+.hero-pill{padding:.4rem .85rem;border-radius:999px;background:var(--bg-elev);color:var(--text);font-size:.8rem;font-weight:600;border:1px solid var(--border-hl)}
+.hero-pill.good{background:rgba(110,231,255,0.08);color:var(--good);border-color:rgba(110,231,255,0.3)}
+section{padding:2.75rem 0;border-bottom:1px solid var(--border)}
+section:last-child{border-bottom:none}
+.section-eyebrow{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--good);margin-bottom:.85rem}
+.lede{font-size:1.02rem;color:var(--text);max-width:78ch;margin-bottom:1.25rem}
+.scroll-x{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.85rem;margin:1rem 0}
+thead th{text-align:left;padding:.65rem .75rem;background:var(--bg-elev);color:var(--text);font-weight:700;border-bottom:2px solid var(--border-hl);font-size:.74rem;letter-spacing:.05em;text-transform:uppercase}
+tbody td{padding:.65rem .75rem;border-bottom:1px solid var(--border);vertical-align:top;color:var(--text-muted)}
+tbody td.col-name{color:var(--text);font-weight:600}
+tbody tr:hover{background:rgba(255,255,255,0.02)}
+pre.codeblock{background:var(--bg-code);border:1px solid var(--border);border-radius:6px;padding:.85rem 1rem;overflow-x:auto;font-family:var(--font-mono);font-size:.78rem;line-height:1.6;color:var(--text-muted);margin:.85rem 0}
+pre.codeblock .cm{color:var(--text-dim)}
+.warn-box{background:var(--bg-card);border-left:3px solid var(--warn);padding:1rem 1.25rem;border-radius:6px;margin:1.25rem 0;color:var(--text-muted);font-size:.92rem}
+.warn-box strong{color:var(--warn);display:block;margin-bottom:.35rem}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.25rem;margin:1.25rem 0}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.25rem}
+.card .lbl{font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--good);margin-bottom:.5rem}
+.card p{font-size:.9rem;margin-bottom:0}
+.stat-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1rem;margin:1.25rem 0}
+.stat{background:var(--bg-elev);border:1px solid var(--border-hl);border-radius:10px;padding:1rem;text-align:center}
+.stat .n{font-size:1.8rem;font-weight:800;color:var(--good);letter-spacing:-0.02em;line-height:1.1}
+.stat .l{color:var(--text-muted);font-size:.78rem;margin-top:.3rem}
+footer{padding:3rem 0 4rem;border-top:1px solid var(--border);background:var(--bg-raised);color:var(--text-dim);font-size:.85rem}
+footer a{color:var(--text-muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <div>
+      <a class="home-link" href="index.html">ai-memory</a>
+      <a href="at-a-glance.html">Atlas</a>
+      <a href="architectures.html">Architectures</a>
+      <a href="reference-architecture/">Reference architecture</a>
+      <a href="evidence.html">Evidence</a>
+      <a href="compliance/index.html">Compliance</a>
+    </div>
+    <div class="right">
+      <a href="whats-new-v07.html">v0.7.0</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <span class="eyebrow">▸ Reproducibility · Public-facing</span>
+    <h1>Reproducible Baselines</h1>
+    <p class="tagline">A result you cannot reproduce is an anecdote. ai-memory v0.7.0 ships <strong>three reproducibility contracts</strong>, each with committed mechanism and citable evidence: the <a href="#fleet">two-round clean-room fleet reproduction</a> (do-1461), the <a href="#bench">performance-baseline + regression-gate mechanism</a> (<code>src/bench.rs</code>), and the <a href="#suite">release-gate full-suite contract</a> (the 2026-05-22 final campaign). This page documents what each contract pins, where the pins live, and how to re-run them.</p>
+    <div class="hero-pills">
+      <span class="hero-pill good">Fleet: 2 × independent 0→60 runs · 119/119 verify checks green both rounds</span>
+      <span class="hero-pill good">Bench: p95 budgets + baseline-JSON regression gate on every PR</span>
+      <span class="hero-pill good">Suite: pinned branch + binary + invocation + environment</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ CONTRACT 1 — FLEET ============ -->
+<section id="fleet">
+  <div class="container">
+    <span class="section-eyebrow">▸ Contract 1 · do-1461 fleet</span>
+    <h2>Two independent clean-room 0→60 fleet builds.</h2>
+    <p class="lede">The <a href="reference-architecture/">do-1461 reference architecture</a> (15 nodes, 3 regions, 9 federated peers, Batman MAXIMUM-SECURE posture) was stood up, fully verified, torn down, and stood up <em>again</em> from nothing — <code>terraform destroy</code> → fresh <code>terraform apply</code> → full push-based provision → complete re-verification. Both rounds minted the same 100% GREEN result: <strong>119/119 verify checks PASS</strong>, asserted by the same harness against two physically distinct fleets.</p>
+
+    <pre class="codeblock"><span class="cm"># the whole contract is one directory, one deterministic flow</span>
+cd deploy/do-1461
+make seed up provision validate test   <span class="cm"># build fleet, verify, full-spectrum test</span>
+make down                              <span class="cm"># tear it all down</span></pre>
+
+    <div class="stat-strip">
+      <div class="stat"><div class="n">2</div><div class="l">Independent clean-room rounds</div></div>
+      <div class="stat"><div class="n">119/119</div><div class="l">Verify checks PASS — both rounds</div></div>
+      <div class="stat"><div class="n">15</div><div class="l">Nodes asserting the per-round golden binary sha256</div></div>
+      <div class="stat"><div class="n">150/150</div><div class="l">Full-spectrum test checks PASS (round-2 retest)</div></div>
+    </div>
+
+    <h3>What is pinned, and where</h3>
+    <div class="scroll-x">
+    <table>
+      <thead><tr><th>Pinned artifact</th><th>Mechanism</th><th>Asserted by</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="col-name">Golden binary</td>
+          <td>Per-round <code>sha256</code> pinned as the named constant <code>GOLDEN_SHA256</code> in <code>deploy/do-1461/provision/lib.sh</code> (env-overridable for forks). No literal SHA appears on this page by convention — the pin rotates with scheduled redeploys; the mechanism is the contract.</td>
+          <td><code>binary.sha256</code> verify row, fleet-asserted on all 15 nodes; <code>binary.version</code> pins <code>0.7.0</code></td>
+        </tr>
+        <tr>
+          <td class="col-name">Schema</td>
+          <td>v55, lockstep across all 9 peers (postgres adapter)</td>
+          <td><code>caps.db_schema_version</code> verify row per peer</td>
+        </tr>
+        <tr>
+          <td class="col-name">Substrate stack</td>
+          <td>Pinned pgdg <code>.deb</code>s (PostgreSQL 18.4, Apache AGE 1.7.0, pgvector 0.8.2) + pinned Ollama release — named constants in <code>provision/lib.sh</code></td>
+          <td><code>store.pg_version</code> / <code>store.age_version</code> / <code>store.pgvector_version</code> / <code>store.age_graph</code> verify rows per pg node</td>
+        </tr>
+        <tr>
+          <td class="col-name">Seed corpus</td>
+          <td><code>sha256</code>-pinned in <code>CORPUS_MANIFEST.json</code>; attested Atlas Corpus baseline committed under <code>deploy/do-1461/atlas/results/</code></td>
+          <td>Atlas ingest reports (<code>atlas-*.tsv</code>)</td>
+        </tr>
+        <tr>
+          <td class="col-name">Trust material</td>
+          <td>Campaign CA + per-node keys generated once per round; zero-touch enrollment proves peers join via CA credential alone</td>
+          <td><code>zerotouch::cred_ca_chain[peer]</code> ×9 + <code>zerotouch::unenrolled_status[peer]</code> ×9 (full-spectrum harness)</td>
+        </tr>
+        <tr>
+          <td class="col-name">Tunables</td>
+          <td>Every knob is a named constant in <code>provision/lib.sh</code>, not a magic literal</td>
+          <td>Reviewed source; the same constants drive both rounds</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3>The two-round evidence pair</h3>
+    <p>Round 1: <code>verify-20260608T231547Z.tsv</code>. Round 2: <code>verify-20260609T133956Z.tsv</code> (both under <code>.local-runs/do-1461/reports/</code>, emitted by <code>deploy/do-1461/validate/run.sh</code>). Both reports contain the <strong>same 119 checks with the same expectations, all PASS</strong>. Row-by-row diff of the two rounds shows exactly three value-level differences — each one expected and none a behavioral delta:</p>
+    <div class="scroll-x">
+    <table>
+      <thead><tr><th>Differing field</th><th>Why it differs</th><th>Rows</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="col-name"><code>binary.sha256</code> value</td>
+          <td>Each round pins and fleet-asserts <em>its own</em> golden build. Within a round, all 15 nodes report the identical hash — that is the per-round determinism claim.</td>
+          <td>15 (one per node)</td>
+        </tr>
+        <tr>
+          <td class="col-name"><code>daemon_pg.tls</code> observed counter</td>
+          <td>The check asserts "≥1 ssl backend, 0 plaintext"; the observed <code>ssl=</code> count is a cumulative connection counter (9 vs 18). Criterion and verdict identical.</td>
+          <td>3 (one per pg node)</td>
+        </tr>
+        <tr>
+          <td class="col-name"><code>fleet federation.write</code> / <code>federation.convergence</code> probe id</td>
+          <td>The convergence probe writes a fresh throwaway memory each run; the row carries that run's UUID. Criterion and verdict identical.</td>
+          <td>2</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Every other field of every other row is byte-identical across the two rounds. The round-2 fleet additionally passed the full-spectrum suite (<code>test-20260609T161203Z.tsv</code>, 150/150 PASS across the <code>regression / crypto / federation / zerotouch / a2a / ai_nhi / nsa_gaps / curator</code> groups) and the recursive-learning suite (<code>recursive-20260609T160851Z.tsv</code>).</p>
+
+    <div class="warn-box">
+      <strong>Honest scope</strong>
+      "Reproducible" here means: from the committed <code>deploy/do-1461/</code> directory, two independent clean-room executions of the same flow produced the same 100%-green verdict against the same pinned artifact set, with each round's binary hash fleet-asserted on every node. It does <em>not</em> mean bit-identical reports (timestamps, run UUIDs, and cumulative counters necessarily differ — itemised above), and it does not claim a deterministic <em>build</em> of the binary itself: the golden binary is pinned by hash and asserted, not rebuilt bit-for-bit per round. One platform footnote carries over from the reference page: DigitalOcean's per-region <em>default</em> VPC container cannot be deleted, so teardown destroys 100% of compute and data while the empty VPC shell is reused — it holds no state between runs.
+    </div>
+  </div>
+</section>
+
+<!-- ============ CONTRACT 2 — BENCH ============ -->
+<section id="bench">
+  <div class="container">
+    <span class="section-eyebrow">▸ Contract 2 · Performance</span>
+    <h2>Bench baselines: absolute budgets plus drift gates.</h2>
+    <p class="lede">Performance claims are held by two independent guards in <code>src/bench.rs</code>, both reproducible from the CLI. The <strong>absolute guard</strong> checks every measured p95 against the published budget table; the <strong>baseline guard</strong> checks every measured p95 against a previously captured run, catching drift that stays inside the absolute budget.</p>
+
+    <div class="cards">
+      <div class="card">
+        <div class="lbl">Budget table</div>
+        <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md"><code>PERFORMANCE.md</code></a> is the authoritative latency contract. Honest split, stated in the doc itself: <strong>7 of 14 budget rows are bench-verified</strong>; the remaining 7 are explicitly marked <em>[advisory]</em> pending bench fixtures — advisory rows are never claimed as verified.</p>
+      </div>
+      <div class="card">
+        <div class="lbl">Absolute guard</div>
+        <p><code>src/bench.rs::P95_TOLERANCE = 1.10</code> — a run fails when any measured p95 exceeds its <code>PERFORMANCE.md</code> budget by more than the published 10% tolerance. Budgets are pinned in-code and cross-checked by in-module tests against the doc table.</p>
+      </div>
+      <div class="card">
+        <div class="lbl">Baseline guard</div>
+        <p><code>ai-memory bench --baseline &lt;file.json&gt;</code> compares each operation's fresh p95 against a captured baseline JSON (<code>load_baseline</code> / <code>compare_against_baseline</code>); growth beyond <code>--regression-threshold</code> (default <code>DEFAULT_REGRESSION_THRESHOLD_PCT = 10.0</code>, <code>src/bench.rs</code>) is reported as a regression. Operations absent from the baseline are skipped, so adding a bench row never invalidates old baselines.</p>
+      </div>
+      <div class="card">
+        <div class="lbl">CI gate</div>
+        <p><code>.github/workflows/bench.yml</code> (job <code>bench</code>) runs the bench workload on every pull request against <code>main</code> / <code>develop</code> / <code>release/**</code> and fails the PR when any p95 breaks budget × tolerance.</p>
+      </div>
+    </div>
+
+    <pre class="codeblock"><span class="cm"># capture a baseline on known-good HEAD, then gate future runs against it</span>
+ai-memory bench --json &gt; baseline-$(git rev-parse --short HEAD).json
+ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</pre>
+
+    <h3>The committed-baseline precedent</h3>
+    <p><a href="BASELINE-v0.6.3.1.md"><code>docs/BASELINE-v0.6.3.1.md</code></a> is the project's committed-baseline precedent: a canonical, code-derived snapshot of what release <code>v0.6.3.1</code> actually <em>was</em> (workspace, features, surfaces, budgets — every number with a traceable <code>file:line</code> source, zero aspirational claims). It is the reference document the long-running drift audit (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/512">#512</a>) measures published surfaces against. The same discipline carries into v0.7.0: baselines are committed artifacts with provenance, not screenshots.</p>
+  </div>
+</section>
+
+<!-- ============ CONTRACT 3 — FULL SUITE ============ -->
+<section id="suite">
+  <div class="container">
+    <span class="section-eyebrow">▸ Contract 3 · Test suite</span>
+    <h2>The release-gate full-suite reproducibility contract.</h2>
+    <p class="lede">The final v0.7.0 release-gate campaign (<a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/README.md">2026-05-22 dossier</a>) closed with a full-suite verdict of <strong>7,321 passed / 0 failed / 0 skipped</strong> — and published the six-point contract that lets anyone re-derive that verdict rather than take it on faith:</p>
+
+    <div class="scroll-x">
+    <table>
+      <thead><tr><th style="width:18ch">Contract point</th><th>Pinned value (from the dossier's "Reproducibility contract")</th></tr></thead>
+      <tbody>
+        <tr><td class="col-name">1 · Branch + tip</td><td><code>release/v0.7.0-mobile-ci-1068</code> (tracking <code>origin/release/v0.7.0</code>), HEAD <code>fd172f2cf629309514cd5dad486c2e59ac4eed39</code></td></tr>
+        <tr><td class="col-name">2 · Binary</td><td>Single release binary, sha256 <code>d4b60aa5b8f97470d95007f30bddb15e7e35c3855f0085c6b4f43d57f6b4ef3e</code></td></tr>
+        <tr><td class="col-name">3 · Exact invocation</td><td><code>cargo test --release --no-default-features --features sal,sal-postgres,sqlite-bundled -- --include-ignored --test-threads=1</code></td></tr>
+        <tr><td class="col-name">4 · Environment</td><td>macOS Sequoia / Darwin 25.4.0; lan-parity PG + AGE container (<code>PG16 + AGE 1.6.0 + pgvector 0.8.2</code> on <code>127.0.0.1:15432</code>); <code>AI_MEMORY_TEST_POSTGRES_URL</code> + <code>AI_MEMORY_TEST_AGE_URL</code> bound to it</td></tr>
+        <tr><td class="col-name">5 · Schema version</td><td>v49 (current at that campaign's HEAD; the ladder has since advanced to v55 — re-running at today's HEAD reproduces against the current schema constant, which is the point of pinning the tip SHA)</td></tr>
+        <tr><td class="col-name">6 · Authoring + QC agents</td><td>Named in the dossier, with two independent QC passes</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p>The dossier also binds the verdict to the campaign discipline that produced it: every failure filed as a GitHub issue at the moment of discovery, every fix retested against a freshly recompiled binary, and the final run executed against the composite tip — so the published number is the output of a documented procedure, not a survivor-curated log. The same README carries the per-issue root-cause table and per-track results (<code>track-a/b/c</code> files alongside it).</p>
+  </div>
+</section>
+
+<!-- ============ WHY ============ -->
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Why three contracts</span>
+    <h2>Each contract pins a different failure mode.</h2>
+    <div class="scroll-x">
+    <table>
+      <thead><tr><th>Contract</th><th>Question it answers</th><th>Primary evidence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="col-name">Fleet (do-1461)</td>
+          <td>"Does the documented deployment actually converge to the verified state — twice, from nothing?"</td>
+          <td><code>verify-20260608T231547Z.tsv</code> + <code>verify-20260609T133956Z.tsv</code> (119/119 both), <a href="reference-architecture/">reference architecture page</a></td>
+        </tr>
+        <tr>
+          <td class="col-name">Bench</td>
+          <td>"Is this build still inside its published latency contract, and has it drifted against a known-good run?"</td>
+          <td><code>PERFORMANCE.md</code>, <code>src/bench.rs</code> (<code>P95_TOLERANCE</code>, <code>DEFAULT_REGRESSION_THRESHOLD_PCT</code>), <code>Bench · bench</code> CI job, <a href="BASELINE-v0.6.3.1.md">BASELINE-v0.6.3.1.md</a></td>
+        </tr>
+        <tr>
+          <td class="col-name">Full suite</td>
+          <td>"Can a third party re-derive the release-gate test verdict from pinned inputs?"</td>
+          <td><a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/README.md">Release-gate dossier §Reproducibility contract</a></td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+    <p>Control-level verification evidence (which named test or harness check exercises which NSA CSI control) lives on the companion page: <a href="compliance/nsa-control-test-matrix.html">NSA CSI MCP Control → Test Matrix</a>.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · Reproducible Baselines · public-facing · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p>Companions: <a href="reference-architecture/">do-1461 reference architecture</a> · <a href="compliance/nsa-control-test-matrix.html">control → test matrix</a> · <a href="evidence.html">ship-gate evidence</a> · <a href="compliance/index.html">compliance &amp; procurement</a>.</p>
+  </div>
+</footer>
+
+</body>
+</html>
