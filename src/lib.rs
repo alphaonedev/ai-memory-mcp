@@ -368,6 +368,12 @@ pub extern "C" fn ai_memory_version() -> *const std::os::raw::c_char {
     VERSION.as_ptr().cast::<std::os::raw::c_char>()
 }
 
+/// The crate version (compile-time `CARGO_PKG_VERSION`) as one named
+/// const — wire surfaces (capabilities, serverInfo, backup manifests,
+/// boot banners, webhook user-agent) all report it from here instead
+/// of nine scattered `env!` calls (#1558 batch 5).
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // v0.7.x (issue #1174 PR5 — pm-v3.1 namespace-sentinel sweep) — the
 // default namespace for AI-NHI memory writes when the caller omits

@@ -9,18 +9,9 @@
 4	agent_pubkey
 12	agent_type
 5	.ai-memory
-3	AI_MEMORY_ANONYMIZE
-7	ai_memory::authz
-3	ai-memory curator (autonomy)
-11	ai_memory::federation::push_dlq
-3	ai_memory::federation::sync
-3	ai_memory::governance::audit
-3	AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR
-3	ai_memory::handlers::skills
 3	AI_MEMORY_LLM_API_KEY
 3	AI_MEMORY_LLM_BACKEND
 4	AI_MEMORY_LLM_BASE_URL
-3	ai_memory::subscriptions
 3	allowed_tools
 3	already exists
 3	ANTHROPIC_API_KEY
@@ -32,8 +23,6 @@
 5	approve rejected: {reason}
 6	archived_at
 4	archived_memories
-5	archive_max_days
-5	archive_on_gc
 3	archive_purge
 4	archive_reason
 4	at least one of namespace, pattern, or tier is required
@@ -41,7 +30,6 @@
 3	atomisation_archived_at
 17	attest_level
 3	autonomous
-4	auto_tag_model
 4	begin AGE tx
 9	budget_tokens
 4	by_namespace
@@ -52,7 +40,6 @@
 14	canonical_name
 14	capabilities
 4	capture_turn
-7	CARGO_PKG_VERSION
 3	catchup: peer {} returned HTTP {} — skipping this tick
 3	catchup: peer {} returned unparseable body: {e}
 3	catchup: peer {} unreachable: {e}
@@ -60,8 +47,6 @@
 3	catchup: sync_state_observe failed for {}: {e}
 3	catchup: unparseable memory from peer {}: {e}
 4	checked above
-3	claude-code
-3	claude_desktop_config.json
 5	collective
 3	command_regex
 3	command_substring
@@ -85,52 +70,43 @@
 29	created_at
 12	created_by
 4	create_time
-4	cross_encoder
 3	current_tier
 3	custom_kind
-3	daemon:wire_action
 4	decided_at
 14	decided_by
 4	{decision}
 4	decision write failed
 3	default_fallback
-5	default_namespace
 3	default_timeout_seconds
 5	DELETE FROM memories WHERE id = $1
 3	DELETE FROM memories WHERE id = ?1
 3	DELETE FROM namespace_meta WHERE standard_id = ?1
 8	derived_from
 6	derives_from
-7	description
+5	description
 4	dim_violations
 3	earliest_updated_at
 4	elapsed_ms
-4	embedding_model
-5	embeddings
 3	entity_id cannot be empty
 11	error: {e}
 4	event_types
 3	excluded_for_scope
 3	excluded_for_scope_private
 4	expanded_terms
-3	experimental
 3	expired_at
 3	expired_deleted
 6	expires_at
 3	exported_at
-3	federation::attestation
-33	federation::signing
 3	filesystem_write
 4	from_agent_id
 4	fts_classifier
 3	generated_at
 3	GOOGLE_API_KEY
-23	governance
+14	governance
 3	governance check failed
 3	governance error: {e}
 8	governance requires approval
 37	handler error: {e}
-3	hnsw.eviction
 4	http_header
 9	http://localhost:11434
 7	id is required
@@ -161,9 +137,7 @@
 4	local_depth_at_arrival
 3	manifest.json
 4	max_depth must be >= 1
-5	max_memory_mb
 3	max_skew_secs
-5	mcpServers
 3	memories_dropped
 3	memory_archive
 3	memory_consolidated
@@ -174,7 +148,6 @@
 7	memory not found: {id}
 3	memory not found: {memory_id}
 4	mini_lm_l6_v2
-3	modelContextProtocolServers
 3	model.safetensors
 3	ms-marco-MiniLM-L-6-v2
 4	must be a string
@@ -197,7 +170,6 @@
 12	observed_by
 5	older_than_days
 3	older_than_days must be non-negative (got {days})
-4	ollama_url
 3	OPENAI_API_KEY
 6	opening {}
 6	openrouter
@@ -213,15 +185,10 @@
 3	pending action not found: {pending_id}
 17	pending_id
 5	persona_version
-5	postgres://
-3	postgresql://
 9	PRAGMA table_info(memories)
-8	pre_store.auto_atomise
-5	pre_store.auto_atomise.sync
-3	PreToolUse
 3	previous_valid_until
 3	process_spawn
-6	properties
+5	properties
 3	public_key
 4	public_key_b64
 3	query is required
@@ -276,11 +243,9 @@
 4	serialize confidence_signals: {e}
 4	serialize source_span: {e}
 7	serialize tags: {e}
-3	SessionStart
 6	SET LOCAL search_path = ag_catalog, \
 4	set search_path
 3	signature verify failed: {e}
-12	signed_events
 4	signing_agent
 4	similarity
 3	skill_description
@@ -326,7 +291,6 @@
 5	total_memories
 10	tracker arc still referenced at finalise
 7	transcripts
-4	transcripts.lifecycle
 4	unread_only
 3	unsubscribe: {e}
 8	updated_at

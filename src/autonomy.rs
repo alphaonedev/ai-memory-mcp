@@ -40,6 +40,10 @@ use crate::db;
 use crate::llm::OllamaClient;
 use crate::models::{Memory, Tier};
 
+/// Source label stamped on memories the autonomy curator writes
+/// (one spelling across the three write paths — #1558).
+const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
+
 /// Minimum Jaccard-keyword overlap required to treat two memories as
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
 /// loosely — actual merge decision is still gated by an LLM pass.
@@ -400,7 +404,7 @@ fn consolidate_cluster(
         &summary,
         &namespace,
         &tier,
-        "ai-memory curator (autonomy)",
+        CURATOR_SOURCE_LABEL,
         crate::identity::sentinels::AI_CURATOR,
     )?;
 
@@ -555,7 +559,7 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
         ],
         priority: 3,
         confidence: 1.0,
-        source: "ai-memory curator (autonomy)".to_string(),
+        source: CURATOR_SOURCE_LABEL.to_string(),
         access_count: 0,
         created_at: ts.clone(),
         updated_at: ts,
@@ -622,7 +626,7 @@ pub fn persist_self_report(
         tags: vec!["_curator".to_string(), "_report".to_string()],
         priority: 2,
         confidence: 1.0,
-        source: "ai-memory curator (autonomy)".to_string(),
+        source: CURATOR_SOURCE_LABEL.to_string(),
         access_count: 0,
         created_at: ts.clone(),
         updated_at: ts,

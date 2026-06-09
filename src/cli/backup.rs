@@ -98,7 +98,7 @@ pub fn run_backup(
         sha256: sha.clone(),
         bytes,
         source_db: db_path.to_string_lossy().into_owned(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::PKG_VERSION.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let manifest_path = args.to.join(format!("ai-memory-{ts}.manifest.json"));

@@ -97,8 +97,23 @@ pub struct MigrationReport {
 /// Returns an error for unrecognised URL schemes or adapter-
 /// construction failures (bad path, unreachable Postgres, etc.).
 #[allow(clippy::unused_async)]
+/// Store-URL scheme prefix for the sqlite adapter.
+pub const SQLITE_URL_SCHEME: &str = "sqlite://";
+
+/// Store-URL scheme prefixes the postgres adapter accepts.
+pub const POSTGRES_URL_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
+
+/// True when `url` selects the postgres adapter — the ONE scheme sniff
+/// shared by `open_store`, the daemon `--store-url` dispatch, and
+/// `schema-init` (#1558 batch 5; previously four copies of the
+/// two-prefix check).
+#[must_use]
+pub fn is_postgres_url(url: &str) -> bool {
+    POSTGRES_URL_SCHEMES.iter().any(|s| url.starts_with(s))
+}
+
 pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
-    if let Some(path) = url.strip_prefix("sqlite://") {
+    if let Some(path) = url.strip_prefix(SQLITE_URL_SCHEME) {
         // Strip the optional third slash (sqlite:///foo → /foo;
         // sqlite://./foo → ./foo).
         let clean = path
@@ -109,7 +124,7 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     }
 
     #[cfg(feature = "sal-postgres")]
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+    if is_postgres_url(url) {
         let store = crate::store::postgres::PostgresStore::connect(url)
             .await
             .context("connect postgres adapter")?;

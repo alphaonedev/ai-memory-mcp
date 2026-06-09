@@ -70,6 +70,13 @@ DUP_THRESHOLD=3
 # truncate the production region below it.
 find_test_boundary () {
     local f="$1" line_mod line_cfg
+    # #1564 — a file-level `#![cfg(test)]` inner attribute makes the
+    # WHOLE file test code (e.g. src/mcp/tools/d1_4_985_helpers.rs);
+    # boundary 0 excludes every line.
+    if grep -qE '^[[:space:]]*#!\[cfg\(test\)\]' "$f" 2>/dev/null; then
+        echo 0
+        return
+    fi
     line_mod=$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests?[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
     line_cfg=$(awk '/^[[:space:]]*#\[cfg\(test\)\]/{attr=NR; next}
                     attr && /^[[:space:]]*(pub([(][^)]*[)])?[[:space:]]+)?mod[[:space:]]+[A-Za-z0-9_]+/{print attr; exit}

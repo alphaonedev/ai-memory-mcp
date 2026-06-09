@@ -341,7 +341,7 @@ fn count_live_memories(conn: &rusqlite::Connection) -> String {
 /// `<unavailable>` sentinel without branching downstream.
 ///
 /// Field semantics:
-/// - `version`         — `env!("CARGO_PKG_VERSION")` at compile time
+/// - `version`         — `crate::PKG_VERSION` at compile time
 /// - `db_path`         — resolved path the boot ran against
 /// - `schema_version`  — `vN` from the DB's `schema_version` table
 /// - `total_memories`  — count of live (non-expired) rows
@@ -460,14 +460,14 @@ impl BootManifest {
                 "db schema v{db_schema} unsupported by binary {bin_ver} \
                  (supports v{min}..v{max}); proceeding with degraded context. \
                  Run `ai-memory doctor` and consider upgrading.",
-                bin_ver = env!("CARGO_PKG_VERSION"),
+                bin_ver = crate::PKG_VERSION,
                 min = MIN_SUPPORTED_SCHEMA,
                 max = MAX_SUPPORTED_SCHEMA,
             ),
         };
 
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::PKG_VERSION.to_string(),
             db_path: db_path.display().to_string(),
             schema_version,
             total_memories,

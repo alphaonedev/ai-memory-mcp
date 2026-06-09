@@ -905,7 +905,7 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "status": if ok { "ok" } else { "error" },
             "service": "ai-memory",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::PKG_VERSION,
             "embedder_ready": embedder_ready,
             "federation_enabled": federation_enabled,
         })),
