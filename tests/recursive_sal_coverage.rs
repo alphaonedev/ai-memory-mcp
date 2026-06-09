@@ -154,7 +154,7 @@ async fn sqlite_sal_recursive_surface_roundtrips() {
     exercise_sal_surface(store.as_ref()).await;
 }
 
-/// Postgres twin — compile-gated on `sal-postgres` (PostgresStore lives
+/// Postgres twin — compile-gated on `sal-postgres` (`PostgresStore` lives
 /// behind that feature) and runtime-gated on `AI_MEMORY_TEST_POSTGRES_URL`.
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
