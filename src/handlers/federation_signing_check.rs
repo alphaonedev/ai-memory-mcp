@@ -1359,8 +1359,7 @@ mod fed_p2d_credential_resolution_tests {
             .expect("header"),
         );
 
-        let resolved =
-            resolve_peer_verifying_key(&headers, Some(leaf_id), &bundle, TEST_NOW_UNIX);
+        let resolved = resolve_peer_verifying_key(&headers, Some(leaf_id), &bundle, TEST_NOW_UNIX);
         assert_eq!(
             resolved.map(|k| k.to_bytes()),
             Some(node_pub.to_bytes()),
