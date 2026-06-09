@@ -674,6 +674,39 @@ impl MemoryStore for SqliteStore {
         .map_err(box_err)
     }
 
+    async fn reflect(
+        &self,
+        _ctx: &CallerContext,
+        input: &crate::storage::reflect::ReflectInput,
+        signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError> {
+        let conn = self.state.lock().await;
+        let mut hooks = db::ReflectHooks::empty();
+        hooks.active_keypair = signing_key;
+        db::reflect_with_hooks(&conn, input, &hooks)
+    }
+
+    async fn get_reflection_origin(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<crate::federation::reflection_bookkeeping::ReflectionOrigin>> {
+        let conn = self.state.lock().await;
+        crate::federation::reflection_bookkeeping::reflection_origin(&conn, id).map_err(box_err)
+    }
+
+    async fn list_recall_observations(
+        &self,
+        recall_id: Option<&str>,
+        consumed: Option<bool>,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::observations::Observation>> {
+        let conn = self.state.lock().await;
+        crate::observations::list_observations(&conn, recall_id, consumed, since, until, limit)
+            .map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
