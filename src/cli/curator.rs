@@ -5,6 +5,12 @@
 //! `daemon_runtime::run_curator_daemon_with_primitives` (W3 work);
 //! this module owns only the outer wrapper and the report printer.
 
+// The SAL store-build helpers (`curator_store_url`, the `--store-url`
+// path) and their `anyhow::Result` import are only live under the
+// sal-gated curator path; relax dead-code / unused-import in a non-sal
+// build only (sal builds enforce both fully).
+#![cfg_attr(not(feature = "sal"), allow(dead_code, unused_imports))]
+
 use crate::cli::CliOutput;
 use crate::curator::reflection_pass;
 use crate::identity::keypair as identity_keypair;
@@ -92,7 +98,7 @@ pub struct CuratorArgs {
     /// Postgres-backed curators require `--features sal,sal-postgres`
     /// at build time; otherwise the URL is rejected at startup.
     #[cfg(feature = "sal")]
-    #[arg(long, env = "AI_MEMORY_STORE_URL", value_name = "URL")]
+    #[arg(long, value_name = "URL")]
     pub store_url: Option<String>,
 }
 

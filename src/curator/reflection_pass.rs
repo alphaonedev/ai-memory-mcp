@@ -46,6 +46,11 @@
 //! flag wiring (see `src/cli/curator.rs`) consumes, plus
 //! [`run_reflection_pass`] which the CLI's `--reflect` mode invokes.
 
+// The pass internals run only through the SAL-gated curator path; in a
+// non-sal build only the config/report structs are live, so relax the
+// dead-code / unused-import lints there only (sal builds enforce fully).
+#![cfg_attr(not(feature = "sal"), allow(dead_code, unused_imports))]
+
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
