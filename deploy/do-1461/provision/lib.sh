@@ -57,7 +57,15 @@ FED_SYNC_QUORUM_W="${FED_SYNC_QUORUM_W:-2}"
 # FED_SYNC_QUORUM_W=2). FED_CATCHUP_INTERVAL_SECS: async /sync/since pull cadence
 # (the PRIMARY convergence mechanism). FED_SHUTDOWN_GRACE_SECS: graceful-drain
 # window on daemon stop. Override any via env for tighter/looser SLAs.
-FED_QUORUM_TIMEOUT_MS="${FED_QUORUM_TIMEOUT_MS:-2000}"
+# 8000ms (was 2000): the synchronous quorum ack must cover a CROSS-CONTINENT
+# round trip (fra1↔nyc3↔sgp1) PLUS the receiver's per-memory work — which can
+# include a ~1s nomic embed-on-receive when the incoming row carries no vector
+# (e.g. after a v29 embedding-dim migration NULLs embeddings) and the AGE
+# projection. 2000ms was tuned for same-DC and is too tight here, causing
+# push `deadline_exceeded` → DLQ. The write still commits LOCALLY first, so a
+# longer remote-ack wait only affects the synchronous-durability gate, not the
+# local write; async catch-up converges the remaining peers regardless.
+FED_QUORUM_TIMEOUT_MS="${FED_QUORUM_TIMEOUT_MS:-8000}"
 FED_CATCHUP_INTERVAL_SECS="${FED_CATCHUP_INTERVAL_SECS:-30}"
 FED_SHUTDOWN_GRACE_SECS="${FED_SHUTDOWN_GRACE_SECS:-30}"
 
@@ -85,9 +93,12 @@ FED_CRED_TTL_SECS="${FED_CRED_TTL_SECS:-604800}"   # 7 * SECS_PER_DAY
 FED_ISSUER_ID="${FED_ISSUER_ID:-$CAMPAIGN-ca}"
 FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # Golden ai-memory linux-x86_64 sha256, --features sal,sal-postgres,sqlite-bundled.
-# Re-pinned for release/v0.7.0 @ dc8666cc (PR #1523 merged: nomic asymmetric
-# search_document:/search_query: prefixes, #1520) — tree afa409bf, reproducible.
-GOLDEN_SHA256="${GOLDEN_SHA256:-2b5579104ad81b7241922d5163b9adb20c4c37c06013fdb967875267ba5718fe}"
+# Re-pinned for release/v0.7.0 @ c7b1bde2 (#1552: reflect + consolidate writes now
+# broadcast to the W-quorum on all backends — postgres SAL branches previously
+# returned before fanout, so recursive-learning artifacts converged cross-region
+# via async catch-up only; shared consolidate_fanout/reflect_fanout helpers + 2
+# fanout tests), reproducible.
+GOLDEN_SHA256="${GOLDEN_SHA256:-c3aba0af2a2eeb6ad47ff078b524402f8c04998281734e176e80539c2cb4bee3}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"
 
