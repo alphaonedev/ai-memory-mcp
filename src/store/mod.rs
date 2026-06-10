@@ -3342,4 +3342,187 @@ mod tests {
         let v = s.schema_version().await.expect("default schema_version");
         assert_eq!(v, 0, "default body MUST return 0");
     }
+
+    // ------------------------------------------------------------------
+    // #1579 A4 — serve-boot embedding-backfill sweep
+    // (`run_embedding_backfill_on_store`) loop-termination pins. The
+    // sweep re-scans `list_unembedded` until empty, so every "stop"
+    // arm (zero-progress, embedder fault, vector-count misalignment)
+    // is load-bearing against an infinite boot-task loop.
+    // ------------------------------------------------------------------
+
+    /// Configurable backfill double for the sweep loop-termination
+    /// pins: `list_unembedded` always reports `rows` candidate rows
+    /// (a stalled scan — the pathological re-scan-forever shape), and
+    /// `set_embeddings_batch` reports `written_per_chunk` rows
+    /// actually updated (0 models every row vanishing between scan
+    /// and write).
+    struct StalledBackfillStore {
+        rows: usize,
+        written_per_chunk: usize,
+    }
+
+    #[async_trait]
+    impl MemoryStore for StalledBackfillStore {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::DURABLE
+        }
+        async fn store(&self, _: &CallerContext, m: &Memory) -> StoreResult<String> {
+            Ok(m.id.clone())
+        }
+        async fn get(&self, _: &CallerContext, id: &str) -> StoreResult<Memory> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+        async fn update(&self, _: &CallerContext, _: &str, _: UpdatePatch) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &CallerContext, _: &str) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list(&self, _: &CallerContext, _: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn search(&self, _: &CallerContext, _: &str, _: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn verify(&self, _: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+            Ok(VerifyReport {
+                memory_id: id.to_string(),
+                integrity_ok: true,
+                findings: vec![],
+                signature_verified: false,
+            })
+        }
+        async fn link(&self, _: &CallerContext, _: &MemoryLink) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_links(&self, _: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+            Ok(vec![])
+        }
+        async fn register_agent(
+            &self,
+            _: &CallerContext,
+            _: &AgentRegistration,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_unembedded(
+            &self,
+            _ctx: &CallerContext,
+            limit: usize,
+        ) -> StoreResult<Vec<(String, String, String)>> {
+            Ok((0..self.rows.min(limit))
+                .map(|i| {
+                    (
+                        format!("stalled-{i}"),
+                        format!("title {i}"),
+                        format!("content {i}"),
+                    )
+                })
+                .collect())
+        }
+        async fn set_embeddings_batch(
+            &self,
+            _ctx: &CallerContext,
+            _entries: &[(String, Vec<f32>)],
+        ) -> StoreResult<usize> {
+            Ok(self.written_per_chunk)
+        }
+    }
+
+    /// #1579 A4 — adapters that inherit the `list_unembedded` default
+    /// (sqlite) make the serve-boot sweep a structural no-op: the
+    /// first scan is empty, the loop exits immediately, zero rows are
+    /// written. This is the "sqlite serve surface unchanged" pin.
+    #[tokio::test]
+    async fn backfill_sweep_is_noop_on_default_list_unembedded() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let written = run_embedding_backfill_on_store(&s, &ctx, &emb, 8).await;
+        assert_eq!(
+            written, 0,
+            "default (sqlite-shape) adapters must make the sweep a no-op"
+        );
+    }
+
+    /// #1579 A4 — the default `set_embeddings_batch` body loops
+    /// `update_embedding` and reports one written row per entry, so
+    /// every adapter is correct without an override.
+    #[tokio::test]
+    async fn default_set_embeddings_batch_loops_update_embedding() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let entries = vec![
+            ("a".to_string(), vec![0.1_f32]),
+            ("b".to_string(), vec![0.2_f32]),
+        ];
+        let written = s
+            .set_embeddings_batch(&ctx, &entries)
+            .await
+            .expect("default batch write");
+        assert_eq!(written, 2, "default body reports one row per entry");
+    }
+
+    /// #1579 A4 — zero-progress guard: a scan that keeps reporting the
+    /// same candidate rows while the batch write lands 0 of them (rows
+    /// deleted between scan and write, or a pathological adapter) MUST
+    /// terminate the sweep instead of re-scanning forever. Also passes
+    /// `batch_size = 0` to pin the zero→default chunk-size coercion
+    /// (a `LIMIT 0` scan would otherwise silently skip the sweep). The
+    /// timeout converts a guard regression into a test failure rather
+    /// than a hung suite.
+    #[tokio::test]
+    async fn backfill_sweep_zero_progress_guard_terminates() {
+        let s = StalledBackfillStore {
+            rows: 3,
+            written_per_chunk: 0,
+        };
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_embedding_backfill_on_store(&s, &ctx, &emb, 0),
+        )
+        .await
+        .expect("zero-progress sweep must terminate, not loop forever");
+        assert_eq!(written, 0, "zero-progress pass writes nothing");
+    }
+
+    /// #1579 A4 — embedder/scan misalignment guard: when `embed_batch`
+    /// returns a different number of vectors than inputs, pairing ids
+    /// with the wrong vectors would corrupt semantic recall. The sweep
+    /// must stop WITHOUT writing the misaligned chunk (and without
+    /// spinning on the unchanged scan).
+    #[tokio::test]
+    async fn backfill_sweep_stops_on_embedder_vector_count_mismatch() {
+        /// Trait-only fake: always returns ONE vector regardless of
+        /// input count (the `MockEmbedder` is documented never to
+        /// misalign, so the guard arm needs this fake to be reachable).
+        struct MisalignedEmbedder;
+        impl crate::embeddings::Embed for MisalignedEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32])
+            }
+            fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![0.0_f32]])
+            }
+        }
+
+        let s = StalledBackfillStore {
+            rows: 3,
+            // Would-be progress if the misaligned chunk were written —
+            // the guard must stop BEFORE the write, so the sweep still
+            // returns 0.
+            written_per_chunk: 3,
+        };
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_embedding_backfill_on_store(&s, &ctx, &MisalignedEmbedder, 8),
+        )
+        .await
+        .expect("misaligned sweep must terminate, not loop forever");
+        assert_eq!(written, 0, "misaligned chunk must be dropped, not written");
+    }
 }
