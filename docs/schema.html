@@ -162,11 +162,11 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The schema, table by table.</h1>
-  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v55 at v0.7.0</strong> (was v33 at v0.6.4; ladder v34 → v55 includes V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 #1156, <code>federation_nonces</code> persistence at v51 #1255, <code>transcript_line_dedup</code> idempotency table at v52 #1389, <code>memories_au</code> FTS5 trigger scoping at v53 #1418, tier-default expiry backfill onto legacy NULL-expiry rows at v54 #1466, and the sargable <code>list_memories_updated_since</code> federation-catchup rewrite + <code>idx_memories_updated_at</code> at v55 #1476). Migration is automatic on first daemon start.</p>
+  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v55 at v0.7.0</strong> (was v33 at v0.6.4; ladder v34 → v55 includes V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 #1156, <code>federation_nonce_cache</code> persistence at v51 #1255, <code>transcript_line_dedup</code> idempotency table at v52 #1389, <code>memories_au</code> FTS5 trigger scoping at v53 #1418, tier-default expiry backfill onto legacy NULL-expiry rows at v54 #1466, and the sargable <code>list_memories_updated_since</code> federation-catchup rewrite + <code>idx_memories_updated_at</code> at v55 #1476). Migration is automatic on first daemon start.</p>
   <div class="pills">
-    <span class="pill">17+ tables</span>
-    <span class="pill">30+ indexes</span>
-    <span class="pill">v50 schema</span>
+    <span class="pill">26 tables</span>
+    <span class="pill">65+ indexes</span>
+    <span class="pill">v55 schema</span>
     <span class="pill">SQLite + Postgres mirror</span>
   </div>
 </section>
@@ -174,7 +174,7 @@ footer a{color:var(--text-muted)}
 <section>
   <div class="container">
     <span class="eyebrow">Table-relationship map</span>
-    <h2 style="font-family:var(--font-sans);font-size:1.75rem">17 first-class tables at v0.7.0.</h2>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">26 first-class tables at v0.7.0.</h2>
     <p class="lede">Every relation flows from the central <code>memories</code> table. Foreign-key cascade-on-delete protects against orphan rows. <code>memory_links</code> is the KG primitive; <code>pending_actions</code> is the governance queue; <code>sync_state</code> is the federation cursor table; <code>audit_log</code> + <code>signed_events</code> are the V-4 tamper-evident chain; <code>signed_events_dlq</code> + <code>federation_push_dlq</code> are the v0.7.0 reliability DLQs (Track D #933). Table list authoritative against <code>src/storage/migrations.rs</code> CREATE TABLE statements at <code>CURRENT_SCHEMA_VERSION = 55</code>.</p>
 
     <svg class="relations-svg" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg">
@@ -312,7 +312,7 @@ footer a{color:var(--text-muted)}
       <g>
         <rect class="table-box" x="780" y="280" width="160" height="50" rx="8"/>
         <text class="table-name" x="860" y="305" text-anchor="middle">schema_version</text>
-        <text class="table-cols" x="860" y="320" text-anchor="middle">version = 50 (v0.7.0)</text>
+        <text class="table-cols" x="860" y="320" text-anchor="middle">version = 55 (v0.7.0)</text>
       </g>
 
       <!-- FK lines -->
@@ -341,7 +341,7 @@ footer a{color:var(--text-muted)}
       </defs>
     </svg>
 
-    <p class="lede" style="margin-top:1rem">Plus governance + identity + lifecycle tables introduced across the v34–v50 ladder (and visible via <code>SELECT name FROM sqlite_master WHERE type='table'</code> on a fresh DB): <code>namespace_standards</code> (Batman, schema v36), <code>entities</code> (entity registry, alongside <code>entity_aliases</code>), <code>skills</code> (Agent Skills, L1-5), <code>permissions</code> (K9 governance gate), <code>governance_rules</code> (K11 substrate rules engine), <code>agents</code> (registry; the <code>_agents</code> namespace is the public surface but reserved-namespace memories project into this side table for cross-cuts), <code>reflection_chain</code> (recursive learning, Task 1/8), <code>offloaded_blobs</code> (QW-3 context-offload), <code>personas</code> (QW-2 persona artefact), plus migration tracking (<code>schema_version</code> shown above). Verified against <code>src/storage/migrations.rs</code> at v0.7.0 release HEAD.</p>
+    <p class="lede" style="margin-top:1rem">Plus governance + identity + lifecycle tables introduced across the v34–v55 ladder (and visible via <code>SELECT name FROM sqlite_master WHERE type='table'</code> on a fresh DB): <code>agent_quotas</code> (K8 per-agent quotas; per-namespace PK dimension at v50 #1156), <code>governance_rules</code> (K11 substrate rules engine), <code>skills</code> + <code>skill_resources</code> (Agent Skills, L1-5), <code>recall_observations</code> (Form-5 recall ledger), <code>offloaded_blobs</code> (QW-3 context-offload), <code>memory_transcripts</code> + <code>memory_transcript_links</code> (sidechain transcripts, I2), <code>subscription_dlq</code> (K7 webhook DLQ), <code>federation_nonce_cache</code> (v51 #1255 replay-prevention persistence), <code>transcript_line_dedup</code> (v52 #1389 L4 idempotency), plus migration tracking (<code>schema_version</code> shown above). Agents, entities, personas, and namespace standards are NOT side tables — they are memories (reserved namespaces / standard memories) resolved via <code>namespace_meta</code> + <code>entity_aliases</code>. Verified against <code>src/storage/migrations.rs</code> CREATE TABLE census at v0.7.0 release HEAD.</p>
   </div>
 </section>
 
@@ -362,24 +362,34 @@ footer a{color:var(--text-muted)}
         <thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td class="col"><span class="flag pk">PK</span>id</td><td class="type">TEXT</td><td class="note">UUIDv4 stringified. Stable across federation.</td></tr>
-          <tr><td class="col">tier</td><td class="type">TEXT NOT NULL</td><td class="note">One of <code>short</code> · <code>mid</code> · <code>long</code> · <code>archived</code>. Drives TTL + visibility.</td></tr>
-          <tr><td class="col">namespace</td><td class="type">TEXT NOT NULL</td><td class="note">Hierarchical path with <code>/</code> delimiter (v0.6.3 Stream A). Max depth 8 segments.</td></tr>
-          <tr><td class="col">title</td><td class="type">TEXT NOT NULL</td><td class="note">Human-readable summary, ≤ 256 chars. FTS5-indexed.</td></tr>
-          <tr><td class="col">content</td><td class="type">TEXT NOT NULL</td><td class="note">Body text. Up to 1 MiB. FTS5-indexed.</td></tr>
-          <tr><td class="col">tags</td><td class="type">TEXT</td><td class="note">JSON array. Validator caps count at 32, length at 64 each.</td></tr>
+          <tr><td class="col">tier</td><td class="type">TEXT NOT NULL</td><td class="note">One of <code>short</code> · <code>mid</code> · <code>long</code> (canonical <code>Tier</code> enum in <code>src/models/memory.rs</code>; archived rows move to the <code>archived_memories</code> table, there is no archived tier value). Drives TTL + visibility.</td></tr>
+          <tr><td class="col">namespace</td><td class="type">TEXT NOT NULL</td><td class="note">Hierarchical path with <code>/</code> delimiter (v0.6.3 Stream A). Max length 512 chars, max depth 8 segments.</td></tr>
+          <tr><td class="col">title</td><td class="type">TEXT NOT NULL</td><td class="note">Human-readable summary, ≤ 512 chars (<code>MAX_TITLE_LEN</code>). FTS5-indexed.</td></tr>
+          <tr><td class="col">content</td><td class="type">TEXT NOT NULL</td><td class="note">Body text. Up to 65,536 bytes (<code>MAX_CONTENT_SIZE</code> = 64 KiB). FTS5-indexed.</td></tr>
+          <tr><td class="col">tags</td><td class="type">TEXT</td><td class="note">JSON array. Validator caps count at 50 (<code>MAX_TAGS_COUNT</code>), length at 128 bytes each (<code>MAX_TAG_LEN</code>).</td></tr>
           <tr><td class="col">priority</td><td class="type">INTEGER</td><td class="note">1-10 scale. Drives auto-promote eligibility.</td></tr>
           <tr><td class="col">confidence</td><td class="type">REAL</td><td class="note">0.0-1.0. Displayed as % when &lt; 1.0.</td></tr>
-          <tr><td class="col">source</td><td class="type">TEXT</td><td class="note">Origin tag: <code>user</code> · <code>claude</code> · <code>hook</code> · <code>api</code> · <code>import</code> · <code>cli</code> · <code>consolidation</code>.</td></tr>
+          <tr><td class="col">source</td><td class="type">TEXT</td><td class="note">Origin tag (<code>VALID_SOURCES</code> in <code>src/validate.rs</code>): <code>user</code> · <code>nhi</code> (v0.7 vendor-neutral default) · <code>claude</code> (deprecated, back-compat) · <code>hook</code> · <code>api</code> · <code>cli</code> · <code>import</code> · <code>consolidation</code> · <code>system</code> · <code>chaos</code> · <code>notify</code>.</td></tr>
           <tr><td class="col">access_count</td><td class="type">INTEGER</td><td class="note">Bumped on each recall hit. Triggers auto-promote at ≥ 5.</td></tr>
           <tr><td class="col">created_at</td><td class="type">TEXT</td><td class="note">RFC3339 UTC. Immutable.</td></tr>
           <tr><td class="col">updated_at</td><td class="type">TEXT</td><td class="note">RFC3339 UTC. Bumped on update.</td></tr>
           <tr><td class="col">last_accessed_at</td><td class="type">TEXT NULL</td><td class="note">RFC3339. Touched on recall. Drives recency-decay scoring.</td></tr>
           <tr><td class="col">expires_at</td><td class="type">TEXT NULL</td><td class="note">RFC3339. NULL = never. GC sweep purges past-due.</td></tr>
-          <tr><td class="col">embedding</td><td class="type">BLOB NULL</td><td class="note">f32 array, 768 dims (nomic-embed-text). Set if semantic+ tier.</td></tr>
+          <tr><td class="col">embedding</td><td class="type">BLOB NULL</td><td class="note">f32 array — 384 dims (all-MiniLM-L6-v2, local candle) or 768 dims (nomic-embed-text-v1.5 via Ollama); declared per row by <code>embedding_dim</code>. Set if semantic+ tier.</td></tr>
+          <tr><td class="col">embedding_dim</td><td class="type">INTEGER NULL</td><td class="note">v0.6.3.1 data-integrity guard — declared dimension of the stored embedding (384 or 768) so mixed-model rows can't cross-contaminate cosine scoring.</td></tr>
           <tr><td class="col">metadata</td><td class="type">TEXT</td><td class="note">JSON. Holds <code>agent_id</code>, <code>scope</code>, <code>governance</code> policy, <code>chunked_from</code>.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>reflection_depth</td><td class="type">INTEGER</td><td class="note">Recursive-learning Task 1/8 — depth in the reflection recursion tree; 0 for caller-minted rows.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>memory_kind</td><td class="type">TEXT NULL</td><td class="note">Batman Form-6 vocabulary: Observation / Reflection / Persona / Concept / Entity / Claim / Relation / Event / Conversation / Decision.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>atomised_into / atom_of</td><td class="type">TEXT NULL</td><td class="note">WT-1 atomisation provenance (parent → atoms, atom → parent).</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>entity_id / persona_version</td><td class="type">TEXT / INTEGER NULL</td><td class="note">QW-2 persona-as-artifact columns.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>citations / source_uri / source_span</td><td class="type">TEXT NULL</td><td class="note">Form-4 fact provenance.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>confidence_source / confidence_signals / confidence_decayed_at</td><td class="type">TEXT NULL</td><td class="note">Form-5 confidence calibration + decay.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>mentioned_entity_id</td><td class="type">TEXT NULL</td><td class="note">Entity-mention back-reference.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>encrypted_envelope</td><td class="type">BLOB NULL</td><td class="note">Schema v44 (#228) — E2E content encryption at rest: X25519 ephemeral pubkey + ChaCha20-Poly1305 AEAD-sealed ciphertext envelope.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>version</td><td class="type">BIGINT</td><td class="note">Schema v45 Gap-1 optimistic concurrency for <code>memory_update</code>; defaults to 1 on legacy rows.</td></tr>
         </tbody>
       </table>
-      <div class="idx-list"><span class="idx-name">▸ idx_memories_namespace</span> · <span class="idx-name">▸ idx_memories_tier</span> · <span class="idx-name">▸ idx_memories_priority_desc</span> · <span class="idx-name">▸ idx_memories_expires_at</span> · <span class="idx-name">▸ memories_fts (FTS5 virtual)</span></div>
+      <div class="idx-list"><span class="idx-name">▸ idx_memories_namespace</span> · <span class="idx-name">▸ idx_memories_tier</span> · <span class="idx-name">▸ idx_memories_priority</span> · <span class="idx-name">▸ idx_memories_expires</span> · <span class="idx-name">▸ idx_memories_updated_at (v55)</span> · <span class="idx-name">▸ idx_memories_title_ns</span> · <span class="idx-name">▸ idx_memories_agent_id</span> · <span class="idx-name">▸ memories_fts (FTS5 virtual)</span></div>
     </div>
 
     <div class="tbl">
@@ -400,8 +410,7 @@ footer a{color:var(--text-muted)}
           <tr><td class="col">valid_until</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.6.3: when the assertion was superseded. NULL = still valid.</td></tr>
           <tr><td class="col">observed_by</td><td class="type">TEXT NULL</td><td class="note">v0.6.3: agent_id of the observer. Powers per-agent visibility filter.</td></tr>
           <tr><td class="col"><span class="flag new">v0.7</span>signature</td><td class="type">BLOB NULL</td><td class="note"><strong>v0.7.0 POPULATED</strong>: Ed25519 signature for attested provenance (was v0.6.3 placeholder). Per-row Ed25519 <code>sig</code> population gated on the resolved daemon <code>agent_id</code> having a <code>*.priv</code> keypair on disk.</td></tr>
-          <tr><td class="col"><span class="flag new">v0.7</span>attest_level</td><td class="type">TEXT NULL</td><td class="note">v0.7.0: one of <code>"unsigned" / "agent" / "operator"</code>. Indicates the attestation tier of the link.</td></tr>
-          <tr><td class="col"><span class="flag new">v0.7</span>signed_at</td><td class="type">TIMESTAMP NULL</td><td class="note">v0.7.0: when the signature was applied. Pairs with <code>signature</code>.</td></tr>
+          <tr><td class="col"><span class="flag new">v0.7</span>attest_level</td><td class="type">TEXT NULL</td><td class="note">v0.7.0 (H4 <code>AttestLevel</code> enum, <code>src/models/link.rs</code>): one of <code>unsigned</code> · <code>self_signed</code> · <code>peer_attested</code> · <code>signed_by_peer</code> · <code>daemon_signed</code>.</td></tr>
         </tbody>
       </table>
       <div class="idx-list"><span class="idx-name">▸ idx_links_temporal_src</span> (source_id, valid_from, valid_until) · <span class="idx-name">▸ idx_links_temporal_tgt</span> · <span class="idx-name">▸ idx_links_relation</span></div>
@@ -415,7 +424,7 @@ footer a{color:var(--text-muted)}
       <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. <strong>Current version: 55 at v0.7.0</strong> (was 33 at v0.6.4 — the v34 → v55 ladder spans 22 migrations).</div>
       <table class="cols">
         <tbody>
-          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 55 (v0.7.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 55</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. v34 → v55 covers V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 (#1156: <code>agent_quotas</code> PK <code>(agent_id)</code> → <code>(agent_id, namespace)</code>; pre-v50 rows backfill to the <code>_global</code> sentinel), <code>federation_nonces</code> persistence at v51 (#1255), <code>transcript_line_dedup</code> idempotency table at v52 (#1389), <code>memories_au</code> FTS5 trigger scoping at v53 (#1418), tier-default expiry backfill onto legacy NULL-expiry mid/short rows at v54 (#1466, in-code arm, no new .sql), and the sargable <code>list_memories_updated_since</code> federation-catchup rewrite + <code>idx_memories_updated_at</code> at v55 (#1476; postgres version-stamp no-op).</td></tr>
+          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 55 (v0.7.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 55</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. v34 → v55 covers V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 (#1156: <code>agent_quotas</code> PK <code>(agent_id)</code> → <code>(agent_id, namespace)</code>; pre-v50 rows backfill to the <code>_global</code> sentinel), <code>federation_nonce_cache</code> persistence at v51 (#1255), <code>transcript_line_dedup</code> idempotency table at v52 (#1389), <code>memories_au</code> FTS5 trigger scoping at v53 (#1418), tier-default expiry backfill onto legacy NULL-expiry mid/short rows at v54 (#1466, in-code arm, no new .sql), and the sargable <code>list_memories_updated_since</code> federation-catchup rewrite + <code>idx_memories_updated_at</code> at v55 (#1476; postgres version-stamp no-op).</td></tr>
         </tbody>
       </table>
     </div>
@@ -496,7 +505,7 @@ footer a{color:var(--text-muted)}
         <thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td class="col"><span class="flag pk">PK</span>id</td><td class="type">TEXT</td><td class="note">UUIDv4 of the pending action.</td></tr>
-          <tr><td class="col">action_type</td><td class="type">TEXT NOT NULL</td><td class="note">One of <code>store</code> · <code>delete</code> · <code>promote</code> (the GovernedAction enum).</td></tr>
+          <tr><td class="col">action_type</td><td class="type">TEXT NOT NULL</td><td class="note">One of <code>store</code> · <code>delete</code> · <code>promote</code> · <code>reflect</code> (the GovernedAction enum; <code>reflect</code> added at v0.7.0 L1-8 for the <code>memory_reflect</code> approval gate).</td></tr>
           <tr><td class="col">namespace</td><td class="type">TEXT NOT NULL</td><td class="note">Target namespace (drives policy lookup).</td></tr>
           <tr><td class="col">requested_by</td><td class="type">TEXT NOT NULL</td><td class="note">agent_id of the caller.</td></tr>
           <tr><td class="col">requested_at</td><td class="type">TEXT NOT NULL</td><td class="note">RFC3339 UTC.</td></tr>
@@ -555,7 +564,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Migrations</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Schema is versioned. Migrations are idempotent.</h2>
-    <p class="lede">Every schema change is a forward migration applied at daemon startup. Idempotent so re-runs are safe. v15 was the v0.6.3 Stream B addition (KG temporal-validity columns + entity_aliases). v0.6.3.1 added the v17/v18/v19 ladder: v17 adds governance.inherit backfill (`migrations/sqlite/0012_governance_inherit.sql`), v18 adds embedding_dim guard + archive lossless (`0011_v0631_data_integrity.sql`), v19 adds webhook event_types column + index (`0013_webhook_event_types.sql`). Older versions (≤ v14) remain inline in <code>src/storage/mod.rs::migrate</code>.</p>
+    <p class="lede">Every schema change is a forward migration applied at daemon startup. Idempotent so re-runs are safe. v15 was the v0.6.3 Stream B addition (KG temporal-validity columns + entity_aliases). v0.6.3.1 added the v17/v18/v19 ladder: v17 adds governance.inherit backfill (`migrations/sqlite/0012_governance_inherit.sql`), v18 adds embedding_dim guard + archive lossless (`0011_v0631_data_integrity.sql`), v19 adds webhook event_types column + index (`0013_webhook_event_types.sql`). Older versions (≤ v14) remain inline in <code>src/storage/migrations.rs::migrate</code>.</p>
 
     <div class="tbl t-meta">
       <div class="tbl-head">
@@ -574,11 +583,17 @@ footer a{color:var(--text-muted)}
           <tr><td class="col">20-33</td><td class="type">v0.6.4</td><td class="note">Hooks pipeline (25 events); sidechain transcripts (zstd-3 BLOB); subscription DLQ; consolidated_from_agents array; KG temporal-index v2; tier-promotion metadata; A2A correlation; smart-load veto; agent quotas; signed_events audit table.</td></tr>
           <tr><td class="col">34</td><td class="type">v0.7.0</td><td class="note"><strong>V-4 closeout (#698)</strong>: <code>signed_events.prev_hash</code> + <code>sequence</code> cross-row SHA-256 hash chain (tamper-evident audit log).</td></tr>
           <tr><td class="col">35-37</td><td class="type">v0.7.0</td><td class="note">Shadow retention columns on calibration tables; <code>memory_kind</code> Batman Form-6 vocabulary column on memories; <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact); <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance).</td></tr>
-          <tr><td class="col">38-44</td><td class="type">v0.7.0</td><td class="note"><code>reflection_depth</code> column on memories (recursive-learning Task 1/8); <code>atomised_into</code> + <code>atom_of</code> columns (atomisation links); <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 auto-confidence + shadow + decay); <code>mentioned_entity_id</code> column; link <code>attest_level</code> enum + <code>signed_at</code> column.</td></tr>
+          <tr><td class="col">38-44</td><td class="type">v0.7.0</td><td class="note"><code>reflection_depth</code> column on memories (recursive-learning Task 1/8); <code>atomised_into</code> + <code>atom_of</code> columns (atomisation links); <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 auto-confidence + shadow + decay); <code>mentioned_entity_id</code> column; link <code>attest_level</code> enum column.</td></tr>
           <tr><td class="col">45</td><td class="type">v0.7.0</td><td class="note"><strong>Gap-1 optimistic concurrency</strong>: <code>version BIGINT</code> column on memories (defaults to 1 on legacy rows via SQL DEFAULT + serde default). Powers <code>memory_update</code> expected_version race-detection.</td></tr>
           <tr><td class="col">46-47</td><td class="type">v0.7.0</td><td class="note">Per-namespace transcript lifecycle TTL + auto-extract policy columns; KG temporal-index v3; subscription HMAC-signed-only enforcement (R3-S1.HMAC; unsigned dispatch DISABLED).</td></tr>
           <tr><td class="col">48</td><td class="type">v0.7.0</td><td class="note"><strong>federation_push_dlq table</strong> (Track D #933): captures peer-rejected federation writes with retry-with-backoff replay. Pairs with <code>memory_subscription_dlq_list</code> / <code>memory_subscription_replay</code> MCP tools.</td></tr>
           <tr><td class="col">49</td><td class="type">v0.7.0 release</td><td class="note"><strong>archived_memories +14 nullable columns</strong> (#1025): reflection_depth, atomised_into, atom_of, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version. Archive → restore is now LOSSLESS for the full v0.7.0 Memory shape on both backends.</td></tr>
+          <tr><td class="col">50</td><td class="type">v0.7.0 release</td><td class="note"><strong>Per-namespace K8 quotas</strong> (#1156): <code>agent_quotas</code> PRIMARY KEY extended <code>(agent_id)</code> → <code>(agent_id, namespace)</code>; pre-v50 rows backfill to the <code>_global</code> sentinel namespace.</td></tr>
+          <tr><td class="col">51</td><td class="type">v0.7.0 release</td><td class="note"><strong>federation_nonce_cache table</strong> (#1255): peer-replay-prevention nonces persist across daemon restarts.</td></tr>
+          <tr><td class="col">52</td><td class="type">v0.7.0 release</td><td class="note"><strong>transcript_line_dedup table</strong> (#1389 L4): <code>(host_pubkey_b64, line_sha256)</code> composite key backing <code>memory_capture_turn</code> idempotency + the L2 <code>recover_from_transcript</code> replay path.</td></tr>
+          <tr><td class="col">53</td><td class="type">v0.7.0 release</td><td class="note"><strong>memories_au FTS5 trigger scoping</strong> (#1418): sync trigger scoped to <code>(title, content, tags)</code> so non-FTS column updates no longer fire a needless sync.</td></tr>
+          <tr><td class="col">54</td><td class="type">v0.7.0 release</td><td class="note"><strong>Tier-default expiry backfill</strong> (#1466): legacy NULL-expiry mid/short rows get <code>created_at + tier TTL</code>, closing the TTL-leak immortal-rows class. In-code arm, no new .sql file.</td></tr>
+          <tr><td class="col">55</td><td class="type">v0.7.0 release</td><td class="note"><strong>Sargable federation catchup</strong> (#1476): <code>list_memories_updated_since</code> predicate split for a true index range scan; SQLite adds <code>idx_memories_updated_at</code>; postgres is a version-stamp no-op (bootstrap already ships <code>memories_updated_at_idx</code>). <strong>Current = CURRENT_SCHEMA_VERSION = 55.</strong></td></tr>
         </tbody>
       </table>
     </div>

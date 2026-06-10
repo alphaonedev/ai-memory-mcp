@@ -192,7 +192,7 @@ footer a{color:var(--text-muted)}
     <p style="margin:0;font-size:.95rem"><strong>v0.7.0 secure-default posture flips</strong> (operators upgrading from v0.6.x):</p>
     <ul style="margin:.75rem 0 0 0;font-size:.9rem;color:var(--text-muted);padding-left:1.5rem">
       <li><code>permissions.mode</code> default <code>advisory</code> → <strong><code>enforce</code></strong>. Opt-out: <code>AI_MEMORY_PERMISSIONS_MODE=advisory</code>.</li>
-      <li><code>AI_MEMORY_FED_REQUIRE_SIG=1</code> + <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> default-on (federation HMAC sig + anti-replay nonce required). Set <code>=0</code> during peer Ed25519 enrolment.</li>
+      <li><code>AI_MEMORY_FED_REQUIRE_SIG=1</code> + <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> default-on (federation Ed25519 <code>X-Memory-Sig</code> + anti-replay <code>X-Memory-Nonce</code> required). Set <code>=0</code> during peer Ed25519 enrolment.</li>
       <li><code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0</code> (governance fail-CLOSED on rule-consultation error). #1054.</li>
       <li><code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=0</code> (passphrase file mode 0400 required). #1055.</li>
       <li><code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=0</code> (SSRF guard fail-CLOSED on DNS NXDOMAIN). #1053.</li>
@@ -498,9 +498,9 @@ footer a{color:var(--text-muted)}
     <p class="lede">Governance is a write-side gate. Reads, federation, and audit live elsewhere. Calling these out so AI clients don't assume the wrong contract.</p>
     <div class="snip" style="font-family:var(--font-sans);white-space:normal;line-height:1.7">
       <div><strong style="color:var(--bad)">Not covered:</strong> read paths (<code>memory_get</code>, <code>memory_list</code>, <code>memory_recall</code>, <code>memory_search</code>) — those use the <code>scope</code>/<code>as_agent</code> visibility filter, not governance.</div>
-      <div><strong style="color:var(--bad)">Not covered:</strong> link creation (<code>memory_link</code>) — passes <code>validate_link</code> only; KG edges are not gated. May change in v0.7 (Hook Pipeline can run KG-write hooks).</div>
+      <div><strong style="color:var(--bad)">Not covered:</strong> link creation (<code>memory_link</code>) — passes link validation only; KG edges are not gated by the write/promote/delete policy (the v0.7.0 hook pipeline can run link-write hooks on top).</div>
       <div><strong style="color:var(--bad)">Not covered:</strong> sync push receive — peers trust each other on validated payloads, but governance is <em>not</em> re-checked on the receiver. The sender's verdict is authoritative.</div>
-      <div><strong style="color:var(--bad)">Not covered (yet):</strong> hooks (<a href="https://github.com/alphaonedev/agentic-mem-labs/blob/main/strategy/2026-04-26/architectural-enhancement-spec-v1.md" style="color:var(--p1)">v0.7 Bucket 0</a>) and Permission System refactor (<a href="https://github.com/alphaonedev/agentic-mem-labs/blob/main/strategy/2026-04-26/ai-memory-v0.7-grand-slam.md" style="color:var(--p1)">v0.7 Bucket 3</a>) — current governance is the foundation those layers extend.</div>
+      <div><strong style="color:var(--good)">Now layered on top (v0.7.0):</strong> the 25-event hook pipeline (Bucket 0) and the K9 permission system (<code>enforce</code> / <code>advisory</code> / <code>off</code> + <code>[[permissions.rules]]</code> overlays, Bucket 3) SHIPPED — both extend, rather than replace, the namespace-policy gate documented on this page.</div>
     </div>
   </div>
 </section>

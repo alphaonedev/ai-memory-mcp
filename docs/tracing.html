@@ -168,11 +168,11 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The trace, every line.</h1>
-  <p class="tagline">ai-memory uses the <code>tracing</code> crate with an <code>EnvFilter</code>-driven subscriber. <strong>564 log call sites across 86 source files / 19 directories at v0.7.0</strong> (was ~176 at v0.6.x; growth from the Wave-2 SAL split, the L1-5 Agent Skills surface, the K7 subscription-reliability drainer, the K11 governance-rules engine, the Form-4/5 provenance + confidence pipelines, and the recursive-learning + atomisation hooks). Every error path is named; every fanout failure is logged with the peer id; every governance verdict is loud. AI clients can grep the canonical lines below to reconstruct what the daemon was doing.</p>
+  <p class="tagline">ai-memory uses the <code>tracing</code> crate with an <code>EnvFilter</code>-driven subscriber. <strong>579 log call sites across 95 source files / 21 directories at v0.7.0</strong> (was ~176 at v0.6.x; growth from the Wave-2 SAL split, the L1-5 Agent Skills surface, the K7 subscription-reliability drainer, the K11 governance-rules engine, the Form-4/5 provenance + confidence pipelines, and the recursive-learning + atomisation hooks). Every error path is named; every fanout failure is logged with the peer id; every governance verdict is loud. AI clients can grep the canonical lines below to reconstruct what the daemon was doing.</p>
   <div class="pills">
     <span class="pill">tracing 0.1</span>
     <span class="pill">EnvFilter</span>
-    <span class="pill">564 call sites</span>
+    <span class="pill">579 call sites</span>
     <span class="pill">RUST_LOG-controlled</span>
   </div>
 </section>
@@ -182,14 +182,14 @@ footer a{color:var(--text-muted)}
     <span class="eyebrow">Setup</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">How tracing initializes.</h2>
     <p class="lede">The daemon installs a <code>tracing_subscriber::fmt</code> layer with the standard <code>EnvFilter</code> chain. Default directives keep <code>ai_memory</code> + <code>tower_http</code> at <code>info</code> while honoring any <code>RUST_LOG</code> override.</p>
-    <div class="snip">// src/main.rs::serve()
+    <div class="snip">// src/daemon_runtime.rs::init_tracing() — called from serve()
 tracing_subscriber::fmt()
     .with_env_filter(
         EnvFilter::<span class="key">from_default_env</span>()
-            .add_directive(<span class="val">"ai_memory=info"</span>.parse()?)
+            .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?) <span class="cm">// "ai_memory=info"</span>
             .add_directive(<span class="val">"tower_http=info"</span>.parse()?),
     )
-    .init();</div>
+    .try_init();</div>
     <p class="lede" style="margin-top:1rem">To turn the volume up:</p>
     <div class="snip"><span class="cm"># quiet — only errors</span>
 RUST_LOG=ai_memory=error ai-memory serve
@@ -202,59 +202,74 @@ RUST_LOG=ai_memory::federation=debug,ai_memory=info ai-memory serve
 
 <span class="cm"># everything (very chatty — local dev only)</span>
 RUST_LOG=ai_memory=trace,tower_http=debug ai-memory serve</div>
+    <p class="lede" style="margin-top:1.5rem"><strong>Named metadata targets (post-#1562).</strong> Most events emit under the module-path default, so an <code>ai_memory=…</code> directive matches them (including the named <code>ai_memory::</code>-prefixed targets: <code>ai_memory::subscriptions</code>, <code>ai_memory::authz</code>, <code>ai_memory::handlers::skills</code>, <code>ai_memory::federation::sync</code>, <code>ai_memory::federation::push_dlq</code>, <code>ai_memory::governance::audit</code>). But a set of subsystems emit under <em>literal</em> targets that do <strong>not</strong> start with <code>ai_memory</code> — an <code>ai_memory=debug</code> filter does NOT match these events; name them explicitly:</p>
+    <div class="snip"><span class="cm"># literal targets (RUST_LOG must name them — ai_memory=… won't match)</span>
+store::postgres            <span class="cm"># postgres SAL adapter (#1562 — real metadata target)</span>
+store::postgres::kg        <span class="cm"># postgres AGE knowledge-graph ops (#1562)</span>
+schema_init                <span class="cm"># `ai-memory schema-init` CLI (#1562)</span>
+signed_events              <span class="cm"># append-only audit chain</span>
+transcripts.lifecycle      <span class="cm"># sidechain transcript storage</span>
+hnsw.eviction              <span class="cm"># vector-index eviction/rebuild</span>
+pre_store.auto_atomise     <span class="cm"># WT-1 auto-atomise hook (+ .sync sibling)</span>
+federation::signing        <span class="cm"># outbound sync-body signing</span>
+federation::attestation    <span class="cm"># inbound peer attestation</span>
+governance                 <span class="cm"># rule-engine verdicts</span>
+
+<span class="cm"># example: debug the postgres adapter specifically</span>
+RUST_LOG=ai_memory=info,store::postgres=debug,store::postgres::kg=debug ai-memory serve</div>
   </div>
 </section>
 
 <section>
   <div class="container">
     <span class="eyebrow">Where the calls live</span>
-    <h2 style="font-family:var(--font-sans);font-size:1.75rem">19 directories, 564 call sites at v0.7.0.</h2>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">21 directories, 579 call sites at v0.7.0.</h2>
     <p class="lede">Counts pulled from <code>grep -rnE '^\s*(tracing::)?(error|warn|info|debug|trace)!\s*\(' src/</code>. Handlers, federation, and the SAL adapter family dominate — they are where user-visible behavior happens.</p>
     <div class="modgrid">
       <div class="mod">
-        <div class="count">191</div>
+        <div class="count">163</div>
         <div class="lbl">src/handlers/</div>
         <p>Every HTTP/MCP write goes through one of these handlers (modular split since v0.7 Wave-1: <code>http.rs</code>, <code>federation_receive.rs</code>, <code>hook_subscribers.rs</code>, <code>transport.rs</code>). Errors get an <code>error!("handler error: {e}")</code> and the response code; governance verdicts get an <code>error!("governance error: {e}")</code>.</p>
       </div>
       <div class="mod">
-        <div class="count">109</div>
+        <div class="count">121</div>
         <div class="lbl">src/ (top-level)</div>
         <p>Boot + MCP dispatch + LLM client + subscriptions + reranker + curator. Mostly <code>info!</code> startup banners + warn-level fallback notices + the Ollama / OpenAI-compatible client error envelopes.</p>
       </div>
       <div class="mod fed">
-        <div class="count">72</div>
+        <div class="count">74</div>
         <div class="lbl">src/federation/</div>
         <p>Quorum fanout (W of N) is the noisiest area. Every peer success is silent; every peer failure logs <code>warn!("federation: peer {peer_id} failed for {id}: {reason}")</code> so the operator can see where the network dropped traffic.</p>
       </div>
       <div class="mod db">
-        <div class="count">53</div>
+        <div class="count">60</div>
         <div class="lbl">src/store/ (SAL)</div>
         <p>SAL adapter family — <code>sqlite.rs</code> + <code>postgres.rs</code> (Apache AGE Cypher). Logs adapter-bound issues, schema-migration ladder progress, and the postgres-route-gate verdicts on missing trait coverage.</p>
       </div>
       <div class="mod db">
-        <div class="count">36</div>
+        <div class="count">40</div>
         <div class="lbl">src/storage/</div>
-        <p>SQLite SQL primitives + migrations.rs (v34→v55 ladder). Migration logs, FTS5 index rebuild events, vacuum completion. Most <code>storage::*</code> calls are silent on success.</p>
+        <p>SQLite SQL primitives + migrations.rs (v2→v55 ladder). Migration logs, FTS5 index rebuild events, vacuum completion. Most <code>storage::*</code> calls are silent on success.</p>
+      </div>
+      <div class="mod">
+        <div class="count">37</div>
+        <div class="lbl">src/mcp/tools/ + src/mcp/</div>
+        <p>MCP protocol layer + the 74-entry registry (15 calls under <code>src/mcp/tools</code>, 21 under <code>src/mcp/tools/store</code> alone). Logs malformed JSON-RPC, unknown tool names, method-not-found, and per-tool dispatch errors.</p>
       </div>
       <div class="mod">
         <div class="count">33</div>
-        <div class="lbl">src/mcp/tools/ + src/mcp/</div>
-        <p>MCP protocol layer + the 74-entry registry (15 calls under <code>src/mcp/tools</code>, 18 under <code>src/mcp/tools/store</code> alone). Logs malformed JSON-RPC, unknown tool names, method-not-found, and per-tool dispatch errors.</p>
-      </div>
-      <div class="mod">
-        <div class="count">28</div>
         <div class="lbl">src/hooks/</div>
-        <p>Pre-store / post-reflect hook pipeline (14 calls under <code>src/hooks/pre_store</code>; 14 across the rest). Logs hook chain failures, retry decisions, and the v0.7.0 auto-export panic-recovery path.</p>
+        <p>Pre-store / post-reflect hook pipeline (14 calls under <code>src/hooks/pre_store</code>; 19 across the rest). Logs hook chain failures, retry decisions, and the v0.7.0 auto-export panic-recovery path.</p>
       </div>
       <div class="mod">
-        <div class="count">12</div>
+        <div class="count">16</div>
         <div class="lbl">src/governance/</div>
         <p>K9 permissions gate + K11 substrate rules engine. Logs every Deny verdict, every fail-CLOSED rule-consultation error, and every signed-rule cache invalidation.</p>
       </div>
       <div class="mod">
-        <div class="count">8</div>
+        <div class="count">12</div>
         <div class="lbl">src/cli/</div>
-        <p>CLI subcommand handlers (58 top-level subcommands at v0.7.0). Logs config-migration outcomes, schema-init progress, doctor reachability probes.</p>
+        <p>CLI subcommand handlers (79 top-level subcommands in the default build at v0.7.0; 81 under <code>--features sal</code>). Logs config-migration outcomes, schema-init progress, doctor reachability probes.</p>
       </div>
       <div class="mod">
         <div class="count">6</div>
@@ -262,12 +277,12 @@ RUST_LOG=ai_memory=trace,tower_http=debug ai-memory serve</div>
         <p>Sidechain transcripts + I2 transcript-link substrate. Logs zstd-3 compression boundaries and the auto-extract policy decisions.</p>
       </div>
       <div class="mod">
-        <div class="count">4</div>
+        <div class="count">8</div>
         <div class="lbl">src/identity/</div>
         <p>Agent-id resolution chain. Logs precedence-chain fall-throughs and the anonymous-fallback path.</p>
       </div>
       <div class="mod">
-        <div class="count">3</div>
+        <div class="count">6</div>
         <div class="lbl">src/curator/ + atomisation</div>
         <p>WT-1 atomisation engine + curator cycle. Logs LlmCurator scaffolding and cycle-skip rationale.</p>
       </div>
@@ -284,7 +299,7 @@ RUST_LOG=ai_memory=trace,tower_http=debug ai-memory serve</div>
   <div class="container">
     <span class="eyebrow">Level taxonomy</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">info / warn / error.</h2>
-    <p class="lede">The daemon does not emit <code>debug!</code> or <code>trace!</code> at the call sites — those are reserved for ad-hoc instrumentation under <code>RUST_LOG</code>. Production output is the three levels below.</p>
+    <p class="lede">42 of the 579 call sites are <code>debug!</code>/<code>trace!</code> diagnostics (federation sync, postgres adapter, hooks executor, migrations) — silent under the default <code>ai_memory=info</code> filter until <code>RUST_LOG</code> raises them. Default production output is the three levels below.</p>
     <div class="lev-grid">
       <div class="lev info">
         <div class="lbl">info</div>
@@ -363,7 +378,7 @@ export error: tar archive write failed</span>
       <div class="when">embedder fallback</div>
       <div class="what">Recall couldn't get a query embedding; degraded to FTS5-only</div>
       <span class="grep">grep 'falling back to keyword-only' daemon.log</span>
-      <span class="meaning">Recall still returns results — the 70/30 hybrid becomes 100/0 keyword for that one request. If frequent, check Ollama health.</span>
+      <span class="meaning">Recall still returns results — the adaptive semantic/keyword blend becomes 100% keyword for that one request. If frequent, check Ollama health.</span>
     </div>
 
     <div class="recipe">
@@ -406,14 +421,14 @@ grep "pulled successfully" daemon.log</span>
 
 <section>
   <div class="container">
-    <span class="eyebrow">Future</span>
-    <h2 style="font-family:var(--font-sans);font-size:1.75rem">v0.7 expansion.</h2>
-    <p class="lede">v0.7 brings the Hook Pipeline (arch-spec §2) and Sidechain Transcripts (§6). Both extend the trace surface — every hook fire becomes a span, every transcript line is durable. Once those land:</p>
+    <span class="eyebrow">Landed + future</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">v0.7.0 expansion.</h2>
+    <p class="lede">v0.7.0 shipped the Hook Pipeline (arch-spec §2) and Sidechain Transcripts (§6). Both extended the trace surface:</p>
     <div class="snip" style="font-family:var(--font-sans);white-space:normal;line-height:1.7">
-      <div><strong style="color:var(--good)">Hook spans</strong> — <code>info_span!("hook", event=..., subscriber=...)</code> wrapping each hook callback so the trace tree shows which hook ran where</div>
-      <div><strong style="color:var(--good)">Transcript stream</strong> — every governed action lands a row in the transcript table with the full payload + verdict, queryable independent of the daemon log</div>
-      <div><strong style="color:var(--good)">OpenTelemetry hookup</strong> — v1.0 charter; the <code>tracing-opentelemetry</code> bridge so traces can ship to a collector</div>
-      <div><strong style="color:var(--good)">memory_capabilities introspection</strong> (<a href="https://github.com/alphaonedev/agentic-mem-labs/blob/main/strategy/2026-04-26/architectural-enhancement-spec-v1.md#7-capabilities-introspection-extension" style="color:var(--p1)">v0.6.3.1 quick patch</a>) — the daemon will report <code>hooks.registered_count</code>, <code>transcripts.total_count</code>, etc. so AI clients can answer "what's enforced here?" honestly</div>
+      <div><strong style="color:var(--good)">MCP dispatch spans</strong> (landed) — <code>info_span!("mcp_tool_call", tool=..., rpc_id=...)</code> wraps every MCP tool dispatch (<code>src/mcp/mod.rs</code>) so production observability can attribute latency per tool</div>
+      <div><strong style="color:var(--good)">Transcript stream</strong> (landed) — transcript lines land durably in the transcript tables (<code>src/transcripts/</code>, <code>transcripts.lifecycle</code> trace target), queryable independent of the daemon log</div>
+      <div><strong style="color:var(--good)">memory_capabilities introspection</strong> (landed) — the daemon reports <code>hooks.registered_count</code>, <code>transcripts.total_count</code>, etc. (<code>src/mcp/tools/capabilities.rs</code>) so AI clients can answer "what's enforced here?" honestly</div>
+      <div><strong style="color:var(--warn)">OpenTelemetry hookup</strong> (future) — v1.0 charter; the <code>tracing-opentelemetry</code> bridge so traces can ship to a collector</div>
     </div>
   </div>
 </section>

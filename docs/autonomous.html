@@ -255,7 +255,7 @@ footer a{color:var(--text-muted)}
           <span class="on">▸ all of Smart</span>
           <span class="on">▸ cross_encoder_reranking</span>
           <span class="on">▸ memory_reflect (SHIPPED at v0.7.0 — recursive learning with reflection_depth cap)</span>
-          <span class="on">▸ session_start (LLM-driven)</span>
+          <span class="on">▸ session_start boot recall</span>
         </div>
       </div>
     </div>
@@ -330,19 +330,17 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="feature au">
-      <div class="feature-head"><span class="feature-name">memory_session_start</span><span class="feature-need au">Autonomous tier (LLM-driven)</span></div>
-      <div class="feature-desc">Run at the start of an agent session. Recalls the most relevant memories given the session's stated context, optionally LLM-summarized into a session brief. The agent's "morning briefing" — pulls in the right context without explicit recall calls peppered through the prompt.</div>
+      <div class="feature-head"><span class="feature-name">memory_session_start</span><span class="feature-need au">All tiers</span></div>
+      <div class="feature-desc">Run at the start of an agent session. Auto-recalls the recent + high-priority memories (optionally scoped to a namespace) so the agent boots with context — the "morning briefing" without explicit recall calls peppered through the prompt. Default output is token-efficient <code>toon_compact</code>.</div>
       <div class="snip"><span class="cm">// MCP — memory_session_start</span>
 {
-  <span class="key">"context"</span>:    <span class="val">"continuing the q3 OKR review thread from yesterday"</span>,
-  <span class="key">"namespace"</span>:  <span class="val">"alphaone/eng/leadership"</span>,
-  <span class="key">"as_agent"</span>:   <span class="val">"alphaone/eng/leadership/alice"</span>,
-  <span class="key">"summarize"</span>:  <span class="ok">true</span>                       <span class="cm">// LLM-generate a brief from the recall hits</span>
+  <span class="key">"namespace"</span>:  <span class="val">"alphaone/eng/leadership"</span>,   <span class="cm">// optional filter</span>
+  <span class="key">"limit"</span>:      <span class="num">10</span>,                          <span class="cm">// default 10 · cap 50</span>
+  <span class="key">"format"</span>:     <span class="val">"toon_compact"</span>               <span class="cm">// json | toon | toon_compact</span>
 }
 
-<span class="ok">→ {"recalled": [12 top memories, ranked, with budget_tokens cap respected],
-   "session_brief": "Yesterday's discussion focused on..." // Gemma 4 summary
-  }</span></div>
+<span class="ok">→ count:10|mode:session_start
+   memories[id|title|tier|namespace|priority|score|tags|agent_id]: …</span></div>
     </div>
   </div>
 </section>
@@ -385,7 +383,7 @@ tier = <span class="val">"autonomous"</span>
 
 [llm]
 backend = <span class="val">"ollama"</span>
-model   = <span class="val">"gemma3:4b"</span>
+model   = <span class="val">"gemma4:e4b"</span>     <span class="cm"># the model pulled in step 2 (compiled default: gemma3:4b)</span>
 base_url = <span class="val">"http://localhost:11434"</span>
 
 [embeddings]
@@ -401,11 +399,12 @@ EOF
 <span class="cm"># 4. Start the daemon</span>
 <span class="ok">$</span> ai-memory serve
 
-<span class="cm"># Verify the autonomous features came online:</span>
-<span class="ok">$</span> ai-memory capabilities
+<span class="cm"># Verify the autonomous features came online (HTTP capabilities surface,
+# or the memory_capabilities MCP tool, or `ai-memory doctor`):</span>
+<span class="ok">$</span> curl -s http://127.0.0.1:9077/api/v1/capabilities
 <span class="ok">→ "tier": "autonomous"</span>
-<span class="ok">→ "features": { "auto_tag": true, "auto_consolidation": true,
-                  "cross_encoder_reranking": true, "embedder_loaded": true }</span></div>
+<span class="ok">→ "features": { "auto_tagging": true, "auto_consolidation": true,
+                  "cross_encoder_reranking": true, "semantic_search": true, … }</span></div>
     <p class="lede" style="margin-top:1rem">From this point on, the autonomous MCP tools are live. Wire them into your AI client (Claude Code, Cursor, Codex, Continue, etc.) — see <a href="integrations.html" style="color:var(--p1)">integrations atlas</a>.</p>
   </div>
 </section>

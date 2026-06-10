@@ -84,7 +84,7 @@ footer a{color:var(--muted)}
 
 <section class="wrap-mid">
   <div class="eyebrow-h2">Build from source</div>
-  <h2>Rust 1.88+, one binary.</h2>
+  <h2>Rust 1.96+, one binary.</h2>
   <pre><code>git clone https://github.com/alphaonedev/ai-memory-mcp
 cd ai-memory-mcp
 cargo build --release
@@ -123,7 +123,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
 ai-memory recall "hello"
 ai-memory stats --json | jq .</code></pre>
 
-  <p>Full surface: <a href="../USER_GUIDE.md">USER_GUIDE.md</a> (MCP tools), <a href="../API_REFERENCE.md">API_REFERENCE.md</a> (HTTP), <a href="../CLI_REFERENCE.md">CLI_REFERENCE.md</a> (CLI). The canonical tool count is asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code>; see issue #862 for the 72+1 disambiguation.</p>
+  <p>Full surface: <a href="../USER_GUIDE.md">USER_GUIDE.md</a> (MCP tools), <a href="../API_REFERENCE.md">API_REFERENCE.md</a> (HTTP), <a href="../CLI_REFERENCE.md">CLI_REFERENCE.md</a> (CLI). The canonical tool count is asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code>; see issue #862 for the 73+1 disambiguation.</p>
 </section>
 
 <section class="wrap-mid">
@@ -162,7 +162,7 @@ lmstudio    # http://localhost:1234/v1                               · (none / 
   </ul>
 
   <h3>Examples</h3>
-  <pre><code># 1. Default — local Ollama with gemma3:e4b
+  <pre><code># 1. Default — local Ollama with gemma3:4b
 ai-memory serve   # no env needed; uses http://localhost:11434
 
 # 2. Cloud — xAI Grok via vendor alias
@@ -207,14 +207,14 @@ ai-memory serve</code></pre>
 
 <section class="wrap-mid">
   <div class="eyebrow-h2">Hooks and subscriptions</div>
-  <h2>20-event hook pipeline + HMAC subscriptions.</h2>
-  <p>The hook pipeline fires on 20 named substrate events: <code>memory_store</code>, <code>memory_touch</code>, <code>memory_link</code>, <code>memory_reflect</code>, <code>kg_invalidate</code>, etc. Hooks run synchronously (default) or async-fan-out (subscriptions).</p>
+  <h2>25-event hook pipeline + HMAC subscriptions.</h2>
+  <p>The hook pipeline fires on 25 named substrate events (snake_case wire names from the <code>HookEvent</code> enum in <code>src/hooks/events.rs</code>): <code>pre_store</code>, <code>post_store</code>, <code>pre_recall</code>, <code>post_recall</code>, <code>pre_link</code>, <code>post_reflect</code>, etc. Hooks run synchronously (default) or async-fan-out (subscriptions).</p>
 
   <h3>Register a webhook subscription</h3>
   <pre><code>ai-memory subscribe \
-  --event memory_store \
   --url https://my-app.example.com/ai-memory-events \
-  --hmac-secret-file /etc/my-app/hmac.key</code></pre>
+  --events post_store \
+  --secret "$(cat /etc/my-app/hmac.key)"</code></pre>
   <p>Events are POSTed as JSON with an <code>X-AI-Memory-Signature</code> HMAC header. Unsigned subscribers are refused at registration. SSRF gate: loopback URLs require <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code>.</p>
   <p>Full hook taxonomy + payload schemas: <a href="../hook-pipeline.md">hook-pipeline.md</a>.</p>
 </section>
@@ -241,7 +241,7 @@ ai-memory serve</code></pre>
 
   <h3>New HTTP endpoint</h3>
   <ol>
-    <li>Add route in the Axum router (src/main.rs)</li>
+    <li>Add route in the Axum router (<code>src/lib.rs</code>; route-path SSOT in <code>src/handlers/routes.rs</code>)</li>
     <li>Implement handler in <code>src/handlers/</code> using the <code>Db</code> extractor</li>
   </ol>
 
@@ -255,7 +255,7 @@ ai-memory serve</code></pre>
   <div class="next">
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest campaign index</strong><span class="desc">2026-05-22 &middot; SHIP-RECOMMENDED &middot; tip <code>fd172f2cf</code></span></a>
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/track-a-build-install-results.md"><strong>Engineering writeup</strong><span class="desc">Track A build + install verification</span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.md"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, schema ladder v15&rarr;v50, per-issue root cause, future-bug prevention</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.md"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, schema ladder v15&rarr;v49, per-issue root cause, future-bug prevention</span></a>
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.md"><strong>For decision-makers</strong><span class="desc">Verdict, risk, cost, roadmap</span></a>
   </div>
 </section>
@@ -269,7 +269,7 @@ ai-memory serve</code></pre>
     <a href="../API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">88 routes (74 unique paths)</span></a>
     <a href="../CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">79 subcommands</span></a>
     <a href="../agent-identity.html"><strong>Agent identity</strong><span class="desc">NHI semantics</span></a>
-    <a href="../hook-pipeline.md"><strong>Hook pipeline</strong><span class="desc">20 events</span></a>
+    <a href="../hook-pipeline.md"><strong>Hook pipeline</strong><span class="desc">25 events</span></a>
     <a href="../knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links + temporal validity</span></a>
     <a href="../integrations/README.md"><strong>Integrations</strong><span class="desc">Claude Code, Cursor, etc</span></a>
   </div>

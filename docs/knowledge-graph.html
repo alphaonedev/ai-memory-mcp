@@ -164,13 +164,13 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Knowledge Graph — structured cognition.</h1>
-  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>6 relation variants at v0.7.0</strong> (related_to, supersedes, contradicts, derived_from, plus the v0.7 additions <code>reflects_on</code> for recursive-learning + <code>derives_from</code> for atomisation atom→parent links), an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable + Ed25519 per-link attestation populated, and <strong>four KG MCP tools at v0.7.0</strong> (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>, <code>memory_find_paths</code>). v0.6.3 Streams B + C laid the foundation; <strong>v0.7.0 ships the Apache AGE Cypher backend</strong> (auto-detected when the AGE Postgres extension is installed) — what was "planned" in v0.6.x is now a feature gate.</p>
+  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>6 relation variants at v0.7.0</strong> (related_to, supersedes, contradicts, derived_from, plus the v0.7 additions <code>reflects_on</code> for recursive-learning + <code>derives_from</code> for atomisation atom→parent links), an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable + Ed25519 per-link attestation populated, and an <strong>11-tool <code>graph</code> MCP family at v0.7.0</strong> headlined by the four dedicated KG query tools (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>, <code>memory_find_paths</code>; the family also carries <code>memory_link</code>, <code>memory_entity_register</code>, <code>memory_entity_get_by_alias</code>, <code>memory_get_taxonomy</code>, <code>memory_load_family</code>, <code>memory_replay</code>, <code>memory_verify</code>). v0.6.3 Streams B + C laid the foundation; <strong>v0.7.0 ships the Apache AGE Cypher backend</strong> (auto-detected when the AGE Postgres extension is installed) — what was "planned" in v0.6.x is now a feature gate.</p>
   <div class="pills">
     <span class="pill">6 relations (v0.7.0)</span>
     <span class="pill">entity registry (Stream C)</span>
     <span class="pill">temporal validity (Stream B)</span>
     <span class="pill">Ed25519 attestation (v0.7.0)</span>
-    <span class="pill">4 KG MCP tools</span>
+    <span class="pill">11-tool graph family</span>
     <span class="pill">Apache AGE Cypher (shipped)</span>
   </div>
 </section>
@@ -179,7 +179,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The graph</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Memories + edges = the KG.</h2>
-    <p class="lede">Every memory is a node. Every <code>memory_link</code> row is a directed edge with a typed relation and (since v0.6.3) a temporal validity window. The graph is queryable via recursive CTE today, and via Apache AGE Cypher in v0.7.</p>
+    <p class="lede">Every memory is a node. Every <code>memory_link</code> row is a directed edge with a typed relation and (since v0.6.3) a temporal validity window. The graph is queryable via recursive CTE on the sqlite backend, and via Apache AGE Cypher on the postgres backend (shipped at v0.7.0).</p>
     <svg class="kg-svg" viewBox="0 0 1180 420" xmlns="http://www.w3.org/2000/svg">
       <style>
         .nb{stroke-width:2;rx:8;ry:8}
@@ -268,7 +268,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The six relations (v0.7.0)</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Closed set — wire-format stable.</h2>
-    <p class="lede">Every <code>memory_link</code> row carries one of these six relation tags at v0.7.0 (was four at v0.6.x; <code>reflects_on</code> joined the set with recursive-learning Task 1/8 and <code>derives_from</code> joined with WT-1-A atomisation). The set is closed (validators reject anything else); adding a new relation is a wire-format change, not a content tweak.</p>
+    <p class="lede">Every <code>memory_link</code> row carries one of these six relation tags at v0.7.0 (was four at v0.6.x; <code>reflects_on</code> joined the set with recursive-learning Task 1/8 and <code>derives_from</code> joined with WT-1-A atomisation). The six canonical names always pass; since v0.7.0 Wave-3 Continuation 5, <code>validate_relation</code> additionally accepts any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier (mirroring the AGE Cypher edge-label convention) — whitespace, control chars, and shell metacharacters are still rejected.</p>
     <div class="rel-grid">
       <div class="rel r1">
         <div class="nm">related_to</div>
@@ -308,7 +308,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Temporal validity — v0.6.3 Stream B</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Edges with a window.</h2>
-    <p class="lede">Schema v15 (v0.6.3) added four nullable columns to <code>memory_links</code>: <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, and <code>signature</code>. <strong>v0.7.0 populates the <code>signature</code> column with Ed25519 per-link attestation</strong> (was placeholder pre-v0.7) — links now carry cryptographic provenance + <code>attest_level</code> (<code>unsigned</code> / <code>agent</code> / <code>operator</code>) + <code>signed_at</code>. Edges carry a temporal window — "this relation was true between Mar 15 and Apr 20." Past states stay queryable via <code>memory_kg_timeline</code>; the present query (<code>memory_kg_query</code>) walks only currently-valid edges.</p>
+    <p class="lede">Schema v15 (v0.6.3) added four nullable columns to <code>memory_links</code>: <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, and <code>signature</code>. <strong>v0.7.0 populates the <code>signature</code> column with Ed25519 per-link attestation</strong> (was placeholder pre-v0.7) — links now carry cryptographic provenance + <code>attest_level</code> (<code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code> / <code>signed_by_peer</code> / <code>daemon_signed</code> — the H4 <code>AttestLevel</code> enum). Edges carry a temporal window — "this relation was true between Mar 15 and Apr 20." Past states stay queryable via <code>memory_kg_timeline</code>; the present query (<code>memory_kg_query</code>) walks only currently-valid edges.</p>
     <div class="snip"><span class="cm">// SQL — schema v15 memory_links columns</span>
 CREATE TABLE memory_links (
   source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -319,8 +319,7 @@ CREATE TABLE memory_links (
   <span class="ok">valid_until  TEXT</span>,        <span class="cm">// NULL = still valid; non-null = invalidated at this time</span>
   <span class="ok">observed_by  TEXT</span>,        <span class="cm">// agent_id of the observer (provenance)</span>
   <span class="ok">signature    BLOB</span>,        <span class="cm">// v0.7.0 POPULATED with Ed25519 per-link attestation</span>
-  <span class="ok">attest_level TEXT</span>,        <span class="cm">// v0.7.0: "unsigned" | "agent" | "operator"</span>
-  <span class="ok">signed_at    TIMESTAMP</span>,   <span class="cm">// v0.7.0: when the signature was applied</span>
+  <span class="ok">attest_level TEXT</span>,        <span class="cm">// v0.7.0: "unsigned" | "self_signed" | "peer_attested" | "signed_by_peer" | "daemon_signed"</span>
   PRIMARY KEY (source_id, target_id, relation)
 );
 
@@ -369,7 +368,7 @@ CREATE INDEX idx_links_relation     (relation, valid_from);</div>
 
     <div class="tool kg">
       <div class="tool-head"><span class="tool-name">memory_kg_query</span><span class="tool-tag">since v0.6.3</span></div>
-      <div class="tool-desc">Walks currently-valid edges from a starting memory or entity. Recursive CTE in v0.6.3, replaced by Apache AGE Cypher in v0.7. Supports filters by relation type, depth, and namespace.</div>
+      <div class="tool-desc">Walks currently-valid edges from a starting memory or entity. Recursive CTE on sqlite; Apache AGE Cypher on the postgres backend at v0.7.0. Supports filters by relation type, depth, and namespace.</div>
       <div class="snip"><span class="cm">// MCP — memory_kg_query</span>
 {
   <span class="key">"source_id"</span>:  <span class="val">"550e8400-…"</span>,

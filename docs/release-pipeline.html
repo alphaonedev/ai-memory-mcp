@@ -263,9 +263,9 @@ footer a{color:var(--text-muted)}
 
         <text x="40" y="350" fill="#999" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ trigger</text>
         <text x="220" y="430" fill="#ffb86b" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ check (must pass)</text>
-        <text x="440" y="370" fill="#6ee7ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ build matrix · 5 platforms</text>
+        <text x="440" y="370" fill="#6ee7ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ build matrix · 7 platforms (5 desktop + 2 mobile #1068)</text>
         <text x="690" y="370" fill="#6ee7ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ package + sign</text>
-        <text x="930" y="430" fill="#c8a2ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ publish · 5 channels</text>
+        <text x="930" y="430" fill="#c8a2ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ publish · 7 channels (+ iOS xcframework, Android jniLibs)</text>
       </svg>
     </div>
   </div>
@@ -275,7 +275,7 @@ footer a{color:var(--text-muted)}
 <section>
   <div class="container">
     <span class="eyebrow">Platform Targets</span>
-    <h2>5 binaries. Every mainstream OS + arch.</h2>
+    <h2>7 binaries. Every mainstream OS + arch.</h2>
     <p class="lede">Each tag produces <strong>seven precompiled binaries at v0.7.0</strong>: 5 desktop (Linux x64/arm64, macOS x64/arm64, Windows x64) plus 2 mobile (iOS xcframework + Android jniLibs tarball — added via #1068). ARM64 first-class on Linux + macOS. No 32-bit, no big-endian, no exotic targets — by design.</p>
 
     <div class="platform-grid">
@@ -305,7 +305,6 @@ footer a{color:var(--text-muted)}
         <div class="psize">tar.gz</div>
         <ul class="palist">
           <li>macOS 12 Monterey+</li>
-          <li>Codesigned (notarized v0.7)</li>
           <li>Homebrew bottle</li>
         </ul>
       </div>
@@ -362,7 +361,7 @@ sudo dnf install ai-memory</pre>
       <div class="channel docker">
         <div class="cname">🐳 Docker (GHCR)</div>
         <div class="csub">multi-arch · alpine + distroless variants</div>
-<pre>docker pull ghcr.io/alphaonedev/ai-memory:0.6.3
+<pre>docker pull ghcr.io/alphaonedev/ai-memory:latest
 docker run -p 9077:9077 ghcr.io/alphaonedev/ai-memory</pre>
       </div>
       <div class="channel crates">
@@ -371,6 +370,16 @@ docker run -p 9077:9077 ghcr.io/alphaonedev/ai-memory</pre>
 <pre>cargo install ai-memory --locked
 # or with sqlcipher feature:
 cargo install ai-memory --features sqlcipher</pre>
+      </div>
+      <div class="channel">
+        <div class="cname">📱 iOS xcframework</div>
+        <div class="csub">#1068 · device + sim arm64 + sim x86_64 slices</div>
+<pre>gh release download --pattern ai-memory-ios.xcframework.tar.gz</pre>
+      </div>
+      <div class="channel">
+        <div class="cname">🤖 Android jniLibs</div>
+        <div class="csub">#1068 · 4 ABIs in jniLibs/&lt;abi&gt;/ layout</div>
+<pre>gh release download --pattern ai-memory-android.tar.gz</pre>
       </div>
     </div>
   </div>
@@ -389,7 +398,7 @@ cargo install ai-memory --features sqlcipher</pre>
       <ul>
         <li><code>cargo fmt --check</code> — formatting must be exact</li>
         <li><code>cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic</code> — pedantic linting</li>
-        <li><code>cargo test --all-features</code> — full test suite, all platforms</li>
+        <li><code>cargo test</code> — test suite on all platforms (impact-scoped on PRs via <code>scripts/ci-test-impact.sh</code>; full suite otherwise)</li>
         <li><code>cargo audit</code> — dependency vulnerability check (Linux only)</li>
         <li><code>cargo build --release</code> — release-mode compile must succeed</li>
       </ul>
@@ -465,7 +474,7 @@ cargo install ai-memory --features sqlcipher</pre>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--gold)">
         <h3 style="margin-bottom:.5rem">Public-source audit</h3>
-        <p style="font-size:.9rem">Apache 2.0. Single repo. ~30K lines of Rust. <strong>A security team can audit the entire codebase in a week.</strong></p>
+        <p style="font-size:.9rem">Apache 2.0. Single repo. ~295K lines of Rust under <code>src/</code> (tests included) at v0.7.0. <strong>The entire codebase is open to security-team audit.</strong></p>
       </div>
     </div>
   </div>

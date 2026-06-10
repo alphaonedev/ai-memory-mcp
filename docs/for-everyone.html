@@ -339,7 +339,7 @@ ai-memory mcp --tier autonomous</pre>
           <li><strong>Per-BU policy enforcement</strong> via governance + hooks; one platform, N policies</li>
           <li><strong>Hooks for DLP integration</strong> — your existing data-loss-prevention pipeline plugs in</li>
           <li><strong>Vendor-risk-zero</strong> — Apache 2.0, full source, single binary, no SaaS dependency</li>
-          <li><strong>FIPS path</strong> via v0.7 attested identity (ed25519 → HSM-backed)</li>
+          <li><strong>FIPS path</strong> via v0.7.0 attested identity (Ed25519 shipped; HSM-backed via AgenticMem Attest)</li>
         </ul>
       </div>
       <div class="aud-stack">
@@ -347,7 +347,7 @@ ai-memory mcp --tier autonomous</pre>
         <div class="aud-stack-row"><span class="badge">multi-region</span> AWS / Azure / GCP / on-prem; cross-region mTLS</div>
         <div class="aud-stack-row"><span class="badge">air-gap</span> No outbound calls; internal-only mirror of crates.io for updates</div>
         <div class="aud-stack-row"><span class="badge">DLP hooks</span> pre_store hook redacts PII before persist</div>
-        <div class="aud-stack-row"><span class="badge">audit</span> Sidechain transcripts (v0.7) — every memory has full conversation</div>
+        <div class="aud-stack-row"><span class="badge">audit</span> Sidechain transcripts (v0.7.0) — every memory has full conversation</div>
         <div class="aud-stack-row"><span class="badge">DR</span> Cross-region quorum + nightly backup → glacier</div>
       </div>
     </div>
@@ -372,7 +372,7 @@ ai-memory mcp --tier autonomous</pre>
       </div>
       <div class="aud-fix">
         <h3>▲ The Fix</h3>
-        <p><strong>Apache 2.0 OSS</strong>. Single Rust binary. Zero outbound calls. Public source code, auditable from <code>git clone</code>. Hardware-attested keys (v0.7 → HSM, TPM, Secure Enclave). FedRAMP / IL5 path via the AgenticMem Sovereign tier. <strong>Domestic supplier (US-based AlphaOne LLC) for procurement.</strong></p>
+        <p><strong>Apache 2.0 OSS</strong>. Single Rust binary. Zero outbound calls. Public source code, auditable from <code>git clone</code>. Attested keys (Ed25519 at v0.7.0; HSM / TPM / Secure Enclave custody via AgenticMem Attest). FedRAMP / IL5 path via the AgenticMem Sovereign tier. <strong>Domestic supplier (US-based AlphaOne LLC) for procurement.</strong></p>
       </div>
       <div class="aud-roi">
         <h3>▼ The ROI</h3>
@@ -389,7 +389,7 @@ ai-memory mcp --tier autonomous</pre>
         <h3>▼ Deployment Pattern</h3>
         <div class="aud-stack-row"><span class="badge">air-gap</span> Build from source on the secure subnet; no internet</div>
         <div class="aud-stack-row"><span class="badge">SQLCipher</span> Encryption-at-rest via <code>--features sqlcipher</code></div>
-        <div class="aud-stack-row"><span class="badge">FIPS</span> v0.7 attested-identity for FIPS 140-3 path</div>
+        <div class="aud-stack-row"><span class="badge">FIPS</span> v0.7.0 attested-identity for FIPS 140-3 path</div>
         <div class="aud-stack-row"><span class="badge">HSM</span> Hardware key custody via AgenticMem Attest commercial tier</div>
         <div class="aud-stack-row"><span class="badge">audit</span> Append-only signed event log; no operator can rewrite history</div>
         <div class="aud-stack-row"><span class="badge">domestic</span> AlphaOne LLC (US, Delaware) is the sole responsible party</div>
@@ -428,7 +428,7 @@ ai-memory mcp --tier autonomous</pre>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--p2)">
         <h3 style="margin-bottom:.5rem">MCP-native</h3>
-        <p style="font-size:.9rem">Open Model Context Protocol. <strong>Every MCP-compliant host autodiscovers all 73 ai-memory tools (at --profile full) or the 7-tool --profile core surface.</strong> Future AI hosts work for free.</p>
+        <p style="font-size:.9rem">Open Model Context Protocol. <strong>Every MCP-compliant host autodiscovers all 74 ai-memory tools (at --profile full) or the 7-tool --profile core surface.</strong> Future AI hosts work for free.</p>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--p3)">
         <h3 style="margin-bottom:.5rem">Reversibility</h3>
@@ -440,7 +440,7 @@ ai-memory mcp --tier autonomous</pre>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--p3)">
         <h3 style="margin-bottom:.5rem">Auditable</h3>
-        <p style="font-size:.9rem">Pending actions queue. Webhook event stream. (v0.7) Ed25519 signatures on every write. <strong>Compliance officers see what they need.</strong></p>
+        <p style="font-size:.9rem">Pending actions queue. Webhook event stream. (v0.7.0) Ed25519-attested writes — optional per-write signatures, enforceable via <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>. <strong>Compliance officers see what they need.</strong></p>
       </div>
     </div>
   </div>

@@ -257,9 +257,9 @@ footer a{color:var(--text-muted)}
       <div class="snip"><span class="cm">// MCP — memory_archive_restore</span>
 {<span class="key">"id"</span>: <span class="val">"550e8400-e29b-41d4-a716-446655440000"</span>}
 
-<span class="ok">→ {"restored": true, "id": "…", "tier": "mid", "expires_at": null}</span>
-<span class="cm">// expires_at is cleared on restore — so a recently-restored memory doesn't
-// immediately re-expire from a stale timestamp.</span></div>
+<span class="ok">→ {"restored": true, "id": "…"}</span>
+<span class="cm">// The original tier + expires_at + embedding round-trip on restore (v0.6.3.1 G5;
+// full v0.7.0 column carry per #1025) — no silent loss of provenance columns.</span></div>
     </div>
 
     <div class="tool purge">
@@ -289,15 +289,15 @@ footer a{color:var(--text-muted)}
 
     <div class="tool archive">
       <div class="tool-head"><span class="tool-name">memory_forget</span><span class="tool-where">MCP · POST /api/v1/forget</span></div>
-      <div class="tool-desc">Pattern-based bulk archive. Combines a namespace + FTS5 pattern + optional tier filter. Always archives (never hard-deletes) — restorable. The "broom" for cleaning up draft notes, transient observations, or anything matching a known-bad pattern.</div>
+      <div class="tool-desc">Pattern-based bulk archive. Combines a namespace + FTS5 pattern + optional tier filter. Archives (restorable) under the default <code>archive_on_gc = true</code>; hard-deletes only when the operator has switched that off. The "broom" for cleaning up draft notes, transient observations, or anything matching a known-bad pattern.</div>
       <div class="snip"><span class="cm">// MCP — memory_forget</span>
 {
   <span class="key">"namespace"</span>: <span class="val">"alphaone/eng/platform"</span>,
   <span class="key">"pattern"</span>:   <span class="val">"draft notes OR scratch"</span>,  <span class="cm">// FTS5 expression</span>
-  <span class="key">"tier"</span>:      <span class="val">"short"</span>                    <span class="cm">// optional</span>
+  <span class="key">"tier"</span>:      <span class="val">"short"</span>                    <span class="cm">// optional · dry_run previews</span>
 }
 
-<span class="ok">→ {"forgotten": 42, "dry_run": false}</span></div>
+<span class="ok">→ {"deleted": 42, "archived": true}</span>   <span class="cm">// dry_run → {"would_delete": 42, "dry_run": true}</span></div>
     </div>
   </div>
 </section>
@@ -338,15 +338,16 @@ footer a{color:var(--text-muted)}
     <span class="eyebrow">Compliance patterns</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Common retention regimes.</h2>
     <div class="snip"><span class="cm"># Pattern 1 — "30-day soft-delete + 90-day hard-delete"
-# Soft-delete on TTL expiry, irreversible after 90 days.</span>
-archive_on_gc = <span class="ok">true</span>
-auto_purge_archive_days = <span class="num">90</span>
+# Soft-delete on TTL expiry, irreversible after 90 days.
+# (v2 sectioned config: both keys live under [storage])</span>
+archive_on_gc    = <span class="ok">true</span>
+archive_max_days = <span class="num">90</span>
 
 <span class="cm"># Pattern 2 — "GDPR right-to-be-forgotten"
 # Soft-delete with 14-day recovery window for accidental erasure.
 # After 14 days, the row is gone with no recovery path.</span>
-archive_on_gc = <span class="ok">true</span>
-auto_purge_archive_days = <span class="num">14</span>
+archive_on_gc    = <span class="ok">true</span>
+archive_max_days = <span class="num">14</span>
 
 <span class="cm"># Pattern 3 — "Strict compliance erasure"
 # TTL expiry triggers immediate hard-delete. No archive, no recovery.
@@ -358,13 +359,13 @@ archive_on_gc = <span class="err">false</span>
 # Indefinite archive. Operator triggers purge manually after evidence
 # release. Hot path stays clean (FTS/HNSW exclude archived rows) but
 # nothing leaves the daemon without explicit action.</span>
-archive_on_gc = <span class="ok">true</span>
-auto_purge_archive_days = <span class="num">0</span>          <span class="cm"># 0 disables auto-purge</span></div>
+archive_on_gc    = <span class="ok">true</span>
+archive_max_days = <span class="num">0</span>          <span class="cm"># &lt;= 0 (or omitting the key) disables auto-purge</span></div>
   </div>
 </section>
 
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · archive paths in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/mod.rs">db.rs</a> (<code>archive_memory</code>, <code>list_archived</code>, <code>restore_archived</code>, <code>purge_archive</code>) · HTTP in <code>src/handlers/</code></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · archive paths in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/mod.rs">src/storage/mod.rs</a> (<code>archive_memory</code>, <code>list_archived</code>, <code>restore_archived</code>, <code>purge_archive</code>) · HTTP in <code>src/handlers/</code></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="ttl-controls.html">TTLs</a> · <a href="lifecycle.html">Lifecycle</a></p>
 </footer>
 

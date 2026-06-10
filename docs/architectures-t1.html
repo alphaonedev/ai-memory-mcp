@@ -230,7 +230,7 @@ table tr:last-child td{border-bottom:none}
           <rect x="290" y="80" width="280" height="280" rx="16"
                 fill="url(#t1-mem-gradient)" stroke="#2dd4bf" stroke-width="1.6" />
           <text x="430" y="105" text-anchor="middle" class="node-label" style="font-size: 13px">ai-memory process</text>
-          <text x="430" y="122" text-anchor="middle" class="sub-label">single Arc&lt;Mutex&lt;Connection&gt;&gt;</text>
+          <text x="430" y="122" text-anchor="middle" class="sub-label">one SQLite DB (WAL)</text>
 
           <!-- Three interfaces -->
           <rect x="306" y="138" width="78" height="40" rx="6" class="node" />
@@ -317,7 +317,7 @@ table tr:last-child td{border-bottom:none}
       </div>
 
       <div class="arch-diagram-caption">
-        Agent talks to ai-memory over MCP, HTTP, or CLI. ai-memory holds a single SQLite connection behind a mutex.
+        Agent talks to ai-memory over MCP, HTTP, or CLI. The HTTP daemon guards a single SQLite connection behind a mutex; MCP stdio is single-threaded by protocol; each CLI invocation opens its own connection (#965 audit).
         Every recall is a hot loop — FTS5 + HNSW + scoring + access-count touch — all in-process.
       </div>
     </div>
@@ -331,9 +331,9 @@ table tr:last-child td{border-bottom:none}
 
     <h3>A write — <code>memory_store</code></h3>
     <ol>
-      <li>The agent calls <code>memory_store</code> over MCP (or <code>POST /api/v1/memory</code> over HTTP, or <code>ai-memory store ...</code> from the CLI).</li>
+      <li>The agent calls <code>memory_store</code> over MCP (or <code>POST /api/v1/memories</code> over HTTP, or <code>ai-memory store ...</code> from the CLI).</li>
       <li>The handler validates the input (<code>src/validate.rs</code>), then acquires the connection mutex.</li>
-      <li>Governance gate runs (<code>src/storage/</code> → <code>governance::check()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
+      <li>Governance gate runs (<code>src/governance/</code> → <code>check_agent_action()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
       <li>Memory row is <code>INSERT</code>ed (or <code>UPDATE</code>d on <code>(title, namespace)</code> collision). FTS5 is kept in sync via triggers. The <code>scope_idx</code> generated column gets recomputed automatically.</li>
       <li>If the feature tier is <code>semantic</code> or above, the embedding is generated and added to the in-memory HNSW index.</li>
       <li>WAL is fsynced; the call returns.</li>
@@ -342,8 +342,8 @@ table tr:last-child td{border-bottom:none}
     <h3>A recall — <code>memory_recall</code></h3>
     <ol>
       <li>Agent calls <code>memory_recall</code> with a context string.</li>
-      <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>fts.rank + priority*0.5 + access_count*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
-      <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback in the keyword tier).</li>
+      <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
+      <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback); skipped entirely in the keyword tier.</li>
       <li><strong>Adaptive blend</strong> — semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text. Final score is <code>semantic_weight * cosine + (1 - semantic_weight) * norm_fts</code>.</li>
       <li><strong>Touch</strong> — every returned memory has <code>access_count</code> incremented, TTL extended, and (for mid-tier memories) auto-promoted to long-tier on the 5th access. Priority bumps every 10 accesses.</li>
       <li>Result formatted as <code>toon_compact</code> (40-60% smaller than JSON), <code>toon</code>, or <code>json</code>.</li>
@@ -358,13 +358,13 @@ table tr:last-child td{border-bottom:none}
     <span class="eyebrow">Deployment recipe</span>
     <h2>Install, run, verify.</h2>
 <pre><code># install
-cargo install ai-memory --version 0.6.3
+cargo install ai-memory --version 0.7.0
 
 # run as MCP server (for Claude Code, etc.)
 ai-memory --db ~/.claude/ai-memory.db mcp --tier semantic
 
 # OR run as HTTP daemon
-ai-memory --db ~/.claude/ai-memory.db serve --bind 127.0.0.1:9077 --tier semantic
+ai-memory --db ~/.claude/ai-memory.db serve --host 127.0.0.1 --port 9077
 
 # verify
 ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
@@ -415,7 +415,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
       <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v55 per v0.7.0 release notes; v55 = sargable list_memories_updated_since federation-catchup rewrite + idx_memories_updated_at #1476; v54 = tier-default expiry backfill #1466; v53 = memories_au FTS5 trigger scoping #1418; v52 = transcript_line_dedup #1389; v51 = federation_nonces persistence #1255 / PR #1296; v50 = per-namespace K8 quota dimension #1156)</li>
       <li><code>src/reranker.rs</code> — adaptive blend semantic + keyword</li>
       <li><code>src/hnsw.rs</code> — in-memory ANN</li>
-      <li><code>docs/ARCHITECTURE.md</code> — full module map</li>
+      <li><code>CLAUDE.md</code> §Architecture / Key Modules — full module map</li>
     </ul>
   </div>
 </section>

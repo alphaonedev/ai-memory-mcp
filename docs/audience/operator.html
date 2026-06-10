@@ -94,7 +94,7 @@ footer a{color:var(--muted)}
   <pre><code>sudo dnf copr enable alpha-one-ai/ai-memory
 sudo dnf install ai-memory</code></pre>
 
-  <h3>cargo (any platform with Rust 1.88+)</h3>
+  <h3>cargo (any platform with Rust 1.96+)</h3>
   <pre><code>cargo install ai-memory</code></pre>
 
   <p>Full matrix (Windows, .deb manual install, Docker, source) is in <a href="../INSTALL.md">INSTALL.md</a>.</p>
@@ -137,26 +137,19 @@ sudo dnf install ai-memory</code></pre>
 <section class="wrap-mid">
   <div class="eyebrow-h2">2. Configure</div>
   <h2>config.toml essentials.</h2>
-  <p>Default config path: <code>~/.config/ai-memory/config.toml</code> on Linux/macOS. Override with <code>--config</code> or unset entirely via <code>AI_MEMORY_NO_CONFIG=1</code> (tests). The full ladder is <strong>CLI flag &gt; AI_MEMORY_* env var &gt; config.toml field &gt; compiled default</strong>.</p>
+  <p>Default config path: <code>~/.config/ai-memory/config.toml</code> on Linux/macOS (resolved per service user; there is no <code>--config</code> flag). Skip loading entirely via <code>AI_MEMORY_NO_CONFIG=1</code> (tests). The full ladder is <strong>CLI flag &gt; AI_MEMORY_* env var &gt; config.toml field &gt; compiled default</strong>.</p>
 
   <pre><code># config.toml — minimal production
 db = "/var/lib/ai-memory/ai-memory.db"
+tier = "semantic"      # keyword | semantic | smart | autonomous
+api_key = "&lt;random-high-entropy-key&gt;"  # daemon API key; Plan C injects it
+                                        # at boot from AI_MEMORY_API_KEY
 
 [identity]
 anonymize_default = false
 
 [permissions]
 mode = "enforce"       # v0.7.0 secure default
-
-[tier]
-default = "semantic"   # keyword | semantic | smart | autonomous
-
-[http]
-host = "127.0.0.1"
-port = 9077
-tls_cert = "/etc/ai-memory/tls.crt"
-tls_key  = "/etc/ai-memory/tls.key"
-api_key_file = "/etc/ai-memory/api.key"  # mode 0400, owned by service user
 
 [limits]                                 # operator-tunable resource caps (#1156 follow-up)
 max_memories_per_day = 1000              # per-agent daily memory-write quota
@@ -165,6 +158,8 @@ max_links_per_day    = 5000              # per-agent daily link-write quota
 max_page_size        = 1000              # list/bulk/sync page-size cap (OOM guard)</code></pre>
 
   <p>The <code>[limits]</code> section makes both the per-agent daily write quota and the list/bulk/sync page-size cap operator-tunable without recompiling. Each field resolves <strong>AI_MEMORY_MAX_* env &gt; [limits] &gt; compiled default</strong>; a non-positive or unparseable value falls through to the default (so a stray <code>0</code> can never clamp every list response to empty). The three quota fields seed fresh <code>agent_quotas</code> rows; <code>max_page_size</code> bounds per-request in-memory materialization as an OOM guard.</p>
+
+  <p>Bind address, port, and TLS are <code>serve</code> flags, not config fields: <code>ai-memory serve --host 127.0.0.1 --port 9077 --tls-cert /etc/ai-memory/tls.crt --tls-key /etc/ai-memory/tls.key</code> (add <code>--mtls-allowlist</code> for fingerprint-pinned client certs). When <code>api_key</code> is set, clients authenticate with the <code>x-api-key</code> request header &mdash; the canonical surface; the legacy <code>?api_key=</code> query parameter is deprecated (it leaks into access logs and proxies; see #1574).</p>
 
   <p>Every knob &mdash; including the full environment-variable table, secret-vs-config classification, and precedence regression tests &mdash; is enumerated in <a href="../ADMIN_GUIDE.md">ADMIN_GUIDE.md</a> and <a href="../CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>.</p>
 </section>
@@ -179,9 +174,9 @@ max_page_size        = 1000              # list/bulk/sync page-size cap (OOM gua
     <dt>HTTP daemon</dt>
     <dd><code>ai-memory serve</code> &mdash; Axum REST on port 9077, 88 route registrations / 74 unique URL paths. Best for shared org deployments with mTLS or API-key gating.</dd>
     <dt>autonomous curator</dt>
-    <dd><code>ai-memory curate</code> &mdash; long-running consolidation + reflection loop. Provider-agnostic (#1067): backs onto Ollama (local) or any OpenAI-compatible vendor via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp-server. Best as a sidecar to the HTTP daemon.</dd>
+    <dd><code>ai-memory curator</code> &mdash; long-running consolidation + reflection loop. Provider-agnostic (#1067): backs onto Ollama (local) or any OpenAI-compatible vendor via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp-server. Best as a sidecar to the HTTP daemon.</dd>
     <dt>quorum sync</dt>
-    <dd><code>ai-memory federate</code> &mdash; signed-event replication between peer nodes. Best for multi-region hive (T3+) deployments.</dd>
+    <dd><code>ai-memory sync-daemon</code> &mdash; signed-event replication between peer nodes. Best for multi-region hive (T3+) deployments.</dd>
   </dl>
 
   <p>The same binary covers all four, distinguished only by the subcommand. Architectures T1 (single agent) through T5 (global hive) are walked through in <a href="../architectures.html">architectures.html</a>.</p>
@@ -195,7 +190,7 @@ After=network-online.target
 Type=simple
 User=ai-memory
 Group=ai-memory
-ExecStart=/usr/bin/ai-memory --config /etc/ai-memory/config.toml serve
+ExecStart=/usr/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db serve
 Restart=on-failure
 RestartSec=2s
 LimitNOFILE=65536
@@ -210,7 +205,7 @@ WantedBy=multi-user.target</code></pre>
   <p>Three observability surfaces, all on by default:</p>
   <ul>
     <li><strong>tracing logs</strong> &mdash; standard <code>tracing-subscriber</code> via <code>RUST_LOG</code>. JSON output supported.</li>
-    <li><strong>append-only audit chain</strong> &mdash; per-event Ed25519-signed records under the configured audit dir. Replayable via <code>ai-memory verify</code>.</li>
+    <li><strong>append-only audit chain</strong> &mdash; per-event Ed25519-signed records under the configured audit dir. Replayable via <code>ai-memory audit verify</code>.</li>
     <li><strong>capabilities v3</strong> &mdash; <code>GET /api/v1/capabilities</code> returns pre-computed calibration strings for monitoring tooling. Never includes secrets.</li>
   </ul>
   <p>Full surface in <a href="../telemetry.md">telemetry.md</a> and <a href="../signed-events-v4.md">signed-events-v4.md</a>.</p>
@@ -255,9 +250,10 @@ WantedBy=multi-user.target</code></pre>
   <h2>Schema-versioned, migration-tested.</h2>
   <p>The SQLite store carries an integer schema version (<strong>currently v55 at v0.7.0</strong>; was v33 at v0.6.4). v55 made the <code>list_memories_updated_since</code> federation-catchup query sargable and added <code>idx_memories_updated_at</code> per #1476 so peer catch-up scans get a true index range instead of a seq scan. v54 backfilled tier-default <code>expires_at</code> onto legacy NULL-expiry mid/short rows per #1466, closing the TTL-leak immortal-rows class. v53 scoped the <code>memories_au</code> FTS5 sync trigger to <code>(title, content, tags)</code> only per #1418 so non-FTS column updates no longer fire a needless sync. v52 added the <code>transcript_line_dedup</code> table per #1389 L4, backing the sha256-keyed idempotency layer for turn-capture. v51 added the <code>federation_nonces</code> table per #1255 / PR #1296 so peer-replay-prevention nonces persist across daemon restarts. v50 extended <code>agent_quotas</code> PRIMARY KEY from <code>(agent_id)</code> to <code>(agent_id, namespace)</code> per #1156 so per-namespace K8 quota allotments hold even when a single agent operates across many namespaces (pre-v50 rows backfill to the <code>_global</code> sentinel namespace). Migrations run on first open of the new binary; the migration set is dry-run-tested against the operator's own DB by the project's dogfood script before a release ships.</p>
   <ul>
-    <li>Backup the DB before upgrade: <code>cp ai-memory.db ai-memory.db.bak</code>.</li>
+    <li>Backup the DB before upgrade: <code>cp ai-memory.db ai-memory.db.bak</code>. The binary additionally takes its own automatic pre-migration snapshot (#1576): before any schema-mutating migration it writes a transactionally-consistent <code>VACUUM INTO</code> sibling named <code>&lt;db&gt;.pre-migration-v&lt;FROM&gt;-to-v&lt;TO&gt;-&lt;token&gt;.bak</code>, and refuses to mutate the schema if that snapshot fails.</li>
     <li>Stop the daemon, install the new binary, restart. Migrations run automatically.</li>
-    <li>Validate post-upgrade: <code>ai-memory stats &amp;&amp; ai-memory verify --since 24h</code>.</li>
+    <li>Validate post-upgrade: <code>ai-memory stats &amp;&amp; ai-memory audit verify</code>.</li>
+    <li>Rollback (#1576): there is no migration downgrade path &mdash; forward-only by design. Stop the daemon, reinstall the previous binary, restore the pre-migration snapshot over the live file, restart. Writes that landed between migration and rollback are lost with the restore; drain traffic first if they matter.</li>
   </ul>
   <p>Version-to-version upgrade notes: <a href="../MIGRATION_v0.7.md">MIGRATION_v0.7.md</a>, <a href="../v0.7.0/release-notes.md">v0.7.0 release notes</a>.</p>
 </section>

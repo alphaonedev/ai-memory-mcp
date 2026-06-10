@@ -368,12 +368,12 @@ table tr:last-child td{border-bottom:none}
     <span class="eyebrow">What ships today</span>
     <h2>The mesh is real. Source-cited.</h2>
     <ul>
-      <li><strong>W-of-N quorum-write contract</strong> — <code>src/main.rs</code> lines 405-411: <code>--quorum-writes N --quorum-peers &lt;list&gt;</code> is wired into the write path. <code>src/handlers/mod.rs</code> calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code> to count peer acks; <code>503 quorum_not_met</code> returns when the deadline (<code>--quorum-timeout-ms</code>, default 2000) lapses without W-1 acks. ADR-0001 is realised, not aspirational. Same wiring applies to <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>.</li>
-      <li><strong><code>sync_push</code> fanout for everything</strong> — <code>src/federation.rs</code> ships <strong>10 broadcast functions</strong>: store, delete, archive, restore, link, consolidate, pending action, pending decision, namespace metadata, namespace metadata clear. Each is invoked from the corresponding handler in <code>src/handlers/</code> after the local commit lands.</li>
-      <li><strong>Vector clocks + catch-up</strong> — Every memory has a per-peer clock in <code>SyncState</code>. A peer that drops off polls <code>GET /api/v1/sync/since?peer=node-a&amp;clock=7400</code> and gets only the deltas after that point. The serve daemon also runs a <code>--catchup-interval-secs</code> loop (default 30s) that pulls peers proactively for any updates missed during partition.</li>
+      <li><strong>W-of-N quorum-write contract</strong> — <code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>): <code>--quorum-writes N --quorum-peers &lt;list&gt;</code> is wired into the write path. The handlers call <code>broadcast_store_quorum</code> then <code>finalise_quorum</code> to count peer acks; <code>503 quorum_not_met</code> returns when the deadline (<code>--quorum-timeout-ms</code>, default 2000) lapses without W-1 acks. ADR-0001 is realised, not aspirational. Same wiring applies to <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>.</li>
+      <li><strong><code>sync_push</code> fanout for everything</strong> — <code>src/federation/sync.rs</code> ships <strong>10 broadcast functions</strong>: store, delete, archive, restore, link, consolidate, pending action, pending decision, namespace metadata, namespace metadata clear. Each is invoked from the corresponding handler in <code>src/handlers/</code> after the local commit lands.</li>
+      <li><strong>Per-peer sync state + catch-up</strong> — The daemon tracks per-peer <code>sync_state</code> (last-seen / last-pulled). A peer that drops off polls <code>GET /api/v1/sync/since?peer=node-a&amp;since=&lt;rfc3339-ts&gt;</code> and gets only the rows updated after that point. The serve daemon also runs a <code>--catchup-interval-secs</code> loop (default 30s) that pulls peers proactively for any updates missed during partition.</li>
       <li><strong>mTLS peer mesh with fingerprint allowlist</strong> — <code>--tls-cert</code> + <code>--tls-key</code> switches <code>serve</code> to TLS; adding <code>--mtls-allowlist &lt;path&gt;</code> enforces client-cert mTLS where every connection's peer must present a cert whose fingerprint is on the allowlist. Quorum POSTs use <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code> for the outbound side.</li>
-      <li><strong>Federated governance</strong> — <code>broadcast_namespace_meta_quorum</code> (<code>src/federation.rs:1007-1075</code>) propagates <code>GovernancePolicy</code> changes to every peer with quorum semantics. A new strict policy on <code>agents/secops</code> set on node-A is enforced on all 4 nodes within seconds, with the same W-of-N durability as memory writes.</li>
-      <li><strong>Federated pending decisions</strong> — <code>broadcast_pending_decision_quorum</code> (<code>src/federation.rs:918-995</code>) means an approve/reject on one node turns into a committed (or audited) state on every peer with quorum-bounded latency.</li>
+      <li><strong>Federated governance</strong> — <code>broadcast_namespace_meta_quorum</code> (<code>src/federation/sync.rs</code>) propagates <code>GovernancePolicy</code> changes to every peer with quorum semantics. A new strict policy on <code>agents/secops</code> set on node-A is enforced on all 4 nodes within seconds, with the same W-of-N durability as memory writes.</li>
+      <li><strong>Federated pending decisions</strong> — <code>broadcast_pending_decision_quorum</code> (<code>src/federation/sync.rs</code>) means an approve/reject on one node turns into a committed (or audited) state on every peer with quorum-bounded latency.</li>
       <li><strong>Per-node governance gate</strong> — Each node enforces its local policy at write time. The federated metadata keeps the policy itself consistent across nodes.</li>
     </ul>
     <p>This is real, durable, multi-node consistency for a knowledge mesh.</p>
@@ -386,7 +386,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Honest about the remaining gaps.</h2>
     <ul>
       <li><strong>Strong consensus on the governance plane</strong> — Quorum writes give bounded staleness, not strong consistency. Two operators on opposite sides of a partition can each approve a pending action; reconciliation is last-decision-wins on rejoin. Distributed consensus (Raft/Paxos) is v1.0+ territory and only makes sense for the governance plane, not the memory write path.</li>
-      <li><strong>Cryptographic attestation</strong> — Agent identity is claimed (<code>metadata.agent_id</code> from clap or <code>AI_MEMORY_AGENT_ID</code> env), not signed. The <code>signature</code> column on <code>memory_links</code> (v0.6.3 schema v15) is POPULATED at v0.7.0 with Ed25519 per-link attestation. Plus <code>attest_level</code> + <code>signed_at</code> columns landed at v0.7.0.</li>
+      <li><strong>Cryptographic attestation — what remains</strong> — Signing shipped at v0.7.0: the <code>signature</code> column on <code>memory_links</code> (reserved v0.6.3 schema v15) is POPULATED with Ed25519 per-link attestation, <code>attest_level</code> + <code>signed_at</code> landed, and #626 Layer-3 verifies caller-presented store-surface signatures. Still permissive by default: <em>unsigned</em> writes land <code>attest_level = "claimed"</code> unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code>, and the federation receive path trusts mTLS + peer allowlist rather than per-row signatures — both tracked for v0.8 hardening under #1464.</li>
       <li><strong>Postgres + pgvector backbone</strong> — <strong>SHIPPED at v0.7.0 GA</strong> via <code>--features sal-postgres</code>. Apache AGE Cypher graph backend auto-detected when pg_extension installed. SAL trait abstracts sqlite vs postgres+AGE; <code>ai-memory serve --store-url postgres://…</code> selects the postgres path.</li>
       <li><strong>CRDT-lite link tombstones</strong> — Delete-link fanout is deferred; the CHANGELOG (#325) tracks it for v0.7. Local <code>DELETE /api/v1/links</code> works today.</li>
     </ul>
@@ -404,18 +404,20 @@ table tr:last-child td{border-bottom:none}
       <li>Agent <code>a1</code> on node-A calls <code>memory_store</code>.</li>
       <li>Local governance gate runs against the federated policy. <code>Allow</code> → continue, <code>Pending</code> → queue, <code>Deny</code> → reject.</li>
       <li>Local <code>INSERT</code> succeeds. WAL fsynced. Vector clock bumped.</li>
-      <li><code>broadcast_store_quorum</code> spawns one HTTP <code>POST /api/v1/sync/push</code> per configured peer (B, C, D). Local response returns to the agent immediately.</li>
+      <li><code>broadcast_store_quorum</code> spawns one HTTP <code>POST /api/v1/sync/push</code> per configured peer (B, C, D). With <code>--quorum-writes 0</code> the local response returns immediately; with quorum enabled it returns only after W-1 peer acks (or 503 <code>quorum_not_met</code> at the deadline).</li>
       <li>Each peer receives the push, validates, applies, and bumps its own SyncState entry for node-A.</li>
     </ol>
 
     <h3>A peer rejoins after a partition</h3>
     <p>Node-C drops off the cluster for 4 hours. When it comes back, its supervisor calls:</p>
-<pre><code>curl http://node-a:9077/api/v1/sync/since?peer=node-c&amp;clock=7350</code></pre>
-    <p>Node-A returns the delta — every memory, link, namespace_meta change, and pending decision that happened after clock 7350. Node-C applies them in causal order, bumps its own state, and re-enters the steady-state mesh.</p>
+<pre><code>curl 'http://node-a:9077/api/v1/sync/since?peer=node-c&amp;since=2026-06-09T04:00:00Z'</code></pre>
+    <p>Node-A returns the delta — every row updated after that timestamp. Node-C applies them in causal order, bumps its own <code>sync_state</code>, and re-enters the steady-state mesh.</p>
 
     <h3>Federated governance — a real example</h3>
 <pre><code># On node-A: tighten policy on a sensitive namespace
-ai-memory --bind node-a:9077 namespace set-standard org/legal/contracts \
+# (the standard memory carries the policy; bind it by id)
+ai-memory namespace set-standard --namespace org/legal/contracts \
+  --id &lt;standard-memory-uuid&gt; \
   --governance '{"write":"approve","delete":"approve"}'</code></pre>
     <p>Within seconds:</p>
     <ul>
@@ -433,11 +435,10 @@ ai-memory --bind node-a:9077 namespace set-standard org/legal/contracts \
   <div class="container">
     <span class="eyebrow">Deployment recipe</span>
     <h2>Quorum writes + mTLS peer mesh.</h2>
-    <p>All real flags, all in v0.6.3:</p>
+    <p>All real flags, all in v0.7.0:</p>
 <pre><code># node-a — quorum writes require 2-of-3 peer acks within 2s
 ai-memory --db /var/lib/ai-memory/store.db serve \
-  --bind 0.0.0.0:9077 \
-  --tier semantic \
+  --host 0.0.0.0 --port 9077 \
   --quorum-writes 2 \
   --quorum-peers https://node-b:9077,https://node-c:9077,https://node-d:9077 \
   --quorum-timeout-ms 2000 \
@@ -472,7 +473,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
         <tr><td>Apache AGE</td><td><strong>1.7.0</strong></td><td><code>AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code> · <code>EXPECTED_AGE_VERSION=1.7.0</code></td></tr>
         <tr><td>pgvector (server extension)</td><td><strong>0.8.2</strong></td><td><code>PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1</code></td></tr>
         <tr><td>pgvector (Rust binding crate)</td><td><strong>0.4</strong></td><td><code>Cargo.toml</code> → <code>pgvector = "0.4"</code></td></tr>
-        <tr><td>ai-memory postgres schema</td><td><strong>v28</strong></td><td>schema parity with SQLite at v28 (v0.7.0)</td></tr>
+        <tr><td>ai-memory postgres schema</td><td><strong>v55</strong></td><td>schema parity with SQLite at v55 (v0.7.0; <code>CURRENT_SCHEMA_VERSION = 55</code> in both adapters)</td></tr>
       </tbody>
     </table>
     <p>The bundled stacked image at <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> (<code>ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code>, <code>ARG PG_MAJOR=18</code>) layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run operators don't build AGE from source. <strong>Alternate tested matrix:</strong> <code>infra/lan-parity-test/</code> legitimately runs PG 16 + AGE 1.6.0 + pgvector 0.8.2 as a second tested combination; the <em>recommended</em> install targets the PG 18.4 / AGE 1.7.0 matrix above.</p>
@@ -556,11 +557,11 @@ llm_call_timeout_secs = 30
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>src/main.rs:405-447</code> — quorum-write CLI flags (<code>--quorum-writes</code>, <code>--quorum-peers</code>, <code>--quorum-timeout-ms</code>, <code>--quorum-client-cert</code>/<code>-key</code>/<code>-ca-cert</code>, <code>--catchup-interval-secs</code>)</li>
-      <li><code>src/main.rs:380-393</code> — TLS / mTLS allowlist flags (<code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls-allowlist</code>)</li>
-      <li><code>src/handlers/mod.rs</code> — <code>broadcast_store_quorum</code> + <code>finalise_quorum</code> ack-counting in the write path</li>
-      <li><code>src/federation.rs</code> — 10 broadcast functions: <code>broadcast_store_quorum</code>, <code>broadcast_delete_quorum</code>, <code>broadcast_archive_quorum</code>, <code>broadcast_restore_quorum</code>, <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>, <code>broadcast_namespace_meta_clear_quorum</code></li>
-      <li><code>src/replication.rs</code> (422 lines) — <code>QuorumWriter</code> + <code>AckTracker</code> implementation</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI flags (<code>--quorum-writes</code>, <code>--quorum-peers</code>, <code>--quorum-timeout-ms</code>, <code>--quorum-client-cert</code>/<code>-key</code>/<code>-ca-cert</code>, <code>--catchup-interval-secs</code>)</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist flags (<code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls-allowlist</code>)</li>
+      <li><code>src/federation/quorum.rs</code> + handlers — <code>broadcast_store_quorum</code> + <code>finalise_quorum</code> ack-counting in the write path</li>
+      <li><code>src/federation/sync.rs</code> — 10 broadcast functions: <code>broadcast_store_quorum</code>, <code>broadcast_delete_quorum</code>, <code>broadcast_archive_quorum</code>, <code>broadcast_restore_quorum</code>, <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>, <code>broadcast_namespace_meta_clear_quorum</code></li>
+      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code> implementation</li>
       <li><code>src/handlers/</code> — <code>POST /api/v1/sync/push</code> ingress, <code>GET /api/v1/sync/since</code> causal catch-up</li>
       <li><code>docs/ADR-0001-quorum-replication.md</code> — the realised design</li>
       <li><code>CHANGELOG.md</code> — #325 link fanout, #326 consolidate fanout, #327 embedder readiness</li>

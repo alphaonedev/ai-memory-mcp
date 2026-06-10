@@ -384,7 +384,7 @@ footer a{color:var(--text-muted)}
 
       <!-- Catchup annotation -->
       <text x="1025" y="330" text-anchor="middle" style="fill:var(--text-muted);font-family:monospace;font-size:11px">when node-4 returns:</text>
-      <text x="1025" y="345" text-anchor="middle" style="fill:var(--p1);font-family:monospace;font-size:11px">GET /api/v1/sync/since?cursor=...</text>
+      <text x="1025" y="345" text-anchor="middle" style="fill:var(--p1);font-family:monospace;font-size:11px">GET /api/v1/sync/since?peer=…&amp;since=…</text>
       <text x="1025" y="360" text-anchor="middle" style="fill:var(--text-muted);font-family:monospace;font-size:11px">advances local state</text>
 
       <defs>
@@ -410,7 +410,7 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="callout">
-      <strong>What if quorum can't be reached?</strong> The leader returns <strong>503 with structured peer status</strong>: which peers responded, which timed out, when the deadline hit. No silent partial writes. Caller can retry or escalate to the operator. The <code>QuorumNotMetPayload</code> includes per-peer error classification (Unreachable / IdDrift / InFlight / InvalidPolicy / LocalWriteFailed).
+      <strong>What if quorum can't be reached?</strong> The leader returns <strong>503 with structured peer status</strong>: which peers responded, which timed out, when the deadline hit. No silent partial writes. Caller can retry or escalate to the operator. The failure payload includes error classification (<code>QuorumFailureReason</code>: Unreachable / Timeout / IdDrift / InFlight; <code>QuorumError</code>: InvalidPolicy / LocalWriteFailed).
     </div>
   </div>
 </section>

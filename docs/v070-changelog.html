@@ -232,7 +232,7 @@ footer a{color:var(--muted)}
   <div class="entry">
     <span class="tag added">ADDED</span>
     <h3>Federation nonce persistence (#1255 / PR #1296)</h3>
-    <p>Schema v51 adds the <code>federation_nonces</code> table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so every restart re-opened a replay window; v51 collapses that window to zero across restarts.</p>
+    <p>Schema v51 adds the <code>federation_nonce_cache</code> table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so every restart re-opened a replay window; v51 collapses that window to zero across restarts.</p>
   </div>
 
   <div class="entry">
@@ -262,7 +262,7 @@ footer a{color:var(--muted)}
   <div class="entry">
     <span class="tag changed">CHANGED</span>
     <h3>Vendor-neutrality lint-gated (#1174 PR10)</h3>
-    <p>Vendor identifiers (<code>"claude"</code>, <code>"openai"</code>, <code>"xai"</code>, ...) are legitimate ONLY in 7 substrate carve-outs (llm.rs, config.rs, mine.rs, validate.rs, cli/wrap.rs, llm_cli_wrap.rs, harness.rs). Every other production-code site MUST read from <code>crate::llm::BACKEND_*</code> constants. CI enforces. Self-test in <code>scripts/check-vendor-literals.sh</code>.</p>
+    <p>Vendor identifiers (<code>"claude"</code>, <code>"openai"</code>, <code>"xai"</code>, ...) are legitimate ONLY in the substrate carve-outs enumerated in <code>scripts/check-vendor-literals.sh::ALLOWED_FILES</code> (9 at v0.7.0 release: llm.rs, config.rs, mine.rs, validate.rs, cli/wrap.rs, llm_cli_wrap.rs, harness.rs, plus the #1389 L2 vendor-routing pair recover/transcript_paths.rs + cli/commands/recover_previous_session.rs). Every other production-code site MUST read from <code>crate::llm::BACKEND_*</code> constants. CI enforces. Self-test in <code>scripts/check-vendor-literals.sh</code>.</p>
   </div>
 </section>
 
