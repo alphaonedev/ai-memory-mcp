@@ -632,6 +632,13 @@ pub struct BenchArgs {
     /// still prints; this flag only adds the append side effect.
     #[arg(long, value_name = "PATH")]
     pub history: Option<PathBuf>,
+    /// #1579 B8 — seed a scratch corpus of N rows before running the
+    /// workload and gate the verdict against the per-scale budget
+    /// table in `PERFORMANCE.md` §"Corpus-scale budgets". Omitting the
+    /// flag keeps the legacy ~500-row workload and legacy budgets.
+    /// Clamped to `[1, 1_000_000]`.
+    #[arg(long, value_name = "ROWS")]
+    pub scale: Option<usize>,
 }
 
 /// Default `--batch` page-size hint for `ai-memory migrate`. Currently
@@ -4343,10 +4350,13 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     // main DB (and disk) are untouched. SQLite's `:memory:` URL and
     // WAL-less mode keep the workload bounded by RAM and CPU.
     let conn = db::open(Path::new(":memory:"))?;
+    // #1579 B8 — corpus scale (None = legacy default workload).
+    let scale = args.scale.map(|s| s.clamp(1, crate::bench::MAX_SCALE));
     let config = bench::BenchConfig {
         iterations,
         warmup,
         namespace: bench::BENCH_NAMESPACE.to_string(),
+        scale,
     };
     let results = bench::run(&conn, &config)?;
 
@@ -4367,6 +4377,7 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "iterations": iterations,
                 "warmup": warmup,
+                "scale": scale,
                 "results": results,
                 "regressions": regressions,
             }))?
@@ -4381,7 +4392,14 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
 
     if let Some(history_path) = &args.history {
         let captured_at = chrono::Utc::now().to_rfc3339();
-        bench::append_history(history_path, &captured_at, iterations, warmup, &results)?;
+        bench::append_history(
+            history_path,
+            &captured_at,
+            iterations,
+            warmup,
+            scale,
+            &results,
+        )?;
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
             stderr,
