@@ -859,4 +859,46 @@ mod tests {
             "expected warn header or empty, got: {s}"
         );
     }
+
+    /// Coverage restoration (post-#1575 floor dip): the
+    /// `boot::run(...).is_err()` hard-failure arm in
+    /// `run_boot_capture` must return an EMPTY string (agent runs
+    /// unwrapped) — forced by pointing db_path at a DIRECTORY, which
+    /// the sqlite open cannot create-or-open even under `--quiet`.
+    #[test]
+    fn run_boot_capture_returns_empty_when_db_path_is_a_directory() {
+        let env = TestEnv::fresh();
+        let dir_as_db = env.db_path.parent().unwrap().to_path_buf();
+        let s = run_boot_capture(
+            &dir_as_db,
+            10,
+            DEFAULT_WRAP_BUDGET_TOKENS,
+            &crate::config::AppConfig::default(),
+        );
+        assert!(
+            s.is_empty() || s.contains("# ai-memory boot:"),
+            "directory-as-db must yield empty or warn-header output, got: {s}"
+        );
+    }
+
+    /// Coverage restoration: the MessageFile arm's trailing-arg
+    /// passthrough loop — trailing CLI args must land on the wrapped
+    /// command AFTER the message-file flag pair.
+    #[test]
+    fn message_file_strategy_passes_trailing_args_through() {
+        let strat = WrapStrategy::MessageFile {
+            flag: "--message-file".into(),
+        };
+        let trailing = vec!["--model".to_string(), "gpt-x".to_string()];
+        let (cmd, tf) =
+            build_command_for_strategy("aider", &strat, "BOOT-TRAIL", &trailing).unwrap();
+        let _tf = tf.expect("MessageFile must allocate a staged file");
+        let argv: Vec<String> = cmd.get_args().map(|s| os_str_to_string_lossy(s)).collect();
+        assert_eq!(argv[0], "--message-file");
+        assert_eq!(
+            &argv[2..],
+            ["--model", "gpt-x"],
+            "trailing args must follow the message-file pair: {argv:?}"
+        );
+    }
 }
