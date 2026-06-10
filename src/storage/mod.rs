@@ -10839,7 +10839,7 @@ pub fn doctor_reflection_totals_by_namespace(
     conn: &Connection,
 ) -> Result<Vec<(String, i64, i64, i64)>> {
     let now = Utc::now();
-    let cutoff_24h = (now - chrono::Duration::hours(24)).to_rfc3339();
+    let last_day_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
     let cutoff_7d = (now - chrono::Duration::days(7)).to_rfc3339();
 
     let mut stmt = conn.prepare(
@@ -10853,7 +10853,7 @@ pub fn doctor_reflection_totals_by_namespace(
          GROUP BY namespace
          ORDER BY namespace",
     )?;
-    let rows = stmt.query_map(params![cutoff_24h, cutoff_7d], |r| {
+    let rows = stmt.query_map(params![last_day_cutoff, cutoff_7d], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,

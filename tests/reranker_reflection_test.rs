@@ -113,7 +113,7 @@ fn factor_for_reflection_grows_with_depth_up_to_cap() {
     let r2 = mk("r2", "t", "c", MemoryKind::Reflection, 2);
     let r3 = mk("r3", "t", "c", MemoryKind::Reflection, 3);
     let r4 = mk("r4", "t", "c", MemoryKind::Reflection, 4); // past cap
-    let r99 = mk("r99", "t", "c", MemoryKind::Reflection, 99); // far past cap
+    let r_past_cap = mk("r_past_cap", "t", "c", MemoryKind::Reflection, 99); // far past cap
 
     // Boost = 1.2; per_depth_increment = 0.05; cap = 3.
     // factor(depth=k) = 1.2 * (1.0 + 0.05 * min(k, 3)).
@@ -132,7 +132,7 @@ fn factor_for_reflection_grows_with_depth_up_to_cap() {
     assert!(eq(cfg.factor_for(&r3), f(3)));
     // Past the cap, factor is clamped to factor(cap).
     assert!(eq(cfg.factor_for(&r4), f(3)));
-    assert!(eq(cfg.factor_for(&r99), f(3)));
+    assert!(eq(cfg.factor_for(&r_past_cap), f(3)));
 }
 
 #[test]

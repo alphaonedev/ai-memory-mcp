@@ -225,12 +225,12 @@ fn test_sender_clock_skew_logged_when_excessive() {
     // timestamps that bracket the threshold and assert the diff math
     // matches the implementation.
     let now = Utc::now();
-    let ahead_70s = now + chrono::Duration::seconds(70);
-    let behind_70s = now - chrono::Duration::seconds(70);
+    let skewed_ahead = now + chrono::Duration::seconds(70);
+    let skewed_behind = now - chrono::Duration::seconds(70);
     let just_under_60s = now + chrono::Duration::seconds(55);
 
-    let skew_ahead = ahead_70s.signed_duration_since(now).num_seconds();
-    let skew_behind = behind_70s.signed_duration_since(now).num_seconds();
+    let skew_ahead = skewed_ahead.signed_duration_since(now).num_seconds();
+    let skew_behind = skewed_behind.signed_duration_since(now).num_seconds();
     let skew_close = just_under_60s.signed_duration_since(now).num_seconds();
 
     // Threshold the handler enforces (mirror of CLOCK_SKEW_WARN_THRESHOLD_SECS).
