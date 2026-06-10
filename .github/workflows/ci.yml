@@ -632,7 +632,7 @@ jobs:
             TIMEOUT_BIN=timeout
           fi
           if [ -n "$TIMEOUT_BIN" ]; then
-            echo "::notice::[#1492] sal-postgres hung-test watchdog active via '$TIMEOUT_BIN' (1500s per invocation)"
+            echo "::notice::[#1492] sal-postgres hung-test watchdog active via '$TIMEOUT_BIN' (2100s per invocation; 1500s budget outgrown by the 2026-06-10 GA-drive suite — tests were actively passing at the old cap's kill, run 27251985404)"
           else
             echo "::warning::[#1492] sal-postgres watchdog could not find GNU timeout — relying on job-level timeout-minutes"
           fi
@@ -640,13 +640,13 @@ jobs:
             local label="$1"; shift
             local rc=0
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 2100 cargo test "$@" || rc=$?
             else
               cargo test "$@" || rc=$?
             fi
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-                echo "::error::[#1492 watchdog] sal-postgres '${label}' exceeded the 1500s per-invocation timeout and was terminated (previously a silent hang until the 45min job cap; see run 26998232157 embedding_dim_migration / leaked advisory lock). Reproduce with the impact set logged above."
+                echo "::error::[#1492 watchdog] sal-postgres '${label}' exceeded the 2100s per-invocation timeout and was terminated (previously a silent hang until the 45min job cap; see run 26998232157 embedding_dim_migration / leaked advisory lock). Reproduce with the impact set logged above."
               fi
               return "$rc"
             fi
