@@ -683,7 +683,18 @@ impl Embedder {
             sq_b += y * y;
         }
         let denom = sq_a.sqrt() * sq_b.sqrt();
-        if denom < 1e-12 { 0.0 } else { dot / denom }
+        if denom < 1e-12 {
+            return 0.0;
+        }
+        let score = dot / denom;
+        // #1584 (SEC) — defense-in-depth: a stored embedding carrying a
+        // NaN/±Inf component (e.g. a future code path that skips the
+        // `federation::sanitize_shipped_vector` ingest guard) would make
+        // `score` non-finite, and NaN is UNORDERED under `partial_cmp`
+        // — a single poisoned row silently corrupts the ranking of an
+        // entire candidate set. Collapse any non-finite score to 0.0 so
+        // a malformed vector ranks LAST instead of perturbing ordering.
+        if score.is_finite() { score } else { 0.0 }
     }
 
     /// v0.7.0 H7 — dimension-aware companion to [`Embedder::cosine_similarity`].

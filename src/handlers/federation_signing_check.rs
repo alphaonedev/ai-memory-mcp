@@ -245,17 +245,27 @@ pub(super) async fn sync_push_via_store(
                 // sender's shipped vector (dim-matching → one UPDATE,
                 // no embed at all); otherwise defer the local embed
                 // to the background task spawned before the response.
-                match shipped_by_id.get(mem.id.as_str()) {
-                    Some(se) if receiver_dim == Some(se.dim) && se.vector.len() == se.dim => {
+                // #1584 (SEC) — finite + L2-norm validation of the
+                // shipped vector before it lands (dim gate alone lets a
+                // NaN/non-normalized vector poison cosine ranking).
+                // `None` (or dim mismatch) defers a local re-embed.
+                let clean_shipped = shipped_by_id
+                    .get(mem.id.as_str())
+                    .filter(|se| receiver_dim == Some(se.dim) && se.vector.len() == se.dim)
+                    .and_then(|se| {
+                        crate::federation::sanitize_shipped_vector(&se.vector)
+                            .map(|v| (v, se.model.clone()))
+                    });
+                match clean_shipped {
+                    Some((vector, model)) => {
                         if let Err(e) = app
                             .store
-                            .update_embedding(&ctx, &applied_id, Some(&se.vector))
+                            .update_embedding(&ctx, &applied_id, Some(&vector))
                             .await
                         {
                             tracing::warn!(
                                 "sync_push (postgres): storing shipped embedding failed \
-                                 for {applied_id} (model {}): {e} — deferring local embed",
-                                se.model,
+                                 for {applied_id} (model {model}): {e} — deferring local embed",
                             );
                             deferred_embed.push((
                                 applied_id.clone(),
@@ -263,7 +273,7 @@ pub(super) async fn sync_push_via_store(
                             ));
                         }
                     }
-                    _ => deferred_embed.push((
+                    None => deferred_embed.push((
                         applied_id.clone(),
                         crate::embeddings::embedding_document(&mem.title, &mem.content),
                     )),
