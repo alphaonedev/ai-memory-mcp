@@ -77,7 +77,7 @@ PG_SSL_MODE="${DOCKER_1461_PG_SSL_MODE:-verify-full}"
 # Pinned artifacts (reproducibility anchors — assert these, never drift)
 # --------------------------------------------------------------------------
 EXPECTED_VERSION="${DOCKER_1461_EXPECTED_VERSION:-0.7.0}"
-EXPECTED_SCHEMA="${DOCKER_1461_EXPECTED_SCHEMA:-55}"
+EXPECTED_SCHEMA="${DOCKER_1461_EXPECTED_SCHEMA:-56}"
 EMBED_DIM="${DOCKER_1461_EMBED_DIM:-768}"
 EMBED_MODEL="${DOCKER_1461_EMBED_MODEL:-nomic-embed-text}"        # Ollama tag
 EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
