@@ -299,7 +299,7 @@ pub async fn purge_archive(
     // called with `bypass_visibility = true` (the SHIP-cluster
     // `for_admin` posture) so the DELETE runs cross-tenant — the
     // legitimate `archive_max_days` operator wipe surface.
-    let is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+    let is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
     crate::governance::audit::record_decision(
         &caller,
         "allow",

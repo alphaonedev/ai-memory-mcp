@@ -151,6 +151,34 @@ pub fn is_admin_caller(state: &AppState, caller: &str) -> bool {
     state.admin_agent_ids.iter().any(|id| id == caller)
 }
 
+/// #1582 (SEC, HIGH) — authn-gated companion to [`is_admin_caller`].
+///
+/// `is_admin_caller` is a PURE allowlist match: it answers "is this
+/// name configured as an admin?" and nothing more. On its own it is
+/// unsafe to use as a privilege grant on a deployment with NO request
+/// authentication, because the `X-Agent-Id` header that produced
+/// `caller` is self-asserted (no cryptographic binding exists for it
+/// in v0.7.0) — any wire caller could type a configured admin id into
+/// the header and mint admin.
+///
+/// This predicate adds the SAME #1570 (H6) gate [`require_admin`]
+/// applies (`admin_role.rs` line ~246): the allowlisted name is
+/// honored only when (a) the daemon has an `api_key` configured — the
+/// middleware then guarantees every request reaching the handler
+/// presented the transport credential — or (b) the operator explicitly
+/// opted into the legacy header-trust posture via
+/// [`ENV_ADMIN_HEADER_TRUST`]. Default = deny (fail closed).
+///
+/// Read handlers that OR an admin flag past the per-row
+/// [`crate::visibility::is_visible_to_caller`] scope=private filter
+/// MUST use this predicate, not the bare [`is_admin_caller`] — else a
+/// self-asserted `X-Agent-Id` on a keyless deployment bypasses
+/// cross-tenant private-row visibility (the #1582 finding).
+#[must_use]
+pub fn is_admin_caller_trusted(state: &AppState, caller: &str) -> bool {
+    is_admin_caller(state, caller) && (request_authn_configured() || admin_header_trust_enabled())
+}
+
 /// Resolve the caller from `headers`, check it against the admin
 /// allowlist, and either return the validated caller string OR a
 /// pre-built `403 Forbidden` response the handler should
