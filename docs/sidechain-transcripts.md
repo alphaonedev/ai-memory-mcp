@@ -147,7 +147,9 @@ cap (commit `26fab06`) with a default of `MAX_DECOMPRESSED_BYTES =
 Prior to I1, a malicious peer could push a 1 KiB zstd payload that
 decompressed to hundreds of MiB and exhaust the daemon's memory. The
 cap is checked on every `fetch`; payloads above the cap are refused
-with a `TranscriptDecompressionExceedsCap` error.
+with a `transcript decompression exceeded … byte cap (decompression
+bomb defence)` error plus a structured `tracing::warn!` under the
+`transcripts.bomb` target.
 
 The cap is **per-call**: concurrent fetches consume up to
 N × `max_decompressed_bytes` of transient memory. Operators with
@@ -295,7 +297,7 @@ substrate for the data (a dedicated log store may be cheaper).
 | Symptom | Likely cause | Diagnostic recipe |
 |---|---|---|
 | `memory_replay` returns empty | No transcript stored for that memory_id, or links missing | `SELECT * FROM memory_transcript_links WHERE memory_id = '<id>';` — if empty, the R5 hook didn't fire or wasn't wired for that namespace. |
-| `TranscriptDecompressionExceedsCap` on fetch | Single transcript above `max_decompressed_bytes` | Raise the cap explicitly OR shard the transcript into per-turn rows on next ingest. |
+| `transcript decompression exceeded … byte cap` error on fetch | Single transcript above `max_decompressed_bytes` | Raise the cap explicitly OR shard the transcript into per-turn rows on next ingest. |
 | Disk growing unboundedly | Lifecycle sweep not running, OR TTL too generous | Inspect `SELECT COUNT(*), MIN(created_at), MAX(archived_at) FROM memory_transcripts;` to confirm the sweep is making progress. |
 | Reflections refused via I3 cascade | Transcript was pruned but memory still exists | `ON DELETE CASCADE` removes the link row when transcript is deleted; memory persists. Re-ingest if recall fidelity matters. |
 | R5 hook fires but no transcript stored | Hook returned `Modify` with empty transcript field, or namespace not opted-in | Check `auto_extract` is `true` for the namespace; check the hook's stdout for the response payload. |
@@ -305,7 +307,8 @@ substrate for the data (a dedicated log store may be cheaper).
 ## Operator runbook (3am procedures)
 
 **Daemon OOM suspected zstd bomb.** Check daemon log for
-`TranscriptDecompressionExceedsCap` warnings just before the OOM. If
+`transcripts.bomb` warnings (`rejecting transcript: decompressed
+size would exceed cap`) just before the OOM. If
 present, an attacker (or a misbehaving R5 hook) pushed an oversized
 transcript. Immediate mitigation: set
 `[transcripts] max_decompressed_bytes = 4194304` (4 MiB) in

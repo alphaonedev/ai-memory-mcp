@@ -401,8 +401,10 @@ signatures that pins the audit story.
   `tests/signed_events_chain_v34.rs`.
 - **V-4 (per-row signature) PASS** — unchanged from v0.6.3.
 - **V-4 (append-only enforcement) PASS** — no UPDATE / DELETE path
-  through the application layer; the substrate validates against
-  `SignedEventsAppendOnlyViolation` on any write that would non-append.
+  through the application layer; the invariant is pinned by the
+  `append_only_invariant_no_mutators_in_src` test in
+  `src/signed_events.rs`, which fails the build if any production
+  UPDATE/DELETE call site against `signed_events` appears.
 
 See also: [`docs/MIGRATION_v0.7.md` §"Ed25519 attestation"](MIGRATION_v0.7.md#ed25519-attestation-opt-in),
 [`docs/v0.7.0/release-notes.md` §"Signed events V-4 closeout"](v0.7.0/release-notes.md),

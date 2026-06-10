@@ -447,7 +447,7 @@ Response envelope additions (back-compat — additive fields only):
 - `src/federation/peer_attestation.rs::namespace_allowed_test_glob`
   + `PeerScope::allowed_namespaces` (`*` / `**` glob, no new
   regex dep).
-- `src/handlers/federation_receive.rs::sync_since` — applies the
+- `src/handlers/federation_sync_since.rs::sync_since` — applies the
   filter to the projection from `db::memories_updated_since` /
   `Store::list_memories_updated_since` (sqlite + postgres parity).
 - `src/federation/receive.rs::catchup_once[_with_store]` — attaches
