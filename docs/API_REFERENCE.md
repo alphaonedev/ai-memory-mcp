@@ -14,13 +14,28 @@ deployments should always bind TLS: `--tls-cert` + `--tls-key`.
 
 ### API key
 
-When `--api-key <key>` is set (or `api_key = "…"` in config), every
-endpoint except `/api/v1/health` requires one of:
+When an `api_key` is configured (the top-level `api_key = "…"` field in
+`config.toml`, or injected via `AI_MEMORY_API_KEY` by the Plan-C
+container entrypoint — there is **no** `--api-key` CLI flag on `serve`),
+every endpoint except `/api/v1/health` requires one of:
 
-- Header: `X-API-Key: <key>`
-- Query parameter: `?api_key=<key>`
+- Header: `x-api-key: <key>` — **the canonical credential channel**.
+- Query parameter: `?api_key=<key>` — **DEPRECATED**
+  ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)):
+  URL-embedded credentials leak into access logs, `Referer` headers,
+  and proxy logs. Still accepted at v0.7.0 for back-compat (the daemon
+  emits a once-per-process WARN on first use); slated for rejection at
+  v0.8.
 
 Failure → **401** `{"error": "missing or invalid API key"}`.
+
+When mTLS fingerprint pinning is enforced (`--mtls-allowlist`), the
+`/api/v1/sync/*` federation paths bypass the api-key check — the mTLS
+handshake plus the `X-Memory-Sig` signed-message gate (#791/#1031) are
+the stronger authentication step there.
+
+`AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses a keyless daemon start on
+ANY bind host, including loopback (#1458).
 
 ### Agent identity — `X-Agent-Id`
 
@@ -32,13 +47,34 @@ X-Agent-Id: alice
 X-Agent-Id: host:prod-web-01:pid-12345-a1b2c3d4
 ```
 
-Resolution precedence (write paths):
+Resolution (v0.7.0, header-first — the pre-v0.7.0 body-wins precedence
+was the #874-class spoof vector):
 
-1. `agent_id` field in request body.
-2. `X-Agent-Id` header.
-3. Per-request anonymous id (`anonymous:req-<uuid8>`).
+1. The `X-Agent-Id` header is the **authoritative** identity slot.
+2. A body `agent_id` field (or `?agent_id=` query param where
+   accepted) is a *refinement* that MUST match the header-resolved id;
+   a mismatch is rejected with **403**
+   (`agent_id_body_header_mismatch` / `agent_id_query_header_mismatch`).
+3. With no header and no body claim, a per-request anonymous id
+   (`anonymous:req-<uuid8>`) is synthesized and logged at WARN.
 
 Validation pattern: `^[A-Za-z0-9_\-:@./]{1,128}$`.
+
+### Admin-gated endpoints (v0.7.0 #943/#945/#946 cluster)
+
+Corpus-scale endpoints require an **admin** caller: `GET /stats`,
+`POST /gc`, `GET /export`, `POST /import`, `GET /agents`,
+`POST /forget`, `GET /namespaces` (list form), `GET /taxonomy`,
+`GET /archive`, `GET /archive/stats`, and the seven `/skill/*` routes.
+The admin allowlist is `[admin] agent_ids = [...]` in `config.toml`
+(plus `AI_MEMORY_ADMIN_AGENT_IDS`); when empty (the default) these
+endpoints return **403** to every caller. Per
+[#1570](https://github.com/alphaonedev/ai-memory-mcp/issues/1570), on a
+deployment with **no `api_key` configured**, a bare self-asserted
+`X-Agent-Id` naming an admin id is NOT trusted for admin-role
+resolution (boot emits a WARN); set `AI_MEMORY_ADMIN_HEADER_TRUST=1`
+only to restore the legacy header-trust posture on isolated/mTLS-fronted
+deployments.
 
 ### mTLS (Layer 2 peer mesh)
 
@@ -88,12 +124,14 @@ Status codes you'll commonly encounter:
 ## Limits
 
 - Bulk / list / sync page-size cap: **1000 items by default**
-  (`/memories/bulk`, `/import`, `/sync/push`, and the per-page cap on
-  list responses). **Operator-tunable** (#1156 follow-up) via the
+  (`/memories/bulk`, `/sync/push`, and the per-page cap on list
+  responses). **Operator-tunable** (#1156 follow-up) via the
   `[limits].max_page_size` config field or the `AI_MEMORY_MAX_PAGE_SIZE`
   env var (precedence: env > config > compiled default `1000`). The cap
   bounds per-request in-memory materialization to guard against OOM
-  under an unbounded `limit=`.
+  under an unbounded `limit=`. `/import` is capped at the **compiled**
+  `MAX_BULK_SIZE` (1000), independent of `max_page_size`.
+- Request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 - Recall: capped at **50** per request.
 - Sync/since: capped at **10,000** per request.
 - Per-agent write quotas (daily memories, storage bytes, daily links)
@@ -167,7 +205,7 @@ curl http://127.0.0.1:9077/metrics
 ### `GET /api/v1/stats`
 
 Structured database stats (counts by tier/namespace, links, size,
-last GC).
+last GC). **Admin-gated** (#946 cluster).
 
 ```json
 {
@@ -256,9 +294,9 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
 
 ### `GET /api/v1/memories` — list
 
-Query params: `namespace`, `tier`, `limit` (default 20, max 200),
-`offset`, `min_priority`, `since`, `until`, `tags` (comma list),
-`agent_id`.
+Query params: `namespace`, `tier`, `limit` (default 20, capped at
+`max_page_size` — compiled default 1000), `offset`, `min_priority`,
+`since`, `until`, `tags` (comma list), `agent_id`.
 
 ```json
 { "memories": [ … ], "count": 1 }
@@ -357,7 +395,7 @@ Bump to long tier. 200 / 202 / 404.
 { "namespace": "scratch", "pattern": "deprecated", "tier": "short" }
 ```
 
-At least one filter required. Returns `{"deleted": N}`.
+At least one filter required. **Admin-gated**. Returns `{"deleted": N}`.
 
 ### `POST /api/v1/consolidate`
 
@@ -375,7 +413,8 @@ At least one filter required. Returns `{"deleted": N}`.
 
 ### `POST /api/v1/gc`
 
-Immediate garbage collection. Empty body. Returns `{"expired_deleted":N}`.
+Immediate garbage collection. Empty body. **Admin-gated**. Returns
+`{"expired_deleted":N}`.
 
 ## Links
 
@@ -402,10 +441,11 @@ columns added in schema v15) and the namespace taxonomy. See
 ### `GET /api/v1/taxonomy`
 
 Walk live (non-expired) memories grouped by namespace into a
-hierarchical tree.
+hierarchical tree. **Admin-gated** (#945).
 
-Query params: `prefix` (optional, restricts walk), `depth` (1-10, default 5),
-`limit` (1-10000, default 1000).
+Query params: `prefix` (optional, restricts walk; `root` is an accepted
+alias — `prefix` wins when both are supplied), `depth` (max 8 =
+`MAX_NAMESPACE_DEPTH`, default 8), `limit` (1-10000, default 1000).
 
 ```json
 {
@@ -443,8 +483,9 @@ Response:
 ```
 
 `threshold` is clamped to a 0.5 floor. Requires the `semantic` feature
-tier or higher. Returns `409` (Conflict) only on internal embedding
-errors; threshold mismatches return `200` with `is_duplicate: false`.
+tier or higher — without an embedder the endpoint returns **503**
+(Service Unavailable); threshold mismatches return `200` with
+`is_duplicate: false`.
 
 ### `POST /api/v1/entities`
 
@@ -537,7 +578,8 @@ source memory.
 }
 ```
 
-Constraints: `max_depth` clamped to 1..=5 (depth 0 errors,
+Constraints: `max_depth` defaults to **1** when omitted and must be in
+1..=5 (`KG_QUERY_MAX_SUPPORTED_DEPTH`; depth 0 errors,
 depth > 5 errors). `allowed_agents: []` (empty array) returns zero
 rows; omit the field to skip the agent filter entirely.
 
@@ -572,8 +614,12 @@ link_created_at ASC`.
 
 ### `GET /api/v1/namespaces`
 
+Lists namespaces with live-memory counts (**admin-gated**, #945). With
+`?namespace=<ns>` the same route instead fetches that namespace's
+standard (query-string twin of the `{ns}/standard` path form below).
+
 ```json
-{ "namespaces": [{"name":"global","count":50},{"name":"project-x","count":30}] }
+{ "namespaces": [{"namespace":"global","count":50},{"namespace":"project-x","count":30}] }
 ```
 
 ### `GET /api/v1/namespaces/{ns}/standard` — get namespace standard
@@ -608,13 +654,16 @@ MCP tool: `memory_namespace_clear_standard` (`src/mcp/tools/namespace.rs`).
 
 ### `GET /api/v1/archive` — list archived memories
 
-Query: `namespace`, `limit` (default 50, max 1000), `offset`.
+**Admin-gated** (#943). Query: `namespace`, `limit` (default 50,
+clamped 1-1000; `limit=0` → 400), `offset`.
 
 ```json
-{ "memories": [ … ], "count": 24 }
+{ "archived": [ … ], "count": 24 }
 ```
 
 Equivalent MCP tool: `memory_archive_list` (`src/mcp/tools/archive.rs`).
+A `POST /api/v1/archive` form also exists (archive an explicit list of
+memory ids; `≤ 1000` ids per request).
 
 ### `POST /api/v1/archive/{id}/restore` — restore archived memory
 
@@ -631,8 +680,10 @@ tool: `memory_archive_purge` (`src/mcp/tools/archive.rs`).
 
 ### `GET /api/v1/archive/stats` — archive counters
 
+**Admin-gated** (#943).
+
 ```json
-{ "total": 24, "by_namespace": [{"namespace":"global","count":18}, … ] }
+{ "archived_total": 24, "by_namespace": [{"namespace":"global","count":18}, … ] }
 ```
 
 Equivalent MCP tool: `memory_archive_stats` (`src/mcp/tools/archive.rs`).
@@ -650,7 +701,7 @@ Equivalent MCP tool: `memory_archive_stats` (`src/mcp/tools/archive.rs`).
 
 ### `GET /api/v1/agents`
 
-Returns `{"agents":[…],"count":N}`.
+**Admin-gated** (#946). Returns `{"agents":[…],"count":N}`.
 
 ### `GET /api/v1/pending` — list pending governance actions
 
@@ -683,13 +734,23 @@ Peer-to-peer push with timestamp-aware merge.
 ```json
 {
   "sender_agent_id": "peer-remote-1",
-  "memories": [ { … up to 1000 … } ],
+  "memories": [ { … up to max_page_size (default 1000) … } ],
   "dry_run": false
 }
 ```
 
 Response includes `applied`, `noop`, `skipped`, `receiver_agent_id`,
 `receiver_clock`.
+
+**Federation headers (v0.7.0 secure defaults).** Under
+`AI_MEMORY_FED_REQUIRE_SIG=1` (default, #791) the request must carry an
+Ed25519 `X-Memory-Sig` over the body, attributed via `X-Peer-Id` to an
+enrolled peer key; under `AI_MEMORY_FED_REQUIRE_NONCE=1` (default,
+#922) a fresh per-message `X-Memory-Nonce` is also required (the
+signature binds `body || 0x00 || nonce`), so byte-replays produce
+`401 x_memory_nonce_replay`. `GET /api/v1/sync/since` enforces the same
+signed-message gate over canonical GET bytes
+(`method || path || query`, #1031).
 
 ### `GET /api/v1/sync/since`
 
@@ -704,12 +765,15 @@ Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
 
 ### `GET /api/v1/export`
 
-Returns `{"memories":[…],"links":[…],"count":N,"exported_at":"…"}`.
+**Admin-gated.** Returns
+`{"memories":[…],"links":[…],"count":N,"exported_at":"…"}`.
 
 ### `POST /api/v1/import`
 
-Body matches export shape. `≤ 1000` memories per call. Preserves
-original `metadata.agent_id` into `metadata.imported_from_agent_id`.
+**Admin-gated.** Body matches export shape. `≤ 1000` memories per call
+(compiled `MAX_BULK_SIZE`). Returns `{"imported":N,"errors":[…]}`.
+Preserves original `metadata.agent_id` into
+`metadata.imported_from_agent_id`.
 
 ## Webhooks (v0.6.0.0)
 
@@ -719,10 +783,16 @@ private-range IPs; requires `https://` unless loopback).
 
 ### `POST /api/v1/subscriptions` — register webhook
 
-Body: `{ "url": "https://…", "events": ["memory_store", …], "secret": "<shared-secret>", "namespace_filter": "…", "agent_filter": "…" }`.
-Stores `secret` as a SHA-256 hash for HMAC signing of dispatched
-events. Returns the new subscription `id`. Equivalent MCP tool:
-`memory_subscribe` (`src/mcp/tools/subscribe.rs`).
+Body: `{ "url": "https://…", "events": "memory_store,memory_delete", "secret": "<shared-secret>", "namespace_filter": "…", "agent_filter": "…" }`.
+`events` is a **comma-separated string** (default `"*"`). Canonical
+event types (`WEBHOOK_EVENT_TYPES` in `src/subscriptions.rs`):
+`memory_store`, `memory_promote`, `memory_delete`,
+`memory_link_created`, `memory_link_invalidated`,
+`memory_consolidated`, `approval_requested`. Stores `secret` as a
+SHA-256 hash; dispatched events carry an
+`X-AI-Memory-Signature: sha256=<hex>` HMAC header. Returns the new
+subscription `id`. Equivalent MCP tool: `memory_subscribe`
+(`src/mcp/tools/subscribe.rs`).
 
 ### `DELETE /api/v1/subscriptions?id=<id>` — unregister webhook
 
@@ -799,25 +869,42 @@ them.
 
 ## v0.7.0 net-new endpoints
 
-The eight HTTP routes added since v0.6.4. All accept the same auth +
+The HTTP routes added since v0.6.4. All accept the same auth +
 agent-identity headers documented above. Wire-shape source of truth is
-`src/handlers/http.rs` (the route file enumeration in `src/lib.rs`).
+the per-domain handler modules under `src/handlers/`; the route-path
+SSOT is `src/handlers/routes.rs` (#1558 batch 4), registered by the
+router in `src/lib.rs`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/quota/status` | K8 quota status — read the calling agent's daily quota row. Auto-inserts a default row on first call. See [`docs/k8-quotas.md`](k8-quotas.md). |
-| `GET`  | `/api/v1/approvals/stream` | K10 SSE approval channel — server-sent events for pending-approval state changes. HMAC body signature required on the partnered POST decide path. See [`docs/k10-sse-approvals.md`](k10-sse-approvals.md). |
-| `POST` | `/api/v1/auto_tag` | LLM auto-tag endpoint (v0.7 smart-tier surface). |
+| `POST` | `/api/v1/quota/status` | K8 quota status — read the calling agent's daily quota row. Auto-inserts a default row on first call. See [`docs/k8-quotas.md`](k8-quotas.md). MCP: `memory_quota_status`. |
+| `GET`  | `/api/v1/approvals/stream` | K10 SSE approval channel — server-sent events for pending-approval state changes. See [`docs/k10-sse-approvals.md`](k10-sse-approvals.md). |
+| `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session|forever"}`, HMAC-gated via `X-AI-Memory-Signature`. |
+| `POST` | `/api/v1/auto_tag` | LLM auto-tag endpoint (v0.7 smart-tier surface; 503 when no LLM is configured). |
 | `POST` | `/api/v1/expand_query` | HTTP parity for the MCP `memory_expand_query` tool. |
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; Cypher on AGE / recursive-CTE on SQLite. |
+| `POST` | `/api/v1/find_paths` | Alias for `/api/v1/kg/find_paths` (#934 — legacy callers). |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
+| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": N}`. |
+| `GET`  | `/api/v1/contradictions` | Detect contradiction candidates (similar titles in a namespace). |
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
-| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (74 at `full`, 7 at `core` — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`). |
+| `POST` | `/api/v1/capture_turn` | #1416 — L4 layered-capture HTTP mirror of MCP `memory_capture_turn` (idempotent per-turn write via `MemoryStore::capture_turn_idempotent`). |
+| `POST` | `/api/v1/share` | #1095 — copy a memory into the recipient agent's `_shared/<from>→<to>/` namespace; body `{source_memory_id, target_agent_id}`. MCP: `memory_share`. |
+| `POST` | `/api/v1/session/start` | HTTP parity for `memory_session_start` (auto-recall session boot). |
+| `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
+| `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. |
+| `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`. |
+| `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** |
+| `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
+| `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (74 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> Total HTTP surface at v0.7.0: **73 distinct route paths** on the
-> sqlite-backed daemon (and the postgres-backed daemon under
-> `--features sal-postgres`). Authoritative count:
-> `grep -oE '"/api/v1[^"]*"|"/metrics"' src/lib.rs | sort -u | wc -l`.
+> Total HTTP surface at v0.7.0: **74 unique URL paths** / 88 production
+> route registrations on the sqlite-backed daemon (and the
+> postgres-backed daemon under `--features sal-postgres`).
+> Authoritative count:
+> `grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l` = 74
+> (73 `/api/v1/*` paths + the bare `/metrics`), pinned by
+> `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` in `src/lib.rs`.
 
 ### v0.7.0 net-new MCP tools
 
@@ -834,7 +921,7 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_verify` | `POST /api/v1/links/verify` | H4. |
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 
-For the canonical 74-entry full inventory: `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 74 — the `registered_tools()` iterator in `src/mcp/registry.rs:564` is the source of truth.
+For the canonical 74-entry full inventory: `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 74 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth.
 
 ## See also
 
