@@ -79,10 +79,16 @@ Clients that pin `schema_version: 2` continue to receive the v2 shape — v2 sta
 
 Backward compat: v0.6.4 SDKs continue to work — they read v2 fields and ignore the new top-level keys.
 
-To inspect the live v3 response (replace the legacy `doctor --capabilities=v3` recipe with):
+To inspect the live v3 response (there is no `ai-memory mcp call`
+sub-subcommand — probe the stdio server with raw JSON-RPC, or use the
+HTTP surface):
 
 ```bash
-ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq .memory_kind_vocab
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_capabilities","arguments":{}}}' \
+  | ai-memory mcp --profile full
+# or, with a running daemon:
+curl -s http://127.0.0.1:9077/api/v1/capabilities | jq .memory_kind_vocab
 ```
 
 ---
@@ -254,7 +260,7 @@ ai-memory identity export-pub --agent-id ai:claude-code@host:pid-12345
 
 Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode 0600 / 0644.
 
-**`attest_level` enum:** `unsigned` (no keypair present — preserves v0.6.4 backward compat), `self_signed` (active agent has a keypair; outbound writes signed), `peer_attested` (federated link verified against the peer's known public key).
+**`attest_level` enum (links / signed events):** `unsigned` (no keypair present — preserves v0.6.4 backward compat), `self_signed` (active agent has a keypair; outbound writes signed), `peer_attested` (federated link verified against the peer's known public key), plus two later v0.7.0 additions: `signed_by_peer` (L4 `memory_capture_turn` host-signed memory verified against `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST`) and `daemon_signed` (the daemon's own signature on its governance-audit emissions). (The *store-path* write attestation in `metadata.attest_level` uses a separate two-value vocabulary: `claimed` / `agent_attested`.)
 
 **Append-only `signed_events` audit table** records every signed write — no UPDATE or DELETE through the application layer. The V-4 closeout ([#698](https://github.com/alphaonedev/ai-memory-mcp/issues/698)) added a cross-row hash chain (`prev_hash` BLOB + `sequence` INTEGER) so the chain itself is tamper-evident, not just each row. Verify with:
 
@@ -272,13 +278,19 @@ Operator doc: [`docs/signed-events-v4.md`](signed-events-v4.md).
 
 v0.7.0 adds raw conversation/reasoning trail storage in zstd-3-compressed BLOBs, linked to derived memories via `memory_transcript_links`. Substrate for R5 auto-extraction.
 
-Default: **off.** Opt in per namespace via `[transcripts]` config:
+Default: **off.** Opt in per namespace via `[transcripts]` config
+(times are in seconds; per-namespace tables live under
+`[transcripts.namespaces."<pattern>"]`):
 
 ```toml
-[transcripts."team/*"]
-enabled = true
-ttl_days = 30
-archive_after_days = 7
+[transcripts]
+default_ttl_secs   = 2592000   # 30d archive-eligibility
+archive_grace_secs = 604800    # 7d linger before prune
+
+  [transcripts.namespaces."team/*"]
+  default_ttl_secs   = 2592000
+  archive_grace_secs = 604800
+  auto_extract       = true    # opt into the R5 transcript-extractor hook
 ```
 
 Background sweeper archives transcripts whose memories are all expired, then prunes after a grace period. `memory_replay(memory_id, depth?)` reconstructs the transcript chain; `depth=0` reproduces the pre-L2-4 shape.
@@ -291,19 +303,14 @@ Operator doc: [`docs/sidechain-transcripts.md`](sidechain-transcripts.md).
 
 v0.7.0 detects Apache AGE in Postgres at SAL initialization (`SELECT * FROM pg_extension WHERE extname='age'`). When present, KG operations route through Cypher; otherwise the recursive-CTE path used since v0.6.x stays in place.
 
-Install AGE in your Postgres instance and restart `ai-memory`. To confirm which backend is live, inspect the v3 capabilities response (which records `kg_backend`):
+Install AGE in your Postgres instance and restart `ai-memory`. To confirm which backend is live, check the daemon's startup log — the postgres adapter emits one INFO line at connect (tracing target `store::postgres`):
 
-```bash
-ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.kg_backend'
+```
+Postgres KG backend: AGE     # Cypher path active
+Postgres KG backend: CTE     # recursive-CTE fallback
 ```
 
-Or, from the HTTP surface:
-
-```bash
-curl -s http://127.0.0.1:9077/api/v1/capabilities | jq '.kg_backend'
-```
-
-Returns `"age"` when AGE is detected, `"cte"` when it falls through. (The v0.7-alpha drafts referenced a `ai-memory doctor --kg-backend` flag; that flag was not shipped — use the capabilities-response surface above.)
+(The v0.7-alpha drafts referenced an `ai-memory doctor --kg-backend` flag and a populated `kg_backend` capabilities field; neither shipped at v0.7.0 — the capabilities envelope declares the `kg_backend` field but no production surface populates it yet, so the startup log line is the authoritative check.)
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your hardware, stay on the CTE path.
 
@@ -346,11 +353,12 @@ v0.7.0 refactors the existing `governance` system into:
 **Migration tool** (idempotent, dry-run by default):
 
 ```bash
-ai-memory governance migrate-to-permissions               # dry-run
-ai-memory governance migrate-to-permissions --apply       # commit
+ai-memory governance migrate-to-permissions               # dry-run (prints, writes nothing)
+ai-memory governance migrate-to-permissions \
+  --config-out ~/.config/ai-memory/config.toml            # commit (in-place merge)
 ```
 
-The dry-run prints the proposed `permissions` rows alongside the source `governance` rows; `--apply` writes them. Re-running is safe — already-migrated rows are skipped.
+The dry-run prints the rendered `[[permissions.rules]]` block derived from the legacy `[[governance.policy]]` entries; `--config-out <path>` writes it (an in-place merge when the path matches the loaded config; `--config-in <path>` overrides the source). Re-running is safe.
 
 Honest disclosures from v0.6.3.1 close out:
 
@@ -560,8 +568,9 @@ Operator doc: [`docs/federation.md`](federation.md).
 ## Upgrade steps
 
 ```bash
-# 1. Stop the running daemon
-ai-memory stop
+# 1. Stop the running daemon (there is no `ai-memory stop` subcommand —
+#    use your service manager, or pkill -INT for shell-launched daemons)
+systemctl --user stop ai-memory   # or: pkill -INT ai-memory
 
 # 2. Backup your DB before the schema migration. Default DB filename
 #    is `ai-memory.db` (NOT `memory.db`); confirm via `ai-memory --help`.
@@ -569,9 +578,12 @@ cp ~/.claude/ai-memory.db ~/.claude/ai-memory.db.v0.6.4.bak
 
 # 3. Upgrade the binary. UNTIL v0.7.0 IS PUBLISHED to the
 #    alphaonedev/homebrew-tap formula AND crates.io, prefer the
-#    GitHub Releases tarball or the --tag v0.7.0 source build:
-ARCH=$(uname -m); OS=$(uname -s | tr A-Z a-z)
-curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-${ARCH}-${OS}.tar.gz" \
+#    GitHub Releases tarball or the --tag v0.7.0 source build.
+#    Release assets are named by Rust target triple
+#    (x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu /
+#    x86_64-apple-darwin / aarch64-apple-darwin /
+#    x86_64-pc-windows-msvc.zip). Example, Linux x86_64:
+curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-x86_64-unknown-linux-gnu.tar.gz" \
   | tar -xz -C ~/.local/bin
 # OR from source (locks the tag explicitly):
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp \
@@ -596,21 +608,23 @@ ai-memory config migrate --also-clean-claude-json   # OPT-IN: also strip
 # 5. Preview the permissions migration (governance v0.6.4 → permissions v0.7.0)
 ai-memory governance migrate-to-permissions               # dry-run
 
-# 6. Apply if happy
-ai-memory governance migrate-to-permissions --apply
+# 6. Apply if happy (in-place merge into the loaded config)
+ai-memory governance migrate-to-permissions \
+  --config-out ~/.config/ai-memory/config.toml
 
-# 7. (Optional) Generate an Ed25519 keypair for outbound link signing
-ai-memory identity generate --agent-id "$(ai-memory identity suggest-id)"
+# 7. (Optional) Generate an Ed25519 keypair for outbound link signing.
+#    Omitting --agent-id uses the NHI-hardened default id.
+ai-memory identity generate
 
 # 8. Restart
-ai-memory start
+systemctl --user start ai-memory   # or relaunch your MCP host
 
 # 9. Verify — `ai-memory doctor` now reports 9 sections incl. the new
 #    "LLM Reachability (#1146)" section that probes the resolved backend.
 ai-memory doctor
 ai-memory doctor --tokens
-ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.kg_backend'
-ai-memory verify-signed-events-chain --format json | jq -e .ok
+curl -s http://127.0.0.1:9077/api/v1/capabilities | jq '.schema_version'
+ai-memory verify-signed-events-chain --format json | jq -e .chain_holds
 ```
 
 **For the comprehensive 3-tier walkthrough** (non-technical /
@@ -623,7 +637,7 @@ opt-out env vars.
 
 Schema migrations (sqlite v20 → v55, postgres v15 → v55 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 55` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration file is [`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`](../migrations/sqlite/0046_v55_idx_memories_updated_at.sql) (sqlite splits per-bump, file-name counter ≠ logical version; v54 is an in-code backfill arm with no new .sql file, while v55 adds the `idx_memories_updated_at` index via its own .sql file) and the postgres in-process `migrate_v55()` arm (postgres runs a single greenfield+upgrade pair, with v34 → v55 deltas applied through in-process `migrate_v34()` … `migrate_v55()` async functions; `migrate_v55()` is a version-stamp no-op on postgres because `memories_updated_at_idx (updated_at DESC)` already serves the federation-catchup range scan).
 
-**Per-bump narrative for the post-v34 sqlite ladder (every operator MUST back up to a sibling `.bak` before `ai-memory serve` first-touches the DB, because the daemon will silently traverse all 15 of these bumps on first open):**
+**Per-bump narrative for the post-v34 sqlite ladder (every operator SHOULD back up to a sibling `.bak` before `ai-memory serve` first-touches the DB — the migrator also writes its own automatic `<db>.pre-migration-v<from>-to-v<to>-<token>.bak` `VACUUM INTO` snapshot before any schema-mutating upgrade — because the daemon will traverse all 22 of these bumps on first open):**
 
 - **v34** — V-4 closeout (#698): `signed_events.prev_hash` + `signed_events.sequence` cross-row hash chain.
 - **v35** — shadow retention columns on calibration tables.
@@ -642,7 +656,7 @@ Schema migrations (sqlite v20 → v55, postgres v15 → v55 logical) run automat
 - **v48** — `federation_push_dlq` table + dispatch indices (#933).
 - **v49** — `archived_memories` full v0.7.0 column carry: 14 nullable columns added so archive → restore is lossless for the full v0.7.0 Memory shape on both backends (`reflection_depth`, `atomised_into`, `atom_of`, `memory_kind`, `entity_id`, `persona_version`, `citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`, `confidence_decayed_at`, `mentioned_entity_id`, `version`; #1025).
 - **v50** — per-namespace K8 quota dimension extension (#1156): `agent_quotas` PRIMARY KEY extended from `(agent_id)` to `(agent_id, namespace)` so per-namespace quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel namespace, preserving pre-v50 row accounting verbatim. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Postgres mirror via `migrate_v50()` runs `ALTER TABLE agent_quotas ADD COLUMN namespace TEXT NOT NULL DEFAULT '_global'` + PK swap + supporting index.
-- **v51** — federation nonce cache persistence (#1255 / PR #1296): adds the `federation_nonces` table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so a daemon restart re-opened a replay window equal to the maximum `X-Memory-Nonce` age tolerated by `AI_MEMORY_FED_REQUIRE_NONCE`. v51 persists the LRU to disk so the replay window collapses to zero across restarts. Postgres mirror via `migrate_v51()` runs the equivalent `CREATE TABLE federation_nonces` + indices.
+- **v51** — federation nonce cache persistence (#1255 / PR #1296): adds the `federation_nonce_cache` table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so a daemon restart re-opened a replay window equal to the maximum `X-Memory-Nonce` age tolerated by `AI_MEMORY_FED_REQUIRE_NONCE`. v51 persists the LRU to disk so the replay window collapses to zero across restarts. Postgres mirror via `migrate_v51()` creates the equivalent `federation_nonce_cache` table + indices.
 - **v52** — transcript line-dedup persistence (#1389, closes #1388): adds the `transcript_line_dedup` table backing the sha256-keyed idempotency layer for the four-layer capture architecture (L2 recover-on-boot + L3 substrate watcher + L4 `memory_capture_turn` MCP tool). Closes the #1388 substrate failure mode at the storage layer so a crashed/restarted capture pipeline cannot double-ingest the same transcript line. Postgres mirror via `migrate_v52()` creates the equivalent table + unique index.
 - **v53** — `memories_au` FTS5 trigger scoping (#1418, R5.F5.2 perf-audit closeout): pure DDL — drops and recreates the after-update FTS sync trigger as `AFTER UPDATE OF title, content, tags` so hot-path UPDATEs that touch only non-FTS columns (`embedding`, `access_count`, `last_accessed_at`, `confidence_decayed_at`, `version`) no longer pay 2 spurious FTS5 row ops apiece. A 100k-row embed backfill drops 200k wasted FTS5 ops; `touch_many` for K=10 recalls sheds 5–10× wall cost. Idempotent. Postgres mirror via `migrate_v53()`.
 - **v54** — tier-default expiry backfill (#1466): in-code backfill arm (no new `.sql` file) that stamps the per-tier create-time expiry backstop onto legacy NULL-`expires_at` mid/short rows, closing the TTL-leak immortal-rows class where pre-v54 rows that never got touched would never expire. Idempotent. Postgres mirror via `migrate_v54()`.
@@ -656,7 +670,7 @@ sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 'PRAGMA schema_version
   > /dev/null && echo "backup verified readable"
 ```
 
-The ladder is idempotent on restart but not reversible — once `schema_version` reaches 51, you cannot downgrade to v34 in place; restore from the `.bak` file if you need to roll back to v0.6.4.
+The ladder is idempotent on restart but forward-only (not reversible) — once `schema_version` reaches 55, you cannot downgrade to v34 in place; restore from your `.bak` file (or the automatic pre-migration snapshot) if you need to roll back to v0.6.4.
 
 ---
 
@@ -665,7 +679,7 @@ The ladder is idempotent on restart but not reversible — once `schema_version`
 - The original v0.6.4 5-tool default surface is **preserved in spirit** — the v0.7 B1/B2 loaders (`memory_load_family`, `memory_smart_load`) joined the `core` family, bringing the default count to 7. No tool was removed from `core`.
 - Existing v0.6.4 SDKs continue to work against a v0.7.0 server. Capabilities v3 fields are additive; v2 fields stay at their existing paths.
 - Memory data — no migration required for stored memories; embeddings, archives, links, governance policies all carry forward.
-- HTTP API endpoints — every v0.6.4 route stays at the same path with the same shape. v0.7.0 adds 8 net-new routes (see [`docs/internal/v070-feature-inventory.md` §"8 new HTTP routes"](internal/v070-feature-inventory.md)).
+- HTTP API endpoints — every v0.6.4 route stays at the same path with the same shape. v0.7.0 adds 15 net-new route registrations (73 → 88; the original "8 new HTTP routes" inventory pre-dated the #1146 config + #1416 capture_turn additions — see [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md)).
 - The CLI surface (`ai-memory store`, `recall`, etc.) — every v0.6.4 subcommand continues to work unchanged.
 - Boot manifest cost — `ai-memory boot` output is independent of attestation, hooks, transcripts, AGE.
 - Hook pipeline — **default off.** A v0.7.0 install with no `hooks.toml` behaves identically to v0.6.4 at the lifecycle layer.

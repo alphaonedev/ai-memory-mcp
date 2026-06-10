@@ -19,9 +19,9 @@ identically to v0.6.4 at the lifecycle layer.
 - **Helper binary:** [`tools/auto-link-detector/`](../tools/auto-link-detector/)
   is the R3 reference `pre_link` hook (~775 LoC).
 - **Capability registry entry:** `CapabilityHooks` in
-  [`src/config.rs:703`](../src/config.rs).
+  [`src/config.rs:944`](../src/config.rs).
 - **Config file:** `~/.config/ai-memory/hooks.toml` — hot-reloadable
-  via `SIGHUP` ([`src/hooks/config.rs:411`](../src/hooks/config.rs)).
+  via `SIGHUP` ([`src/hooks/config.rs:424`](../src/hooks/config.rs)).
 
 ## Configuration
 
@@ -88,17 +88,18 @@ The 5 grand-slam additions:
 | `pre_reflect` / `post_reflect` | Recursive-learning Task 6/8 | Write | `memory_reflect` |
 | `pre_compaction` / `on_compaction_rollback` | L1-7 | Write | curator compaction pipeline |
 
-The discriminator strings and the `HookEvent` enum live at
-[`src/hooks/events.rs:73`](../src/hooks/events.rs); the canonical wire
+The discriminator strings (snake_case of the variant names via
+`#[serde(rename_all = "snake_case")]`) and the `HookEvent` enum live at
+[`src/hooks/events.rs:91`](../src/hooks/events.rs); the canonical wire
 shapes for every event's payload (`MemoryDelta`, `RecallQuery`,
-`SearchResult`, `ReflectDelta`, `CompactionDelta`, …) start at
-[`src/hooks/events.rs:231`](../src/hooks/events.rs) and run to line
-640.
+`SearchResult`, `ReflectDelta`, `CompactionDelta`, …) start right
+after the enum (≈[`src/hooks/events.rs:235`](../src/hooks/events.rs))
+and span the rest of the module.
 
 ## Decision-class semantics
 
 Every hook returns a `HookDecision`
-([`src/hooks/decision.rs:88`](../src/hooks/decision.rs)):
+([`src/hooks/decision.rs:87`](../src/hooks/decision.rs)):
 
 - **`Allow`** — chain proceeds to the next hook (or to the substrate
   if this was the last one).
@@ -107,17 +108,16 @@ Every hook returns a `HookDecision`
   whose payload type implements the modify protocol (e.g.
   `pre_store` carries `MemoryDelta`, `pre_link` carries `LinkDelta`).
 - **`Deny{reason, code}`** — chain short-circuits; the substrate
-  refuses the operation and surfaces `code` to the caller. The
-  `reason` string is operator-log-only and may carry diagnostic
-  detail; the `code` is the wire-safe identifier the caller switches
-  on.
+  refuses the operation and surfaces `code` (an `i32` status-style
+  code, serde-defaulted when the hook omits it) to the caller along
+  with the `reason` string.
 - **`AskUser{prompt, options, default}`** — chain pauses pending an
   operator decision. Today the only consumer is the K10 SSE approval
   loop ([`docs/k10-sse-approvals.md`](k10-sse-approvals.md)). The
   default is applied if the K10 sweeper expires the row before an
   operator answers.
 
-`is_pre_event` ([`src/hooks/decision.rs:369`](../src/hooks/decision.rs))
+`is_pre_event` ([`src/hooks/decision.rs:344`](../src/hooks/decision.rs))
 is the canonical predicate for "may this event return `Modify`" — the
 chain runner rejects `Modify` decisions on `post_*` events.
 
@@ -127,7 +127,7 @@ The chain runner reads `event_class(event)`
 ([`src/hooks/timeouts.rs:137`](../src/hooks/timeouts.rs)) at fire
 entry and computes a wall-clock ceiling on the *entire* chain. Per-hook
 budgets are derived by `per_hook_budget_ms`
-([`src/hooks/timeouts.rs:223`](../src/hooks/timeouts.rs)) and shrink
+([`src/hooks/timeouts.rs:264`](../src/hooks/timeouts.rs)) and shrink
 monotonically as earlier hooks consume time:
 
 | Class | Deadline | Events |
@@ -148,9 +148,10 @@ When `per_hook_budget_ms` returns `None`, the chain has already
 exhausted its class deadline before this hook even fired. The runner
 increments the process-wide
 `timeout_violations_total` counter
-([`src/hooks/timeouts.rs:265-273`](../src/hooks/timeouts.rs)) and
-fails open (treats the missed hook as `Allow`). The doctor surface
-reads this counter for the "did we trip a budget since boot" panel.
+([`src/hooks/timeouts.rs:306-313`](../src/hooks/timeouts.rs)) and
+handles the missed hook per its `fail_mode` (`open` → treated as
+`Allow`; `closed` → chain `Deny`). The doctor surface reads this
+counter for the "did we trip a budget since boot" panel.
 
 ## Hot-path constraint
 
@@ -190,20 +191,24 @@ the operator wants strict observability they grep for the line
 before treating the reload as effective.
 
 On parse failure (TOML error, validation error, missing file) the
-reload task logs a warning and **keeps the previous config**
-([`src/hooks/config.rs:459`](../src/hooks/config.rs)). The daemon
+reload task logs an error and **keeps the previous config**
+([`src/hooks/config.rs:456`](../src/hooks/config.rs)). The daemon
 never reloads to an empty config because of operator typo — silent
 hook removal would be a security regression.
 
 ## Security hardening
 
-- **Stderr redaction** — the executor scrubs stderr through a
-  regex-based pass before forwarding to the daemon log when
-  `secret_redact = true`. Mitigates the v0.7.0 reconciliation finding
-  (commit `cbe934c`). Pinned by
+- **Stderr redaction** — the executor unconditionally scrubs the
+  captured stderr tail through a keyword/shape-based pass
+  (`redact_stderr_tail`,
+  [`src/hooks/executor.rs:303`](../src/hooks/executor.rs)) before
+  forwarding to the daemon log — conservative, favouring
+  over-redaction over leaking. Pinned by
   [`tests/g3_hooks_stderr_drain.rs`](../tests/g3_hooks_stderr_drain.rs).
-- **Timeout enforcement** — hooks past their `timeout_ms` are killed
-  with `SIGKILL` after `SIGTERM` + 200 ms grace. Pinned by
+- **Timeout enforcement** — hooks past their `timeout_ms` surface
+  `ExecutorError::Timeout`; the child process is reaped via tokio's
+  `kill_on_drop(true)` (hard kill — no graceful-shutdown window).
+  Pinned by
   [`tests/hooks_timeout_budget.rs`](../tests/hooks_timeout_budget.rs).
 - **Substrate authority** — hook decisions are advisory unless the
   substrate explicitly elevates them (e.g., the 7th-form
@@ -230,9 +235,13 @@ Pinned by [`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
 4. **Reload** with `kill -HUP $(pgrep -f 'ai-memory mcp')` or restart
    the daemon. The reload task logs `hooks: reloaded config on SIGHUP`
    on success.
-5. **Verify** with `ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.hooks'`
-   — the `enabled_events` field lists every event with at least one
-   registered hook.
+5. **Verify** the reload landed via the
+   `hooks: reloaded config on SIGHUP` log line (it carries the loaded
+   hook count). The capabilities `hooks` block
+   (`memory_capabilities` over MCP, e.g.
+   `printf '<JSON-RPC tools/call>' | ai-memory mcp --profile full`)
+   reports `hook_events_count` (25) and `registered_count` — it does
+   not enumerate per-event hook rows.
 
 ## Tuning guidance
 
@@ -275,12 +284,12 @@ For deployment sizes:
 
 | Symptom | Likely cause | Diagnostic recipe |
 |---|---|---|
-| Hook not firing | Namespace mismatch, `enabled = false`, or capability not surfaced | `memory_capabilities | jq '.hooks.enabled_events'` — if event missing, config didn't load. Then `RUST_LOG=ai_memory::hooks=debug` and watch `chain_skipped` reason. |
-| Hook fires but result ignored | Returned `Modify` on a `post_*` event | Check `decision.rs:369` `is_pre_event` — `Modify` is only valid on pre-events. Daemon log carries the rejection reason. |
-| `chain_skipped: empty` on every write | No `hooks.toml`, or zero matching rows | This is the **expected v0.6.4-equivalent behavior**. Confirms hooks aren't quietly firing. |
+| Hook not firing | Namespace mismatch, `enabled = false`, or config not loaded | Confirm the `hooks: reloaded config on SIGHUP` line reported a non-zero hook count (or restart and watch boot logs). Then `RUST_LOG=ai_memory::hooks=debug` and watch the chain's per-hook warn/debug lines. |
+| Hook fires but result ignored | Returned `Modify` on a `post_*` event | Check `decision.rs:344` `is_pre_event` — `Modify` is only valid on pre-events. Daemon log carries the rejection reason. |
+| No hook log lines on any write | No `hooks.toml`, or zero matching rows (an empty chain is a silent no-op returning `Allow`) | This is the **expected v0.6.4-equivalent behavior**. Confirms hooks aren't quietly firing. |
 | Recall p95 regressed after enabling hook | Hook is `mode = "exec"` on a hot-path event | Switch to `mode = "daemon"`. If already daemon, reduce `timeout_ms` and inspect helper-binary tracing for the slow path. |
-| `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook `ExecutorMetrics` ([`src/hooks/executor.rs:380`](../src/hooks/executor.rs)) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
-| Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `executor: daemon spawn failed` line. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
+| `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook `ExecutorMetrics` ([`src/hooks/executor.rs:530`](../src/hooks/executor.rs)) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
+| Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
 | Reload didn't pick up new hook | TOML parse error | Look for `hooks: SIGHUP reload failed; keeping previous config` in the log. Validate the file with `cat ~/.config/ai-memory/hooks.toml | toml --check` (or `taplo lint`). |
 
 ## Operator runbook (3am procedures)
@@ -289,13 +298,18 @@ For deployment sizes:
 
 1. Set `RUST_LOG=ai_memory::hooks=debug` (`pkill -USR2 ai-memory` if
    you have the dynamic-log signal wired; otherwise restart).
-2. `tail -F` the daemon log and grep for `hook_denied`. The log
-   line carries the hook name, event, and `code`.
+2. Inspect the refused callers' error responses — a hook `Deny`
+   short-circuits the chain and surfaces `{reason, code}` directly to
+   the caller (`ChainResult::Deny`); fail-mode conversions
+   additionally log `hooks: chain hook errored; fail_mode=closed,
+   denying` lines naming the hook command and event.
 3. To unblock: edit `~/.config/ai-memory/hooks.toml`, set
    `enabled = false` on the offending row, `kill -HUP`. Confirm via
-   `memory_capabilities`.
-4. RCA after the bleeding stops. The auto-link-detector ships with a
-   `--dry-run` mode for replay verification.
+   the `hooks: reloaded config on SIGHUP` log line.
+4. RCA after the bleeding stops — replay the captured payload against
+   the helper binary on the command line (daemon-mode helpers speak
+   framed JSON-RPC on stdin/stdout, so a single-request replay is a
+   `printf | helper` one-liner).
 
 **Reload appears to have hung.**
 
@@ -308,7 +322,8 @@ itself is unresponsive, fall through to standard restart procedure
 
 **Hot-path latency regressed; suspect a hook.**
 
-1. `memory_capabilities | jq '.hooks.enabled_events'` — confirm which
+1. Review `~/.config/ai-memory/hooks.toml` (and the loaded-count on
+   the last `hooks: reloaded config on SIGHUP` line) — confirm which
    events have hooks attached.
 2. Temporarily disable hot-path hooks (`enabled = false` on
    `post_recall` / `post_search` / `pre_recall_expand` rows), `SIGHUP`.
@@ -320,9 +335,11 @@ itself is unresponsive, fall through to standard restart procedure
 ## Migration
 
 A v0.6.4 → v0.7.0 install with no `hooks.toml` is a no-op at the
-lifecycle layer. To opt in, follow the operator workflow above. To
-verify hooks are NOT firing on a write path, set `RUST_LOG=ai_memory::hooks=debug`
-and watch for the `chain_skipped: empty` log line.
+lifecycle layer (an empty chain returns `Allow` without spawning
+anything). To opt in, follow the operator workflow above. To verify
+hooks are NOT firing on a write path, set
+`RUST_LOG=ai_memory::hooks=debug` and confirm the absence of per-hook
+chain log lines on writes.
 
 See also: [`docs/MIGRATION_v0.7.md` §"Hook pipeline (opt-in)"](MIGRATION_v0.7.md#hook-pipeline-opt-in),
 the canonical inventory in

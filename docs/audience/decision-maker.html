@@ -76,6 +76,7 @@ footer a{color:var(--muted)}
     <a class="brand" href="../">ai-memory</a>
     <div class="links">
       <a href="../#install">Install</a>
+      <a href="../for-everyone.html">Everyone</a>
       <a href="operator.html">Operator</a>
       <a href="developer.html">Developer</a>
       <a href="decision-maker.html" style="color:var(--text)">Decision</a>
@@ -170,6 +171,21 @@ footer a{color:var(--muted)}
 </section>
 
 <section class="wrap-mid">
+  <div class="eyebrow-h2">Enterprise &amp; federal architecture</div>
+  <h2>The federated story is proven live, not promised.</h2>
+  <p>If your question is "can this run a secure, multi-region fleet of AI agents &mdash; teams, swarms, hives &mdash; under our compliance regime?", the answer is a public, reproducible artifact rather than a slide deck. The <strong>Grand Slam reference architecture</strong> is a 15-node, 3-region federated hive (do-1461) with W=2 quorum replication and three independently encrypted legs &mdash; each leg proven both positive (traffic flows when keys are right) and negative (traffic refused when they are not).</p>
+  <p>The same fleet was destroyed and rebuilt from nothing in two independent clean-room rounds; both rounds returned <strong>119/119 verify checks green</strong>, and the round-2 fleet passed the <strong>150/150 full-spectrum suite</strong> (regression, crypto, federation, zero-touch trust, A2A, AI-NHI, NSA-gap, curator groups). Identity is Ed25519 end to end; enrollment at fleet scale is CA-rooted Zero-Touch Trust; the security posture maps control-by-control onto NSA CSI MCP guidance with live-fleet test citations.</p>
+  <div class="next">
+    <a href="../reference-architecture/"><strong>Grand Slam reference architecture</strong><span class="desc">15 nodes &middot; 3 regions &middot; W=2 quorum &middot; proven live (do-1461)</span></a>
+    <a href="../compliance/nsa-control-test-matrix.html"><strong>NSA control-by-control test matrix</strong><span class="desc">Each control &rarr; a live-hive test artifact</span></a>
+    <a href="../zero-touch-trust.html"><strong>Zero-Touch Trust</strong><span class="desc">CA-rooted federation identity &middot; O(1) enrollment</span></a>
+    <a href="../reproducible-baselines.html"><strong>Reproducible baselines</strong><span class="desc">Two-round clean-room fleet reproduction &middot; 119/119 both rounds</span></a>
+    <a href="../encryption.html"><strong>Encryption at rest</strong><span class="desc">sqlcipher build, passphrase-file discipline</span></a>
+    <a href="../architectures.html"><strong>Architectures T1&rarr;T5</strong><span class="desc">Laptop &rarr; team &rarr; enterprise &rarr; region &rarr; global hive</span></a>
+  </div>
+</section>
+
+<section class="wrap-mid">
   <div class="eyebrow-h2">Roadmap</div>
   <h2>Where this is going.</h2>
   <div class="timeline">
@@ -201,7 +217,7 @@ footer a{color:var(--muted)}
 <section class="wrap-mid">
   <div class="eyebrow-h2">Test results</div>
   <h2>The evidence behind SHIP.</h2>
-  <p>Every release ships with a public test campaign directory: pinned binary SHA, every test in expected-vs-actual form, every issue closed with retest evidence. The latest release-gate-final campaign (2026-05-22) returned <strong>SHIP-RECOMMENDED on 7,321 PASS / 0 FAIL across 269 test binaries</strong> with 22 issues (#1120-#1141) fixed in-campaign &mdash; no deferrals to v0.8.0.</p>
+  <p>Every release ships with a public test campaign directory: pinned binary SHA, every test in expected-vs-actual form, every issue closed with retest evidence. The release-gate-final campaign (2026-05-22) returned <strong>SHIP-RECOMMENDED on 7,321 PASS / 0 FAIL across 269 test binaries</strong> with 22 issues (#1120-#1141) fixed in-campaign &mdash; no deferrals to v0.8.0. The subsequent final-baseline regression (2026-05-31, off a pristine volume-wiped rig) ran both backends end to end: <strong>15,951 PASS / 0 FAIL</strong> (sqlite 7,458 + Postgres/AGE 8,493), reproduced at 15,952 / 0 on an independent round-2 re-run &mdash; full provenance on the <a href="../evidence.html">frozen-claims evidence page</a>.</p>
   <div class="next">
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest campaign index</strong><span class="desc">2026-05-22 &middot; SHIP-RECOMMENDED &middot; tip <code>fd172f2cf</code></span></a>
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.md"><strong>For decision-makers</strong><span class="desc">Verdict, risk profile, cost, vector-DB comparison, scope honesty</span></a>
@@ -219,6 +235,7 @@ footer a{color:var(--muted)}
     <a href="../v0.7.0/release-notes.md"><strong>v0.7.0 release notes</strong><span class="desc">Detailed changelog</span></a>
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest test campaign</strong><span class="desc">2026-05-22 SHIP-RECOMMENDED evidence</span></a>
     <a href="../SECURITY.md"><strong>Security posture</strong><span class="desc">Threat model</span></a>
+    <a href="../compliance/index.html"><strong>Compliance &amp; procurement</strong><span class="desc">NSA CSI MCP mapping, honest limitations</span></a>
     <a href="../positioning.md"><strong>Positioning</strong><span class="desc">Where this fits</span></a>
     <a href="operator.html"><strong>Operator path</strong><span class="desc">For your SRE team</span></a>
     <a href="developer.html"><strong>Developer path</strong><span class="desc">For your engineers</span></a>

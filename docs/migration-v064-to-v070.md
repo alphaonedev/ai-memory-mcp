@@ -18,11 +18,11 @@
 
 ## 1. TL;DR migration verdict
 
-- **What changes.** The sqlite schema jumps from **v15 → v55** — 11 new columns
+- **What changes.** The sqlite schema jumps from **v20 → v55** — 11 new columns
   on the `memories` table (citations, source URIs, byte-range spans, memory
   kind, entity id, persona version, confidence provenance + signals + decay
-  stamp, optimistic-concurrency `version`, plus the QW-2 `auto_persona_entity_id`
-  / PERF-8 `mentioned_entity_id`). New tables: `signed_events` (audit chain),
+  stamp, optimistic-concurrency `version`, plus the PERF-8
+  `mentioned_entity_id` added by the v42 auto-persona migration). New tables: `signed_events` (audit chain),
   `memory_transcripts` + `memory_transcript_links` (sidechain transcripts),
   `agent_skills`, `offloaded_blobs`, `confidence_shadow_observations`,
   `federation_push_dlq`, several more. None of this is destructive — every
@@ -35,7 +35,10 @@
   because of the QW-2 `auto_persona_entity_id` backfill scan.
 - **Rollback supported?** **Yes — via file restore from the pre-upgrade
   backup.** The schema ladder is idempotent on replay but NOT reversible in
-  place; once `schema_version` reaches 53, you cannot ALTER the columns away.
+  place; once `schema_version` reaches 55, you cannot ALTER the columns away.
+  (The migrator also writes an automatic pre-migration snapshot —
+  `<db>.pre-migration-v<from>-to-v<to>-<token>.bak` — next to the DB
+  before any schema-mutating upgrade.)
   Rollback means stopping the v0.7.0 binary, restoring the `.bak.pre-v07` file
   you took in step 2 of §4, and reinstalling the v0.6.4 binary. Data written
   while you were on v0.7.0 is lost in that rollback — see §7.

@@ -35,6 +35,14 @@ docs below.
 - **`off`** — pipeline disabled; substrate writes are accepted
   without consulting the rule corpus.
 
+Rule-consultation failure is **fail-CLOSED** at v0.7.0
+([#1455](https://github.com/alphaonedev/ai-memory-mcp/issues/1455)
+secure default): when the rules DB cannot be consulted, the gated
+action is refused and a synthetic
+`governance:consultation_unavailable` refusal is chain-logged.
+`AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1` reverts to the legacy
+permissive posture (UNSAFE; the degraded-ALLOW path is WARN-logged).
+
 ## Namespace-standard defaults (allow-on-silence)
 
 Per-namespace access control is carried by a **namespace standard**
@@ -49,8 +57,9 @@ documented posture):
 > `write: GovernanceLevel::Any`, `promote: GovernanceLevel::Any`,
 > `delete: GovernanceLevel::Owner`. The governance pipeline gates
 > only what operators configure — `resolve_governance_policy`
-> returns the permissive default for a namespace with no standard
-> (and no inheriting parent standard).
+> returns `None` for a namespace with no standard (and no inheriting
+> parent standard), and callers fall through to the permissive
+> `CorePolicy::default()`.
 
 The hardening knob is the namespace-standard surface: attach a
 standard via the `memory_namespace_set_standard` MCP tool (companions
@@ -83,8 +92,9 @@ ai-memory rules sign-seed rule-seed.json
 # List the active rule corpus (CLI equivalent of memory_rule_list)
 ai-memory rules list
 
-# Wire the policy file at install time on a harness
-ai-memory install --harness claude-code --enforce-policy
+# Wire the harness-side PreToolUse policy hook at install time
+# (routes Bash / Edit / Write tool calls through memory_check_agent_action)
+ai-memory install claude-code --hook pretool --apply
 ```
 
 ## Honest disclosures from v0.6.3.1 close out

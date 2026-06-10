@@ -749,6 +749,7 @@ footer.site-foot a { color: var(--text-muted); }
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 </style>
 </head>
 <body>
@@ -766,6 +767,9 @@ footer.site-foot a { color: var(--text-muted); }
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html" class="current">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -799,6 +803,7 @@ footer.site-foot a { color: var(--text-muted); }
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
         </div>
       </div>
       <div class="menu">
@@ -897,8 +902,8 @@ footer.site-foot a { color: var(--text-muted); }
   </div>
 
   <div class="pillars-icons" aria-hidden="true" style="margin-top:2.5rem;">
-    <span class="pillar-icon"><span class="dot p1"></span> 93.84% test coverage</span>
-    <span class="pillar-icon"><span class="dot p2"></span> 1,886 tests passing</span>
+    <span class="pillar-icon"><span class="dot p1"></span> 92.59% test coverage (v0.7.0)</span>
+    <span class="pillar-icon"><span class="dot p2"></span> 15,951 / 0 final-baseline regression</span>
     <span class="pillar-icon"><span class="dot p3"></span> Apache-2.0 licensed</span>
   </div>
 </section>
