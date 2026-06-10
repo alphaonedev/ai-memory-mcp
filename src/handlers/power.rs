@@ -228,7 +228,7 @@ pub async fn detect_contradictions(
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
-    let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
 
     let lock = app.db.lock().await;
     let all = match db::list(
@@ -803,7 +803,7 @@ pub async fn check_duplicate(
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
-    let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
 
     let lock = app.db.lock().await;
     // Round-2 F18 — short-circuit on raw-content hash equality before
