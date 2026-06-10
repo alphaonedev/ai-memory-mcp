@@ -72,7 +72,7 @@ with AiMemoryClient(base_url="http://localhost:9077") as c:
 
 ## Per-harness recommendations
 
-Run `ai-memory install --harness <name>` after upgrading to write the v0.6.4 default config:
+Run `ai-memory install <target> --apply` (e.g. `ai-memory install claude-desktop --apply`; the installer is per-target subcommand-shaped, dry-run by default) after upgrading to write the v0.6.4 default config:
 
 | Harness | Loading mode | Recommended profile | Reason |
 |---|---|---|---|

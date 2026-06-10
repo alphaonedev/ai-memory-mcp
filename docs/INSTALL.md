@@ -96,10 +96,10 @@
    |---------------|---------------------------------------------------------------------|
    | Cargo         | `cargo install ai-memory --version =0.7.0 --locked`                 |
    | cargo-binstall| `cargo binstall ai-memory --version 0.7.0`                          |
-   | Homebrew      | `brew install alphaonedev/tap/ai-memory@0.7.0`                      |
+   | Homebrew      | The tap publishes a single rolling `Formula/ai-memory.rb` (no versioned `@0.7.0` formula). Pin by installing the desired release, then `brew pin ai-memory` to block upgrades. |
    | COPR          | `sudo dnf install ai-memory-0.7.0-1.fc40`                           |
    | .deb / .rpm   | Download the `0.7.0` artifact from the GH Release; pin by filename. |
-   | AUR           | Use `ai-memory=0.7.0-1` in `paru -S ai-memory=0.7.0-1`.             |
+   | AUR           | AUR helpers build the latest PKGBUILD; pin by checking out the package at the `0.7.0-1` revision and `makepkg -si`, or hold with `IgnorePkg = ai-memory` in `pacman.conf`. |
    | Docker        | `docker pull ghcr.io/alphaonedev/ai-memory:0.7.0` (digest pin is even safer: `@sha256:…`). |
 
    In CI, prefer the cargo-binstall + `--version` form so the version
@@ -198,12 +198,14 @@
 
    > **Note:** `~/.claude.json` likely already exists with other settings. Merge the `mcpServers` key into the existing JSON — do not overwrite the file. See [Claude Code MCP Scopes](#claude-code-mcp-configuration-scopes) below for project-level and team-shared alternatives.
 
+   > **`~` in `--db` args.** The binary uses a CLI `--db` value verbatim — tilde expansion happens in your shell (or in some MCP hosts), NOT inside ai-memory. Only a `db = "~/..."` line in `config.toml` is tilde-expanded by ai-memory itself (#507). If memories land in a literal `./~` directory, replace `~/.claude/ai-memory.db` in the args with the absolute path (e.g. `/Users/you/.claude/ai-memory.db`) or move the path into `config.toml`.
+
    > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), any of: local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selected via `AI_MEMORY_LLM_BACKEND` env var. Full env-var matrix in [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers); MCP-config recipes in [`integrations/llm-backends.md`](integrations/llm-backends.md).
    > **Other AI platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.) have their own MCP configuration locations. Consult your platform's documentation for where to add MCP server entries. The server command and args are the same — only the config file location differs.
 
 3. **Restart your AI client.**
 
-   > **Verify the LLM backend wired through (smart/autonomous tier only).** After restart, check the ai-memory boot banner that prints on first MCP session-start (or the AI client's MCP server stderr log). You should see `LLM ready (backend=<vendor>, model=<name>)` matching what you put in the `env:` block, plus an `(#1143)` embed-client banner line when using a non-Ollama backend. If you see `llm=gemma4:e4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the MCP config path you edited matches the AI client's actual scope. Full troubleshooting: [`TROUBLESHOOTING.md` § LLM backend silently fell back](TROUBLESHOOTING.md#llm-backend-silently-fell-back-to-ollama).
+   > **Verify the LLM backend wired through (smart/autonomous tier only).** After restart, check the ai-memory boot banner that prints on first MCP session-start (or the AI client's MCP server stderr log). You should see `LLM ready (backend=<vendor>, model=<name>)` matching what you put in the `env:` block, plus an `(#1143)` embed-client banner line when using a non-Ollama backend. If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the MCP config path you edited matches the AI client's actual scope. Full troubleshooting: [`TROUBLESHOOTING.md` § LLM backend silently fell back](TROUBLESHOOTING.md#llm-backend-silently-fell-back-to-ollama).
 
 4. **Verify** — at the default `--profile core` (v0.7.0) you should see **7 new tools** registered plus the always-on `memory_capabilities` bootstrap (8 total): `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`. To eagerly load the full v0.7.0 surface (74 advertised entries — 73 callable memory tools + the always-on `memory_capabilities` bootstrap), launch with `ai-memory mcp --profile full`. The full-profile surface includes (highlights): `memory_update`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, the 4 archive tools, `memory_check_duplicate`, the 2 entity tools, the 3 KG tools (`memory_kg_query`/`memory_kg_timeline`/`memory_kg_invalidate`), `memory_get_taxonomy`, the 3 namespace-standard tools, the 3 pending-action tools, the 2 agent tools, `memory_notify`/`memory_inbox`, the 3 subscription tools, `memory_session_start`, `memory_gc`, and the v0.7 additions: `memory_reflect`, `memory_atomise`, `memory_ingest_multistep`, `memory_persona`, `memory_persona_generate`, `memory_offload`, `memory_deref`, `memory_calibrate_confidence`, the 7 L1-5 Agent Skills tools, `memory_check_agent_action`, `memory_rule_list`, `memory_export_reflection`, `memory_reflection_origin`, `memory_dependents_of_invalidated`, `memory_find_paths`, `memory_verify`, `memory_quota_status`, the archive-list metadata helpers (#860), and more. Full per-tool reference: [API_REFERENCE.md](API_REFERENCE.md). Run `memory_capabilities` from the agent loop to get the live family list.
 
@@ -222,7 +224,7 @@
 
    This stops the built-in system from injecting 200+ lines of memory context into every conversation. ai-memory uses zero tokens until `memory_recall` is called -- only relevant memories are returned, ranked by score.
 
-7. **Token savings are automatic.** All recall, search, and list responses use TOON compact format by default -- 79% smaller than JSON. The MCP server also provides `recall-first` and `memory-workflow` prompts that teach AI clients to use memory proactively.
+7. **Token savings are automatic.** All recall, search, and list responses use TOON compact format by default -- eliminating 40-60% of repeated field-name tokens vs JSON. The MCP server also provides `recall-first` and `memory-workflow` prompts that teach AI clients to use memory proactively.
 
 That's it. Everything below is optional detail.
 
@@ -232,7 +234,7 @@ That's it. Everything below is optional detail.
 
 > **Pre-built binaries have no prerequisites** -- just run `install.sh` or `install.ps1` as shown above. The requirements below only apply when building from source.
 
-- **Rust toolchain (1.87+): Install via [rustup](https://rustup.rs/)
+- **Rust toolchain (1.96+; `rust-version` in `Cargo.toml`)**: Install via [rustup](https://rustup.rs/)
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
@@ -263,7 +265,7 @@ cargo install --path .
 
 ## Pre-built Binaries
 
-Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for Linux (x86_64) and macOS (aarch64). Releases are created on git tags.
+Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for five targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`), macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`), and Windows (`x86_64-pc-windows-msvc`, zipped). Releases are created on git tags. Note the pre-built binaries are default-feature builds — the `migrate` / `schema-init` subcommands and the postgres `--store-url` daemon path require a `--features sal,sal-postgres` source build.
 
 The easiest way to install is via the install scripts:
 
@@ -712,9 +714,22 @@ Ask your AI assistant to store a memory. It should use the `memory_store` tool a
 
 ## Hook Installation (Optional, Claude Code-Specific)
 
-The `hooks/session-start.sh` script auto-recalls relevant memories at the start of each Claude Code session. Other AI platforms may have their own hook/plugin mechanisms -- the CLI commands used in this hook work with any platform.
+The SessionStart hook auto-recalls relevant memories at the start of each Claude Code session. Other AI platforms may have their own hook/plugin mechanisms -- the CLI commands used in this hook work with any platform.
 
-### Install the hook
+### Recommended — one command
+
+```bash
+ai-memory install claude-code            # dry-run (default) — prints what would change
+ai-memory install claude-code --apply    # actually write the file
+```
+
+This writes a managed `SessionStart` entry into `~/.claude/settings.json`
+running `ai-memory boot --quiet --limit 10 --budget-tokens 4096` on every
+fresh session. Re-running is idempotent;
+`ai-memory install claude-code --uninstall --apply` removes the managed
+entry surgically.
+
+### Manual alternative — `hooks/session-start.sh`
 
 ```bash
 # Copy the hook
@@ -724,14 +739,19 @@ cp hooks/session-start.sh ~/.claude/hooks/
 chmod +x ~/.claude/hooks/session-start.sh
 ```
 
-### Configure the hook in settings.json
+Then configure it under the `SessionStart` event in
+`~/.claude/settings.json` (note the nested `hooks` array shape Claude
+Code expects):
 
 ```json
 {
   "hooks": {
-    "PreToolUse": [
+    "SessionStart": [
       {
-        "command": "~/.claude/hooks/session-start.sh"
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/session-start.sh" }
+        ]
       }
     ]
   }
@@ -835,9 +855,10 @@ file is a no-op INFO log. Legacy v0.6.x flat fields continue to
 work in v0.7.x with a single-line deprecation WARN at load time;
 they will be removed in v0.8.0.
 
-The DB schema migration is **automatic** — the daemon walks v33 →
-v55 on first open of an existing v0.6.x DB. No operator action
-required.
+The DB schema migration is **automatic** — the daemon walks v20 →
+v55 on first open of an existing v0.6.4 DB (writing an automatic
+`<db>.pre-migration-v<from>-to-v<to>-<token>.bak` snapshot first).
+No operator action required.
 
 For a comprehensive walkthrough (security-posture defaults that
 changed, tiered admin / DevOps recipes, NFS-shared config fleets),
@@ -973,7 +994,7 @@ ollama pull nomic-embed-text:v1.5  # Default embedder (~280 MB) — semantic + a
 curl http://localhost:11434/api/tags
 
 # Test the model
-ollama run gemma4:e2b "Hello, world"
+ollama run gemma3:4b "Hello, world"
 ```
 
 ### Configure ai-memory for Smart/Autonomous Tier

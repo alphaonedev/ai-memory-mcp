@@ -15,13 +15,13 @@ platform-specific differences for the
 | **Linux** (musl, e.g. Alpine) | Supported — static-linked binary recommended | per package manager | `${HOME}/.claude/ai-memory.db` | `sh`/`ash` — POSIX-compatible only |
 | **Windows** (10/11, native) | Supported — see Windows-specific notes below | `C:\Users\<user>\.cargo\bin\ai-memory.exe` (cargo install) or wherever the user dropped the release zip | `%USERPROFILE%\.claude\ai-memory.db` | PowerShell or `cmd.exe`. `bash` only via WSL |
 | **Windows** (WSL2) | First-class — equivalent to Linux | as Linux (above) | as Linux | `bash` |
-| **Docker** / containers | First-class — official image planned, see "Container deployments" below | `/usr/local/bin/ai-memory` inside the image | `/data/ai-memory.db` (volume-mounted) | depends on host |
+| **Docker** / containers | First-class — official image at `ghcr.io/alphaonedev/ai-memory`, see "Container deployments" below | `/usr/local/bin/ai-memory` inside the image | `/data/ai-memory.db` (volume-mounted) | depends on host |
 | **Kubernetes** | First-class — production deployment target, see "Kubernetes" below | `/usr/local/bin/ai-memory` inside the pod image | `/data/ai-memory.db` from a `PersistentVolumeClaim` (or `emptyDir` for ephemeral) | sidecar (HTTP boot) or DaemonSet (localhost:9077) |
 | **ARM Linux** (Raspberry Pi, AWS Graviton, ARM servers) | First-class — covered by cross-compile docs, see "ARM Linux" below | per package manager / cargo install (`~/.cargo/bin/ai-memory`) | `${HOME}/.claude/ai-memory.db` | `bash`/`sh` |
 | **Commercial Unix** (AIX, Solaris, HP-UX) | Best-effort — no project CI, "issues welcome but won't gate releases", see "Commercial Unix" below | varies (`/usr/local/bin/ai-memory` typical) | `${HOME}/.claude/ai-memory.db` | `sh`/`ksh` (POSIX) |
 | **Embedded Linux** (OpenWRT, Yocto, Buildroot) | Best-effort — static-linked musl build, see "Embedded Linux" below | `/usr/bin/ai-memory` (per-package convention) | `/etc/ai-memory.db` or `/var/lib/ai-memory.db` (flash storage) | `sh`/`ash` (BusyBox POSIX) |
 | **BSD** (FreeBSD, OpenBSD, NetBSD) | Best-effort — should build cleanly via `cargo build --release` but not regularly tested | `/usr/local/bin/ai-memory` (manual install) | `${HOME}/.claude/ai-memory.db` | `sh` |
-| **iOS / Android** | Not supported | n/a | n/a | n/a |
+| **iOS / Android** | Linkable mobile artifacts ship at v0.7.0 (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`); CLI use via Termux on Android — see [`../mobile-iot-deployment.md`](../mobile-iot-deployment.md) | n/a (embedded) | app-sandbox path | n/a |
 
 > CI gap callout: the GitHub Actions matrix covers `ubuntu-latest`,
 > `macos-latest`, and `windows-latest` only. Every other row above —
@@ -145,7 +145,7 @@ without a volume mount, the DB lives inside the container and dies with
 it. For session-boot integration the recipe pattern is:
 
 ```dockerfile
-FROM rust:1.85-slim AS builder
+FROM rust:1.96-slim AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release --bin ai-memory
@@ -162,8 +162,8 @@ calls `docker exec <container> ai-memory boot --quiet` for the hook —
 or, more commonly, runs `ai-memory` natively on the host and only uses
 the container for the daemon mode.
 
-The official image lives in `docker/Dockerfile` (TODO — track in #487
-follow-ups).
+The official image is built from the repo-root `Dockerfile` and published
+to `ghcr.io/alphaonedev/ai-memory` on every stable release tag.
 
 ## BSD specifics
 
@@ -210,8 +210,8 @@ spec:
         - name: AI_MEMORY_HTTP
           value: "http://127.0.0.1:9077"
     - name: ai-memory
-      image: ghcr.io/alphaonedev/ai-memory:0.6.3
-      args: ["daemon", "--http", "0.0.0.0:9077"]
+      image: ghcr.io/alphaonedev/ai-memory:0.7.0
+      args: ["serve", "--host", "0.0.0.0", "--port", "9077"]
       env:
         - name: AI_MEMORY_DB
           value: "/data/ai-memory.db"
@@ -273,8 +273,8 @@ spec:
       hostNetwork: false
       containers:
         - name: ai-memory
-          image: ghcr.io/alphaonedev/ai-memory:0.6.3
-          args: ["daemon", "--http", "0.0.0.0:9077"]
+          image: ghcr.io/alphaonedev/ai-memory:0.7.0
+          args: ["serve", "--host", "0.0.0.0", "--port", "9077"]
           ports:
             - containerPort: 9077
               hostPort: 9077
@@ -312,7 +312,7 @@ name: ai-memory
 description: Persistent memory sidecar/daemon for AI agents
 type: application
 version: 0.1.0
-appVersion: "0.6.3"
+appVersion: "0.7.0"
 ```
 
 ```yaml
@@ -336,7 +336,7 @@ spec:
         - name: ai-memory
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["daemon", "--http", "0.0.0.0:{{ .Values.service.port }}"]
+          args: ["serve", "--host", "0.0.0.0", "--port", "{{ .Values.service.port }}"]
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -383,11 +383,11 @@ metadata:
   name: ai-memory-config
 data:
   config.toml: |
-    feature_tier = "keyword"
+    schema_version = 2
+    tier = "keyword"
+
+    [storage]
     archive_on_gc = true
-    [recall]
-    default_limit = 10
-    default_budget_tokens = 4096
 ```
 
 Pair with the volume mount shown in the sidecar / DaemonSet snippets:
@@ -411,16 +411,18 @@ as a stdio one-shot when `ai-memory` is running in a sidecar — there's
 no shared filesystem unless you explicitly volume-share it, and no
 shared shell. Two equivalents:
 
-1. **HTTP boot (recommended for production).** `ai-memory daemon`
-   exposes a boot endpoint. The agent fetches it at session start:
+1. **HTTP recall at session start (recommended for production).**
+   There is no dedicated `/boot` HTTP endpoint — the daemon's recall
+   surface provides the same context payload. The agent fetches it at
+   session start:
 
    ```text
-   curl -s "http://ai-memory:9077/v1/boot?namespace=my-project&limit=10&format=text"
+   curl -s "http://ai-memory:9077/api/v1/recall?context=session+start&namespace=my-project&limit=10"
    ```
 
-   The response body is identical to `ai-memory boot --format text` --
-   same status header, same body. Wire it into your agent the same way
-   the [Codex CLI recipe](codex-cli.md) wires the local CLI.
+   Wire it into your agent the same way the
+   [Codex CLI recipe](codex-cli.md) wires the local `ai-memory boot`
+   CLI (which remains the stdio-side equivalent).
 
 2. **`kubectl exec` (dev only).** For interactive debugging, you can
    shell into the sidecar:
@@ -436,7 +438,7 @@ shared shell. Two equivalents:
 
 For stdio-only agents (no HTTP client), the current best practice is
 the sidecar pattern with a shared `emptyDir` volume holding a Unix
-socket, and `ai-memory daemon --unix-socket /run/ai-memory.sock` -- but
+socket, and a hypothetical `ai-memory serve --unix-socket /run/ai-memory.sock` -- but
 that's outside the scope of issue #487 PR-8 and tracked as a separate
 follow-up.
 
@@ -491,17 +493,18 @@ stringData:
 ```
 
 Mount it at `/run/secrets/ai-memory-passphrase` and point the binary
-at it via the existing `--db-passphrase-file` flag (or
-`AI_MEMORY_DB_PASSPHRASE_FILE` env var):
+at it via the `--db-passphrase-file` flag (a global CLI flag — there
+is no env-var form; the flag reads the file once at startup and
+exports `AI_MEMORY_DB_PASSPHRASE` internally):
 
 ```yaml
 volumeMounts:
   - name: ai-memory-passphrase
     mountPath: /run/secrets
     readOnly: true
-env:
-  - name: AI_MEMORY_DB_PASSPHRASE_FILE
-    value: "/run/secrets/ai-memory-passphrase/passphrase"
+# In the container args:
+#   args: ["--db-passphrase-file", "/run/secrets/ai-memory-passphrase/passphrase",
+#          "serve", "--host", "0.0.0.0", "--port", "9077"]
 ```
 
 The file-based flag avoids the passphrase appearing in process listings
@@ -686,8 +689,8 @@ distributions of the same arch.
 
 - **Flash storage wear.** Embedded devices typically run from NAND or
   eMMC flash with limited write cycles. The audit log (PR-5) is the
-  most write-heavy component. **Recommendation: pass `--max-size-mb 50`
-  on the audit-log flag** to cap rotation size and avoid premature
+  most write-heavy component. **Recommendation: set `max_size_mb = 50` under `[logging]` in
+  `config.toml`** to cap rotation size and avoid premature
   wear-leveling exhaustion. On very small devices (≤16 MB user
   storage) consider disabling the audit log entirely.
 - **DB path.** `/var/lib/ai-memory.db` for systems with a writable

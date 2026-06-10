@@ -226,7 +226,9 @@ T") but operators should know that:
   against every peer in turn (or wait `--interval` seconds between
   the write and the read).
 
-This may be tightened in v0.7 with quorum-broadcast invalidations.
+(Update: v0.7.0 deliberately kept KG invalidation eventually consistent
+— see [`ADR-0003`](ADR-0003-kg-invalidation-eventual-consistency.md);
+quorum-broadcast invalidation did not ship.)
 
 ---
 
@@ -286,7 +288,7 @@ After upgrading, confirm:
 - [ ] MCP `tools/list` includes the seven new tool names above
 - [ ] `curl -s http://localhost:PORT/api/v1/health` returns `200 OK`
 - [ ] Existing memories are recallable (`ai-memory recall "any test phrase"`)
-- [ ] `ai-memory taxonomy` returns the namespace tree without error
+- [ ] `curl -s http://localhost:PORT/api/v1/taxonomy` returns the namespace tree without error (the taxonomy surface is MCP + HTTP; there is no `ai-memory taxonomy` CLI subcommand)
 - [ ] (Federation) every peer reports schema_version 15
 
 If any of the above fail, restore the pre-upgrade snapshot and file an

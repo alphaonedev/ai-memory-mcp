@@ -114,7 +114,7 @@ ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape);
            building dedicated Ollama embed client at http://localhost:11434 (#1143)
 ```
 
-If you see `llm=gemma4:e4b` (the legacy Ollama default), neither the
+If you see `llm=gemma3:4b` (the legacy Ollama default), neither the
 config file nor the env block landed — re-check the paths your AI
 client reads.
 

@@ -58,7 +58,7 @@ one you're in until it's too late.
   `~/.local/share/ai-memory/memory.db`). Stop the daemon first. Copy the file
   AND its WAL sidecar:
   ```bash
-  ai-memory stop                                                # or pkill ai-memory
+  systemctl --user stop ai-memory 2>/dev/null || pkill -INT ai-memory   # no `ai-memory stop` subcommand exists
   cp ~/.local/share/ai-memory/ai-memory.db ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07
   # If you see -wal / -shm sidecar files, copy those too:
   cp ~/.local/share/ai-memory/ai-memory.db-wal ~/.local/share/ai-memory/ai-memory.db-wal.bak.pre-v07 2>/dev/null || true
@@ -71,7 +71,7 @@ one you're in until it's too late.
   # Expected output: ok
   sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 \
     'SELECT MAX(version) FROM schema_version;'
-  # Expected output for v0.6.4 installs: 15 (or whatever your version is — note it)
+  # Expected output for v0.6.4 installs: 20 (or whatever your version is — note it)
   ```
 - [ ] **Config file.** Copy your config too:
   ```bash
@@ -91,7 +91,7 @@ one you're in until it's too late.
 - [ ] **Note your current schema version** for the rollback path:
   ```bash
   sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
-  # On v0.6.4 you should see 15. Write this down.
+  # On v0.6.4 you should see 20. Write this down.
   ```
 - [ ] **Disk space.** The schema migration creates several new tables and
   indexes. Plan for **roughly 1.3× your current DB size** of free space on
@@ -123,8 +123,8 @@ not federating, you have not customised `hooks.toml` or `config.toml`. Skip
 to §4 if any of those are false.
 
 ```bash
-# 1. Stop whatever's running.
-ai-memory stop 2>/dev/null || pkill ai-memory
+# 1. Stop whatever's running (there is no `ai-memory stop` subcommand).
+systemctl --user stop ai-memory 2>/dev/null || pkill -INT ai-memory
 
 # 2. One backup before anything else.
 cp ~/.local/share/ai-memory/ai-memory.db ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07
@@ -135,11 +135,11 @@ brew upgrade ai-memory                                          # Homebrew
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp ai-memory --locked
 
 # 4. Start it back up. The schema migration runs automatically on first boot.
-ai-memory start
+ai-memory serve                                                 # or: systemctl --user start ai-memory
 ```
 
-That's it. The first `ai-memory start` after the upgrade walks the schema
-ladder v15 → v55 against your DB in place. It's idempotent — if you Ctrl-C
+That's it. The first daemon start after the upgrade walks the schema
+ladder v20 → v55 against your DB in place. It's idempotent — if you Ctrl-C
 during the migration, restart and the unfinished bumps resume from where they
 stopped.
 
@@ -149,7 +149,7 @@ To confirm you landed cleanly:
 ai-memory doctor --tokens                                       # general health
 ai-memory recall "anything"                                     # smoke recall
 sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
-# Expected: 53
+# Expected: 55
 ```
 
 If any of those go sideways, jump to §9 (Troubleshooting).
@@ -165,7 +165,7 @@ step is independently auditable.
 ### 4.1 Stop the daemon
 
 ```bash
-ai-memory stop                                                  # graceful shutdown
+pkill -INT ai-memory                                            # graceful shutdown (no `ai-memory stop` subcommand)
 # Or under systemd:
 sudo systemctl stop ai-memory
 # Confirm nothing's still holding the file:
@@ -206,11 +206,12 @@ ai-memory --version
 
 ### 4.4 First-boot schema migration
 
-Start the daemon. The first boot detects `schema_version=15` (your v0.6.4 state)
-and walks the ladder up to 53.
+Start the daemon. The first boot detects `schema_version=20` (your v0.6.4 state)
+and walks the ladder up to 55.
 
 ```bash
-ai-memory serve --foreground 2>&1 | tee ~/.local/share/ai-memory/migrate.log
+# `serve` runs in the foreground by default (no --foreground flag exists)
+ai-memory serve 2>&1 | tee ~/.local/share/ai-memory/migrate.log
 # Or under systemd:
 sudo systemctl start ai-memory
 journalctl -u ai-memory -f                                      # tail the log
@@ -220,17 +221,17 @@ Expected log lines, in rough order:
 
 ```
 [INFO] opening sqlite db at ~/.local/share/ai-memory/ai-memory.db
-[INFO] current schema_version=15, target schema_version=55
-[INFO] applying migration 0015..0055 idempotent ladder
-[INFO] migration v16 applied (pending_action_timeouts)
-[INFO] migration v17 applied (transcripts)
+[INFO] current schema_version=20, target schema_version=55
+[INFO] applying migrations v21..v55 idempotent ladder
+[INFO] migration v21 applied (pending_action_timeouts)
+[INFO] migration v22 applied (transcripts)
 …
 [INFO] migration v40 applied (source_uri_backfill: 1247 rows scanned, 312 backfilled)
-[INFO] migration v42 applied (auto_persona_entity_id: 89 rows scanned, 17 backfilled)
+[INFO] migration v42 applied (mentioned_entity_id: 89 rows scanned, 17 backfilled)
 …
 [INFO] migration v49 applied (archived_memories full carry)
 [INFO] migration v50 applied (agent_quotas per-namespace PK)
-[INFO] migration v51 applied (federation_nonces persistence)
+[INFO] migration v51 applied (federation_nonce_cache persistence)
 [INFO] migration v52 applied (transcript_line_dedup #1389 L4)
 [INFO] migration v53 applied (memories_au FTS trigger scoping #1418)
 [INFO] migration v54 applied (tier-default expiry backfill #1466)
@@ -262,7 +263,7 @@ clean signals:
 ```bash
 # Schema is at the v0.7.0 target.
 sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
-# Expected: 53
+# Expected: 55
 
 # Row counts match your pre-upgrade backup.
 sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 \
@@ -287,8 +288,9 @@ sqlite3 ~/.local/share/ai-memory/ai-memory.db \
 # Sanity: pick a memory you know by heart and recall it.
 ai-memory recall "the topic you wrote on Monday" --json | jq '.memories[0].title'
 
-# Capability surface advertises v3.
-ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.schema_version'
+# Capability surface advertises v3 (no `ai-memory mcp call` sub-subcommand
+# exists — probe the stdio server with raw JSON-RPC, or curl the daemon):
+curl -s http://127.0.0.1:9077/api/v1/capabilities | jq '.schema_version'
 # Expected: "3"
 ```
 
@@ -312,11 +314,15 @@ operators wait at least 7 days of clean runtime before deleting.
 
 If you run ai-memory against PostgreSQL (with or without Apache AGE), the
 upgrade path differs because schema bumps land via the `ai-memory schema-init
---upgrade` command rather than via the daemon's first-boot ladder.
+--store-url <url>` command (opening the store runs the migration ladder as a
+side effect; there is no `--upgrade` flag) rather than via the daemon's
+first-boot ladder. Note `schema-init`/`migrate` exist only in
+`--features sal` / `sal,sal-postgres` builds — the pre-built release
+binaries are default-feature builds without them.
 
 **Read [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) for the
-full runbook.** It covers schema-init upgrades, the v15→v28→v55 paths, the
-AGE projection prime, and the cutover dance.
+full runbook.** It covers schema-init upgrades, the postgres upgrade ladder,
+the AGE projection prime, and the cutover dance.
 
 ### 5.1 Executive summary (do not skip the full doc)
 
@@ -331,23 +337,25 @@ AGE projection prime, and the cutover dance.
 4. **Run the in-place upgrade** against the live postgres URL:
    ```bash
    ai-memory schema-init \
-     --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory \
-     --upgrade
+     --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
    ```
-   This walks the postgres ladder up to schema v55 idempotently, preserving
-   data.
+   Opening the store walks the postgres ladder up to schema v55
+   idempotently, preserving data.
 5. **Verify schema parity:**
    ```bash
    psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
-     -tAc "SELECT version FROM _ai_memory_schema_version ORDER BY version DESC LIMIT 1;"
-   # → 53
+     -tAc "SELECT MAX(version) FROM schema_version;"
+   # → 55
    ```
-6. **Restart and validate:**
+6. **Restart and validate** — the postgres adapter logs its resolved KG
+   backend at connect:
    ```bash
    sudo systemctl start ai-memory
-   curl -s http://localhost:9077/api/v1/capabilities | jq '.store_backend, .kg_backend'
-   # → "PostgresStore"
-   # → "Age" (if you have AGE installed) or "cte" (recursive-CTE fallback)
+   journalctl -u ai-memory | grep "Postgres KG backend"
+   # → "Postgres KG backend: AGE" (if AGE is installed)
+   #   or "Postgres KG backend: CTE" (recursive-CTE fallback)
+   curl -s http://localhost:9077/api/v1/capabilities | jq '.schema_version'
+   # → "3"
    ```
 
 ### 5.2 If you want to switch sqlite → postgres at the same time
@@ -365,16 +373,16 @@ This section walks the 11 new columns on the `memories` table and the WHY
 behind each. The detailed call-out paragraphs follow the summary table.
 Schema-deep readers, see
 [`MIGRATION_v0.7.md` §"Per-bump narrative"](MIGRATION_v0.7.md) for the v34 →
-v53 ladder.
+v55 ladder.
 
 ### Summary table
 
 | # | Column | Type & default | Schema | One-line why |
 |---|--------|----------------|--------|--------------|
 | 1 | `reflection_depth` | INTEGER NOT NULL DEFAULT 0 | v29 | Bound recursion in `memory_reflect`; filter recall to raw observations. |
-| 2 | `memory_kind` | TEXT NOT NULL DEFAULT 'observation' | v30 | 10-variant Batman vocabulary — indexed type lookup vs JSON-extract scan. |
-| 3 | `entity_id` | TEXT NULL | v36 | Subject of a Persona artefact; queryable by who-it's-about. |
-| 4 | `persona_version` | INTEGER NULL | v36 | Monotonic persona version — old profiles stay queryable for audit. |
+| 2 | `memory_kind` | TEXT NOT NULL DEFAULT 'observation' | v31 | 10-variant Batman vocabulary — indexed type lookup vs JSON-extract scan. |
+| 3 | `entity_id` | TEXT NULL | v37 | Subject of a Persona artefact; queryable by who-it's-about. |
+| 4 | `persona_version` | INTEGER NULL | v37 | Monotonic persona version — old profiles stay queryable for audit. |
 | 5 | `citations` | TEXT NOT NULL DEFAULT '[]' | v38 | Hop recall hits back to source PR / doc / conversation. |
 | 6 | `source_uri` | TEXT NULL | v38 | First-class URI form; untangles role-label `source` from URL. |
 | 7 | `source_span` | TEXT NULL | v38 | Byte-range into the parent doc — reverse-translate atom → source paragraph. |
@@ -395,11 +403,11 @@ And new tables (opt-in / empty if you never use the feature): `signed_events` (V
 
 **6.1 `reflection_depth`** (v29). Depth in the reflection tree. `0` for caller-minted rows (and every pre-v0.7.0 row); positive for reflections synthesised by `memory_reflect` over lower-depth peers. Without this, a reflection that summarises three reflections that summarise nine raw observations is indistinguishable from any other memory — you can't bound runaway recursion or filter recall to "raw observations only".
 
-**6.2 `memory_kind`** (v30, backfilled by `0025_v07_memory_kind.sql`). Ten-variant Batman discriminator. Rows tagged `metadata.type='reflection'` are auto-promoted from `observation` to `reflection`. "Show me decisions, not observations" becomes an indexed lookup instead of a JSON-extract scan.
+**6.2 `memory_kind`** (v31; ALTER emitted from Rust, backfilled by `0025_v07_memory_kind.sql`). Ten-variant Batman discriminator. Rows tagged `metadata.type='reflection'` are auto-promoted from `observation` to `reflection`. "Show me decisions, not observations" becomes an indexed lookup instead of a JSON-extract scan.
 
-**6.3 `entity_id`** (v36, QW-2). Subject of a Persona artefact. Populated only when `memory_kind = 'persona'`. Lets you query Persona rows by who-they're-about rather than by full-text search.
+**6.3 `entity_id`** (v37, QW-2). Subject of a Persona artefact. Populated only when `memory_kind = 'persona'`. Lets you query Persona rows by who-they're-about rather than by full-text search.
 
-**6.4 `persona_version`** (v36). Monotonic per-`(entity_id, namespace)` version. Each `memory_persona_generate` writes `version + 1`; older profiles stay queryable. Personas evolve — yesterday's profile of "Alice the engineer" must not silently destroy today's.
+**6.4 `persona_version`** (v37). Monotonic per-`(entity_id, namespace)` version. Each `memory_persona_generate` writes `version + 1`; older profiles stay queryable. Personas evolve — yesterday's profile of "Alice the engineer" must not silently destroy today's.
 
 **6.5 `citations`** (v38, Form 4 fact-provenance). JSON array of Citation envelopes — `[{ uri, accessed_at, hash?, span? }, …]`. Without citations every recall result is a he-said-she-said blob; with them, downstream readers can hop straight back to the source PR / doc / conversation.
 
@@ -424,14 +432,17 @@ The bump-by-bump v34 → v55 narrative lives in
 
 > **Rollback loses every memory you wrote while on v0.7.0.** The pre-upgrade
 > backup is the only readable v0.6.4-shaped database you have; once v0.7.0
-> migrates the original, the original is at v53 and v0.6.4 can't open it.
+> migrates the original, the original is at v55 and v0.6.4 can't open it.
+> (The migrator's automatic pre-migration `VACUUM INTO` snapshot
+> — `<db>.pre-migration-v<from>-to-v<to>-<token>.bak` — is a second
+> v0.6.4-shaped restore point if you missed the manual backup.)
 > Plan for this — don't migrate until you have a backup and a stop-the-world
 > plan.
 
 ### 7.1 Stop the v0.7.0 daemon
 
 ```bash
-ai-memory stop                                                  # graceful
+pkill -INT ai-memory                                            # graceful
 # or:
 sudo systemctl stop ai-memory
 lsof ~/.local/share/ai-memory/ai-memory.db                      # confirm nothing's open
@@ -472,9 +483,9 @@ ai-memory --version                                             # confirm 0.6.4
 ### 7.5 Start back up and verify
 
 ```bash
-ai-memory start
+systemctl --user start ai-memory    # or relaunch your MCP host / `ai-memory serve`
 sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
-# Expected: 15 (your pre-v0.7.0 version)
+# Expected: 20 (your pre-v0.7.0 version)
 ai-memory recall "a memory you knew was there pre-upgrade"
 ```
 
@@ -526,26 +537,25 @@ Expected output on a fresh v0.7.0 install with no signed activity yet:
 
 ```json
 {
-  "status": "ok",
-  "rows_verified": 0,
-  "chain_head": null,
-  "chain_tip": null,
-  "tampered": false
+  "rows_checked": 0,
+  "chain_break": null,
+  "signature_failures": [],
+  "chain_holds": true
 }
 ```
 
 After your first signed activity (a `memory_link` write against an agent that
 has an Ed25519 keypair under `~/.config/ai-memory/keys/`), the same command
-should report `rows_verified > 0` with `tampered: false`.
+should report `rows_checked > 0` with `chain_holds: true`.
 
-If you see `tampered: true`, something has rewritten the `signed_events`
-table out-of-band. That's a serious finding — file an issue with the JSON
-output attached.
+If you see `chain_holds: false` (with `chain_break` naming the first broken
+sequence), something has rewritten the `signed_events` table out-of-band.
+That's a serious finding — file an issue with the JSON output attached.
 
 ### 8.3 Capability surface health
 
 ```bash
-ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.schema_version, .summary'
+curl -s http://127.0.0.1:9077/api/v1/capabilities | jq '.schema_version, .summary'
 # Expected:
 # "3"
 # "AI Memory MCP exposes a 7-tool core with N additional families available via runtime expansion."
@@ -610,13 +620,13 @@ directly) fails because it expects a v0.7.0 column that isn't there.
 
 **Cause:** The schema migration didn't run. Most likely you copied the
 v0.7.0 binary in place but never started it against the DB, OR the
-migration aborted partway and the daemon never reached v53.
+migration aborted partway and the daemon never reached v55.
 
 **Fix:**
 ```bash
 sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
-# If <55: rerun:
-ai-memory serve --foreground 2>&1 | tee ~/.local/share/ai-memory/migrate.log
+# If <55: rerun (serve runs in the foreground by default):
+ai-memory serve 2>&1 | tee ~/.local/share/ai-memory/migrate.log
 # Watch the log for migration completion; halt only after schema_version=55.
 ```
 
@@ -634,7 +644,7 @@ memories` and your migration log.
 manually, then restart:
 ```bash
 sqlite3 ~/.local/share/ai-memory/ai-memory.db 'UPDATE schema_version SET version = <last-good-version>;'
-ai-memory serve --foreground
+ai-memory serve
 ```
 
 ### 9.4 "permissions.mode = enforce" denies a write that v0.6.4 allowed
@@ -697,13 +707,14 @@ ai-memory identity list                                         # confirm visibl
 ```
 
 If you have no backup, generate a fresh keypair — but be aware that links
-signed by the old key will read as `peer_attested = false` against the new
-key. Old signatures remain valid in the audit chain; only new writes are
-attributed to the new key.
+signed by the old key can no longer be verified against the new public key
+(`memory_verify` reports the signature as unverifiable). Old signatures
+remain in the audit chain; only new writes are attributed to the new key.
 
-### 9.7 "verify-signed-events-chain reports tampered: true"
+### 9.7 "verify-signed-events-chain reports chain_holds: false"
 
-**Symptom:** Post-migration the chain verifier reports tampering.
+**Symptom:** Post-migration the chain verifier reports a break
+(`chain_holds: false`, `chain_break` naming the first bad sequence).
 
 **Cause (most common, benign):** The v0.7.0 V-4 closeout (schema v34) is the
 migration that introduced the `prev_hash + sequence` columns. If your
@@ -715,7 +726,7 @@ re-run the daemon to completion, the chain will read as broken.
 
 **Fix:** Restart the daemon. The v34 backfill is idempotent — it re-walks
 and re-stamps. After a clean run, `verify-signed-events-chain` should report
-`tampered: false`.
+`chain_holds: true`.
 
 **Cause (rare, serious):** Something genuinely wrote into the table
 out-of-band. File an issue with the full JSON verifier output and the
@@ -782,8 +793,9 @@ the existing vectors, no re-computation needed.
 **Yes.** Capabilities v3 is additive — v2 fields stay at their existing
 paths and shapes. v0.6.4 SDKs continue to read v2 fields and ignore the
 new top-level keys. Every v0.6.4 CLI subcommand, MCP tool, and HTTP route
-behaves identically against a v0.7.0 server (where v0.7.0 added 28 new
-MCP tools, those are net-new; nothing was removed).
+behaves identically against a v0.7.0 server (v0.7.0 grew the full-profile
+MCP surface to 74 advertised entries — every addition is net-new; nothing
+was removed).
 
 ### Q6. What's the biggest behavior change?
 
@@ -798,7 +810,7 @@ If you relied on the v0.6.4 default-permissive posture, opt back in via
 **Yes.** v0.7.0 ships a bidirectional migration tool (`ai-memory migrate
 --from sqlite:///… --to postgres://…`). The recommended order is: upgrade
 the sqlite-backed daemon to v0.7.0 first (so both sides converge on schema
-v53), then run the cross-backend migration. The postgres guide has the
+v55), then run the cross-backend migration. The postgres guide has the
 full runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md).
 
 ### Q8. The first boot is taking forever. Is it stuck?

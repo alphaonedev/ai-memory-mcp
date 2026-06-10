@@ -36,8 +36,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends have **schema parity at v28** as of v0.7.0 — every
-feature that works on sqlite works on postgres.
+The two backends have **schema parity at v55** as of v0.7.0
+(`CURRENT_SCHEMA_VERSION = 55` on both ladders) — every feature that
+works on sqlite works on postgres.
 
 ## Prerequisites
 
@@ -46,7 +47,7 @@ feature that works on sqlite works on postgres.
 | PostgreSQL | **18.4** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.7.0** (canonical) | Targets PG 18. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` (`apache/age:release_PG18_1.7.0`) or build from source (see below). |
 | pgvector | **0.8.2** (canonical) | Faster HNSW. SSOT: `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
-| ai-memory | v0.7.0 with `--features sal-postgres` | The sql-postgres feature is **off by default** to keep the no-postgres build hermetic. |
+| ai-memory | v0.7.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 ### Bundled Dockerfile (Apache AGE + pgvector on PG18, #1065)
 
@@ -165,7 +166,8 @@ Notes:
 
 - `aimemory` is the role the daemon runs as. Pick a strong password and
   store it in your secret manager — the daemon reads it from the
-  `--store-url` URL or the `AI_MEMORY_STORE_URL` env var.
+  `--store-url` URL only (the `AI_MEMORY_STORE_URL` env fallback was
+  deliberately dropped; commit `1e8ad69b`).
 - `ag_catalog` must be on the search path so AGE's `cypher()` SQL
   function resolves without a schema prefix on every call.
 - The role only needs `USAGE` on `ag_catalog` (read of the AGE
@@ -181,31 +183,36 @@ way to bootstrap a fresh postgres backend:
 ai-memory schema-init --store-url postgres://aimemory:changeme-please@localhost:5432/aimemory
 ```
 
-What it does:
+What it does (see `src/cli/schema_init.rs`):
 
-1. Connects to the `--store-url`.
-2. Probes for `age` and `vector` extensions; refuses to proceed with a
-   helpful error if either is missing.
-3. Runs `src/store/postgres_schema.sql` (idempotent — `CREATE TABLE
-   IF NOT EXISTS` throughout) up to the v28 schema marker.
-4. If AGE is present, creates the AGE graph (`ai_memory_kg`) and
-   primes the projection labels (entity, memory) and edge types
-   (related_to, supersedes, contradicts, derived_from).
-5. Records `schema_version=28` in the `_ai_memory_schema_version`
-   table.
+1. Connects to the `--store-url` via the same `open_store` factory the
+   `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
+   bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
+   IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
+   schema v55 as a side effect. The `vector` (pgvector) extension is
+   **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
+   aborts the bootstrap.
+2. If the `age` extension is installed, additionally bootstraps the
+   AGE `memory_graph` projection via `SELECT
+   create_graph('memory_graph')` (idempotent — "graph already exists"
+   is treated as success). **AGE is opt-in**: a missing extension is
+   NOT fatal; the JSON report just carries
+   `age_projection_created: false` and KG queries use the
+   recursive-CTE fallback.
+3. Applies the `--embedding-dim` contract (default 384): a fresh
+   schema is initialised with `vector(<dim>)` columns; an existing
+   schema whose dim differs is converted in place (HNSW indexes
+   dropped + recreated, existing embedding values NULLed — re-embed
+   afterwards; `embedding_dim_migrated: true` in the JSON report).
+4. Enumerates the resulting catalog and prints the human summary
+   (tables / indices / views / functions / extensions /
+   `schema_version: 55`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
-0 on success, 2 on missing prerequisites, 1 on transient connection
-error.
+0 on success, non-zero on connection / bootstrap failure.
 
-If you'd rather not install the AGE projection (e.g. you don't need
-KG queries), run `ai-memory schema-init --skip-age` and the recursive
-CTE fallback will be used for `kg_query`/`kg_timeline`/etc.
-
-> **Pre-Wave-1 fallback.** Until Wave 1 Stream B's commit lands, you
-> can bootstrap by running the migration tool against a fresh empty
-> postgres (which uses the same `INIT_SCHEMA` path internally) — see
-> `migration-v0.7.0-postgres.md` for that workflow.
+There is no `--skip-age` flag — AGE is auto-detected; when absent the
+recursive-CTE fallback serves `kg_query`/`kg_timeline`/etc.
 
 ## Daemon configuration
 
@@ -591,9 +598,10 @@ pass-through.
 
 After Wave-3 Continuation 3, **no standard HTTP endpoint** returns
 501 on a postgres-backed daemon. Every endpoint listed in the v0.7.0
-router (**72 `.route(...)` registrations in `src/lib.rs` at v0.7.0**,
-surfaced through `/api/v1/capabilities`) dispatches through the SAL
-trait or is handled directly by the postgres adapter.
+router (**88 production `.route(...)` registrations in `src/lib.rs`
+at v0.7.0 — 74 unique URL paths**, surfaced through
+`/api/v1/capabilities`) dispatches through the SAL trait or is handled
+directly by the postgres adapter.
 
 The route gate retains its 501 envelope as a safety net for:
 
@@ -616,7 +624,7 @@ endpoint availability:
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
 
-Schema parity at v28 means a future `migrate sqlite → postgres`
+Schema parity at v55 means `ai-memory migrate` sqlite → postgres
 carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both
@@ -682,19 +690,23 @@ and `AI_MEMORY_PG_POOL_MIN` env vars.
 
 ## Troubleshooting
 
-### "extension age is not installed"
+### AGE not installed
 
-`ai-memory schema-init` exits 2 if AGE isn't present. Either install
-AGE (see "Install" above) or pass `--skip-age` to bootstrap with the
-CTE fallback. The `vector` extension is **not** optional — pgvector
-is required for embeddings.
+A missing `age` extension is non-fatal — `ai-memory schema-init`
+completes, reports `age_projection_created: false` in its `--json`
+output, and the daemon serves KG queries through the recursive-CTE
+fallback. Install AGE (see "Install" above) and re-run `schema-init`
+to enable the Cypher path. The `vector` extension is **not** optional
+— pgvector is required for embeddings, and its absence aborts the
+bootstrap.
 
-### "schema_version=15 detected, expected 28"
+### Old postgres schema version detected
 
-You're pointing at a v0.7-alpha postgres database. Run `ai-memory
-migrate --from postgres://… --to postgres://… --in-place` to apply
-the v15→v28 migrations idempotently. (See
-`migration-v0.7.0-postgres.md` for the full migration guide.)
+If you're pointing at a v0.7-alpha postgres database (schema v15),
+run `ai-memory schema-init --store-url postgres://…` with the v0.7.0
+binary — opening the store applies the upgrade ladder to v55
+idempotently. (See `migration-v0.7.0-postgres.md` for the full
+migration guide.)
 
 ### "could not find parameter $N" against a Cypher query
 
@@ -704,7 +716,7 @@ hits it — if you see it, you're running a custom psql probe. Use the
 AGE-recommended SQL-function shape:
 
 ```sql
-SELECT * FROM cypher('ai_memory_kg', $$
+SELECT * FROM cypher('memory_graph', $$
   MATCH (a)-[r:RELATED_TO]->(b)
   WHERE a.id = $node_id
   RETURN b
@@ -731,7 +743,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v28 | v28 (Wave 2) |
+| Schema parity | v55 | v55 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |

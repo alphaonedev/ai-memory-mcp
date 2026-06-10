@@ -96,7 +96,7 @@ The canonical CI matrix is in
 | Embedded | FreeBSD | x86_64 / aarch64 | `x86_64-unknown-freebsd` / `aarch64-unknown-freebsd` | Build-from-source; community-attested but not gated by upstream CI |
 
 The lib target's `crate-type = ["rlib", "staticlib", "cdylib"]`
-(see [`Cargo.toml`](../Cargo.toml) line 447) is what makes the
+(see `[lib]` in [`Cargo.toml`](../Cargo.toml)) is what makes the
 mobile slices possible: `staticlib` produces `libai_memory.a`
 that the iOS xcframework wraps, `cdylib` produces
 `libai_memory.so` that the Android `.aar` ships under
@@ -148,7 +148,7 @@ cat > $PREFIX/var/service/ai-memory/run <<'SH'
 #!/data/data/com.termux/files/usr/bin/sh
 exec ai-memory serve \
   --db $HOME/.ai-memory/ai-memory.db \
-  --bind 127.0.0.1:9077
+  --host 127.0.0.1 --port 9077
 SH
 chmod +x $PREFIX/var/service/ai-memory/run
 sv-enable ai-memory
@@ -164,9 +164,10 @@ can hit `http://127.0.0.1:9077/api/v1/` for memory persistence.
 - Disable Android's aggressive power-save for Termux: Settings →
   Apps → Termux → Battery → "Unrestricted". Without this, the
   daemon gets SIGSTOPped after the screen has been off for ~30 min.
-- Set `--gc-interval 3600` (1h) instead of the default 30 min on a
-  battery-powered phone — GC sweeps wake the radio if the schema
-  triggers any audit-chain emit on rotation.
+- The background GC sweep runs on a fixed 30-minute cadence at
+  v0.7.0 (there is no `--gc-interval` flag). On a battery-powered
+  phone, prefer ephemeral CLI invocations (§9) over a resident
+  daemon when traffic is sparse.
 
 ## 4. Cellphone: iOS
 
@@ -211,7 +212,7 @@ iPad:
 
 ```bash
 # On a Mac on the same network:
-ai-memory serve --bind 0.0.0.0:9077 --db ~/Documents/family-memory.db
+ai-memory serve --host 0.0.0.0 --port 9077 --db ~/Documents/family-memory.db
 
 # In your iOS app, point your MCP / HTTP client at:
 # http://<mac-lan-ip>:9077/api/v1/
@@ -241,9 +242,10 @@ prebuilt `aarch64-unknown-linux-gnu` binary works on:
 ### Install
 
 ```bash
-# On the Pi (or any aarch64 Linux):
+# On the Pi (or any aarch64 Linux) — the tarball contains the bare
+# `ai-memory` binary at its root:
 curl -fsSL https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-aarch64-unknown-linux-gnu.tar.gz \
-  | sudo tar -xz -C /usr/local/bin --strip-components=1 ai-memory/ai-memory
+  | sudo tar -xz -C /usr/local/bin ai-memory
 ai-memory --version
 ```
 
@@ -263,10 +265,10 @@ Wants=network-online.target
 Type=simple
 User=ai-memory
 Group=ai-memory
+Environment=AI_MEMORY_LOG_DIR=/var/log/ai-memory
 ExecStart=/usr/local/bin/ai-memory serve \
   --db /var/lib/ai-memory/ai-memory.db \
-  --bind 127.0.0.1:9077 \
-  --log-dir /var/log/ai-memory
+  --host 127.0.0.1 --port 9077
 Restart=on-failure
 RestartSec=5
 # Resource caps — sane defaults for a Pi 4 (4GB) / Pi 5 (8GB):
@@ -322,9 +324,9 @@ build and run but recall latency starts to dominate.
 | Binary size | ~31 MB | Same as desktop; cross-compile output is stripped + thin-LTO |
 | RAM at rest (daemon idle) | ~18–25 MB RSS | sqlite + HNSW empty + tracing subscriber |
 | RAM under recall load | ~80–120 MB RSS | HNSW resident for 10k vectors at default dim=384 |
-| RAM under embedding load | +250–400 MB | MiniLM CPU inference; turn off by running `--profile keyword` if RAM-constrained |
-| CPU recall p95 (FTS5 only, `--profile keyword`) | ~3 ms | 10k-row corpus |
-| CPU recall p95 (FTS5 + HNSW, `--profile semantic`) | ~25–40 ms | 10k-row corpus, 384-dim embeddings |
+| RAM under embedding load | +250–400 MB | MiniLM CPU inference; turn off by running the `keyword` tier if RAM-constrained |
+| CPU recall p95 (FTS5 only, `keyword` tier) | ~3 ms | 10k-row corpus |
+| CPU recall p95 (FTS5 + HNSW, `semantic` tier) | ~25–40 ms | 10k-row corpus, 384-dim embeddings |
 | Disk per 1k memories | ~6 MB | Includes FTS5 index, vector embeddings, audit chain |
 | Disk per 10k memories | ~55 MB | Includes archive table, expired memory backfill |
 | Disk per 100k memories | ~520 MB | HNSW graph contributes ~120 MB at this scale |
@@ -376,7 +378,7 @@ build-from-source is the only supported path.
 ## 8. Resource envelope (reference numbers)
 
 The numbers below are measured on a release build, sqlite-bundled,
-`--profile semantic`, MiniLM-L6-v2 384-dim embeddings, on a
+`semantic` tier, MiniLM-L6-v2 384-dim embeddings, on a
 benchmark host running ai-memory's own `cargo bench --bench
 recall` after a representative seed corpus. Use them to size
 provisioning for a fleet.
@@ -414,15 +416,15 @@ push memory rows continuously.
 
 Tuning knobs that matter on battery:
 
-- `--gc-interval` — default 30 min. Raise to 1–4h on battery
-  devices to reduce wake-the-CPU overhead.
-- `--checkpoint-interval` — default 5 min. Raise to 15–30 min to
-  reduce write-wakeups (WAL checkpointing is the largest
-  background CPU cost).
-- `--profile keyword` — disables the embedder + reranker. Cuts
-  recall RAM by ~250 MB and recall CPU by ~80%, at the cost of
-  the semantic blend. Good default for low-power IoT sensors that
-  only ever do tag / FTS5 lookups.
+- **GC cadence is fixed at 30 min** at v0.7.0 (no `--gc-interval` /
+  `--checkpoint-interval` flags exist on `serve`). If background
+  wakeups dominate your power budget, prefer ephemeral CLI mode
+  (below) over a resident daemon.
+- **`keyword` tier** (`tier = "keyword"` in `config.toml` for the
+  daemon; `--tier keyword` on `mcp` / `store` / `recall`) — disables
+  the embedder + reranker. Cuts recall RAM by ~250 MB and recall CPU
+  by ~80%, at the cost of the semantic blend. Good default for
+  low-power IoT sensors that only ever do tag / FTS5 lookups.
 
 ### Ephemeral mode (CLI invocation per call)
 
@@ -440,16 +442,16 @@ The CLI path opens a fresh SQLite connection per call (see
 ephemeral invocations are safe as long as the WAL contention stays
 modest.
 
-### Recommended polling intervals
+### Recommended run modes
 
-| Device class | Mode | GC interval | Checkpoint | Profile |
-|---|---|---|---|---|
-| Phone (active conversation) | daemon | 30 min | 5 min | semantic |
-| Phone (background daemon, idle 95% of the day) | daemon | 4h | 30 min | semantic |
-| Pi 4 / Pi 5 (always-on, mains power) | daemon | 30 min | 5 min | semantic |
-| Pi Zero 2 W (battery, intermittent) | ephemeral | n/a | n/a | keyword |
-| Drone / field sensor (sparse waypoint memory) | ephemeral | n/a | n/a | keyword |
-| Wearable (sub-hourly memory emits) | ephemeral | n/a | n/a | keyword |
+| Device class | Mode | Tier |
+|---|---|---|
+| Phone (active conversation) | daemon | semantic |
+| Phone (background daemon, idle 95% of the day) | daemon (or ephemeral) | semantic |
+| Pi 4 / Pi 5 (always-on, mains power) | daemon | semantic |
+| Pi Zero 2 W (battery, intermittent) | ephemeral | keyword |
+| Drone / field sensor (sparse waypoint memory) | ephemeral | keyword |
+| Wearable (sub-hourly memory emits) | ephemeral | keyword |
 
 ## 10. Sync patterns — edge device to regional hub
 
@@ -472,8 +474,9 @@ The deployment pattern that works:
   The hub holds the durable archive + cross-device memory + the
   source-of-truth FTS5/HNSW for the fleet.
 - **Edge device pulls from the hub on demand** when local recall
-  misses or returns low-confidence results, via the same
-  `/sync/pull` shape.
+  misses or returns low-confidence results, via
+  `GET /api/v1/sync/since` (the catch-up endpoint — there is no
+  `/sync/pull` route).
 
 This is the **mobile-edge tier** documented as topology 9 in
 [`docs/reference-architectures.md`](reference-architectures.md#topology-9).
@@ -495,13 +498,14 @@ recommended subset for resource-constrained devices:
 | `memory_kg_query` | DEFER to hub | Recursive CTE / AGE traversals can blow RAM on a 10k+ corpus |
 | `memory_reflect` | DEFER to hub | Triggers LLM chain — too expensive on-device |
 | `memory_atomise` | DEFER to hub | Same — LLM curator chain |
-| `/sync/push` + `/sync/pull` | YES | The whole point of the edge tier |
+| `/sync/push` + `/sync/since` | YES | The whole point of the edge tier |
 | `/metrics` | OPTIONAL | If you're aggregating fleet telemetry; otherwise turn off |
 
-Use `--profile core` or `--profile keyword` on the device to
-expose only the mobile-friendly surface; the LLM-heavy tools then
-return a `tool not enabled` envelope so the AI client knows to
-forward to the hub.
+Use `ai-memory mcp --profile core` (the 7-tool default surface) plus
+`--tier keyword` on the device to expose only the mobile-friendly
+surface and skip the embedder; tools outside the loaded profile are
+simply not advertised, so the AI client knows to forward heavier
+operations to the hub.
 
 ## 11. Examples / use cases
 
