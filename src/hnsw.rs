@@ -845,6 +845,23 @@ impl VectorIndex {
         state.all_entries.len()
     }
 
+    /// `true` when the index holds no live entries at all.
+    ///
+    /// #1579 QC — load-bearing for the proactive-conflict dispatch:
+    /// an EMPTY index is *vacuously* [`Self::is_fully_searchable`]
+    /// (`0 + 0 >= 0`), but during the async-boot LOAD phase — after
+    /// the daemon binds with `VectorIndex::empty()` and before the
+    /// boot loader's `seed_entries` lands (the `get_all_embeddings`
+    /// read is the long pole at 100k rows) — emptiness says nothing
+    /// about what the DB holds. Callers that would otherwise trust a
+    /// fully-searchable index (the #519 conflict check) must ALSO
+    /// require non-emptiness, so that window routes to the bounded
+    /// recency-scan fallback instead of consulting an index that
+    /// cannot return anything.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// #968 — Force a full rebuild of the HNSW index from all entries,
     /// SYNCHRONOUSLY. Preserved for tests + emergency paths; production
     /// code should call [`Self::rebuild_async`] so the multi-second
