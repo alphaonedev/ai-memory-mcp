@@ -227,6 +227,13 @@ pub async fn search_memories(
         )
             .into_response();
     }
+    // #1579 B4 — negotiate the response format BEFORE doing any work
+    // (json default | toon | toon_compact; invalid → 400 with the
+    // SSOT message). Mirrors the recall handlers.
+    let format = match crate::toon::WireFormat::parse_http(p.format.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return crate::handlers::wire_format::invalid_format_response(&e),
+    };
 
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The Postgres adapter's `search` runs the same
@@ -282,7 +289,11 @@ pub async fn search_memories(
             bypass_visibility: false,
         };
         return match app.store.search(&ctx, &p.q, &filter).await {
-            Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
+            // #1579 B4 — serialize per the negotiated format.
+            Ok(r) => crate::handlers::wire_format::search_response(
+                format,
+                json!({"results": r, "count": r.len(), "query": p.q}),
+            ),
             Err(e) => store_err_to_response(e),
         };
     }
@@ -339,10 +350,11 @@ pub async fn search_memories(
                 Some(limit),
                 effective_as_agent.as_deref(),
             ) {
-                Ok(r) => {
-                    Json(json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}))
-                        .into_response()
-                }
+                // #1579 B4 — serialize per the negotiated format.
+                Ok(r) => crate::handlers::wire_format::search_response(
+                    format,
+                    json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}),
+                ),
                 Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
         }
@@ -362,7 +374,11 @@ pub async fn search_memories(
         false,
         source_uri,
     ) {
-        Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
+        // #1579 B4 — serialize per the negotiated format.
+        Ok(r) => crate::handlers::wire_format::search_response(
+            format,
+            json!({"results": r, "count": r.len(), "query": p.q}),
+        ),
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

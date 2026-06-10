@@ -87,6 +87,15 @@ See `docs/ADMIN_GUIDE.md` § "Peer-mesh security" for setup.
 
 ## Response envelopes
 
+### Compression (v0.7.0, #1579 B4)
+
+The daemon gzip-compresses responses when the request advertises
+`Accept-Encoding: gzip` (standard `tower-http` CompressionLayer;
+measured ~4.6× smaller recall payloads). Requests without the header
+receive identity-coded responses, byte-identical to earlier releases.
+The SSE surface (`GET /api/v1/approvals/stream`) is never compressed —
+`text/event-stream` is exempted so events flush immediately.
+
 ### Success (2xx)
 
 JSON body, shape depends on endpoint. Common patterns:
@@ -349,7 +358,10 @@ Hybrid recall (FTS5 + semantic + blend). **Mutates the database**
 
 Query / body fields: `context` (required), `namespace`, `limit`
 (default 10, max 50), `tags`, `since`, `until`, `as_agent`,
-`budget_tokens`.
+`budget_tokens`, `format` (`json` default | `toon` | `toon_compact` —
+v0.7.0 #1579 B4; the TOON variants return `text/plain` rendered by the
+same encoder the MCP tools use, `toon_compact` ≈ 79% smaller than the
+JSON envelope; an unrecognised value is a 400).
 
 ```json
 {
@@ -369,19 +381,22 @@ curl -X POST http://127.0.0.1:9077/api/v1/recall \
 ### `GET /api/v1/search`
 
 Read-only FTS5 keyword search. Same filter params as list, plus `q`
-(required).
+(required) and `format` (`json` default | `toon` | `toon_compact` —
+v0.7.0 #1579 B4, same semantics as recall above).
 
 ```json
 { "results": [ … ], "count": 3, "query": "urgent deadline" }
 ```
 
 > **Note (HTTP ↔ MCP parity):** The MCP `memory_recall`,
-> `memory_search`, and `memory_list` tools accept an optional `format`
-> parameter (`json` | `toon` | `toon_compact`). The HTTP endpoints do
-> not yet expose `format`; HTTP responses are always JSON. The MCP
-> `memory_recall` tool also accepts a `context_tokens` array (v0.6.0.0
-> contextual recall — recent conversation tokens biasing the query
-> embedding at 70/30) that the HTTP body does not surface.
+> `memory_search`, and `memory_list` tools accept the same optional
+> `format` parameter (`json` | `toon` | `toon_compact`). As of v0.7.0
+> (#1579 B4) the HTTP recall + search endpoints expose `format` too
+> (HTTP defaults to `json` for backwards compat; MCP defaults to
+> `toon_compact`). HTTP `memory_list` does not yet accept `format`.
+> The MCP `memory_recall` tool also accepts a `context_tokens` array
+> (v0.6.0.0 contextual recall — recent conversation tokens biasing the
+> query embedding at 70/30) that the HTTP body does not surface.
 
 ## Lifecycle
 

@@ -1058,6 +1058,13 @@ pub struct SearchQuery {
     /// lookup so the query is O(log N).
     #[serde(default)]
     pub source_uri: Option<String>,
+    /// #1579 B4 — response format negotiation: `json` (default) |
+    /// `toon` | `toon_compact`. Reuses the MCP TOON encoder
+    /// (`crate::toon`); invalid values are rejected with `400`
+    /// carrying the SSOT message from
+    /// `crate::toon::invalid_format_msg`.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[allow(clippy::unnecessary_wraps)]
