@@ -306,9 +306,19 @@ pub(crate) fn handle_store(
     // `RegexThenLlm` policy.
     // #880 — `auto_classify_kind` lives on `policy.kind_class` after
     // the governance decomposition.
-    let auto_classify_policy = db::resolve_governance_policy(conn, &mem.namespace)
-        .and_then(|p| p.kind_class.auto_classify_kind);
-    crate::hooks::pre_store::maybe_auto_classify(&mut mem, auto_classify_policy);
+    //
+    // #1579 A1 — resolve the namespace governance policy ONCE for the
+    // whole store call. Pre-#1579 this site and the Form-1/Form-2
+    // `ns_policy` binding (below, pre-synthesis) each walked the
+    // namespace chain independently — two identical
+    // `resolve_governance_policy` resolutions per store. The policy
+    // cannot change mid-call (single synchronous connection), so the
+    // first resolution is authoritative for both consumers. A failed
+    // resolution falls back to defaults exactly as both legacy sites
+    // did (`None.and_then(..)` ≡ `default().kind_class.auto_classify_kind`,
+    // which is `None`).
+    let ns_policy = db::resolve_governance_policy(conn, &mem.namespace).unwrap_or_default();
+    crate::hooks::pre_store::maybe_auto_classify(&mut mem, ns_policy.kind_class.auto_classify_kind);
 
     // #626 Layer-3 (C7) — agent-attestation gate on the MCP store path.
     // A remote caller signs the `SignableWrite` envelope
@@ -449,11 +459,10 @@ pub(crate) fn handle_store(
     let existing =
         db::find_synthesis_candidates(conn, &mem.title, &mem.namespace).unwrap_or_default();
 
-    // v0.7.x Form 1 (#754) — Resolve namespace policy ONCE up-front so
-    // both the synthesis path (Form 1) and the synchronous-atomise mode
-    // (Form 2) share a single resolution. Falls back to defaults when
-    // no namespace standard is configured.
-    let ns_policy = db::resolve_governance_policy(conn, &mem.namespace).unwrap_or_default();
+    // v0.7.x Form 1 (#754) — the namespace policy was resolved ONCE
+    // at the auto-classify hook above (#1579 A1); the synthesis path
+    // (Form 1) and the synchronous-atomise mode (Form 2) consume that
+    // same `ns_policy` binding.
 
     // v0.7.x Form 1 — single batch action-emitting synthesis call
     // BEFORE the SQL write. Gated on: autonomous_hooks + LLM wired +
@@ -633,30 +642,39 @@ pub(crate) fn handle_store(
     // conflicting fact to land alongside the existing one (e.g. a
     // curator pass that intends to revise an earlier claim).
     let force_write = params["force"].as_bool().unwrap_or(false);
+    // #1579 A1 — the conflict check and the post-insert source-embed
+    // (below) need the embedding of the IDENTICAL
+    // `embedding_document(title, content)` text. Pre-#1579 each site
+    // called `emb.embed` independently — two model forward passes (or
+    // two remote round-trips) per store, ~2× the semantic/smart-tier
+    // store latency. Compute once here and thread the vector through
+    // to `store_source_embedding`.
+    let mut source_embedding: Option<Vec<f32>> = None;
     if !force_write && let Some(emb) = embedder {
         let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
-        if let Ok(query_embedding) = emb.embed(&text)
-            && let Ok(Some(conflict)) = db::proactive_conflict_check(conn, &mem, &query_embedding)
-        {
-            tracing::info!(
-                target: "memory_store",
-                namespace = %mem.namespace,
-                existing_id = %conflict.existing_id,
-                similarity = conflict.similarity,
-                reason = conflict.reason,
-                "memory_store refused by proactive conflict detection (#519); \
-                 pass force=true to override",
-            );
-            return Err(format!(
-                "CONFLICT: memory near-duplicates an existing memory in namespace \
-                 '{}' (existing id: {}, title: '{}', similarity: {:.3}, reason: {}). \
-                 Pass force=true to insert anyway.",
-                mem.namespace,
-                conflict.existing_id,
-                conflict.existing_title,
-                conflict.similarity,
-                conflict.reason,
-            ));
+        if let Ok(query_embedding) = emb.embed(&text) {
+            if let Ok(Some(conflict)) = db::proactive_conflict_check(conn, &mem, &query_embedding) {
+                tracing::info!(
+                    target: "memory_store",
+                    namespace = %mem.namespace,
+                    existing_id = %conflict.existing_id,
+                    similarity = conflict.similarity,
+                    reason = conflict.reason,
+                    "memory_store refused by proactive conflict detection (#519); \
+                     pass force=true to override",
+                );
+                return Err(format!(
+                    "CONFLICT: memory near-duplicates an existing memory in namespace \
+                     '{}' (existing id: {}, title: '{}', similarity: {:.3}, reason: {}). \
+                     Pass force=true to insert anyway.",
+                    mem.namespace,
+                    conflict.existing_id,
+                    conflict.existing_title,
+                    conflict.similarity,
+                    conflict.reason,
+                ));
+            }
+            source_embedding = Some(query_embedding);
         }
     }
 
@@ -787,7 +805,10 @@ pub(crate) fn handle_store(
     if !embed::skip_source_embed_for_synchronous_atomise(atomise_mode, mem.content.len())
         && let Some(emb) = embedder
     {
-        embed::store_source_embedding(conn, emb, &mem, &actual_id, vector_index);
+        // #1579 A1 — `source_embedding` is the vector the proactive
+        // conflict check computed for the same document text; `Some`
+        // skips the duplicate embed inside the helper.
+        embed::store_source_embedding(conn, emb, &mem, &actual_id, vector_index, source_embedding);
     }
 
     // v0.6.0.0 post-store autonomy hooks. When enabled via
