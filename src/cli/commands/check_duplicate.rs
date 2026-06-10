@@ -20,6 +20,7 @@
 //! through the same [`crate::daemon_runtime::build_embedder`]
 //! resolution ladder the daemon uses.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -103,21 +104,21 @@ pub async fn cmd_check_duplicate(
     }
 
     let is_dup = envelope
-        .get("is_duplicate")
+        .get(field_names::IS_DUPLICATE)
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let scanned = envelope
-        .get("candidates_scanned")
+        .get(field_names::CANDIDATES_SCANNED)
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if is_dup {
         let merge = envelope
-            .get("suggested_merge")
+            .get(field_names::SUGGESTED_MERGE)
             .and_then(Value::as_str)
             .unwrap_or("?");
         let sim = envelope
             .get("nearest")
-            .and_then(|n| n.get("similarity"))
+            .and_then(|n| n.get(field_names::SIMILARITY))
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         writeln!(

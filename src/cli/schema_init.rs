@@ -75,6 +75,10 @@ use serde::Serialize;
 use crate::cli::CliOutput;
 use crate::migrate;
 
+/// Tracing target for schema-init events (#1562 — was emitted as a
+/// field via `target = `; now the real metadata target).
+const TRACE_TARGET: &str = "schema_init";
+
 // ---------------------------------------------------------------------------
 // CLI arg surface
 // ---------------------------------------------------------------------------
@@ -241,11 +245,11 @@ pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn is_sqlite_url(url: &str) -> bool {
-    url.starts_with("sqlite://")
+    url.starts_with(crate::migrate::SQLITE_URL_SCHEME)
 }
 
 fn is_postgres_url(url: &str) -> bool {
-    url.starts_with("postgres://") || url.starts_with("postgresql://")
+    crate::migrate::is_postgres_url(url)
 }
 
 /// Strip the `sqlite://` prefix and the optional third slash so the
@@ -345,11 +349,11 @@ fn list_sqlite_indices(conn: &rusqlite::Connection) -> Result<Vec<String>> {
 fn read_schema_version_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
     let v: i64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
             [],
             |row| row.get(0),
         )
-        .context("read schema_version")?;
+        .context(crate::errors::msg::READ_SCHEMA_VERSION)?;
     Ok(v)
 }
 
@@ -484,7 +488,7 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         sqlx::query_as("SELECT COALESCE(MAX(version), 0)::int FROM schema_version")
             .fetch_optional(&pool)
             .await
-            .context("read schema_version")?;
+            .context(crate::errors::msg::READ_SCHEMA_VERSION)?;
     let schema_version = i64::from(schema_version_row.map_or(0, |(v,)| v));
 
     // AGE bootstrap: only attempt when the extension is actually
@@ -538,7 +542,7 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                target = "schema_init",
+                target: TRACE_TARGET,
                 error = %e,
                 "acquire connection for AGE bootstrap"
             );
@@ -551,14 +555,14 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
         .await
     {
         tracing::warn!(
-            target = "schema_init",
+            target: TRACE_TARGET,
             error = %e,
             "set ag_catalog search_path"
         );
         return false;
     }
 
-    match sqlx::query("SELECT create_graph('memory_graph')")
+    match sqlx::query(crate::store::postgres::SQL_CREATE_AGE_GRAPH)
         .execute(&mut *conn)
         .await
     {
@@ -570,11 +574,11 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
             // against a previously-bootstrapped DB MUST be
             // idempotent.
             let msg = e.to_string();
-            if msg.contains("already exists") {
+            if msg.contains(crate::store::postgres::PG_ERR_ALREADY_EXISTS) {
                 true
             } else {
                 tracing::warn!(
-                    target = "schema_init",
+                    target: TRACE_TARGET,
                     error = %e,
                     "create_graph('memory_graph') failed (continuing without AGE projection)"
                 );

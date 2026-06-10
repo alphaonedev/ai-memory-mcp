@@ -49,11 +49,10 @@ impl McpTool for ListTool {
         "Browse memories. Filters: namespace, tier, agent_id. Limit caps at 200."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ListRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 

@@ -32,9 +32,14 @@
 // 100 canonical MCP tool-call parameter field names (v0.7.0 census).
 // Source: grep of every `.get("X")` / `["X"]` literal in
 // `src/mcp/mod.rs` + `src/mcp/tools/*.rs` production code.
-pub const AGENT_FILTER: &str = "agent_filter";
+//
+// #1558 wave 4: names that are ALSO crate-wide wire/row field names are
+// defined as aliases of `crate::models::field_names::*` so each string
+// has exactly ONE spelling in the tree. The public surface (const name,
+// value, ALL_PARAM_NAMES census) is unchanged.
+pub const AGENT_FILTER: &str = crate::models::field_names::AGENT_FILTER;
 pub const AGENT_ID: &str = "agent_id";
-pub const AGENT_TYPE: &str = "agent_type";
+pub const AGENT_TYPE: &str = crate::models::field_names::AGENT_TYPE;
 pub const ALIAS: &str = "alias";
 pub const ALIASES: &str = "aliases";
 pub const ALLOWED_AGENTS: &str = "allowed_agents";
@@ -43,14 +48,14 @@ pub const AS_AGENT: &str = "as_agent";
 pub const BY_SOURCE_URI: &str = "by_source_uri";
 pub const BYTE_ESTIMATE: &str = "byte_estimate";
 pub const CALLER_AGENT_ID: &str = "caller_agent_id";
-pub const CANONICAL_NAME: &str = "canonical_name";
-pub const CAPABILITIES: &str = "capabilities";
+pub const CANONICAL_NAME: &str = crate::models::field_names::CANONICAL_NAME;
+pub const CAPABILITIES: &str = crate::models::field_names::CAPABILITIES;
 pub const CITATIONS: &str = "citations";
-pub const CONFIDENCE: &str = "confidence";
+pub const CONFIDENCE: &str = crate::models::field_names::CONFIDENCE;
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
 pub const CONTEXT: &str = "context";
-pub const CREATED_AT: &str = "created_at";
+pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
 pub const DEPTH: &str = "depth";
 pub const DRY_RUN: &str = "dry_run";
 pub const EDIT_SOURCE: &str = "edit_source";
@@ -58,14 +63,14 @@ pub const ENTITY_ID: &str = "entity_id";
 pub const EVENT_TYPES: &str = "event_types";
 pub const EVENTS: &str = "events";
 pub const EXPECTED_VERSION: &str = "expected_version";
-pub const EXPIRES_AT: &str = "expires_at";
+pub const EXPIRES_AT: &str = crate::models::field_names::EXPIRES_AT;
 pub const FAMILY: &str = "family";
 pub const FILTER: &str = "filter";
 pub const FOLDER_PATH: &str = "folder_path";
 pub const FORCE: &str = "force";
 pub const FORCE_RE_ATOMISE: &str = "force_re_atomise";
 pub const FORMAT: &str = "format";
-pub const GOVERNANCE: &str = "governance";
+pub const GOVERNANCE: &str = crate::models::field_names::GOVERNANCE;
 pub const ID: &str = "id";
 pub const ID_A: &str = "id_a";
 pub const ID_B: &str = "id_b";
@@ -87,9 +92,9 @@ pub const MEMORY_ID: &str = "memory_id";
 pub const METADATA: &str = "metadata";
 pub const NAME: &str = "name";
 pub const NAMESPACE: &str = "namespace";
-pub const NAMESPACE_FILTER: &str = "namespace_filter";
+pub const NAMESPACE_FILTER: &str = crate::models::field_names::NAMESPACE_FILTER;
 pub const OFFSET: &str = "offset";
-pub const OLDER_THAN_DAYS: &str = "older_than_days";
+pub const OLDER_THAN_DAYS: &str = crate::models::field_names::OLDER_THAN_DAYS;
 pub const ON_CONFLICT: &str = "on_conflict";
 pub const PARENT: &str = "parent";
 pub const PATTERN: &str = "pattern";
@@ -107,19 +112,19 @@ pub const SIGNATURE: &str = "signature";
 pub const SINCE: &str = "since";
 pub const SKILL_DESCRIPTION: &str = "skill_description";
 pub const SKILL_ID: &str = "skill_id";
-pub const SKILL_NAME: &str = "skill_name";
+pub const SKILL_NAME: &str = crate::models::field_names::SKILL_NAME;
 pub const SOURCE: &str = "source";
 pub const SOURCE_ID: &str = "source_id";
-pub const SOURCE_IDS: &str = "source_ids";
-pub const SOURCE_MEMORY_ID: &str = "source_memory_id";
-pub const SOURCE_SPAN: &str = "source_span";
-pub const SOURCE_URI: &str = "source_uri";
+pub const SOURCE_IDS: &str = crate::models::field_names::SOURCE_IDS;
+pub const SOURCE_MEMORY_ID: &str = crate::models::field_names::SOURCE_MEMORY_ID;
+pub const SOURCE_SPAN: &str = crate::models::field_names::SOURCE_SPAN;
+pub const SOURCE_URI: &str = crate::models::field_names::SOURCE_URI;
 pub const STATUS: &str = "status";
-pub const SUBSCRIPTION_ID: &str = "subscription_id";
+pub const SUBSCRIPTION_ID: &str = crate::models::field_names::SUBSCRIPTION_ID;
 pub const SUMMARY: &str = "summary";
 pub const TAGS: &str = "tags";
-pub const TARGET_AGENT_ID: &str = "target_agent_id";
-pub const TARGET_FOLDER: &str = "target_folder";
+pub const TARGET_AGENT_ID: &str = crate::models::field_names::TARGET_AGENT_ID;
+pub const TARGET_FOLDER: &str = crate::models::field_names::TARGET_FOLDER;
 pub const TARGET_ID: &str = "target_id";
 pub const TARGET_TIER: &str = "target_tier";
 pub const THRESHOLD: &str = "threshold";
@@ -131,7 +136,7 @@ pub const UNREAD_ONLY: &str = "unread_only";
 pub const UNTIL: &str = "until";
 pub const URL: &str = "url";
 pub const VALID_AT: &str = "valid_at";
-pub const VALID_UNTIL: &str = "valid_until";
+pub const VALID_UNTIL: &str = crate::models::field_names::VALID_UNTIL;
 
 /// Every canonical MCP tool-call parameter name, surfaced as a single
 /// allowlist slice for the parity test in

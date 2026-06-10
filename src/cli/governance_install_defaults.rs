@@ -145,7 +145,7 @@ pub fn run(
     if operator_pubkey.is_some() {
         let unsigned_seed_rows: Vec<&SeedRuleRow> = preview
             .iter()
-            .filter(|r| r.attest_level != "operator_signed")
+            .filter(|r| r.attest_level != crate::governance::rules_store::ATTEST_OPERATOR_SIGNED)
             .collect();
         if !unsigned_seed_rows.is_empty() {
             let unsigned_ids: Vec<&str> =

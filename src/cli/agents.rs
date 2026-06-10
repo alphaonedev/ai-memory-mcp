@@ -6,6 +6,7 @@
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::id_short;
+use crate::models::field_names;
 use crate::{db, identity, validate};
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -134,11 +135,11 @@ pub fn run_agents(
                     out.stdout,
                     "{}",
                     serde_json::json!({
-                        "registered": true,
+                        (field_names::REGISTERED): true,
                         "id": id,
                         "agent_id": agent_id,
-                        "agent_type": agent_type,
-                        "capabilities": caps,
+                        (field_names::AGENT_TYPE): agent_type,
+                        (field_names::CAPABILITIES): caps,
                     })
                 )?;
             } else {
@@ -165,7 +166,7 @@ pub fn run_agents(
                     serde_json::json!({
                         "bound": true,
                         "agent_id": agent_id,
-                        "agent_pubkey": trimmed,
+                        (field_names::AGENT_PUBKEY): trimmed,
                     })
                 )?;
             } else {
@@ -242,7 +243,7 @@ pub fn run_pending(
                             serde_json::json!({
                                 "approved": true,
                                 "id": id,
-                                "decided_by": agent,
+                                (field_names::DECIDED_BY): agent,
                                 "executed": true,
                                 "memory_id": executed,
                             })
@@ -262,7 +263,7 @@ pub fn run_pending(
                                 "id": id,
                                 "votes": votes,
                                 "quorum": quorum,
-                                "reason": "consensus threshold not yet reached",
+                                "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
                             })
                         )?;
                     } else {
@@ -273,7 +274,11 @@ pub fn run_pending(
                     }
                 }
                 ApproveOutcome::Rejected(reason) => {
-                    writeln!(out.stderr, "approve rejected: {reason}")?;
+                    writeln!(
+                        out.stderr,
+                        "{}",
+                        crate::errors::msg::approve_rejected(&reason)
+                    )?;
                     std::process::exit(1);
                 }
             }
@@ -293,7 +298,7 @@ pub fn run_pending(
                 writeln!(
                     out.stdout,
                     "{}",
-                    serde_json::json!({"rejected": true, "id": id, "decided_by": agent})
+                    serde_json::json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent})
                 )?;
             } else {
                 writeln!(out.stdout, "rejected: {id} (by {agent})")?;

@@ -185,7 +185,7 @@ this repo. Highlights:
   `// SPDX-License-Identifier: Apache-2.0`)
 - No new production `unwrap()` calls
 - All SQL via parameterized queries (`params![]`)
-- FTS5 input via `sanitize_fts5_query()`
+- FTS5 input via `sanitize_fts_query()`
 
 ### 5.4 Tests alongside code
 

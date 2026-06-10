@@ -45,6 +45,12 @@ mod common_admin {
     use std::sync::Arc;
 
     pub fn build_router_with_admin_allowlist() -> axum::Router {
+        // #1570 — these tests model an AUTHENTICATED deployment (api_key
+        // configured at boot), the pre-#1570 implicit posture, so the admin
+        // header role-claims they assert keep working. The #1570 secure
+        // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+        // is pinned by tests/admin_header_trust_1570.rs in its own process.
+        ai_memory::handlers::admin_role::mark_request_authn_configured(true);
         let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
         let path = std::path::PathBuf::from(":memory:");
         let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((

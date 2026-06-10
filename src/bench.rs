@@ -72,6 +72,17 @@ pub const DEFAULT_ITERATIONS: usize = 200;
 /// Default warmup iterations discarded from the percentile sample.
 pub const DEFAULT_WARMUP: usize = 20;
 
+/// Hard ceiling on `--iterations` — bounds bench wall-clock on a
+/// mistyped flag.
+pub const MAX_ITERATIONS: usize = 100_000;
+
+/// Hard ceiling on `--warmup` iterations.
+pub const MAX_WARMUP: usize = 10_000;
+
+/// Hard ceiling on `--regression-threshold` (percent) — values above
+/// this are clamped; a 1000% allowance already means "no gate".
+pub const MAX_REGRESSION_THRESHOLD_PCT: f64 = 1000.0;
+
 /// Default tolerance applied when comparing a fresh run against a
 /// `--baseline` JSON file: a measured p95 may grow by this percentage
 /// before the run is flagged as a regression. Independent of
@@ -116,7 +127,7 @@ impl Operation {
             Self::KgQueryDepth1 => "memory_kg_query (depth=1)",
             Self::KgQueryDepth3 => "memory_kg_query (depth=3)",
             Self::KgQueryDepth5 => "memory_kg_query (depth=5)",
-            Self::KgTimeline => "memory_kg_timeline",
+            Self::KgTimeline => crate::mcp::registry::tool_names::MEMORY_KG_TIMELINE,
         }
     }
 
@@ -422,7 +433,12 @@ fn seed_kg_fixture(conn: &Connection, namespace: &str) -> Result<Vec<String>> {
             // `db::create_link` stamps `created_at` and `valid_from` to
             // the current wall clock — sufficient for `kg_timeline`
             // (which skips rows with NULL `valid_from`).
-            db::create_link(conn, &src_id, &tgt_id, "related_to")?;
+            db::create_link(
+                conn,
+                &src_id,
+                &tgt_id,
+                crate::models::MemoryLinkRelation::RelatedTo.as_str(),
+            )?;
         }
         sources.push(src_id);
     }
@@ -448,7 +464,12 @@ fn seed_kg_chain_fixture(conn: &Connection, namespace: &str) -> Result<Vec<Strin
             let node_idx = c * KG_CHAIN_FIXTURE_HOPS + h;
             let next = synth_memory(namespace, node_idx, "kg-chain-node");
             let next_id = db::insert(conn, &next)?;
-            db::create_link(conn, &prev_id, &next_id, "related_to")?;
+            db::create_link(
+                conn,
+                &prev_id,
+                &next_id,
+                crate::models::MemoryLinkRelation::RelatedTo.as_str(),
+            )?;
             prev_id = next_id;
         }
         sources.push(chain_head_id);

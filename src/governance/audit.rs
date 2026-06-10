@@ -46,6 +46,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Tracing target for the forensic audit sink (#1558 tracing-target SSOT).
+const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
+
 /// Sentinel `prev_hash` for the first line of a fresh chain.
 pub const CHAIN_HEAD_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -183,7 +186,7 @@ fn run_writer(rx: Receiver<WriteOp>) {
                             Ok(file) => open_file = Some((path, file)),
                             Err(e) => {
                                 tracing::error!(
-                                    target: "ai_memory::governance::audit",
+                                    target: AUDIT_TRACE_TARGET,
                                     "forensic: opening {} failed: {e}",
                                     path.display()
                                 );
@@ -195,7 +198,7 @@ fn run_writer(rx: Receiver<WriteOp>) {
                     if let Some((path, file)) = open_file.as_mut() {
                         if let Err(e) = writeln!(file, "{line}") {
                             tracing::error!(
-                                target: "ai_memory::governance::audit",
+                                target: AUDIT_TRACE_TARGET,
                                 "forensic: appending to {} failed: {e}",
                                 path.display()
                             );
@@ -445,7 +448,7 @@ pub fn record_decision(
 ) {
     if let Err(e) = try_record_decision(actor, decision, kind, rule_id, payload) {
         tracing::error!(
-            target: "ai_memory::governance::audit",
+            target: AUDIT_TRACE_TARGET,
             "forensic: emission failed: {e}"
         );
     }
@@ -568,7 +571,7 @@ pub fn verify_since(
         if date >= cutoff {
             break;
         }
-        let f = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
         for line in BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
@@ -585,7 +588,7 @@ pub fn verify_since(
         if date < cutoff {
             continue;
         }
-        let f = File::open(file).with_context(|| format!("opening {}", file.display()))?;
+        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
         for (idx, line) in BufReader::new(f).lines().enumerate() {
             let line_no = (idx as u64) + 1;
             let line = line.with_context(|| format!("reading {}:{line_no}", file.display()))?;
@@ -668,7 +671,7 @@ pub fn verify_since(
                             line_number: line_no,
                             file: file.clone(),
                             kind: VerifyFailureKind::Signature,
-                            detail: format!("signature verify failed: {e}"),
+                            detail: crate::errors::msg::signature_verify_failed(e),
                         }),
                     });
                 }

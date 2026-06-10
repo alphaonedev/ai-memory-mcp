@@ -54,13 +54,15 @@ pub fn cmd_inbox(
         params["agent_id"] = json!(a);
     }
     if args.unread_only {
-        params["unread_only"] = json!(true);
+        params[crate::models::field_names::UNREAD_ONLY] = json!(true);
     }
     if let Some(l) = args.limit {
         params["limit"] = json!(l);
     }
 
-    let envelope = crate::mcp::handle_inbox(&conn, &params, None)
+    // CLI is single-tenant (the operator runs it locally) → trust-all caller
+    // (None), preserving the existing `--agent-id`-selects-inbox behavior. #1557.
+    let envelope = crate::mcp::handle_inbox(&conn, &params, None, None)
         .map_err(|e| anyhow::anyhow!("inbox: {e}"))?;
 
     if args.json {

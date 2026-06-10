@@ -30,6 +30,7 @@ use crate::db;
 use crate::mcp::{
     handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
 };
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
@@ -176,7 +177,7 @@ fn set_standard(
     if let Some(g) = governance {
         let gov_val: Value =
             serde_json::from_str(g).context("--governance must be a valid JSON object")?;
-        params["governance"] = gov_val;
+        params[field_names::GOVERNANCE] = gov_val;
     }
     let resp = handle_namespace_set_standard(&conn, &params).map_err(|e| anyhow::anyhow!(e))?;
     emit(out, json_out, &resp, |o, r| {
@@ -184,13 +185,13 @@ fn set_standard(
             o.stdout,
             "set standard: namespace='{}' standard_id='{}'{}",
             r["namespace"].as_str().unwrap_or(""),
-            r["standard_id"].as_str().unwrap_or(""),
+            r[field_names::STANDARD_ID].as_str().unwrap_or(""),
             r.get("parent")
                 .and_then(Value::as_str)
                 .map(|p| format!(" parent='{p}'"))
                 .unwrap_or_default(),
         )?;
-        if let Some(gov) = r.get("governance") {
+        if let Some(gov) = r.get(field_names::GOVERNANCE) {
             writeln!(
                 o.stdout,
                 "governance merged: {}",
@@ -237,21 +238,21 @@ fn get_standard(
                         o.stdout,
                         "  - {}: {}",
                         s["namespace"].as_str().unwrap_or(""),
-                        s["standard_id"].as_str().unwrap_or("null")
+                        s[field_names::STANDARD_ID].as_str().unwrap_or("null")
                     )?;
                 }
             }
-        } else if r.get("standard_id").map_or(true, Value::is_null) {
+        } else if r.get(field_names::STANDARD_ID).map_or(true, Value::is_null) {
             writeln!(o.stdout, "namespace '{}' has no standard set", namespace)?;
         } else {
             writeln!(
                 o.stdout,
                 "namespace: {}\nstandard_id: {}\ntitle: {}",
                 r["namespace"].as_str().unwrap_or(""),
-                r["standard_id"].as_str().unwrap_or(""),
+                r[field_names::STANDARD_ID].as_str().unwrap_or(""),
                 r["title"].as_str().unwrap_or(""),
             )?;
-            if let Some(gov) = r.get("governance") {
+            if let Some(gov) = r.get(field_names::GOVERNANCE) {
                 writeln!(
                     o.stdout,
                     "governance:\n{}",
@@ -296,7 +297,7 @@ fn batman_policy(
 ) -> Result<()> {
     let policy = json!({
         "auto_atomise": true,
-        "auto_atomise_mode": "synchronous",
+        "auto_atomise_mode": crate::models::namespace::AUTO_ATOMISE_SYNCHRONOUS,
         "auto_atomise_threshold_cl100k": atomise_threshold,
         "auto_atomise_max_atom_tokens": atom_max_tokens,
         "auto_classify_kind": classify_mode,

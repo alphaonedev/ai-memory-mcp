@@ -47,6 +47,7 @@
 //! distinct, signed event.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -73,7 +74,7 @@ pub const DEFAULT_MAX_REFLECTION_SOURCES: usize = 20;
 
 /// Default curator family stamp on the Persona's `metadata.agent_id`
 /// when the engine is constructed without an explicit keypair (tests).
-const ANONYMOUS_CURATOR_AGENT_ID: &str = "ai:curator";
+const ANONYMOUS_CURATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 
 /// v0.7.0 issue #848 — sentinel namespace value reported in
 /// [`PersonaError::NoReflections`] when the caller asked for the
@@ -366,8 +367,8 @@ impl<'a> PersonaGenerator<'a> {
                 "entity_id": entity_id,
                 "sources": source_ids.clone(),
                 "version": version,
-                "attest_level": crate::models::AttestLevel::Unsigned.as_str(),
-                "generated_at": now,
+                (field_names::ATTEST_LEVEL): crate::models::AttestLevel::Unsigned.as_str(),
+                (field_names::GENERATED_AT): now,
             }
         });
 
@@ -422,7 +423,7 @@ impl<'a> PersonaGenerator<'a> {
                 self.conn,
                 &persona_id,
                 &source.id,
-                "derived_from",
+                crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
                 self.signer,
             )
             .with_context(|| format!("linking persona {persona_id} -> source {}", source.id))?;
@@ -493,7 +494,7 @@ impl<'a> PersonaGenerator<'a> {
             .and_then(serde_json::Value::as_object_mut)
         {
             env.insert(
-                "attest_level".to_string(),
+                field_names::ATTEST_LEVEL.to_string(),
                 serde_json::Value::String(attest_level.clone()),
             );
             if let Some(sig) = signature_bytes.as_ref() {
@@ -541,7 +542,9 @@ impl<'a> PersonaGenerator<'a> {
 /// rule stays symmetric.
 fn validate_entity_id(entity_id: &str) -> std::result::Result<(), PersonaError> {
     if entity_id.trim().is_empty() {
-        return Err(PersonaError::Validation("entity_id cannot be empty".into()));
+        return Err(PersonaError::Validation(
+            crate::errors::msg::ENTITY_ID_EMPTY.into(),
+        ));
     }
     if entity_id.len() > 128 {
         return Err(PersonaError::Validation(format!(
@@ -601,7 +604,7 @@ pub fn get_latest_persona(
         })
         .unwrap_or_default();
     let attest_level = envelope
-        .get("attest_level")
+        .get(field_names::ATTEST_LEVEL)
         .and_then(|v| v.as_str())
         .unwrap_or(crate::models::AttestLevel::Unsigned.as_str())
         .to_string();
@@ -836,15 +839,15 @@ pub fn render_persona_json(persona: &Persona) -> String {
         serde_json::Value::String(persona.namespace.clone()),
     );
     map.insert(
-        "persona_version",
+        field_names::PERSONA_VERSION,
         serde_json::Value::Number(serde_json::Number::from(persona.version)),
     );
     map.insert(
-        "generated_at",
+        field_names::GENERATED_AT,
         serde_json::Value::String(persona.generated_at.clone()),
     );
     map.insert(
-        "attest_level",
+        field_names::ATTEST_LEVEL,
         serde_json::Value::String(persona.attest_level.clone()),
     );
     map.insert(

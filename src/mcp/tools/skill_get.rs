@@ -7,6 +7,7 @@
 //! decompressed markdown body. Durable history: `_get(<old_id>)` returns
 //! the old version even after it has been superseded.
 
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -86,12 +87,12 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         superseded_by,
     )) = row
     else {
-        return Err(format!("skill not found: {skill_id}"));
+        return Err(crate::errors::msg::skill_not_found(skill_id));
     };
 
     // Decompress body.
-    let body_bytes =
-        zstd::decode_all(body_blob.as_slice()).map_err(|e| format!("zstd decompress body: {e}"))?;
+    let body_bytes = zstd::decode_all(body_blob.as_slice())
+        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -100,9 +101,9 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         "id": id,
         "namespace": namespace,
         "name": name,
-        "description": description,
+        (field_names::DESCRIPTION): description,
         "digest": digest_hex,
-        "created_at": created_at,
+        (field_names::CREATED_AT): created_at,
         "body": body,
         "current": superseded_by.is_none(),
     });
@@ -111,15 +112,15 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         response["license"] = json!(lic);
     }
     if let Some(compat) = compatibility {
-        response["compatibility"] = json!(compat);
+        response[field_names::COMPATIBILITY] = json!(compat);
     }
     if let Some(tools_json) = allowed_tools {
         if let Ok(v) = serde_json::from_str::<Value>(&tools_json) {
-            response["allowed_tools"] = v;
+            response[field_names::ALLOWED_TOOLS] = v;
         }
     }
     if let Some(agent) = signing_agent {
-        response["signing_agent"] = json!(agent);
+        response[field_names::SIGNING_AGENT] = json!(agent);
     }
     if let Some(sup_id) = superseded_by {
         response["superseded_by"] = json!(sup_id);
@@ -181,11 +182,10 @@ impl McpTool for SkillGetTool {
         "L1-5: metadata + decompressed body (<5000 tok). Old version ids stay addressable."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillGetRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillGetRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

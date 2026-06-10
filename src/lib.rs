@@ -31,6 +31,17 @@ pub const SECS_PER_HOUR: i64 = 3_600;
 pub const SECS_PER_DAY: i64 = 86_400;
 pub const SECS_PER_WEEK: i64 = 604_800;
 
+/// Milliseconds per second — for secs→ms conversions feeding wire/SQL
+/// surfaces that take milliseconds (e.g. postgres `statement_timeout`).
+/// `u64` matches the `*_timeout_secs` config field type; `i64`/`u128`
+/// callers cast at the use site like the `SECS_PER_*` family above.
+pub const MILLIS_PER_SEC: u64 = 1_000;
+
+/// Rounding factor for similarity/score values surfaced on wire
+/// responses (HTTP handlers + MCP tools) — `1000.0` keeps three
+/// decimal places via `(score * FACTOR).round() / FACTOR`.
+pub const SCORE_DISPLAY_ROUND_FACTOR: f64 = 1000.0;
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner B finding F-B7) — byte-unit
 // consts so substrate-wide size math is grep-able and refactor-safe.
@@ -76,6 +87,14 @@ pub const RECALL_PRIMARY_CTX_BLEND: f32 = 0.7;
 /// scenario-18; load-bearing per CLAUDE.md §"Recall Pipeline").
 pub const RECALL_COSINE_GATE: f64 = 0.2;
 
+/// #1558 batch 5 wave 3 — canonical secret-redaction placeholder
+/// rendered by every `Debug` impl that masks credential material
+/// (`AppConfig.api_key`, `[llm].api_key`, `ResolvedLlm.api_key`,
+/// `HooksSubscriptionConfig.hmac_secret`, x25519 `Keypair.secret`,
+/// `RuntimeContext.hooks_hmac_secret`). One spelling, hoist-only;
+/// `src/llm.rs` keeps its own site per the vendor carve-out.
+pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
 // canonical HTTP route-path consts. The substrate's HTTP router
@@ -94,29 +113,29 @@ pub const RECALL_COSINE_GATE: f64 = 0.2;
 // memory `f57da43e`: F-F-ROUTE-1 was previously deferred for design
 // review; this commit lands the minimum viable subset (the 19
 // highest-traffic surfaces from the audit) leaving the
-// `format!("/api/v1/memories/{id}", ...)` consumer-side helper as a
+// `format!(handlers::routes::MEMORIES_ID, ...)` consumer-side helper as a
 // follow-up surface refactor.
 // ---------------------------------------------------------------------------
 
-pub const ROUTE_HEALTH: &str = "/api/v1/health";
-pub const ROUTE_METRICS: &str = "/metrics";
-pub const ROUTE_METRICS_V1: &str = "/api/v1/metrics";
-pub const ROUTE_CAPABILITIES: &str = "/api/v1/capabilities";
-pub const ROUTE_MEMORIES: &str = "/api/v1/memories";
-pub const ROUTE_MEMORIES_BULK: &str = "/api/v1/memories/bulk";
-pub const ROUTE_MEMORY_BY_ID_TEMPLATE: &str = "/api/v1/memories/{id}";
-pub const ROUTE_RECALL: &str = "/api/v1/recall";
-pub const ROUTE_SEARCH: &str = "/api/v1/search";
-pub const ROUTE_SESSION_START: &str = "/api/v1/session/start";
-pub const ROUTE_SYNC_PUSH: &str = "/api/v1/sync/push";
-pub const ROUTE_SYNC_SINCE: &str = "/api/v1/sync/since";
-pub const ROUTE_NOTIFY: &str = "/api/v1/notify";
-pub const ROUTE_INBOX: &str = "/api/v1/inbox";
-pub const ROUTE_SUBSCRIPTIONS: &str = "/api/v1/subscriptions";
-pub const ROUTE_NAMESPACES: &str = "/api/v1/namespaces";
-pub const ROUTE_ARCHIVE: &str = "/api/v1/archive";
-pub const ROUTE_PROMOTE_TEMPLATE: &str = "/api/v1/memories/{id}/promote";
-pub const ROUTE_LINKS: &str = "/api/v1/links";
+pub const ROUTE_HEALTH: &str = handlers::routes::HEALTH;
+pub const ROUTE_METRICS: &str = handlers::routes::METRICS_BARE;
+pub const ROUTE_METRICS_V1: &str = handlers::routes::METRICS;
+pub const ROUTE_CAPABILITIES: &str = handlers::routes::CAPABILITIES;
+pub const ROUTE_MEMORIES: &str = handlers::routes::MEMORIES;
+pub const ROUTE_MEMORIES_BULK: &str = handlers::routes::MEMORIES_BULK;
+pub const ROUTE_MEMORY_BY_ID_TEMPLATE: &str = handlers::routes::MEMORIES_ID;
+pub const ROUTE_RECALL: &str = handlers::routes::RECALL;
+pub const ROUTE_SEARCH: &str = handlers::routes::SEARCH;
+pub const ROUTE_SESSION_START: &str = handlers::routes::SESSION_START;
+pub const ROUTE_SYNC_PUSH: &str = handlers::routes::SYNC_PUSH;
+pub const ROUTE_SYNC_SINCE: &str = handlers::routes::SYNC_SINCE;
+pub const ROUTE_NOTIFY: &str = handlers::routes::NOTIFY;
+pub const ROUTE_INBOX: &str = handlers::routes::INBOX;
+pub const ROUTE_SUBSCRIPTIONS: &str = handlers::routes::SUBSCRIPTIONS;
+pub const ROUTE_NAMESPACES: &str = handlers::routes::NAMESPACES;
+pub const ROUTE_ARCHIVE: &str = handlers::routes::ARCHIVE;
+pub const ROUTE_PROMOTE_TEMPLATE: &str = handlers::routes::MEMORIES_ID_PROMOTE;
+pub const ROUTE_LINKS: &str = handlers::routes::LINKS;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-METHOD-1) —
@@ -126,13 +145,17 @@ pub const ROUTE_LINKS: &str = "/api/v1/links";
 // loop's match arms point at named consts.
 // ---------------------------------------------------------------------------
 
-pub const METHOD_INITIALIZE: &str = "initialize";
-pub const METHOD_TOOLS_LIST: &str = "tools/list";
-pub const METHOD_TOOLS_CALL: &str = "tools/call";
-pub const METHOD_PROMPTS_LIST: &str = "prompts/list";
-pub const METHOD_PROMPTS_GET: &str = "prompts/get";
-pub const METHOD_RESOURCES_LIST: &str = "resources/list";
-pub const METHOD_RESOURCES_READ: &str = "resources/read";
+// #1558 batch 3 — these crate-root aliases now point at the
+// domain-canonical SSOT in `crate::mcp::jsonrpc` (version tag,
+// reserved error codes, method names, protocol revision all live
+// there); kept so existing consumers/tests keep compiling.
+pub const METHOD_INITIALIZE: &str = mcp::jsonrpc::METHOD_INITIALIZE;
+pub const METHOD_TOOLS_LIST: &str = mcp::jsonrpc::METHOD_TOOLS_LIST;
+pub const METHOD_TOOLS_CALL: &str = mcp::jsonrpc::METHOD_TOOLS_CALL;
+pub const METHOD_PROMPTS_LIST: &str = mcp::jsonrpc::METHOD_PROMPTS_LIST;
+pub const METHOD_PROMPTS_GET: &str = mcp::jsonrpc::METHOD_PROMPTS_GET;
+pub const METHOD_RESOURCES_LIST: &str = mcp::jsonrpc::METHOD_RESOURCES_LIST;
+pub const METHOD_RESOURCES_READ: &str = mcp::jsonrpc::METHOD_RESOURCES_READ;
 
 // ---------------------------------------------------------------------------
 // v0.7.x (issue #1174 PR2 — pm-v3.1 HTTP const sweep) — canonical
@@ -173,6 +196,21 @@ pub const MIME_JSON: &str = "application/json";
 // ---------------------------------------------------------------------------
 
 pub const HEADER_AGENT_ID: &str = "x-agent-id";
+
+/// API-key auth header consumed by the HTTP daemon's auth middleware
+/// (`handlers/transport.rs`) and SENT by every internal client
+/// (federation push/receive, CLI remote commands). Client and server
+/// must agree byte-for-byte — a drifted copy is a silent auth break
+/// (#1558 batch 4).
+pub const HEADER_API_KEY: &str = "x-api-key";
+
+/// HMAC signature header on signed webhook/approval callbacks
+/// (`subscriptions.rs` dispatch ⇄ `handlers/approvals.rs` verify).
+pub const HEADER_AI_MEMORY_SIGNATURE: &str = "x-ai-memory-signature";
+
+/// Timestamp header paired with [`HEADER_AI_MEMORY_SIGNATURE`] for
+/// HMAC replay-window checks.
+pub const HEADER_AI_MEMORY_TIMESTAMP: &str = "x-ai-memory-timestamp";
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner B finding F-B7.x) —
@@ -338,6 +376,12 @@ pub extern "C" fn ai_memory_version() -> *const std::os::raw::c_char {
     VERSION.as_ptr().cast::<std::os::raw::c_char>()
 }
 
+/// The crate version (compile-time `CARGO_PKG_VERSION`) as one named
+/// const — wire surfaces (capabilities, serverInfo, backup manifests,
+/// boot banners, webhook user-agent) all report it from here instead
+/// of nine scattered `env!` calls (#1558 batch 5).
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // v0.7.x (issue #1174 PR5 — pm-v3.1 namespace-sentinel sweep) — the
 // default namespace for AI-NHI memory writes when the caller omits
@@ -366,6 +410,10 @@ pub extern "C" fn ai_memory_version() -> *const std::os::raw::c_char {
 /// are different namespaces with different semantics. The
 /// underscore prefix is the reserved-namespace convention.
 pub const DEFAULT_NAMESPACE: &str = "global";
+
+/// Per-user ai-memory data directory name (`~/.ai-memory`) — home of
+/// reflection exports + persona artefacts (#1558 batch 6).
+pub const AI_MEMORY_HOME_DIR_NAME: &str = ".ai-memory";
 
 /// v0.7.x (issue #1174 PR5) — re-export of the system-reserved
 /// namespace constant defined originally at `src/quotas.rs:70`.
@@ -686,20 +734,26 @@ pub fn build_router_with_timeout(
     );
 
     axum::Router::new()
-        .route("/api/v1/health", get(handlers::health))
+        .route(handlers::routes::HEALTH, get(handlers::health))
         // v0.6.0.0: Prometheus scrape endpoint. Exposed at both /metrics
         // (the community convention) and /api/v1/metrics (consistent with
         // the rest of the REST surface).
-        .route("/metrics", get(handlers::prometheus_metrics))
-        .route("/api/v1/metrics", get(handlers::prometheus_metrics))
-        .route("/api/v1/memories", get(handlers::list_memories))
-        .route("/api/v1/memories", post(handlers::create_memory))
-        .route("/api/v1/memories/bulk", post(handlers::bulk_create))
-        .route("/api/v1/memories/{id}", get(handlers::get_memory))
-        .route("/api/v1/memories/{id}", put(handlers::update_memory))
-        .route("/api/v1/memories/{id}", delete(handlers::delete_memory))
         .route(
-            "/api/v1/memories/{id}/promote",
+            handlers::routes::METRICS_BARE,
+            get(handlers::prometheus_metrics),
+        )
+        .route(handlers::routes::METRICS, get(handlers::prometheus_metrics))
+        .route(handlers::routes::MEMORIES, get(handlers::list_memories))
+        .route(handlers::routes::MEMORIES, post(handlers::create_memory))
+        .route(handlers::routes::MEMORIES_BULK, post(handlers::bulk_create))
+        .route(handlers::routes::MEMORIES_ID, get(handlers::get_memory))
+        .route(handlers::routes::MEMORIES_ID, put(handlers::update_memory))
+        .route(
+            handlers::routes::MEMORIES_ID,
+            delete(handlers::delete_memory),
+        )
+        .route(
+            handlers::routes::MEMORIES_ID_PROMOTE,
             post(handlers::promote_memory),
         )
         // v0.7.0 #1416 — L4 layered-capture HTTP surface. Mirrors the
@@ -707,86 +761,104 @@ pub fn build_router_with_timeout(
         // a callable L4 turn-capture path (the MCP tool only ever runs
         // against a local sqlite connection). Routes through the SAL
         // `MemoryStore::capture_turn_idempotent` trait method.
-        .route("/api/v1/capture_turn", post(handlers::capture_turn))
-        .route("/api/v1/search", get(handlers::search_memories))
-        .route("/api/v1/recall", get(handlers::recall_memories_get))
-        .route("/api/v1/recall", post(handlers::recall_memories_post))
-        .route("/api/v1/forget", post(handlers::forget_memories))
-        .route("/api/v1/consolidate", post(handlers::consolidate_memories))
+        .route(handlers::routes::CAPTURE_TURN, post(handlers::capture_turn))
+        .route(handlers::routes::SEARCH, get(handlers::search_memories))
+        .route(handlers::routes::RECALL, get(handlers::recall_memories_get))
         .route(
-            "/api/v1/contradictions",
+            handlers::routes::RECALL,
+            post(handlers::recall_memories_post),
+        )
+        .route(handlers::routes::FORGET, post(handlers::forget_memories))
+        .route(
+            handlers::routes::CONSOLIDATE,
+            post(handlers::consolidate_memories),
+        )
+        .route(
+            handlers::routes::CONTRADICTIONS,
             get(handlers::detect_contradictions),
         )
         // v0.7.0 L6 — S51 autonomous-tier surface. `auto_tag` and
         // `expand_query` are the two REST mirrors of the corresponding
         // MCP tools; they were never wired before L6 (S51 expected
         // them and got 404). Both 503 when no LLM is configured.
-        .route("/api/v1/auto_tag", post(handlers::auto_tag_handler))
-        .route("/api/v1/expand_query", post(handlers::expand_query_handler))
+        .route(handlers::routes::AUTO_TAG, post(handlers::auto_tag_handler))
+        .route(
+            handlers::routes::EXPAND_QUERY,
+            post(handlers::expand_query_handler),
+        )
         // v0.7.0 L9 — HTTP parity for the MCP `tools/list` JSON-RPC
         // method. Surfaces the canonical tool catalog under the
         // daemon's resolved Profile. Backend-agnostic — pure config
         // enumeration, no DB access — so postgres and sqlite return
         // identical bodies (NHI-D-501-postgres-traits).
-        .route("/api/v1/tools/list", get(handlers::tools_list))
+        .route(handlers::routes::TOOLS_LIST, get(handlers::tools_list))
         // v0.7.0 L10 — HTTP parity for the MCP `memory_load_family`
         // tool. Returns top-K memories tagged with the requested
         // family on both sqlite and postgres backends
         // (NHI-D-501-postgres-loadfamily).
         .route(
-            "/api/v1/memory_load_family",
+            handlers::routes::MEMORY_LOAD_FAMILY,
             post(handlers::load_family_handler),
         )
-        .route("/api/v1/links", post(handlers::create_link))
-        .route("/api/v1/links", delete(handlers::delete_link))
-        .route("/api/v1/links/{id}", get(handlers::get_links))
+        .route(handlers::routes::LINKS, post(handlers::create_link))
+        .route(handlers::routes::LINKS, delete(handlers::delete_link))
+        .route(handlers::routes::LINKS_ID, get(handlers::get_links))
         // HTTP parity for MCP-only tools. The `/api/v1/namespaces` surface
         // serves three verbs: GET lists namespaces OR (when ?namespace=…)
         // fetches the namespace standard, POST sets a standard, DELETE
         // clears one. S34/S35 use the query-string form; the path form
         // (`/api/v1/namespaces/{ns}/standard`) is kept for MCP-tool parity.
         .route(
-            "/api/v1/namespaces",
+            handlers::routes::NAMESPACES,
             get(handlers::get_namespace_standard_qs),
         )
         .route(
-            "/api/v1/namespaces",
+            handlers::routes::NAMESPACES,
             post(handlers::set_namespace_standard_qs),
         )
         .route(
-            "/api/v1/namespaces",
+            handlers::routes::NAMESPACES,
             delete(handlers::clear_namespace_standard_qs),
         )
         .route(
-            "/api/v1/namespaces/{ns}/standard",
+            handlers::routes::NAMESPACES_NS_STANDARD,
             post(handlers::set_namespace_standard),
         )
         .route(
-            "/api/v1/namespaces/{ns}/standard",
+            handlers::routes::NAMESPACES_NS_STANDARD,
             get(handlers::get_namespace_standard),
         )
         .route(
-            "/api/v1/namespaces/{ns}/standard",
+            handlers::routes::NAMESPACES_NS_STANDARD,
             delete(handlers::clear_namespace_standard),
         )
         // Pillar 1 / Stream A — hierarchical namespace taxonomy.
-        .route("/api/v1/taxonomy", get(handlers::get_taxonomy))
+        .route(handlers::routes::TAXONOMY, get(handlers::get_taxonomy))
         // Pillar 2 / Stream D — pre-write near-duplicate check.
-        .route("/api/v1/check_duplicate", post(handlers::check_duplicate))
-        // Pillar 2 / Stream B — entity registry.
-        .route("/api/v1/entities", post(handlers::entity_register))
         .route(
-            "/api/v1/entities/by_alias",
+            handlers::routes::CHECK_DUPLICATE,
+            post(handlers::check_duplicate),
+        )
+        // Pillar 2 / Stream B — entity registry.
+        .route(handlers::routes::ENTITIES, post(handlers::entity_register))
+        .route(
+            handlers::routes::ENTITIES_BY_ALIAS,
             get(handlers::entity_get_by_alias),
         )
         // Pillar 2 / Stream C — KG timeline.
-        .route("/api/v1/kg/timeline", get(handlers::kg_timeline))
+        .route(handlers::routes::KG_TIMELINE, get(handlers::kg_timeline))
         // Pillar 2 / Stream C — KG link supersession.
-        .route("/api/v1/kg/invalidate", post(handlers::kg_invalidate))
+        .route(
+            handlers::routes::KG_INVALIDATE,
+            post(handlers::kg_invalidate),
+        )
         // Pillar 2 / Stream C — KG outbound traversal.
-        .route("/api/v1/kg/query", post(handlers::kg_query))
+        .route(handlers::routes::KG_QUERY, post(handlers::kg_query))
         // v0.7.0 Continuation 6 — KG path enumeration (S65).
-        .route("/api/v1/kg/find_paths", post(handlers::kg_find_paths))
+        .route(
+            handlers::routes::KG_FIND_PATHS,
+            post(handlers::kg_find_paths),
+        )
         // #934 (Track C, 2026-05-20) — alias for legacy callers that
         // hit the bare `/api/v1/find_paths` route (advertised under
         // the MCP `memory_find_paths` shape + pre-v0.7.0 docs). Pre-
@@ -795,52 +867,76 @@ pub fn build_router_with_timeout(
         // implemented" — actually the route just lived under `/kg/`.
         // Mounting both paths to the same handler closes the drift
         // for all callers without a redirect.
-        .route("/api/v1/find_paths", post(handlers::kg_find_paths))
+        .route(handlers::routes::FIND_PATHS, post(handlers::kg_find_paths))
         // v0.7.0 Continuation 6 — link signature verification (S52).
-        .route("/api/v1/links/verify", post(handlers::verify_link_handler))
-        // v0.7.0 Continuation 6 — per-agent quota status (S61).
-        .route("/api/v1/quota/status", post(handlers::quota_status_handler))
-        .route("/api/v1/stats", get(handlers::get_stats))
-        .route("/api/v1/gc", post(handlers::run_gc))
-        .route("/api/v1/export", get(handlers::export_memories))
-        .route("/api/v1/import", post(handlers::import_memories))
-        .route("/api/v1/archive", get(handlers::list_archive))
-        .route("/api/v1/archive", post(handlers::archive_by_ids))
-        .route("/api/v1/archive", delete(handlers::purge_archive))
         .route(
-            "/api/v1/archive/{id}/restore",
+            handlers::routes::LINKS_VERIFY,
+            post(handlers::verify_link_handler),
+        )
+        // v0.7.0 Continuation 6 — per-agent quota status (S61).
+        .route(
+            handlers::routes::QUOTA_STATUS,
+            post(handlers::quota_status_handler),
+        )
+        .route(handlers::routes::STATS, get(handlers::get_stats))
+        .route(handlers::routes::GC, post(handlers::run_gc))
+        .route(handlers::routes::EXPORT, get(handlers::export_memories))
+        .route(handlers::routes::IMPORT, post(handlers::import_memories))
+        .route(handlers::routes::ARCHIVE, get(handlers::list_archive))
+        .route(handlers::routes::ARCHIVE, post(handlers::archive_by_ids))
+        .route(handlers::routes::ARCHIVE, delete(handlers::purge_archive))
+        .route(
+            handlers::routes::ARCHIVE_ID_RESTORE,
             post(handlers::restore_archive),
         )
-        .route("/api/v1/archive/stats", get(handlers::archive_stats))
-        .route("/api/v1/agents", get(handlers::list_agents))
-        .route("/api/v1/agents", post(handlers::register_agent))
-        .route("/api/v1/pending", get(handlers::list_pending))
         .route(
-            "/api/v1/pending/{id}/approve",
+            handlers::routes::ARCHIVE_STATS,
+            get(handlers::archive_stats),
+        )
+        .route(handlers::routes::AGENTS, get(handlers::list_agents))
+        .route(handlers::routes::AGENTS, post(handlers::register_agent))
+        .route(handlers::routes::PENDING, get(handlers::list_pending))
+        .route(
+            handlers::routes::PENDING_ID_APPROVE,
             post(handlers::approve_pending),
         )
         .route(
-            "/api/v1/pending/{id}/reject",
+            handlers::routes::PENDING_ID_REJECT,
             post(handlers::reject_pending),
         )
         // v0.7.0 K10 — Approval API. POST is HMAC-gated; SSE rides on
         // top of the existing api_key_auth middleware (no extra gate).
         .route(
-            "/api/v1/approvals/{pending_id}",
+            handlers::routes::APPROVALS_PENDING_ID,
             post(handlers::approval_decide),
         )
-        .route("/api/v1/approvals/stream", get(handlers::approvals_sse))
+        .route(
+            handlers::routes::APPROVALS_STREAM,
+            get(handlers::approvals_sse),
+        )
         // Phase 3 foundation (issue #224) — peer-to-peer sync endpoints.
-        .route("/api/v1/sync/push", post(handlers::sync_push))
-        .route("/api/v1/sync/since", get(handlers::sync_since))
+        .route(handlers::routes::SYNC_PUSH, post(handlers::sync_push))
+        .route(handlers::routes::SYNC_SINCE, get(handlers::sync_since))
         // HTTP parity for MCP-only tools.
-        .route("/api/v1/capabilities", get(handlers::get_capabilities))
-        .route("/api/v1/notify", post(handlers::notify))
-        .route("/api/v1/inbox", get(handlers::get_inbox))
-        .route("/api/v1/subscriptions", post(handlers::subscribe))
-        .route("/api/v1/subscriptions", delete(handlers::unsubscribe))
-        .route("/api/v1/subscriptions", get(handlers::list_subscriptions))
-        .route("/api/v1/session/start", post(handlers::session_start))
+        .route(
+            handlers::routes::CAPABILITIES,
+            get(handlers::get_capabilities),
+        )
+        .route(handlers::routes::NOTIFY, post(handlers::notify))
+        .route(handlers::routes::INBOX, get(handlers::get_inbox))
+        .route(handlers::routes::SUBSCRIPTIONS, post(handlers::subscribe))
+        .route(
+            handlers::routes::SUBSCRIPTIONS,
+            delete(handlers::unsubscribe),
+        )
+        .route(
+            handlers::routes::SUBSCRIPTIONS,
+            get(handlers::list_subscriptions),
+        )
+        .route(
+            handlers::routes::SESSION_START,
+            post(handlers::session_start),
+        )
         // v0.7.0 Cluster E API-2 (issue #767) — Agent Skills HTTP parity.
         // Seven routes mirroring the seven L1-5 `memory_skill_*` MCP
         // tools so HTTP-daemon operators can drive skills without
@@ -849,25 +945,28 @@ pub fn build_router_with_timeout(
         // expected_tool_count()` reports (canonical SSOT in
         // `src/profile.rs`; pinned by `profile_full_matches_registry_all`).
         .route(
-            "/api/v1/skill/register",
+            handlers::routes::SKILL_REGISTER,
             post(handlers::skill_register_route),
         )
-        .route("/api/v1/skill/list", get(handlers::skill_list_route))
-        .route("/api/v1/skill/{id}", get(handlers::skill_get_route))
         .route(
-            "/api/v1/skill/{id}/resource",
+            handlers::routes::SKILL_LIST,
+            get(handlers::skill_list_route),
+        )
+        .route(handlers::routes::SKILL_ID, get(handlers::skill_get_route))
+        .route(
+            handlers::routes::SKILL_ID_RESOURCE,
             get(handlers::skill_resource_route),
         )
         .route(
-            "/api/v1/skill/{id}/export",
+            handlers::routes::SKILL_ID_EXPORT,
             post(handlers::skill_export_route),
         )
         .route(
-            "/api/v1/skill/{id}/promote",
+            handlers::routes::SKILL_ID_PROMOTE,
             post(handlers::skill_promote_route),
         )
         .route(
-            "/api/v1/skill/{id}/compose",
+            handlers::routes::SKILL_ID_COMPOSE,
             post(handlers::skill_compose_route),
         )
         // v0.7.0 #1095 — `POST /api/v1/share` HTTP parity for the
@@ -876,7 +975,7 @@ pub fn build_router_with_timeout(
         // (`source_memory_id` + `target_agent_id`) and wraps the same
         // substrate primitive (`crate::mcp::tools::share::handle_share`)
         // so MCP / HTTP behave byte-equally.
-        .route("/api/v1/share", post(handlers::share_memory))
+        .route(handlers::routes::SHARE, post(handlers::share_memory))
         // v0.7.0 #1111 — 14 HTTP routes for the MCP-only tools the
         // SR-4 three-surface-parity audit flagged. Each route is a thin
         // wrapper around the existing `crate::mcp::handle_<name>`
@@ -884,59 +983,59 @@ pub fn build_router_with_timeout(
         // the MCP and HTTP surfaces. See
         // [`crate::handlers::route_1111`] for the per-handler module.
         .route(
-            "/api/v1/memory_smart_load",
+            handlers::routes::MEMORY_SMART_LOAD,
             post(handlers::route_1111::handle_smart_load_http),
         )
         .route(
-            "/api/v1/memory_reflect",
+            handlers::routes::MEMORY_REFLECT,
             post(handlers::route_1111::handle_reflect_http),
         )
         .route(
-            "/api/v1/memory_recall_observations",
+            handlers::routes::MEMORY_RECALL_OBSERVATIONS,
             post(handlers::route_1111::handle_recall_observations_http),
         )
         .route(
-            "/api/v1/memory_reflection_origin",
+            handlers::routes::MEMORY_REFLECTION_ORIGIN,
             post(handlers::route_1111::handle_reflection_origin_http),
         )
         .route(
-            "/api/v1/memory_dependents_of_invalidated",
+            handlers::routes::MEMORY_DEPENDENTS_OF_INVALIDATED,
             post(handlers::route_1111::handle_dependents_of_invalidated_http),
         )
         .route(
-            "/api/v1/memory_export_reflection",
+            handlers::routes::MEMORY_EXPORT_REFLECTION,
             post(handlers::route_1111::handle_export_reflection_http),
         )
         .route(
-            "/api/v1/memory_atomise",
+            handlers::routes::MEMORY_ATOMISE,
             post(handlers::route_1111::handle_atomise_http),
         )
         .route(
-            "/api/v1/memory_calibrate_confidence",
+            handlers::routes::MEMORY_CALIBRATE_CONFIDENCE,
             post(handlers::route_1111::handle_calibrate_confidence_http),
         )
         .route(
-            "/api/v1/memory_verify",
+            handlers::routes::MEMORY_VERIFY,
             post(handlers::route_1111::handle_verify_http),
         )
         .route(
-            "/api/v1/memory_replay",
+            handlers::routes::MEMORY_REPLAY,
             post(handlers::route_1111::handle_replay_http),
         )
         .route(
-            "/api/v1/memory_subscription_replay",
+            handlers::routes::MEMORY_SUBSCRIPTION_REPLAY,
             post(handlers::route_1111::handle_subscription_replay_http),
         )
         .route(
-            "/api/v1/memory_subscription_dlq_list",
+            handlers::routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
             post(handlers::route_1111::handle_subscription_dlq_list_http),
         )
         .route(
-            "/api/v1/memory_rule_list",
+            handlers::routes::MEMORY_RULE_LIST,
             post(handlers::route_1111::handle_rule_list_http),
         )
         .route(
-            "/api/v1/memory_check_agent_action",
+            handlers::routes::MEMORY_CHECK_AGENT_ACTION,
             post(handlers::route_1111::handle_check_agent_action_http),
         )
         .layer(axum::middleware::from_fn_with_state(

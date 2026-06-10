@@ -266,7 +266,10 @@ impl<'a> ReflectionPass<'a> {
         max_depth: Option<u32>,
         dry_run: bool,
     ) -> Self {
-        let agent_id = keypair.map_or_else(|| "ai:curator".to_string(), |k| k.agent_id.clone());
+        let agent_id = keypair.map_or_else(
+            || crate::identity::sentinels::AI_CURATOR.to_string(),
+            |k| k.agent_id.clone(),
+        );
         Self {
             store,
             ctx: curator_caller_context(&agent_id),
@@ -284,8 +287,10 @@ impl<'a> ReflectionPass<'a> {
     /// `metadata.agent_id` finds curator-written rows under either
     /// tag.
     fn agent_id(&self) -> String {
-        self.keypair
-            .map_or_else(|| "ai:curator".to_string(), |k| k.agent_id.clone())
+        self.keypair.map_or_else(
+            || crate::identity::sentinels::AI_CURATOR.to_string(),
+            |k| k.agent_id.clone(),
+        )
     }
 
     /// Human-readable pass name used in log messages and reports.

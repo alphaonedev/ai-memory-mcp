@@ -487,7 +487,7 @@ fn canonical_payload(
 ) -> Result<Vec<u8>> {
     let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
     map.insert(
-        "content_sha256",
+        crate::models::field_names::CONTENT_SHA256,
         ciborium::Value::Text(content_sha256.to_string()),
     );
     map.insert("namespace", ciborium::Value::Text(namespace.to_string()));

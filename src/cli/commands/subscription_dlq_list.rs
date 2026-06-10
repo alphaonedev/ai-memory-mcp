@@ -11,6 +11,7 @@
 //! landed previously; this module wires the CLI surface so operators
 //! can list undeliverable webhook events from a terminal.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -51,7 +52,7 @@ pub fn cmd_subscription_dlq_list(
     let conn = db::open(db_path)?;
     let mut params = json!({});
     if let Some(s) = &args.subscription_id {
-        params["subscription_id"] = json!(s);
+        params[field_names::SUBSCRIPTION_ID] = json!(s);
     }
     if let Some(l) = args.limit {
         params["limit"] = json!(l);

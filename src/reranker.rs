@@ -239,7 +239,24 @@ const ORIGINAL_WEIGHT: f64 = 0.6;
 /// Blend weight applied to the cross-encoder score.
 const CROSS_ENCODER_WEIGHT: f64 = 0.4;
 
+/// #1531 M13 — clamp a non-finite blended score to the ranking floor.
+///
+/// The rerank sort uses `partial_cmp(..).unwrap_or(Equal)`; a NaN
+/// final score (poisoned caller `original_score`, or a corrupt model
+/// weights file producing a NaN logit) compares `Equal` to EVERYTHING,
+/// so the stable sort left the NaN-scored candidate wherever it sat in
+/// the input — a corrupt candidate could nondeterministically hold the
+/// top rank. Mapping non-finite scores to `f64::MIN` deterministically
+/// sinks them to the bottom of the ranking instead. Finite scores pass
+/// through untouched, so ordinary ranking is byte-identical.
+fn finite_or_floor(score: f64) -> f64 {
+    if score.is_finite() { score } else { f64::MIN }
+}
+
 const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+/// Bare configured-model spelling for the default reranker — shared with
+/// the `ai-memory config migrate` template (#1558 batch 6).
+pub(crate) const DEFAULT_RERANKER_MODEL: &str = "ms-marco-MiniLM-L-6-v2";
 const CROSS_ENCODER_MAX_SEQ: usize = 512;
 const CROSS_ENCODER_HIDDEN_DIM: usize = 384;
 
@@ -435,13 +452,13 @@ impl CrossEncoder {
         ));
 
         let config_path = repo
-            .get("config.json")
+            .get(crate::embeddings::HF_CONFIG_FILE)
             .context("failed to download config.json")?;
         let tokenizer_path = repo
-            .get("tokenizer.json")
+            .get(crate::embeddings::HF_TOKENIZER_FILE)
             .context("failed to download tokenizer.json")?;
         let weights_path = repo
-            .get("model.safetensors")
+            .get(crate::embeddings::HF_WEIGHTS_FILE)
             .context("failed to download model.safetensors")?;
 
         // Load BERT config
@@ -547,7 +564,7 @@ impl CrossEncoder {
         content: &str,
     ) -> Result<f32> {
         // Cross-encoder input: "[CLS] query [SEP] title content [SEP]"
-        let document = format!("{title} {content}");
+        let document = crate::embeddings::embedding_document(title, content);
 
         let encoding = tokenizer
             .encode((query, document.as_str()), true)
@@ -623,7 +640,7 @@ impl CrossEncoder {
                 let ce_score = f64::from(self.score(query, &mem.title, &mem.content));
                 let final_score =
                     ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * ce_score;
-                (mem, final_score)
+                (mem, finite_or_floor(final_score))
             })
             .collect();
 
@@ -659,7 +676,7 @@ impl CrossEncoder {
                 let ce_score = f64::from(self.score(query, &mem.title, &mem.content));
                 let blended = ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * ce_score;
                 let factor = boost_config.factor_for(&mem);
-                (mem, blended * factor)
+                (mem, finite_or_floor(blended * factor))
             })
             .collect();
 
@@ -751,7 +768,7 @@ impl CrossEncoder {
                                     let blended =
                                         ORIGINAL_WEIGHT * original + CROSS_ENCODER_WEIGHT * ce;
                                     let factor = boost_config.factor_for(&mem);
-                                    (mem, blended * factor)
+                                    (mem, finite_or_floor(blended * factor))
                                 })
                                 .collect();
                             cursor += n;
@@ -797,7 +814,7 @@ impl CrossEncoder {
         let mut pairs: Vec<(&str, String)> = Vec::new();
         for (q, cands) in queries {
             for (mem, _) in cands {
-                let document = format!("{} {}", mem.title, mem.content);
+                let document = crate::embeddings::embedding_document(&mem.title, &mem.content);
                 pairs.push((q.as_str(), document));
             }
         }
@@ -1482,6 +1499,44 @@ mod tests {
             confidence_decayed_at: None,
             version: 1,
         }
+    }
+
+    /// #1531 M13 — a NaN original score must not nondeterministically
+    /// hold the top rank. Pre-fix, the blended NaN compared `Equal` to
+    /// every finite score under `partial_cmp(..).unwrap_or(Equal)`, so
+    /// the stable sort left the poisoned candidate in its input
+    /// position (here: first). Post-fix non-finite scores clamp to
+    /// `f64::MIN` and sink to the bottom.
+    #[test]
+    fn nan_scored_candidate_sinks_to_bottom_m13() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let poisoned = make_memory("poisoned", "irrelevant body");
+        let good = make_memory("network configuration", "network configuration body");
+        let out = ce.rerank(
+            "network configuration",
+            vec![(poisoned, f64::NAN), (good, 0.9)],
+        );
+        assert_eq!(
+            out[0].0.title, "network configuration",
+            "finite-scored candidate must outrank the NaN-poisoned one"
+        );
+        assert_eq!(out[1].0.title, "poisoned");
+        assert_eq!(
+            out[1].1,
+            f64::MIN,
+            "non-finite blended score must clamp to the ranking floor"
+        );
+
+        // Boost-aware path takes the same clamp.
+        let poisoned = make_memory("poisoned", "irrelevant body");
+        let good = make_memory("network configuration", "network configuration body");
+        let out = ce.rerank_with_reflection_boost(
+            "network configuration",
+            vec![(poisoned, f64::NAN), (good, 0.9)],
+            &ReflectionBoostConfig::disabled(),
+        );
+        assert_eq!(out[0].0.title, "network configuration");
+        assert_eq!(out[1].1, f64::MIN);
     }
 
     #[test]

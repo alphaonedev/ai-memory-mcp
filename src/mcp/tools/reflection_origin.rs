@@ -10,6 +10,7 @@
 //! [`crate::federation::reflection_bookkeeping`] for the substrate
 //! contract.
 
+use crate::models::field_names;
 use serde_json::{Value, json};
 
 /// MCP `memory_reflection_origin` handler. Returns the structured
@@ -39,22 +40,22 @@ pub fn handle_reflection_origin(
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or("memory_id is required")?;
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
     if memory_id.is_empty() {
-        return Err("memory_id cannot be empty".to_string());
+        return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
     let origin = crate::federation::reflection_bookkeeping::reflection_origin(conn, memory_id)
         .map_err(|e| format!("reflection_origin substrate error: {e}"))?;
     match origin {
         Some(record) => Ok(json!({
             "memory_id": record.memory_id,
-            "peer_origin": record.peer_origin,
-            "signing_agent": record.signing_agent,
-            "original_depth": record.original_depth,
-            "local_depth_at_arrival": record.local_depth_at_arrival,
-            "is_reflection": record.is_reflection,
+            (field_names::PEER_ORIGIN): record.peer_origin,
+            (field_names::SIGNING_AGENT): record.signing_agent,
+            (field_names::ORIGINAL_DEPTH): record.original_depth,
+            (field_names::LOCAL_DEPTH_AT_ARRIVAL): record.local_depth_at_arrival,
+            (field_names::IS_REFLECTION): record.is_reflection,
         })),
-        None => Err(format!("memory not found: {memory_id}")),
+        None => Err(crate::errors::msg::memory_not_found(memory_id)),
     }
 }
 
@@ -87,11 +88,10 @@ impl McpTool for ReflectionOriginTool {
         "L2-2 (S6-M1): {memory_id, peer_origin, signing_agent, original_depth, local_depth_at_arrival, is_reflection}. Non-reflections return envelope with is_reflection=false. Unknown ids => error."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ReflectionOriginRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ReflectionOriginRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

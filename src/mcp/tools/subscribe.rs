@@ -3,7 +3,9 @@
 
 //! MCP subscription management handlers.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -54,11 +56,10 @@ impl McpTool for SubscribeTool {
         "Webhook subscription. HMAC-SHA256 signed via X-Ai-Memory-Signature when secret supplied. https required (http only for loopback). Secret stored hashed only."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SubscribeRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SubscribeRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -84,11 +85,10 @@ impl McpTool for UnsubscribeTool {
         "Delete subscription. DLQ rows retained for audit."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(UnsubscribeRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<UnsubscribeRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -100,8 +100,8 @@ pub fn handle_subscribe(
     let url = params["url"].as_str().ok_or("url is required")?;
     let events = params["events"].as_str().unwrap_or("*");
     let secret = params["secret"].as_str();
-    let namespace_filter = params["namespace_filter"].as_str();
-    let agent_filter = params["agent_filter"].as_str();
+    let namespace_filter = params[param_names::NAMESPACE_FILTER].as_str();
+    let agent_filter = params[param_names::AGENT_FILTER].as_str();
     let created_by =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
 
@@ -126,7 +126,7 @@ pub fn handle_subscribe(
     // subscription to a narrow event subset. When omitted, the legacy
     // `events` (comma-separated / `*`) field governs — preserves
     // backward compatibility for pre-P5 subscribers.
-    let event_types: Option<Vec<String>> = params["event_types"].as_array().map(|arr| {
+    let event_types: Option<Vec<String>> = params[field_names::EVENT_TYPES].as_array().map(|arr| {
         arr.iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect()
@@ -169,12 +169,12 @@ pub fn handle_subscribe(
         "id": id,
         "url": url,
         "events": events,
-        "namespace_filter": namespace_filter,
-        "agent_filter": agent_filter,
-        "created_by": created_by,
+        (field_names::NAMESPACE_FILTER): namespace_filter,
+        (field_names::AGENT_FILTER): agent_filter,
+        (field_names::CREATED_BY): created_by,
     });
     if let Some(et) = &event_types {
-        response["event_types"] = json!(et);
+        response[field_names::EVENT_TYPES] = json!(et);
     }
     Ok(response)
 }
@@ -184,7 +184,9 @@ pub fn handle_unsubscribe(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     // Cross-tenant authorization (#870, security-high, 2026-05-18):
     // scope the DELETE to the caller's resolved agent_id. Without this
     // any tenant could enumerate ids (via lucky guess or by exfiltrating
@@ -205,7 +207,7 @@ pub fn handle_list_subscriptions(
     // returned every tenant's rows.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
     let subs = crate::subscriptions::list(conn, Some(&caller)).map_err(|e| e.to_string())?;
-    Ok(json!({"count": subs.len(), "subscriptions": subs}))
+    Ok(json!({"count": subs.len(), (field_names::SUBSCRIPTIONS): subs}))
 }
 
 /// v0.7 K7 — MCP handler for `memory_subscription_replay`. Thin
@@ -217,7 +219,7 @@ pub fn handle_subscription_replay(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let subscription_id = params["subscription_id"]
+    let subscription_id = params[param_names::SUBSCRIPTION_ID]
         .as_str()
         .ok_or("subscription_id is required")?;
     let since = params["since"]
@@ -241,7 +243,7 @@ pub fn handle_subscription_replay(
         // id is owned by someone else" from "this id doesn't exist"
         // from "this id exists but no events since `since`".
         return Ok(json!({
-            "subscription_id": subscription_id,
+            (field_names::SUBSCRIPTION_ID): subscription_id,
             "since": since,
             "count": 0,
             "events": Vec::<Value>::new(),
@@ -284,11 +286,10 @@ impl McpTool for ListSubscriptionsTool {
         "List subscriptions. Secrets never returned."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ListSubscriptionsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ListSubscriptionsRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 
@@ -318,11 +319,10 @@ impl McpTool for SubscriptionReplayTool {
         "K7: replay events ordered by delivered_at asc."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SubscriptionReplayRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SubscriptionReplayRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

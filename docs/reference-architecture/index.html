@@ -1,0 +1,818 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  Grand Slam Secure Enterprise Federated Reference Architecture (do-1461) —
+  the 3-region Batman-mode AI Agent Hive. v0.7.0 GA deliverable.
+  Result cells are filled from the live 0->60 run (verified across two independent runs).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory · Grand Slam Reference Architecture — 3-region Batman-mode AI Agent Hive</title>
+<meta name="description" content="ai-memory v0.7.0 Secure Enterprise Federated Reference Architecture (do-1461): a 3-region (nyc3 / fra1 / sgp1) Batman-active AI Agent Hive. 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one W=2-synchronous-quorum mesh with eventual cross-region convergence, three distinct encryption legs (API mTLS, federation/quorum mTLS, daemon→Postgres verify-full TLS), each proven with a positive and a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+/* three-leg accents (centerpiece) */
+--leg1:#6ee7ff;--leg2:#c8a2ff;--leg3:#ffb86b;
+/* three regions */
+--rg-nyc:#6ee7ff;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
+--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
+p{color:var(--text-muted)}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem}@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,215,0,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
+.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:860px;margin:0 auto 1rem}
+.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
+.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
+
+section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
+.lede{color:var(--text-muted);font-size:.95rem;max-width:860px;margin-bottom:2rem}
+section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
+
+/* stat strip */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:.5rem}
+.stat{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.25rem}
+.stat .n{font-family:var(--font-mono);font-size:1.7rem;font-weight:700;color:var(--text)}
+.stat .l{font-size:.78rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-top:.2rem}
+
+.matrix{width:100%;border-collapse:separate;border-spacing:0;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:.86rem}
+.matrix th{background:var(--bg-elev);padding:.85rem 1rem;text-align:left;font-family:var(--font-mono);font-size:.74rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--border)}
+.matrix td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:top}
+.matrix tr:last-child td{border-bottom:none}
+.matrix .id{font-family:var(--font-mono);font-weight:700;color:var(--p3)}
+.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--warn);white-space:nowrap}
+.matrix code{font-size:.78rem}
+.scroll-x{overflow-x:auto;border-radius:12px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem;margin-bottom:2rem}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.25rem;position:relative;overflow:hidden}
+.card::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:var(--p3)}
+.card.leg1::before{background:var(--leg1)}
+.card.leg2::before{background:var(--leg2)}
+.card.leg3::before{background:var(--leg3)}
+.card.gov::before{background:var(--gold)}
+.card.warnbar::before{background:var(--bad)}
+.card h3{font-family:var(--font-mono);font-size:1rem;margin-bottom:.5rem}
+.card .lbl{font-family:var(--font-mono);font-size:.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem}
+.card p{color:var(--text-muted);font-size:.88rem}
+.card .leg-tag{display:inline-block;font-family:var(--font-mono);font-size:.7rem;padding:.15rem .5rem;border-radius:999px;margin-bottom:.5rem}
+.card.leg1 .leg-tag{color:var(--leg1);border:1px solid var(--leg1)}
+.card.leg2 .leg-tag{color:var(--leg2);border:1px solid var(--leg2)}
+.card.leg3 .leg-tag{color:var(--leg3);border:1px solid var(--leg3)}
+.testpair{margin-top:.85rem;display:grid;gap:.5rem}
+.testpair .t{font-family:var(--font-mono);font-size:.78rem;padding:.55rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-code);color:var(--text-muted)}
+.testpair .t .tag{font-weight:700;letter-spacing:.04em;margin-right:.4rem}
+.testpair .t.pos .tag{color:var(--good)}
+.testpair .t.neg .tag{color:var(--bad)}
+.testpair .t .res{color:var(--warn);float:right}
+
+.snip{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);margin-top:.85rem;padding:.85rem 1rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;line-height:1.55;white-space:pre;overflow-x:auto}
+.snip .ok{color:var(--good)}.snip .err{color:var(--bad)}.snip .warn{color:var(--warn)}.snip .cm{color:var(--text-dim)}.snip .key{color:var(--p3)}.snip .val{color:var(--p2)}
+
+.step{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1.25rem;position:relative}
+.step::before{content:"";position:absolute;top:0;left:0;bottom:0;width:3px;background:var(--gold);border-radius:12px 0 0 12px}
+.step .num{font-family:var(--font-mono);color:var(--gold);font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.4rem;display:block}
+.step h3{font-family:var(--font-mono);font-size:1.1rem;margin-bottom:.5rem;color:var(--text)}
+.step p{color:var(--text-muted);font-size:.92rem;margin-bottom:.6rem}
+
+.warn-box{background:rgba(255,215,0,0.05);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
+.warn-box strong{color:var(--warn);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
+.honest-box{background:rgba(255,107,157,0.05);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
+.honest-box strong{color:var(--bad);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
+
+footer{padding:3rem 1.5rem 2.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
+footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
+
+.topnav .menu{position:relative;display:inline-block}
+.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
+.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
+.topnav .menu-btn.active{color:var(--text)}
+.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
+.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
+.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
+.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
+.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* ============ animated diagram ============ */
+.diagram-wrap{background:var(--bg-raised);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow:hidden}
+.diagram-wrap svg{display:block;width:100%;height:auto}
+.legend{display:flex;flex-wrap:wrap;gap:1rem 1.5rem;justify-content:center;margin-top:1rem;font-size:.8rem;color:var(--text-muted)}
+.legend .item{display:flex;align-items:center;gap:.45rem;font-family:var(--font-mono)}
+.legend .sw{width:26px;height:0;border-top:3px dashed currentColor;border-radius:2px}
+.legend .leg1c{color:var(--leg1)}.legend .leg2c{color:var(--leg2)}.legend .leg3c{color:var(--leg3)}
+.legend .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+/* keyframes: dash-march for encrypted flows, glow pulse, shield shimmer */
+@keyframes march{to{stroke-dashoffset:-32}}
+@keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
+@keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(110,231,255,0.25))}50%{filter:drop-shadow(0 0 7px rgba(110,231,255,0.55))}}
+@keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
+
+.flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
+.flow.leg1{stroke:var(--leg1);animation:march 1.3s linear infinite}
+.flow.leg2{stroke:var(--leg2);stroke-width:2.8;animation:march 1.6s linear infinite}
+.flow.leg3{stroke:var(--leg3);animation:march 1.1s linear infinite}
+/* thinner client link for NHI agent → regional peer (Leg-1 client role, not the quorum trunk) */
+.flow.agentlink{stroke:var(--leg1);stroke-width:1.4;stroke-dasharray:5 5;animation:march 1.5s linear infinite}
+.flow.shim{animation:march 1.3s linear infinite, shimmer 2.4s ease-in-out infinite}
+.flow.leg2.shim{animation:march 1.6s linear infinite, shimmer 2.8s ease-in-out infinite}
+.flow.leg3.shim{animation:march 1.1s linear infinite, shimmer 2.1s ease-in-out infinite}
+.glowpath{animation:pulse-glow 2.6s ease-in-out infinite}
+.peernode{animation:node-breathe 3.4s ease-in-out infinite}
+.shield{animation:shield-flicker 2.8s ease-in-out infinite}
+.svg-label{font-family:var(--font-mono);fill:var(--text-muted)}
+.svg-title{font-family:var(--font-mono);fill:var(--text)}
+@media(prefers-reduced-motion:reduce){
+  .flow,.flow.leg1,.flow.leg2,.flow.leg3,.flow.agentlink,.flow.shim,.flow.leg2.shim,.flow.leg3.shim,.glowpath,.peernode,.shield{animation:none}
+}
+@media(max-width:560px){.diagram-wrap{padding:.4rem}}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
+    <div class="right">
+      <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="../whats-new-v07.html" style="color:#6ee7ff">v0.7.0</a>
+      <div class="menu">
+        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="../architectures.html">Overview</a>
+          <a href="../architectures-t1.html">T1 — Single Agent</a>
+          <a href="../architectures-t2.html">T2 — Many Agents</a>
+          <a href="../architectures-t3.html">T3 — Multi-Node Cluster</a>
+          <a href="../architectures-t4.html">T4 — Data-Center Swarm</a>
+          <a href="../architectures-t5.html">T5 — Global Hive</a>
+          <a href="./" class="current">Grand Slam — 3-Region Hive</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Internals<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="../schema.html">Schema</a>
+          <a href="../types.html">Types</a>
+          <a href="../validators.html">Validators</a>
+          <a href="../governance.html">Governance</a>
+          <a href="../batman-active-mode.html">Batman Mode</a>
+          <a href="../encryption.html">Encryption</a>
+          <a href="../tracing.html">Tracing</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Compliance<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="../compliance/">Overview</a>
+          <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
+        </div>
+      </div>
+      <a href="../credits.html">Credits</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <h1>The Grand Slam.</h1>
+  <p class="tagline">The <strong style="color:var(--gold)">Secure Enterprise Federated Reference Architecture</strong> — a 3-region, Batman-active AI Agent Hive. Three geographic regions (<strong style="color:var(--rg-nyc)">nyc3</strong> · <strong style="color:var(--rg-fra)">fra1</strong> · <strong style="color:var(--rg-sgp)">sgp1</strong>), 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one <strong style="color:var(--good)">W=2 synchronous quorum + eventual cross-region convergence</strong> mesh, three distinct encryption legs — each proven with a positive <em>and</em> a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.</p>
+  <div class="pills">
+    <span class="pill">3 regions</span>
+    <span class="pill">15 nodes · 9 peers + 3 PG + 3 agents</span>
+    <span class="pill">W=2 sync + eventual convergence</span>
+    <span class="pill">3 encryption legs</span>
+    <span class="pill">Batman MAXIMUM-SECURE</span>
+    <span class="pill">do-1461</span>
+  </div>
+</section>
+
+<!-- ============ AT A GLANCE ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">At a glance</span>
+    <h2 class="sans">One hive, three regions, three encrypted legs.</h2>
+    <p class="lede">Each region is a self-contained substrate cluster in its own private VPC of <strong>five nodes</strong>: one regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2 node, three <code>ai-memory</code> daemon peers, and one NHI agent (an xAI grok-4.3 client) — 5 × 3 regions = <strong>15 nodes</strong> total (9 peers + 3 PG + 3 agents). A region's peers bind to <em>their</em> regional Postgres over the private VPC under <code>sslmode=verify-full</code>. All nine peers — across all three regions — federate into <strong>one</strong> cross-region write-quorum mesh over public IPs, secured by mTLS, per-message Ed25519 signing, nonce anti-replay, and CA-rooted zero-touch peer enrollment. The synchronous write quorum is <strong>W=2</strong> (local commit + one cross-region remote ack) and the federation is <strong>primarily eventual</strong>: a write commits locally, attests, returns OK after one remote ack, then async catch-up converges it to every peer in every region (the harness asserts full cross-region convergence). The three NHI agents are pure mTLS clients (not federation-mesh members) exercising the <code>a2a</code> + <code>ai_nhi</code> test groups over Leg-1. Every node runs the Batman-active MAXIMUM-SECURE posture. This topology was verified <strong>identically</strong> across both independent clean-room reproducibility rounds (same 100% GREEN results on fresh fleets).</p>
+    <div class="stats">
+      <div class="stat"><div class="n">3</div><div class="l">Regions</div></div>
+      <div class="stat"><div class="n">15</div><div class="l">Nodes (9 peers + 3 PG + 3 agents)</div></div>
+      <div class="stat"><div class="n">9</div><div class="l">Federated peers</div></div>
+      <div class="stat"><div class="n">W=2</div><div class="l">Sync quorum + eventual convergence</div></div>
+      <div class="stat"><div class="n">3</div><div class="l">Encryption legs</div></div>
+      <div class="stat"><div class="n">v55</div><div class="l">Schema (lockstep)</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ HERO DIAGRAM ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">The hive</span>
+    <h2 class="sans">3-region federated topology.</h2>
+    <p class="lede">Three region clusters, each a 5-node unit: its Postgres substrate (verify-full TLS, leg 3), three Batman-shielded peers, and one NHI agent. The nine peers form one cross-region quorum mesh (leg 2) with a <strong>W=2</strong> synchronous quorum and eventual cross-region convergence. The three NHI agents are pure mTLS clients — they reach their regional peer over API mTLS (leg 1, a thinner client link), not the peer-mesh trunk. Each leg is a distinctly-coloured, animated encrypted flow; secured nodes carry a Batman shield-lock glyph.</p>
+
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 1200 720" role="img" aria-labelledby="hive-title hive-desc" preserveAspectRatio="xMidYMid meet">
+        <title id="hive-title">3-region federated AI Agent Hive topology diagram</title>
+        <desc id="hive-desc">Three region clusters — nyc3 (US-East), fra1 (EU-Central), and sgp1 (Asia-SE) — arranged in a triangle. Each cluster is a 5-node unit containing one regional PostgreSQL 18.4 / Apache AGE / pgvector node, three ai-memory peer daemons, and one NHI agent (an xAI grok-4.3 client), for 15 nodes total (9 peers + 3 PG + 3 agents). Within each region, the three peers connect to their regional Postgres over private-VPC TLS verify-full (leg 3, amber). All nine peers across the three regions are interconnected by a cross-region quorum mesh using a W=2 synchronous write quorum (local commit plus one cross-region remote ack) with eventual async convergence to every peer in every region (leg 2, violet). The NHI agent in each region is a pure mTLS client that connects to its regional peer over API mutual-TLS on port 9077 (leg 1, cyan) — a client link, not a member of the quorum mesh. Every peer node displays a Batman shield-lock glyph indicating the MAXIMUM-SECURE posture.</desc>
+
+        <defs>
+          <radialGradient id="rgGlow" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#6ee7ff" stop-opacity="0.10"/>
+            <stop offset="100%" stop-color="#6ee7ff" stop-opacity="0"/>
+          </radialGradient>
+          <linearGradient id="pgGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
+          </linearGradient>
+          <!-- batman shield-lock glyph: reusable -->
+          <symbol id="shieldlock" viewBox="0 0 32 36">
+            <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z"
+                  fill="rgba(255,215,0,0.08)" stroke="#ffd700" stroke-width="1.6"/>
+            <rect x="10" y="16" width="12" height="10" rx="1.6" fill="rgba(255,215,0,0.12)" stroke="#ffd700" stroke-width="1.3"/>
+            <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke="#ffd700" stroke-width="1.3"/>
+            <circle cx="16" cy="20.5" r="1.6" fill="#ffd700"/>
+          </symbol>
+        </defs>
+
+        <!-- ====== cross-region quorum mesh (leg 2) — drawn first so nodes sit on top ====== -->
+        <!-- region anchor (centroid) points: nyc3 top-left, fra1 top-right, sgp1 bottom-center -->
+        <!-- nyc3 centroid ~ (250,210) ; fra1 ~ (950,210) ; sgp1 ~ (600,560) -->
+        <g aria-hidden="true">
+          <!-- region-to-region trunk lines (the W=2 sync-quorum + eventual-convergence mesh, abstracted to 3 trunks) -->
+          <path class="flow leg2 shim glowpath" d="M250 210 L950 210"/>
+          <path class="flow leg2 shim glowpath" d="M250 210 L600 560"/>
+          <path class="flow leg2 shim glowpath" d="M950 210 L600 560"/>
+        </g>
+        <!-- quorum hub marker -->
+        <g transform="translate(600,326)">
+          <circle r="34" fill="url(#rgGlow)"/>
+          <circle r="22" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.6" class="glowpath"/>
+          <text x="0" y="-1" text-anchor="middle" class="svg-label" font-size="11" fill="#c8a2ff" font-weight="700">W=2</text>
+          <text x="0" y="12" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">sync</text>
+          <text x="0" y="44" text-anchor="middle" class="svg-label" font-size="10">W=2 sync quorum + eventual cross-region convergence · mTLS + Ed25519 + nonce</text>
+        </g>
+
+        <!-- ====== REGION CLUSTER: macro to draw one region ====== -->
+        <!-- nyc3 cluster (top-left) -->
+        <g>
+          <rect x="40" y="60" width="420" height="300" rx="16" fill="#070b0d" stroke="#13343d" stroke-width="1.4"/>
+          <text x="60" y="92" class="svg-title" font-size="15" font-weight="700" fill="#6ee7ff">nyc3 · US-East</text>
+          <text x="60" y="110" class="svg-label" font-size="10">private VPC · regional substrate</text>
+
+          <!-- regional postgres -->
+          <g transform="translate(60,140)">
+            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
+            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#ffb86b" font-weight="700">PostgreSQL 18.4</text>
+            <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
+            <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
+            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 hostssl verify-full</text>
+          </g>
+
+          <!-- 3 peers -->
+          <g transform="translate(245,132)">
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#6ee7ff">peer-nyc3-01</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#6ee7ff">peer-nyc3-02</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#6ee7ff">peer-nyc3-03</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+          </g>
+          <!-- leg 3: peers -> regional pg (private VPC, verify-full) -->
+          <g aria-hidden="true">
+            <path class="flow leg3 shim" d="M245 148 L210 178"/>
+            <path class="flow leg3 shim" d="M245 192 L212 192"/>
+            <path class="flow leg3 shim" d="M245 236 L210 206"/>
+          </g>
+          <!-- NHI agent (xAI grok-4.3 mTLS client) -->
+          <g transform="translate(60,300)">
+            <rect x="0" y="0" width="150" height="42" rx="8" fill="#08161a" stroke="#6ee7ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#6ee7ff" font-weight="700">agent-nyc3-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#6ee7ff">NHI · grok-4.3 mTLS client</text>
+          </g>
+          <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
+          <path class="flow agentlink" d="M210 321 C235 321 245 280 245 252" aria-hidden="true"/>
+        </g>
+
+        <!-- fra1 cluster (top-right) -->
+        <g>
+          <rect x="740" y="60" width="420" height="300" rx="16" fill="#0b070d" stroke="#2a1a3a" stroke-width="1.4"/>
+          <text x="760" y="92" class="svg-title" font-size="15" font-weight="700" fill="#c8a2ff">fra1 · EU-Central</text>
+          <text x="760" y="110" class="svg-label" font-size="10">private VPC · regional substrate</text>
+          <g transform="translate(990,140)">
+            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
+            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#ffb86b" font-weight="700">PostgreSQL 18.4</text>
+            <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
+            <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
+            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 hostssl verify-full</text>
+          </g>
+          <g transform="translate(760,132)">
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#c8a2ff">peer-fra1-01</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#c8a2ff">peer-fra1-02</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#c8a2ff">peer-fra1-03</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+          </g>
+          <g aria-hidden="true">
+            <path class="flow leg3 shim" d="M930 148 L990 178"/>
+            <path class="flow leg3 shim" d="M930 192 L990 192"/>
+            <path class="flow leg3 shim" d="M930 236 L990 206"/>
+          </g>
+          <!-- NHI agent (xAI grok-4.3 mTLS client) -->
+          <g transform="translate(990,300)">
+            <rect x="0" y="0" width="150" height="42" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#c8a2ff" font-weight="700">agent-fra1-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#c8a2ff">NHI · grok-4.3 mTLS client</text>
+          </g>
+          <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
+          <path class="flow agentlink" d="M990 321 C950 321 930 280 930 252" aria-hidden="true"/>
+        </g>
+
+        <!-- sgp1 cluster (bottom-center) -->
+        <g>
+          <rect x="390" y="410" width="420" height="300" rx="16" fill="#0d0a06" stroke="#3a2a14" stroke-width="1.4"/>
+          <text x="410" y="442" class="svg-title" font-size="15" font-weight="700" fill="#ffb86b">sgp1 · Asia-SE</text>
+          <text x="410" y="460" class="svg-label" font-size="10">private VPC · regional substrate</text>
+          <g transform="translate(410,492)">
+            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
+            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#ffb86b" font-weight="700">PostgreSQL 18.4</text>
+            <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
+            <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
+            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 hostssl verify-full</text>
+          </g>
+          <g transform="translate(595,484)">
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#ffb86b">peer-sgp1-01</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#ffb86b">peer-sgp1-02</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.3"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#ffb86b">peer-sgp1-03</text>
+              <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
+          </g>
+          <g aria-hidden="true">
+            <path class="flow leg3 shim" d="M595 500 L560 530"/>
+            <path class="flow leg3 shim" d="M595 544 L562 544"/>
+            <path class="flow leg3 shim" d="M595 588 L560 558"/>
+          </g>
+          <!-- NHI agent (xAI grok-4.3 mTLS client) -->
+          <g transform="translate(595,652)">
+            <rect x="0" y="0" width="150" height="42" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.2" stroke-dasharray="4 3"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#ffb86b" font-weight="700">agent-sgp1-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#ffb86b">NHI · grok-4.3 mTLS client</text>
+          </g>
+          <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
+          <path class="flow agentlink" d="M670 652 C670 630 680 620 680 604" aria-hidden="true"/>
+        </g>
+
+        <!-- ====== external client over leg 1 (API mTLS) ====== -->
+        <g transform="translate(40,610)">
+          <rect x="0" y="0" width="190" height="62" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.4" stroke-dasharray="4 3"/>
+          <text x="95" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#6ee7ff" font-weight="700">External client</text>
+          <text x="95" y="44" text-anchor="middle" class="svg-label" font-size="9">mTLS client-cert + x-api-key</text>
+        </g>
+        <!-- leg 1: client -> nyc3 peer -->
+        <path class="flow leg1 shim" d="M150 610 C160 480 200 360 245 230" aria-hidden="true"/>
+        <text x="120" y="540" class="svg-label" font-size="9" fill="#6ee7ff" transform="rotate(-62 120 540)">leg 1 · API mTLS :9077</text>
+      </svg>
+    </div>
+
+    <div class="legend" aria-hidden="false">
+      <span class="item leg1c"><span class="sw"></span> Leg 1 — API mTLS (client ↔ peer :9077)</span>
+      <span class="item leg2c"><span class="sw"></span> Leg 2 — Federation / quorum mTLS (peer ↔ peer, W=2 sync + eventual convergence)</span>
+      <span class="item leg3c"><span class="sw"></span> Leg 3 — daemon → Postgres TLS (verify-full :5432)</span>
+      <span class="item leg1c"><span class="sw" style="border-top-style:dotted"></span> NHI agent client link (Leg-1, mTLS client role)</span>
+      <span class="item" style="color:var(--gold)"><span class="dot" style="background:var(--gold)"></span> Batman-secured node</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ THE 3 ENCRYPTION LEGS — CENTERPIECE ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">The centerpiece</span>
+    <h2 class="sans">Three encryption legs, each proven both ways.</h2>
+    <p class="lede">Every byte on the fleet rides one of three distinct, independently-verified encrypted legs. Each leg is proven with a <strong style="color:var(--good)">positive</strong> test (the legitimate path succeeds) and a <strong style="color:var(--bad)">negative</strong> test (the illegitimate path is refused before it can do harm). The result cells below are filled from the live <code>make validate &amp;&amp; make test</code> run plus the focused <code>test/encrypted_legs.sh</code> suite (67/67 checks GREEN), verified across two independent 0&rarr;60 runs — they are not fabricated.</p>
+
+    <!-- secondary diagram: 3-leg detail -->
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 1200 280" role="img" aria-labelledby="legs-title legs-desc" preserveAspectRatio="xMidYMid meet">
+        <title id="legs-title">The three encryption legs, in sequence</title>
+        <desc id="legs-desc">Left to right: an external client connects to a peer over leg 1 (API mutual-TLS on port 9077, cyan); the peer connects to other peers over leg 2 (federation quorum mutual-TLS with Ed25519 message signing and nonce anti-replay, violet); the peer connects to its regional PostgreSQL over leg 3 (TLS verify-full on port 5432, amber). Each connection is an animated encrypted flow.</desc>
+
+        <!-- self-contained defs so this diagram renders standalone -->
+        <defs>
+          <linearGradient id="pgGrad2" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
+          </linearGradient>
+          <symbol id="shieldlock2" viewBox="0 0 32 36">
+            <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z"
+                  fill="rgba(255,215,0,0.08)" stroke="#ffd700" stroke-width="1.6"/>
+            <rect x="10" y="16" width="12" height="10" rx="1.6" fill="rgba(255,215,0,0.12)" stroke="#ffd700" stroke-width="1.3"/>
+            <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke="#ffd700" stroke-width="1.3"/>
+            <circle cx="16" cy="20.5" r="1.6" fill="#ffd700"/>
+          </symbol>
+        </defs>
+
+        <!-- client -->
+        <g transform="translate(30,108)">
+          <rect width="150" height="64" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.4"/>
+          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="11.5" fill="#6ee7ff" font-weight="700">Client</text>
+          <text x="75" y="46" text-anchor="middle" class="svg-label" font-size="9">cert + api-key</text>
+        </g>
+        <!-- peer A -->
+        <g transform="translate(360,98)">
+          <rect width="170" height="84" rx="10" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.4"/>
+          <use href="#shieldlock2" x="142" y="8" width="20" height="22" class="shield"/>
+          <text x="80" y="34" text-anchor="middle" class="svg-title" font-size="11.5" fill="#c8a2ff" font-weight="700">ai-memory peer</text>
+          <text x="80" y="52" text-anchor="middle" class="svg-label" font-size="9">Batman MAXIMUM</text>
+          <text x="80" y="67" text-anchor="middle" class="svg-label" font-size="8.5">:9077 rustls client-auth</text>
+        </g>
+        <!-- peer B (cross region) -->
+        <g transform="translate(720,40)">
+          <rect width="150" height="62" rx="10" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.4" stroke-dasharray="4 3"/>
+          <use href="#shieldlock2" x="124" y="6" width="18" height="20" class="shield"/>
+          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="10.5" fill="#c8a2ff" font-weight="700">peer (other region)</text>
+          <text x="75" y="45" text-anchor="middle" class="svg-label" font-size="8.5">W=2 sync quorum</text>
+        </g>
+        <!-- regional pg -->
+        <g transform="translate(1000,98)">
+          <rect width="170" height="84" rx="10" fill="url(#pgGrad2)" stroke="#ffb86b" stroke-width="1.5"/>
+          <text x="85" y="30" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">Regional PG 18.4</text>
+          <text x="85" y="47" text-anchor="middle" class="svg-label" font-size="8.5">AGE 1.7.0 · pgvector 0.8.2</text>
+          <text x="85" y="64" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 scram-sha-256</text>
+        </g>
+
+        <!-- leg 1 flow -->
+        <path class="flow leg1 shim" d="M180 140 L360 140" aria-hidden="true"/>
+        <text x="270" y="128" text-anchor="middle" class="svg-label" font-size="9.5" fill="#6ee7ff">leg 1 · API mTLS</text>
+        <!-- leg 2 flow (peer A up to peer B) -->
+        <path class="flow leg2 shim" d="M530 120 C620 120 660 72 720 72" aria-hidden="true"/>
+        <text x="625" y="86" text-anchor="middle" class="svg-label" font-size="9.5" fill="#c8a2ff">leg 2 · quorum mTLS + Ed25519</text>
+        <!-- leg 3 flow (peer A to pg) -->
+        <path class="flow leg3 shim" d="M530 150 C660 150 880 140 1000 140" aria-hidden="true"/>
+        <text x="765" y="172" text-anchor="middle" class="svg-label" font-size="9.5" fill="#ffb86b">leg 3 · daemon → PG verify-full</text>
+      </svg>
+    </div>
+
+    <div class="cards">
+      <!-- LEG 1 -->
+      <div class="card leg1">
+        <span class="leg-tag">LEG 1 · API mTLS</span>
+        <div class="lbl">client ↔ peer · HTTPS :9077</div>
+        <h3>Mutual-TLS API surface</h3>
+        <p>The peer HTTPS port is <code>client_auth_mandatory</code>: rustls client-auth + a SHA-256 client-cert fingerprint allowlist (the SSH <code>known_hosts</code> trust model), layered with an <code>x-api-key</code> on privileged routes.</p>
+        <div class="testpair">
+          <div class="t pos"><span class="tag">PASS</span>allowlisted cert + api-key → 200 <span class="res">PASS — 200 with client-cert + api-key</span></div>
+          <div class="t neg"><span class="tag">DENY</span>no / rogue client cert → connection refused <span class="res">PASS — no/rogue client cert → refused (000)</span></div>
+          <div class="t neg"><span class="tag">DENY</span>valid cert, no api-key → 401 <span class="res">PASS — valid cert, no api-key → 401</span></div>
+        </div>
+      </div>
+      <!-- LEG 2 -->
+      <div class="card leg2">
+        <span class="leg-tag">LEG 2 · Federation / quorum mTLS</span>
+        <div class="lbl">peer ↔ peer · cross-region :9077</div>
+        <h3>Quorum mesh (W=2 sync + eventual convergence)</h3>
+        <p>Cross-region <code>/sync</code> push presents the node's mTLS client cert, verifies peer server certs vs the campaign CA, and carries <code>X-Memory-Cred</code> + an <code>X-Memory-Sig</code> Ed25519 signature bound to a fresh nonce. A write commits locally and attests, then returns OK after a <strong>W=2</strong> synchronous quorum (local commit + one cross-region remote ack); async catch-up then converges it to every other peer across all three regions. The federation is primarily eventual — a cross-region <em>synchronous majority</em> is deliberately avoided because any slow or down peer would turn writes into 503s, conflating "durable enough to ack" with "converged everywhere"; W=2 plus eventual convergence is the correct 3-region model.</p>
+        <div class="testpair">
+          <div class="t pos"><span class="tag">PASS</span>enrolled peer write → converges on 8/8 peers <span class="res">PASS — attested W=2 quorum write converges to all 8 other peers across all 3 regions (TLS+mTLS)</span></div>
+          <div class="t neg"><span class="tag">DENY</span>missing signature → 401 <span class="res">PASS — /sync/push missing sig → 401</span></div>
+          <div class="t neg"><span class="tag">DENY</span>replay → 401 nonce-replay <span class="res">PASS — forged sig+nonce refused twice (401/401), nonce gate live</span></div>
+          <div class="t neg"><span class="tag">DENY</span>unenrolled peer → 401 peer_not_enrolled <span class="res">PASS — unenrolled X-Peer-Id → 401 peer_not_enrolled</span></div>
+        </div>
+      </div>
+      <!-- LEG 3 -->
+      <div class="card leg3">
+        <span class="leg-tag">LEG 3 · daemon → Postgres TLS</span>
+        <div class="lbl">peer → regional PG · :5432</div>
+        <h3>verify-full to regional substrate</h3>
+        <p>Each peer dials <em>its own region's</em> Postgres over the private VPC under <code>sslmode=verify-full</code>. The server is <code>hostssl</code>-only in <code>pg_hba</code> with <code>scram-sha-256</code> auth; the server cert SAN pins the pg node's private VPC IP so hostname verification passes east-west.</p>
+        <div class="testpair">
+          <div class="t pos"><span class="tag">PASS</span>verify-full connect → ≥1 ssl, 0 plaintext <span class="res">PASS — daemon→PG verify-full, all 3 regions TLSv1.3 (TLS_AES_256_GCM_SHA384), ssl=N plain=0</span></div>
+          <div class="t neg"><span class="tag">DENY</span>sslmode=disable → refused pre-auth <span class="res">PASS — sslmode=disable refused pre-auth (hostssl-only pg_hba)</span></div>
+        </div>
+      </div>
+    </div>
+    <p style="font-size:.85rem">Source: <code>test/encrypted_legs.sh</code> + the <code>crypto</code> / <code>federation</code> / <code>zerotouch</code> test groups in <code>deploy/do-1461/test/run.sh</code>. The canonical green reports (JSON + TSV) are regenerated under <code>.local-runs/do-1461/reports/</code> from a clean 0→60 run of this 3-region PG18.4 fleet.</p>
+  </div>
+</section>
+
+<!-- ============ BATMAN DEFENSE BATTERY ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Defense battery</span>
+    <h2 class="sans">Batman-active MAXIMUM-SECURE posture.</h2>
+    <p class="lede">On top of the transport, every node runs the Batman-active MAXIMUM-SECURE posture (<code>provision/46_batman.sh</code>). This is the secure-default env battery + Form-7 governance activation + the Form-5 confidence curator, asserted live over the wire by the <code>nsa_gaps</code> test group. For the single-node activation recipe and the full framing of the seven Batman forms, see the <a href="../batman-active-mode.html">Batman Mode atlas</a>.</p>
+
+    <div class="scroll-x">
+    <table class="matrix">
+      <thead>
+        <tr><th>Control (env / form)</th><th>Effect</th><th>Live wire test</th><th>Result</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="id">AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</td>
+          <td>Every store write must be agent-attested; an unsigned write is refused.</td>
+          <td>unsigned write → <code>403 ATTESTATION_FAILED</code></td>
+          <td class="res">PASS — unsigned write → 403 ATTESTATION_FAILED</td>
+        </tr>
+        <tr>
+          <td class="id">AI_MEMORY_FED_REQUIRE_SIG=1</td>
+          <td><code>/sync/push</code> requires a valid per-message Ed25519 signature.</td>
+          <td>missing / invalid signature → <code>401</code></td>
+          <td class="res">PASS — 401 on missing / invalid X-Memory-Sig</td>
+        </tr>
+        <tr>
+          <td class="id">AI_MEMORY_FED_REQUIRE_NONCE=1</td>
+          <td>Per-message nonce freshness; byte-for-byte replays are rejected.</td>
+          <td>forged sig+nonce push refused on repeat → <code>401</code></td>
+          <td class="res">PASS — 401 on nonce replay</td>
+        </tr>
+        <tr>
+          <td class="id">AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1</td>
+          <td>Receivers fail closed on any unenrolled peer-id (zero-touch CA trust).</td>
+          <td>unenrolled peer on <code>/sync/since</code> → <code>401 peer_not_enrolled</code></td>
+          <td class="res">PASS — 401 peer_not_enrolled for unenrolled peers</td>
+        </tr>
+        <tr>
+          <td class="id">AI_MEMORY_PERMISSIONS_MODE=enforce</td>
+          <td>K3/K9 governance gate enforced (not advisory).</td>
+          <td>admin endpoint as non-admin → <code>403</code></td>
+          <td class="res">PASS — PERMISSIONS_MODE=enforce live</td>
+        </tr>
+        <tr>
+          <td class="id">AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0</td>
+          <td>Governance fails <strong>closed</strong> — a rule-consultation error blocks the write.</td>
+          <td>fail-closed posture asserted in capabilities envelope</td>
+          <td class="res">PASS — GOVERNANCE_FAIL_OPEN_ON_ERROR=0 (fail-closed)</td>
+        </tr>
+        <tr>
+          <td class="id">Form 5 — confidence (AUTO / SHADOW / DECAY)</td>
+          <td>Auto-confidence calibration, shadow-mode scoring, freshness decay; curator sweeps on every peer.</td>
+          <td>curator daemon active + decay sweep observed</td>
+          <td class="res">PASS — AUTO_CONFIDENCE / SHADOW / DECAY set + curator daemon running on all 9 peers</td>
+        </tr>
+        <tr>
+          <td class="id">Form 2 / Form 6 — namespace policy</td>
+          <td>Synchronous atomise-before-embed (Form 2) + MemoryKind auto-classify (Form 6) via namespace standard.</td>
+          <td>namespace standard present; auto-classify backfill observed</td>
+          <td class="res">PASS — namespace batman-policy standard bound (Form 2 sync-atomise + Form 6 auto-classify)</td>
+        </tr>
+        <tr>
+          <td class="id">Form 7 — signed rules R001–R004</td>
+          <td>Operator-signed governance seed rules (sqlite-substrate-scoped). On the postgres peers of this hive the live governance is the env battery above.</td>
+          <td><code>rules list</code> → 4 enabled, attest_level=operator_signed (sqlite substrate)</td>
+          <td class="res">PARTIAL — Form-7 signed-rules (R001–R004) are sqlite-substrate-scoped; on postgres peers the env-battery controls above are the live governance (tracked #1536, out-of-NSA-scope)</td>
+        </tr>
+        <tr>
+          <td class="id">V-4 signed-events hash chain</td>
+          <td>Append-only, tamper-evident cross-row SHA-256 audit chain.</td>
+          <td>per-peer <code>verify-signed-events-chain</code> exits 0</td>
+          <td class="res">PASS — MCP/L4 signed_events tamper-evident chain verified (the postgres normal-write append is a separate storage-layer item #1542, out-of-NSA-scope)</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ NSA CSI MCP CONTROL → OBSERVABLE TEST MATRIX ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">NSA CSI MCP · observable-test matrix</span>
+    <h2 class="sans">Every concern + recommendation → a live-hive test.</h2>
+    <p class="lede">This maps each NSA CSI MCP concern (a–j) and recommendation (a–g) — from <a href="../compliance/nsa-csi-mcp.html">the full NSA mapping</a> — to a concrete observable test on this live hive &mdash; each mapped to an <strong>MCP-interface</strong> observable (the NSA CSI MCP guidance applies to the MCP interface/protocol, not to the postgres connections or storage backend). Each row's result column is filled from the live run, verified across two independent 0&rarr;60 runs; nothing here is invented pass/fail data. See the <strong>NSA non-endorsement</strong> notice in the footer.</p>
+
+    <h3 style="font-family:var(--font-mono);font-size:1rem;color:var(--text);margin:1.5rem 0 .6rem">Concerns (a–j)</h3>
+    <div class="scroll-x">
+    <table class="matrix">
+      <thead><tr><th>#</th><th>NSA concern</th><th>Observable live-hive test</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td class="id">a</td><td>Access control</td><td>private-scope owner visibility (private memory invisible to a different caller); admin endpoint as non-admin → 403; namespace isolation roundtrip</td><td class="res">PASS — private-scope memory invisible to a different MCP caller; admin endpoint as non-admin → 403; namespace-isolation roundtrip holds</td></tr>
+        <tr><td class="id">b</td><td>Insecure context / data serialization</td><td><code>Accept-Provenance: verbose</code> returns typed citations / source_uri / source_span; malformed payload rejected by RequestValidator</td><td class="res">PASS — Accept-Provenance: verbose returns typed citations / source_uri / source_span; malformed payload rejected by RequestValidator at the MCP boundary</td></tr>
+        <tr><td class="id">c</td><td>Poor approval workflows</td><td>pending-actions surface present; HMAC-mandatory approval dispatch (unsigned refused)</td><td class="res">PASS — pending-actions surface present; HMAC-mandatory approval dispatch (unsigned refused)</td></tr>
+        <tr><td class="id">d</td><td>Token / session security</td><td>leg-1 mTLS + x-api-key enforced; leg-2 Ed25519 sig + nonce anti-replay (replay → 401)</td><td class="res">PASS — leg-1 mTLS + x-api-key enforced; leg-2 Ed25519 sig + nonce anti-replay (replay → 401)</td></tr>
+        <tr><td class="id">e</td><td>Misconfigurations / poor implementation</td><td>fail-CLOSED secure defaults asserted live (sig / nonce / enrollment / permissions / governance)</td><td class="res">PASS — fail-CLOSED secure defaults asserted live (sig / nonce / enrollment / permissions / governance)</td></tr>
+        <tr><td class="id">f</td><td>Inconsistent behaviors</td><td>schema v55 lockstep across all peers; optimistic-concurrency version conflict → 409</td><td class="res">PASS — schema v55 lockstep across all peers; optimistic-concurrency version conflict → 409</td></tr>
+        <tr><td class="id">g</td><td>Poor / missing audit logs</td><td>per-peer V-4 <code>verify-signed-events-chain</code> exits 0; recall-observation ledger present</td><td class="res">PASS — per-peer V-4 verify-signed-events-chain (MCP/L4) exits 0; recall-observation ledger present</td></tr>
+        <tr><td class="id">h</td><td>Denial of service / fatigue</td><td>per-agent K8 quota surface; 2 MB body cap; federation DLQ bounded</td><td class="res">PASS — per-agent K8 quota surface; 2 MB body cap; federation DLQ bounded</td></tr>
+        <tr><td class="id">i</td><td>Tool parameter injection</td><td>RequestValidator rejects malformed parameters at the wire boundary</td><td class="res">PASS — RequestValidator rejects malformed parameters at the MCP wire boundary</td></tr>
+        <tr><td class="id">j</td><td>Tool invocation path confusion</td><td>MCP initialize returns daemon-Ed25519-signed <code>serverInfo</code> identity block (TOFU)</td><td class="res">PASS — MCP initialize returns daemon-Ed25519-signed serverInfo identity block (TOFU)</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3 style="font-family:var(--font-mono);font-size:1rem;color:var(--text);margin:1.75rem 0 .6rem">Recommendations (a–g)</h3>
+    <div class="scroll-x">
+    <table class="matrix">
+      <thead><tr><th>#</th><th>NSA recommendation</th><th>Observable live-hive test</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td class="id">a</td><td>Choose supported MCP projects</td><td>live <code>/api/v1/health</code> reports pinned version 0.7.0 + schema 55 on every node</td><td class="res">PASS — /api/v1/health reports pinned version 0.7.0 + schema 55 on every node</td></tr>
+        <tr><td class="id">b</td><td>Design for boundaries</td><td>namespace isolation + per-region VPC substrate boundary + fail-CLOSED defaults verified live</td><td class="res">PASS — namespace isolation + per-region VPC substrate boundary + fail-CLOSED defaults verified live</td></tr>
+        <tr><td class="id">c</td><td>Validate parameters</td><td>malformed / out-of-range write rejected with typed validation error</td><td class="res">PASS — malformed / out-of-range write rejected with typed RequestValidator error</td></tr>
+        <tr><td class="id">d</td><td>Constrain &amp; sandbox tool execution</td><td>Form-7 governance gate live (R001–R004 enabled); permissions=enforce</td><td class="res">PASS — governance gate live (permissions=enforce, attestation required, fail-closed) on every MCP write path</td></tr>
+        <tr><td class="id">e</td><td>Sign &amp; verify MCP messages</td><td>leg-2 Ed25519 sig required (missing → 401); V-4 chain verifies; serverInfo signed</td><td class="res">PASS — leg-2 Ed25519 sig required (missing → 401); V-4 MCP/L4 chain verifies; serverInfo signed at initialize</td></tr>
+        <tr><td class="id">f</td><td>Filter &amp; monitor output pipelines</td><td><code>Accept-Provenance: verbose</code> envelope returns citations / ConfidenceTier / MemoryKind</td><td class="res">PASS — Accept-Provenance: verbose envelope returns citations / ConfidenceTier / MemoryKind</td></tr>
+        <tr><td class="id">g</td><td>Instrument for logging &amp; detection</td><td>bare <code>/metrics</code> Prometheus surface reachable; federation-convergence probe observable</td><td class="res">PASS — bare /metrics Prometheus surface reachable; federation-convergence probe observable</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p style="font-size:.85rem;margin-top:1rem">Live assertions are driven by the <code>nsa_gaps</code> + <code>crypto</code> + <code>regression</code> test groups against the real TLS+mTLS path. Full per-claim mapping with file:line provenance: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.</p>
+  </div>
+</section>
+
+<!-- ============ HONEST LIMITATIONS ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Honest limitations</span>
+    <h2 class="sans">What this posture does not claim.</h2>
+    <p class="lede">The prime directive forbids papering over gaps. A mature security posture is transparent about its trust boundaries. The limitations below are split into two clearly-separated buckets: <strong>(1)</strong> the one genuine honest limitation that lives <em>within</em> NSA CSI MCP scope — the MCP / federation interface — and <strong>(2)</strong> transparent substrate / storage engineering findings that are tracked separately and are explicitly <em>not</em> NSA CSI MCP compliance gaps. The NSA CSI MCP guidance applies to the MCP interface/protocol, not to the postgres connections or storage backend. The full companion is <a href="../compliance/honest-limitations.md">honest-limitations.md</a>.</p>
+
+    <h3 style="font-family:var(--font-mono);font-size:1rem;color:var(--text);margin:1.5rem 0 .6rem">1 · Within NSA CSI MCP scope (the MCP / federation interface)</h3>
+    <div class="honest-box">
+      <strong>Federation-receive is claimed-by-default at the MCP/federation boundary</strong>
+      A compromised peer holding a valid mTLS client cert can push under any <code>agent_id</code>; the receiving side trusts the envelope-attributed sender. <strong>mTLS + the peer allowlist + zero-touch CA enrollment are the trust boundary</strong> here — they bound <em>which machines</em> can speak (only enrolled, CA-rooted peers), not which <code>agent_id</code> each asserts on a received write. Per-write federation-receive attestation (verifying the asserting agent's own signature on every received write) is a v0.8 item, tracked in <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>. This is the single honest limitation that falls inside the MCP CSI surface, and it is disclosed rather than silently carried.
+    </div>
+
+    <h3 style="font-family:var(--font-mono);font-size:1rem;color:var(--text);margin:1.75rem 0 .6rem">2 · Outside NSA CSI MCP scope (substrate / storage findings — <em>not</em> compliance gaps)</h3>
+    <p class="lede" style="margin-bottom:1rem">These are transparent engineering findings on the substrate / storage layer, tracked separately. They are <strong>not</strong> NSA CSI MCP limitations — the MCP interface, federation protocol, and the three encryption legs (including Leg-3 daemon&rarr;Postgres TLS) all pass at the MCP surface. They are listed here for full disclosure.</p>
+    <div class="honest-box">
+      <strong>#1536 — Form-7 signed rules are sqlite-substrate-scoped</strong>
+      The Batman Form-7 R001–R004 signed filesystem/process rules are scoped to the sqlite substrate. On the <strong>postgres</strong> peers of this hive the live governance is the <em>env battery</em> (attestation, sig, nonce, enrollment, permissions=enforce, fail-closed). A storage-substrate scoping item, not an MCP-interface gap. <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1536">#1536</a>.
+    </div>
+    <div class="honest-box">
+      <strong>#1539 — no HTTP pubkey-bind route</strong>
+      There is no HTTP route to bind a public key over the API surface yet; key binding is handled out-of-band by the zero-touch CA enrollment path. An API-surface convenience item, not an MCP CSI gap. <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1539">#1539</a>.
+    </div>
+    <div class="honest-box">
+      <strong>#1541 — closed / not-an-issue (postgres <code>signed_events</code>)</strong>
+      Investigated and closed: postgres peer-to-peer comms <em>are</em> TLS via Leg-3 (daemon&rarr;PG verify-full, TLSv1.3). No storage-layer plaintext path exists. Resolved &mdash; carried here only for audit transparency. <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1541">#1541</a>.
+    </div>
+    <div class="honest-box">
+      <strong>#1542 — <code>PostgresStore::link_signed</code> is a no-op (KG-on-postgres gap)</strong>
+      The signed-link write is currently a no-op on the postgres adapter, leaving a knowledge-graph-on-postgres gap. The MCP/L4 <code>signed_events</code> tamper-evident chain itself verifies (see the V-4 row above); this is a separate storage-layer adapter item. <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1542">#1542</a>.
+    </div>
+    <div class="honest-box">
+      <strong>#1543 — <code>source_uri</code> not projected on postgres read</strong>
+      The <code>source_uri</code> provenance field is written but not projected back on the postgres read path. A storage-adapter projection fix; the verbose-provenance envelope at the MCP surface is otherwise complete. <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1543">#1543</a>.
+    </div>
+    <div class="honest-box">
+      <strong>#1544 — bulk ingest saturates per-agent quota (config / scale)</strong>
+      A large bulk ingest can saturate the per-agent K8 quota; this is a configuration / scale-tuning concern (operators raise the per-agent quota for bulk-ingest agents), not a security boundary. <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1544">#1544</a>.
+    </div>
+    <p style="font-size:.85rem">These findings are framed honestly per the substrate's honesty discipline (the v0.6.3.1 capabilities-v2 honesty floor). Bucket 1 scopes the MCP/federation interface's residual risk precisely; bucket 2 is transparent substrate engineering tracked separately and explicitly out of NSA CSI MCP scope.</p>
+  </div>
+</section>
+
+<!-- ============ REPRODUCIBILITY ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Reproducibility</span>
+    <h2 class="sans">Stand the whole hive up from one directory.</h2>
+    <p class="lede">Everything a reviewer needs to reproduce both the environment and the results lives in <code>deploy/do-1461/</code> and ships inside <code>release/v0.7.0</code>. Terraform stands the infrastructure up (3 regions, one VPC per region, tag-based firewall); a push-based toolkit brings every node to a verified Batman-active state; a harness proves it.</p>
+
+    <div class="snip"><span class="cm"># one directory, one deterministic 0→60 flow</span>
+make seed up provision validate test   <span class="cm"># build, prove, full-spectrum test</span>
+make down                              <span class="cm"># tear it all down</span></div>
+
+    <div class="cards" style="margin-top:1.5rem">
+      <div class="card">
+        <div class="lbl">Terraform</div>
+        <h3 style="font-family:var(--font-mono)">3-region infra</h3>
+        <p>One private VPC per region (regional by DO design), tag-based firewall, role droplets, deterministic outputs. <code>inventory.json</code> is a pure projection of TF state — the whole toolkit drives off it.</p>
+      </div>
+      <div class="card">
+        <div class="lbl">Push-based provision</div>
+        <h3 style="font-family:var(--font-mono)">00 → 50 + 46_batman</h3>
+        <p>Deterministic, idempotent SSH steps: <code>00</code> inventory → <code>05</code> wait-ssh → <code>10</code> golden binary → <code>15</code> TLS (before PG) → <code>20</code> PG/AGE → <code>25</code> Ollama embed → <code>30</code> config → <code>45</code> zero-touch → <code>46_batman</code> → <code>50</code> federation.</p>
+      </div>
+      <div class="card">
+        <div class="lbl">Pinned stack</div>
+        <h3 style="font-family:var(--font-mono)">single-source constants</h3>
+        <p>PostgreSQL <code>18.4-1.pgdg24.04+1</code> · Apache AGE <code>1.7.0</code> · pgvector <code>0.8.2</code> · schema <code>v55</code> · golden binary <code>sha256</code>-asserted · <code>nomic-embed-text</code> 768-dim CPU embedder. Installed natively — no Docker anywhere on the fleet.</p>
+      </div>
+    </div>
+
+    <div class="warn-box">
+      <strong>What "reproducible" means here</strong>
+      Pinned artifacts (golden binary <code>sha256</code> / version <code>0.7.0</code> / schema <code>v55</code> / pinned pgdg <code>.deb</code>s / pinned Ollama release) are single-source named constants in <code>provision/lib.sh</code>, overridable by env for forks. The seed corpus is pinned by <code>sha256</code> in <code>CORPUS_MANIFEST.json</code>; every tunable knob is a named constant, not a magic literal. The campaign CA + per-node keys are generated once and reused on re-runs for stable trust. <code>make validate</code> exercises the live fleet over the real TLS+mTLS path and emits a JSON + tabular report under <code>.local-runs/do-1461/reports/</code>; the committed baseline artifact set is the attested Atlas Corpus baseline under <code>deploy/do-1461/atlas/results/</code>. Reference: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/deploy/do-1461/README.md">deploy/do-1461/README.md</a>.
+    </div>
+
+    <div class="warn-box">
+      <strong>Verified across two independent clean-room 0&rarr;60 runs</strong>
+      The results on this page are not a single lucky run. The hive was stood up, proven, and torn down across <strong>two fully independent clean-room runs</strong>: <code>terraform destroy</code> &rarr; fresh <code>terraform apply</code> &rarr; full push-based <code>provision</code> &rarr; complete retest, with the golden-binary <code>sha256</code>, the corpus <code>sha256</code> (<code>CORPUS_MANIFEST.json</code>), and every tunable knob pinned as named constants on both runs. Each round pins and fleet-asserts its own golden-binary <code>sha256</code> on all 15 nodes (<code>binary.sha256</code> in the verify report); both rounds reproduced the same 100% GREEN result set (119/119 verify checks).
+      <!-- PHASE-3E SHA NOTE (orchestrator): this page deliberately carries NO literal golden-binary sha256 in
+           visible text, so the scheduled redeploy with the newer golden binary
+           (provision/lib.sh GOLDEN_SHA256 = c3aba0af2a2eeb6ad47ff078b524402f8c04998281734e176e80539c2cb4bee3)
+           requires no inline SHA patch here. For provenance: round-1 artifacts (verify-20260608T231547Z)
+           asserted 2b5579104ad81b7241922d5163b9adb20c4c37c06013fdb967875267ba5718fe; round-2 artifacts
+           (verify-20260609T133956Z) asserted 624ed37c3c69709653af68820ab2ddac82f1ebfc36550bf212de9ad4b164df62.
+           If a literal SHA is ever surfaced on this page, the two spots to keep in lockstep with
+           provision/lib.sh GOLDEN_SHA256 are: (1) the "Pinned stack" card above, (2) this warn-box. -->
+
+      <br><br>
+      <strong>DO platform constraint (does not affect reproducibility):</strong> on DigitalOcean a region's <em>default</em> VPC cannot be deleted. Teardown therefore destroys <strong>100% of compute and substrate</strong> (every droplet, every PostgreSQL/AGE/pgvector node, every peer) while the empty regional VPC <em>container</em> persists and is re-used on the next <code>apply</code>. The container holds no compute, no data, and no trust material between runs, so re-using it does not affect the clean-room property of the 0&rarr;60 reproduction.
+    </div>
+
+    <div class="scroll-x">
+    <table class="matrix">
+      <thead><tr><th>Step</th><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td><code>make seed</code></td><td><code>terraform init</code> + <code>validate</code> (no cloud mutation)</td></tr>
+        <tr><td class="id">2</td><td><code>make up</code></td><td><code>terraform apply</code> → fleet; render <code>inventory.json</code> from TF state</td></tr>
+        <tr><td class="id">3</td><td><code>make provision</code></td><td>push-based bring-up, steps <code>00</code>→<code>50</code> (incl. <code>46_batman</code>)</td></tr>
+        <tr><td class="id">4</td><td><code>make validate</code></td><td>verification harness → machine + human report; non-zero on any FAIL</td></tr>
+        <tr><td class="id">5</td><td><code>make test</code></td><td>full-spectrum P3 suite (regression / crypto / federation / zerotouch / a2a / ai_nhi / nsa_gaps / curator)</td></tr>
+        <tr><td class="id">—</td><td><code>make down</code></td><td><code>terraform destroy</code> (destructive; 5s abort window)</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ TOPOLOGY TABLE ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Fleet manifest</span>
+    <h2 class="sans">15 nodes, named by function.</h2>
+    <p class="lede">Hostnames encode each node's function: <code>do-1461-&lt;function&gt;-&lt;region&gt;-&lt;NN&gt;</code>. Each of the three regions is a 5-node unit — three peers + one PG + one NHI agent — for <strong>15 nodes total (9 peers + 3 PG + 3 agents)</strong>. Nine peers (3 per region) form the W=2-synchronous-quorum mesh with eventual cross-region convergence; three pg nodes (one per region) each run native PostgreSQL and are never federation members; three NHI agents (one per region, an xAI grok-4.3 client) are pure mTLS clients exercising the <code>a2a</code> + <code>ai_nhi</code> test groups and are <em>never</em> federation members. This 15-node topology was verified <strong>identically</strong> across both independent clean-room reproducibility rounds.</p>
+    <div class="scroll-x">
+    <table class="matrix">
+      <thead><tr><th>Host</th><th>Role</th><th>Region</th><th>Runs</th></tr></thead>
+      <tbody>
+        <tr><td><code>do-1461-peer-nyc3-01..03</code></td><td>peer ×3</td><td style="color:var(--rg-nyc)">nyc3</td><td>federated <code>ai-memory serve</code> + CPU Ollama embedder sidecar</td></tr>
+        <tr><td><code>do-1461-pg-nyc3-01</code></td><td>pg</td><td style="color:var(--rg-nyc)">nyc3</td><td>regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2</td></tr>
+        <tr><td><code>do-1461-agent-nyc3-01</code></td><td>agent</td><td style="color:var(--rg-nyc)">nyc3</td><td>NHI agent — xAI grok-4.3 mTLS client (Leg-1); exercises <code>a2a</code> + <code>ai_nhi</code>; not a federation member</td></tr>
+        <tr><td><code>do-1461-peer-fra1-01..03</code></td><td>peer ×3</td><td style="color:var(--rg-fra)">fra1</td><td>federated <code>ai-memory serve</code> + CPU Ollama embedder sidecar</td></tr>
+        <tr><td><code>do-1461-pg-fra1-01</code></td><td>pg</td><td style="color:var(--rg-fra)">fra1</td><td>regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2</td></tr>
+        <tr><td><code>do-1461-agent-fra1-01</code></td><td>agent</td><td style="color:var(--rg-fra)">fra1</td><td>NHI agent — xAI grok-4.3 mTLS client (Leg-1); exercises <code>a2a</code> + <code>ai_nhi</code>; not a federation member</td></tr>
+        <tr><td><code>do-1461-peer-sgp1-01..03</code></td><td>peer ×3</td><td style="color:var(--rg-sgp)">sgp1</td><td>federated <code>ai-memory serve</code> + CPU Ollama embedder sidecar</td></tr>
+        <tr><td><code>do-1461-pg-sgp1-01</code></td><td>pg</td><td style="color:var(--rg-sgp)">sgp1</td><td>regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2</td></tr>
+        <tr><td><code>do-1461-agent-sgp1-01</code></td><td>agent</td><td style="color:var(--rg-sgp)">sgp1</td><td>NHI agent — xAI grok-4.3 mTLS client (Leg-1); exercises <code>a2a</code> + <code>ai_nhi</code>; not a federation member</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ RELATED ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Related</span>
+    <h2 class="sans">Where to read more.</h2>
+    <ul style="color:var(--text-muted);font-size:.92rem;list-style:none;padding-left:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:.6rem">
+      <li>• <a href="../batman-active-mode.html" style="color:var(--text)">Batman Mode atlas</a> — single-node activation recipe + the 7 forms</li>
+      <li>• <a href="../compliance/nsa-csi-mcp.html" style="color:var(--text)">NSA CSI MCP mapping</a> — full concern/recommendation matrix with provenance</li>
+      <li>• <a href="../compliance/honest-limitations.md" style="color:var(--text)">honest-limitations.md</a> — what the substrate does not defend against</li>
+      <li>• <a href="../encryption.html" style="color:var(--text)">Encryption atlas</a> — SQLCipher / mTLS / HMAC-mandatory webhooks</li>
+      <li>• <a href="../zero-touch-trust.html" style="color:var(--text)">Zero-touch trust</a> — CA-rooted O(1) peer enrollment</li>
+      <li>• <a href="../architectures-t5.html" style="color:var(--text)">T5 — Global Hive</a> — the architecture tier this fleet realises</li>
+      <li>• <a href="../signed-events-v4.md" style="color:var(--text)">signed-events-v4.md</a> — the V-4 tamper-evident audit chain</li>
+      <li>• <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/deploy/do-1461/README.md" style="color:var(--text)">deploy/do-1461/README.md</a> — the canonical 0→60 runbook</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="footer-links">
+    <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
+    <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
+    <a href="../batman-active-mode.html">Batman Mode</a>
+    <a href="../credits.html">Credits</a>
+    <a href="../whats-new-v07.html">v0.7.0</a>
+  </div>
+  <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
+  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.7.0 GA deliverable.</div>
+  <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem; margin-left:auto; margin-right:auto">
+    <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
+  </div>
+</footer>
+
+</body>
+</html>

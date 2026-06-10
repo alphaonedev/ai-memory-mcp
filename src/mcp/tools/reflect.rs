@@ -6,6 +6,8 @@
 use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::param_names;
+use crate::models::field_names;
 use crate::models::{GovernedAction, Tier};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -98,7 +100,7 @@ pub(crate) fn parse_reflect_input(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<(db::ReflectInput, Option<i64>), String> {
-    let source_ids_arr = params["source_ids"]
+    let source_ids_arr = params[param_names::SOURCE_IDS]
         .as_array()
         .ok_or("source_ids is required (array of memory IDs)")?;
     if source_ids_arr.is_empty() {
@@ -113,17 +115,18 @@ pub(crate) fn parse_reflect_input(
     }
     let title = params["title"]
         .as_str()
-        .ok_or("title is required")?
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?
         .to_string();
     let content = params["content"]
         .as_str()
-        .ok_or("content is required")?
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
     let tags: Vec<String> = params["tags"]
         .as_array()
         .map(|a| {
@@ -137,7 +140,9 @@ pub(crate) fn parse_reflect_input(
     } else {
         serde_json::json!({})
     };
-    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    let caller_depth: Option<i64> = params
+        .get(param_names::DEPTH)
+        .and_then(serde_json::Value::as_i64);
     if let Some(d) = caller_depth {
         if d < 0 {
             return Err(format!(
@@ -145,9 +150,11 @@ pub(crate) fn parse_reflect_input(
             ));
         }
     }
-    let explicit_agent_id = params["agent_id"]
-        .as_str()
-        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let explicit_agent_id = params["agent_id"].as_str().or_else(|| {
+        metadata
+            .get(param_names::AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+    });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
     let input = db::ReflectInput {
@@ -186,7 +193,7 @@ pub fn handle_reflect(
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<Value, String> {
     // ─── Argument parsing ───────────────────────────────────────────
-    let source_ids_arr = params["source_ids"]
+    let source_ids_arr = params[param_names::SOURCE_IDS]
         .as_array()
         .ok_or("source_ids is required (array of memory IDs)")?;
     if source_ids_arr.is_empty() {
@@ -201,17 +208,18 @@ pub fn handle_reflect(
     }
     let title = params["title"]
         .as_str()
-        .ok_or("title is required")?
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?
         .to_string();
     let content = params["content"]
         .as_str()
-        .ok_or("content is required")?
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier = Tier::from_str(tier_str).ok_or(format!("invalid tier: {tier_str}"))?;
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
     let namespace = params["namespace"].as_str().map(str::to_string);
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params["confidence"].as_f64().unwrap_or(1.0);
+    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
     let tags: Vec<String> = params["tags"]
         .as_array()
         .map(|a| {
@@ -239,7 +247,9 @@ pub fn handle_reflect(
     // didn't. The fix surfaces a typed refusal slug that fits the
     // existing `REFLECTION_DEPTH_EXCEEDED` / `REFLECTION_HOOK_VETO`
     // family of stable string-prefix errors.
-    let caller_depth: Option<i64> = params.get("depth").and_then(serde_json::Value::as_i64);
+    let caller_depth: Option<i64> = params
+        .get(param_names::DEPTH)
+        .and_then(serde_json::Value::as_i64);
     if let Some(d) = caller_depth {
         if d < 0 {
             return Err(format!(
@@ -251,9 +261,11 @@ pub fn handle_reflect(
     // NHI: resolve agent_id via the same precedence chain memory_store
     // uses, so the reflection memory's `metadata.agent_id` is consistent
     // with regular stores.
-    let explicit_agent_id = params["agent_id"]
-        .as_str()
-        .or_else(|| metadata.get("agent_id").and_then(serde_json::Value::as_str));
+    let explicit_agent_id = params["agent_id"].as_str().or_else(|| {
+        metadata
+            .get(param_names::AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+    });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
 
@@ -364,14 +376,14 @@ pub fn handle_reflect(
                     // pending → execute round-trip — sibling defect
                     // to #1172, surfaced by the Block 1 QC audit.
                     let payload = json!({
-                        "source_ids": input.source_ids,
+                        (field_names::SOURCE_IDS): input.source_ids,
                         "title": input.title,
                         "content": input.content,
                         "namespace": ns,
                         "tier": input.tier.as_str(),
                         "tags": input.tags,
                         "priority": input.priority,
-                        "confidence": input.confidence,
+                        (field_names::CONFIDENCE): input.confidence,
                         "agent_id": input.agent_id,
                         "metadata": input.metadata,
                         "proposed_depth": new_depth_u32,
@@ -388,7 +400,7 @@ pub fn handle_reflect(
                     crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
                     return Ok(json!({
                         "status": "pending",
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                         "reason": "governance requires approval for reflections above depth threshold",
                         "action": "reflect",
                         "namespace": ns,
@@ -450,7 +462,7 @@ pub fn handle_reflect(
     // semantic recall can find it. Failure is logged, not fatal — the
     // memory is already committed.
     if let Some(emb) = embedder {
-        let text = format!("{title} {content}");
+        let text = crate::embeddings::embedding_document(title, content);
         match emb.embed(&text) {
             Ok(embedding) => {
                 if let Err(e) = db::set_embedding(conn, &outcome.id, &embedding) {
@@ -480,7 +492,7 @@ pub fn handle_reflect(
     // events on top of this baseline.
     crate::subscriptions::dispatch_event(
         conn,
-        "memory_store",
+        crate::mcp::registry::tool_names::MEMORY_STORE,
         &outcome.id,
         &outcome.namespace,
         Some(&input.agent_id),
@@ -489,8 +501,8 @@ pub fn handle_reflect(
 
     Ok(json!({
         "id": outcome.id,
-        "reflection_depth": outcome.reflection_depth,
-        "reflects_on": outcome.reflects_on,
+        (field_names::REFLECTION_DEPTH): outcome.reflection_depth,
+        (crate::models::link::REL_REFLECTS_ON): outcome.reflects_on,
         "namespace": outcome.namespace,
     }))
 }
@@ -561,11 +573,10 @@ impl McpTool for ReflectTool {
         "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) — refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ReflectRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ReflectRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

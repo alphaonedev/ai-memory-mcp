@@ -44,6 +44,10 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
+// ── #1558 batch 6 — repeated `.expect` labels on just-built JSON nodes ──
+const EXPECT_JUST_INSERTED_OBJECT: &str = "just-inserted object";
+const EXPECT_JUST_INSERTED_ARRAY: &str = "just-inserted array";
+
 /// Sentinel key that marks the start of a managed block. Used by both
 /// install (to recognise an existing block) and uninstall (to find the
 /// block to remove).
@@ -60,6 +64,37 @@ const MARKER_PAYLOAD: &str = "Do not edit. Managed by `ai-memory install`. https
 /// any user-added siblings alone (defence-in-depth against a user
 /// editing `// ai-memory:managed-block:end` out of the file).
 const MANAGED_KEYS_PROPERTY: &str = "// ai-memory:managed-keys";
+
+// --- Harness config key names (#1558) --------------------------------------
+
+/// Agent-target key for the Claude Code harness (`Target::ClaudeCode`
+/// display name + managed-keys metadata).
+const AGENT_TARGET_CLAUDE_CODE: &str = "claude-code";
+
+/// File name of Claude Desktop's MCP config under its OS-specific
+/// application-support directory. Only referenced on the macOS /
+/// Windows auto-discovery arms (Linux requires `--config`).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const CLAUDE_DESKTOP_CONFIG_FILENAME: &str = "claude_desktop_config.json";
+
+/// MCP-spec camelCase servers key used by every JSON-config harness.
+/// `pub(crate)` because the `config migrate --also-clean-claude-json`
+/// rewriter in `src/cli/commands/config.rs` strips `env` blocks from
+/// entries under the same key.
+pub(crate) const KEY_MCP_SERVERS: &str = "mcpServers";
+
+/// Continue's wrapper key — its MCP block lives under
+/// `experimental.modelContextProtocolServers`.
+const KEY_EXPERIMENTAL: &str = "experimental";
+
+/// Continue's MCP server-list key under [`KEY_EXPERIMENTAL`].
+const KEY_MODEL_CONTEXT_PROTOCOL_SERVERS: &str = "modelContextProtocolServers";
+
+/// Claude Code hook-event key for the boot (memory-rehydration) hook.
+const HOOK_EVENT_SESSION_START: &str = "SessionStart";
+
+/// Claude Code hook-event key for the policy-engine tool-call hook.
+const HOOK_EVENT_PRE_TOOL_USE: &str = "PreToolUse";
 
 /// Args for `ai-memory install`.
 #[derive(Args, Debug)]
@@ -200,7 +235,7 @@ impl Target {
     /// Display name used in stdout and managed-keys metadata.
     fn name(self) -> &'static str {
         match self {
-            Self::ClaudeCode => "claude-code",
+            Self::ClaudeCode => AGENT_TARGET_CLAUDE_CODE,
             Self::Openclaw => "openclaw",
             Self::Cursor => "cursor",
             Self::Cline => "cline",
@@ -396,7 +431,7 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
     }
 
     std::fs::write(&config_path, &after_text)
-        .with_context(|| format!("writing {}", config_path.display()))?;
+        .with_context(|| crate::errors::msg::writing(config_path.display()))?;
 
     writeln!(
         out.stdout,
@@ -645,7 +680,7 @@ fn resolve_config_path(target: Target, args: &TargetArgs) -> Result<PathBuf> {
                 home.join("Library")
                     .join("Application Support")
                     .join("Claude")
-                    .join("claude_desktop_config.json")
+                    .join(CLAUDE_DESKTOP_CONFIG_FILENAME)
             }
             #[cfg(target_os = "windows")]
             {
@@ -653,13 +688,13 @@ fn resolve_config_path(target: Target, args: &TargetArgs) -> Result<PathBuf> {
                     .map(|p| {
                         std::path::PathBuf::from(p)
                             .join("Claude")
-                            .join("claude_desktop_config.json")
+                            .join(CLAUDE_DESKTOP_CONFIG_FILENAME)
                     })
                     .unwrap_or_else(|| {
                         home.join("AppData")
                             .join("Roaming")
                             .join("Claude")
-                            .join("claude_desktop_config.json")
+                            .join(CLAUDE_DESKTOP_CONFIG_FILENAME)
                     })
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -779,8 +814,8 @@ fn read_config_or_empty(path: &Path) -> Result<(String, Value)> {
     if !path.exists() {
         return Ok((String::new(), Value::Object(Map::new())));
     }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| crate::errors::msg::reading(path.display()))?;
     if text.trim().is_empty() {
         return Ok((text, Value::Object(Map::new())));
     }
@@ -873,7 +908,7 @@ fn apply_managed_block(
 fn mcp_servers_key(target: Target, format: ConfigFormat) -> &'static str {
     match (target, format) {
         (Target::Codex, ConfigFormat::Toml) => "mcp_servers",
-        _ => "mcpServers",
+        _ => KEY_MCP_SERVERS,
     }
 }
 
@@ -920,7 +955,9 @@ fn apply_mcp_standard(obj: &mut Map<String, Value>, binary: &str, mcp_key: &str)
     if !mcp_servers.is_object() {
         *mcp_servers = Value::Object(Map::new());
     }
-    let mcp_obj = mcp_servers.as_object_mut().expect("just-inserted object");
+    let mcp_obj = mcp_servers
+        .as_object_mut()
+        .expect(EXPECT_JUST_INSERTED_OBJECT);
     mcp_obj.insert(
         "ai-memory".to_string(),
         serde_json::json!({
@@ -983,25 +1020,29 @@ fn apply_claude_code(obj: &mut Map<String, Value>, binary: &str) {
     if !hooks.is_object() {
         *hooks = Value::Object(Map::new());
     }
-    let hooks_obj = hooks.as_object_mut().expect("just-inserted object");
+    let hooks_obj = hooks.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let session_start = hooks_obj
-        .entry("SessionStart".to_string())
+        .entry(HOOK_EVENT_SESSION_START.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !session_start.is_array() {
         *session_start = Value::Array(Vec::new());
     }
-    let arr = session_start.as_array_mut().expect("just-inserted array");
+    let arr = session_start
+        .as_array_mut()
+        .expect(EXPECT_JUST_INSERTED_ARRAY);
     arr.retain(|v| !is_managed_value(v));
     arr.insert(0, entry);
 }
 
 fn remove_claude_code(obj: &mut Map<String, Value>) {
     if let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut())
-        && let Some(arr) = hooks.get_mut("SessionStart").and_then(|s| s.as_array_mut())
+        && let Some(arr) = hooks
+            .get_mut(HOOK_EVENT_SESSION_START)
+            .and_then(|s| s.as_array_mut())
     {
         arr.retain(|v| !is_managed_value(v));
         if arr.is_empty() {
-            hooks.remove("SessionStart");
+            hooks.remove(HOOK_EVENT_SESSION_START);
         }
     }
     // Don't strip an empty hooks object if the user had one — leave their
@@ -1100,14 +1141,14 @@ fn apply_claude_code_pretool(
     if !hooks.is_object() {
         *hooks = Value::Object(Map::new());
     }
-    let hooks_obj = hooks.as_object_mut().expect("just-inserted object");
+    let hooks_obj = hooks.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let pretool = hooks_obj
-        .entry("PreToolUse".to_string())
+        .entry(HOOK_EVENT_PRE_TOOL_USE.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !pretool.is_array() {
         *pretool = Value::Array(Vec::new());
     }
-    let arr = pretool.as_array_mut().expect("just-inserted array");
+    let arr = pretool.as_array_mut().expect(EXPECT_JUST_INSERTED_ARRAY);
 
     // Detect any operator-authored entry that points at the same MCP
     // tool with a different `matcher`. That's the conflict path —
@@ -1152,11 +1193,13 @@ fn apply_claude_code_pretool(
 /// [`apply_claude_code_pretool`]). Idempotent on a clean config.
 fn remove_claude_code_pretool(obj: &mut Map<String, Value>) {
     if let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut())
-        && let Some(arr) = hooks.get_mut("PreToolUse").and_then(|s| s.as_array_mut())
+        && let Some(arr) = hooks
+            .get_mut(HOOK_EVENT_PRE_TOOL_USE)
+            .and_then(|s| s.as_array_mut())
     {
         arr.retain(|v| !is_managed_value(v));
         if arr.is_empty() {
-            hooks.remove("PreToolUse");
+            hooks.remove(HOOK_EVENT_PRE_TOOL_USE);
         }
     }
     if let Some(hooks) = obj.get("hooks").and_then(|h| h.as_object())
@@ -1236,14 +1279,14 @@ fn apply_openclaw(obj: &mut Map<String, Value>, binary: &str) {
     if !mcp.is_object() {
         *mcp = Value::Object(Map::new());
     }
-    let mcp_obj = mcp.as_object_mut().expect("just-inserted object");
+    let mcp_obj = mcp.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let servers = mcp_obj
         .entry("servers".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if !servers.is_object() {
         *servers = Value::Object(Map::new());
     }
-    let servers_obj = servers.as_object_mut().expect("just-inserted object");
+    let servers_obj = servers.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     servers_obj.insert("ai-memory".to_string(), ai_memory_server_value(binary));
 }
 
@@ -1269,24 +1312,24 @@ fn remove_openclaw(obj: &mut Map<String, Value>) {
 
 fn apply_cursor(obj: &mut Map<String, Value>, binary: &str) {
     let servers = obj
-        .entry("mcpServers".to_string())
+        .entry(KEY_MCP_SERVERS.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if !servers.is_object() {
         *servers = Value::Object(Map::new());
     }
-    let servers_obj = servers.as_object_mut().expect("just-inserted object");
+    let servers_obj = servers.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     servers_obj.insert("ai-memory".to_string(), ai_memory_server_value(binary));
 }
 
 fn remove_cursor(obj: &mut Map<String, Value>) {
-    if let Some(servers) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+    if let Some(servers) = obj.get_mut(KEY_MCP_SERVERS).and_then(|v| v.as_object_mut()) {
         if let Some(v) = servers.get("ai-memory") {
             if is_managed_value(v) {
                 servers.remove("ai-memory");
             }
         }
         if servers.is_empty() {
-            obj.remove("mcpServers");
+            obj.remove(KEY_MCP_SERVERS);
         }
     }
 }
@@ -1308,19 +1351,19 @@ fn apply_continue(obj: &mut Map<String, Value>, binary: &str) {
     // Continue's MCP config lives under experimental.modelContextProtocolServers
     // (an array of transport entries).
     let exp = obj
-        .entry("experimental".to_string())
+        .entry(KEY_EXPERIMENTAL.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if !exp.is_object() {
         *exp = Value::Object(Map::new());
     }
-    let exp_obj = exp.as_object_mut().expect("just-inserted object");
+    let exp_obj = exp.as_object_mut().expect(EXPECT_JUST_INSERTED_OBJECT);
     let arr = exp_obj
-        .entry("modelContextProtocolServers".to_string())
+        .entry(KEY_MODEL_CONTEXT_PROTOCOL_SERVERS.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !arr.is_array() {
         *arr = Value::Array(Vec::new());
     }
-    let arr = arr.as_array_mut().expect("just-inserted array");
+    let arr = arr.as_array_mut().expect(EXPECT_JUST_INSERTED_ARRAY);
     arr.retain(|v| !is_managed_value(v));
     let entry = serde_json::json!({
         MARKER_START_KEY: MARKER_PAYLOAD,
@@ -1336,18 +1379,21 @@ fn apply_continue(obj: &mut Map<String, Value>, binary: &str) {
 }
 
 fn remove_continue(obj: &mut Map<String, Value>) {
-    if let Some(exp) = obj.get_mut("experimental").and_then(|v| v.as_object_mut()) {
+    if let Some(exp) = obj
+        .get_mut(KEY_EXPERIMENTAL)
+        .and_then(|v| v.as_object_mut())
+    {
         if let Some(arr) = exp
-            .get_mut("modelContextProtocolServers")
+            .get_mut(KEY_MODEL_CONTEXT_PROTOCOL_SERVERS)
             .and_then(|v| v.as_array_mut())
         {
             arr.retain(|v| !is_managed_value(v));
             if arr.is_empty() {
-                exp.remove("modelContextProtocolServers");
+                exp.remove(KEY_MODEL_CONTEXT_PROTOCOL_SERVERS);
             }
         }
         if exp.is_empty() {
-            obj.remove("experimental");
+            obj.remove(KEY_EXPERIMENTAL);
         }
     }
 }

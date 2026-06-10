@@ -119,7 +119,7 @@ pub(crate) fn resolve_caller_agent_id(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let resolved = crate::identity::resolve_http_agent_id(body, header_val)
-        .map_err(|e| format!("invalid agent_id: {e}"))?;
+        .map_err(|e| crate::errors::msg::invalid("agent_id", e))?;
 
     // 2. Query refinement — same posture as body: when non-empty it
     //    MUST match the authoritative resolved id. Validate first so a
@@ -128,7 +128,8 @@ pub(crate) fn resolve_caller_agent_id(
     if let Some(claim) = query
         && !claim.is_empty()
     {
-        validate::validate_agent_id(claim).map_err(|e| format!("invalid agent_id: {e}"))?;
+        validate::validate_agent_id(claim)
+            .map_err(|e| crate::errors::msg::invalid("agent_id", e))?;
         if claim != resolved {
             return Err(format!(
                 "agent_id_query_header_mismatch: query-supplied agent_id {claim:?} disagrees \
@@ -176,11 +177,11 @@ pub(crate) fn http_caller_ctx(
         // handler can map to a 4xx) is tracked as a v0.7.1 follow-up
         // since it requires touching every call site.
         tracing::warn!(
-            target = "handlers::parity",
+            target: "handlers::parity",
             error = %e,
             "http_caller_ctx: invalid X-Agent-Id / body.agent_id, falling back to anonymous:invalid"
         );
-        "anonymous:invalid".to_string()
+        crate::identity::sentinels::ANONYMOUS_INVALID.to_string()
     });
     crate::store::CallerContext::for_agent(resolved)
 }
@@ -317,7 +318,8 @@ pub fn require_caller_owns_memory(
         .get("agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if owner.is_empty() || owner == caller || caller == "daemon" {
+    if owner.is_empty() || owner == caller || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+    {
         return None;
     }
     if allow_inbox {
@@ -331,7 +333,7 @@ pub fn require_caller_owns_memory(
         }
     }
     tracing::warn!(
-        target: "ai_memory::authz",
+        target: super::AUTHZ_TRACE_TARGET,
         "ownership-gate 403: caller {caller} != owner {owner} (id={})",
         mem.id
     );

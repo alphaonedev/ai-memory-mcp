@@ -8,6 +8,7 @@
 //! functions are the only path inside the curator that mutates the
 //! database; `run_once` guards every call with a `dry_run` check.
 
+use crate::models::field_names;
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -47,7 +48,7 @@ pub(super) fn persist_contradiction(
     let mut updated = mem.metadata.clone();
     if let Some(obj) = updated.as_object_mut() {
         let existing = obj
-            .get("confirmed_contradictions")
+            .get(field_names::CONFIRMED_CONTRADICTIONS)
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
@@ -59,7 +60,7 @@ pub(super) fn persist_contradiction(
             ids.push(against_id.to_string());
         }
         obj.insert(
-            "confirmed_contradictions".to_string(),
+            field_names::CONFIRMED_CONTRADICTIONS.to_string(),
             serde_json::json!(ids),
         );
     }

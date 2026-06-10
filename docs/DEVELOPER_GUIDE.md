@@ -242,13 +242,13 @@ Retroactive conversation import — bulk-imports historical Claude / ChatGPT / S
 
 Hybrid recall algorithm. Blends the FTS5 keyword score and the embedding cosine similarity into a single ranking, applying configurable weighting and a 6-factor scoring formula (recency, priority, access count, tier weight, content match, namespace match). Returns a score field in every recall response so callers can audit ranking decisions.
 
-### `src/identity.rs`
+### `src/identity/`
 
-Non-Human Identity (NHI) resolution for `agent_id`. Centralises the precedence chain across CLI, MCP, and HTTP entry points so `metadata.agent_id` is uniformly populated. Public API: `resolve_agent_id()` (CLI/MCP), `resolve_http_agent_id()` (HTTP body + `X-Agent-Id` header), `preserve_agent_id()` (round-trip), `process_discriminator()` (stable per-process identifier). Default-id formats: `ai:<client>@<hostname>:pid-<pid>` (MCP), `host:<hostname>:pid-<pid>-<uuid8>` (CLI), `anonymous:req-<uuid8>` (HTTP per-request fallback). By default `agent_id` is a *claimed* identity, not attested; a write that presents a valid Ed25519 `signature` is upgraded to `agent_attested` (#626 Layer-3 — see `identity::attest::stamp_attestation`).
+Non-Human Identity (NHI) resolution for `agent_id` (split from the former `src/identity.rs` into per-domain modules: `mod.rs`, `attest.rs`, `sign.rs`, `verify.rs`, `replay.rs`, plus the #1558 additions `sentinels.rs` — reserved caller identities / `RESERVED_AGENT_IDS` — and `keypair.rs` — `DAEMON_KEYPAIR_LABEL` + daemon signing-keypair load). Centralises the precedence chain across CLI, MCP, and HTTP entry points so `metadata.agent_id` is uniformly populated. Public API: `resolve_agent_id()` (CLI/MCP), `resolve_http_agent_id()` (HTTP body + `X-Agent-Id` header), `preserve_agent_id()` (round-trip), `process_discriminator()` (stable per-process identifier). Default-id formats: `ai:<client>@<hostname>:pid-<pid>` (MCP), `host:<hostname>:pid-<pid>-<uuid8>` (CLI), `anonymous:req-<uuid8>` (HTTP per-request fallback). By default `agent_id` is a *claimed* identity, not attested; a write that presents a valid Ed25519 `signature` is upgraded to `agent_attested` (#626 Layer-3 — see `identity::attest::stamp_attestation`).
 
-### `src/curator.rs`
+### `src/curator/`
 
-Autonomous curator daemon (v0.6.1). Runs a periodic sweep over stored memories, invoking `auto_tag` and `detect_contradiction` via the configured LLM and persisting results into each memory's metadata. Complements the synchronous post-store hooks (#265). Hard cap on operations per cycle (default 100); skips internal `_`-prefixed namespaces; honours include/exclude lists; dry-run mode emits a report without touching rows; LLM errors are logged but never abort a cycle. Public API: `CuratorConfig`, `CuratorReport`, `run_once()`, `run_daemon()`.
+Autonomous curator daemon (v0.6.1; split from the former `src/curator.rs` into `mod.rs` + `pipeline.rs`, `candidates.rs`, `cluster.rs`, `compaction.rs`, `persist.rs`, `reflection_pass.rs`). Runs a periodic sweep over stored memories, invoking `auto_tag` and `detect_contradiction` via the configured LLM and persisting results into each memory's metadata. Complements the synchronous post-store hooks (#265). Hard cap on operations per cycle (default 100); skips internal `_`-prefixed namespaces; honours include/exclude lists; dry-run mode emits a report without touching rows; LLM errors are logged but never abort a cycle. Public API: `CuratorConfig`, `CuratorReport`, `run_once()`, `run_daemon()`.
 
 ### `src/autonomy.rs`
 
@@ -265,9 +265,9 @@ Defines the `AutonomyLlm` trait so the curator can be unit-tested without a live
 
 W-of-N quorum-write layer for the peer-mesh sync (v0.7 track C). Scaffolds the contract described in [`ADR-0001-quorum-replication.md`](ADR-0001-quorum-replication.md). The `QuorumWriter` sits ABOVE the existing sync-daemon — deployments without `--quorum-writes` keep the v0.6.0 one-way push behaviour byte-for-byte. Public API: `QuorumPolicy`, `QuorumWriter::commit`, `AckTracker`. Emits metrics: `replication_quorum_ack_total{result}`, `replication_quorum_failures_total{reason}`, `replication_clock_skew_seconds`.
 
-### `src/federation.rs`
+### `src/federation/`
 
-Federation autonomy — wires the quorum primitives from `replication` into the HTTP write path (v0.7 track C, PR 2 of N). When `ai-memory serve` is started with `--quorum-writes N --quorum-peers <urls>`, every successful HTTP write fans out a 1-memory `/api/v1/sync/push` POST to each peer; the write returns OK only once `W-1` peer acks land within `--quorum-timeout-ms`. Fewer acks → `503 quorum_not_met`. Public API: `FederationConfig`, `broadcast_store_quorum()`.
+Federation autonomy (split from the former `src/federation.rs` into `mod.rs` + `quorum.rs`, `peer.rs`, `peer_attestation.rs`, `receive.rs`, `sync.rs`, `signing.rs`, `push_dlq.rs`, `reflection_bookkeeping.rs`, `identity/`) — wires the quorum primitives from `replication` into the HTTP write path (v0.7 track C, PR 2 of N). When `ai-memory serve` is started with `--quorum-writes N --quorum-peers <urls>`, every successful HTTP write fans out a 1-memory `/api/v1/sync/push` POST to each peer; the write returns OK only once `W-1` peer acks land within `--quorum-timeout-ms`. Fewer acks → `503 quorum_not_met`. Public API: `FederationConfig`, `broadcast_store_quorum()`.
 
 ### `src/subscriptions.rs`
 

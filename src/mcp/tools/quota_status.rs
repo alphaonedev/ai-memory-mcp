@@ -3,6 +3,7 @@
 
 //! MCP `memory_quota_status` handler.
 
+use crate::mcp::param_names;
 use serde_json::{Value, json};
 
 /// v0.7 K8 — MCP handler for `memory_quota_status`. Reports per-agent
@@ -30,8 +31,8 @@ use serde_json::{Value, json};
 /// reach without affecting their write capacity in unrelated
 /// namespaces.
 pub fn handle_quota_status(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
-    let agent_id = params.get("agent_id").and_then(Value::as_str);
-    let namespace = params.get("namespace").and_then(Value::as_str);
+    let agent_id = params.get(param_names::AGENT_ID).and_then(Value::as_str);
+    let namespace = params.get(param_names::NAMESPACE).and_then(Value::as_str);
 
     match (agent_id, namespace) {
         // Single (agent, namespace) row.
@@ -113,11 +114,10 @@ impl McpTool for QuotaStatusTool {
          the single row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(QuotaStatusRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<QuotaStatusRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

@@ -41,9 +41,9 @@ pub fn handle_dependents_of_invalidated(
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
-        .ok_or("memory_id is required")?;
+        .ok_or(crate::errors::msg::MEMORY_ID_REQUIRED)?;
     if memory_id.is_empty() {
-        return Err("memory_id cannot be empty".to_string());
+        return Err(crate::errors::msg::MEMORY_ID_EMPTY.to_string());
     }
     let dependents =
         crate::notification::invalidation::list_dependents_of_invalidated(conn, memory_id)
@@ -95,11 +95,10 @@ impl McpTool for DependentsOfInvalidatedTool {
         "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade — dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(DependentsOfInvalidatedRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<DependentsOfInvalidatedRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

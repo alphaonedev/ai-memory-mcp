@@ -81,6 +81,34 @@ const DEFAULT_WRAP_LIMIT: usize = 10;
 const WRAP_PREAMBLE: &str = "You have access to ai-memory, a persistent memory system. \
 The recent context loaded for you appears below. Reference it when relevant to the user's request.";
 
+/// #1575 — subdirectory of the per-user ai-memory data dir
+/// (`~/.ai-memory`, [`crate::AI_MEMORY_HOME_DIR_NAME`]) where the
+/// `MessageFile` strategy stages the boot-context system message.
+const WRAP_STAGING_SUBDIR: &str = "wrap";
+
+/// #1575 — resolve (and secure) the staging directory for the
+/// `MessageFile` boot-context file: `~/.ai-memory/wrap/`, mode 0700.
+///
+/// The boot-context system message contains memory contents, so it
+/// must not sit on a world-readable tmpfs path for the wrapped
+/// agent's whole lifetime (the pre-#1575 behavior — `NamedTempFile`
+/// under `std::env::temp_dir()`). Returns `None` when the home
+/// directory cannot be resolved or the directory cannot be created /
+/// permission-tightened; the caller then falls back to the platform
+/// temp dir with an operator-visible WARN.
+fn message_file_staging_dir() -> Option<std::path::PathBuf> {
+    let dir = dirs::home_dir()?
+        .join(crate::AI_MEMORY_HOME_DIR_NAME)
+        .join(WRAP_STAGING_SUBDIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(dir)
+}
+
 /// Args for `ai-memory wrap`. Designed so the simplest form
 /// (`ai-memory wrap codex -- "hello"`) just works — every flag has a
 /// defaulted value or the lookup table fills it in.
@@ -282,8 +310,38 @@ fn build_command_for_strategy(
             // skips the unlink-while-open trick (which Windows
             // disallows) and cleans up on `Drop`. Either way the file
             // is gone after wrap exits.
-            let mut tf = tempfile::NamedTempFile::new()
-                .context("ai-memory wrap: failed to create system-message tempfile")?;
+            //
+            // #1575 — stage under `~/.ai-memory/wrap/` (0700 dir,
+            // 0600 file) instead of the platform temp dir, so the
+            // memory-bearing boot context never sits on a
+            // world-readable tmpfs path for the agent's lifetime.
+            // The temp dir remains ONLY as a home-unresolvable
+            // fallback, with an operator-visible WARN.
+            let mut tf = match message_file_staging_dir() {
+                Some(dir) => tempfile::NamedTempFile::new_in(&dir).context(
+                    "ai-memory wrap: failed to create system-message file in staging dir",
+                )?,
+                None => {
+                    tracing::warn!(
+                        "ai-memory wrap: could not resolve/secure the {}/{} staging dir under \
+                         the home directory; falling back to the platform temp dir for the \
+                         boot-context message file (#1575 — memory contents will transit a \
+                         shared temp path)",
+                        crate::AI_MEMORY_HOME_DIR_NAME,
+                        WRAP_STAGING_SUBDIR
+                    );
+                    tempfile::NamedTempFile::new()
+                        .context("ai-memory wrap: failed to create system-message tempfile")?
+                }
+            };
+            // Belt-and-braces: the tempfile crate already creates
+            // 0600 on Unix; pin it explicitly so a future tempfile
+            // upgrade can't silently loosen the boot-context file.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(tf.path(), std::fs::Permissions::from_mode(0o600));
+            }
             tf.write_all(system_msg.as_bytes())
                 .context("ai-memory wrap: failed to write system-message tempfile")?;
             // Flush so the agent process reads the full message even
@@ -530,6 +588,42 @@ mod tests {
             "tempfile must be cleaned up on Drop, but {} still exists",
             path_owned.display()
         );
+    }
+
+    /// #1575 — the boot-context message file must be staged under the
+    /// per-user ai-memory data dir (`~/.ai-memory/wrap/`, 0700 dir /
+    /// 0600 file), NOT the platform temp dir. The temp dir is only the
+    /// home-unresolvable fallback (exercised implicitly when
+    /// `dirs::home_dir()` returns `None`, which cannot be forced here
+    /// without unsafe env mutation — the fallback arm is plain
+    /// pre-#1575 behavior).
+    #[test]
+    fn message_file_staged_under_ai_memory_home_with_tight_perms_1575() {
+        let Some(staging) = message_file_staging_dir() else {
+            // No resolvable home in this environment — the WARN +
+            // temp-dir fallback arm applies; nothing to assert.
+            return;
+        };
+        let strat = WrapStrategy::MessageFile {
+            flag: "--message-file".into(),
+        };
+        let (_cmd, tf) =
+            build_command_for_strategy("aider", &strat, "BOOT-CONTEXT-1575", &[]).unwrap();
+        let tf = tf.expect("MessageFile must allocate a staged file");
+        assert_eq!(
+            tf.path().parent(),
+            Some(staging.as_path()),
+            "boot-context file must live under the ai-memory staging dir, got {}",
+            tf.path().display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dmode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dmode, 0o700, "staging dir must be 0700");
+            let fmode = std::fs::metadata(tf.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(fmode, 0o600, "boot-context file must be 0600");
+        }
     }
 
     #[test]

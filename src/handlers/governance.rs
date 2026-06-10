@@ -9,6 +9,7 @@
 //! to resolve). The K10 SSE approval stream lives in [`super::approvals`]
 //! because it carries its own state (subscriber map).
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -78,7 +79,7 @@ pub async fn list_pending(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     let is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
     // v0.7.0 Wave-3 Continuation 5 — postgres-backed daemons read
@@ -110,7 +111,7 @@ pub async fn list_pending(
                     items
                         .into_iter()
                         .filter(|row| {
-                            row.get("requested_by")
+                            row.get(field_names::REQUESTED_BY)
                                 .and_then(serde_json::Value::as_str)
                                 .is_some_and(|rb| rb == caller)
                         })
@@ -119,8 +120,8 @@ pub async fn list_pending(
                 Json(json!({
                     "count": filtered.len(),
                     "pending": filtered,
-                    "storage_backend": "postgres",
-                    "owner_scope": if is_admin { "admin" } else { "caller" },
+                    (field_names::STORAGE_BACKEND): "postgres",
+                    (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
                 }))
                 .into_response()
             }
@@ -147,18 +148,11 @@ pub async fn list_pending(
             Json(json!({
                 "count": filtered.len(),
                 "pending": filtered,
-                "owner_scope": if is_admin { "admin" } else { "caller" },
+                (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
             }))
             .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -184,7 +178,7 @@ pub async fn approve_pending(
         return (
             status,
             Json(json!({
-                "error": "invalid or missing X-AI-Memory-Signature",
+                "error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
                 "hint": "POST /api/v1/pending/{id}/approve requires HMAC signing per K7's pattern. \
                         Set [hooks.subscription] hmac_secret in config and send \
                         X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \"<ts>.<METHOD>.<pending_id>.<body>\")> \
@@ -209,7 +203,7 @@ pub async fn approve_pending(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -225,7 +219,7 @@ pub async fn approve_pending(
         "allow",
         "pending_approve",
         "",
-        json!({ "pending_id": &id }),
+        json!({ (field_names::PENDING_ID): &id }),
     );
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — postgres-backed approve
@@ -255,7 +249,11 @@ pub async fn approve_pending(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Approve,
-                        crate::audit::actor(agent_id.clone(), "http_header", None),
+                        crate::audit::actor(
+                            agent_id.clone(),
+                            crate::audit::synthesis_sources::HTTP_HEADER,
+                            None,
+                        ),
                         crate::audit::target_memory(id.clone(), String::new(), None, None, None),
                     ));
                 }
@@ -277,10 +275,10 @@ pub async fn approve_pending(
                 Json(json!({
                     "approved": true,
                     "id": id,
-                    "decided_by": agent_id,
+                    (field_names::DECIDED_BY): agent_id,
                     "executed": executed_id.is_some(),
                     "memory_id": executed_id,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -292,14 +290,14 @@ pub async fn approve_pending(
                     "id": id,
                     "votes": votes,
                     "quorum": quorum,
-                    "reason": "consensus threshold not yet reached",
-                    "storage_backend": "postgres",
+                    "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
             Ok(SalOutcome::Rejected(reason)) => (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": format!("approve rejected: {reason}")})),
+                Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -352,7 +350,7 @@ pub async fn approve_pending(
                 Json(json!({
                     "approved": true,
                     "id": id,
-                    "decided_by": agent_id,
+                    (field_names::DECIDED_BY): agent_id,
                     "executed": true,
                     "memory_id": memory_id,
                 }))
@@ -375,23 +373,16 @@ pub async fn approve_pending(
                 "id": id,
                 "votes": votes,
                 "quorum": quorum,
-                "reason": "consensus threshold not yet reached",
+                "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
             })),
         )
             .into_response(),
         Ok(ApproveOutcome::Rejected(reason)) => (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": format!("approve rejected: {reason}")})),
+            Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -410,7 +401,7 @@ pub async fn reject_pending(
         return (
             status,
             Json(json!({
-                "error": "invalid or missing X-AI-Memory-Signature",
+                "error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE,
                 "hint": "POST /api/v1/pending/{id}/reject requires HMAC signing per K7's pattern. \
                         Set [hooks.subscription] hmac_secret in config and send \
                         X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), \"<ts>.<METHOD>.<pending_id>.<body>\")> \
@@ -435,7 +426,7 @@ pub async fn reject_pending(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -449,7 +440,7 @@ pub async fn reject_pending(
         "refuse",
         "pending_reject",
         "",
-        json!({ "pending_id": &id }),
+        json!({ (field_names::PENDING_ID): &id }),
     );
 
     // v0.7.0 Wave-3 Continuation 2 (Phase 11) — postgres-backed reject.
@@ -461,21 +452,25 @@ pub async fn reject_pending(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Reject,
-                        crate::audit::actor(agent_id.clone(), "http_header", None),
+                        crate::audit::actor(
+                            agent_id.clone(),
+                            crate::audit::synthesis_sources::HTTP_HEADER,
+                            None,
+                        ),
                         crate::audit::target_memory(id.clone(), String::new(), None, None, None),
                     ));
                 }
                 Json(json!({
                     "rejected": true,
                     "id": id,
-                    "decided_by": agent_id,
-                    "storage_backend": "postgres",
+                    (field_names::DECIDED_BY): agent_id,
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "pending action not found or already decided"})),
+                Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -507,20 +502,14 @@ pub async fn reject_pending(
                     }
                 }
             }
-            Json(json!({"rejected": true, "id": id, "decided_by": agent_id})).into_response()
+            Json(json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent_id}))
+                .into_response()
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "pending action not found or already decided"})),
+            Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

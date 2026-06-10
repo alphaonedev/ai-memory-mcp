@@ -5,6 +5,7 @@
 
 use crate::cli::CliOutput;
 use crate::cli::helpers::id_short;
+use crate::models::field_names;
 use crate::{db, validate};
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -69,7 +70,7 @@ pub fn run(
                         "[{}] {} (archived: {})",
                         id_short(item["id"].as_str().unwrap_or("")),
                         item["title"].as_str().unwrap_or(""),
-                        item["archived_at"].as_str().unwrap_or("")
+                        item[field_names::ARCHIVED_AT].as_str().unwrap_or("")
                     )?;
                 }
                 writeln!(out.stdout, "{} archived memories", items.len())?;
@@ -102,9 +103,9 @@ pub fn run(
             crate::governance::audit::record_decision(
                 &caller,
                 "allow",
-                "archive_purge",
+                crate::governance::action_labels::ARCHIVE_PURGE,
                 "",
-                serde_json::json!({ "older_than_days": older_than_days }),
+                serde_json::json!({ (field_names::OLDER_THAN_DAYS): older_than_days }),
             );
 
             let purged = db::purge_archive(&conn, older_than_days)?;
@@ -120,7 +121,7 @@ pub fn run(
                 writeln!(out.stdout, "{stats}")?;
             } else {
                 writeln!(out.stdout, "archived: {} total", stats["archived_total"])?;
-                if let Some(by_ns) = stats["by_namespace"].as_array() {
+                if let Some(by_ns) = stats[field_names::BY_NAMESPACE].as_array() {
                     for ns in by_ns {
                         writeln!(
                             out.stdout,

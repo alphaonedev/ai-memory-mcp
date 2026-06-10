@@ -57,8 +57,17 @@ pub fn cmd_resolve(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
-    validate::validate_link(&args.winner_id, &args.loser_id, "supersedes")?;
-    db::create_link(&conn, &args.winner_id, &args.loser_id, "supersedes")?;
+    validate::validate_link(
+        &args.winner_id,
+        &args.loser_id,
+        crate::models::MemoryLinkRelation::Supersedes.as_str(),
+    )?;
+    db::create_link(
+        &conn,
+        &args.winner_id,
+        &args.loser_id,
+        crate::models::MemoryLinkRelation::Supersedes.as_str(),
+    )?;
     let _ = db::update(
         &conn,
         &args.loser_id,

@@ -7,6 +7,7 @@
 //! (deterministic, parallel-where-independent); LLM stages follow with
 //! explicit trust slots pointing back at the helper outputs.
 
+use crate::models::field_names;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -171,7 +172,7 @@ pub fn two_phase_default() -> Pipeline {
                 output_schema: json!({
                     "type": "object",
                     "required": ["title", "summary", "tags", "atoms"],
-                    "properties": {
+                    (field_names::PROPERTIES): {
                         "title": {"type": "string"},
                         "summary": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
@@ -224,17 +225,17 @@ pub fn four_step_default() -> Pipeline {
                     .to_string(),
                 trust_inputs: vec![HelperOutputRef {
                     stage_index: 0,
-                    label: "fts_classifier".to_string(),
+                    label: HelperKind::FtsClassifier.as_str().to_string(),
                 }],
                 output_schema: json!({
                     "type": "object",
-                    "required": ["fact_kind", "confidence"],
-                    "properties": {
+                    "required": ["fact_kind", field_names::CONFIDENCE],
+                    (field_names::PROPERTIES): {
                         "fact_kind": {
                             "type": "string",
                             "enum": ["procedural", "declarative", "episodic"]
                         },
-                        "confidence": {
+                        (field_names::CONFIDENCE): {
                             "type": "number",
                             "minimum": 0.0,
                             "maximum": 1.0
@@ -255,7 +256,7 @@ pub fn four_step_default() -> Pipeline {
                 output_schema: json!({
                     "type": "object",
                     "required": ["entities", "claims", "relations"],
-                    "properties": {
+                    (field_names::PROPERTIES): {
                         "entities": {"type": "array", "items": {"type": "string"}},
                         "claims": {"type": "array", "items": {"type": "string"}},
                         "relations": {"type": "array", "items": {"type": "object"}}
@@ -271,7 +272,7 @@ pub fn four_step_default() -> Pipeline {
                 trust_inputs: vec![
                     HelperOutputRef {
                         stage_index: 0,
-                        label: "fts_classifier".to_string(),
+                        label: HelperKind::FtsClassifier.as_str().to_string(),
                     },
                     HelperOutputRef {
                         stage_index: 1,
@@ -281,7 +282,7 @@ pub fn four_step_default() -> Pipeline {
                 output_schema: json!({
                     "type": "object",
                     "required": ["title", "summary", "tags", "proposed_links"],
-                    "properties": {
+                    (field_names::PROPERTIES): {
                         "title": {"type": "string"},
                         "summary": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},

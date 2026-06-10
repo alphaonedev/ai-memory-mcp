@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use crate::autonomy::AutonomyLlm;
 use crate::config::FeatureTier;
+use crate::mcp::param_names;
 use crate::persona::{PersonaConfig, PersonaError, PersonaGenerator, get_latest_persona};
 
 /// Wire shape (read-only):
@@ -57,7 +58,7 @@ pub(super) fn handle_persona(conn: &rusqlite::Connection, params: &Value) -> Res
         .as_str()
         .ok_or("entity_id is required")?;
     if entity_id.is_empty() {
-        return Err("entity_id cannot be empty".to_string());
+        return Err(crate::errors::msg::ENTITY_ID_EMPTY.to_string());
     }
     let namespace = params["namespace"]
         .as_str()
@@ -109,7 +110,7 @@ pub fn handle_persona_generate(
         .as_str()
         .ok_or("entity_id is required")?;
     if entity_id.is_empty() {
-        return Err("entity_id cannot be empty".to_string());
+        return Err(crate::errors::msg::ENTITY_ID_EMPTY.to_string());
     }
     // v0.7.0 issue #848 — namespace handling.
     //
@@ -128,7 +129,7 @@ pub fn handle_persona_generate(
     //   across every namespace the entity has touched, and the new
     //   persona row lands in `"global"` so subsequent
     //   `memory_persona(entity_id)` calls have a deterministic find.
-    let scoped_single: Option<&str> = match params.get("namespace") {
+    let scoped_single: Option<&str> = match params.get(param_names::NAMESPACE) {
         None => None,
         Some(v) if v.is_null() => None,
         Some(v) => match v.as_str() {
@@ -203,11 +204,10 @@ impl McpTool for PersonaTool {
         "QW-2: latest MemoryKind::Persona for (entity_id, namespace). Returns envelope {id, entity_id, namespace, body_md, sources, generated_at, version, attest_level}. null when none. Pair with memory_persona_generate."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PersonaRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PersonaRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 
@@ -241,11 +241,10 @@ impl McpTool for PersonaGenerateTool {
         "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PersonaGenerateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PersonaGenerateRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

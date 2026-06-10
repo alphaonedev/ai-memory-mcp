@@ -50,7 +50,7 @@ pub fn cmd_unsubscribe(
     let params = json!({"id": args.id});
 
     let envelope = crate::mcp::handle_unsubscribe(&conn, &params, None)
-        .map_err(|e| anyhow::anyhow!("unsubscribe: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(crate::errors::msg::unsubscribe(e)))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;

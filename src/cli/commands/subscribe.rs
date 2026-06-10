@@ -15,6 +15,7 @@
 //! [`crate::mcp::handle_subscribe`]. The MCP, HTTP, and CLI surfaces
 //! share that one implementation.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -79,13 +80,13 @@ pub fn cmd_subscribe(
         params["secret"] = json!(s);
     }
     if let Some(ns) = &args.namespace_filter {
-        params["namespace_filter"] = json!(ns);
+        params[field_names::NAMESPACE_FILTER] = json!(ns);
     }
     if let Some(a) = &args.agent_filter {
-        params["agent_filter"] = json!(a);
+        params[field_names::AGENT_FILTER] = json!(a);
     }
     if !args.event_types.is_empty() {
-        params["event_types"] = json!(args.event_types);
+        params[field_names::EVENT_TYPES] = json!(args.event_types);
     }
 
     let envelope = crate::mcp::handle_subscribe(&conn, &params, None)

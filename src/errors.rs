@@ -75,6 +75,166 @@ pub mod error_codes {
     pub const STORE_VERSION_CONFLICT: &str = "VERSION_CONFLICT";
 }
 
+// ---------------------------------------------------------------------------
+// #1558 batch 5 wave 2 — canonical wire-visible error prose.
+//
+// Single source of truth for duplicated human-readable error messages
+// emitted across the HTTP / MCP / CLI surfaces. Hoisting the spellings
+// into shared `const`s (and tiny `format!` helpers for the templated
+// shapes) means a future wording change touches one definition rather
+// than dozens of scattered string literals — and the no-hardcoded-
+// literals ratchet (`scripts/check-hardcoded-literals.sh`) can burn
+// the baseline down. Every value below is BYTE-IDENTICAL to the
+// literal it replaced; this module never rewords.
+//
+// `Display`-impl `write!` bodies and `#[error(...)]` attributes keep
+// their literal spellings (the format string must be a literal there);
+// those irreducible sites stay below the ratchet's 3-site threshold.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub mod msg {
+    // ---- sanitized 500 body (issue #851 canonical envelope) -----------------
+    pub const INTERNAL_SERVER_ERROR: &str = "internal server error";
+
+    // ---- not-found family ----------------------------------------------------
+    pub const MEMORY_NOT_FOUND: &str = "memory not found";
+    pub const NOT_FOUND_IN_ARCHIVE: &str = "not found in archive";
+    pub const SKILL_NOT_FOUND: &str = "skill not found";
+    pub const SOURCE_MEMORY_NOT_FOUND: &str = "source memory not found";
+    pub const PENDING_ACTION_NOT_FOUND_OR_DECIDED: &str =
+        "pending action not found or already decided";
+
+    // ---- governance ------------------------------------------------------------
+    pub const GOVERNANCE_REQUIRES_APPROVAL: &str = "governance requires approval";
+    pub const GOVERNANCE_CHECK_FAILED: &str = "governance check failed";
+    pub const CONSENSUS_NOT_REACHED: &str = "consensus threshold not yet reached";
+    pub const DECISION_WRITE_FAILED: &str = "decision write failed";
+
+    // ---- ownership / identity ---------------------------------------------------
+    pub const CALLER_NOT_SOURCE_MEMORY_OWNER: &str = "caller does not own this source memory";
+    pub const CALLER_NOT_NAMESPACE_STANDARD_OWNER: &str =
+        "caller does not own this namespace standard";
+    pub const AGENT_ID_BODY_MISMATCH: &str =
+        "agent_id body parameter does not match authenticated caller";
+    pub const AGENT_ID_QUERY_MISMATCH: &str =
+        "agent_id query parameter does not match authenticated caller";
+    pub const INVALID_OR_MISSING_SIGNATURE: &str = "invalid or missing X-AI-Memory-Signature";
+
+    // ---- validation -------------------------------------------------------------
+    pub const FORGET_FILTER_REQUIRED: &str =
+        "at least one of namespace, pattern, or tier is required";
+    pub const MAX_DEPTH_MIN: &str = "max_depth must be >= 1";
+    pub const VERIFY_LINK_ARGS_REQUIRED: &str = "verify_link requires either source_id or link_id";
+    pub const ENTITY_ID_EMPTY: &str = "entity_id cannot be empty";
+    pub const MEMORY_ID_EMPTY: &str = "memory_id cannot be empty";
+
+    // ---- "<field> is required" family --------------------------------------------
+    pub const ID_REQUIRED: &str = "id is required";
+    pub const CONTENT_REQUIRED: &str = "content is required";
+    pub const TITLE_REQUIRED: &str = "title is required";
+    pub const MEMORY_ID_REQUIRED: &str = "memory_id is required";
+    pub const NAMESPACE_REQUIRED: &str = "namespace is required";
+    pub const SOURCE_ID_REQUIRED: &str = "source_id is required";
+    pub const TARGET_ID_REQUIRED: &str = "target_id is required";
+    pub const QUERY_REQUIRED: &str = "query is required";
+    pub const CONTEXT_REQUIRED: &str = "context is required";
+
+    // ---- shared sqlx/rusqlite context label (postgres adapter + schema-init) -----
+    pub const READ_SCHEMA_VERSION: &str = "read schema_version";
+
+    // ---- templated shapes ----------------------------------------------------
+    /// `"invalid {field}: {e}"` — the canonical invalid-parameter prose.
+    #[must_use]
+    pub fn invalid(field: &str, e: impl std::fmt::Display) -> String {
+        format!("invalid {field}: {e}")
+    }
+
+    /// `"error: {e}"` — the canonical CLI stderr error line.
+    #[must_use]
+    pub fn error_line(e: impl std::fmt::Display) -> String {
+        format!("error: {e}")
+    }
+
+    /// `"memory not found: {id}"`.
+    #[must_use]
+    pub fn memory_not_found(id: impl std::fmt::Display) -> String {
+        format!("{MEMORY_NOT_FOUND}: {id}")
+    }
+
+    /// `"skill not found: {skill_id}"`.
+    #[must_use]
+    pub fn skill_not_found(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_NOT_FOUND}: {skill_id}")
+    }
+
+    /// `"pending action not found: {pending_id}"`.
+    #[must_use]
+    pub fn pending_action_not_found(pending_id: impl std::fmt::Display) -> String {
+        format!("pending action not found: {pending_id}")
+    }
+
+    /// `"not found: {id}"` — the CLI stderr not-found line.
+    #[must_use]
+    pub fn not_found(id: impl std::fmt::Display) -> String {
+        format!("not found: {id}")
+    }
+
+    /// `"approve rejected: {reason}"`.
+    #[must_use]
+    pub fn approve_rejected(reason: impl std::fmt::Display) -> String {
+        format!("approve rejected: {reason}")
+    }
+
+    /// `"older_than_days must be non-negative (got {days})"`.
+    #[must_use]
+    pub fn older_than_days_negative(days: impl std::fmt::Display) -> String {
+        format!("older_than_days must be non-negative (got {days})")
+    }
+
+    /// `"signature verify failed: {e}"`.
+    #[must_use]
+    pub fn signature_verify_failed(e: impl std::fmt::Display) -> String {
+        format!("signature verify failed: {e}")
+    }
+
+    /// `"zstd decompress body: {e}"`.
+    #[must_use]
+    pub fn zstd_decompress_body(e: impl std::fmt::Display) -> String {
+        format!("zstd decompress body: {e}")
+    }
+
+    /// `"network: {e}"`.
+    #[must_use]
+    pub fn network(e: impl std::fmt::Display) -> String {
+        format!("network: {e}")
+    }
+
+    /// `"unsubscribe: {e}"`.
+    #[must_use]
+    pub fn unsubscribe(e: impl std::fmt::Display) -> String {
+        format!("unsubscribe: {e}")
+    }
+
+    /// `"opening {path}"` — fs-open `.with_context` label (#1558 batch 6).
+    #[must_use]
+    pub fn opening(path: impl std::fmt::Display) -> String {
+        format!("opening {path}")
+    }
+
+    /// `"reading {path}"` — fs-read `.with_context` label (#1558 batch 6).
+    #[must_use]
+    pub fn reading(path: impl std::fmt::Display) -> String {
+        format!("reading {path}")
+    }
+
+    /// `"writing {path}"` — fs-write `.with_context` label (#1558 batch 6).
+    #[must_use]
+    pub fn writing(path: impl std::fmt::Display) -> String {
+        format!("writing {path}")
+    }
+}
+
 #[cfg(test)]
 mod arch_9_slug_tests {
     use super::error_codes::*;
@@ -138,6 +298,7 @@ mod arch_9_slug_tests {
                 detail: "d".into(),
             },
             StoreError::InvalidInput { detail: "d".into() },
+            StoreError::LinkRefused { detail: "d".into() },
             StoreError::UnsupportedCapability {
                 capability: "c".into(),
             },
@@ -150,6 +311,7 @@ mod arch_9_slug_tests {
             GOVERNANCE_REFUSED,
             STORE_BACKEND_UNAVAILABLE,
             VALIDATION_FAILED,
+            CONFLICT,
             STORE_UNSUPPORTED_CAPABILITY,
             STORE_OPERATION_FAILED,
             DATABASE_ERROR,

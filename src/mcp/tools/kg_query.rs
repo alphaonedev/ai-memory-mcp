@@ -4,6 +4,7 @@
 //! MCP `memory_kg_query` handler.
 
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -62,11 +63,10 @@ impl McpTool for KgQueryTool {
         "Pillar 2 / Stream C: BFS/CTE traversal with cycle detection. Each row carries valid_from/valid_until/observed_by + target title/namespace. Filters chain across every hop. max_depth ceiling 5."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(KgQueryRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<KgQueryRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -83,7 +83,7 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
     // forest rooted at the document. The traversal is unbounded (one
     // hop, since the goal is "what else is from this document") and
     // bypasses the `source_id`-required argument check.
-    let by_source_uri = params["by_source_uri"]
+    let by_source_uri = params[field_names::BY_SOURCE_URI]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -110,14 +110,14 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
                 json!({
                     "target_id": m.id,
                     "title": m.title,
-                    "target_namespace": m.namespace,
+                    (field_names::TARGET_NAMESPACE): m.namespace,
                     "depth": 0,
-                    "source_uri": m.source_uri,
+                    (field_names::SOURCE_URI): m.source_uri,
                 })
             })
             .collect();
         return Ok(json!({
-            "by_source_uri": uri,
+            (field_names::BY_SOURCE_URI): uri,
             "memories": memories_json,
             "count": roots.len(),
         }));
@@ -125,7 +125,7 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
 
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
 
     let max_depth = params["max_depth"]
@@ -160,7 +160,9 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
     // NHI-P3-T7 (v0.7.0 NHI testing): default to "current view" —
     // exclude edges whose `valid_until` lies in the past. Pass
     // `include_invalidated=true` to traverse the full historical graph.
-    let include_invalidated = params["include_invalidated"].as_bool().unwrap_or(false);
+    let include_invalidated = params[field_names::INCLUDE_INVALIDATED]
+        .as_bool()
+        .unwrap_or(false);
 
     let nodes = db::kg_query(
         conn,
@@ -179,11 +181,11 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
             json!({
                 "target_id": n.target_id,
                 "relation": n.relation,
-                "valid_from": n.valid_from,
-                "valid_until": n.valid_until,
-                "observed_by": n.observed_by,
+                (field_names::VALID_FROM): n.valid_from,
+                (field_names::VALID_UNTIL): n.valid_until,
+                (field_names::OBSERVED_BY): n.observed_by,
                 "title": n.title,
-                "target_namespace": n.target_namespace,
+                (field_names::TARGET_NAMESPACE): n.target_namespace,
                 "depth": n.depth,
                 "path": n.path,
             })

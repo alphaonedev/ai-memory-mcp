@@ -23,6 +23,7 @@
 //! Extracted from `src/handlers/mod.rs` as part of the issue #650
 //! file-architecture cleanup.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, State},
@@ -122,14 +123,14 @@ pub(crate) fn verify_approval_hmac(
         }
     };
     let sig_header = headers
-        .get("x-ai-memory-signature")
+        .get(crate::HEADER_AI_MEMORY_SIGNATURE)
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let sig_hex = sig_header
         .strip_prefix("sha256=")
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let timestamp = headers
-        .get("x-ai-memory-timestamp")
+        .get(crate::HEADER_AI_MEMORY_TIMESTAMP)
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     // Replay-window check: the timestamp MUST parse as a Unix epoch
@@ -216,7 +217,7 @@ pub async fn approval_decide(
     if let Err(status) = verify_approval_hmac(&headers, &body_bytes, "POST", &id) {
         return (
             status,
-            Json(json!({"error": "invalid or missing X-AI-Memory-Signature"})),
+            Json(json!({"error": crate::errors::msg::INVALID_OR_MISSING_SIGNATURE})),
         )
             .into_response();
     }
@@ -245,7 +246,7 @@ pub async fn approval_decide(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -270,7 +271,7 @@ pub async fn approval_decide(
         decision_outcome,
         decision_kind,
         "",
-        json!({ "pending_id": &id }),
+        json!({ (field_names::PENDING_ID): &id }),
     );
 
     let lock = app.db.lock().await;
@@ -286,7 +287,7 @@ pub async fn approval_decide(
                         Ok(memory_id) => json!({
                             "approved": true,
                             "id": id,
-                            "decided_by": agent_id,
+                            (field_names::DECIDED_BY): agent_id,
                             "executed": true,
                             "memory_id": memory_id,
                             "remember": format!("{:?}", body.remember).to_lowercase(),
@@ -312,17 +313,12 @@ pub async fn approval_decide(
                 Ok(crate::db::ApproveOutcome::Rejected(reason)) => {
                     return (
                         StatusCode::FORBIDDEN,
-                        Json(json!({"error": format!("approve rejected: {reason}")})),
+                        Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
                     )
                         .into_response();
                 }
                 Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response();
+                    return crate::handlers::errors::handler_error_500(&e);
                 }
             }
         }
@@ -331,23 +327,18 @@ pub async fn approval_decide(
                 Ok(true) => json!({
                     "rejected": true,
                     "id": id,
-                    "decided_by": agent_id,
+                    (field_names::DECIDED_BY): agent_id,
                     "remember": format!("{:?}", body.remember).to_lowercase(),
                 }),
                 Ok(false) => {
                     return (
                         StatusCode::NOT_FOUND,
-                        Json(json!({"error": "pending action not found or already decided"})),
+                        Json(json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED})),
                     )
                         .into_response();
                 }
                 Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response();
+                    return crate::handlers::errors::handler_error_500(&e);
                 }
             }
         }
@@ -552,9 +543,10 @@ pub async fn approvals_sse(
                             continue;
                         }
                         let (event_name, json_value) = match &evt {
-                            crate::approvals::ApprovalEvent::ApprovalRequested { .. } => {
-                                ("approval_requested", serde_json::to_value(&evt))
-                            }
+                            crate::approvals::ApprovalEvent::ApprovalRequested { .. } => (
+                                crate::subscriptions::webhook_events::APPROVAL_REQUESTED,
+                                serde_json::to_value(&evt),
+                            ),
                             crate::approvals::ApprovalEvent::ApprovalDecided { .. } => {
                                 ("approval_decided", serde_json::to_value(&evt))
                             }

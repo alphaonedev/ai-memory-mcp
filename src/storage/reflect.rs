@@ -11,6 +11,7 @@
 
 use crate::identity::keypair::AgentKeypair;
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use anyhow::Context;
 use chrono::Utc;
 use rusqlite::Connection;
@@ -472,13 +473,16 @@ pub fn reflect_with_hooks(
         serde_json::Value::String(input.agent_id.clone()),
     );
     // Splice reflection_metadata only when the caller didn't pre-set it.
-    if !metadata.contains_key("reflection_metadata") {
+    if !metadata.contains_key(field_names::REFLECTION_METADATA) {
         let reflection_meta = serde_json::json!({
             "reflected_on_source_ids": input.source_ids,
-            "reflection_depth": new_depth_i32,
+            (field_names::REFLECTION_DEPTH): new_depth_i32,
             "reflection_created_at": now,
         });
-        metadata.insert("reflection_metadata".to_string(), reflection_meta);
+        metadata.insert(
+            field_names::REFLECTION_METADATA.to_string(),
+            reflection_meta,
+        );
     }
     let metadata_value = serde_json::Value::Object(metadata);
     // Re-validate the merged metadata so an oversized splice surfaces
@@ -523,7 +527,7 @@ pub fn reflect_with_hooks(
     // links inside a single BEGIN IMMEDIATE ... COMMIT block. If any
     // link insert fails, ROLLBACK undoes the reflection row too.
     // Matches the `consolidate` pattern earlier in this file.
-    conn.execute_batch("BEGIN IMMEDIATE")
+    conn.execute_batch(super::connection::SQL_BEGIN_IMMEDIATE)
         .map_err(|e| ReflectError::Database(e.to_string()))?;
 
     let txn_result = (|| -> std::result::Result<String, ReflectError> {
@@ -548,8 +552,12 @@ pub fn reflect_with_hooks(
         // failure with the txn rolled back so the reflection never
         // lands.
         for src_id in &input.source_ids {
-            validate::validate_link(&actual_id, src_id, "reflects_on")
-                .map_err(|e| ReflectError::Validation(e.to_string()))?;
+            validate::validate_link(
+                &actual_id,
+                src_id,
+                crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+            )
+            .map_err(|e| ReflectError::Validation(e.to_string()))?;
             // Issue #815 — the pre-#815 path called `create_link` here,
             // which always produced `attest_level='unsigned'` rows for
             // every reflects_on edge regardless of whether the caller
@@ -569,7 +577,7 @@ pub fn reflect_with_hooks(
                 conn,
                 &actual_id,
                 src_id,
-                "reflects_on",
+                crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
                 hooks.active_keypair,
             )
             .map_err(|e| ReflectError::Database(e.to_string()))?;
@@ -579,7 +587,7 @@ pub fn reflect_with_hooks(
 
     match txn_result {
         Ok(actual_id) => {
-            conn.execute_batch("COMMIT")
+            conn.execute_batch(super::connection::SQL_COMMIT)
                 .map_err(|e| ReflectError::Database(e.to_string()))?;
             let outcome = ReflectOutcome {
                 id: actual_id,
@@ -601,7 +609,7 @@ pub fn reflect_with_hooks(
             Ok(outcome)
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(super::connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in reflect: {}", rb);
             }
             Err(e)
@@ -655,21 +663,27 @@ pub fn canonical_cbor_reflection_depth_exceeded(
     map.insert("agent_id", ciborium::Value::Text(agent_id.to_string()));
     map.insert("attempted", ciborium::Value::Integer(attempted.into()));
     map.insert("cap", ciborium::Value::Integer(cap.into()));
-    map.insert("created_at", ciborium::Value::Text(created_at.to_string()));
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Text(created_at.to_string()),
+    );
     map.insert("namespace", ciborium::Value::Text(namespace.to_string()));
     // v0.7.0 L2-2 — conditional inclusion preserves pre-L2-2 payload
     // hashes on the purely-local refusal path (no `peer_origin` key
     // present at all in the encoded map). Cross-peer refusals carry the
     // peer claim as a tamper-evident structured field.
     if let Some(peer) = peer_origin {
-        map.insert("peer_origin", ciborium::Value::Text(peer.to_string()));
+        map.insert(
+            field_names::PEER_ORIGIN,
+            ciborium::Value::Text(peer.to_string()),
+        );
     }
     map.insert(
         "proposed_title",
         ciborium::Value::Text(proposed_title.to_string()),
     );
     map.insert(
-        "source_ids",
+        field_names::SOURCE_IDS,
         ciborium::Value::Array(
             source_ids
                 .iter()
@@ -730,7 +744,7 @@ pub(crate) fn emit_reflection_depth_exceeded_audit(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
-                target: "signed_events",
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                 agent_id, attempted, cap, namespace,
                 "failed to encode canonical CBOR for reflection_depth_exceeded audit: {e}"
             );
@@ -760,7 +774,7 @@ pub(crate) fn emit_reflection_depth_exceeded_audit(
     };
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             agent_id, attempted, cap, namespace,
             "failed to append reflection_depth_exceeded audit row: {e}"
         );

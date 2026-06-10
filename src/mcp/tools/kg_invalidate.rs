@@ -3,7 +3,9 @@
 
 //! MCP `memory_kg_invalidate` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -45,11 +47,10 @@ impl McpTool for KgInvalidateTool {
         "Pillar 2 / Stream C: set valid_until on (source_id, target_id, relation). valid_until defaults to now. Idempotent; response carries previous_valid_until. found:false when no match."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(KgInvalidateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<KgInvalidateRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -64,14 +65,14 @@ pub fn handle_kg_invalidate(
 ) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     let target_id = params["target_id"]
         .as_str()
-        .ok_or("target_id is required")?;
+        .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
     let relation = params["relation"].as_str().ok_or("relation is required")?;
     validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
         .map_err(|e| e.to_string())?;
-    let valid_until = params["valid_until"]
+    let valid_until = params[param_names::VALID_UNTIL]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -110,7 +111,7 @@ pub fn handle_kg_invalidate(
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
                 return Err(crate::governance::deny_message(
-                    "kg_invalidate",
+                    crate::governance::action_labels::KG_INVALIDATE,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
                 ));
@@ -119,7 +120,7 @@ pub fn handle_kg_invalidate(
                 return Ok(json!({
                     "status": "ask",
                     "reason": prompt,
-                    "action": "kg_invalidate",
+                    "action": crate::governance::action_labels::KG_INVALIDATE,
                     "source_id": source_id,
                     "target_id": target_id,
                 }));
@@ -145,7 +146,7 @@ pub fn handle_kg_invalidate(
                 Ok(Some(mem)) => {
                     let owner = mem
                         .metadata
-                        .get("agent_id")
+                        .get(param_names::AGENT_ID)
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
                     (mem.namespace, owner)
@@ -161,7 +162,7 @@ pub fn handle_kg_invalidate(
             .ok();
             crate::subscriptions::dispatch_event_with_details(
                 conn,
-                "memory_link_invalidated",
+                crate::subscriptions::webhook_events::MEMORY_LINK_INVALIDATED,
                 source_id,
                 &event_namespace,
                 event_agent_id.as_deref(),
@@ -174,8 +175,8 @@ pub fn handle_kg_invalidate(
                 "source_id": source_id,
                 "target_id": target_id,
                 "relation": relation,
-                "valid_until": res.valid_until,
-                "previous_valid_until": res.previous_valid_until,
+                (field_names::VALID_UNTIL): res.valid_until,
+                (field_names::PREVIOUS_VALID_UNTIL): res.previous_valid_until,
             }))
         }
         None => Ok(json!({

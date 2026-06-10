@@ -4,6 +4,7 @@
 //! MCP `memory_kg_timeline` handler.
 
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -46,18 +47,17 @@ impl McpTool for KgTimelineTool {
         "Pillar 2 / Stream C: outbound links from source_id ordered valid_from ASC. Includes valid_from/valid_until/observed_by + target title/namespace. NULL valid_from rows excluded. Cross-namespace."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(KgTimelineRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<KgTimelineRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
 pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
     let since = params["since"]
         .as_str()
@@ -86,11 +86,11 @@ pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result
             json!({
                 "target_id": e.target_id,
                 "relation": e.relation,
-                "valid_from": e.valid_from,
-                "valid_until": e.valid_until,
-                "observed_by": e.observed_by,
+                (field_names::VALID_FROM): e.valid_from,
+                (field_names::VALID_UNTIL): e.valid_until,
+                (field_names::OBSERVED_BY): e.observed_by,
                 "title": e.title,
-                "target_namespace": e.target_namespace,
+                (field_names::TARGET_NAMESPACE): e.target_namespace,
             })
         })
         .collect();

@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -150,7 +151,7 @@ pub async fn detect_contradictions(
                         "source_id": link.source_id,
                         "target_id": link.target_id,
                         "relation": link.relation,
-                        "synthesized": false,
+                        (field_names::SYNTHESIZED): false,
                     }));
                 }
             }
@@ -198,8 +199,8 @@ pub async fn detect_contradictions(
                     synth_links.push(json!({
                         "source_id": a.id,
                         "target_id": b.id,
-                        "relation": "contradicts",
-                        "synthesized": true,
+                        "relation": crate::models::MemoryLinkRelation::Contradicts.as_str(),
+                        (field_names::SYNTHESIZED): true,
                     }));
                 }
             }
@@ -209,7 +210,7 @@ pub async fn detect_contradictions(
         return Json(json!({
             "memories": candidates,
             "links": links,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
@@ -225,7 +226,7 @@ pub async fn detect_contradictions(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
@@ -247,7 +248,7 @@ pub async fn detect_contradictions(
             tracing::error!("detect_contradictions list error: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -307,7 +308,7 @@ pub async fn detect_contradictions(
                         "source_id": link.source_id,
                         "target_id": link.target_id,
                         "relation": link.relation,
-                        "synthesized": false,
+                        (field_names::SYNTHESIZED): false,
                     }));
                 }
             }
@@ -362,8 +363,8 @@ pub async fn detect_contradictions(
                 synth_links.push(json!({
                     "source_id": a.id,
                     "target_id": b.id,
-                    "relation": "contradicts",
-                    "synthesized": true,
+                    "relation": crate::models::MemoryLinkRelation::Contradicts.as_str(),
+                    (field_names::SYNTHESIZED): true,
                 }));
             }
         }
@@ -403,7 +404,7 @@ pub async fn list_namespaces(
         return match app.store.list_namespaces().await {
             Ok(rows) => {
                 let v: Vec<String> = rows.into_iter().map(|r| r.namespace).collect();
-                Json(json!({"namespaces": v})).into_response()
+                Json(json!({(field_names::NAMESPACES): v})).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -411,15 +412,8 @@ pub async fn list_namespaces(
 
     let lock = app.db.lock().await;
     match db::list_namespaces(&lock.0) {
-        Ok(ns) => Json(json!({"namespaces": ns})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Ok(ns) => Json(json!({(field_names::NAMESPACES): ns})).into_response(),
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -478,7 +472,10 @@ pub async fn get_taxonomy(
         .depth
         .unwrap_or(crate::models::MAX_NAMESPACE_DEPTH)
         .min(crate::models::MAX_NAMESPACE_DEPTH);
-    let limit = p.limit.unwrap_or(1000).clamp(1, 10_000);
+    let limit = p
+        .limit
+        .unwrap_or(crate::storage::TAXONOMY_DEFAULT_LIMIT)
+        .clamp(1, crate::storage::TAXONOMY_MAX_LIMIT);
 
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
     // now route taxonomy reads through `MemoryStore::get_taxonomy`.
@@ -497,9 +494,9 @@ pub async fn get_taxonomy(
         {
             Ok(tax) => Json(json!({
                 "tree": tax.tree,
-                "total_count": tax.total_count,
+                (field_names::TOTAL_COUNT): tax.total_count,
                 "truncated": tax.truncated,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             }))
             .into_response(),
             Err(e) => store_err_to_response(e),
@@ -639,9 +636,9 @@ pub async fn get_taxonomy(
         let root_node = build_node(&root_ns, &nodes, depth);
         return Json(json!({
             "tree": root_node,
-            "total_count": total_count,
+            (field_names::TOTAL_COUNT): total_count,
             "truncated": truncated,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
@@ -653,18 +650,11 @@ pub async fn get_taxonomy(
     match db::get_taxonomy(&lock.0, prefix_owned.as_deref(), depth, limit) {
         Ok(tax) => Json(json!({
             "tree": tax.tree,
-            "total_count": tax.total_count,
+            (field_names::TOTAL_COUNT): tax.total_count,
             "truncated": tax.truncated,
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -718,7 +708,7 @@ pub async fn check_duplicate(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid namespace: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
     }
@@ -728,7 +718,7 @@ pub async fn check_duplicate(
     // route through the canonical `MemoryStore::check_duplicate_with_text`
     // trait method. Mirrors the SQLite `db::check_duplicate_with_text`
     // shape byte-for-byte: SHA-256 exact-content short-circuit (returns
-    // `similarity=1.0` on byte-equal `format!("{title} {content}")`),
+    // `similarity=1.0` on byte-equal `crate::embeddings::embedding_document(title, content)`),
     // then pgvector cosine distance for nearest-neighbor on near hits.
     // Pre-fix branch was hand-rolled (`list` + client-side exact-match
     // walk + `recall_hybrid` fallback); the trait method consolidates
@@ -736,7 +726,7 @@ pub async fn check_duplicate(
     // identical across backends.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let embedding_text = format!("{} {}", body.title, body.content);
+        let embedding_text = crate::embeddings::embedding_document(&body.title, &body.content);
         // Best-effort: when the embedder is loaded, compute the query
         // vector so phase 2 (cosine nearest) is available. Without it
         // the trait method falls through to phase-1 hash-only.
@@ -760,12 +750,12 @@ pub async fn check_duplicate(
                     None => serde_json::Value::Null,
                 };
                 Json(json!({
-                    "is_duplicate": check.is_duplicate,
+                    (field_names::IS_DUPLICATE): check.is_duplicate,
                     "threshold": check.threshold,
                     "nearest": near_json,
-                    "suggested_merge": check.is_duplicate,
-                    "candidates_scanned": check.candidates_scanned,
-                    "storage_backend": "postgres",
+                    (field_names::SUGGESTED_MERGE): check.is_duplicate,
+                    (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -776,7 +766,7 @@ pub async fn check_duplicate(
     // Embed before taking the DB lock — same rationale as create_memory
     // (issue #219). The embedder call is 10-200ms; we don't want it
     // serialised behind the connection mutex.
-    let embedding_text = format!("{} {}", body.title, body.content);
+    let embedding_text = crate::embeddings::embedding_document(&body.title, &body.content);
     let query_embedding = match app.embedder.as_ref().as_ref() {
         Some(emb) => match emb.embed(&embedding_text) {
             Ok(v) => v,
@@ -811,7 +801,7 @@ pub async fn check_duplicate(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
@@ -828,12 +818,7 @@ pub async fn check_duplicate(
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
 
@@ -856,7 +841,8 @@ pub async fn check_duplicate(
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            "similarity": (m.similarity * 1000.0).round() / 1000.0,
+            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                / crate::SCORE_DISPLAY_ROUND_FACTOR,
         })
     });
     let suggested_merge = if check.is_duplicate {
@@ -866,11 +852,11 @@ pub async fn check_duplicate(
     };
 
     Json(json!({
-        "is_duplicate": check.is_duplicate,
+        (field_names::IS_DUPLICATE): check.is_duplicate,
         "threshold": check.threshold,
         "nearest": nearest_json,
-        "suggested_merge": suggested_merge,
-        "candidates_scanned": check.candidates_scanned,
+        (field_names::SUGGESTED_MERGE): suggested_merge,
+        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
     }))
     .into_response()
 }

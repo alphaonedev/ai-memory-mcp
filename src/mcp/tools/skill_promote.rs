@@ -57,6 +57,8 @@
 //! produces it on disk. The accompanying integration test pins the
 //! contract.
 
+use crate::mcp::param_names;
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -104,20 +106,20 @@ pub fn handle_skill_promote_from_reflection(
     active_keypair: Option<&AgentKeypair>,
 ) -> Result<Value, String> {
     // ─── 1. Argument parsing ────────────────────────────────────────────
-    let reflection_id = params["reflection_id"]
+    let reflection_id = params[field_names::REFLECTION_ID]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'reflection_id'")?;
-    let skill_name = params["skill_name"]
+    let skill_name = params[param_names::SKILL_NAME]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'skill_name'")?;
-    let skill_description = params["skill_description"]
+    let skill_description = params[field_names::SKILL_DESCRIPTION]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'skill_description'")?;
     let parameters_schema: Option<&Value> = params
-        .get("parameters_schema")
+        .get(field_names::PARAMETERS_SCHEMA)
         .filter(|v| !v.is_null() && v.is_object());
 
     // Validate skill name against agentskills.io §3.1 BEFORE any DB work
@@ -130,15 +132,15 @@ pub fn handle_skill_promote_from_reflection(
     // so the audit trail captures the caller + source reflection_id
     // regardless of downstream outcome.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
         "skill_promote_from_reflection",
         "",
         serde_json::json!({
-            "reflection_id": reflection_id,
-            "skill_name": skill_name,
+            (field_names::REFLECTION_ID): reflection_id,
+            (field_names::SKILL_NAME): skill_name,
         }),
     );
     if skill_description.len() > 1024 {
@@ -330,7 +332,7 @@ pub fn handle_skill_promote_from_reflection(
         "signed": active_keypair.is_some(),
     });
     if let Some(prev) = outcome.superseded {
-        response["superseded_id"] = json!(prev);
+        response[field_names::SUPERSEDED_ID] = json!(prev);
     }
     Ok(response)
 }
@@ -378,11 +380,10 @@ impl McpTool for SkillPromoteFromReflectionTool {
         "L2-6 (#671): reflection (depth>=namespace.governance.skill_promotion_min_depth, default 1) -> SKILL.md. Each reflects_on source -> references/source_{i}.md. Frontmatter preserves derived_from_reflection_id + original_reflection_depth. Promote->export->register => identical SHA-256. Refuses depth-0."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillPromoteFromReflectionRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillPromoteFromReflectionRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

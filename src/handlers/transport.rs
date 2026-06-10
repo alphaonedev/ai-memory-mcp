@@ -773,7 +773,7 @@ pub async fn api_key_auth(
     };
 
     // Exempt health endpoint
-    if req.uri().path() == "/api/v1/health" {
+    if req.uri().path() == super::routes::HEALTH {
         return next.run(req).await.into_response();
     }
 
@@ -821,7 +821,7 @@ pub async fn api_key_auth(
     }
 
     // Check X-API-Key header
-    if let Some(header_val) = req.headers().get("x-api-key")
+    if let Some(header_val) = req.headers().get(crate::HEADER_API_KEY)
         && let Ok(val) = header_val.to_str()
         && constant_time_eq(val.as_bytes(), expected.as_bytes())
     {
@@ -842,9 +842,10 @@ pub async fn api_key_auth(
                 if constant_time_eq(decoded.as_bytes(), expected.as_bytes()) {
                     // v0.7.0 de-silencing: a credential in the URL query
                     // string leaks into access logs, the Referer header,
-                    // and proxy logs. Accept it (back-compat) but emit a
-                    // once-per-process operator-visible warn nudging
-                    // migration to the `X-API-Key` request header.
+                    // and proxy logs. Accept it (the v0.7.0 back-compat
+                    // contract) but emit a once-per-process
+                    // operator-visible warn naming the header
+                    // alternative + the deprecation intent (#1574).
                     static QUERY_KEY_WARN_ONCE: std::sync::Once = std::sync::Once::new();
                     QUERY_KEY_WARN_ONCE.call_once(|| {
                         tracing::warn!(
@@ -852,7 +853,10 @@ pub async fn api_key_auth(
                             "a request authenticated via the `?api_key=` query \
                              parameter; URL-embedded credentials leak into access \
                              logs, Referer headers, and proxy logs. Migrate callers \
-                             to the `X-API-Key` request header."
+                             to the `x-api-key` request header — the `?api_key=` \
+                             query form is DEPRECATED and will be removed in a \
+                             future release (still accepted for the v0.7.0 \
+                             back-compat contract)."
                         );
                     });
                     return next.run(req).await.into_response();
@@ -905,7 +909,7 @@ pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "status": if ok { "ok" } else { "error" },
             "service": "ai-memory",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::PKG_VERSION,
             "embedder_ready": embedder_ready,
             "federation_enabled": federation_enabled,
         })),

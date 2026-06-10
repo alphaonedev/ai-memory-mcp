@@ -5,6 +5,7 @@ use serde_json::Value;
 
 pub mod audit;
 pub mod capture_turn;
+pub mod field_names;
 pub mod link;
 pub mod memory;
 pub mod namespace;

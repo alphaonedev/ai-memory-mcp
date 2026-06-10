@@ -13,6 +13,7 @@ use crate::cli::CliOutput;
 use crate::cli::helpers::{human_age, id_short};
 use crate::config::AppConfig;
 use crate::embeddings::Embed;
+use crate::models::field_names;
 use crate::{color, daemon_runtime, db, embeddings, hnsw, reranker, validate};
 use anyhow::Result;
 use clap::Args;
@@ -322,7 +323,7 @@ pub(crate) fn run_with_embedder(
         )?;
         let mut ok = 0usize;
         for (id, title, content) in &unembedded {
-            let text = format!("{title} {content}");
+            let text = crate::embeddings::embedding_document(title, content);
             if let Ok(embedding) = emb.embed(&text)
                 && db::set_embedding(conn, id, &embedding).is_ok()
             {
@@ -401,7 +402,11 @@ pub(crate) fn run_with_embedder(
                     args.source_uri_prefix.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
-                    (ce.rerank(&args.context, results), outcome, "hybrid+rerank")
+                    (
+                        ce.rerank(&args.context, results),
+                        outcome,
+                        crate::models::RECALL_MODE_HYBRID_RERANK,
+                    )
                 } else {
                     (results, outcome, "hybrid")
                 }
@@ -485,15 +490,15 @@ pub(crate) fn run_with_embedder(
             "memories": scored,
             "count": results.len(),
             "mode": mode,
-            "tokens_used": outcome.tokens_used,
+            (field_names::TOKENS_USED): outcome.tokens_used,
         });
         if let Some(b) = args.budget_tokens {
-            body["budget_tokens"] = serde_json::json!(b);
+            body[field_names::BUDGET_TOKENS] = serde_json::json!(b);
             // Phase P6 (R1) meta block — same shape as MCP / HTTP paths.
             body["meta"] = serde_json::json!({
                 "budget_tokens_used": outcome.tokens_used,
                 "budget_tokens_remaining": outcome.tokens_remaining.unwrap_or(0),
-                "memories_dropped": outcome.memories_dropped,
+                (field_names::MEMORIES_DROPPED): outcome.memories_dropped,
                 "budget_overflow": outcome.budget_overflow,
             });
         }

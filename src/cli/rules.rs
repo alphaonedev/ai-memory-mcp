@@ -35,6 +35,7 @@
 //! mutation tools are explicitly disabled (return
 //! `governance.not_available_over_mcp`).
 
+use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -43,9 +44,12 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
 
 use crate::cli::CliOutput;
-use crate::governance::agent_action::{AgentAction, check_agent_action};
+use crate::governance::agent_action::{AgentAction, action_kinds as ak, check_agent_action};
 use crate::governance::rules_store::{self, Rule};
 use crate::identity::keypair as kp;
+
+/// Operator Ed25519 private-key file name under the key dir (#1558 batch 6).
+const OPERATOR_KEY_FILENAME: &str = "operator.key";
 
 /// Wire id reserved for the operator's keypair file on disk. Stored
 /// under the same directory as per-agent keys but treated specially
@@ -98,7 +102,7 @@ pub enum RulesAction {
         #[arg(long)]
         reason: String,
         /// Optional namespace scope. Defaults to `_global`.
-        #[arg(long, default_value = "_global")]
+        #[arg(long, default_value = crate::quotas::GLOBAL_NAMESPACE)]
         namespace: String,
         /// Land the rule with `enabled = 0` (operator activates
         /// later via `ai-memory rules enable <id> --sign`).
@@ -253,14 +257,20 @@ pub fn run(
             // pastes `rm\s+-rf` does not silently install a
             // never-matching rule.
             if let Some(val) = matcher_json
-                .get("command_substring")
-                .or_else(|| matcher_json.get("command_regex"))
+                .get(crate::governance::agent_action::MATCHER_COMMAND_SUBSTRING)
+                .or_else(|| {
+                    matcher_json.get(crate::governance::agent_action::MATCHER_COMMAND_REGEX)
+                })
                 .and_then(|v| v.as_str())
             {
                 crate::governance::agent_action::validate_command_substring(val)
                     .map_err(|e| anyhow::anyhow!("rules add: {e}"))?;
-                if matcher_json.get("command_regex").is_some()
-                    && matcher_json.get("command_substring").is_none()
+                if matcher_json
+                    .get(crate::governance::agent_action::MATCHER_COMMAND_REGEX)
+                    .is_some()
+                    && matcher_json
+                        .get(crate::governance::agent_action::MATCHER_COMMAND_SUBSTRING)
+                        .is_none()
                 {
                     tracing::warn!(
                         "rules add: matcher field `command_regex` is DEPRECATED — rename to \
@@ -414,7 +424,7 @@ pub fn run(
             //      `~/.config/ai-memory/operator.key` shape) keeps
             //      working when neither is supplied.
             let resolved_key: Option<PathBuf> = key.or_else(|| {
-                let key_layout = key_dir.join("operator.key");
+                let key_layout = key_dir.join(OPERATOR_KEY_FILENAME);
                 if key_layout.exists() {
                     return Some(key_layout);
                 }
@@ -453,7 +463,7 @@ fn resolve_operator_key_path(override_path: Option<&Path>) -> Result<PathBuf> {
     }
     let base = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("rules.keygen: OS did not advertise a config directory"))?;
-    Ok(base.join("ai-memory").join("operator.key"))
+    Ok(base.join("ai-memory").join(OPERATOR_KEY_FILENAME))
 }
 
 /// Generate a fresh Ed25519 keypair, write the 32-byte seed to `path`
@@ -756,7 +766,7 @@ fn sign_seed_rules(
         }
         summary.push(serde_json::json!({
             "id": rule.id,
-            "attest_level": OPERATOR_SIGNED_LEVEL,
+            (field_names::ATTEST_LEVEL): OPERATOR_SIGNED_LEVEL,
             "signed_now": !already_signed,
         }));
     }
@@ -827,7 +837,7 @@ fn load_operator_signing_key_from_dir(
     // `rules keygen` writes; verify the public half decodes and matches
     // the seed's derived verifying key before returning so a tampered
     // .pub surfaces here, not on the next signature-verify call.
-    let priv_keygen = key_dir.join("operator.key");
+    let priv_keygen = key_dir.join(OPERATOR_KEY_FILENAME);
     let pub_keygen = key_dir.join("operator.key.pub");
     if priv_keygen.exists() {
         let signing = load_operator_signing_key(&priv_keygen).with_context(|| {
@@ -881,7 +891,7 @@ fn load_operator_signing_key_from_dir(
     // mirroring the key into both locations. This in-process fallback
     // closes the wart so a fresh keygen + immediate enable just works.
     if let Some(parent) = key_dir.parent() {
-        let parent_priv = parent.join("operator.key");
+        let parent_priv = parent.join(OPERATOR_KEY_FILENAME);
         let parent_pub = parent.join("operator.key.pub");
         if parent_priv.exists() {
             let signing = load_operator_signing_key(&parent_priv).with_context(|| {
@@ -951,7 +961,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
     let payload: serde_json::Value = serde_json::from_str(payload_json)
         .with_context(|| format!("rules check: payload is not valid JSON: {payload_json}"))?;
     match kind {
-        "bash" => {
+        ak::BASH => {
             let command = payload
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -963,7 +973,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
                 .map(PathBuf::from);
             Ok(AgentAction::Bash { command, cwd })
         }
-        "filesystem_write" => {
+        ak::FILESYSTEM_WRITE => {
             let path = payload
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -977,7 +987,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
                 byte_estimate,
             })
         }
-        "network_request" => {
+        ak::NETWORK_REQUEST => {
             let host = payload
                 .get("host")
                 .and_then(|v| v.as_str())
@@ -990,7 +1000,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
                 .to_string();
             Ok(AgentAction::NetworkRequest { host, scheme })
         }
-        "process_spawn" => {
+        ak::PROCESS_SPAWN => {
             let binary = payload
                 .get("binary")
                 .and_then(|v| v.as_str())
@@ -1009,7 +1019,7 @@ fn build_action(kind: &str, payload_json: &str) -> Result<AgentAction> {
         }
         "custom" => {
             let custom_kind = payload
-                .get("custom_kind")
+                .get(field_names::CUSTOM_KIND)
                 .or_else(|| payload.get("kind"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("custom payload requires `custom_kind` string"))?
@@ -1039,11 +1049,11 @@ fn rule_to_json(rule: &Rule) -> serde_json::Value {
         "severity": rule.severity,
         "reason": rule.reason,
         "namespace": rule.namespace,
-        "created_by": rule.created_by,
-        "created_at": rule.created_at,
+        (field_names::CREATED_BY): rule.created_by,
+        (field_names::CREATED_AT): rule.created_at,
         "enabled": rule.enabled,
         "signature_b64": sig_b64,
-        "attest_level": rule.attest_level,
+        (field_names::ATTEST_LEVEL): rule.attest_level,
     })
 }
 

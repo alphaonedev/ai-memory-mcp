@@ -16,14 +16,16 @@ use crate::llm::OllamaClient;
 use serde_json::{Value, json};
 pub fn handle_expand_query(llm: Option<&OllamaClient>, params: &Value) -> Result<Value, String> {
     let llm = llm.ok_or("query expansion requires smart or autonomous tier (Ollama LLM)")?;
-    let query = params["query"].as_str().ok_or("query is required")?;
+    let query = params["query"]
+        .as_str()
+        .ok_or(crate::errors::msg::QUERY_REQUIRED)?;
     // COVERAGE: LLM response variability. The call below produces a
     // String whose content depends on the underlying model. Envelope
     // is tested at ≥95% via wiremock-driven success / error / shape
     // cases below; real-LLM behaviour is validated end-to-end via
     // the LongMemEval benchmark (see `benchmarks/longmemeval/`).
     let terms = llm.expand_query(query).map_err(|e| e.to_string())?;
-    Ok(json!({"original": query, "expanded_terms": terms}))
+    Ok(json!({"original": query, (crate::models::field_names::EXPANDED_TERMS): terms}))
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_expand_query ---
@@ -55,11 +57,10 @@ impl McpTool for ExpandQueryTool {
         "LLM query expansion. Smart/autonomous tier."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ExpandQueryRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ExpandQueryRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

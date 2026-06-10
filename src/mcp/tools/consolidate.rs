@@ -7,6 +7,7 @@ use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
 use crate::models::Tier;
+use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -32,7 +33,9 @@ pub(super) fn handle_consolidate(
             None => return Err(format!("ids[{i}] must be a string")),
         }
     }
-    let title = params["title"].as_str().ok_or("title is required")?;
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
     let namespace = params["namespace"]
         .as_str()
         .unwrap_or(crate::DEFAULT_NAMESPACE);
@@ -46,7 +49,7 @@ pub(super) fn handle_consolidate(
         for id in &ids {
             match db::get(conn, id) {
                 Ok(Some(mem)) => memory_pairs.push((mem.title, mem.content)),
-                Ok(None) => return Err(format!("memory not found: {id}")),
+                Ok(None) => return Err(crate::errors::msg::memory_not_found(id)),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -74,14 +77,14 @@ pub(super) fn handle_consolidate(
             payload: json!({
                 "title": title,
                 "summary_chars": summary.len(),
-                "source_ids": ids,
+                (field_names::SOURCE_IDS): ids,
             }),
         };
         match Permissions::evaluate(&ctx, &[]) {
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
                 return Err(crate::governance::deny_message(
-                    "consolidate",
+                    crate::audit::OP_CONSOLIDATE,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
                 ));
@@ -90,7 +93,7 @@ pub(super) fn handle_consolidate(
                 return Ok(json!({
                     "status": "ask",
                     "reason": prompt,
-                    "action": "consolidate",
+                    "action": crate::audit::OP_CONSOLIDATE,
                     "namespace": namespace,
                     "source_count": ids.len(),
                 }));
@@ -119,7 +122,7 @@ pub(super) fn handle_consolidate(
         &summary,
         namespace,
         &Tier::Long,
-        "consolidation",
+        crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
     )
     .map_err(|e| e.to_string())?;
@@ -154,7 +157,7 @@ pub(super) fn handle_consolidate(
         }
     }
 
-    let mut result = json!({"id": new_id, "consolidated": ids.len()});
+    let mut result = json!({"id": new_id, (field_names::CONSOLIDATED): ids.len()});
     if auto_generated {
         result["auto_summary"] = json!(true);
         result["summary_preview"] = json!(summary.chars().take(200).collect::<String>());
@@ -183,7 +186,7 @@ pub(super) fn handle_consolidate(
     .ok();
     crate::subscriptions::dispatch_event_with_details(
         conn,
-        "memory_consolidated",
+        crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED,
         &new_id,
         namespace,
         Some(&consolidator_agent_id),
@@ -242,11 +245,10 @@ impl McpTool for ConsolidateTool {
         "Merge 2-100 sources into one long-tier memory; deletes sources, adds derived_from links. LLM auto-generates summary if omitted (smart/autonomous tier)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ConsolidateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ConsolidateRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

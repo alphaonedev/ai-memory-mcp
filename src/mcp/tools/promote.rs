@@ -3,6 +3,7 @@
 
 //! MCP `memory_promote` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::Tier;
 use crate::{db, validate};
@@ -45,11 +46,10 @@ impl McpTool for PromoteTool {
         "Default: bump to long (clears expiry); short->long and mid->long are single-call. #831: target_tier ('mid'|'long') stops on intermediate. Task 1.7: to_namespace clones to an ancestor + derived_from link."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PromoteRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PromoteRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 
@@ -81,7 +81,9 @@ pub(super) fn handle_promote(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // Resolve prefix if exact ID not found; capture the memory so governance
     // has owner context (Task 1.9).
@@ -90,14 +92,14 @@ pub(super) fn handle_promote(
     } else if let Some(m) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
         m
     } else {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
     let resolved_id = target.id.clone();
     // P5 (G9): snapshot fields needed for the post-success webhook.
     let snapshot_namespace = target.namespace.clone();
     let snapshot_owner: Option<String> = target
         .metadata
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
@@ -108,7 +110,7 @@ pub(super) fn handle_promote(
             .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = json!({
@@ -140,7 +142,7 @@ pub(super) fn handle_promote(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "promote",
                     "memory_id": resolved_id,
                 }));
@@ -246,7 +248,7 @@ pub(super) fn handle_promote(
     )
     .map_err(|e| e.to_string())?;
     if !found {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
     // P5 (G9): fire `memory_promote` webhook for the default tier-upgrade
     // path AFTER the update commits. The webhook `tier` field reflects

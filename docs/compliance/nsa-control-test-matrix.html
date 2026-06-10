@@ -1,0 +1,464 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  ai-memory v0.7.0 — NSA CSI MCP Control → Test Matrix (verification evidence)
+
+  Companion to nsa-csi-mcp.html. That page maps every NSA CSI MCP concern and
+  recommendation to the substrate FEATURE that addresses it (capability_id +
+  file anchor). THIS page maps the same controls to the concrete AUTOMATED
+  CHECK that exercises each one: the named unit/integration test
+  (file::test_name), the CI workflow job, and/or the do-1461 live-fleet
+  harness check id.
+
+  Honesty bar: no coverage is claimed that cannot be cited by name. Where a
+  mitigation is deployed by fleet configuration but has NO live-fleet harness
+  PASS row, the cell says so explicitly ("config-asserted (provision/lib.sh)
+  — no harness PASS row").
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory — NSA CSI MCP Control → Test Matrix</title>
+<meta name="description" content="ai-memory v0.7.0 verification-evidence matrix: every NSA CSI MCP security control (U/OO/6030316-26) mapped to the named unit/integration test, CI workflow job, and do-1461 live-fleet harness check that exercises it. Gaps stated honestly.">
+<meta name="theme-color" content="#0d1117">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-control-test-matrix.html">
+<style>
+:root {
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666; --accent:#fff;
+  --good:#6ee7ff; --warn:#ffb86b; --bad:#ff6b9d;
+  --pillar-3:#c8a2ff;
+  --font-mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  --max-w:1280px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--good);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.82rem;background:var(--bg-code);padding:.12em .35em;border-radius:4px;word-break:break-word}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1{font-weight:800;letter-spacing:-0.03em;font-size:2.4rem;line-height:1.1;margin-bottom:.75rem}
+h2{font-weight:700;letter-spacing:-0.02em;font-size:1.8rem;line-height:1.2;margin-bottom:.75rem}
+h3{font-weight:700;font-size:1.15rem;margin:1rem 0 .5rem}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text);text-decoration:none}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;align-items:center}
+@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 0 2.5rem;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;padding:.3rem .8rem;border-radius:999px;background:rgba(110,231,255,0.1);color:var(--good);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:1rem;border:1px solid rgba(110,231,255,0.25)}
+.hero .tagline{font-size:1.05rem;color:var(--text-muted);max-width:72ch}
+.hero-pills{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.4rem}
+.hero-pill{padding:.4rem .85rem;border-radius:999px;background:var(--bg-elev);color:var(--text);font-size:.8rem;font-weight:600;border:1px solid var(--border-hl)}
+.hero-pill.good{background:rgba(110,231,255,0.08);color:var(--good);border-color:rgba(110,231,255,0.3)}
+.hero-pill.warn{background:rgba(255,184,107,0.08);color:var(--warn);border-color:rgba(255,184,107,0.3)}
+section{padding:2.75rem 0;border-bottom:1px solid var(--border)}
+section:last-child{border-bottom:none}
+.section-eyebrow{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--good);margin-bottom:.85rem}
+.lede{font-size:1.02rem;color:var(--text);max-width:78ch;margin-bottom:1.25rem}
+.scroll-x{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.83rem;margin:1rem 0}
+thead th{text-align:left;padding:.65rem .75rem;background:var(--bg-elev);color:var(--text);font-weight:700;border-bottom:2px solid var(--border-hl);font-size:.74rem;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
+tbody td{padding:.65rem .75rem;border-bottom:1px solid var(--border);vertical-align:top;color:var(--text-muted)}
+tbody td.col-name{color:var(--text);font-weight:600;min-width:17ch}
+tbody tr:hover{background:rgba(255,255,255,0.02)}
+td ul{list-style:none;padding-left:0;margin:0}
+td li{padding:.12rem 0}
+.tag{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.68rem;font-weight:700;letter-spacing:.04em;white-space:nowrap}
+.tag.pass{background:rgba(110,231,255,0.12);color:var(--good);border:1px solid rgba(110,231,255,0.3)}
+.tag.cfg{background:rgba(255,184,107,0.12);color:var(--warn);border:1px solid rgba(255,184,107,0.3)}
+.tag.na{background:rgba(200,162,255,0.12);color:var(--pillar-3);border:1px solid rgba(200,162,255,0.3)}
+.tag.none{background:rgba(255,107,157,0.10);color:var(--bad);border:1px solid rgba(255,107,157,0.3)}
+.disclaimer-box{background:var(--bg-card);border-left:3px solid var(--warn);padding:1rem 1.25rem;border-radius:6px;margin:1.5rem 0}
+.disclaimer-box strong{color:var(--warn);display:block;margin-bottom:.35rem}
+.disclaimer-box p{color:var(--text-muted);margin:0;font-size:.9rem}
+.key-box{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.4rem;margin:1.25rem 0}
+.key-box h4{color:var(--text);font-size:.9rem;letter-spacing:.05em;text-transform:uppercase;margin-bottom:.6rem}
+.key-box ul{list-style:none;padding-left:0}
+.key-box li{padding:.25rem 0;font-size:.88rem;color:var(--text-muted)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.25rem;margin:1.25rem 0}
+.stat-card{background:var(--bg-elev);border:1px solid var(--border-hl);border-radius:10px;padding:1.1rem}
+.stat-card .n{font-size:2.2rem;font-weight:800;color:var(--text);letter-spacing:-0.03em;line-height:1}
+.stat-card .n.warn{color:var(--warn)}
+.stat-card .n.good{color:var(--good)}
+.stat-card .l{color:var(--text-muted);font-size:.85rem;margin-top:.35rem}
+footer{padding:3rem 0 4rem;border-top:1px solid var(--border);background:var(--bg-raised);color:var(--text-dim);font-size:.85rem}
+footer a{color:var(--text-muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <div>
+      <a class="home-link" href="../index.html">ai-memory</a>
+      <a href="../at-a-glance.html">Atlas</a>
+      <a href="../architectures.html">Architectures</a>
+      <a href="../feature-matrix.html">Feature matrix</a>
+      <a href="../evidence.html">Evidence</a>
+      <a class="active" href="index.html">Compliance</a>
+    </div>
+    <div class="right">
+      <a href="../whats-new-v07.html">v0.7.0</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <span class="eyebrow">▸ Verification evidence · Public-facing</span>
+    <h1>NSA CSI MCP — Control → Test Matrix</h1>
+    <p class="tagline">The <a href="nsa-csi-mcp.html">NSA CSI MCP compliance mapping</a> claims structural coverage of every NSA-enumerated concern and recommendation (<code>U/OO/6030316-26</code>, May 2026) and anchors each claim to a substrate feature. <strong>This page answers the follow-up question a reviewer should ask: what automated check actually exercises each control?</strong> Every cell below names the exact test (<code>file::test_name</code>), the CI workflow job, and/or the do-1461 live-fleet harness check id. Where no automated check exists, the cell says so — honestly.</p>
+    <div class="hero-pills">
+      <span class="hero-pill good">19 controls (10 concerns + 7 recommendations + 2 meta)</span>
+      <span class="hero-pill good">18 / 19 cite at least one named automated check</span>
+      <span class="hero-pill good">9 controls carry do-1461 live-fleet PASS rows</span>
+      <span class="hero-pill warn">7 mitigations config-asserted — no harness PASS row</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ How to read this matrix</span>
+    <h2>Three evidence classes, one honesty bar.</h2>
+    <p class="lede">Each control row carries up to three independent evidence columns. A control is only as verified as the strongest check you can run yourself.</p>
+
+    <div class="key-box">
+      <h4>Evidence sources</h4>
+      <ul>
+        <li><strong style="color:var(--text)">Unit / integration tests</strong> — named tests in <code>tests/</code> or in-module <code>#[cfg(test)]</code> blocks, run by <code>AI_MEMORY_NO_CONFIG=1 cargo test</code>. Cited as <code>file::test_name</code>; reproduce any single row with <code>cargo test &lt;test_name&gt;</code>.</li>
+        <li><strong style="color:var(--text)">CI gate</strong> — the GitHub Actions workflow · job that runs the check on every PR / push. Job names are read directly from <code>.github/workflows/*.yml</code>: <code>CI · check</code> (full test suite + the <em>Security audit</em> <code>cargo audit</code> step), <code>Fuzz Testing · fuzz</code>, <code>token-budget · budget</code>, <code>Bench · bench</code>, <code>Batman Mode acceptance gate · rust-integration / bash-integration / surface-stability</code>.</li>
+        <li><strong style="color:var(--text)">do-1461 live-fleet harness</strong> — black-box probes against the live 15-node, 3-region reference fleet over the real TLS+mTLS path. Check ids come from <code>deploy/do-1461/test/run.sh</code> (groups <code>regression / crypto / federation / zerotouch / a2a / ai_nhi / nsa_gaps / curator</code>), <code>deploy/do-1461/validate/run.sh</code>, and <code>deploy/do-1461/test/encrypted_legs.sh</code>. Cited rows reference the run artifacts <code>test-20260609T161203Z.tsv</code> (150/150 PASS), <code>verify-20260609T133956Z.tsv</code> (119/119 PASS), and <code>encrypted-legs-20260608T205716Z.tsv</code> under <code>.local-runs/do-1461/reports/</code>. See the <a href="../reference-architecture/">reference architecture page</a> for the fleet itself.</li>
+      </ul>
+    </div>
+
+    <div class="disclaimer-box">
+      <strong>Honesty bar.</strong>
+      <p>No coverage is claimed that cannot be cited by name. Some mitigations are <em>deployed</em> on the reference fleet purely by configuration (named constants and env battery in <code>deploy/do-1461/provision/lib.sh</code> + <code>provision/46_batman.sh</code>) but have <strong>no live-fleet harness PASS row</strong> exercising them end-to-end. Those cells say <span class="tag cfg">config-asserted</span> — the control is wired and unit-tested, but the fleet harness does not (yet) prove it over the wire. The seven such mitigations are listed in full <a href="#config-asserted">below the matrix</a>.</p>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card"><div class="n">19</div><div class="l">NSA controls in scope (concerns a–j, recommendations a–g, 2 meta)</div></div>
+      <div class="stat-card"><div class="n good">18</div><div class="l">Controls with ≥1 named automated check (test, CI job, or harness row)</div></div>
+      <div class="stat-card"><div class="n good">9</div><div class="l">Controls with do-1461 live-fleet PASS rows</div></div>
+      <div class="stat-card"><div class="n warn">7</div><div class="l">Mitigations config-asserted — no harness PASS row (stated per cell)</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="matrix-concerns">
+  <div class="container">
+    <span class="section-eyebrow">▸ Concerns a–j</span>
+    <h2>NSA concerns → automated checks.</h2>
+
+    <div class="scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:16ch">NSA concern</th>
+          <th>Unit / integration tests (file::test_name)</th>
+          <th style="width:18ch">CI gate (workflow · job)</th>
+          <th style="width:34ch">do-1461 live-fleet harness check</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="col-name">a · Access control</td>
+          <td><ul>
+            <li><code>tests/export_memories_admin_gate_957.rs::non_admin_caller_gets_403_957</code></li>
+            <li><code>tests/export_memories_admin_gate_957.rs::admin_caller_gets_full_corpus_957</code></li>
+            <li><code>tests/export_memories_admin_gate_957.rs::missing_agent_id_header_gets_403_957</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>crypto::admin_gated</code> (403 as non-admin)</li>
+            <li><code>regression::private_isolation</code> (non-owner cannot read private row)</li>
+            <li><code>regression::ns_cross_isolation</code></li>
+            <li>— <code>test-20260609T161203Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">b · Insecure context or data serialization</td>
+          <td><ul>
+            <li><code>tests/capabilities_v3.rs::cap_v3_response_carries_schema_version_and_summary</code></li>
+            <li><code>tests/capabilities_v3.rs::cap_v3_legacy_entry_point_refuses_v3</code></li>
+            <li>fuzz targets <code>fuzz/fuzz_targets/fuzz_validate.rs</code>, <code>fuzz_namespace.rs</code></li>
+          </ul></td>
+          <td><code>Fuzz Testing · fuzz</code><br><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>nsa_gaps::provenance_envelope[peer]</code> ×9 peers — typed provenance envelope (citations / ConfidenceTier / MemoryKind) returned over the live wire</li>
+            <li>— <code>test-20260609T161203Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">c · Poor approval workflows</td>
+          <td><ul>
+            <li><code>tests/k10_approval_security.rs::hmac_replay_rejected</code></li>
+            <li><code>tests/k10_approval_security.rs::hmac_in_window_replay_rejected</code></li>
+            <li><code>tests/k10_approval_security.rs::hmac_cross_method_binding_rejected</code></li>
+            <li><code>tests/k10_approval_security.rs::hmac_cross_pending_id_binding_rejected</code></li>
+            <li><code>tests/k7_hmac.rs::k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag cfg">config-asserted</span><br>Pending-actions HMAC-mandatory dispatch — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row.</td>
+        </tr>
+        <tr>
+          <td class="col-name">d · Token or session security</td>
+          <td><ul>
+            <li><code>src/tls.rs::tests::test_load_mtls_rustls_config_happy_path</code></li>
+            <li><code>src/tls.rs::tests::test_allowlist_empty_file_errors</code></li>
+            <li><code>tests/federation_nonce_replay_922.rs::replay_922_repeated_nonce_returns_401_with_replay_tag</code></li>
+            <li><code>tests/federation_nonce_replay_922.rs::replay_922_fresh_nonce_after_replay_is_accepted</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>crypto::no_client_cert</code> / <code>crypto::rogue_client_cert</code> / <code>crypto::wrong_server_ca</code> (handshake refused, 000)</li>
+            <li><code>crypto::apikey_required</code> (401) / <code>crypto::apikey_accepted</code> (200)</li>
+            <li><code>nsa_gaps::sync_push_replay_refused[peer]</code> ×9</li>
+            <li><code>leg1_api_mtls::*</code> ×5 checks × 9 peers — <code>encrypted-legs-20260608T205716Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">e · Misconfigurations and poor implementation</td>
+          <td><ul>
+            <li><code>tests/config_precedence.rs::test_secret_not_in_capabilities</code></li>
+            <li><code>src/subscriptions.rs::tests::test_validate_url_dns_fails_closed_on_dns_failure_1053</code></li>
+            <li><code>src/subscriptions.rs::tests::test_validate_url_dns_fail_open_env_overrides_1053</code></li>
+          </ul></td>
+          <td><code>Batman Mode acceptance gate · rust-integration / bash-integration / surface-stability</code><br><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>nsa_gaps::unsigned_write_403[peer]</code> ×9 (attestation gate live)</li>
+            <li><code>zerotouch::unenrolled_status[peer]</code> + <code>zerotouch::unenrolled_reason[peer]</code> ×9 (#1088 fail-closed, <code>peer_not_enrolled</code>)</li>
+            <li><span class="tag cfg">config-asserted</span> fail-closed posture surfaced in the capabilities envelope — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row</li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">f · Inconsistent behaviors</td>
+          <td><ul>
+            <li><code>tests/http_if_match_concurrency.rs::http_put_with_stale_if_match_returns_409_with_envelope</code></li>
+            <li><code>tests/http_if_match_concurrency.rs::http_put_with_matching_if_match_succeeds</code></li>
+            <li><code>tests/http_if_match_concurrency.rs::http_put_without_if_match_preserves_legacy_last_write_wins</code> (+2 siblings in the same file)</li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag cfg">config-asserted</span><br>409 optimistic-concurrency conflict — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row.</td>
+        </tr>
+        <tr>
+          <td class="col-name">g · Poor or missing audit logs</td>
+          <td><ul>
+            <li><code>src/cli/verify_signed_events.rs::tests::populated_db_reports_chain_ok</code></li>
+            <li><code>src/cli/verify_signed_events.rs::tests::broken_chain_text_format_reports_fail_with_sequence</code></li>
+            <li><code>src/cli/verify_signed_events.rs::tests::broken_chain_json_format_carries_chain_break</code></li>
+            <li><code>src/signed_events.rs::tests::payload_hash_is_sha256_32_bytes</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>nsa_gaps::signed_events_chain_ok[peer]</code> ×9 — SQL chain-integrity verdict per peer schema. <em>Honest scope:</em> structural integrity (contiguous sequence, genesis prev_hash, no NULLs), not the byte-exact cross-row hash recompute; the first-party postgres verifier is tracked as <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1541">#1541</a>.</li>
+            <li>— <code>test-20260609T161203Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">h · Denial of service and fatigue-based techniques</td>
+          <td><ul>
+            <li><code>tests/token_budget_guard.rs::issue_829_trimmed_full_profile_total_under_ceiling</code></li>
+            <li><code>tests/k8_daily_reset.rs::k8_daily_reset_zeros_stale_rows_only</code></li>
+            <li><code>tests/per_namespace_quota.rs::per_namespace_memories_isolation</code> (+7 siblings)</li>
+            <li><code>tests/federation_dlq_replay.rs::replay_drains_dlq_when_peer_recovers</code></li>
+            <li><code>tests/federation_dlq_replay.rs::dlq_dedupes_repeated_failures_via_unique_index</code></li>
+            <li><code>src/subscriptions.rs::tests::test_validate_url_dns_rejects_aws_metadata</code>, <code>::test_validate_url_dns_rejects_rfc1918_private_ranges</code> (SSRF guard)</li>
+            <li><em>2 MB body cap:</em> code anchor <code>src/lib.rs</code> <code>DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES)</code> — no dedicated named test found; not claimed as test-covered.</li>
+          </ul></td>
+          <td><code>token-budget · budget</code><br><code>CI · check</code></td>
+          <td><span class="tag cfg">config-asserted</span><br>K8 quota surface / 2&nbsp;MB body cap / bounded federation DLQ — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row.</td>
+        </tr>
+        <tr>
+          <td class="col-name">i · Tool parameter injection (real-world)</td>
+          <td><ul>
+            <li><code>src/validate.rs::tests::test_namespace_rejects_dot_segments_redteam_240</code></li>
+            <li><code>src/validate.rs::tests::test_validate_id_rejects_path_traversal_1051</code></li>
+            <li><code>src/validate.rs::tests::test_agent_id_rejects_path_traversal_1251</code></li>
+            <li><code>src/validate.rs::tests::prop_validate_title_rejects_empty_strings_only_when_actually_empty</code> (property test)</li>
+            <li>fuzz targets <code>fuzz_validate.rs</code> / <code>fuzz_namespace.rs</code></li>
+          </ul></td>
+          <td><code>Fuzz Testing · fuzz</code><br><code>CI · check</code></td>
+          <td><span class="tag cfg">config-asserted</span><br>Malformed-payload <code>RequestValidator</code> rejection — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row.</td>
+        </tr>
+        <tr>
+          <td class="col-name">j · Tool invocation path confusion (real-world)</td>
+          <td><ul>
+            <li><code>tests/mcp_initialize_server_signing.rs::signed_identity_block_signature_verifies_round_trip</code></li>
+            <li><code>tests/mcp_initialize_server_signing.rs::tampered_daemon_id_field_breaks_signature_verification</code></li>
+            <li><code>tests/mcp_initialize_server_signing.rs::bit_flipped_signature_breaks_verification</code></li>
+            <li><code>tests/mcp_initialize_server_signing.rs::client_tofu_pin_detects_keypair_rotation</code></li>
+            <li><code>tests/mcp_initialize_server_signing.rs::legacy_no_keypair_handshake_shape_is_unchanged</code> (27 integration tests in that file + 20 module tests in <code>src/mcp/server_identity.rs</code>)</li>
+            <li><code>tests/harness_integration.rs::d4_claude_code_initialize_round_trip</code> (+3 host siblings)</li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag cfg">config-asserted</span><br>MCP TOFU Ed25519-signed serverInfo at initialize — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row (the fleet harness probes the HTTP surface; MCP stdio initialize is not exercised by <code>run.sh</code>).</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section id="matrix-recommendations">
+  <div class="container">
+    <span class="section-eyebrow">▸ Recommendations a–g + 2 meta</span>
+    <h2>NSA recommendations → automated checks.</h2>
+
+    <div class="scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:18ch">NSA recommendation</th>
+          <th>Unit / integration tests (file::test_name)</th>
+          <th style="width:18ch">CI gate (workflow · job)</th>
+          <th style="width:34ch">do-1461 live-fleet harness check</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="col-name">a · Choose supported MCP projects when possible</td>
+          <td>Process control (maintenance + advisory channel), not a test target. Dependency hygiene is mechanically gated: the <em>Security audit</em> step runs <code>cargo audit</code> against the RustSec advisory DB.</td>
+          <td><code>CI · check</code> (<em>Security audit</em> step)</td>
+          <td><span class="tag na">not harness-applicable</span><br>Release/registry process — no fleet probe.</td>
+        </tr>
+        <tr>
+          <td class="col-name">b · Design for boundaries</td>
+          <td><ul>
+            <li><code>tests/per_namespace_quota.rs::per_namespace_memories_isolation</code></li>
+            <li><code>tests/per_namespace_quota.rs::per_namespace_storage_bytes_isolation</code></li>
+            <li><code>tests/per_namespace_quota.rs::per_namespace_links_isolation</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>regression::ns_cross_isolation</code> / <code>regression::private_isolation</code></li>
+            <li><code>zerotouch::cred_ca_chain[peer]</code> ×9 (trust-domain-scoped CA chain)</li>
+            <li><code>zerotouch::unenrolled_status[peer]</code> ×9</li>
+            <li>— <code>test-20260609T161203Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">c · Validate parameters</td>
+          <td>Same named tests as concern (i): <code>src/validate.rs::tests::test_validate_id_rejects_path_traversal_1051</code>, <code>::test_namespace_rejects_dot_segments_redteam_240</code>, <code>::test_agent_id_rejects_path_traversal_1251</code>; plus <code>tests/per_namespace_quota.rs::global_sentinel_is_backwards_compat_landing_zone</code> (schema-v50 quota dimension, #1156).</td>
+          <td><code>Fuzz Testing · fuzz</code><br><code>CI · check</code></td>
+          <td><span class="tag cfg">config-asserted</span><br>Malformed-payload <code>RequestValidator</code> rejection — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row.</td>
+        </tr>
+        <tr>
+          <td class="col-name">d · Constrain and sandbox tool execution</td>
+          <td><ul>
+            <li><code>tests/hooks_timeout_budget.rs::chain_fire_fail_closed_yields_deny_503_on_timeout</code></li>
+            <li><code>tests/hooks_timeout_budget.rs::chain_fire_spawn_error_fail_closed_yields_deny_503</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag none">no harness row</span><br>The Track G hook pipeline is default-off and is not enabled on the do-1461 fleet — no harness PASS row; not claimed.</td>
+        </tr>
+        <tr>
+          <td class="col-name">e · Sign and verify MCP messages</td>
+          <td><ul>
+            <li><code>tests/capture_turn_security_integrity.rs::rejects_signature_without_pubkey</code></li>
+            <li><code>tests/federation_nonce_replay_922.rs::replay_922_repeated_nonce_returns_401_with_replay_tag</code></li>
+            <li><code>tests/mcp_initialize_server_signing.rs::signed_identity_block_signature_verifies_round_trip</code> (see concern j for the full battery)</li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>nsa_gaps::unsigned_write_403[peer]</code> + <code>nsa_gaps::unsigned_write_reason[peer]</code> ×9 (403 <code>ATTESTATION_FAILED</code>)</li>
+            <li><code>nsa_gaps::sync_push_missing_sig_401[peer]</code> ×9</li>
+            <li><code>nsa_gaps::sync_push_replay_refused[peer]</code> ×9 (sig+nonce gate)</li>
+            <li>— <code>test-20260609T161203Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">f · Filter and monitor output pipelines and chained execution</td>
+          <td><ul>
+            <li><code>tests/accept_provenance_http.rs::verbose_header_resolves_to_verbose</code></li>
+            <li><code>tests/accept_provenance_http.rs::absent_header_resolves_to_minimal</code></li>
+            <li><code>tests/accept_provenance_http.rs::minimal_is_not_verbose</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span><ul>
+            <li><code>nsa_gaps::provenance_envelope[peer]</code> ×9 — <code>Accept-Provenance: verbose</code> recall returns citations / ConfidenceTier / MemoryKind over the live wire</li>
+            <li>— <code>test-20260609T161203Z.tsv</code></li>
+          </ul></td>
+        </tr>
+        <tr>
+          <td class="col-name">g · Instrument for logging and detection</td>
+          <td><ul>
+            <li><code>tests/serve_integration.rs::serve_metrics_endpoint_at_root_path</code></li>
+            <li><code>tests/serve_integration.rs::serve_metrics_endpoint_at_v1_path</code></li>
+            <li><code>tests/l07_3_chunk_d_http_surface.rs::http_metrics_returns_prom_text</code></li>
+          </ul></td>
+          <td><code>CI · check</code></td>
+          <td><span class="tag pass">harness PASS</span> <code>nsa_gaps::signed_events_chain_ok[peer]</code> ×9 (audit chain live).<br><span class="tag cfg">config-asserted</span> <code>/metrics</code> reachability — config-asserted (<code>provision/lib.sh</code>) — no harness PASS row.</td>
+        </tr>
+        <tr>
+          <td class="col-name">meta · Track and patch MCP-related vulnerabilities</td>
+          <td><code>cargo audit</code> against the RustSec advisory database (<em>Security audit</em> step, <code>.github/workflows/ci.yml</code>), <code>Cargo.lock</code> dependency pinning.</td>
+          <td><code>CI · check</code> (<em>Security audit</em> step)</td>
+          <td><span class="tag na">not harness-applicable</span><br>Process control — no fleet probe.</td>
+        </tr>
+        <tr>
+          <td class="col-name">meta · Scan local network for open or vulnerable MCP servers</td>
+          <td><span class="tag none">no automated check</span> Operator-side network scanning is out of substrate scope (per the <a href="nsa-csi-mcp.html#boundaries">honest boundaries</a>). The substrate-side mitigation (first-party <code>verify-*</code> CLI family, not MCP-Inspector) is exercised by the concern-(g) tests above.</td>
+          <td>—</td>
+          <td><span class="tag na">not harness-applicable</span></td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section id="config-asserted">
+  <div class="container">
+    <span class="section-eyebrow">▸ Honest gap register</span>
+    <h2>The seven config-asserted mitigations.</h2>
+    <p class="lede">These mitigations are wired into the reference fleet by configuration (named constants + env battery in <code>deploy/do-1461/provision/lib.sh</code> and <code>provision/46_batman.sh</code>) and are unit-/integration-tested in the repo, but the do-1461 live-fleet harness has <strong>no PASS row</strong> that exercises them end-to-end over the wire. Listing them here is the point: a reviewer should not have to discover an evidence gap by grepping TSVs.</p>
+    <ul style="list-style:none;padding-left:0;color:var(--text-muted);font-size:.95rem">
+      <li style="padding:.3rem 0">1. Malformed-payload <code>RequestValidator</code> rejection (concerns i, rec c)</li>
+      <li style="padding:.3rem 0">2. Pending-actions HMAC-mandatory dispatch (concern c)</li>
+      <li style="padding:.3rem 0">3. 409 optimistic-concurrency conflict (concern f)</li>
+      <li style="padding:.3rem 0">4. K8 quota surface / 2&nbsp;MB HTTP body cap / bounded federation DLQ (concern h)</li>
+      <li style="padding:.3rem 0">5. MCP TOFU Ed25519-signed serverInfo at initialize (concern j)</li>
+      <li style="padding:.3rem 0">6. <code>/metrics</code> reachability (rec g)</li>
+      <li style="padding:.3rem 0">7. Fail-closed posture surfaced in the capabilities envelope (concern e)</li>
+    </ul>
+    <p>Each carries the named unit/integration tests cited in its matrix row — the gap is specifically the absence of a live-fleet harness probe, not the absence of any automated check.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Reproduce</span>
+    <h2>Re-derive any cell yourself.</h2>
+    <p class="lede">Every citation on this page is reproducible from a fresh checkout of <code>release/v0.7.0</code>:</p>
+    <ul style="list-style:none;padding-left:0;color:var(--text-muted)">
+      <li style="padding:.25rem 0">• <strong style="color:var(--text)">Tests:</strong> <code>AI_MEMORY_NO_CONFIG=1 cargo test &lt;test_name&gt;</code> — e.g. <code>cargo test http_put_with_stale_if_match_returns_409_with_envelope</code>.</li>
+      <li style="padding:.25rem 0">• <strong style="color:var(--text)">CI jobs:</strong> read <code>.github/workflows/*.yml</code>; job names cited verbatim.</li>
+      <li style="padding:.25rem 0">• <strong style="color:var(--text)">Harness checks:</strong> stand up the fleet per <code>deploy/do-1461/README.md</code> (<code>make seed up provision validate test</code>); the check ids cited here are the <code>group::test</code> columns of the emitted TSV/JSON reports.</li>
+    </ul>
+    <p>Feature-level mapping (what addresses each control, with <code>capability_id</code> + file anchors) lives on the companion page: <a href="nsa-csi-mcp.html">NSA CSI MCP Security Compliance</a>. Reproducibility contracts for the fleet, bench, and full-suite baselines live at <a href="../reproducible-baselines.html">Reproducible baselines</a>.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · NSA CSI MCP Control → Test Matrix · public-facing verification evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p style="margin-bottom:.5rem">Companion pages: <a href="nsa-csi-mcp.html">NSA CSI MCP compliance mapping</a> · <a href="honest-limitations.md">honest-limitations.md</a> · <a href="index.html">Compliance landing</a> · <a href="../reference-architecture/">do-1461 reference architecture</a>.</p>
+    <p>Reference: National Security Agency, <em>Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation</em>, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. NSA, DoD, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.</p>
+  </div>
+</footer>
+
+</body>
+</html>

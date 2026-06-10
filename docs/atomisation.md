@@ -116,7 +116,7 @@ The production curator is `LlmCurator<OllamaClient>` in
 [`src/atomisation/curator.rs`](../src/atomisation/curator.rs):
 
 - **Model.** Gemma 4 (E2B at smart tier). The prompt is pinned in
-  `GEMMA4_ATOMISATION_PROMPT_TEMPLATE` and surfaces the
+  `CURATOR_SYSTEM_PROMPT` and surfaces the
   envelope `2 ≤ N ≤ 10 atoms, ≤ max_atom_tokens` directly to the LLM
   so a malformed response is rare.
 - **Token budget.** Validated post-response with
@@ -184,8 +184,8 @@ THEN embed" order set the policy explicitly.
 
 When the policy resolves to `Synchronous`:
 
-1. The MCP `memory_store` handler SKIPS source embedding (line ~505
-   in `src/mcp/tools/store.rs`).
+1. The MCP `memory_store` handler SKIPS source embedding (the
+   `Synchronous`-policy branch in `src/mcp/tools/store/mod.rs`).
 2. `run_synchronous_auto_atomise` runs the curator pass INSIDE the
    handler, BEFORE the response returns.
 3. Atoms are inserted as first-class memories on the standard write

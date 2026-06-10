@@ -3,6 +3,8 @@
 
 //! MCP agent-registration and agent-list handlers.
 
+use crate::mcp::param_names;
+use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 pub(super) fn handle_agent_register(
@@ -10,10 +12,10 @@ pub(super) fn handle_agent_register(
     params: &Value,
 ) -> Result<Value, String> {
     let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
-    let agent_type = params["agent_type"]
+    let agent_type = params[param_names::AGENT_TYPE]
         .as_str()
         .ok_or("agent_type is required")?;
-    let capabilities: Vec<String> = params["capabilities"]
+    let capabilities: Vec<String> = params[param_names::CAPABILITIES]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -32,7 +34,7 @@ pub(super) fn handle_agent_register(
     // storage write so the audit trail captures intent regardless of
     // downstream storage outcome. Mirrors the #911 HTTP fix.
     let caller = crate::identity::resolve_agent_id(params["caller_agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -40,8 +42,8 @@ pub(super) fn handle_agent_register(
         "",
         json!({
             "new_agent_id": agent_id,
-            "agent_type": agent_type,
-            "capabilities": &capabilities,
+            (field_names::AGENT_TYPE): agent_type,
+            (field_names::CAPABILITIES): &capabilities,
         }),
     );
 
@@ -49,11 +51,11 @@ pub(super) fn handle_agent_register(
         db::register_agent(conn, agent_id, agent_type, &capabilities).map_err(|e| e.to_string())?;
 
     Ok(json!({
-        "registered": true,
+        (field_names::REGISTERED): true,
         "id": id,
         "agent_id": agent_id,
-        "agent_type": agent_type,
-        "capabilities": capabilities,
+        (field_names::AGENT_TYPE): agent_type,
+        (field_names::CAPABILITIES): capabilities,
     }))
 }
 
@@ -112,11 +114,10 @@ impl McpTool for AgentRegisterTool {
         "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested — pair with attestation for security boundary."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(AgentRegisterRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<AgentRegisterRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 
@@ -141,11 +142,10 @@ impl McpTool for AgentListTool {
         "List agents (ordered by registered_at)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(AgentListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<AgentListRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

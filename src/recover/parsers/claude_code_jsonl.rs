@@ -12,6 +12,7 @@
 //! implementation slice §C2 for the verbatim line-shape reference
 //! and the surviving `f755c061-...jsonl` example dossier path.
 
+use crate::models::field_names;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -132,12 +133,24 @@ fn parse_one_turn(v: &Value, raw_line: &str) -> Option<ParsedTurn> {
 
     let line_sha256_hex = sha256_hex(raw_line);
 
+    // #1573 — surface the host session identifier so the dedup layer
+    // can key on `(host_session_id, host_turn_index)` when available.
+    // Claude Code JSONL carries `sessionId` per line but NO numeric
+    // turn counter, so `host_turn_index` stays `None` here (a line
+    // ordinal is not a substitute — see the `ParsedTurn` field doc).
+    let host_session_id = v
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
     Some(ParsedTurn {
         timestamp_iso,
         role,
         content_text,
         tool_calls,
         line_sha256_hex,
+        host_session_id,
+        host_turn_index: None,
     })
 }
 
@@ -152,7 +165,7 @@ fn tool_use_brief(b: &Value) -> String {
             .and_then(Value::as_str)
             .map(ToString::to_string)
     };
-    let brief = pick("description")
+    let brief = pick(field_names::DESCRIPTION)
         .or_else(|| pick("command"))
         .or_else(|| pick("file_path"))
         .or_else(|| pick("query"))

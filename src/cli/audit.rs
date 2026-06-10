@@ -12,6 +12,7 @@
 //! - `path` — print the resolved audit log path. Useful for SIEM
 //!   ingestion configuration scripts.
 
+use crate::models::field_names;
 use std::fs;
 use std::io::{BufRead, BufReader};
 #[cfg(test)]
@@ -223,7 +224,7 @@ fn run_verify(
                 "{}",
                 serde_json::json!({
                     "status": "ok",
-                    "total_lines": 0,
+                    (field_names::TOTAL_LINES): 0,
                     "note": "audit log does not exist (audit may be disabled)",
                     "path": path.display().to_string(),
                 })
@@ -245,7 +246,7 @@ fn run_verify(
                 "{}",
                 serde_json::json!({
                     "status": "fail",
-                    "total_lines": report.total_lines,
+                    (field_names::TOTAL_LINES): report.total_lines,
                     "failure": {
                         "line_number": failure.line_number,
                         "kind": format!("{:?}", failure.kind),
@@ -269,7 +270,7 @@ fn run_verify(
             "{}",
             serde_json::json!({
                 "status": "ok",
-                "total_lines": report.total_lines,
+                (field_names::TOTAL_LINES): report.total_lines,
                 "path": path.display().to_string(),
             })
         )?;
@@ -352,7 +353,7 @@ fn run_forensic_verify(
                 "{}",
                 serde_json::json!({
                     "status": "fail",
-                    "total_lines": report.total_lines,
+                    (field_names::TOTAL_LINES): report.total_lines,
                     "unsigned_lines": report.unsigned_lines,
                     "failure": {
                         "file": failure.file.display().to_string(),
@@ -383,7 +384,7 @@ fn run_forensic_verify(
             "{}",
             serde_json::json!({
                 "status": "ok",
-                "total_lines": report.total_lines,
+                (field_names::TOTAL_LINES): report.total_lines,
                 "unsigned_lines": report.unsigned_lines,
                 "since": since,
                 "dir": dir.display().to_string(),

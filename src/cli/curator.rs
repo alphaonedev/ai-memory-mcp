@@ -246,8 +246,10 @@ pub async fn run(
     .await
 }
 
-/// v0.7.0 #1548 — resolve the operator-supplied `--store-url` (env
-/// `AI_MEMORY_STORE_URL`) in a feature-flag-aware way. Returns `None`
+/// v0.7.0 #1548 — resolve the operator-supplied `--store-url` flag in
+/// a feature-flag-aware way (no env binding — the
+/// `AI_MEMORY_STORE_URL` env fallback was deliberately dropped in
+/// `1e8ad69b`). Returns `None`
 /// on builds without the `sal` feature (where the field does not exist)
 /// so the curator falls through to the legacy SQLite path.
 #[must_use]

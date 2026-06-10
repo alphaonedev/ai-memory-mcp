@@ -4,6 +4,7 @@
 //! MCP `memory_load_family` and `memory_smart_load` handlers and routing helpers.
 
 use crate::embeddings::{Embed, Embedder};
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::Memory;
 use crate::{db, validate};
@@ -50,11 +51,10 @@ impl McpTool for LoadFamilyTool {
          NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(LoadFamilyRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<LoadFamilyRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 
@@ -92,11 +92,10 @@ impl McpTool for SmartLoadTool {
          NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SmartLoadRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SmartLoadRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 
@@ -235,7 +234,11 @@ mod d1_3_984_tests {
 ///   "memories": [<MemoryRow>, ...]
 /// }
 
-pub fn handle_load_family(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+pub fn handle_load_family(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     use crate::profile::Family;
     use std::str::FromStr;
 
@@ -246,7 +249,7 @@ pub fn handle_load_family(conn: &rusqlite::Connection, params: &Value) -> Result
     let family = Family::from_str(family_raw).map_err(|e| e.to_string())?;
     let family_name = family.name();
 
-    let namespace = params.get("namespace").and_then(Value::as_str);
+    let namespace = params.get(param_names::NAMESPACE).and_then(Value::as_str);
     if let Some(ns) = namespace {
         validate::validate_namespace(ns).map_err(|e| e.to_string())?;
     }
@@ -255,7 +258,10 @@ pub fn handle_load_family(conn: &rusqlite::Connection, params: &Value) -> Result
     // — calling `memory_load_family(k=0)` is almost always a bug, and
     // the always-return-at-least-one shape lines up with R1's recall
     // budget guarantee.
-    let k_raw = params.get("k").and_then(Value::as_u64).unwrap_or(20);
+    let k_raw = params
+        .get(param_names::K)
+        .and_then(Value::as_u64)
+        .unwrap_or(20);
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -281,6 +287,20 @@ pub fn handle_load_family(conn: &rusqlite::Connection, params: &Value) -> Result
     let memories: Vec<Memory> = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
+
+    // #1555 — scope=private visibility post-filter, parity with the sibling
+    // read tools (list/search/recall) and applied through the canonical
+    // `is_visible_to_caller` predicate so the inbox / target_agent_id carve-out
+    // is honored (a naive `metadata.scope != 'private'` SQL clause would miss
+    // it). `caller == None` is the single-tenant trust-all posture (unchanged).
+    // `count` is recomputed from the filtered set so the wire count stays honest.
+    let memories: Vec<Memory> = match caller {
+        Some(c) => memories
+            .into_iter()
+            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
+            .collect(),
+        None => memories,
+    };
 
     Ok(json!({
         "family": family_name,
@@ -333,6 +353,7 @@ pub fn handle_smart_load(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let intent_raw = params["intent"].as_str().ok_or("intent is required")?;
     let intent = intent_raw.trim();
@@ -348,6 +369,7 @@ pub fn handle_smart_load(
             "fallback",
             intent,
             params,
+            caller,
         )?;
         return Ok(resp);
     }
@@ -382,7 +404,7 @@ pub fn handle_smart_load(
         None => kw_pick,
     };
 
-    forward_to_load_family(conn, family, score, source, intent, params)
+    forward_to_load_family(conn, family, score, source, intent, params, caller)
 }
 
 /// Build the `memory_smart_load` response by forwarding to
@@ -396,6 +418,7 @@ fn forward_to_load_family(
     source: &str,
     intent: &str,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let family_name = family.name();
     tracing::info!(
@@ -410,23 +433,30 @@ fn forward_to_load_family(
     // Build the payload memory_load_family expects: family + the
     // forwarded namespace + k from the caller.
     let mut forward = json!({"family": family_name});
-    if let Some(ns) = params.get("namespace").and_then(Value::as_str) {
+    if let Some(ns) = params.get(param_names::NAMESPACE).and_then(Value::as_str) {
         forward["namespace"] = json!(ns);
     }
-    if let Some(k) = params.get("k").and_then(Value::as_u64) {
+    if let Some(k) = params.get(param_names::K).and_then(Value::as_u64) {
         forward["k"] = json!(k);
     }
 
-    let inner = handle_load_family(conn, &forward)?;
+    let inner = handle_load_family(conn, &forward, caller)?;
     let memories = inner.get("memories").cloned().unwrap_or_else(|| json!([]));
     let count = inner.get("count").cloned().unwrap_or_else(|| json!(0));
-    let k = inner.get("k").cloned().unwrap_or_else(|| json!(20));
-    let namespace = inner.get("namespace").cloned().unwrap_or(Value::Null);
+    let k = inner
+        .get(param_names::K)
+        .cloned()
+        .unwrap_or_else(|| json!(20));
+    let namespace = inner
+        .get(param_names::NAMESPACE)
+        .cloned()
+        .unwrap_or(Value::Null);
 
     // Round score to 3 decimals at the wire — keeps the JSON readable
     // without leaking f32 quantisation noise (same convention as
     // memory_check_duplicate).
-    let score_rounded = (f64::from(score) * 1000.0).round() / 1000.0;
+    let score_rounded = (f64::from(score) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+        / crate::SCORE_DISPLAY_ROUND_FACTOR;
 
     Ok(json!({
         "chosen_family": family_name,

@@ -131,7 +131,7 @@ Status codes you'll commonly encounter:
 ```
 
 `tier` is one of `"short"` | `"mid"` | `"long"` (see `Tier` enum in
-`src/models.rs:10`). `last_accessed_at` and `expires_at` are omitted
+`src/models/memory.rs`). `last_accessed_at` and `expires_at` are omitted
 from the JSON when not set — they are NOT serialized as `null`.
 
 Fields marked in `metadata` are preserved across update / upsert /
@@ -778,7 +778,7 @@ tool schema is authoritative via the per-tool `<ToolName>Request`
 structs in `src/mcp/tools/<name>.rs` (schemars-derived; consumed by
 `registered_tools()` in `src/mcp/registry.rs` and projected to
 `tools/list` by `tool_definitions()`). The HTTP body / query types in
-`src/models.rs` and the route handlers in `src/handlers/` are
+`src/models/` and the route handlers in `src/handlers/` are
 authoritative for HTTP.
 
 | Tool | Param | HTTP | MCP | Notes |

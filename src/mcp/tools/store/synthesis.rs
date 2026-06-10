@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use crate::identity::keypair::AgentKeypair;
 use crate::llm::OllamaClient;
+use crate::mcp::param_names;
 use crate::models::{GovernancePolicy, Memory, MemoryLinkRelation};
 use crate::{db, hnsw::VectorIndex};
 
@@ -312,7 +313,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
             }
         };
         if content_changed && let Some(emb) = embedder {
-            let text = format!("{} {}", target.title, merged_content);
+            let text = crate::embeddings::embedding_document(&target.title, &merged_content);
             if let Ok(embedding) = emb.embed(&text) {
                 let _ = db::set_embedding(conn, cand_id, &embedding);
                 if let Some(idx) = vector_index {
@@ -408,7 +409,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     let target = existing.iter().find(|c| c.id == *primary_id).cloned()?;
     let preserved_metadata = crate::identity::preserve_agent_id(&target.metadata, &mem.metadata);
     let echoed_agent_id = preserved_metadata
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let mut resp = json!({

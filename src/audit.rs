@@ -49,6 +49,11 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime_context::RuntimeContext;
 
+/// Canonical `consolidate` operation label — shared by the audit op
+/// vocabulary, the autonomy rollback tags, and the governance action
+/// adapter (#1558 batch 6).
+pub(crate) const OP_CONSOLIDATE: &str = "consolidate";
+
 /// Stable schema version stamped on every emitted line. Bump only when
 /// a field's semantics change in a way SIEM parsers care about
 /// (renaming, removing, or repurposing). Adding optional fields does
@@ -110,6 +115,25 @@ pub struct AuditActor {
     pub synthesis_source: String,
 }
 
+/// #1558 batch 5 wave 3 — canonical [`AuditActor::synthesis_source`]
+/// provenance values. One spelling per value; every production writer
+/// (MCP dispatch, MCP store/delete tools, HTTP handlers, CLI
+/// crud/store/update) references these consts instead of scattering
+/// the literal. The vocabulary doc on `synthesis_source` above stays
+/// the narrative SSOT; this mod is the mechanical one.
+pub mod synthesis_sources {
+    /// Caller passed an explicit `--agent-id` / `agent_id` param.
+    pub const EXPLICIT: &str = "explicit";
+    /// Resolved from `initialize.clientInfo.name` (MCP stdio).
+    pub const MCP_CLIENT_INFO: &str = "mcp_client_info";
+    /// Synthesized `host:<hostname>:pid-…` fallback (no client info).
+    pub const HOST_FALLBACK: &str = "host_fallback";
+    /// Taken from the `X-Agent-Id` HTTP request header.
+    pub const HTTP_HEADER: &str = "http_header";
+    /// No explicit caller identity — default resolution ladder.
+    pub const DEFAULT_FALLBACK: &str = "default_fallback";
+}
+
 /// Canonical action vocabulary. Adding a variant is a non-breaking
 /// schema change; renaming or removing one IS breaking.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,7 +172,7 @@ impl AuditAction {
             Self::Link => "link",
             Self::Promote => "promote",
             Self::Forget => "forget",
-            Self::Consolidate => "consolidate",
+            Self::Consolidate => OP_CONSOLIDATE,
             Self::Export => "export",
             Self::Import => "import",
             Self::Approve => "approve",
@@ -749,7 +773,7 @@ impl VerifyReport {
 /// # Errors
 /// - The file cannot be opened or read.
 pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     verify_chain_from_reader(file)
 }
 

@@ -4,6 +4,7 @@
 //! MCP `memory_delete` handler.
 
 use crate::mcp::VectorIndex;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -35,11 +36,10 @@ impl McpTool for DeleteTool {
         "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk pattern delete (archives first)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(DeleteRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<DeleteRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 
@@ -73,7 +73,9 @@ pub(super) fn handle_delete(
     vector_index: Option<&VectorIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
@@ -85,7 +87,7 @@ pub(super) fn handle_delete(
     // the SIEM-shaped enterprise row AFTER the delete commits.
     let caller_for_forensic =
         crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",
@@ -101,7 +103,7 @@ pub(super) fn handle_delete(
         db::get_by_prefix(conn, id).map_err(|e| e.to_string())?
     };
     let Some(target) = target else {
-        return Err("memory not found".into());
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
 
     // P5 (G9): snapshot fields the dispatcher needs BEFORE delete frees
@@ -112,7 +114,7 @@ pub(super) fn handle_delete(
     let snapshot_tier = target.tier.as_str().to_string();
     let snapshot_owner: Option<String> = target
         .metadata
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
@@ -155,7 +157,7 @@ pub(super) fn handle_delete(
             .map_err(|e| e.to_string())?;
         let mem_owner = target
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = json!({"id": target.id, "title": target.title});
@@ -184,7 +186,7 @@ pub(super) fn handle_delete(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "delete",
                     "memory_id": target.id,
                 }));
@@ -204,7 +206,9 @@ pub(super) fn handle_delete(
                 snapshot_owner
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+                mcp_client.map_or(crate::audit::synthesis_sources::HOST_FALLBACK, |_| {
+                    crate::audit::synthesis_sources::MCP_CLIENT_INFO
+                }),
                 None,
             ),
             crate::audit::target_memory(
@@ -233,7 +237,7 @@ pub(super) fn handle_delete(
         );
         Ok(json!({"deleted": true}))
     } else {
-        Err("memory not found".into())
+        Err(crate::errors::msg::MEMORY_NOT_FOUND.into())
     }
 }
 

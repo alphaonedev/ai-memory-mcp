@@ -77,7 +77,7 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
             && orig != caller_id
         {
             obj.insert(
-                "imported_from_agent_id".to_string(),
+                crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
                 serde_json::Value::String(orig),
             );
         }
@@ -391,7 +391,7 @@ pub async fn run_daemon(
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("ai_memory=info".parse()?)
+                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?)
                 .add_directive("tower_http=info".parse()?),
         )
         .try_init();

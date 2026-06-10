@@ -272,7 +272,8 @@ async fn fetch_namespace_candidates(
         // resolution is system-internal, not a user-visible read,
         // and we want the candidate pool to surface every memory in
         // the namespace regardless of who originally authored it.
-        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::AI_HTTP_INTERNAL);
         let filter = crate::store::Filter {
             namespace: Some(namespace.to_string()),
             limit: limit + 1,
@@ -593,6 +594,9 @@ mod cov897_tests {
         let v = serde_json::to_value(&r).expect("serialize");
         assert_eq!(v["id"], "mem-id-123");
         assert_eq!(v["title"], "conflicting title");
-        assert!(v["suggested_merge"].is_null(), "None ⇒ null on the wire");
+        assert!(
+            v[crate::models::field_names::SUGGESTED_MERGE].is_null(),
+            "None ⇒ null on the wire"
+        );
     }
 }

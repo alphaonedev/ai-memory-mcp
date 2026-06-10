@@ -93,14 +93,14 @@ pub fn refresh_once(holder: &OutboundCredentialHolder, now_unix: i64) -> Renewal
     let loaded = match SignedCredential::load_from_env() {
         Ok(loaded) => loaded,
         Err(e) => {
-            tracing::warn!(target: "federation::signing", error = %e,
+            tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,
                 "outbound credential refresh: load failed; keeping the currently-held credential");
             return RenewalOutcome::Failed(e.to_string());
         }
     };
     let outcome = apply_refresh(holder, loaded);
     if outcome == RenewalOutcome::Reloaded {
-        tracing::info!(target: "federation::signing",
+        tracing::info!(target: crate::federation::SIGNING_TRACE_TARGET,
             "outbound federation credential reloaded from disk");
         // A fresh credential landed — reset the renewal-lag clock.
         LAST_RENEW_UNIX.store(now_unix, Ordering::Relaxed);
@@ -125,11 +125,11 @@ pub fn refresh_once(holder: &OutboundCredentialHolder, now_unix: i64) -> Renewal
 
         let not_after = claims.not_after;
         if now_unix > not_after {
-            tracing::warn!(target: "federation::signing", not_after,
+            tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, not_after,
                 "held outbound credential has EXPIRED and no fresh credential is on disk; \
                  peers will fall back to per-peer enrollment for this node");
         } else if now_unix + DEFAULT_RENEWAL_LEAD_SECS >= not_after {
-            tracing::info!(target: "federation::signing", not_after,
+            tracing::info!(target: crate::federation::SIGNING_TRACE_TARGET, not_after,
                 "held outbound credential nearing expiry; awaiting a fresh credential file");
         }
     }
@@ -186,7 +186,7 @@ fn emit_renewal_audit(conn: &rusqlite::Connection, claims: &FederationCredential
     let value = ciborium::Value::Map(entries);
     let mut cbor: Vec<u8> = Vec::with_capacity(128);
     if let Err(e) = ciborium::ser::into_writer(&value, &mut cbor) {
-        tracing::warn!(target: "federation::signing", error = %e,
+        tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,
             "failed to encode canonical CBOR for credential-renewal audit event");
         return;
     }
@@ -197,7 +197,7 @@ fn emit_renewal_audit(conn: &rusqlite::Connection, claims: &FederationCredential
         timestamp,
     );
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
-        tracing::warn!(target: "federation::signing", error = %e,
+        tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,
             "failed to append credential-renewal audit row; live credential is retained");
     }
 }
@@ -231,7 +231,7 @@ pub fn spawn_refresh_outbound_credential(
             // retained (no reset), so a transiently-bad file never strips a
             // node of its hierarchical proof.
             if let Err(e) = outbound::reload_intermediates_from_env() {
-                tracing::warn!(target: "federation::signing", error = %e,
+                tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,
                     "failed to reload outbound federation intermediate chain; retaining prior");
             }
             tokio::time::sleep(interval).await;

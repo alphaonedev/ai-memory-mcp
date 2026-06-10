@@ -204,7 +204,8 @@ trail is preserved.
 
 ```bash
 curl -H "X-API-Key: YOUR_KEY" http://127.0.0.1:9077/api/v1/stats
-# or
+# or (DEPRECATED #1574 — URL keys leak into access/proxy logs;
+# accepted with a WARN at v0.7.0, slated for v0.8 rejection)
 curl 'http://127.0.0.1:9077/api/v1/stats?api_key=YOUR_KEY'
 ```
 
@@ -236,7 +237,13 @@ but peers are unreachable or slow.
 3. Check peer mTLS allowlist — your fingerprint may not be listed.
 
 **Fix**: lower `--quorum-writes` temporarily, restore peer
-connectivity, restart with the original setting.
+connectivity, restart with the original setting. For `timeout` on a
+**cross-region** mesh, raise `--quorum-timeout-ms` — the 2000 ms
+default is same-DC-tuned; WAN meshes need 5000-10000 ms (the do-1461
+3-region reference deploy uses `FED_QUORUM_TIMEOUT_MS=8000`; see
+[#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)).
+The write commits locally first, so the longer wait affects only the
+synchronous-durability gate.
 
 ## Sync / federation
 

@@ -35,6 +35,34 @@ docs below.
 - **`off`** — pipeline disabled; substrate writes are accepted
   without consulting the rule corpus.
 
+## Namespace-standard defaults (allow-on-silence)
+
+Per-namespace access control is carried by a **namespace standard**
+(a standard memory whose `metadata.governance` holds the
+`CorePolicy` knobs — `src/models/namespace.rs`). The defaults are
+deliberately permissive
+([#1569](https://github.com/alphaonedev/ai-memory-mcp/issues/1569)
+documented posture):
+
+> **Absent an explicit namespace standard, `write` and `promote` are
+> ungated by design at v0.7.0.** `CorePolicy::default()` is
+> `write: GovernanceLevel::Any`, `promote: GovernanceLevel::Any`,
+> `delete: GovernanceLevel::Owner`. The governance pipeline gates
+> only what operators configure — `resolve_governance_policy`
+> returns the permissive default for a namespace with no standard
+> (and no inheriting parent standard).
+
+The hardening knob is the namespace-standard surface: attach a
+standard via the `memory_namespace_set_standard` MCP tool (companions
+`memory_namespace_get_standard` / `memory_namespace_clear_standard`)
+with a `metadata.governance` policy, e.g.
+`{"write": "registered", "promote": "owner", "delete": "owner"}`.
+**Production namespaces should carry an explicit standard** — the
+allow-on-silence default is appropriate for single-operator local
+substrates, not for shared or federated deployments. Child
+namespaces inherit the parent's policy by default (`inherit: true`),
+so one standard at `org/` governs the subtree until a child opts out.
+
 ## Commands
 
 ```bash

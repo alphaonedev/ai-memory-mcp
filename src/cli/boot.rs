@@ -39,6 +39,7 @@
 use crate::cli::CliOutput;
 use crate::cli::helpers::{auto_namespace, human_age, id_short};
 use crate::config::AppConfig;
+use crate::models::field_names;
 use crate::{db, models, toon};
 use anyhow::Result;
 use clap::Args;
@@ -135,7 +136,7 @@ impl BootFormat {
         match s {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
-            "toon" | "toon-compact" | "toon_compact" => Ok(Self::Toon),
+            "toon" | "toon-compact" | crate::toon::FORMAT_TOON_COMPACT => Ok(Self::Toon),
             other => Err(anyhow::anyhow!(
                 "unknown --format value: {other} (expected: text | json | toon)"
             )),
@@ -307,7 +308,7 @@ impl BootStatus {
 /// failing boot.
 fn read_schema_version(conn: &rusqlite::Connection) -> (String, Option<u32>) {
     match conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
         [],
         |r| r.get::<_, i64>(0),
     ) {
@@ -341,7 +342,7 @@ fn count_live_memories(conn: &rusqlite::Connection) -> String {
 /// `<unavailable>` sentinel without branching downstream.
 ///
 /// Field semantics:
-/// - `version`         — `env!("CARGO_PKG_VERSION")` at compile time
+/// - `version`         — `crate::PKG_VERSION` at compile time
 /// - `db_path`         — resolved path the boot ran against
 /// - `schema_version`  — `vN` from the DB's `schema_version` table
 /// - `total_memories`  — count of live (non-expired) rows
@@ -460,14 +461,14 @@ impl BootManifest {
                 "db schema v{db_schema} unsupported by binary {bin_ver} \
                  (supports v{min}..v{max}); proceeding with degraded context. \
                  Run `ai-memory doctor` and consider upgrading.",
-                bin_ver = env!("CARGO_PKG_VERSION"),
+                bin_ver = crate::PKG_VERSION,
                 min = MIN_SUPPORTED_SCHEMA,
                 max = MAX_SUPPORTED_SCHEMA,
             ),
         };
 
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::PKG_VERSION.to_string(),
             db_path: db_path.display().to_string(),
             schema_version,
             total_memories,
@@ -733,14 +734,14 @@ fn emit_status_header(
                     "status": manifest.status.label(),
                     "version": manifest.version,
                     "db_path": manifest.db_path,
-                    "schema_version": manifest.schema_version,
+                    (field_names::SCHEMA_VERSION): manifest.schema_version,
                     "schema_supported": manifest.schema_supported,
-                    "total_memories": manifest.total_memories,
+                    (field_names::TOTAL_MEMORIES): manifest.total_memories,
                     "tier": manifest.tier,
                     "embedder": manifest.embedder,
                     "reranker": manifest.reranker,
                     "llm": manifest.llm,
-                    "latency_ms": manifest.latency_ms,
+                    (field_names::LATENCY_MS): manifest.latency_ms,
                     "namespace": manifest.namespace,
                     "count": manifest.count,
                     "note": manifest.note,
@@ -868,14 +869,14 @@ fn emit_json_with_status(
         "status": manifest.status.label(),
         "version": manifest.version,
         "db_path": manifest.db_path,
-        "schema_version": manifest.schema_version,
+        (field_names::SCHEMA_VERSION): manifest.schema_version,
         "schema_supported": manifest.schema_supported,
-        "total_memories": manifest.total_memories,
+        (field_names::TOTAL_MEMORIES): manifest.total_memories,
         "tier": manifest.tier,
         "embedder": manifest.embedder,
         "reranker": manifest.reranker,
         "llm": manifest.llm,
-        "latency_ms": manifest.latency_ms,
+        (field_names::LATENCY_MS): manifest.latency_ms,
         "namespace": manifest.namespace,
         "count": manifest.count,
         "note": manifest.note,

@@ -10,6 +10,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+#[cfg(feature = "sal")]
+use crate::models::field_names;
 use axum::{
     Json,
     http::{HeaderMap, StatusCode},
@@ -64,6 +66,10 @@ pub(super) async fn sync_push_via_store(
         || body.pending_decisions.len() > cap
         || body.namespace_meta.len() > cap
         || body.namespace_meta_clears.len() > cap
+        // #1556 — `links` was previously omitted from this predicate (the same
+        // gap as the sqlite twin); cap it so a peer cannot bypass the batch
+        // bound via an oversized links array.
+        || body.links.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -215,7 +221,8 @@ pub(super) async fn sync_push_via_store(
                 // queries against a peer that received the memory
                 // through sync_push would surface empty.
                 if let Some(emb) = app.embedder.as_ref().as_ref() {
-                    let embedding_text = format!("{} {}", mem.title, mem.content);
+                    let embedding_text =
+                        crate::embeddings::embedding_document(&mem.title, &mem.content);
                     if let Ok(vector) = emb.embed(&embedding_text) {
                         let _ = app
                             .store
@@ -287,9 +294,9 @@ pub(super) async fn sync_push_via_store(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
-                "quota_refused": quota_refused,
+                (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 "reset_at": reset_at,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -405,11 +412,11 @@ pub(super) async fn sync_push_via_store(
             "links_applied": links_applied,
             "noop": noop,
             "skipped": skipped,
-            "quota_refused": quota_refused,
+            (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             "unsupported_on_postgres": unsupported_on_postgres,
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
             "note": "pendings / archives / restores / namespace_meta are sqlite-only \
                      in v0.7.0; memories / deletions / links round-trip via the SAL trait",
         })),
@@ -435,7 +442,7 @@ fn cached_trust_bundle() -> &'static TrustBundle {
     BUNDLE.get_or_init(|| {
         TrustBundle::load_from_env().unwrap_or_else(|e| {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 error = %e,
                 "failed to load federation trust bundle; continuing with legacy per-peer verify"
             );
@@ -525,7 +532,7 @@ fn verify_credential_pubkey(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 tag = e.tag(),
                 peer_id = %peer_id.unwrap_or(""),
                 "sync: X-Memory-Cred malformed; falling back to legacy per-peer verify"
@@ -538,7 +545,7 @@ fn verify_credential_pubkey(
             Ok(inters) => inters,
             Err(e) => {
                 tracing::warn!(
-                    target: "federation::signing",
+                    target: crate::federation::SIGNING_TRACE_TARGET,
                     tag = e.tag(),
                     peer_id = %peer_id.unwrap_or(""),
                     "sync: X-Memory-Cred-Chain malformed; falling back to legacy"
@@ -553,7 +560,7 @@ fn verify_credential_pubkey(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 tag = e.tag(),
                 peer_id = %peer_id.unwrap_or(""),
                 "sync: X-Memory-Cred chain failed trust-bundle verification; falling back to legacy"
@@ -563,7 +570,7 @@ fn verify_credential_pubkey(
     };
     if peer_id != Some(cred.subject_agent_id.as_str()) {
         tracing::warn!(
-            target: "federation::signing",
+            target: crate::federation::SIGNING_TRACE_TARGET,
             peer_id = %peer_id.unwrap_or(""),
             cred_subject = %cred.subject_agent_id,
             "sync: X-Memory-Cred subject does not match X-Peer-Id; refusing credential binding"
@@ -574,7 +581,7 @@ fn verify_credential_pubkey(
         Ok(vk) => Some(vk),
         Err(e) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 tag = e.tag(),
                 peer_id = %peer_id.unwrap_or(""),
                 "sync: X-Memory-Cred subject key malformed; falling back to legacy"
@@ -637,7 +644,7 @@ pub(super) fn verify_signature_or_reject(
             };
             if let Err(e) = verify_result {
                 tracing::warn!(
-                    target: "federation::signing",
+                    target: crate::federation::SIGNING_TRACE_TARGET,
                     tag = e.tag(),
                     peer_id = %peer_id.unwrap_or(""),
                     "sync_push: X-Memory-Sig verification failed"
@@ -663,7 +670,7 @@ pub(super) fn verify_signature_or_reject(
                         crate::identity::replay::ReplayDecision::Fresh => None,
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
-                                target: "federation::signing",
+                                target: crate::federation::SIGNING_TRACE_TARGET,
                                 tag = fed_signing::VerifyError::ReplayedNonce.tag(),
                                 peer_id = %pid_for_cache,
                                 "sync_push: X-Memory-Nonce replay detected"
@@ -684,7 +691,7 @@ pub(super) fn verify_signature_or_reject(
                 _ => {
                     if fed_signing::require_nonce() {
                         tracing::warn!(
-                            target: "federation::signing",
+                            target: crate::federation::SIGNING_TRACE_TARGET,
                             tag = fed_signing::VerifyError::NonceMissing.tag(),
                             peer_id = %pid_for_cache,
                             "sync_push: X-Memory-Nonce header absent — strict refusal"
@@ -701,7 +708,7 @@ pub(super) fn verify_signature_or_reject(
                         )
                     } else {
                         tracing::warn!(
-                            target: "federation::signing",
+                            target: crate::federation::SIGNING_TRACE_TARGET,
                             peer_id = %pid_for_cache,
                             "sync_push: X-Memory-Nonce absent — permissive, accepting"
                         );
@@ -712,7 +719,7 @@ pub(super) fn verify_signature_or_reject(
         }
         (Some(_), None) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_push: X-Memory-Sig present but no enrolled public key for peer-id"
             );
@@ -731,7 +738,7 @@ pub(super) fn verify_signature_or_reject(
         }
         (None, Some(_)) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_push: enrolled peer omitted X-Memory-Sig header"
             );
@@ -758,7 +765,7 @@ pub(super) fn verify_signature_or_reject(
             // permissive escape hatch on the SAME arm post-#1056).
             if require_peer_enrollment_enabled() {
                 tracing::warn!(
-                    target: "federation::signing",
+                    target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
                     "sync_push: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
                 );
@@ -777,7 +784,7 @@ pub(super) fn verify_signature_or_reject(
                 );
             }
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_push: unsigned (no enrolled key for peer-id) — strict enforcement skipped"
             );
@@ -815,7 +822,7 @@ fn require_peer_enrollment_enabled() -> bool {
 // chain through the same `FederationNonceCache` for replay protection.
 // Canonical bytes:
 //
-//   "GET" || 0x0A || "/api/v1/sync/since" || 0x0A || canonical_query
+//   "GET" || 0x0A || super::routes::SYNC_SINCE || 0x0A || canonical_query
 //
 // where `canonical_query` is the request's raw query string verbatim
 // (the caller fixes the param ordering before signing — a future
@@ -906,7 +913,7 @@ pub(super) fn verify_get_signature_or_reject(
             };
             if let Err(e) = verify_result {
                 tracing::warn!(
-                    target: "federation::signing",
+                    target: crate::federation::SIGNING_TRACE_TARGET,
                     tag = e.tag(),
                     peer_id = %peer_id.unwrap_or(""),
                     "sync_since: X-Memory-Sig verification failed"
@@ -932,7 +939,7 @@ pub(super) fn verify_get_signature_or_reject(
                         crate::identity::replay::ReplayDecision::Fresh => None,
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
-                                target: "federation::signing",
+                                target: crate::federation::SIGNING_TRACE_TARGET,
                                 tag = fed_signing::VerifyError::ReplayedNonce.tag(),
                                 peer_id = %pid_for_cache,
                                 "sync_since: X-Memory-Nonce replay detected"
@@ -953,7 +960,7 @@ pub(super) fn verify_get_signature_or_reject(
                 _ => {
                     if fed_signing::require_nonce() {
                         tracing::warn!(
-                            target: "federation::signing",
+                            target: crate::federation::SIGNING_TRACE_TARGET,
                             tag = fed_signing::VerifyError::NonceMissing.tag(),
                             peer_id = %pid_for_cache,
                             "sync_since: X-Memory-Nonce header absent — strict refusal"
@@ -970,7 +977,7 @@ pub(super) fn verify_get_signature_or_reject(
                         )
                     } else {
                         tracing::warn!(
-                            target: "federation::signing",
+                            target: crate::federation::SIGNING_TRACE_TARGET,
                             peer_id = %pid_for_cache,
                             "sync_since: X-Memory-Nonce absent — permissive, accepting"
                         );
@@ -981,7 +988,7 @@ pub(super) fn verify_get_signature_or_reject(
         }
         (Some(_), None) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_since: X-Memory-Sig present but no enrolled public key for peer-id (#1031)"
             );
@@ -1000,7 +1007,7 @@ pub(super) fn verify_get_signature_or_reject(
         }
         (None, Some(_)) => {
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_since: enrolled peer omitted X-Memory-Sig header (#1031)"
             );
@@ -1023,7 +1030,7 @@ pub(super) fn verify_get_signature_or_reject(
             // opt-in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
             if require_peer_enrollment_enabled() {
                 tracing::warn!(
-                    target: "federation::signing",
+                    target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
                     "sync_since: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
                 );
@@ -1040,7 +1047,7 @@ pub(super) fn verify_get_signature_or_reject(
                 );
             }
             tracing::warn!(
-                target: "federation::signing",
+                target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_since: unsigned (no enrolled key for peer-id) — strict enforcement skipped"
             );
@@ -1320,13 +1327,20 @@ mod fed_p2d_credential_resolution_tests {
             fixed_signing_key(71),
             IssuerConfig::new("region/nyc/ca", TEST_TRUST_DOMAIN),
         );
+        // #1554 — the leaf MUST be within the region CA's delegated namespace
+        // (`region/nyc`, i.e. the CA id minus the `/ca` marker). A regional
+        // intermediate may only vouch for subjects in its own region; this is a
+        // legitimate in-namespace delegation. (The flat P2/P3 path with generic
+        // ids like `host:peer-a` is unaffected — `verify_link` runs only for
+        // chained certs.)
+        let leaf_id = "region/nyc/peer-a";
         let anchor = root
             .issue_intermediate(region.issuer_id(), &region.verifying_key(), TEST_NOW_UNIX)
             .expect("issue intermediate");
 
         let node_pub = fixed_signing_key(72).verifying_key();
         let chain = region
-            .issue_chained(TEST_PEER_ID, &node_pub, vec![anchor], TEST_NOW_UNIX)
+            .issue_chained(leaf_id, &node_pub, vec![anchor], TEST_NOW_UNIX)
             .expect("issue chained");
 
         let bundle = TrustBundle::new().with_issuer("ca:root", root.verifying_key());
@@ -1348,8 +1362,7 @@ mod fed_p2d_credential_resolution_tests {
             .expect("header"),
         );
 
-        let resolved =
-            resolve_peer_verifying_key(&headers, Some(TEST_PEER_ID), &bundle, TEST_NOW_UNIX);
+        let resolved = resolve_peer_verifying_key(&headers, Some(leaf_id), &bundle, TEST_NOW_UNIX);
         assert_eq!(
             resolved.map(|k| k.to_bytes()),
             Some(node_pub.to_bytes()),

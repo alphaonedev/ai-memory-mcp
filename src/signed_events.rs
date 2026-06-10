@@ -108,6 +108,12 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+/// Tracing target for signed-events chain emission/verification log
+/// lines across the storage backends (#1558 tracing-target SSOT).
+/// Distinct from the `signed_events` SQL table name, which stays
+/// embedded in the SQL strings that reference it.
+pub(crate) const SIGNED_EVENTS_TRACE_TARGET: &str = "signed_events";
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner B finding F-B9.x) —
 // canonical signed_events event-type slugs.

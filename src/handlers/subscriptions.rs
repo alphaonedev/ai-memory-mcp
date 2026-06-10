@@ -10,6 +10,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -37,6 +38,18 @@ use super::{fanout_or_503, resolve_caller_agent_id};
 /// scope the subscriber lookup to a sargable namespace range.
 #[cfg(feature = "sal")]
 const SUBSCRIPTION_NS_PREFIX: &str = "_subscriptions/";
+
+/// Memory `kind` marker for subscription rows (#1558 batch 6).
+#[cfg(feature = "sal")]
+const KIND_SUBSCRIPTION: &str = "subscription";
+
+/// `_subscriptions/<caller>` — the per-caller subscription namespace.
+/// (Single synthesis site; `SUBSCRIPTION_NS_PREFIX` above is the sargable
+/// range form and is `sal`-gated, so the template stays self-contained.)
+#[cfg(feature = "sal")]
+fn caller_subscription_ns(caller: impl std::fmt::Display) -> String {
+    format!("_subscriptions/{caller}")
+}
 
 /// Upper bound on subscription rows pulled per dispatch tick. Matches
 /// the sqlite path's implicit ceiling; production deployments rarely
@@ -92,7 +105,7 @@ pub async fn notify(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response();
     }
@@ -158,16 +171,16 @@ pub async fn notify(
             StatusCode::CREATED,
             Json(json!({
                 "id": new_id,
-                "target_agent_id": body.target_agent_id,
+                (field_names::TARGET_AGENT_ID): body.target_agent_id,
                 "namespace": crate::inbox_namespace(&body.target_agent_id),
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
     }
 
     let mut params = json!({
-        "target_agent_id": body.target_agent_id,
+        (field_names::TARGET_AGENT_ID): body.target_agent_id,
         "title": body.title,
         "payload": payload,
     });
@@ -272,7 +285,7 @@ pub async fn subscribe(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response();
     }
@@ -365,7 +378,7 @@ pub async fn subscribe(
         }
         let sub_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let ns = format!("_subscriptions/{caller}");
+        let ns = caller_subscription_ns(&caller);
         // #932 (v0.7.0 Track D, 2026-05-20) — persist the SHA-256
         // hash of the per-subscription secret in the metadata blob
         // so `dispatch_event_postgres` can resolve it back without
@@ -381,16 +394,16 @@ pub async fn subscribe(
             .filter(|s| !s.is_empty())
             .map(crate::subscriptions::sha256_hex);
         let metadata = json!({
-            "kind": "subscription",
+            "kind": KIND_SUBSCRIPTION,
             "agent_id": caller,
-            "subscription_id": sub_id,
+            (field_names::SUBSCRIPTION_ID): sub_id,
             "url": url,
             "events": events,
-            "namespace_filter": namespace_filter,
-            "agent_filter": agent_filter,
+            (field_names::NAMESPACE_FILTER): namespace_filter,
+            (field_names::AGENT_FILTER): agent_filter,
             "secret_hash": secret_hash_for_metadata,
-            "created_by": caller,
-            "created_at": now,
+            (field_names::CREATED_BY): caller,
+            (field_names::CREATED_AT): now,
         });
         let mem = Memory {
             id: sub_id.clone(),
@@ -401,7 +414,7 @@ pub async fn subscribe(
                 "subscription for {caller} -> {} (events={events})",
                 namespace_filter.as_deref().unwrap_or("*")
             ),
-            tags: vec!["subscription".to_string()],
+            tags: vec![KIND_SUBSCRIPTION.to_string()],
             priority: 5,
             confidence: 1.0,
             source: "subscribe".to_string(),
@@ -443,11 +456,11 @@ pub async fn subscribe(
                 "url": url,
                 "events": events,
                 "namespace": namespace_filter,
-                "namespace_filter": namespace_filter,
-                "agent_filter": agent_filter,
+                (field_names::NAMESPACE_FILTER): namespace_filter,
+                (field_names::AGENT_FILTER): agent_filter,
                 "agent_id": caller,
-                "created_by": caller,
-                "storage_backend": "postgres",
+                (field_names::CREATED_BY): caller,
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -489,9 +502,9 @@ pub async fn subscribe(
             "id": id,
             "url": url,
             "events": events,
-            "namespace_filter": namespace_filter,
-            "agent_filter": agent_filter,
-            "created_by": caller,
+            (field_names::NAMESPACE_FILTER): namespace_filter,
+            (field_names::AGENT_FILTER): agent_filter,
+            (field_names::CREATED_BY): caller,
         }))
     })();
     // Federate the `_agents` write we may have just done so registration is
@@ -502,9 +515,9 @@ pub async fn subscribe(
     } else {
         db::list(
             &lock.0,
-            Some("_agents"),
+            Some(crate::models::AGENTS_NAMESPACE),
             None,
-            1000,
+            crate::storage::LIST_MAX_LIMIT,
             0,
             None,
             None,
@@ -515,7 +528,7 @@ pub async fn subscribe(
         .ok()
         .and_then(|rows| {
             rows.into_iter()
-                .find(|m| m.title == format!("agent:{caller}"))
+                .find(|m| m.title == crate::models::agent_registration_title(&caller))
         })
     };
     drop(lock);
@@ -586,7 +599,7 @@ pub async fn unsubscribe(
         {
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+                Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
             )
                 .into_response();
         }
@@ -603,22 +616,24 @@ pub async fn unsubscribe(
                 )
                     .into_response();
             };
-            let sub_ns = format!("_subscriptions/{caller}");
+            let sub_ns = caller_subscription_ns(&caller);
             let filter = crate::store::Filter {
                 namespace: Some(sub_ns),
-                limit: 1000,
+                limit: crate::storage::LIST_MAX_LIMIT,
                 ..Default::default()
             };
             match app.store.list(&ctx, &filter).await {
                 Ok(rows) => rows
                     .into_iter()
                     .find(|m| {
-                        m.metadata.get("namespace_filter").and_then(|v| v.as_str())
+                        m.metadata
+                            .get(field_names::NAMESPACE_FILTER)
+                            .and_then(|v| v.as_str())
                             == Some(ns.as_str())
                     })
                     .map(|m| {
                         m.metadata
-                            .get("subscription_id")
+                            .get(field_names::SUBSCRIPTION_ID)
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .unwrap_or(m.id)
@@ -630,12 +645,12 @@ pub async fn unsubscribe(
             Some(id) => match app.store.delete(&ctx, &id).await {
                 Ok(()) => (
                     StatusCode::OK,
-                    Json(json!({"id": id, "removed": true, "storage_backend": "postgres"})),
+                    Json(json!({"id": id, "removed": true, (field_names::STORAGE_BACKEND): "postgres"})),
                 )
                     .into_response(),
                 Err(crate::store::StoreError::NotFound { .. }) => (
                     StatusCode::OK,
-                    Json(json!({"id": id, "removed": false, "storage_backend": "postgres"})),
+                    Json(json!({"id": id, "removed": false, (field_names::STORAGE_BACKEND): "postgres"})),
                 )
                     .into_response(),
                 Err(e) => store_err_to_response(e),
@@ -645,7 +660,7 @@ pub async fn unsubscribe(
                 Json(json!({
                     "id": "",
                     "removed": false,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -667,7 +682,7 @@ pub async fn unsubscribe(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
         )
             .into_response();
     }
@@ -684,10 +699,10 @@ pub async fn unsubscribe(
                 (StatusCode::OK, Json(json!({"id": id, "removed": removed}))).into_response()
             }
             Err(e) => {
-                tracing::error!("unsubscribe: {e}");
+                tracing::error!("{}", crate::errors::msg::unsubscribe(&e));
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
@@ -725,10 +740,10 @@ pub async fn unsubscribe(
             (StatusCode::OK, Json(json!({"id": id, "removed": removed}))).into_response()
         }
         Err(e) => {
-            tracing::error!("unsubscribe: {e}");
+            tracing::error!("{}", crate::errors::msg::unsubscribe(&e));
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -762,7 +777,7 @@ pub async fn list_subscriptions(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
         )
             .into_response();
     }
@@ -781,35 +796,35 @@ pub async fn list_subscriptions(
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(&caller);
-        let namespaces: Vec<String> = vec![format!("_subscriptions/{caller}")];
+        let namespaces: Vec<String> = vec![caller_subscription_ns(&caller)];
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for ns in namespaces {
             let filter = crate::store::Filter {
                 namespace: Some(ns),
-                limit: 1000,
+                limit: crate::storage::LIST_MAX_LIMIT,
                 ..Default::default()
             };
             match app.store.list(&ctx, &filter).await {
                 Ok(memories) => {
                     for m in memories {
                         let meta = m.metadata;
-                        if meta.get("kind").and_then(|v| v.as_str()) != Some("subscription") {
+                        if meta.get("kind").and_then(|v| v.as_str()) != Some(KIND_SUBSCRIPTION) {
                             continue;
                         }
                         let sub_id = meta
-                            .get("subscription_id")
+                            .get(field_names::SUBSCRIPTION_ID)
                             .cloned()
                             .unwrap_or_else(|| serde_json::Value::String(m.id.clone()));
                         rows.push(json!({
                             "id": sub_id,
                             "url": meta.get("url").cloned().unwrap_or(serde_json::Value::Null),
                             "events": meta.get("events").cloned().unwrap_or(serde_json::Value::Null),
-                            "namespace": meta.get("namespace_filter").cloned().unwrap_or(serde_json::Value::Null),
-                            "namespace_filter": meta.get("namespace_filter").cloned().unwrap_or(serde_json::Value::Null),
-                            "agent_filter": meta.get("agent_filter").cloned().unwrap_or(serde_json::Value::Null),
+                            "namespace": meta.get(field_names::NAMESPACE_FILTER).cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::NAMESPACE_FILTER): meta.get(field_names::NAMESPACE_FILTER).cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::AGENT_FILTER): meta.get(field_names::AGENT_FILTER).cloned().unwrap_or(serde_json::Value::Null),
                             "agent_id": meta.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
-                            "created_by": meta.get("created_by").cloned().unwrap_or(serde_json::Value::Null),
-                            "created_at": meta.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::CREATED_BY): meta.get(field_names::CREATED_BY).cloned().unwrap_or(serde_json::Value::Null),
+                            (field_names::CREATED_AT): meta.get(field_names::CREATED_AT).cloned().unwrap_or(serde_json::Value::Null),
                             "dispatch_count": 0,
                             "failure_count": 0,
                         }));
@@ -823,8 +838,8 @@ pub async fn list_subscriptions(
             StatusCode::OK,
             Json(json!({
                 "count": count,
-                "subscriptions": rows,
-                "storage_backend": "postgres",
+                (field_names::SUBSCRIPTIONS): rows,
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -838,7 +853,7 @@ pub async fn list_subscriptions(
             tracing::error!("list_subscriptions: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -855,11 +870,11 @@ pub async fn list_subscriptions(
                 "url": s.url,
                 "events": s.events,
                 "namespace": s.namespace_filter,
-                "namespace_filter": s.namespace_filter,
-                "agent_filter": s.agent_filter,
+                (field_names::NAMESPACE_FILTER): s.namespace_filter,
+                (field_names::AGENT_FILTER): s.agent_filter,
                 "agent_id": s.agent_filter.clone().or(s.created_by.clone()),
-                "created_by": s.created_by,
-                "created_at": s.created_at,
+                (field_names::CREATED_BY): s.created_by,
+                (field_names::CREATED_AT): s.created_at,
                 "dispatch_count": s.dispatch_count,
                 "failure_count": s.failure_count,
             })
@@ -868,7 +883,7 @@ pub async fn list_subscriptions(
     let count = rows.len();
     (
         StatusCode::OK,
-        Json(json!({"count": count, "subscriptions": rows})),
+        Json(json!({"count": count, (field_names::SUBSCRIPTIONS): rows})),
     )
         .into_response()
 }
@@ -913,7 +928,8 @@ pub async fn dispatch_event_postgres(
     // every matching subscriber's hook regardless of which tenant
     // registered it. The cross-tenant authorization gate lives at the
     // wire surface (subscribe/list/unsubscribe handlers).
-    let ctx = crate::store::CallerContext::for_admin("subscription-dispatch");
+    let ctx =
+        crate::store::CallerContext::for_admin(crate::identity::sentinels::SUBSCRIPTION_DISPATCH);
 
     // Pull only the subscription mirror rows (`_subscriptions/<agent>`)
     // via the sargable namespace-prefix scan. `Filter::namespace` is
@@ -943,11 +959,11 @@ pub async fn dispatch_event_postgres(
             continue;
         }
         let meta = &m.metadata;
-        if meta.get("kind").and_then(|v| v.as_str()) != Some("subscription") {
+        if meta.get("kind").and_then(|v| v.as_str()) != Some(KIND_SUBSCRIPTION) {
             continue;
         }
         let sub_id = meta
-            .get("subscription_id")
+            .get(field_names::SUBSCRIPTION_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| m.id.clone());
@@ -961,19 +977,19 @@ pub async fn dispatch_event_postgres(
             .unwrap_or("*")
             .to_string();
         let namespace_filter = meta
-            .get("namespace_filter")
+            .get(field_names::NAMESPACE_FILTER)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let agent_filter = meta
-            .get("agent_filter")
+            .get(field_names::AGENT_FILTER)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let created_by = meta
-            .get("created_by")
+            .get(field_names::CREATED_BY)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let created_at = meta
-            .get("created_at")
+            .get(field_names::CREATED_AT)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();

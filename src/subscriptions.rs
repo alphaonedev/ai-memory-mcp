@@ -20,6 +20,7 @@
 //!   shared secret; the plaintext is returned **once** at
 //!   subscription time and never leaves the DB after.
 
+use crate::models::field_names;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -29,6 +30,10 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+
+/// Tracing target for the subscription fan-out / DLQ surface
+/// (#1558 tracing-target SSOT).
+const SUBSCRIPTIONS_TRACE_TARGET: &str = "ai_memory::subscriptions";
 
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1152,7 +1157,7 @@ pub fn dispatch_approval_requested(conn: &Connection, pending_id: &str, db_path:
     });
     dispatch_event_with_details(
         conn,
-        "approval_requested",
+        webhook_events::APPROVAL_REQUESTED,
         &pa.id,
         &pa.namespace,
         Some(&pa.requested_by),
@@ -1383,16 +1388,16 @@ fn send(
             "user-agent",
             format!("ai-memory/{}", env!("CARGO_PKG_VERSION")),
         )
-        .header("x-ai-memory-timestamp", timestamp)
+        .header(crate::HEADER_AI_MEMORY_TIMESTAMP, timestamp)
         .header("x-ai-memory-correlation-id", correlation_id);
     if let Some(sig) = signature {
-        req = req.header("x-ai-memory-signature", format!("sha256={sig}"));
+        req = req.header(crate::HEADER_AI_MEMORY_SIGNATURE, format!("sha256={sig}"));
     }
     let resp = match req.body(body.to_string()).send() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("webhook POST to {url} failed: {e}");
-            return Err(format!("network: {e}"));
+            return Err(crate::errors::msg::network(e));
         }
     };
     if !resp.status().is_success() {
@@ -1456,7 +1461,7 @@ pub(crate) fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
         Some(k) => k,
         None => {
             tracing::warn!(
-                target: "ai_memory::subscriptions",
+                target: SUBSCRIPTIONS_TRACE_TARGET,
                 "hmac_sha256_hex: hmac_secret is not valid hex (len={}); falling back to raw \
                  bytes as key material — this produces a STABLE BUT WEAK key. Re-encode the \
                  secret as hex (e.g. `openssl rand -hex 32`) and restart the daemon. \
@@ -1686,7 +1691,7 @@ fn validate_url_dns_with(
     if hostname_shape_invalid(&resolved_host) {
         if ssrf_dns_fail_open() {
             tracing::warn!(
-                target: "ai_memory::subscriptions",
+                target: SUBSCRIPTIONS_TRACE_TARGET,
                 "SSRF guard: hostname {resolved_host} violates RFC 1035 label/length \
                  limits for {url}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
                  ALLOW (UNSAFE, legacy posture)"
@@ -1705,7 +1710,7 @@ fn validate_url_dns_with(
             let fail_open = ssrf_dns_fail_open();
             if fail_open {
                 tracing::warn!(
-                    target: "ai_memory::subscriptions",
+                    target: SUBSCRIPTIONS_TRACE_TARGET,
                     "SSRF guard: DNS resolution failed for {url}: {e}; \
                      AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to ALLOW \
                      (UNSAFE, legacy posture) — reqwest's resolver may bind to \
@@ -2178,7 +2183,7 @@ pub fn memory_subscription_replay(
 ) -> Result<serde_json::Value> {
     let events = replay_subscription_events(conn, subscription_id, since_rfc3339)?;
     Ok(serde_json::json!({
-        "subscription_id": subscription_id,
+        (field_names::SUBSCRIPTION_ID): subscription_id,
         "since": since_rfc3339,
         "count": events.len(),
         "events": events,

@@ -61,6 +61,21 @@ Allowlist format: a directory of public-key files keyed by agent id. There is no
 
 ---
 
+## 3b. HTTP API key authentication
+
+The HTTP daemon takes an optional shared API key (`ai-memory serve --api-key "$(cat /etc/ai-memory/api.key)"`). When set, every endpoint except `/api/v1/health` requires the key; `AI_MEMORY_REQUIRE_API_KEY=1` additionally hard-refuses daemon start without a key on ANY bind host, including loopback ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)) — set it for reverse-proxy / `--network=host` deployments.
+
+**The supported credential channel is the `x-api-key` request header** (constant-time compared in `handlers::transport::api_key_auth`). The `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)): a credential in the URL leaks into access logs, `Referer` headers, and proxy logs, all of which may outlive your key-rotation window. At v0.7.0 the query form is still accepted for back-compat and emits a once-per-process operator-visible WARN on first use; v0.8 is slated to reject it outright, with a temporary opt-back-in escape hatch for callers that cannot migrate in time. Migrate callers to the header now:
+
+```bash
+curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/stats   # supported
+curl "http://127.0.0.1:9077/api/v1/stats?api_key=$KEY"         # deprecated — logs capture it
+```
+
+mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*` only (they have already cleared a stronger gate; see [`federation.md`](federation.md)).
+
+---
+
 ## 4. Backup and restore
 
 SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a defragmented snapshot plus a sha256 manifest):
@@ -89,6 +104,8 @@ Backup cadence target: hourly snapshots, 48-hour rotation, weekly off-host trans
 
 Migrations are forward-only and run automatically on the first daemon start after an upgrade. There is no offline migration step. The substrate refuses to start against a database newer than the binary expects (downgrade refusal) and progresses through every intermediate version on upgrade — never skips.
 
+**Forward-only is by design; snapshot-restore is the rollback** ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576)). Before any schema-mutating upgrade runs, the binary automatically snapshots the live SQLite file as a sibling of the database: `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak` (`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`). The snapshot is produced with `VACUUM INTO` — transactionally consistent, folds pending WAL frames, inherits the source's SQLCipher keying — and the migration refuses to mutate the schema if the snapshot fails. To roll back: stop the daemon, reinstall the previous binary, copy the `.pre-migration-…bak` snapshot over the live DB file (removing stale `-wal`/`-shm` siblings), and start. See [`ADMIN_GUIDE.md` §Migration](ADMIN_GUIDE.md) for the step-by-step procedure.
+
 A dry-run flag for offline previewing of a pending migration ships in v0.8.0 (`ai-memory migrate --dry-run`). Until then, the recommended workflow on a major-version upgrade is:
 
 1. Take a snapshot (`ai-memory backup --to <path>`).
@@ -104,7 +121,7 @@ Migration failures roll back; the database is never left in a half-migrated stat
 
 Out-of-the-box observability lands in three places:
 
-- **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug` for deep traces.
+- **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug` for deep traces. Note (post-#1562, 2026-06-09): the postgres SAL adapter emits under the literal targets `store::postgres` / `store::postgres::kg`, which an `ai_memory=...` filter does not match — postgres-backed deployments wanting those events must add e.g. `store::postgres=debug` to the filter.
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
 - **`ai-memory doctor`.** A 7-section health dashboard run locally: database integrity, schema version, retention drift, embedder availability, hook pipeline status, federation peer reachability, recent audit summary. Nothing leaves the host.
 

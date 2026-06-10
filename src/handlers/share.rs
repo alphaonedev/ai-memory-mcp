@@ -12,6 +12,7 @@
 //! (SR-4) flagged the three-surface parity gap. CLI lands separately;
 //! this module pins the HTTP half.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -51,8 +52,8 @@ pub async fn share_memory(
     Json(body): Json<ShareBody>,
 ) -> impl IntoResponse {
     let params: Value = json!({
-        "source_memory_id": body.source_memory_id,
-        "target_agent_id": body.target_agent_id,
+        (field_names::SOURCE_MEMORY_ID): body.source_memory_id,
+        (field_names::TARGET_AGENT_ID): body.target_agent_id,
     });
 
     // Route through the existing substrate primitive. Lock the DB,

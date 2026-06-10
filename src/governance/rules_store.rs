@@ -24,9 +24,14 @@
 //! [`get`]; mutation tools over MCP are explicitly disabled per
 //! issue #691 design revision 2026-05-13.
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+/// `attest_level` value carried by operator-signed governance rules —
+/// shared with `governance install-defaults` (#1558 batch 6).
+pub(crate) const ATTEST_OPERATOR_SIGNED: &str = "operator_signed";
 
 /// One row of `governance_rules`. Field order matches the SQL column
 /// order so projection / debugging is symmetric.
@@ -202,7 +207,7 @@ pub fn enforced_rule_passes(
     operator_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> bool {
     match (operator_pubkey, rule.attest_level.as_str()) {
-        (Some(pk), "operator_signed") => match verify_rule_signature(rule, pk) {
+        (Some(pk), ATTEST_OPERATOR_SIGNED) => match verify_rule_signature(rule, pk) {
             Ok(()) => true,
             Err(_) => {
                 tracing::error!(
@@ -647,8 +652,8 @@ pub fn canonical_bytes(rule: &Rule) -> Result<Vec<u8>> {
         "severity": rule.severity,
         "reason": rule.reason,
         "namespace": rule.namespace,
-        "created_by": rule.created_by,
-        "created_at": rule.created_at,
+        (field_names::CREATED_BY): rule.created_by,
+        (field_names::CREATED_AT): rule.created_at,
     });
     serde_json::to_vec(&canonical).context("rules_store::canonical_bytes: serialize")
 }
@@ -694,7 +699,7 @@ pub fn canonical_bytes_for_signing(rule: &Rule) -> Result<Vec<u8>> {
         "severity": rule.severity,
         "reason": rule.reason,
         "namespace": rule.namespace,
-        "created_by": rule.created_by,
+        (field_names::CREATED_BY): rule.created_by,
         "enabled": rule.enabled,
     });
     serde_json::to_vec(&canonical).context("rules_store::canonical_bytes_for_signing: serialize")

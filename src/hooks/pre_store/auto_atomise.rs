@@ -49,6 +49,13 @@ use crate::atomisation::{AtomiseError, Atomiser};
 use crate::models::Memory;
 use crate::storage as db;
 
+/// Tracing target for the async auto-atomise hook (#1558 tracing-target SSOT).
+const AUTO_ATOMISE_TRACE_TARGET: &str = "pre_store.auto_atomise";
+
+/// Tracing target for the synchronous (inline) auto-atomise path
+/// (#1558 tracing-target SSOT).
+const AUTO_ATOMISE_SYNC_TRACE_TARGET: &str = "pre_store.auto_atomise.sync";
+
 /// Outcome surfaced to telemetry by the worker thread. The MCP
 /// response shape never carries this — the hook is deferred — but the
 /// test harness inspects it via the optional observation channel.
@@ -232,7 +239,7 @@ pub fn run_synchronous_auto_atomise(
 ) -> &'static str {
     let Some(dispatch) = AUTO_ATOMISE_DISPATCH.get() else {
         tracing::info!(
-            target: "pre_store.auto_atomise.sync",
+            target: AUTO_ATOMISE_SYNC_TRACE_TARGET,
             "synchronous-mode dispatch unset for memory={}; substrate stays quiet",
             actual_id,
         );
@@ -266,7 +273,7 @@ pub fn run_synchronous_auto_atomise(
     ) {
         Ok(result) => {
             tracing::info!(
-                target: "pre_store.auto_atomise.sync",
+                target: AUTO_ATOMISE_SYNC_TRACE_TARGET,
                 "synchronous-atomise succeeded: source={} atoms={}",
                 result.source_id,
                 result.atom_count,
@@ -275,7 +282,7 @@ pub fn run_synchronous_auto_atomise(
         }
         Err(AtomiseError::SourceTooSmall) => {
             tracing::info!(
-                target: "pre_store.auto_atomise.sync",
+                target: AUTO_ATOMISE_SYNC_TRACE_TARGET,
                 "synchronous-atomise skipped: source={} body too small",
                 actual_id,
             );
@@ -283,7 +290,7 @@ pub fn run_synchronous_auto_atomise(
         }
         Err(AtomiseError::AlreadyAtomised { .. }) => {
             tracing::info!(
-                target: "pre_store.auto_atomise.sync",
+                target: AUTO_ATOMISE_SYNC_TRACE_TARGET,
                 "synchronous-atomise skipped: source={} already atomised",
                 actual_id,
             );
@@ -291,7 +298,7 @@ pub fn run_synchronous_auto_atomise(
         }
         Err(e) => {
             tracing::error!(
-                target: "pre_store.auto_atomise.sync",
+                target: AUTO_ATOMISE_SYNC_TRACE_TARGET,
                 "synchronous-atomise failed for source={}: {:?}",
                 actual_id,
                 e,
@@ -326,7 +333,7 @@ pub fn run_deferred_atomise(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "worker: failed to open db at {} for memory={}: {}",
                 db_path.display(),
                 memory_id,
@@ -339,7 +346,7 @@ pub fn run_deferred_atomise(
     match atomiser.atomise_sync(&conn, memory_id, max_atom_tokens, false, calling_agent_id) {
         Ok(result) => {
             tracing::info!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation succeeded: source={} atoms={}",
                 result.source_id,
                 result.atom_count
@@ -350,7 +357,7 @@ pub fn run_deferred_atomise(
             existing_atom_ids,
         }) => {
             tracing::info!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation skipped (race): source={} already split into {} atoms",
                 source_id,
                 existing_atom_ids.len()
@@ -358,14 +365,14 @@ pub fn run_deferred_atomise(
         }
         Err(AtomiseError::SourceTooSmall) => {
             tracing::warn!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation skipped: source={} body fits within max_atom_tokens (curator returned no atoms)",
                 memory_id
             );
         }
         Err(AtomiseError::CuratorFailed(reason)) => {
             tracing::error!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation curator failed for source={}: {} — operator may retry with `memory_atomise`",
                 memory_id,
                 reason
@@ -373,7 +380,7 @@ pub fn run_deferred_atomise(
         }
         Err(AtomiseError::TierLocked) => {
             tracing::info!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation skipped: source={} tier_locked (keyword feature tier)",
                 memory_id
             );
@@ -382,14 +389,14 @@ pub fn run_deferred_atomise(
             // Race: memory was deleted between commit and hook
             // fire. Nothing to atomise.
             tracing::info!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation skipped: source={} not found (raced with delete?)",
                 memory_id
             );
         }
         Err(e) => {
             tracing::error!(
-                target: "pre_store.auto_atomise",
+                target: AUTO_ATOMISE_TRACE_TARGET,
                 "auto-atomisation failed for source={}: {:?} (full context: {})",
                 memory_id,
                 e,

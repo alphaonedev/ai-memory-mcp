@@ -2,7 +2,7 @@
 
 **Audience:** operators wiring ai-memory's `smart` / `autonomous` tiers to a specific LLM provider via an MCP-capable AI client (Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, Aider, Cody, Gemini CLI, OpenClaw, …).
 
-**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client. **15 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 17 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative selector list lives in `src/llm.rs::resolve_backend_alias`; compiled default models per backend live in `src/config.rs::backend_default_model`.
+**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client. **15 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 17 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
 
 ## Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)
 
@@ -522,7 +522,7 @@ The same precedence applies whether the var lives in your shell or in the MCP `e
 
 ## Embedding wire shape (#1143)
 
-ai-memory's embedder is Ollama-native (`/api/embed`). When the LLM backend is non-Ollama (e.g. xAI, OpenAI), the MCP server detects the wire-shape mismatch and builds a **dedicated Ollama embed client** at `http://localhost:11434` (configurable via `AI_MEMORY_EMBED_URL`) while chat goes to the cloud vendor. You'll see the `(#1143)` banner line on first MCP start confirming this disambiguation took effect.
+ai-memory's embedder is Ollama-native (`/api/embed`). When the LLM backend is non-Ollama (e.g. xAI, OpenAI), the MCP server detects the wire-shape mismatch and builds a **dedicated Ollama embed client** at `http://localhost:11434` (configurable via the `[embeddings].url` config key) while chat goes to the cloud vendor. You'll see the `(#1143)` banner line on first MCP start confirming this disambiguation took effect.
 
 If you don't have a local Ollama running and you've selected a non-Ollama LLM backend, semantic recall will fall back to keyword-only. To run fully cloud-side, either:
 - Install Ollama locally just for the embedder (`brew install ollama && ollama serve &` — no models need to be pulled; the embed endpoint accepts any embedding model tag the daemon knows about).
