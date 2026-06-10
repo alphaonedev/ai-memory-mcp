@@ -204,10 +204,15 @@ becomes a write outage.
 3-region reference deploy (fra1↔nyc3↔sgp1) pins
 `FED_QUORUM_TIMEOUT_MS=8000` (rationale in
 `deploy/do-1461/provision/lib.sh`) because the synchronous ack must
-cover a cross-continent round trip PLUS the receiver's per-memory
-work — embed-on-receive after an embedding-dimension migration can
-add ~1 s/row
-([#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)).
+cover a cross-continent round trip plus the receiver's commit work.
+Receive-side embedding is **no longer part of that window**
+([#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566),
+fixed under #1579 B1): the push payload ships the sender's embedding
+vector inside the signed body (`embeddings` array — optional on the
+wire, so older peers interoperate), a dim-matching receiver stores it
+directly, and any row without a usable shipped vector is embedded by
+a background task **after** the ack (the pre-fix behaviour embedded
+synchronously at ~1 s/row while holding the receiver's DB lock).
 A too-tight deadline shows up as push `deadline_exceeded` → DLQ
 ([#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)).
 Raising it is cheap: the write commits **locally first**, so a longer
@@ -225,7 +230,14 @@ schema v48). A replay worker
 (`spawn_replay_federation_push_dlq`) is spawned alongside the catchup
 loop at the same cadence (`--catchup-interval-secs`, default 30s); it
 re-POSTs the originally captured payload via `post_once` and stamps
-`replayed_at` on Ack. Retries are bounded: after
+`replayed_at` on Ack. The per-tick batch is adaptive (#1579 B5):
+`min(backlog, cap)` with a floor of 64, where the cap defaults to
+2048 and is operator-tunable via `AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH`
+— a bulk backlog drains at thousands of rows/min instead of the
+historical fixed-64 ceiling (128 rows/min/peer). Replay POSTs reuse
+the daemon's pooled per-peer connections (5-minute idle pool + 60 s
+TCP keepalive on the shared federation client), so a drain pays one
+TLS handshake per peer, not one per row. Retries are bounded: after
 `MAX_REPLAY_ATTEMPTS = 100` (~50 min at the default tick) a row is
 **quarantined** — the take query excludes it
 ([#1578](https://github.com/alphaonedev/ai-memory-mcp/issues/1578))

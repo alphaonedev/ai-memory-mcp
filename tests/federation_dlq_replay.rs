@@ -389,3 +389,181 @@ async fn quarantined_head_does_not_starve_take_batch_1578() {
         "#1578: the at-ceiling head must be excluded from the take set"
     );
 }
+
+/// #1579 B5 — adaptive drain batch. The pre-fix worker took a FIXED
+/// 64 rows per tick, capping bulk drains at 128 rows/min/peer at the
+/// default 30s cadence (the #1578 62k-row backlog took 8+ hours).
+/// `replay_once` now scales the take to `min(backlog, cap)` (floor
+/// 64, cap default 2048 / `AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH`), so
+/// a 150-row backlog must drain in ONE tick against a healthy peer.
+/// Quarantine semantics + the #1578 take-exclusion are untouched
+/// (pinned by `quarantined_head_does_not_starve_take_batch_1578`
+/// above, which keeps running unchanged).
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_batch_drains_backlog_beyond_fixed_64_in_one_tick_1579b5() {
+    use ai_memory::federation::push_dlq::REPLAY_BATCH_SIZE;
+
+    let peer = PeerState {
+        fail_mode: Arc::new(AtomicBool::new(false)), // healthy from the start
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, db) = fresh_dlq_db();
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 2000);
+
+    // Preload a backlog comfortably above the legacy fixed batch.
+    let backlog = REPLAY_BATCH_SIZE * 2 + 22; // 150
+    for i in 0..backlog {
+        sink.enqueue_push_failure(
+            &format!("mem-adaptive-{i:04}"),
+            "peer-0",
+            &serde_json::json!({"sender_agent_id": "ai:dlq-test", "memories": [], "dry_run": false}),
+            "preloaded for #1579 B5 adaptive-batch test",
+        )
+        .await
+        .expect("enqueue backlog row");
+    }
+    assert_eq!(
+        sink.pending_dlq_count().await.unwrap(),
+        i64::try_from(backlog).unwrap(),
+        "backlog preloaded"
+    );
+
+    // ONE replay tick must drain the whole backlog (pre-fix: only 64).
+    replay_once(&cfg, sink.as_ref()).await;
+
+    assert_eq!(
+        sink.pending_dlq_count().await.unwrap(),
+        0,
+        "#1579 B5: one adaptive tick must drain a {backlog}-row backlog \
+         (pre-fix fixed batch left {} rows pending)",
+        backlog - REPLAY_BATCH_SIZE,
+    );
+    assert_eq!(
+        peer.hit_count.load(Ordering::Relaxed),
+        backlog,
+        "every backlog row must have been POSTed exactly once"
+    );
+}
+
+/// #1579 B5 — `replay_max_batch` resolver contract: env override wins
+/// when sane; zero / garbage / sub-floor values fall through to the
+/// compiled default (a stray `0` can never wedge the drain).
+///
+/// NOTE on parallel-test safety: every value this test sets resolves
+/// to an effective cap ≥ the largest backlog any sibling test in this
+/// file preloads, so a concurrently-running `replay_once` can never
+/// observe a cap that changes its take semantics.
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_max_batch_env_resolver_1579b5() {
+    use ai_memory::federation::push_dlq::{
+        DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, replay_max_batch,
+    };
+
+    // Unset → compiled default.
+    // SAFETY: env mutation confined to this test; see parallel-safety
+    // note above.
+    unsafe {
+        std::env::remove_var(ENV_FED_DLQ_REPLAY_MAX_BATCH);
+    }
+    assert_eq!(replay_max_batch(), DEFAULT_REPLAY_MAX_BATCH);
+
+    // Sane override → honored.
+    unsafe {
+        std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "4096");
+    }
+    assert_eq!(replay_max_batch(), 4096);
+
+    // Garbage → default.
+    unsafe {
+        std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "not-a-number");
+    }
+    assert_eq!(replay_max_batch(), DEFAULT_REPLAY_MAX_BATCH);
+
+    // Below the REPLAY_BATCH_SIZE floor → default (never shrinks the
+    // worker below its historical fixed batch).
+    unsafe {
+        std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "10");
+    }
+    assert_eq!(replay_max_batch(), DEFAULT_REPLAY_MAX_BATCH);
+
+    unsafe {
+        std::env::remove_var(ENV_FED_DLQ_REPLAY_MAX_BATCH);
+    }
+}
+
+/// #1566 / #1579 B1 — sender wire shape. `broadcast_store_quorum_with_embedding`
+/// must place the shipped vector under the top-level `embeddings` key
+/// of the push body (INSIDE the signed payload), and the legacy
+/// `broadcast_store_quorum` entry point must keep the pre-#1566 wire
+/// bytes (no `embeddings` key at all) so older peers see an unchanged
+/// shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn broadcast_with_embedding_ships_vector_in_push_body_1566() {
+    use ai_memory::federation::{ShippedEmbedding, broadcast_store_quorum_with_embedding};
+
+    let peer = PeerState {
+        fail_mode: Arc::new(AtomicBool::new(false)),
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let (_tmp, db) = fresh_dlq_db();
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 2000);
+
+    // (a) With a shipped embedding → `embeddings` array in the body.
+    let mem = sample_memory("wire-embed-001");
+    let shipped = ShippedEmbedding::new(
+        mem.id.clone(),
+        "wire-test-model".to_string(),
+        vec![1.5_f32, -2.5, 3.5],
+    );
+    let _ = broadcast_store_quorum_with_embedding(&cfg, &mem, Some(&shipped))
+        .await
+        .expect("broadcast with embedding");
+    let body = peer
+        .last_body
+        .lock()
+        .await
+        .clone()
+        .expect("peer received the push");
+    let arr = body["embeddings"]
+        .as_array()
+        .expect("body must carry the embeddings array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["memory_id"], "wire-embed-001");
+    assert_eq!(arr[0]["dim"], 3);
+    assert_eq!(
+        arr[0]["vector"].as_array().map(Vec::len),
+        Some(3),
+        "vector payload round-trips: {body}"
+    );
+
+    // (b) Legacy entry point → byte-shape parity: no `embeddings` key.
+    let mem2 = sample_memory("wire-noembed-001");
+    let _ = broadcast_store_quorum(&cfg, &mem2)
+        .await
+        .expect("broadcast without embedding");
+    // Poll until the second push lands (post-quorum detach may lag).
+    for _ in 0..100 {
+        let last = peer.last_body.lock().await.clone();
+        if last
+            .as_ref()
+            .is_some_and(|b| b.to_string().contains("wire-noembed-001"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let body2 = peer
+        .last_body
+        .lock()
+        .await
+        .clone()
+        .expect("peer received the second push");
+    assert!(
+        body2.get("embeddings").is_none(),
+        "legacy broadcast_store_quorum must keep the pre-#1566 wire shape: {body2}"
+    );
+}

@@ -189,6 +189,65 @@ pub(super) fn next_utc_midnight() -> String {
     next.to_rfc3339()
 }
 
+/// #1566 / #1579 B1 — deferred receive-side embedding refresh.
+///
+/// Spawns a detached task that embeds each `(memory_id,
+/// embedding_document)` pair OFF the request path: the embed itself
+/// runs on the blocking pool (the embedder is CPU-/network-heavy —
+/// ~1s/row via ollama), the DB lock is held only for the per-row
+/// `set_embedding` UPDATE, and the HNSW index is touched last (its
+/// own mutex, never overlapping the DB lock). Errors are logged and
+/// the row is left for the boot-time embed backfill
+/// (`db::get_unembedded_ids` selects `embedding IS NULL`, which covers
+/// federation-applied rows) — same best-effort posture as the
+/// pre-#1566 inline loop, minus the quorum-window coupling.
+///
+/// No-op when `rows` is empty or the receiver runs keyword-only (no
+/// embedder): rows stay FTS-recallable, matching the pre-#1566
+/// behaviour where the embed loop was gated on `app.embedder`.
+fn spawn_deferred_embedding_refresh(app: &AppState, rows: Vec<(String, String)>) {
+    if rows.is_empty() || app.embedder.as_ref().as_ref().is_none() {
+        return;
+    }
+    let db = app.db.clone();
+    let embedder = app.embedder.clone();
+    let vector_index = app.vector_index.clone();
+    tokio::spawn(async move {
+        for (id, text) in rows {
+            let emb = embedder.clone();
+            let embed_res =
+                tokio::task::spawn_blocking(move || emb.as_ref().as_ref().map(|e| e.embed(&text)))
+                    .await;
+            let vec = match embed_res {
+                Ok(Some(Ok(v))) => v,
+                Ok(Some(Err(e))) => {
+                    tracing::warn!("sync_push: deferred embed failed for {id}: {e}");
+                    continue;
+                }
+                // Embedder vanished (impossible — checked above and the
+                // Arc is immutable) — nothing left to do for any row.
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!("sync_push: deferred embed join error for {id}: {e}");
+                    continue;
+                }
+            };
+            {
+                let lock = db.lock().await;
+                if let Err(e) = db::set_embedding(&lock.0, &id, &vec) {
+                    tracing::warn!("sync_push: set_embedding failed for {id}: {e}");
+                    continue;
+                }
+            }
+            let mut idx_lock = vector_index.lock().await;
+            if let Some(idx) = idx_lock.as_mut() {
+                idx.remove(&id);
+                idx.insert(id.clone(), vec);
+            }
+        }
+    });
+}
+
 /// Request body for `POST /api/v1/sync/push`.
 #[derive(Deserialize)]
 pub struct SyncPushBody {
@@ -219,6 +278,16 @@ pub struct SyncPushBody {
     /// Memories the sender is offering. Applied via the existing
     /// timestamp-aware merge (`insert_if_newer`).
     pub memories: Vec<Memory>,
+    /// #1566 / #1579 B1 — source-side embedding vectors for the rows
+    /// in `memories` (embed-once-replicate-vector). Inside the
+    /// Ed25519-signed body bytes, so vector integrity is covered by
+    /// the same `X-Memory-Sig` + nonce replay protection as the rows.
+    /// `#[serde(default)]` keeps decode TOLERANT of absence: pushes
+    /// from pre-#1566 peers parse identically (empty vec), and the
+    /// receive path falls back to the deferred background-embed for
+    /// any applied row without a dim-matching shipped vector.
+    #[serde(default)]
+    pub embeddings: Vec<crate::federation::ShippedEmbedding>,
     /// Memory IDs the sender has deleted and wants propagated. Applied
     /// via `db::delete`. v0.6.0.1: simple remove (no tombstone row); a
     /// concurrent newer `insert_if_newer` from another peer could revive
@@ -436,6 +505,22 @@ pub async fn sync_push(
         )
             .into_response();
     }
+    // #1566 / #1579 B1 — the shipped-vector array is bounded by the
+    // same cap as its sibling subcollections (red-team #242 posture:
+    // vectors are the LARGEST per-element payload on this surface, so
+    // an unbounded array would be the cheapest flood vector).
+    if body.embeddings.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} embeddings per request",
+                    app.max_page_size
+                )
+            })),
+        )
+            .into_response();
+    }
     if body.deletions.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
@@ -571,10 +656,34 @@ pub async fn sync_push(
     // pattern: substrate CRUD fanout works, but semantic recall on peers
     // silently misses propagated writes.
     //
-    // Collect rows that need an embedding refresh and apply AFTER we drop
-    // the DB lock (embedder is CPU-heavy; holding the Mutex across that
-    // would serialize unrelated writers for hundreds of ms).
-    let mut embedding_refresh: Vec<(String, String)> = Vec::new();
+    // #1566 / #1579 B1 (2026-06-10) — embed-once-replicate-vector +
+    // ack-after-commit. The pre-#1566 shape embedded every applied row
+    // synchronously (~1s/row via ollama) while STILL HOLDING the DB
+    // lock, inside the sender's quorum-ack window — the mechanism
+    // behind the deadline_exceeded → DLQ cascade (the 62k-row #1578
+    // event) and the up-to-9× duplicate embedding across the fleet.
+    // Now:
+    //   - a dim-matching shipped vector is stored directly under the
+    //     already-held lock (one cheap UPDATE, microseconds);
+    //   - everything else is DEFERRED to a detached background task
+    //     spawned after the response is decided (see
+    //     `spawn_deferred_embedding_refresh`), so the ack never waits
+    //     on the embedder. FTS keeps the rows keyword-recallable in
+    //     the gap, and the boot-time embed backfill
+    //     (`db::get_unembedded_ids` — `embedding IS NULL` covers
+    //     federation-applied rows) is the restart safety net.
+    let receiver_dim = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(crate::embeddings::Embedder::dim);
+    let shipped_by_id: std::collections::HashMap<&str, &crate::federation::ShippedEmbedding> = body
+        .embeddings
+        .iter()
+        .map(|se| (se.memory_id.as_str(), se))
+        .collect();
+    let mut deferred_embed: Vec<(String, String)> = Vec::new();
+    let mut hnsw_updates: Vec<(String, Vec<f32>)> = Vec::new();
     for mem in &body.memories {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
@@ -701,10 +810,33 @@ pub async fn sync_push(
         match db::insert_if_newer(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
-                embedding_refresh.push((
-                    actual_id,
-                    crate::embeddings::embedding_document(&mem.title, &mem.content),
-                ));
+                // #1566 / #1579 B1 — store a dim-matching shipped
+                // vector directly (no local embed at all); anything
+                // else falls back to the deferred background embed.
+                // `se.vector.len() == se.dim` guards a malformed
+                // sender whose claimed dim disagrees with the payload.
+                match shipped_by_id.get(mem.id.as_str()) {
+                    Some(se) if receiver_dim == Some(se.dim) && se.vector.len() == se.dim => {
+                        match db::set_embedding(&lock.0, &actual_id, &se.vector) {
+                            Ok(()) => hnsw_updates.push((actual_id, se.vector.clone())),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "sync_push: storing shipped embedding failed for \
+                                     {actual_id} (model {}): {e} — deferring local embed",
+                                    se.model,
+                                );
+                                deferred_embed.push((
+                                    actual_id,
+                                    crate::embeddings::embedding_document(&mem.title, &mem.content),
+                                ));
+                            }
+                        }
+                    }
+                    _ => deferred_embed.push((
+                        actual_id,
+                        crate::embeddings::embedding_document(&mem.title, &mem.content),
+                    )),
+                }
             }
             Err(e) => {
                 // Best-effort refund so a downstream insert failure
@@ -731,6 +863,21 @@ pub async fn sync_push(
     // (matches the HTTP POST store refusal envelope from F7 / #639).
     if let Some(q) = first_quota_refusal.take() {
         drop(lock);
+        // #1566 / #1579 B1 — rows applied BEFORE the refusal are
+        // committed and stay committed (the 429 covers the remainder
+        // of the batch); index their stored shipped vectors and defer
+        // the rest exactly like the success path, instead of leaving
+        // them for the next boot backfill.
+        if !hnsw_updates.is_empty() {
+            let mut idx_lock = app.vector_index.lock().await;
+            if let Some(idx) = idx_lock.as_mut() {
+                for (id, vec) in hnsw_updates {
+                    idx.remove(&id);
+                    idx.insert(id, vec);
+                }
+            }
+        }
+        spawn_deferred_embedding_refresh(&app, deferred_embed);
         let reset_at = next_utc_midnight();
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1060,33 +1207,13 @@ pub async fn sync_push(
         tracing::warn!("sync_push: sync_state_observe failed: {e}");
     }
 
-    // v0.6.0.1 (#322): regenerate embeddings for applied rows so peer-side
-    // semantic recall surfaces the propagated memories. Without this,
-    // scenario-18 observed the a2a-hermes r14 black-hole pattern:
-    // substrate CRUD fanout works, but semantic recall on peers misses.
-    //
-    // Embedding + set_embedding are serialized under the existing DB lock;
-    // HNSW updates happen after we release the lock to avoid contention.
-    let mut hnsw_updates: Vec<(String, Vec<f32>)> = Vec::new();
-    if !body.dry_run
-        && !embedding_refresh.is_empty()
-        && let Some(emb) = app.embedder.as_ref().as_ref()
-    {
-        for (id, text) in &embedding_refresh {
-            match emb.embed(text) {
-                Ok(vec) => {
-                    if let Err(e) = db::set_embedding(&lock.0, id, &vec) {
-                        tracing::warn!("sync_push: set_embedding failed for {id}: {e}");
-                        continue;
-                    }
-                    hnsw_updates.push((id.clone(), vec));
-                }
-                Err(e) => {
-                    tracing::warn!("sync_push: embed failed for {id}: {e}");
-                }
-            }
-        }
-    }
+    // #1566 / #1579 B1 — the pre-#1566 synchronous embed loop lived
+    // here (one `emb.embed()` per applied row, ~1s/row via ollama,
+    // WHILE HOLDING the DB lock and inside the sender's quorum-ack
+    // window). It is gone: dim-matching shipped vectors were stored
+    // inline above (cheap UPDATE under the already-held lock), and
+    // every other applied row is handed to the detached background
+    // task spawned after the response is decided below.
 
     // Receiver's current clock, returned so the sender can learn which
     // peers the receiver has seen. Phase 3 Task 3a.1 will use this to
@@ -1106,6 +1233,11 @@ pub async fn sync_push(
             }
         }
     }
+
+    // #1566 / #1579 B1 — ack-after-commit: hand the rows that still
+    // need a locally-computed vector to the detached background task.
+    // The HTTP response (the sender's quorum ack) returns immediately.
+    spawn_deferred_embedding_refresh(&app, deferred_embed);
 
     (
         StatusCode::OK,

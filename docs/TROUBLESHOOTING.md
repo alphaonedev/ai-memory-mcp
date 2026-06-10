@@ -290,7 +290,20 @@ Layer 2b).
 the `federation_push_dlq_depth` gauge stays high.
 
 Failed quorum pushes land in the `federation_push_dlq` table and a
-background worker replays them (oldest first, batches per tick).
+background worker replays them (oldest first, batches per tick). The
+per-tick batch is **adaptive** (#1579 B5): it scales with the live
+backlog up to a cap (`min(backlog, cap)`, floor 64; cap default 2048,
+operator-tunable via `AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH`), so a bulk
+backlog drains at thousands of rows/min instead of the historical
+fixed-64 ceiling of 128 rows/min/peer. Replays reuse the daemon's
+pooled federation connections (no per-row TLS handshake), and the
+captured payload ships the source embedding vector when one was
+available at enqueue time (#1566), so a healthy receiver applies a
+replayed row in milliseconds — receivers **no longer re-embed
+synchronously on receive** (the pre-#1566 ~1 s/row embed-on-receive
+that inflated replay latency and quorum deadlines is gone; rows
+without a usable shipped vector are embedded by a background task
+after the ack).
 Rows that fail `MAX_REPLAY_ATTEMPTS` (100) times are *quarantined*:
 the take query excludes them (#1578) and they wait for operator
 review. **No CLI drain surface ships at v0.7.0** — inspection and

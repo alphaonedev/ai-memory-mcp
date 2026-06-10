@@ -102,6 +102,12 @@ pub const DESCRIPTION: &str = "description";
 pub const EARLIEST_UPDATED_AT: &str = "earliest_updated_at";
 /// `elapsed_ms` — wire/row field name.
 pub const ELAPSED_MS: &str = "elapsed_ms";
+/// `embeddings` — wire field name. Federation `/sync/push` payloads
+/// carry shipped source-side embedding vectors under this key
+/// (#1566 / #1579 B1 embed-once-replicate-vector). The array lives
+/// inside the Ed25519-signed body bytes; decode is tolerant of the
+/// field's absence so older peers interoperate.
+pub const EMBEDDINGS: &str = "embeddings";
 /// `event_types` — wire/row field name.
 pub const EVENT_TYPES: &str = "event_types";
 /// `excluded_for_scope` — wire/row field name.
