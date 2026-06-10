@@ -76,6 +76,11 @@ default_namespace = "alphaone"
 archive_on_gc     = true
 archive_max_days  = 90
 max_memory_mb     = 4096
+db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
+                                # 256 MiB compiled default; 0 disables
+                                # memory-mapped I/O. Env override:
+                                # AI_MEMORY_DB_MMAP_SIZE (env > this
+                                # field > compiled default).
 
 # ---------------------------------------------------------------------
 # [limits] — operator-tunable resource caps (#1156 follow-up).
@@ -114,7 +119,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.2** | `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v55** | `EXPECTED_SCHEMA=55`; postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 55` (`src/storage/migrations.rs`) |
+| ai-memory postgres schema | **v56** | `EXPECTED_SCHEMA=56`; postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 56` (`src/storage/migrations.rs`) |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)

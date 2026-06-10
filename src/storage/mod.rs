@@ -384,6 +384,11 @@ pub(crate) mod reflect;
 // is re-published at `crate::storage::*` (and therefore `crate::db::*`
 // via the lib.rs shim) so callsites keep resolving without churn.
 pub use connection::open;
+// #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
+// seeding hook (`daemon_runtime::run`); the DEFAULT const is the
+// compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
+// out on (also consumed by the config-precedence tests).
+pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
 // v0.7.0 refactor PR-1 (#793) — schema-pins SSOT. Re-export the
 // test-facing helper so callers can use either
 // `ai_memory::storage::current_schema_version_for_tests()` or the
