@@ -455,6 +455,9 @@ Below is a complete example showing every supported field with explanatory comme
 #   archive_on_gc     = true
 #   archive_max_days  = 90
 #   max_memory_mb     = 4096
+#   db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7);
+#                                   # 256 MiB default, 0 disables mmap.
+#                                   # Env override: AI_MEMORY_DB_MMAP_SIZE.
 #
 # Inline `[llm].api_key = "<literal>"` is REJECTED at parse time — use
 # api_key_env (process env var reference) or api_key_file (mode 0400
