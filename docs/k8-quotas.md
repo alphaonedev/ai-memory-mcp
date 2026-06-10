@@ -13,15 +13,23 @@ operations.
 - **Code paths:** [`src/quotas.rs`](../src/quotas.rs),
   [`src/handlers/http.rs`](../src/handlers/http.rs) quota status handler,
   [`src/mcp/tools/quota_status.rs`](../src/mcp/tools/quota_status.rs).
-- **Schema:** [`migrations/sqlite/0022_v07_agent_quotas.sql`](../migrations/sqlite/0022_v07_agent_quotas.sql).
+- **Schema:** [`migrations/sqlite/0022_v07_agent_quotas.sql`](../migrations/sqlite/0022_v07_agent_quotas.sql)
+  (original K8 shape) +
+  [`migrations/sqlite/0042_v50_per_namespace_quota.sql`](../migrations/sqlite/0042_v50_per_namespace_quota.sql)
+  (schema v50, [#1156](https://github.com/alphaonedev/ai-memory-mcp/issues/1156)
+  per-namespace extension).
 - **MCP tool:** `memory_quota_status` in the Power family
-  ([`src/mcp/registry.rs:1307`](../src/mcp/registry.rs)).
+  ([`src/mcp/registry.rs`](../src/mcp/registry.rs)).
 
 ## Row shape
 
+Since schema v50 ([#1156](https://github.com/alphaonedev/ai-memory-mcp/issues/1156))
+each `(agent_id, namespace)` tuple gets its own row:
+
 ```sql
 CREATE TABLE agent_quotas (
-  agent_id                TEXT PRIMARY KEY,
+  agent_id                TEXT NOT NULL,
+  namespace               TEXT NOT NULL DEFAULT '_global',
   max_memories_per_day    INTEGER NOT NULL DEFAULT 1000,
   max_storage_bytes       INTEGER NOT NULL DEFAULT 104857600,   -- 100 MiB
   max_links_per_day       INTEGER NOT NULL DEFAULT 5000,
@@ -30,18 +38,29 @@ CREATE TABLE agent_quotas (
   current_links_today     INTEGER NOT NULL DEFAULT 0,
   day_started_at          TEXT NOT NULL,
   created_at              TEXT NOT NULL,
-  updated_at              TEXT NOT NULL
+  updated_at              TEXT NOT NULL,
+  PRIMARY KEY (agent_id, namespace)
 );
 ```
 
+Pre-v50 rows are carried forward verbatim under the sentinel
+namespace `_global` (`crate::quotas::GLOBAL_NAMESPACE` — the
+underscore prefix is outside the validated namespace charset, so no
+caller-supplied namespace can collide). Call sites without a
+per-namespace context land on the `_global` row.
+
 A row is auto-inserted on the agent's first write (or first
-`memory_quota_status` call) at compiled defaults. Operators set
-per-agent caps via direct SQL — the K8 substrate is operator-mutated,
+`memory_quota_status` call) at the seeded defaults. Operators set
+per-row caps via direct SQL — the K8 substrate is operator-mutated,
 not MCP-mutated, by design (a malicious agent must not be able to
-raise its own ceiling).
+raise its own ceiling). The *seeded defaults for fresh rows* are
+operator-tunable via `AI_MEMORY_MAX_MEMORIES_PER_DAY` /
+`AI_MEMORY_MAX_STORAGE_BYTES` / `AI_MEMORY_MAX_LINKS_PER_DAY` (or the
+`[limits]` config.toml section) — existing rows are NOT retroactively
+rewritten.
 
 Compiled defaults
-([`src/quotas.rs:31-40`](../src/quotas.rs)):
+([`src/quotas.rs:75-84`](../src/quotas.rs)):
 
 | Const | Value | Counter |
 |---|---|---|
@@ -55,7 +74,7 @@ len(metadata)` per stored memory.
 
 ## Daily reset
 
-`reset_daily` ([`src/quotas.rs:570`](../src/quotas.rs)) runs every UTC
+`reset_daily` ([`src/quotas.rs:749`](../src/quotas.rs)) runs every UTC
 midnight from the K8 sweep loop wired into
 `daemon_runtime::bootstrap_serve`. It zeroes
 `current_memories_today` and `current_links_today` on every row whose
@@ -63,7 +82,7 @@ midnight from the K8 sweep loop wired into
 the new bucket. `current_storage_bytes` is never zeroed.
 
 Inline roll-over: `check_and_record`
-([`src/quotas.rs:313`](../src/quotas.rs)) also performs an inline
+([`src/quotas.rs:472`](../src/quotas.rs)) also performs an inline
 daily-bucket roll inside the `BEGIN IMMEDIATE` transaction so the
 per-write quota stays honest even if the sweeper hasn't fired yet.
 Pinned by [`tests/k8_daily_reset.rs`](../tests/k8_daily_reset.rs).
@@ -71,7 +90,7 @@ Pinned by [`tests/k8_daily_reset.rs`](../tests/k8_daily_reset.rs).
 ## Enforcement semantics
 
 Every `memory_store` / `memory_link` write calls `check_and_record`
-([`src/quotas.rs:313`](../src/quotas.rs)) inside a `BEGIN IMMEDIATE`
+([`src/quotas.rs:472`](../src/quotas.rs)) inside a `BEGIN IMMEDIATE`
 SQLite transaction. The transaction acquires a `RESERVED` lock on the
 database at the start, serializing every other would-be writer until
 COMMIT/ROLLBACK — this is the SQLite analogue of
@@ -79,7 +98,7 @@ COMMIT/ROLLBACK — this is the SQLite analogue of
 write could otherwise pass the check and then both increment the
 counter past the cap).
 
-The three refusal shapes ([`src/quotas.rs:64-86`](../src/quotas.rs)):
+The three refusal shapes ([`src/quotas.rs:159-178`](../src/quotas.rs)):
 
 - `QuotaLimit::MemoriesPerDay` — the pending memory_store would push
   `current_memories_today + 1 > max_memories_per_day`.
@@ -90,7 +109,7 @@ The three refusal shapes ([`src/quotas.rs:64-86`](../src/quotas.rs)):
   `current_links_today + 1 > max_links_per_day`.
 
 Refusals raise `QuotaError`
-([`src/quotas.rs:91`](../src/quotas.rs)) which the MCP / HTTP layers
+([`src/quotas.rs:186`](../src/quotas.rs)) which the MCP / HTTP layers
 map to the `QUOTA_EXCEEDED` diagnostic. The error envelope carries
 `agent_id`, `limit` (lower-snake-case name), `current`, `max` — the
 caller can render "you have used X/Y for today, reset at UTC midnight"
@@ -98,7 +117,7 @@ without a second round-trip. Pinned by
 [`tests/k8_quota_enforcement.rs`](../tests/k8_quota_enforcement.rs).
 
 If a downstream write fails *after* `check_and_record` succeeds,
-`refund_op` ([`src/quotas.rs:456`](../src/quotas.rs)) reverses the
+`refund_op` ([`src/quotas.rs:631`](../src/quotas.rs)) reverses the
 increment. The two-phase pattern: `check_and_record(...)?;
 op(...)?;` and on op-failure, `refund_op(...)`.
 
@@ -110,17 +129,23 @@ Request ([`src/mcp/tools/quota_status.rs`](../src/mcp/tools/quota_status.rs)):
 {
   "tool": "memory_quota_status",
   "args": {
-    "agent_id": "ai:claude-opus@host:pid-12345"   // optional
+    "agent_id": "ai:claude-opus@host:pid-12345",  // optional
+    "namespace": "team/alpha"                     // optional (v0.7.0 #1156)
   }
 }
 ```
 
-When `agent_id` is provided, the handler returns a single envelope
-(auto-inserting a default row if absent):
+When both `agent_id` and `namespace` are provided, the handler
+returns that `(agent_id, namespace)` row (auto-inserting a default
+row if absent). When `agent_id` is provided without `namespace`, the
+handler returns the **aggregate** view — counters summed across every
+namespace the agent has written into, reported with
+`namespace = "_global"`:
 
 ```jsonc
 {
   "agent_id": "ai:claude-opus@host:pid-12345",
+  "namespace": "team/alpha",
   "quota": {
     "agent_id": "ai:claude-opus@host:pid-12345",
     "max_memories_per_day": 1000,
@@ -137,7 +162,7 @@ When `agent_id` is provided, the handler returns a single envelope
 ```
 
 When `agent_id` is omitted, the handler returns every row in the
-substrate, sorted by `agent_id` ASC:
+substrate, sorted by `(agent_id ASC, namespace ASC)`:
 
 ```jsonc
 { "count": 7, "quotas": [ /* QuotaStatus rows */ ] }
@@ -194,10 +219,13 @@ append-only against the lifetime of the row. (Tracking issue: the
 substrate's storage byte accounting predates the L2-7 archive sweep
 integration.)
 
-**Per-agent tuning is the right granularity.** There is no
-namespace-scoped or tenant-scoped quota row today. Multi-tenant
-operators should pre-allocate agent_ids per tenant and tune each
-agent's row.
+**Per-`(agent, namespace)` tuning is the granularity.** Since schema
+v50 ([#1156](https://github.com/alphaonedev/ai-memory-mcp/issues/1156))
+quota rows are keyed `(agent_id, namespace)`, so multi-tenant
+operators can carve tight blast-radius limits on a single shared
+namespace without starving the same agent's writes elsewhere.
+Pre-v50-style aggregate accounting lives on the `_global` sentinel
+row.
 
 ## Anti-pattern examples
 
@@ -301,13 +329,15 @@ operation it cannot drift. A persistent drift signals either an
 out-of-band write (someone editing the SQLite file directly — never
 do this) or a substrate bug (file an issue with the row diff and
 `tests/k8_quota_enforcement.rs` reproduction). Recover by re-counting
-from the live `memories` table:
+from the live `memories` table (per `(agent, namespace)` row since
+schema v50):
 ```sql
 UPDATE agent_quotas
 SET current_storage_bytes = (
   SELECT COALESCE(SUM(LENGTH(title) + LENGTH(content) + LENGTH(metadata)), 0)
   FROM memories
   WHERE json_extract(metadata, '$.agent_id') = agent_quotas.agent_id
+    AND memories.namespace = agent_quotas.namespace
 )
 WHERE agent_id = '<id>';
 ```

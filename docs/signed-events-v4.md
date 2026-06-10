@@ -64,6 +64,15 @@ time. **Callers MUST NOT pre-populate them** — any value set by the
 caller is ignored. Use `..SignedEvent::default()` at the
 struct-literal tail to leave them empty.
 
+**Unsigned posture.** Per-row Ed25519 `sig` population is gated on
+the resolved daemon `agent_id` having a `*.priv` keypair on disk
+under the key directory. When no signing key loads, the daemon boots
+with a stderr "continuing unsigned" line
+([`src/main.rs:118`](../src/main.rs)) and writes rows with an empty
+signature + `attest_level = "unsigned"`. The cross-row hash chain
+remains tamper-evident in either posture — only the per-row
+signature property is degraded.
+
 ## Backfill (v33 → v34)
 
 A fresh v0.7.0 install starts at v34 and writes the chain from row 1.
@@ -80,7 +89,9 @@ others don't) is **load-bearing-bad**. `read_chain_head`
 ([`src/signed_events.rs::read_chain_head`](../src/signed_events.rs)) hard-fails
 with a clear diagnostic in this case (the COR-9 fix; cluster-C
 issue #767) and refuses to append further rows until the operator
-re-runs `ai-memory migrate`. Silently treating `NULL` as 0 would
+re-runs the schema migration (re-open the DB with the v0.7.0 binary —
+migrations apply automatically on open and the backfill is
+idempotent). Silently treating `NULL` as 0 would
 collide with the legitimately-backfilled first row on the UNIQUE
 index, masking a real migration-needed state behind a misleading
 SQLITE_CONSTRAINT_UNIQUE.
@@ -187,8 +198,9 @@ in `src/` outside doc comments.
 
 ## Operator workflow
 
-1. **Generate an operator keypair** (`ai-memory identity generate
-   --agent-id "$(ai-memory identity suggest-id)"`).
+1. **Generate an operator keypair** (`ai-memory identity generate`
+   — omit `--agent-id` to use the NHI-hardened default id, or pass
+   `--agent-id <id>` explicitly).
 2. **Restart the daemon.** The v34 schema migration runs
    automatically on first start and backfills the chain from existing
    `signed_events` rows. The backfill is idempotent; no manual step
@@ -218,8 +230,8 @@ TAIL=$(sqlite3 "$AI_MEMORY_DB" "SELECT MAX(sequence) FROM signed_events;")
 echo "Current chain tail: $TAIL"
 
 # 2. Full walk (cold start; expensive for >1M rows)
-ai-memory verify-signed-events-chain --format json > /tmp/verify-report.json
-jq '{rows_checked, chain_holds, chain_break, signature_failures}' /tmp/verify-report.json
+ai-memory verify-signed-events-chain --format json > ./verify-report.json
+jq '{rows_checked, chain_holds, chain_break, signature_failures}' ./verify-report.json
 
 # 3. Incremental walk (verify only what's new since last cron tick)
 LAST_VERIFIED=$(cat /var/lib/ai-memory/last-verified-seq 2>/dev/null || echo 0)
@@ -227,7 +239,7 @@ ai-memory verify-signed-events-chain --since "$LAST_VERIFIED" --format json \
   | jq -r 'if .chain_holds then "OK at \(.rows_checked) rows" else "BROKEN at \(.chain_break)" end'
 
 # 4. On success, advance the watermark
-if jq -e '.chain_holds' /tmp/verify-report.json > /dev/null; then
+if jq -e '.chain_holds' ./verify-report.json > /dev/null; then
   echo "$TAIL" > /var/lib/ai-memory/last-verified-seq
 fi
 ```
@@ -237,7 +249,7 @@ For a forensic walk after suspected tamper (the chain returns
 
 ```bash
 # 1. Identify the broken row
-SUSPECT=$(jq -r .chain_break /tmp/verify-report.json)
+SUSPECT=$(jq -r .chain_break ./verify-report.json)
 
 # 2. Dump that row and its neighbours
 sqlite3 -header "$AI_MEMORY_DB" "
@@ -260,15 +272,21 @@ post-hoc — a strong signal for incident response.
 
 `signed_events.signature` is Ed25519 over the source row's
 canonical-CBOR bytes; the key material is the agent's identity
-keypair (`~/.config/ai-memory/identities/<agent-id>.key`). Rotation:
+keypair at `<key_dir>/<agent-id>.{pub,priv}` (key dir:
+`AI_MEMORY_KEY_DIR`, default platform config dir +
+`/ai-memory/keys` — [`src/identity/keypair.rs`](../src/identity/keypair.rs)).
+Rotation:
 
-1. **Generate the new keypair**:
+1. **Back up the old key material first** (copy
+   `<key_dir>/<id>.pub` + `<id>.priv` aside — the generator does NOT
+   preserve them), then **generate the new keypair**:
    ```bash
-   ai-memory identity generate --agent-id "<id>" --rotate
+   ai-memory identity generate --agent-id "<id>" --force
    ```
-   The `--rotate` flag preserves the old key under
-   `<id>.key.rotated-<timestamp>` for re-verification of historical
-   rows.
+   `--force` is required because `generate` refuses to overwrite an
+   existing keypair by default (the safe default that prevents a typo
+   from silently destroying a daemon key). The old public key remains
+   needed for re-verification of historical rows.
 2. **Restart the daemon** so the new key is the active signer.
 3. **Verify historical chain still holds** under the rotated key set:
    ```bash
@@ -344,9 +362,9 @@ The operationally-relevant choices:
 | Symptom | Likely cause | Diagnostic recipe |
 |---|---|---|
 | `verify-signed-events-chain FAIL: chain break at sequence=N` | Tamper, partial backfill, or operator-issued DELETE | Inspect rows N-2..N+2 (recipe above); check operator change-log for SQL writes. |
-| `read_chain_head: signed_events row(s) have sequence IS NULL` | v34 backfill incomplete | Re-run `ai-memory migrate`; the backfill is idempotent. Daemon refuses to append until repaired. |
+| `read_chain_head: signed_events row(s) have sequence IS NULL` | v34 backfill incomplete | Re-open the DB with the v0.7.0 binary so the automatic migration ladder re-runs; the backfill is idempotent. Daemon refuses to append until repaired. |
 | New rows fail with `SQLITE_CONSTRAINT_UNIQUE` on sequence | Two writers raced past the chain head | Confirms PE-3 hook isn't wired; check `tests/deferred_audit_soak.rs` for the correct boot pattern. |
-| `signature_failures` non-empty after key rotation | Old key not retained for historical verification | Restore old key under `<id>.key.rotated-<timestamp>`; re-verify. |
+| `signature_failures` non-empty after key rotation | Old key not retained for historical verification | Restore the backed-up old `<id>.pub` from your pre-rotation copy; re-verify. |
 | Verifier slow on large substrates | Cold walk over millions of rows | Use `--since <last-verified>` to skip pre-verified prefix. |
 | Postgres deployment: `prev_hash` column missing | Postgres migration ladder is one step behind sqlite | Check `migrations/postgres/0015_v07_signed_events_chain.sql` is applied. |
 | JSONL audit log count diverges from SQL count | Either dropped JSONL flush or post-write tamper | Investigate per the forensic recipe; F2 hardened JSONL durability but a divergence is high-signal. |
@@ -379,14 +397,16 @@ evident — the operator notes the rotation-debt in the incident log
 and moves on.
 
 **Partial backfill stuck in a v0.7-alpha → v0.7.0 upgrade.** The
-COR-9 diagnostic fires and the daemon refuses appends. Run
-`ai-memory migrate` explicitly:
-```bash
-ai-memory migrate --target 34
-```
-The `migrate_v34_backfill_chain` function is idempotent — re-running
+COR-9 diagnostic fires and the daemon refuses appends. Re-run the
+schema migration by re-opening the DB with the v0.7.0 binary — any
+CLI command that opens the DB (e.g. `ai-memory stats`) triggers the
+automatic `current_version → apply_migrations` ladder. The
+`migrate_v34_backfill_chain` function is idempotent — re-running
 is safe. After it completes, `verify-signed-events-chain --format
 json` should report `chain_holds: true` over the full row count.
+(Note: the `ai-memory migrate` subcommand is the sal-gated
+store-to-store migrator — `--from`/`--to` URLs — not a
+schema-version tool.)
 
 **Audit log + SQL chain divergence.** Treat as high-signal. Pull
 both logs for the divergence window, file an incident, and roll out

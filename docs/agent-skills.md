@@ -61,13 +61,16 @@ The 7 MCP tools that make up the Agent Skills wire surface:
 
 | Tool | Family | Wave | Purpose |
 |---|---|---|---|
-| `memory_skill_register` | Power | L1-5 | Register a SKILL.md from a folder (with optional `resources/` sub-directory) or from inline text. Re-registering the same `(name, namespace)` creates a new version; the previous row is superseded. |
-| `memory_skill_list` | Discovery | L1-5 | List current (non-superseded) skills with `~100 tokens/skill`. Returns id, name, description, namespace, digest, metadata. **Body is NOT decompressed** — use `memory_skill_get` for activation. |
-| `memory_skill_get` | Discovery | L1-5 | Return the full activation payload: metadata + decompressed body. Old version ids remain addressable after supersession (durable history). |
-| `memory_skill_resource` | Discovery | L1-5 | Fetch a single resource by `(skill_id, resource_path)`, digest-verified against the row's SHA-256 before return. Errors on digest mismatch. |
-| `memory_skill_export` | Power | L1-5 | Write SKILL.md + `resources/` to a target folder. Re-registering from the exported folder produces the **identical SHA-256 digest** — the round-trip guarantee. Appends a `skill.exported` row to `signed_events`. |
-| `memory_skill_promote_from_reflection` | Power | L2-6 | Promote a `Reflection`-kind memory (depth ≥ 1, default floor `1`) to a SKILL.md-format skill. Each `reflects_on` source becomes a `references/source_{i}.md` resource. Frontmatter records `derived_from_reflection_id` + `original_reflection_depth`. The resulting digest is identical to a hand-authored SKILL.md with the same content. |
-| `memory_skill_compositional_context` | Power | L2-7 | Return a skill body + reflection memories from the namespaces declared in its `composes_with_reflections` frontmatter list, bounded by `max_reflection_depth` and a caller-supplied token budget (`budget_tokens`, default 4000, max 32000). |
+| `memory_skill_register` | `other` | L1-5 | Register a SKILL.md from a folder (with optional `resources/` sub-directory) or from inline text. Re-registering the same `(name, namespace)` creates a new version; the previous row is superseded. |
+| `memory_skill_list` | `other` | L1-5 | List current (non-superseded) skills with `~100 tokens/skill`. Returns id, name, description, namespace, digest, metadata. **Body is NOT decompressed** — use `memory_skill_get` for activation. |
+| `memory_skill_get` | `other` | L1-5 | Return the full activation payload: metadata + decompressed body. Old version ids remain addressable after supersession (durable history). |
+| `memory_skill_resource` | `other` | L1-5 | Fetch a single resource by `(skill_id, resource_path)`, digest-verified against the row's SHA-256 before return. Errors on digest mismatch. |
+| `memory_skill_export` | `other` | L1-5 | Write SKILL.md + `resources/` to a target folder. Re-registering from the exported folder produces the **identical SHA-256 digest** — the round-trip guarantee. Appends a `skill.exported` row to `signed_events`. |
+| `memory_skill_promote_from_reflection` | `other` | L2-6 | Promote a `Reflection`-kind memory (depth ≥ 1, default floor `1`) to a SKILL.md-format skill. Each `reflects_on` source becomes a `references/source_{i}.md` resource. Frontmatter records `derived_from_reflection_id` + `original_reflection_depth`. The resulting digest is identical to a hand-authored SKILL.md with the same content. |
+| `memory_skill_compositional_context` | `other` | L2-7 | Return a skill body + reflection memories from the namespaces declared in its `composes_with_reflections` frontmatter list, bounded by `max_reflection_depth` and a caller-supplied token budget (`budget_tokens`, default 4000, max 32000). |
+
+(All seven report the `other` family in the MCP registry —
+`crate::profile::Family::Other`; they ship in `--profile full`.)
 
 Total: 7 MCP tools in the `memory_skill_*` family. The MCP tool
 count grew from 60 → 63 across the L2 wave (L2-3 +
@@ -169,42 +172,56 @@ append-only `signed_events` audit table on every export, so a
 downstream auditor can re-derive when and by whom a skill was
 moved off the substrate.
 
-## Federation behavior
+## Cross-node interchange (export-folder round-trip)
 
-Skills federate via the same `sync_push` path as memories. The
-sender's `skills` row is delivered with its full attestation chain
-(digest, signing agent, frontmatter). The receiver:
+At v0.7.0 the federation receive pipeline
+([`src/federation/receive.rs`](../src/federation/receive.rs)) ferries
+`memories` and `memory_links` between peers — it does **not** carry
+the `skills` / `skill_resources` tables. The canonical cross-node
+interchange shape for a skill is the **export folder**:
+`memory_skill_export` on node A produces `SKILL.md + resources/`,
+the operator ships the folder (e.g. `tar | curl | tar -x`), and
+`memory_skill_register` on node B consumes it. Because the digest is
+content-addressed over the canonical serialisation, node B's
+registered row carries the **identical SHA-256 digest** — pinned
+end-to-end by
+[`tests/cov_17_skills_federation_roundtrip.rs`](../tests/cov_17_skills_federation_roundtrip.rs).
 
-- preserves the digest column verbatim — federation never silently
-  re-hashes the body;
-- preserves `metadata.signing_agent` from the original author;
-- runs the same validation pipeline the local `memory_skill_register`
-  handler runs, so a malformed remote skill is refused with the same
-  structured error the local register would emit;
-- writes the row inside the same atomic envelope the local register
-  uses — half-imported skills never survive the boundary.
+On the receiving node:
 
-Skill version chaining survives federation: a re-register on a
-remote host that already holds version N produces version N+1 in
-the receiver's table with the same name + namespace and supersedes
-the older row, just as it would on a local-only deploy. Both
-versions remain addressable by id.
+- the digest is re-derived from the imported content, so tampering
+  in transit surfaces as a digest change;
+- the same validation pipeline the local `memory_skill_register`
+  handler runs refuses a malformed imported skill with the same
+  structured error;
+- re-registering on a node that already holds version N of the same
+  `(name, namespace)` produces version N+1 and supersedes the older
+  row, just as on a local-only deploy. Both versions remain
+  addressable by id.
+
+A wire-level federation fanout for skills rides on this folder
+contract and is a future-release surface.
 
 ## Ed25519 attestation
 
-Every `skills` row is **signable**. When the daemon is started with
-an operator keypair on disk (default location:
-`~/.local/share/ai-memory/keypair.ed25519`), the registrar:
+Every `skills` row is **signable**. When the daemon has a signing
+keypair on disk (under the key directory —
+`AI_MEMORY_KEY_DIR`, default platform config dir +
+`/ai-memory/keys`, layout `<key_dir>/<agent_id>.{pub,priv}` —
+[`src/identity/keypair.rs`](../src/identity/keypair.rs)), the
+registrar:
 
 1. Computes the canonical-byte digest of the manifest + resources.
-2. Signs the digest with the operator's Ed25519 private key.
+2. Signs the digest with the signing agent's Ed25519 private key.
 3. Writes the signature plus the signing agent identity into the
-   row, with `attest_level = "signed"`.
+   row; the companion `signed_events` row carries
+   `attest_level = "self_signed"`
+   (`crate::models::AttestLevel::SelfSigned`).
 
-Unsigned skills (no keypair on disk, or a remote import with no
-inbound signature) carry `attest_level = "unsigned"` and the
-signature column is empty — verification surfaces this honestly
-rather than silently passing.
+Unsigned skills (no keypair on disk, or an import with no inbound
+signature) carry `attest_level = "unsigned"` and the signature
+column is empty — verification surfaces this honestly rather than
+silently passing.
 
 Verification on read is **always-on**: `memory_skill_resource`
 re-derives the resource's SHA-256 digest and compares to the

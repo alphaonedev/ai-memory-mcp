@@ -546,9 +546,15 @@ for r in R001 R002 R003 R004; do
   ai-memory rules disable --id "$r" --sign
 done
 
-# (Optional) Flip namespace policies off
-sqlite3 "$AI_MEMORY_DB" "UPDATE namespace_standards SET \
-  shadow_mode_enabled=0, auto_classify_enabled=0, freshness_decay_enabled=0;"
+# (Optional) Detach the namespace standards (Forms 2 + 6 revert to
+# the permissive defaults) — via MCP `memory_namespace_clear_standard`,
+# or directly:
+sqlite3 "$AI_MEMORY_DB" \
+  "UPDATE namespace_meta SET standard_id = NULL WHERE namespace = 'main';"
+
+# (Optional) Unset the Form 5 env vars (AI_MEMORY_AUTO_CONFIDENCE /
+# AI_MEMORY_CONFIDENCE_SHADOW / AI_MEMORY_CONFIDENCE_DECAY) from the
+# MCP entry in ~/.claude.json and the curator service definition.
 ```
 
 The operator key on disk is left alone — keep it, rotate it via a fresh
@@ -565,8 +571,8 @@ them back on without re-signing.
 | 2 — Synchronous atomise-before-embed | Already in MCP write path | ACTIVE |
 | 3 — Multi-step ingest | Already in MCP write path | ACTIVE |
 | 4 — Citations + source-URI + atom-grain | Already in store schema | ACTIVE |
-| 5 — Confidence + freshness decay | Curator daemon + namespace `shadow_mode` | ACTIVE |
-| 6 — MemoryKind auto-classify | Namespace `auto_classify` policy | ACTIVE (curator backfills idle rows) |
+| 5 — Confidence + freshness decay | Curator daemon + the three `AI_MEMORY_*CONFIDENCE*` process env vars | ACTIVE |
+| 6 — MemoryKind auto-classify | Namespace `auto_classify_kind` policy | ACTIVE (curator backfills idle rows) |
 | 7 — Agent-EXTERNAL governance | Operator key + R001–R004 enabled + `serve`/curator daemon | ACTIVE (substrate-INTERNAL write paths + the four agent-EXTERNAL daemon wire-points; shipped v0.7.0 per [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760)) |
 
 The qualifier on Form 7 is no longer a version gate. Two surfaces are
@@ -598,7 +604,8 @@ Two limits this does **not** cover, which you own:
 2. **The harness's own tools.** Claude Code's `Bash` / `Write` outside
    the substrate are not substrate-intercepted. Enforce the same rules
    at that boundary with a `PreToolUse` hook that shells out to
-   `ai-memory rules check`; the [cookbook recipe](https://github.com/alphaonedev/ai-memory-mcp/tree/feat/v0.7.0-grand-slam/cookbook/agent-external-governance)
+   `ai-memory rules check`; the
+   [cookbook recipe](../cookbook/agent-external-governance/)
    documents the pattern.
 
 ## Resolved: keygen ↔ enable key-path resolution

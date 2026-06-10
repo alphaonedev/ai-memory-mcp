@@ -152,7 +152,8 @@ under the `memory_kind_vocab` block of the v3 capabilities
 response. Operators can read the live state via:
 
 ```bash
-ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq .memory_kind_vocab
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_capabilities","arguments":{"accept":"3"}}}' \
+  | ai-memory mcp --profile core | jq .
 ```
 
 (The v0.7-alpha drafts referenced `ai-memory doctor --capabilities=v3`;
@@ -189,5 +190,3 @@ without a CHECK constraint. That was a deliberate forward-compat
 choice: new variants land as new column values; no migration is
 required to widen the accepted set. The decision is documented in
 the L1-1 commit and validated by Form 6's no-migration ship.
-
-Cold mountain.

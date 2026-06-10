@@ -116,7 +116,7 @@ operator-tunable via the daemon config):
    CASCADE`.
 
 Implementation: `sweep_transcript_lifecycle` at
-[`src/transcripts/storage.rs:359`](../src/transcripts/storage.rs).
+[`src/transcripts/storage.rs:363`](../src/transcripts/storage.rs).
 The supporting partial index
 `idx_memory_transcripts_archived_at WHERE archived_at IS NOT NULL`
 keeps the prune-phase scan O(archived rows) rather than O(total
@@ -143,7 +143,7 @@ created_at, and the originating memory id.
 The v0.7.0 release/v0.7.0 branch landed
 **`TranscriptsConfig.max_decompressed_bytes`** as a config-driven
 cap (commit `26fab06`) with a default of `MAX_DECOMPRESSED_BYTES =
-16 * 1024 * 1024` (16 MiB, [`src/transcripts/storage.rs:29`](../src/transcripts/storage.rs)).
+16 * 1024 * 1024` (16 MiB, [`src/transcripts/storage.rs:33`](../src/transcripts/storage.rs)).
 Prior to I1, a malicious peer could push a 1 KiB zstd payload that
 decompressed to hundreds of MiB and exhaust the daemon's memory. The
 cap is checked on every `fetch`; payloads above the cap are refused
@@ -194,8 +194,11 @@ Pinned by [`tests/i1_zstd_bomb.rs`](../tests/i1_zstd_bomb.rs).
    ```
 4. **Restart** the daemon (or `kill -HUP` for hooks; transcripts
    config is loaded at startup).
-5. **Verify** with `ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq '.transcripts'` —
-   the response surfaces the enabled namespaces.
+5. **Verify** via the capabilities `transcripts` block:
+   ```bash
+   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_capabilities","arguments":{"accept":"3"}}}' \
+     | ai-memory mcp --profile core | jq .
+   ```
 6. **Audit disk usage** periodically — the `content_blob` column is
    the only large surface. `du -sh ~/.local/share/ai-memory/memory.db`
    tells the story.
@@ -234,10 +237,11 @@ more INSERT statements.
 The substrate stores transcripts as raw bytes — redaction must
 happen **before** `store`. The two recommended patterns:
 
-1. **Inline at the hook.** The transcript-extractor reference
-   implementation accepts a `--redact-pattern <regex>` flag. Operators
-   author the regex once and the hook scrubs every incoming turn
-   before compression. The redacted text is what lands in
+1. **Inline at the hook.** Wrap (or fork) the transcript-extractor
+   reference implementation with an operator-authored scrub pass so
+   every incoming turn is redacted before compression. The reference
+   binary itself does NOT ship a redaction flag — redaction is
+   operator-authored by design. The redacted text is what lands in
    `content_blob`; the raw text never touches disk.
 2. **Pre-extractor pipeline.** A higher-volume pattern: a dedicated
    redaction service sits between the agent and the substrate. The
@@ -264,9 +268,10 @@ ey[A-Za-z0-9_-]+\.ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+
 
 **What the substrate will NOT redact for you.** Inline secrets in
 prose (API keys mentioned in passing, credentials pasted into a
-turn) require operator-authored patterns. The transcript-extractor
-ships a baseline set but is intentionally conservative — false-
-positive redaction breaks legitimate conversations.
+turn) require operator-authored patterns — neither the substrate nor
+the reference extractor ships built-in redaction, deliberately:
+false-positive redaction breaks legitimate conversations, so the
+pattern set is an operator decision.
 
 ## Retention tuning
 
@@ -337,7 +342,7 @@ the disk pressure clears.
 transcript-extractor hook (`enabled = false` in `hooks.toml`, then
 `SIGHUP`). Audit existing transcripts via the redaction regex:
 ```bash
-ai-memory mcp call memory_replay '{"memory_id":"…"}' \
+ai-memory replay --memory-id '<id>' --verbose --json \
   | jq -r '.entries[].content' \
   | grep -E '<your-secret-pattern>'
 ```

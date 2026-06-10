@@ -9,13 +9,13 @@ timestamp inside a 300-second replay window, and the signature itself
 is consumed single-use to defeat replay within that window.
 
 - **Code paths:** [`src/approvals.rs`](../src/approvals.rs),
-  [`src/handlers/mod.rs:705`](../src/handlers/mod.rs)
+  [`src/handlers/approvals.rs:481`](../src/handlers/approvals.rs)
   (the `approvals_sse` handler),
-  [`src/handlers/mod.rs:352`](../src/handlers/mod.rs)
+  [`src/handlers/approvals.rs:107`](../src/handlers/approvals.rs)
   (the `verify_approval_hmac` core),
-  [`src/handlers/transport.rs:455`](../src/handlers/transport.rs)
-  (the `/api/v1/approvals/stream` route matcher),
-  [`src/lib.rs:359`](../src/lib.rs) (route registration).
+  [`src/handlers/routes.rs`](../src/handlers/routes.rs)
+  (`APPROVALS_STREAM = "/api/v1/approvals/stream"`),
+  [`src/lib.rs:914`](../src/lib.rs) (route registration).
 - **Schema:** [`migrations/sqlite/0015_v07_pending_action_timeouts.sql`](../migrations/sqlite/0015_v07_pending_action_timeouts.sql)
   + [`migrations/sqlite/0021_v07_a2a_correlation.sql`](../migrations/sqlite/0021_v07_a2a_correlation.sql).
 - **Reconciliation security-sweep commits:**
@@ -33,7 +33,7 @@ curl -N -H "X-API-Key: $API_KEY" \
 ```
 
 The stream emits one named event per state change. Frame names
-([`src/handlers/mod.rs:705-806`](../src/handlers/mod.rs)):
+([`src/handlers/approvals.rs:481-596`](../src/handlers/approvals.rs)):
 
 | Event | Frame body | Fires on |
 |---|---|---|
@@ -42,7 +42,7 @@ The stream emits one named event per state change. Frame names
 | `lagged`             | `{"lagged": true}` (no per-event detail) | The subscriber dropped frames; reconnect to re-sync. |
 
 A keepalive comment line fires every 15s
-([`src/handlers/mod.rs:805`](../src/handlers/mod.rs)) to prevent
+([`src/handlers/approvals.rs:596`](../src/handlers/approvals.rs)) to prevent
 intermediary timeouts. The stream is intentionally unauthenticated
 beyond `api_key_auth` middleware — SSE re-key handshakes are clunky,
 and the HMAC gate sits on the **write** side (the decide endpoint),
@@ -50,7 +50,7 @@ not the read side.
 
 The `lagged` event carries **only the boolean flag**, never the
 per-event count — closing the K10 lagged-event-leak finding (commit
-`d1f6c9f`, [`src/handlers/mod.rs:785-794`](../src/handlers/mod.rs)).
+`d1f6c9f`, [`src/handlers/approvals.rs:577-584`](../src/handlers/approvals.rs)).
 The count would leak cross-tenant traffic volume to a noisy-neighbour
 subscriber. Subscribers that see `lagged` must reconnect and re-fetch
 the pending list via `GET /api/v1/pending`.
@@ -59,9 +59,9 @@ the pending list via `GET /api/v1/pending`.
 
 The subscriber's `agent_id` is captured at subscribe time from the
 `X-Agent-Id` header
-([`src/handlers/mod.rs:733`](../src/handlers/mod.rs)) and every event
+([`src/handlers/approvals.rs:495`](../src/handlers/approvals.rs)) and every event
 is filtered through `sse_event_visible_to`
-([`src/handlers/mod.rs:649`](../src/handlers/mod.rs)) before fan-out.
+([`src/handlers/approvals.rs:425`](../src/handlers/approvals.rs)) before fan-out.
 Cross-tenant events are silently dropped — the subscriber sees only
 their own pending rows and decisions, plus rows in namespaces an
 active K9 `Allow` rule grants them.
@@ -92,7 +92,7 @@ requires two headers when the substrate has an
 - `X-AI-Memory-Timestamp: <unix seconds>` — request freshness clock.
 
 The canonical request that the HMAC covers is
-([`src/handlers/mod.rs:344-345, 409`](../src/handlers/mod.rs)):
+([`src/handlers/approvals.rs:100,164`](../src/handlers/approvals.rs)):
 
 ```text
 canonical = "<unix_ts>.<METHOD>.<pending_id>.<body>"
@@ -114,14 +114,14 @@ even a single byte of the body invalidates the signature.
 - **Body binding** prevents post-hoc decision flipping. Captured
   signature must replay the exact body that was signed.
 - **Timestamp + 300s window**
-  ([`src/handlers/mod.rs:308`](../src/handlers/mod.rs),
+  ([`src/handlers/approvals.rs:63`](../src/handlers/approvals.rs),
   `APPROVAL_HMAC_MAX_AGE_SECS`) bounds the replay window. The 60s
   future-skew tolerance
-  ([`src/handlers/mod.rs:314`](../src/handlers/mod.rs),
+  ([`src/handlers/approvals.rs:69`](../src/handlers/approvals.rs),
   `APPROVAL_HMAC_MAX_SKEW_SECS`) absorbs NTP drift without admitting
   forged-future-dated signatures.
 - **Nonce single-use within window** (`a69325f`,
-  [`src/handlers/mod.rs:422-447`](../src/handlers/mod.rs)) — the
+  [`src/handlers/approvals.rs:173-197`](../src/handlers/approvals.rs)) — the
   signature hex itself is recorded in a process-wide replay cache for
   600s (`APPROVAL_HMAC_MAX_AGE_SECS * 2`). A captured signature
   cannot be replayed even within the freshness window. Entries expire
@@ -129,7 +129,7 @@ even a single byte of the body invalidates the signature.
 
 When no `[hooks.subscription].hmac_secret` is configured, the decide
 endpoint **rejects every request** with 401
-([`src/handlers/mod.rs:358-368`](../src/handlers/mod.rs)). The K10
+([`src/handlers/approvals.rs:121`](../src/handlers/approvals.rs)). The K10
 contract is strict by default — better to refuse a write than to
 accept an unauthenticated one.
 
@@ -186,7 +186,8 @@ Step 5. Verify with the SSE consumer — within one round-trip the
 stream emits an `approval_decided` frame whose `pending_id` matches.
 
 The mirror outbound construction
-([`src/config.rs:2589`](../src/config.rs)) is what
+([`src/subscriptions.rs`](../src/subscriptions.rs) `hmac_sha256_hex` /
+`sha256_hex`; config-key docs at [`src/config.rs:3997`](../src/config.rs)) is what
 `[hooks.subscription]` peers use to sign their own requests; signers
 must produce byte-identical canonical strings or the verify will
 401.
@@ -197,7 +198,7 @@ The 300s / 60s constants are intentionally hardcoded — they mirror
 AWS SigV4 and Stripe webhook windows and have been validated against
 both NTP drift and exfiltration windows. They are NOT operator-tunable
 via config today. The constants are visible at
-[`src/handlers/mod.rs:308-314`](../src/handlers/mod.rs).
+[`src/handlers/approvals.rs:63-69`](../src/handlers/approvals.rs).
 
 **Why 300s.** Long enough to absorb client-side retry jitter
 (network blip, queue lag), short enough that an exfiltrated
@@ -226,9 +227,11 @@ The MCP tools `memory_pending_list` / `memory_pending_approve` /
 `memory_pending_reject` are the stdio-side equivalents. The v0.7-alpha
 drafts named these `memory_approval_pending` /
 `memory_approval_decide`; **the shipped names are `memory_pending_*`**
-(see [`src/mcp/registry.rs`](../src/mcp/registry.rs)). The MCP path
-uses the same HMAC binding as the HTTP path when the substrate is in
-`enforce` mode.
+(see [`src/mcp/registry.rs`](../src/mcp/registry.rs)). The MCP stdio
+path is a local operator surface and does **not** carry the HTTP
+HMAC headers — the HMAC gate protects the network-reachable decide
+endpoint; stdio access is bounded by process-level access to the
+daemon host.
 
 ## SSE client implementation guide
 
@@ -338,22 +341,23 @@ test signature.
 
 **Suspected captured-signature replay.** Inspect daemon log for
 `K10 approval rejected: stale signature` AND
-`K10 approval rejected: nonce already used` (the latter is the
+`K10 approval rejected: signature replay` (the latter is the
 replay-cache hit). A pattern of refused-replay attempts on a single
 pending_id strongly suggests a captured signature; rotate the HMAC
 secret immediately and audit the `signed_events` chain for any
 matching write that did succeed before the rotation.
 
 **Need to bulk-approve while SSE pipeline is down.** Use the MCP
-`memory_pending_approve` tool over stdio — same HMAC binding, but
-no SSE round-trip required. The substrate writes the decision and
+`memory_pending_approve` tool over stdio — local process access, no
+HMAC headers and no SSE round-trip required. The substrate writes the decision and
 re-broadcasts on the SSE channel for any other subscribers, so
 recovery is observable as soon as the SSE consumer reconnects.
 
 **Lagged events cascading on a noisy tenant.** Identify the
-high-volume tenant via the daemon log (every published event has the
-tenant_agent_id at WARN). Either shard the tenant to its own daemon
-or raise `APPROVAL_BROADCAST_CAPACITY` and ship.
+high-volume tenant via the pending-actions table
+(`GET /api/v1/pending`, grouped by agent_id). Either shard the
+tenant to its own daemon or raise `APPROVAL_BROADCAST_CAPACITY`
+(a compiled constant — requires a rebuild) and ship.
 
 See also: [`docs/governance.md`](governance.md) for the wider
 permissions pipeline, [`docs/MIGRATION_v0.7.md` §"K10 SSE approvals"](MIGRATION_v0.7.md),

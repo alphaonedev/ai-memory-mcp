@@ -39,10 +39,16 @@ insert long memory  →  curator (Gemma 4 + tiktoken-rs)  →  N atoms
 2. **Curator.** The `LlmCurator` in
    [`src/atomisation/curator.rs`](../src/atomisation/curator.rs)
    issues a Gemma 4 prompt and validates the response per the
-   `tiktoken-rs` `cl100k_base` token budget (default 200 tokens per
-   atom). Out-of-budget atoms trigger a single retry; a second
-   over-budget response collapses to `CuratorFailed` (no silent retry
-   storm — the audit-honest STOP is deliberate).
+   `tiktoken-rs` `cl100k_base` token budget (default
+   `DEFAULT_ATOM_TOKENS = 200` per atom; callers may pass
+   `max_atom_tokens` in `[MIN_ATOM_TOKENS = 50, MAX_ATOM_TOKENS =
+   1000]`). Malformed JSON responses retry up to the per-mode retry
+   budget with exponential backoff (100 ms → 500 ms → 2500 ms); the
+   final failed attempt collapses to `CuratorFailed` (no silent retry
+   storm — the audit-honest STOP is deliberate). Token-budget
+   enforcement is fail-soft: atoms ≤ 25% over budget are accepted
+   with a warn log, grossly over-budget atoms are dropped
+   (`enforce_token_budget`).
 3. **Per-atom write.** Each atom is written as its own
    `MemoryKind::Observation` row inside a fresh transaction so the
    `pre_store` / `post_store` / `pre_link` / `post_link` hook chain
@@ -87,8 +93,9 @@ read.
 
 `ai-memory atomise <memory_id>` (WT-1-F) is the operator-side wrapper:
 same tier gating, same curator construction, stable exit codes (0
-success, 1 informational, 3 tier-locked, 4 curator-failed,
-5 governance-refused, 6 db-error). `--force` re-atomises a previously-
+success, 1 informational (already-atomised / source-too-small),
+2 not-found, 3 tier-locked, 4 curator-failed, 5 governance-refused,
+6 db-error / signer-error, 7 depth-exceeded). `--force` re-atomises a previously-
 atomised source; old atoms are retained, `atomised_into` updates to
 the fresh count. `--json` emits structured envelopes for shell
 pipelines.
@@ -120,9 +127,15 @@ The production curator is `LlmCurator<OllamaClient>` in
   envelope `2 ≤ N ≤ 10 atoms, ≤ max_atom_tokens` directly to the LLM
   so a malformed response is rare.
 - **Token budget.** Validated post-response with
-  `tiktoken_rs::cl100k_base`. Atoms above the budget trigger a single
-  retry with the explicit "you exceeded the budget" feedback prompt.
-- **Audit-honest STOP.** After one malformed-response retry, a second
+  `tiktoken_rs::cl100k_base` (`enforce_token_budget`). Atoms within
+  25% of the budget are accepted fail-soft with a warn log; atoms
+  more than 25% over are dropped so a pathological response cannot
+  pollute the store. The accepted range for `max_atom_tokens` is
+  `[50, 1000]` (`MIN_ATOM_TOKENS` / `MAX_ATOM_TOKENS`), default
+  `DEFAULT_ATOM_TOKENS = 200`.
+- **Audit-honest STOP.** Malformed JSON responses retry up to the
+  per-mode retry budget (deferred 3 / synchronous 1), re-sending the
+  original prompt verbatim with exponential backoff; the final
   failure collapses to `CuratorFailed` rather than looping. This is
   deliberate: silent retries hide a real prompt drift and burn token
   budget without operator consent.
