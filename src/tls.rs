@@ -178,6 +178,45 @@ pub async fn load_mtls_rustls_config(
     ))
 }
 
+/// v0.7.0 #1581 — production acceptor for the TLS / mTLS `serve` path:
+/// the rustls acceptor wrapped around [`axum_server::accept::NoDelayAcceptor`]
+/// so `TCP_NODELAY` is set on every accepted socket BEFORE the handshake.
+///
+/// # Why (the #1579 P3 fleet finding)
+///
+/// `serve()` used to bind via `axum_server::bind_rustls`, whose inner
+/// `DefaultAcceptor` is a no-op — Nagle's algorithm stayed enabled on every
+/// accepted socket. After a TLS 1.3 handshake the server flushes the
+/// NewSessionTicket records as a small TCP segment ahead of the first
+/// response; with Nagle on, the response segment is then held until the
+/// ticket segment is ACKed, and the client kernel's delayed-ACK timer
+/// (40 ms minimum on Linux) is what finally supplies that ACK. Net effect:
+/// the FIRST request of every fresh mTLS connection paid a fixed ~40 ms
+/// stall that no later request on the same connection repeats — measured
+/// fleet-wide on all 9 intra-region do-1461 peer pairs (first-request TTFB
+/// ~52–57 ms vs ~5–8 ms reused, RTT 2–3 ms) and reproduced on loopback
+/// (~41 ms gap between `time_appconnect` and `time_starttransfer` vs
+/// ~2 ms for a reused connection).
+///
+/// Setting `TCP_NODELAY` disables Nagle so the response goes out the
+/// moment it's written. The client side of federation sync was never
+/// affected: reqwest defaults `tcp_nodelay(true)`, as does curl ≥ 7.50.
+///
+/// # Security
+///
+/// This is a pure socket-option change ahead of the handshake. The
+/// verifier chain — [`FingerprintAllowlistVerifier`], `client_auth_mandatory`,
+/// the protocol-version floor — is byte-identical to what
+/// `axum_server::bind_rustls` constructs. Equivalence is pinned by
+/// `tests/mtls_nodelay_acceptor.rs` (allowlisted cert accepted, unknown
+/// cert rejected, absent cert rejected, on BOTH acceptor shapes).
+pub fn serve_rustls_acceptor(
+    config: &axum_server::tls_rustls::RustlsConfig,
+) -> axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor> {
+    axum_server::tls_rustls::RustlsAcceptor::new(config.clone())
+        .acceptor(axum_server::accept::NoDelayAcceptor::new())
+}
+
 /// Parse the allowlist file: one SHA-256 fingerprint per line, case-insensitive
 /// hex with optional `:` separators. Empty lines and `#` comments are skipped.
 pub async fn load_fingerprint_allowlist(path: &Path) -> Result<HashSet<[u8; 32]>> {

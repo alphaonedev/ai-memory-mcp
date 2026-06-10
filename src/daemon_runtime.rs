@@ -4251,7 +4251,15 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             shutdown.await;
             handle_clone.graceful_shutdown(Some(grace));
         });
-        axum_server::bind_rustls(socket_addr, tls_config)
+        // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
+        // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
+        // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
+        // timer added a fixed ~40 ms to the FIRST request of every fresh
+        // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
+        // and accept/reject semantics are unchanged; see
+        // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
+        axum_server::bind(socket_addr)
+            .acceptor(tls::serve_rustls_acceptor(&tls_config))
             .handle(handle)
             .serve(app.into_make_service())
             .await?;
