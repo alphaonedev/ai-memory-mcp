@@ -2431,9 +2431,11 @@ pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 /// Replaces the original per-row `emb.embed()` + `db::set_embedding()`
 /// loop that issued one autocommit `UPDATE` per memory. The new path:
 ///
-/// 1. Scans all unembedded rows in a single `SELECT` (unchanged
-///    behaviour — [`db::get_unembedded_ids`]).
-/// 2. Slices the result into chunks of `batch_size`. Callers
+/// 1. Fetches unembedded rows in bounded passes of `batch_size`
+///    (#1579 B6 / F5.6 — [`db::get_unembedded_ids_batch`]; the
+///    pre-fix path materialised the WHOLE backlog in one Vec via
+///    [`db::get_unembedded_ids`]) and re-fetches until drained.
+/// 2. Each pass embeds one `batch_size` chunk. Callers
 ///    typically resolve this via
 ///    [`crate::config::AppConfig::resolve_embeddings`] which
 ///    applies the #1146 universal precedence ladder
@@ -2450,22 +2452,23 @@ pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 ///    [`db::set_embeddings_batch`] call that wraps every UPDATE in
 ///    one transaction.
 ///
-/// **Idempotence:** if `get_unembedded_ids` returns an empty vec
+/// **Idempotence:** if the first bounded fetch returns an empty vec
 /// (the "fully embedded" steady state), the function returns
-/// `Ok(0)` without preparing any statement — re-running the
-/// backfill on a fully-embedded DB is a true no-op.
+/// `Ok(0)` without further work — re-running the backfill on a
+/// fully-embedded DB is a true no-op.
 ///
-/// **Single-chunk failure isolation:** an embedder error for one
-/// chunk is logged and that chunk is skipped (the subsequent
-/// chunks still run). The aggregate `ok` counter is the number of
-/// rows successfully written across all chunks.
+/// **Failure isolation:** an embedder/writer fault for one pass is
+/// logged and the sweep stops at the no-progress check (re-fetching
+/// would return the same head rows); the next sweep invocation
+/// retries. The aggregate `ok` counter is the number of rows
+/// successfully written across all passes.
 ///
 /// # Errors
 ///
-/// Only propagates errors from [`db::get_unembedded_ids`] (the initial
-/// scan). Per-chunk embedder + writer faults are logged and counted
-/// (NOT propagated), matching the original loop's semantics so a
-/// transient embedder fault on one chunk doesn't block MCP readiness.
+/// Only propagates errors from [`db::get_unembedded_ids_batch`] (the
+/// bounded scans). Per-chunk embedder + writer faults are logged and
+/// counted (NOT propagated), matching the original loop's semantics so
+/// a transient embedder fault doesn't block MCP readiness.
 pub fn run_embedding_backfill(
     conn: &mut rusqlite::Connection,
     emb: &dyn Embed,
@@ -2495,29 +2498,22 @@ pub fn run_embedding_backfill(
 /// `batch_size` is the post-resolver value — pass
 /// `AppConfig::resolve_embeddings().backfill_batch as usize`. Zero or
 /// out-of-band values are coerced up to
-/// [`DEFAULT_EMBED_BACKFILL_BATCH_SIZE`] defensively (`chunks(0)`
-/// panics in the standard library).
+/// [`DEFAULT_EMBED_BACKFILL_BATCH_SIZE`] defensively (a zero batch
+/// would make the bounded fetch a no-op-forever).
 ///
 /// # Errors
 ///
-/// Same contract as [`run_embedding_backfill`] — only the initial
-/// `get_unembedded_ids` scan can propagate.
+/// Same contract as [`run_embedding_backfill`] — only the bounded
+/// `get_unembedded_ids_batch` scans can propagate.
 pub fn run_embedding_backfill_with_batch_size(
     conn: &mut rusqlite::Connection,
     emb: &dyn Embed,
     batch_size: usize,
 ) -> anyhow::Result<usize> {
-    let unembedded = db::get_unembedded_ids(conn)?;
-    if unembedded.is_empty() {
-        // Idempotence: zero rows scanned ⇒ zero work, no log line so
-        // re-runs on a steady-state DB stay silent.
-        return Ok(0);
-    }
-
-    // Defensive: `chunks(0)` would panic. The resolver clamps to
-    // 1..=10000 by construction (`AppConfig::resolve_embeddings` at
-    // src/config.rs:5524-5532), but if a future caller passes an
-    // unvalidated value we coerce up to the compiled default rather
+    // Defensive: a zero batch would make the bounded fetch below a
+    // no-op-forever. The resolver clamps to 1..=10000 by construction
+    // (`AppConfig::resolve_embeddings`), but if a future caller passes
+    // an unvalidated value we coerce up to the compiled default rather
     // than blowing up.
     let batch_size = if batch_size == 0 {
         DEFAULT_EMBED_BACKFILL_BATCH_SIZE
@@ -2525,66 +2521,94 @@ pub fn run_embedding_backfill_with_batch_size(
         batch_size
     };
 
-    eprintln!(
-        "ai-memory: backfilling {} memories (batch_size={batch_size})...",
-        unembedded.len()
-    );
-
+    // #1579 B6 (F5.6) — bounded drain loop. The pre-fix path
+    // materialised EVERY unembedded `(id, title, content)` triple in
+    // one Vec before chunking, which on a cold 100k-row corpus is the
+    // whole table in memory. Each pass now fetches at most
+    // `batch_size` rows (`db::get_unembedded_ids_batch`); rows that
+    // gain an embedding drop out of the `embedding IS NULL` predicate,
+    // so re-fetching until the batch comes back empty drains the
+    // backlog with bounded materialisation. A pass that makes ZERO
+    // progress (embedder fault, write fault, or rows that persistently
+    // fail) breaks out instead of spinning on the same head rows —
+    // the next backfill sweep retries them.
     let mut ok = 0usize;
-    for chunk in unembedded.chunks(batch_size) {
+    let mut scanned = 0usize;
+    let mut announced = false;
+    loop {
+        let chunk = db::get_unembedded_ids_batch(conn, batch_size)?;
+        if chunk.is_empty() {
+            // Idempotence: zero rows scanned ⇒ zero work; on the
+            // first pass no log line is emitted so re-runs on a
+            // steady-state DB stay silent.
+            break;
+        }
+        if !announced {
+            eprintln!("ai-memory: backfilling unembedded memories (batch_size={batch_size})...");
+            announced = true;
+        }
+        scanned += chunk.len();
+        let ok_before = ok;
+
         let texts: Vec<String> = chunk.iter().map(|(_, t, c)| format!("{t} {c}")).collect();
         let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
-        let embeddings = match emb.embed_batch(&text_refs) {
-            Ok(v) => v,
+        match emb.embed_batch(&text_refs) {
             Err(e) => {
                 eprintln!(
-                    "ai-memory: embed_batch failed for chunk of {} rows: {e} (skipping chunk)",
+                    "ai-memory: embed_batch failed for chunk of {} rows: {e} (stopping this sweep)",
                     chunk.len()
                 );
-                continue;
             }
-        };
-
-        // Defensive: a well-behaved embedder must return one vector
-        // per input. If a future custom impl violates the contract,
-        // fall back to the per-row path for safety rather than
-        // misaligning ids with vectors.
-        if embeddings.len() != chunk.len() {
-            eprintln!(
-                "ai-memory: embed_batch returned {} vectors for {} inputs — falling back to per-row path for this chunk",
-                embeddings.len(),
-                chunk.len()
-            );
-            for (id, title, content) in chunk {
-                let text = crate::embeddings::embedding_document(title, content);
-                if let Ok(v) = emb.embed(&text)
-                    && db::set_embedding(conn, id, &v).is_ok()
-                {
-                    ok += 1;
+            // Defensive: a well-behaved embedder must return one vector
+            // per input. If a future custom impl violates the contract,
+            // fall back to the per-row path for safety rather than
+            // misaligning ids with vectors.
+            Ok(embeddings) if embeddings.len() != chunk.len() => {
+                eprintln!(
+                    "ai-memory: embed_batch returned {} vectors for {} inputs — falling back to per-row path for this chunk",
+                    embeddings.len(),
+                    chunk.len()
+                );
+                for (id, title, content) in &chunk {
+                    let text = crate::embeddings::embedding_document(title, content);
+                    if let Ok(v) = emb.embed(&text)
+                        && db::set_embedding(conn, id, &v).is_ok()
+                    {
+                        ok += 1;
+                    }
                 }
             }
-            continue;
+            Ok(embeddings) => {
+                let entries: Vec<(String, Vec<f32>)> = chunk
+                    .iter()
+                    .zip(embeddings.into_iter())
+                    .map(|((id, _, _), v)| (id.clone(), v))
+                    .collect();
+
+                match db::set_embeddings_batch(conn, &entries) {
+                    Ok(n) => ok += n,
+                    Err(e) => {
+                        eprintln!(
+                            "ai-memory: set_embeddings_batch failed for chunk of {} rows: {e} (stopping this sweep)",
+                            chunk.len()
+                        );
+                    }
+                }
+            }
         }
 
-        let entries: Vec<(String, Vec<f32>)> = chunk
-            .iter()
-            .zip(embeddings.into_iter())
-            .map(|((id, _, _), v)| (id.clone(), v))
-            .collect();
-
-        match db::set_embeddings_batch(conn, &entries) {
-            Ok(n) => ok += n,
-            Err(e) => {
-                eprintln!(
-                    "ai-memory: set_embeddings_batch failed for chunk of {} rows: {e} (skipping chunk)",
-                    chunk.len()
-                );
-            }
+        if ok == ok_before {
+            // No progress this pass — the same rows would come back on
+            // the next fetch. Break so a persistently-failing row (or a
+            // down embedder) cannot wedge the sweep in a hot loop.
+            break;
         }
     }
 
-    eprintln!("ai-memory: backfilled {ok}/{}", unembedded.len());
+    if scanned > 0 {
+        eprintln!("ai-memory: backfilled {ok}/{scanned}");
+    }
     Ok(ok)
 }
 
