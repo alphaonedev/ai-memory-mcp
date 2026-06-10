@@ -4749,12 +4749,79 @@ pub fn canonical_content_hash(text: &str) -> [u8; 32] {
 /// fact, restated" bar; combined with the textual contradiction signal
 /// below, we surface only writes that proactively conflict with an
 /// established near-duplicate.
+///
+/// **Known miss class (pre-existing; deliberately unchanged by the
+/// #1579 A5 remediation):** genuine paraphrases can embed just BELOW
+/// this bar — the P2-audit probe pair ("deadline is june 15" vs
+/// "deadline is june 22" in otherwise-identical sentences) scored
+/// 0.945 cosine on the release MiniLM and is therefore not detected.
+/// Safe direction for an advisory gate (the write is ALLOWED; nothing
+/// is wrongly refused); lowering the bar instead would re-open the
+/// false-409 epidemic the
+/// [`PROACTIVE_CONFLICT_CONTENT_JACCARD_FLOOR`] corroboration exists
+/// to close. The deeper `detect_contradiction` tooling remains the
+/// surface for sub-threshold contradictions.
 pub const PROACTIVE_CONFLICT_SIM_THRESHOLD: f32 = 0.95;
 
 /// Top-K cap for the candidate pool inspected by
 /// [`proactive_conflict_check`]. Bounded so the per-write cost is O(K)
 /// rather than O(namespace_size).
 pub const PROACTIVE_CONFLICT_TOP_K: usize = 5;
+
+/// #1579 A5 — row cap on the bounded fallback scan in
+/// [`proactive_conflict_check`] (most-recently-updated rows first).
+///
+/// Pre-#1579 the check decoded + cosine-scored EVERY embedded live row
+/// in the namespace per write — an O(N) scan that (under the HTTP
+/// daemon's single-connection mutex) collapsed semantic-tier write
+/// throughput to 0.3-1.7 rps in the P2 audit. The fallback path (used
+/// when no fully-searchable HNSW index is available: keyword tier,
+/// the async-boot warm window, CLI one-shots) now scans only the
+/// `PROACTIVE_CONFLICT_SCAN_LIMIT` most-recently-updated candidates.
+/// Recency ordering is the right prior for an advisory near-duplicate
+/// gate: conflicting restatements cluster temporally (an agent
+/// re-asserting a fact it just learned), and the indexed path (the
+/// production semantic-tier route) covers the long tail. A miss here
+/// only ALLOWS a write that deeper inspection might have refused —
+/// never refuses a legitimate one — which is the safe direction for
+/// an advisory check with a `force=true` bypass.
+pub const PROACTIVE_CONFLICT_SCAN_LIMIT: usize = 1024;
+
+/// #1579 A5 — `k` requested from the HNSW index by
+/// [`proactive_conflict_check_with_index`]. Deliberately larger than
+/// [`PROACTIVE_CONFLICT_TOP_K`] because the index is global while the
+/// conflict check is namespace-scoped: the namespace filter is applied
+/// AFTER the ANN search (post-filter semantics), so foreign-namespace
+/// hits consume slots. 32 gives the in-namespace pool ample headroom
+/// (the ≥ 0.95 cosine gate means only near-identical vectors matter,
+/// and > 32 near-identical foreign-namespace rows crowding out an
+/// in-namespace conflict is a pathology the bounded fallback's
+/// advisory contract already tolerates — see
+/// [`PROACTIVE_CONFLICT_SCAN_LIMIT`]).
+pub const PROACTIVE_CONFLICT_INDEX_K: usize = 32;
+
+/// #1579 A5 — minimum Jaccard token overlap between the incoming
+/// `content` and a cosine-near-duplicate candidate's `content` for the
+/// pair to be classified as a proactive conflict.
+///
+/// **Why this exists** (the P2 false-409 epidemic). The P2 perf audit
+/// measured **81% of semantic-tier writes refused with 409** when a
+/// loadtest wrote unique random-alphanumeric payloads: MiniLM-L6-v2
+/// assigns ≥ 0.95 cosine to ~28% of PAIRS of unrelated 256-byte noise
+/// documents (probe on the release model: pairwise min 0.44 / mean
+/// 0.83 / max 0.97), so with a 1k-row namespace virtually every write
+/// found SOME ≥ 0.95 "near-duplicate" — while a genuine paraphrase
+/// pair ("deadline is june 15" vs "deadline is june 22" in identical
+/// sentences) scored 0.945, BELOW the threshold. Embedding cosine
+/// alone is therefore not sufficient evidence of "the same fact,
+/// restated". The deterministic corroboration is lexical: a true
+/// restatement shares vocabulary. We reuse the #1320 tokenizer
+/// (lowercase, split on non-alphanumeric, stopword-strip — see
+/// [`CONTRADICTION_TITLE_JACCARD_FLOOR`]) over the CONTENT bodies and
+/// require this floor, which rejects the disjoint-token noise pairs
+/// (Jaccard ≈ 0) while keeping real restatements (the june-15/june-22
+/// pair scores 0.5).
+pub const PROACTIVE_CONFLICT_CONTENT_JACCARD_FLOOR: f32 = 0.30;
 
 /// Result envelope returned by [`proactive_conflict_check`] when an
 /// existing memory near-duplicates AND textually contradicts the
@@ -4830,14 +4897,150 @@ pub fn proactive_conflict_check(
     // namespace-scoped check matches the `find_contradictions` /
     // `find_by_title_namespace` semantics already used by the
     // `OnConflict::Error` branch of `insert_with_conflict`.
+    //
+    // #1579 A5 — BOUNDED: most-recently-updated rows first, capped at
+    // `PROACTIVE_CONFLICT_SCAN_LIMIT`. See the const for the recency
+    // rationale and the advisory-miss contract. The unbounded
+    // full-namespace decode+scan this replaces was the P2-measured
+    // write-throughput collapse (0.3-1.7 rps under the HTTP mutex).
     let mut stmt = conn.prepare(
         "SELECT id, title, content, embedding FROM memories
          WHERE embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?1)
-           AND namespace = ?2",
+           AND namespace = ?2
+         ORDER BY updated_at DESC
+         LIMIT ?3",
     )?;
     let rows: Vec<(String, String, String, Vec<u8>)> = stmt
-        .query_map(params![now, &mem.namespace], |row| {
+        .query_map(
+            params![
+                now,
+                &mem.namespace,
+                i64::try_from(PROACTIVE_CONFLICT_SCAN_LIMIT).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(proactive_conflict_verdict(mem, query_embedding, rows))
+}
+
+/// #1579 A5 — HNSW-routed entry point for the proactive conflict
+/// check. This is the production write-path dispatcher:
+///
+/// * When a [`crate::hnsw::VectorIndex`] is available AND fully
+///   searchable (its graph covers `all_entries` — see
+///   [`crate::hnsw::VectorIndex::is_fully_searchable`]), the candidate
+///   pool comes from an O(log N) ANN query instead of the table scan;
+///   candidates are then re-verified against the DB (live, same
+///   namespace, EXACT cosine recomputed from the stored blob — the
+///   index's distance is approximate and assumes L2-normalised
+///   vectors, so the stored-blob recompute keeps the decision function
+///   byte-equal to the scan path).
+/// * Otherwise (no index at keyword tier, the async-boot warm window
+///   before the first graph swap, CLI one-shots below the build
+///   threshold) it falls back to the BOUNDED recency scan in
+///   [`proactive_conflict_check`]. An EMPTY index also routes to the
+///   fallback (#1579 QC): emptiness makes `is_fully_searchable`
+///   vacuously true, but during the async-boot LOAD phase (daemon
+///   bound with `VectorIndex::empty()`, boot loader still reading the
+///   stored embeddings, `seed_entries` not yet landed) it says
+///   nothing about what the DB holds — consulting it would silently
+///   SKIP the check instead of degrading to the documented bounded
+///   scan. On a genuinely empty corpus the fallback scan matches zero
+///   rows, so the routing is behaviour-neutral outside that window.
+///
+/// Known under-detection windows, both safe-direction (a missed
+/// conflict ALLOWS a write; the check never wrongly refuses):
+/// rows evicted from the index's 100k entry cap are invisible to the
+/// ANN query, and a warm-window write beyond the bounded scan's
+/// recency horizon is invisible to the fallback. Callers that need a
+/// hard guarantee already have the `(title, namespace)` SQL conflict
+/// gate; this check is the advisory #519 layer with a `force=true`
+/// bypass.
+///
+/// # Errors
+///
+/// Bubbles rusqlite errors from the candidate SELECTs (same contract
+/// as [`proactive_conflict_check`]).
+pub fn proactive_conflict_check_with_index(
+    conn: &Connection,
+    mem: &Memory,
+    query_embedding: &[f32],
+    vector_index: Option<&crate::hnsw::VectorIndex>,
+) -> Result<Option<ProactiveConflict>> {
+    if query_embedding.is_empty() {
+        return Ok(None);
+    }
+    if let Some(idx) = vector_index
+        && idx.is_fully_searchable()
+        // #1579 QC — an empty index is vacuously fully-searchable but
+        // proves nothing about the DB during the async-boot LOAD
+        // phase; see the doc comment above and
+        // `crate::hnsw::VectorIndex::is_empty`.
+        && !idx.is_empty()
+    {
+        let hits = idx.search(query_embedding, PROACTIVE_CONFLICT_INDEX_K);
+        let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+        return proactive_conflict_check_candidates(conn, mem, query_embedding, &ids);
+    }
+    tracing::trace!(
+        target: "proactive_conflict",
+        namespace = %mem.namespace,
+        "no fully-searchable (or empty) vector index — bounded recency-scan fallback (#1579 A5)"
+    );
+    proactive_conflict_check(conn, mem, query_embedding)
+}
+
+/// #1579 A5 — verify an ANN-derived candidate id list against the DB
+/// and apply the conflict verdict. Fetches only the named rows (point
+/// lookups by PK), re-applies the live/namespace filters the table
+/// scan used, and recomputes EXACT cosine from the stored embedding
+/// blob so the decision function is identical to the scan path.
+///
+/// Public so the HTTP create handler (which holds the vector index
+/// behind an async mutex and must run the ANN search BEFORE taking
+/// the DB lock) can split the search from the verification.
+///
+/// # Errors
+///
+/// Bubbles rusqlite errors from the `IN (...)` candidate SELECT.
+pub fn proactive_conflict_check_candidates(
+    conn: &Connection,
+    mem: &Memory,
+    query_embedding: &[f32],
+    candidate_ids: &[String],
+) -> Result<Option<ProactiveConflict>> {
+    if query_embedding.is_empty() || candidate_ids.is_empty() {
+        return Ok(None);
+    }
+    let now = Utc::now().to_rfc3339();
+    let placeholders = std::iter::repeat_n("?", candidate_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, title, content, embedding FROM memories
+         WHERE id IN ({placeholders})
+           AND embedding IS NOT NULL
+           AND (expires_at IS NULL OR expires_at > ?{p_now})
+           AND namespace = ?{p_ns}",
+        p_now = candidate_ids.len() + 1,
+        p_ns = candidate_ids.len() + 2,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_iter = candidate_ids
+        .iter()
+        .map(String::as_str)
+        .chain([now.as_str(), mem.namespace.as_str()]);
+    let rows: Vec<(String, String, String, Vec<u8>)> = stmt
+        .query_map(rusqlite::params_from_iter(bind_iter), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -4847,6 +5050,27 @@ pub fn proactive_conflict_check(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    Ok(proactive_conflict_verdict(mem, query_embedding, rows))
+}
+
+/// #1579 A5 — shared scoring + verdict tail of the proactive conflict
+/// check. Decodes candidate blobs, cosine-scores against the query,
+/// sorts descending, and applies the conflict rule to the top
+/// [`PROACTIVE_CONFLICT_TOP_K`]:
+///
+///   near-duplicate (≥ [`PROACTIVE_CONFLICT_SIM_THRESHOLD`] cosine)
+///   AND content differs
+///   AND content token-overlap ≥ [`PROACTIVE_CONFLICT_CONTENT_JACCARD_FLOOR`]
+///
+/// The Jaccard corroboration is the #1579 false-409 fix — see the
+/// floor const for the P2 evidence (81% of semantic-tier loadtest
+/// writes refused because MiniLM clusters unrelated noise documents
+/// above 0.95 cosine).
+fn proactive_conflict_verdict(
+    mem: &Memory,
+    query_embedding: &[f32],
+    rows: Vec<(String, String, String, Vec<u8>)>,
+) -> Option<ProactiveConflict> {
     // Score every candidate and keep the top-K by cosine.
     let mut scored: Vec<(f32, String, String, String)> = Vec::with_capacity(rows.len());
     for (id, title, content, blob) in rows {
@@ -4885,6 +5109,7 @@ pub fn proactive_conflict_check(
     // Sort descending by similarity so we visit the strongest matches
     // first; bail at the top-K cap.
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let incoming_tokens = contradiction_title_tokens(&mem.content);
     for (sim, id, title, content) in scored.into_iter().take(PROACTIVE_CONFLICT_TOP_K) {
         if sim < PROACTIVE_CONFLICT_SIM_THRESHOLD {
             // The top-K cap is sorted descending — once we drop below
@@ -4897,16 +5122,25 @@ pub fn proactive_conflict_check(
         // near-duplicates are not contradictions; they are the upsert
         // happy-path that the SQL `ON CONFLICT(title, namespace)`
         // already handles.
-        if content != mem.content {
-            return Ok(Some(ProactiveConflict {
+        //
+        // #1579 A5 — lexical corroboration: a true "same fact,
+        // restated" pair shares vocabulary. Without this floor,
+        // unrelated documents that the embedder happens to cluster
+        // above 0.95 cosine (P2-measured on random-alphanumeric
+        // payloads) produced the 81% false-409 epidemic.
+        if content != mem.content
+            && contradiction_title_jaccard(&incoming_tokens, &contradiction_title_tokens(&content))
+                >= PROACTIVE_CONFLICT_CONTENT_JACCARD_FLOOR
+        {
+            return Some(ProactiveConflict {
                 existing_id: id,
                 existing_title: title,
                 similarity: sim,
                 reason: "near_duplicate_with_differing_content",
-            }));
+            });
         }
     }
-    Ok(None)
+    None
 }
 
 /// v0.7.0 F18 — exact-match-aware nearest-neighbor duplicate check.
@@ -7384,6 +7618,24 @@ pub fn get_unembedded_ids_batch(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// #1579 B3 — count of rows carrying a stored embedding. Cheap probe
+/// (no blob decode, no row materialisation) used by the CLI recall
+/// path to decide whether a one-shot invocation should pay the HNSW
+/// graph-construction cost at all (see
+/// [`crate::hnsw::CLI_HNSW_BUILD_MIN_ENTRIES`]).
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the COUNT query.
+pub fn count_embedded_memories(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Get all stored embeddings as (id, embedding) pairs for building the HNSW index.

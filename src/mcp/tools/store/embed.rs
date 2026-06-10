@@ -40,15 +40,35 @@ pub(super) fn skip_source_embed_for_synchronous_atomise(
 /// any failure logs at WARN and lets the store response proceed
 /// without the embedding (degrades recall on this row, never blocks
 /// the write).
+///
+/// #1579 A1 — `precomputed` carries the document embedding the
+/// proactive-conflict check already produced for the IDENTICAL
+/// `embedding_document(title, content)` text earlier in
+/// `handle_store`. When `Some`, the second (duplicate) embed call is
+/// skipped — at semantic/smart tiers the embed is the dominant
+/// per-store cost (~150-400 ms inline MiniLM on commodity hardware;
+/// one network round-trip per call on remote embedders), so reusing
+/// the vector halves store latency. `None` preserves the legacy
+/// embed-here path for callers that skipped the conflict check
+/// (`force=true`) or whose earlier embed attempt failed (the retry
+/// keeps the WARN label attribution on `actual_id` byte-identical to
+/// the pre-#1579 contract).
 pub(super) fn store_source_embedding(
     conn: &rusqlite::Connection,
     embedder: &dyn Embed,
     mem: &Memory,
     actual_id: &str,
     vector_index: Option<&VectorIndex>,
+    precomputed: Option<Vec<f32>>,
 ) {
-    let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
-    match embedder.embed(&text) {
+    let embed_result = match precomputed {
+        Some(embedding) => Ok(embedding),
+        None => {
+            let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
+            embedder.embed(&text)
+        }
+    };
+    match embed_result {
         Ok(embedding) => {
             if let Err(e) = db::set_embedding(conn, actual_id, &embedding) {
                 tracing::warn!("failed to store embedding for {}: {}", actual_id, e);

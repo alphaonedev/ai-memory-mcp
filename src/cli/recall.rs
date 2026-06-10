@@ -180,7 +180,7 @@ pub fn run(
     if let Some(ref a) = args.as_agent {
         validate::validate_namespace(a)?;
     }
-    let conn = db::open(db_path)?;
+    let mut conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
 
     // Resolve feature tier
@@ -228,7 +228,7 @@ pub fn run(
     // every branch downstream without owning a real candle Embedder.
     let embedder_ref: Option<&dyn Embed> = embedder.as_ref().map(|e| e as &dyn Embed);
     run_with_embedder(
-        &conn,
+        &mut conn,
         args,
         json_out,
         app_config,
@@ -241,6 +241,16 @@ pub fn run(
     )
 }
 
+/// #1579 B3 — should a ONE-SHOT CLI invocation pay the HNSW
+/// graph-construction cost for `embedded_rows` stored embeddings?
+/// `false` below [`hnsw::CLI_HNSW_BUILD_MIN_ENTRIES`] (the recall
+/// pipeline's linear-scan fallback is faster end-to-end there — see
+/// the const for the P1 numbers); negative/garbage counts never
+/// build.
+pub(crate) fn should_build_cli_hnsw(embedded_rows: i64) -> bool {
+    usize::try_from(embedded_rows).is_ok_and(|n| n >= hnsw::CLI_HNSW_BUILD_MIN_ENTRIES)
+}
+
 /// Test-injectable core of [`run`]. Production callers go through `run`
 /// which builds an [`Embedder`] via `daemon_runtime::build_embedder` and
 /// delegates here. Tests can pass a `MockEmbedder` directly without the
@@ -248,7 +258,7 @@ pub fn run(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_embedder(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     args: &RecallArgs,
     json_out: bool,
     app_config: &AppConfig,
@@ -311,35 +321,37 @@ pub(crate) fn run_with_embedder(
         )?;
     }
 
-    // Backfill embeddings for memories that don't have them
-    if let Some(emb) = embedder
-        && let Ok(unembedded) = db::get_unembedded_ids(conn)
-        && !unembedded.is_empty()
-    {
-        writeln!(
-            out.stderr,
-            "ai-memory: backfilling {} memories...",
-            unembedded.len()
-        )?;
-        let mut ok = 0usize;
-        for (id, title, content) in &unembedded {
-            let text = crate::embeddings::embedding_document(title, content);
-            if let Ok(embedding) = emb.embed(&text)
-                && db::set_embedding(conn, id, &embedding).is_ok()
-            {
-                ok += 1;
-            }
+    // Backfill embeddings for memories that don't have them.
+    //
+    // #1579 B6-CLI — routed through the same batched helper the MCP
+    // boot path uses (`run_embedding_backfill_with_batch_size`:
+    // `embed_batch` chunks + `set_embeddings_batch`) instead of the
+    // legacy per-row `emb.embed` loop. On the local candle backend a
+    // true batched forward is ~10-20× faster than row-at-a-time
+    // (PERF-5), and the batch size follows the canonical #1146
+    // `[embeddings].backfill_batch` resolver instead of being
+    // implicitly 1.
+    if let Some(emb) = embedder {
+        let batch_size = app_config.resolve_embeddings().backfill_batch as usize;
+        if let Err(e) = crate::mcp::run_embedding_backfill_with_batch_size(conn, emb, batch_size) {
+            writeln!(out.stderr, "ai-memory: backfill failed: {e}")?;
         }
-        writeln!(
-            out.stderr,
-            "ai-memory: backfilled {}/{}",
-            ok,
-            unembedded.len()
-        )?;
     }
 
-    // Build HNSW vector index if embedder is available
-    let vector_index = if embedder.is_some() {
+    // Build HNSW vector index if embedder is available.
+    //
+    // #1579 B3 — but ONLY above the SSOT row threshold
+    // (`hnsw::CLI_HNSW_BUILD_MIN_ENTRIES`). A one-shot CLI recall
+    // pays the full graph-construction cost per invocation (P1
+    // audit: ~40 s at 10k vectors) while the recall pipeline's
+    // linear-scan fallback answers in ≤ 35 ms at that scale — so
+    // below the threshold we skip the build entirely (pass `None`;
+    // the semantic phase linear-scans the embedding column). The
+    // cheap COUNT probe avoids even decoding the blobs when the
+    // build is going to be skipped.
+    let vector_index = if embedder.is_some()
+        && db::count_embedded_memories(conn).is_ok_and(should_build_cli_hnsw)
+    {
         match db::get_all_embeddings(conn) {
             Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
             _ => Some(hnsw::VectorIndex::empty()),
@@ -949,7 +961,7 @@ limit = 25
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "content");
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let mock = crate::embeddings::test_support::MockEmbedder::new_local().unwrap();
         let args = default_args();
         let cfg = AppConfig::default();
@@ -957,7 +969,7 @@ limit = 25
         {
             let mut out = env.output();
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 true,
                 &cfg,
@@ -970,9 +982,80 @@ limit = 25
         }
         let stderr = env.stderr_str();
         assert!(stderr.contains("embedder loaded"), "got: {stderr}");
-        assert!(stderr.contains("backfilling"), "got: {stderr}");
+        // #1579 B6-CLI: the backfill banner now comes from the shared
+        // batched helper (process stderr, not the captured CliOutput),
+        // so assert the backfill EFFECT instead: the seeded row gained
+        // an embedding.
+        {
+            let conn2 = db::open(&db).unwrap();
+            let ids = db::get_unembedded_ids(&conn2).unwrap();
+            assert!(
+                ids.is_empty(),
+                "batched backfill must embed every unembedded row; left: {ids:?}"
+            );
+        }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["mode"].as_str().unwrap(), "hybrid");
+    }
+
+    // -----------------------------------------------------------------
+    // #1579 B3 — CLI HNSW build threshold
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn b3_1579_should_build_cli_hnsw_threshold() {
+        use crate::hnsw::CLI_HNSW_BUILD_MIN_ENTRIES;
+        assert!(
+            !should_build_cli_hnsw(0),
+            "empty corpus never builds a graph"
+        );
+        assert!(
+            !should_build_cli_hnsw(i64::try_from(CLI_HNSW_BUILD_MIN_ENTRIES - 1).unwrap()),
+            "one under the threshold: linear scan wins"
+        );
+        assert!(
+            should_build_cli_hnsw(i64::try_from(CLI_HNSW_BUILD_MIN_ENTRIES).unwrap()),
+            "at the threshold: build"
+        );
+        assert!(!should_build_cli_hnsw(-1), "garbage counts never build");
+    }
+
+    #[test]
+    fn b3_1579_small_corpus_recall_skips_hnsw_and_still_answers_semantically() {
+        // Below CLI_HNSW_BUILD_MIN_ENTRIES the vector_index is None and
+        // the recall pipeline's linear-scan fallback serves the
+        // semantic phase — results must still come back in hybrid mode.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "test", "needle title", "needle content body");
+        let mut conn = db::open(&db).unwrap();
+        let mock = crate::embeddings::test_support::MockEmbedder::new_local().unwrap();
+        let args = default_args();
+        let cfg = AppConfig::default();
+        {
+            let mut out = env.output();
+            run_with_embedder(
+                &mut conn,
+                &args,
+                true,
+                &cfg,
+                FeatureTier::Keyword,
+                Some(&mock as &dyn Embed),
+                Some(mock.model_description()),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(
+            v["mode"].as_str().unwrap(),
+            "hybrid",
+            "semantic phase must still answer via the linear-scan fallback"
+        );
+        assert!(
+            v["memories"].as_array().is_some_and(|r| !r.is_empty()),
+            "seeded row must be recalled without an HNSW graph; got: {v}"
+        );
     }
 
     #[test]
@@ -983,13 +1066,13 @@ limit = 25
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "content");
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let args = default_args();
         let cfg = AppConfig::default();
         {
             let mut out = env.output();
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 true,
                 &cfg,
@@ -1017,7 +1100,7 @@ limit = 25
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "content");
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let mock = FailOnContextTokens {
             joined_marker: "alpha beta".to_string(),
         };
@@ -1027,7 +1110,7 @@ limit = 25
         {
             let mut out = env.output();
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 true,
                 &cfg,
@@ -1051,7 +1134,7 @@ limit = 25
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "content");
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let mock = crate::embeddings::test_support::MockEmbedder::new_local().unwrap();
         let mut args = default_args();
         args.context_tokens = Some(vec!["a".into(), "b".into()]);
@@ -1059,7 +1142,7 @@ limit = 25
         {
             let mut out = env.output();
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 true,
                 &cfg,
@@ -1081,13 +1164,13 @@ limit = 25
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "test", "needle title", "content");
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let args = default_args();
         let cfg = AppConfig::default();
         {
             let mut out = env.output();
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 true,
                 &cfg,
@@ -1113,7 +1196,7 @@ limit = 25
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         // Insert a low-confidence memory directly.
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let mut mem = crate::models::Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
@@ -1152,7 +1235,7 @@ limit = 25
             let mut out = env.output();
             // text mode (json_out=false) — drives the text-rendering loop.
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 false,
                 &cfg,
@@ -1173,13 +1256,13 @@ limit = 25
         // Empty result text path (lines 343-345).
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let conn = db::open(&db).unwrap();
+        let mut conn = db::open(&db).unwrap();
         let args = default_args();
         let cfg = AppConfig::default();
         {
             let mut out = env.output();
             run_with_embedder(
-                &conn,
+                &mut conn,
                 &args,
                 false,
                 &cfg,

@@ -40,7 +40,22 @@ const REBUILD_THRESHOLD: usize = 200;
 /// to convert "silently return stale graph" → "bounded timeout, then
 /// best-effort swap".
 const REBUILD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-const REBUILD_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// Poll cadence for bounded waits on an in-flight rebuild. Shared by
+/// the [`VectorIndex::rebuild`] sync shim (#1037) and the #1579 B3
+/// boot warm-up retry loops (`warm_boot`,
+/// `daemon_runtime::spawn_vector_index_boot_load`).
+pub(crate) const REBUILD_WAIT_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
+
+/// #1579 B3 — minimum embedded-row count before a ONE-SHOT CLI
+/// invocation builds an HNSW graph. Below this, the recall pipeline's
+/// linear-scan fallback (`vector_index = None`) answers the semantic
+/// phase in ≤ 35 ms (P1 audit, 10-20k rows) while graph construction
+/// costs ~40 s at 10k vectors — a build that is then thrown away when
+/// the process exits. Long-lived processes (serve / MCP stdio) always
+/// build (asynchronously, see `daemon_runtime::spawn_vector_index_boot_load`)
+/// because they amortise the cost across many recalls.
+pub const CLI_HNSW_BUILD_MIN_ENTRIES: usize = 20_000;
 
 /// Maximum entries before evicting oldest to prevent unbounded memory growth.
 ///
@@ -343,6 +358,11 @@ struct RebuildResult {
     /// v0.7.0 #1074 — propagated from the snapshot so the swap path
     /// can detect a stale-by-eviction warming result.
     overflow_generation: u64,
+    /// #1579 — number of entries captured in the snapshot this graph
+    /// was built from. On swap it becomes the new
+    /// `IndexState::graph_entry_count`, the coverage accounting behind
+    /// [`VectorIndex::is_fully_searchable`].
+    entries_in_graph: usize,
 }
 
 struct IndexState {
@@ -383,6 +403,17 @@ struct IndexState {
     /// per entry plus the no-spare-capacity heap-side). HashSet
     /// lookup against `&str` works through the `Borrow<str>` impl.
     valid_ids_cache: Option<std::collections::HashSet<std::sync::Arc<str>>>,
+    /// #1579 — number of entries baked into the ACTIVE graph (the
+    /// snapshot length at its build time; 0 when `hnsw` is `None`).
+    /// Together with `overflow.len()` this tells whether a search can
+    /// see every live entry: entries seeded into `all_entries` by the
+    /// async-boot loader ([`VectorIndex::seed_entries`]) are in
+    /// NEITHER the graph NOR `overflow` until the boot rebuild swaps
+    /// in, and [`VectorIndex::is_fully_searchable`] reports `false`
+    /// for that window so callers (the #519 proactive conflict check)
+    /// can route to their non-index fallback instead of silently
+    /// searching an index that cannot return the seeded rows.
+    graph_entry_count: usize,
 }
 
 /// A search result from the vector index.
@@ -396,6 +427,7 @@ impl VectorIndex {
     /// Build a new index from a list of (`memory_id`, embedding) pairs.
     pub fn build(entries: Vec<(String, Vec<f32>)>) -> Self {
         let hnsw = Self::build_hnsw(&entries);
+        let graph_entry_count = entries.len();
         VectorIndex {
             inner: Mutex::new(IndexState {
                 hnsw,
@@ -404,6 +436,7 @@ impl VectorIndex {
                 max_entries: MAX_ENTRIES,
                 overflow_generation: 0,
                 valid_ids_cache: None,
+                graph_entry_count,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -421,6 +454,7 @@ impl VectorIndex {
                 max_entries: MAX_ENTRIES,
                 overflow_generation: 0,
                 valid_ids_cache: None,
+                graph_entry_count: 0,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -445,6 +479,7 @@ impl VectorIndex {
                 max_entries,
                 overflow_generation: 0,
                 valid_ids_cache: None,
+                graph_entry_count: 0,
             }),
             eviction_sink: Mutex::new(None),
             warming: Arc::new(Mutex::new(None)),
@@ -810,6 +845,23 @@ impl VectorIndex {
         state.all_entries.len()
     }
 
+    /// `true` when the index holds no live entries at all.
+    ///
+    /// #1579 QC — load-bearing for the proactive-conflict dispatch:
+    /// an EMPTY index is *vacuously* [`Self::is_fully_searchable`]
+    /// (`0 + 0 >= 0`), but during the async-boot LOAD phase — after
+    /// the daemon binds with `VectorIndex::empty()` and before the
+    /// boot loader's `seed_entries` lands (the `get_all_embeddings`
+    /// read is the long pole at 100k rows) — emptiness says nothing
+    /// about what the DB holds. Callers that would otherwise trust a
+    /// fully-searchable index (the #519 conflict check) must ALSO
+    /// require non-emptiness, so that window routes to the bounded
+    /// recency-scan fallback instead of consulting an index that
+    /// cannot return anything.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// #968 — Force a full rebuild of the HNSW index from all entries,
     /// SYNCHRONOUSLY. Preserved for tests + emergency paths; production
     /// code should call [`Self::rebuild_async`] so the multi-second
@@ -930,6 +982,7 @@ impl VectorIndex {
                 hnsw,
                 overflow_at_snapshot: snapshot.overflow_at_snapshot,
                 overflow_generation: snapshot.overflow_generation,
+                entries_in_graph: snapshot.entries.len(),
             };
             // Park the result in the warming slot. The next caller
             // through `try_swap_warming` will move it into `active`.
@@ -986,6 +1039,8 @@ impl VectorIndex {
             return false;
         }
         state.hnsw = result.hnsw;
+        // #1579 — coverage accounting for `is_fully_searchable`.
+        state.graph_entry_count = result.entries_in_graph;
         // Trim overflow: the first `overflow_at_snapshot` entries are
         // now in the graph; entries inserted AFTER the snapshot
         // remain. Defensive `min` in case `remove` or eviction
@@ -993,6 +1048,118 @@ impl VectorIndex {
         let to_drain = result.overflow_at_snapshot.min(state.overflow.len());
         state.overflow.drain(..to_drain);
         true
+    }
+
+    /// #1579 — `true` when a search against this index can observe
+    /// every live entry: the active graph (its build-time snapshot
+    /// length) plus the linearly-scanned `overflow` cover
+    /// `all_entries`. `false` exactly during the async-boot warm
+    /// window, when [`Self::seed_entries`] has parked DB-loaded
+    /// entries in `all_entries` but the background graph build has
+    /// not swapped in yet — sequenced writes flow through `insert()`
+    /// (graph- or overflow-visible) so they never break coverage, and
+    /// removals/evictions only shrink `all_entries` (stale graph ids
+    /// are filtered at search time), so the inequality is conservative
+    /// in the safe direction.
+    ///
+    /// Consumers: the #519 proactive conflict check routes to its
+    /// bounded-scan fallback while this is `false`; the boot loader
+    /// uses it to decide whether a make-up rebuild is needed after a
+    /// racing routine rebuild swallowed its CAS.
+    pub fn is_fully_searchable(&self) -> bool {
+        // Opportunistically land any warmed graph first so a caller
+        // probing right after a rebuild finished sees the swapped
+        // state (mirrors `search`/`insert`).
+        self.try_swap_warming();
+        let state = match self.inner.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.graph_entry_count + state.overflow.len() >= state.all_entries.len()
+    }
+
+    /// #1579 B3 — bulk-load DB-resident entries into the index
+    /// WITHOUT building the graph (the async-boot path). Entries land
+    /// in `all_entries` only; they become searchable when the
+    /// follow-up rebuild (see [`Self::seed_and_rebuild_async`]) swaps
+    /// its graph in. Ids already present (e.g. a row written through
+    /// `insert()` between the caller's DB snapshot and this call) are
+    /// skipped so the index never double-counts. Returns the number of
+    /// entries actually seeded.
+    ///
+    /// Deliberately does NOT enforce `max_entries` eviction here —
+    /// the legacy synchronous boot path (`VectorIndex::build` over
+    /// `get_all_embeddings`) never evicted at boot either, and the
+    /// first post-boot `insert()` applies the cap exactly as before.
+    pub fn seed_entries(&self, entries: Vec<(String, Vec<f32>)>) -> usize {
+        let mut state = match self.inner.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let existing: std::collections::HashSet<std::sync::Arc<str>> = state
+            .all_entries
+            .iter()
+            .map(|(id, _)| std::sync::Arc::<str>::from(id.as_str()))
+            .collect();
+        let mut seeded = 0usize;
+        for (id, emb) in entries {
+            if existing.contains(id.as_str()) {
+                continue;
+            }
+            state.all_entries.push((id, emb));
+            seeded += 1;
+        }
+        if seeded > 0 {
+            state.valid_ids_cache = None;
+        }
+        seeded
+    }
+
+    /// #1579 B3 — async-boot warm-up: seed DB-loaded entries (see
+    /// [`Self::seed_entries`]) and schedule the graph build on the
+    /// existing #968 double-buffer rebuild machinery. Returns the
+    /// rebuild thread's [`JoinHandle`]; the caller (the boot loader)
+    /// joins it off the request path and then calls
+    /// [`Self::try_swap_warming`] + emits the operator-visible
+    /// "index warm" line.
+    ///
+    /// If a routine rebuild is already in flight (its snapshot
+    /// predates the seed), `rebuild_async` returns a no-op handle and
+    /// the seeded entries stay graph-invisible until a later rebuild;
+    /// the boot loader detects that via [`Self::is_fully_searchable`]
+    /// and issues a make-up `rebuild`.
+    pub fn seed_and_rebuild_async(&self, entries: Vec<(String, Vec<f32>)>) -> JoinHandle<()> {
+        self.seed_entries(entries);
+        self.rebuild_async()
+    }
+
+    /// #1579 B3 — blocking boot warm-up for callers that hold the
+    /// index directly (the MCP stdio boot thread; tests). Seeds the
+    /// DB-loaded entries and drives rebuild→swap to completion,
+    /// returning the number of entries seeded. Each step takes the
+    /// inner mutex only briefly (the graph build itself runs on the
+    /// #968 background thread against a snapshot), so concurrent
+    /// readers/writers on other threads keep making progress — the
+    /// CALLING thread is the only one parked.
+    ///
+    /// The retry loop covers the rebuild-CAS race: if a routine
+    /// 200-overflow rebuild was already in flight when our seed
+    /// landed, `rebuild_async` short-circuits to a no-op handle and
+    /// the in-flight build's pre-seed snapshot cannot cover the
+    /// seeded rows — `is_fully_searchable` stays `false` and the loop
+    /// schedules a make-up rebuild once the CAS frees up.
+    pub fn warm_boot(&self, entries: Vec<(String, Vec<f32>)>) -> usize {
+        let seeded = self.seed_entries(entries);
+        loop {
+            let handle = self.rebuild_async();
+            let _ = handle.join();
+            // `is_fully_searchable` opportunistically swaps any warmed
+            // graph before evaluating coverage.
+            if self.is_fully_searchable() {
+                return seeded;
+            }
+            std::thread::sleep(REBUILD_WAIT_POLL_INTERVAL);
+        }
     }
 }
 
@@ -1733,6 +1900,7 @@ mod d1_968_tests {
                 hnsw: None,
                 overflow_at_snapshot: 999, // would have drained the whole overflow
                 overflow_generation: current_gen.wrapping_add(1), // mismatched
+                entries_in_graph: 0,
             });
         }
 
@@ -1771,6 +1939,77 @@ mod d1_968_tests {
         assert!(
             gen_after > gen_initial,
             "eviction-clear path must bump overflow_generation (#1074)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #1579 — async-boot seeding + coverage accounting
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn seed_entries_dedupes_and_defers_searchability_1579() {
+        let idx = VectorIndex::empty();
+        // A write that arrived through the normal path stays covered
+        // (overflow is linearly scanned).
+        idx.insert("live".into(), make_embedding(&[1.0, 0.0, 0.0]));
+        assert!(
+            idx.is_fully_searchable(),
+            "overflow-only index is fully searchable"
+        );
+        // Seed the boot snapshot; the id already present must be
+        // skipped (no double-count), the rest land in all_entries
+        // only.
+        let seeded = idx.seed_entries(vec![
+            ("live".into(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("a".into(), make_embedding(&[0.0, 1.0, 0.0])),
+            ("b".into(), make_embedding(&[0.0, 0.0, 1.0])),
+        ]);
+        assert_eq!(seeded, 2, "duplicate id must be skipped");
+        assert_eq!(idx.len(), 3);
+        assert!(
+            !idx.is_fully_searchable(),
+            "seeded-but-unbuilt entries must report not-fully-searchable \
+             so the conflict check routes to its fallback (#1579 A5/B3)"
+        );
+        // Search during the warm window must still serve the live
+        // (overflow) entry — and must NOT pretend to cover the seeds.
+        let hits = idx.search(&make_embedding(&[0.0, 1.0, 0.0]), 3);
+        assert!(hits.iter().all(|h| h.id == "live"));
+    }
+
+    #[test]
+    fn warm_boot_seeds_builds_and_swaps_1579() {
+        let idx = VectorIndex::empty();
+        let seeded = idx.warm_boot(vec![
+            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("b".into(), make_embedding(&[0.0, 1.0, 0.0])),
+            ("c".into(), make_embedding(&[0.0, 0.0, 1.0])),
+        ]);
+        assert_eq!(seeded, 3);
+        assert!(
+            idx.is_fully_searchable(),
+            "warm_boot must drive rebuild→swap to completion"
+        );
+        let hits = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 2);
+        assert_eq!(hits.first().map(|h| h.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn build_and_insert_preserve_full_searchability_1579() {
+        let idx = VectorIndex::build(vec![
+            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("b".into(), make_embedding(&[0.0, 1.0, 0.0])),
+        ]);
+        assert!(idx.is_fully_searchable(), "synchronous build covers all");
+        idx.insert("c".into(), make_embedding(&[0.0, 0.0, 1.0]));
+        assert!(
+            idx.is_fully_searchable(),
+            "insert lands in overflow — coverage preserved"
+        );
+        idx.remove("a");
+        assert!(
+            idx.is_fully_searchable(),
+            "remove only shrinks all_entries — coverage preserved"
         );
     }
 }
