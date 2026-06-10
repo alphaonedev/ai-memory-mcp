@@ -174,9 +174,10 @@ are called out explicitly below.
   cross-region quorum pushes hit `deadline_exceeded` → DLQ (do-1461
   finding). Cross-region meshes need **5000-10000 ms**; the reference
   3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000`
-  (`deploy/do-1461/provision/lib.sh` carries the rationale — the
-  receiver's embed-on-receive after a dimension migration can add
-  ~1 s/row, see #1566 below). Raising the deadline is safe: the write
+  (`deploy/do-1461/provision/lib.sh` carries the rationale — written
+  when the receiver's embed-on-receive after a dimension migration
+  could add ~1 s/row; that cost no longer rides the ack window, see
+  #1566 below). Raising the deadline is safe: the write
   commits locally first, so a longer remote-ack wait widens only the
   synchronous-durability gate, never the local commit. WAN guidance
   documented in `docs/federation.md` §Tuning,
