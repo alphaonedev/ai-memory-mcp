@@ -276,6 +276,39 @@ authoritative ones.
 Per-namespace conflict resolution is an open work item (sync-phase
 Layer 2b).
 
+### Federation push-DLQ backlog / quarantined rows {#federation-push-dlq}
+
+**Symptom**: the daemon logs
+`replay: row N quarantined after 100 attempts (ceiling 100)` and/or
+the `federation_push_dlq_depth` gauge stays high.
+
+Failed quorum pushes land in the `federation_push_dlq` table and a
+background worker replays them (oldest first, batches per tick).
+Rows that fail `MAX_REPLAY_ATTEMPTS` (100) times are *quarantined*:
+the take query excludes them (#1578) and they wait for operator
+review. **No CLI drain surface ships at v0.7.0** — inspection and
+drain are direct SQL against the daemon's store:
+
+```sql
+-- Inspect (postgres-backed daemons: table lives in the daemon's
+-- schema, e.g. ic_peer_1.federation_push_dlq on shared fleets):
+SELECT attempt_count, count(*), max(left(last_error, 60))
+FROM federation_push_dlq WHERE replayed_at IS NULL GROUP BY 1;
+
+-- Drain quarantined rows after confirming the target memories
+-- already converged (compare distinct memory counts across peers, or
+-- GET each memory_id on the destination peer). Marking replayed
+-- retains the rows for audit; deleting is equivalent operationally:
+UPDATE federation_push_dlq SET replayed_at = now()
+WHERE replayed_at IS NULL AND attempt_count >= 100;
+```
+
+A large backlog of *replayable* (below-ceiling) rows whose memories
+already converged via async catch-up (e.g. a historical quota-429
+burst) can be drained the same way — drop the `attempt_count`
+predicate after verifying convergence. The replay worker handles
+everything else on its own.
+
 ## Performance
 
 ### `recall` is slow (> 2 s)
