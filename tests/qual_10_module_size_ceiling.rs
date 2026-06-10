@@ -242,7 +242,21 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the file at 16_601. Growth justified: closes the postgres
     // ungoverned-link-write security hole + decay parity, zero
     // speculative surface. 16_700 = 16_601 + 99 headroom.
-    ("src/store/postgres.rs", 16_700),
+    //
+    // 2026-06-10 (#1579 A4+B2, postgres lane, merged batch-2) — the
+    // SAL `list_unembedded` (bounded NULL-embedding scan) +
+    // `set_embeddings_batch` (single-tx chunk write) overrides closing
+    // the dead-fleet-semantic-recall backfill gap (~90 LOC incl.
+    // docs), plus the `migrate_v57` arm (stored generated `tsv`
+    // tsvector column + `memories_tsv_gin`, drops the legacy
+    // expression index; ~75 LOC incl. the operational-lock docs), the
+    // v55-arm literal-stamp fix, and the merge-composed v56
+    // stamp-only arm (literal-56 stamp per the replay-hazard rule).
+    // Growth justified: correctness fix (fleet semantic recall was
+    // DEAD at 0.46% embedded) + a 20-37x measured FTS-rank win, zero
+    // speculative surface. Measured post-merge LOC: 16_811.
+    // 16_900 = 16_811 + 89 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 16_900),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -306,15 +320,24 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #1548 — the curator `--store-url` SAL store-build path
     // (`build_curator_store` + the Curator dispatch arm) added ~34 LOC.
     // Bumped in lockstep.
-    // 2026-06-10 — bumped 7_950 → 8_300 by the #1579 B3 async-boot
-    // HNSW loader: `load_boot_index_entries` +
+    // 2026-06-10 (#1579 B3, writepath lane) — the async-boot HNSW
+    // loader: `load_boot_index_entries` +
     // `spawn_vector_index_boot_load` (the seed → background-build →
     // swap orchestration with its lock-discipline doc block) and the
     // `b3_1579_boot_loader_warms_index_off_the_startup_path`
     // readiness regression test — ~185 LOC on the serve boot path
-    // (the 40 s @10k / >28 min @100k sync-build fix), no speculative
-    // surface. Actual LOC at the bump: 8_135. 8_300 = 8_135 + 165
-    // headroom; far under the 1.5x cap.
+    // (the 40 s @10k / >28 min @100k sync-build fix).
+    //
+    // 2026-06-10 (#1579 A4, postgres lane, merged batch-2) — the
+    // serve-boot embedding-backfill sweep spawn (detached task
+    // draining `MemoryStore::list_unembedded` through the daemon
+    // embedder under the `embedding-backfill` sentinel principal;
+    // ~46 LOC incl. the root-cause doc block) on the SAME module —
+    // closes the postgres fleet dead-semantic-recall gap. Measured
+    // post-merge LOC: 8_196. 8_300 (the writepath-lane ceiling)
+    // already covers the union — kept. NOTE: the wire lane (A3+B8)
+    // lands on this module in the same train; re-measure at that
+    // merge.
     ("src/daemon_runtime.rs", 8_300),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),

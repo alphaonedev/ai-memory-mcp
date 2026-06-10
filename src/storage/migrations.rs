@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 56).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 57).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -603,7 +603,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 56;
+const CURRENT_SCHEMA_VERSION: i64 = 57;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2444,7 +2444,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // `CREATE INDEX IF NOT EXISTS` so the migration is replay-safe.
             conn.execute_batch(MIGRATION_V55_SQLITE)?;
         }
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 56 {
             // v0.7.0 #1579 (A2 + B6d) — composite list / archive
             // ordering indexes. The P1 perf audit measured the 100k-row
             // `storage::list` page at ~141 ms because the plan used
@@ -2482,6 +2482,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 );
             }
         }
+        // v57 (#1579 B2, perf) — SQLite no-op twin of the postgres
+        // stored generated tsvector column + `memories_tsv_gin` GIN
+        // index (`src/store/postgres.rs::migrate_v57`). SQLite's FTS5
+        // virtual table (`memories_fts`) already materialises the
+        // indexed text at write time via the sync triggers, so there
+        // is nothing to precompute on this backend — the per-matched-
+        // row tsvector recompute the postgres arm eliminates never
+        // existed here. No DDL; the unconditional stamp below records
+        // CURRENT_SCHEMA_VERSION (= 57) so the lockstep pin holds
+        // (the inverse of the v55 arm, where SQLite added an index and
+        // postgres stamped a no-op).
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
@@ -2955,12 +2966,17 @@ mod tests {
         // sibling is created behind a table probe and exercised by the
         // historical v1 replay test, since this fixture applies SCHEMA
         // only and SCHEMA carries no archived_memories table). Start a DB
-        // one version below current WITHOUT the indexes, run the ladder,
-        // assert they materialised, then rewind + re-run to prove
-        // replay-safety. No hardcoded version literal — the seed version
-        // derives from CURRENT_SCHEMA_VERSION so the test tracks the
-        // constant across future schema bumps.
-        const PRIOR_VERSION: i64 = CURRENT_SCHEMA_VERSION - 1;
+        // BELOW the version-pinned v56 arm (seed = 55, one under the v56
+        // trigger), run the ladder, assert the indexes materialised,
+        // then rewind + re-run to prove replay-safety.
+        //
+        // The seed is the FIXED literal 55, NOT
+        // `CURRENT_SCHEMA_VERSION - 1` — post-#1579-batch-2 the tip is
+        // 57, so CURRENT-1 (= 56) would enter ABOVE the `< 56` arm under
+        // test and the assertions would pass vacuously against indexes
+        // that were never created by the arm (the v55 updated-at test
+        // above pins the same discipline for its arm).
+        const PRIOR_VERSION: i64 = 55;
         const LIST_INDEXES: [&str; 2] = ["idx_memories_list_order", "idx_memories_ns_list_order"];
 
         let conn = Connection::open_in_memory().expect("in-memory db");
