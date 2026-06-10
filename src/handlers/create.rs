@@ -1026,6 +1026,30 @@ pub async fn create_memory(
     // hold the single shared `Mutex<Connection>`.
     let (embedding, embed_status) = embed_create_before_lock(&app, &body.title, &body.content);
 
+    // #1579 A5 — ANN candidate pool for the proactive conflict check
+    // (#519). The HNSW search runs BEFORE the DB lock (vector-index
+    // mutex only — the FX-4/PERF-2 recall lock discipline), replacing
+    // the O(namespace) embedding decode+scan that previously ran
+    // UNDER the DB mutex and collapsed semantic-tier write throughput
+    // to 0.3-1.7 rps (P2 audit). `None` ⇒ force-bypass, no embedding,
+    // or no fully-searchable index (keyword tier / async-boot warm
+    // window) — the check below then uses the bounded-scan fallback.
+    let conflict_candidate_ids: Option<Vec<String>> = if body.force {
+        None
+    } else if let Some(ref qe) = embedding {
+        let vi = app.vector_index.lock().await;
+        vi.as_ref()
+            .filter(|idx| idx.is_fully_searchable())
+            .map(|idx| {
+                idx.search(qe, db::PROACTIVE_CONFLICT_INDEX_K)
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect()
+            })
+    } else {
+        None
+    };
+
     // v0.6.3.1 P2 (G6) — resolve `on_conflict` policy. HTTP defaults to
     // 'error'; callers that want the v0.6.3 silent-merge behaviour must
     // pass on_conflict='merge'. v0.7.0 (sweep F-B3.x): routes through
@@ -1197,7 +1221,14 @@ pub async fn create_memory(
     if !body.force
         && let Some(ref qe) = embedding
     {
-        match db::proactive_conflict_check(&lock.0, &mem, qe) {
+        // #1579 A5 — verify the pre-lock ANN candidates (point lookups
+        // + exact cosine recompute) when an index was available;
+        // bounded recency scan otherwise.
+        let check_result = match &conflict_candidate_ids {
+            Some(ids) => db::proactive_conflict_check_candidates(&lock.0, &mem, qe, ids),
+            None => db::proactive_conflict_check(&lock.0, &mem, qe),
+        };
+        match check_result {
             Ok(Some(conflict)) => {
                 tracing::info!(
                     target: "create_memory",

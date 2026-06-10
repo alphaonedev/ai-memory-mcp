@@ -653,7 +653,12 @@ pub(crate) fn handle_store(
     if !force_write && let Some(emb) = embedder {
         let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
         if let Ok(query_embedding) = emb.embed(&text) {
-            if let Ok(Some(conflict)) = db::proactive_conflict_check(conn, &mem, &query_embedding) {
+            // #1579 A5 — HNSW-routed candidate pool (O(log N)) with a
+            // bounded-scan fallback; see
+            // `db::proactive_conflict_check_with_index`.
+            if let Ok(Some(conflict)) =
+                db::proactive_conflict_check_with_index(conn, &mem, &query_embedding, vector_index)
+            {
                 tracing::info!(
                     target: "memory_store",
                     namespace = %mem.namespace,
