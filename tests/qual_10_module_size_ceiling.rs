@@ -90,7 +90,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // magic numbers across ~10 files with one named knob set per the
     // operator's no-hardcoded-literals directive. 16_450 = 16_405 + 45
     // headroom; far under the 1.5x cap.
-    ("src/storage/mod.rs", 16_450),
+    //
+    // 2026-06-09 (#1531 burn-down) — bumped 16_450 → 16_550 by the
+    // #1568 H1-residual link-governance hoist + the L5 taxonomy
+    // LIKE-escape fix: `evaluate_link_permission` (the shared K9 link
+    // gate both adapters now call) + the escaped descendant pattern in
+    // `get_taxonomy` + their regression tests
+    // (`taxonomy_prefix_like_metacharacters_do_not_widen_match_l5`)
+    // pushed the file to 16_475. Growth justified: security-gate
+    // hoist + injection-class fix, no speculative surface.
+    // 16_550 = 16_475 + 75 headroom.
+    ("src/storage/mod.rs", 16_550),
     ("src/mcp/mod.rs", 14_000),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
@@ -182,7 +192,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // models::field_names (multi-line const-arg reflows + imports)
     // pushed the file to 16_255. Same justification class: named SSOT
     // refs replacing scattered literals. 16_300 = 16_255 + 45 headroom.
-    ("src/store/postgres.rs", 16_300),
+    //
+    // 2026-06-09 (#1531 burn-down) — bumped 16_300 → 16_700 by the
+    // #1568 H1-residual fix (`validate_link_pre_create_pg`: the
+    // postgres pre-link cycle + K9 governance gates, ~130 LOC incl.
+    // docs) + the #1572 M1-residual recall-path confidence-decay
+    // parity arm in `touch_after_recall` (~55 LOC) + the L5 taxonomy
+    // LIKE-escape + the three live-PG regression tests
+    // (`live_link_reflects_on_cycle_refused_1568`,
+    // `live_touch_after_recall_applies_decay_parity_1572`), landing
+    // the file at 16_601. Growth justified: closes the postgres
+    // ungoverned-link-write security hole + decay parity, zero
+    // speculative surface. 16_700 = 16_601 + 99 headroom.
+    ("src/store/postgres.rs", 16_700),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /

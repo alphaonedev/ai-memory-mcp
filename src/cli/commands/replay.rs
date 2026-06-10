@@ -86,7 +86,9 @@ pub fn cmd_replay(
     // available. Pass `None` so the same default-identity resolution
     // the MCP path uses applies (`host:<host>:pid-<pid>-…` fallback
     // when `agent_id` param is also absent).
-    let envelope = crate::mcp::handle_replay(&conn, &params, None)
+    // #1571 — CLI is the single-tenant trust posture: no bound visibility
+    // caller (mirrors the CLI inbox call shape), legacy resolution applies.
+    let envelope = crate::mcp::handle_replay(&conn, &params, None, None)
         .map_err(|e| anyhow::anyhow!("replay: {e}"))?;
 
     if args.json {

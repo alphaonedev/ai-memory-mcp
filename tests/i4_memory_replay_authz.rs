@@ -107,6 +107,7 @@ fn agent_b_cannot_replay_agent_a_transcript_when_rule_denies() {
             "agent_id": "agent-b",
         }),
         None,
+        None,
     )
     .expect("post-#1075 replay returns Ok with empty body on visibility-denied");
 
@@ -159,6 +160,7 @@ fn agent_a_can_still_replay_own_namespace_with_same_rule_loaded() {
             "memory_id": "mem-a",
             "agent_id": "agent-a",
         }),
+        None,
         None,
     )
     .expect("agent-a must be allowed");

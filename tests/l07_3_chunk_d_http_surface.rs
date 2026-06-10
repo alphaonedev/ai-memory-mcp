@@ -85,6 +85,12 @@ fn install_federation_legacy_bypass() {
 }
 
 fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+    // #1570 — these tests model an AUTHENTICATED deployment (api_key
+    // configured at boot), the pre-#1570 implicit posture, so the admin
+    // header role-claims they assert keep working. The #1570 secure
+    // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+    // is pinned by tests/admin_header_trust_1570.rs in its own process.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     build_router_fixture_with_llm(Arc::new(None))
 }
 
@@ -95,6 +101,12 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
 fn build_router_fixture_with_llm(
     llm: Arc<Option<ai_memory::llm::OllamaClient>>,
 ) -> (axum::Router, NamedTempFile) {
+    // #1570 — these tests model an AUTHENTICATED deployment (api_key
+    // configured at boot), the pre-#1570 implicit posture, so the admin
+    // header role-claims they assert keep working. The #1570 secure
+    // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+    // is pinned by tests/admin_header_trust_1570.rs in its own process.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     install_federation_legacy_bypass();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -173,6 +185,12 @@ fn build_router_fixture_with_llm(
 /// contract on `/export` and `/import` stays exercised at the same
 /// fixture grain (no separate test binary needed).
 fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
+    // #1570 — these tests model an AUTHENTICATED deployment (api_key
+    // configured at boot), the pre-#1570 implicit posture, so the admin
+    // header role-claims they assert keep working. The #1570 secure
+    // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+    // is pinned by tests/admin_header_trust_1570.rs in its own process.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     install_federation_legacy_bypass();
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();

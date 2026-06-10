@@ -596,6 +596,13 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
             StatusCode::BAD_REQUEST,
             sanitize_store_err_message(&e.to_string()),
         ),
+        // #1568 — pre-link gate refusal (reflects_on cycle). 409
+        // CONFLICT with the canonical LINK_CYCLE_ERR_PREFIX message,
+        // byte-parity with the sqlite branch in handlers/links.rs.
+        StoreError::LinkRefused { .. } => (
+            StatusCode::CONFLICT,
+            sanitize_store_err_message(&e.to_string()),
+        ),
         StoreError::UnsupportedCapability { capability } => (
             StatusCode::NOT_IMPLEMENTED,
             format!("backend does not support capability: {capability}"),
@@ -1485,6 +1492,13 @@ mod transport_postgres_gate_tests {
             detail: "bad".to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // #1568 — pre-link gate refusal maps to 409 CONFLICT.
+        let r = store_err_to_response(StoreError::LinkRefused {
+            detail: "link refused: reflection cycle: a --reflects_on--> b would close a cycle"
+                .to_string(),
+        });
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
 
         let r = store_err_to_response(StoreError::UnsupportedCapability {
             capability: "X".to_string(),

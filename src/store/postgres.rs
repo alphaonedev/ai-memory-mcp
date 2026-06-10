@@ -5588,11 +5588,140 @@ impl PostgresStore {
     /// Returns the resolved attestation level so the trait surfaces
     /// (`link_signed`) can pass it back to upper layers without
     /// re-querying.
+    /// #1568 (H1 residual) — postgres twin of the sqlite pre-link
+    /// gates (`db::create_link_signed` → `db::validate_link_pre_create`).
+    /// Pre-fix the postgres SAL link path performed FK pre-flight only,
+    /// so a postgres-backed daemon accepted link writes ungoverned.
+    ///
+    /// Pass 1 (reflects_on cycle gate): pre-fetches the bounded
+    /// `reflects_on` subgraph reachable forward from the proposed
+    /// target via a recursive CTE, then runs the SHARED
+    /// backend-agnostic walker
+    /// ([`crate::kg::cycle_check::would_create_reflection_cycle_with`])
+    /// over the in-memory adjacency — identical BFS semantics (visited
+    /// set, fail-CLOSED on depth-ceiling truncation) to the sqlite
+    /// path, with the same namespace-scoped
+    /// `effective_max_reflection_depth` cap. The CTE is bounded at
+    /// [`crate::kg::cycle_check::walk_bound`], which by construction
+    /// covers every node the walker can explore, so the prefetch
+    /// cannot under-feed the walk.
+    ///
+    /// Pass 2 (K9 governance gate): the SHARED
+    /// [`crate::storage::evaluate_link_permission`] free fn — the same
+    /// `Permissions::evaluate` pipeline `validate_link_pre_create`
+    /// consults on sqlite, with Ask treated as Deny at the storage
+    /// layer.
+    ///
+    /// Wire shapes: cycle → [`StoreError::LinkRefused`] (HTTP 409 via
+    /// `store_err_to_response`, body message byte-identical to
+    /// sqlite's `StorageError::LinkReflectionCycle` Display); deny →
+    /// [`StoreError::PermissionDenied`] (HTTP 403, reason carries the
+    /// canonical `LINK_PERMISSION_DENIED_ERR_PREFIX`). The federation
+    /// inbound path (`apply_remote_link`) is intentionally NOT routed
+    /// through this gate — it mirrors sqlite's `create_link_inbound`
+    /// peer-attested posture, tracked separately.
+    async fn validate_link_pre_create_pg(
+        &self,
+        link: &MemoryLink,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<()> {
+        // Same identity fallback as sqlite's `create_link_signed`: the
+        // signing keypair's claim when present (the writer is by
+        // definition the actor), else "system".
+        let agent_id_for_eval = keypair.map_or("system", |kp| kp.agent_id.as_str());
+
+        // The source memory's namespace scopes both gates (matches the
+        // sqlite/MCP choice). A missing source falls back to the
+        // default namespace — the FK pre-flight in `link_internal`
+        // surfaces the missing-memory error after this returns.
+        let link_ns: Option<String> =
+            sqlx::query_scalar("SELECT namespace FROM memories WHERE id = $1")
+                .bind(&link.source_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("resolve link source namespace", e))?;
+        let link_ns = link_ns.unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
+
+        // Pass 1: cycle gate — only `reflects_on` participates in the
+        // DAG invariant; the other relations may legally form cycles.
+        if link.relation == crate::models::MemoryLinkRelation::ReflectsOn {
+            let max_depth = super::MemoryStore::resolve_governance_policy(self, &link_ns)
+                .await?
+                .unwrap_or_default()
+                .effective_max_reflection_depth();
+            let bound = crate::kg::cycle_check::walk_bound(max_depth);
+
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "WITH RECURSIVE walk(source_id, target_id, depth) AS (
+                     SELECT ml.source_id, ml.target_id, 1
+                     FROM memory_links ml
+                     WHERE ml.source_id = $1 AND ml.relation = $3
+                   UNION
+                     SELECT ml.source_id, ml.target_id, w.depth + 1
+                     FROM memory_links ml
+                     JOIN walk w ON ml.source_id = w.target_id
+                     WHERE ml.relation = $3 AND w.depth < $2
+                 )
+                 SELECT source_id, target_id FROM walk",
+            )
+            .bind(&link.target_id)
+            .bind(i64::from(bound))
+            .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("cycle-check subgraph fetch", e))?;
+
+            let mut adjacency: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (src, dst) in rows {
+                adjacency.entry(src).or_default().push(dst);
+            }
+            let result = crate::kg::cycle_check::would_create_reflection_cycle_with::<
+                std::convert::Infallible,
+            >(&link.source_id, &link.target_id, max_depth, &mut |node| {
+                Ok(adjacency.get(node).cloned().unwrap_or_default())
+            })
+            .unwrap_or_else(|never| match never {});
+            if result.would_cycle {
+                return Err(StoreError::LinkRefused {
+                    // Reuse the sqlite typed envelope's Display so the
+                    // wire body is byte-identical across backends.
+                    detail: crate::storage::StorageError::LinkReflectionCycle {
+                        source_id: link.source_id.clone(),
+                        target_id: link.target_id.clone(),
+                    }
+                    .to_string(),
+                });
+            }
+        }
+
+        // Pass 2: K9 governance gate (shared free fn — see
+        // `crate::storage::evaluate_link_permission`).
+        crate::storage::evaluate_link_permission(
+            &link_ns,
+            &link.source_id,
+            &link.target_id,
+            link.relation.as_str(),
+            agent_id_for_eval,
+        )
+        .map_err(|se| StoreError::PermissionDenied {
+            action: "memory_link".to_string(),
+            target: link_ns.clone(),
+            reason: se.to_string(),
+        })?;
+        Ok(())
+    }
+
     async fn link_internal(
         &self,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
+        // #1568 (H1 residual) — run the same pre-link gates the sqlite
+        // `db::create_link_signed` path runs (reflects_on cycle
+        // invariant + K9 governance) BEFORE any FK pre-flight or write.
+        self.validate_link_pre_create_pg(link, keypair).await?;
+
         // FK pre-flight — mirror SQLite's explicit existence check so
         // the error message names the missing memory rather than
         // surfacing a raw `pg_class` constraint violation. Both
@@ -9979,6 +10108,55 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("touch_after_recall", e))?;
 
+        // #1572 (M1 residual) — postgres parity for the sqlite
+        // recall-path confidence-decay touch
+        // (`src/store/sqlite.rs::touch_after_recall` →
+        // `crate::confidence::decay::apply_decay_touch`). Pre-fix the
+        // decay opt-in (`AI_MEMORY_CONFIDENCE_DECAY=1`) was honored on
+        // the sqlite read path only; a postgres-backed daemon silently
+        // never decayed. Same gate, same math
+        // (`base * 2^(-age_days / half_life)`, age anchored on
+        // `confidence_decayed_at` falling back to `created_at`,
+        // negative age clamped to 0, result clamped to [0,1]), same
+        // provenance stamps (`confidence_source = 'decayed'`, fresh
+        // RFC3339 `confidence_decayed_at`), same non-version-bumping
+        // contract (#1036). Set-based single UPDATE instead of the
+        // sqlite per-id loop since the whole computation is
+        // expressible in SQL. Failures degrade to a WARN, matching
+        // the sqlite arm — decay is opportunistic, never a recall
+        // failure.
+        if crate::confidence::decay::decay_enabled() {
+            #[allow(clippy::cast_precision_loss)]
+            let secs_per_day = crate::SECS_PER_DAY as f64;
+            let result = sqlx::query(
+                "UPDATE memories SET
+                    confidence = LEAST(GREATEST(
+                        confidence * POWER(2.0, -(
+                            GREATEST(EXTRACT(EPOCH FROM
+                                (NOW() - COALESCE(confidence_decayed_at::timestamptz,
+                                                  created_at))), 0.0)
+                            / $2) / $3),
+                        0.0), 1.0),
+                    confidence_source = $4,
+                    confidence_decayed_at = $5
+                 WHERE id = ANY($1)",
+            )
+            .bind(ids)
+            .bind(secs_per_day)
+            .bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+            .bind(crate::models::ConfidenceSource::Decayed.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    "confidence decay touch failed for {} memories: {e}",
+                    ids.len()
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -12001,6 +12179,17 @@ impl MemoryStore for PostgresStore {
         let effective_limit = limit.min(crate::storage::TAXONOMY_MAX_LIMIT);
         let effective_depth = max_depth.min(crate::models::MAX_NAMESPACE_DEPTH);
         let prefix = namespace_prefix.unwrap_or("");
+        // #1531 L5 — escape LIKE metacharacters in the descendant
+        // pattern (mirrors `taxonomy_namespaces` above and the sqlite
+        // `get_taxonomy` twin) so a prefix containing a literal `%` /
+        // `_` cannot over-match unrelated subtrees.
+        let descendant_pattern = format!(
+            "{}/%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
         let now_dt = Utc::now();
 
         // Total count is computed independently of the row-walk so the
@@ -12018,10 +12207,11 @@ impl MemoryStore for PostgresStore {
             sqlx::query_scalar(
                 "SELECT COUNT(*)::BIGINT FROM memories
                  WHERE (expires_at IS NULL OR expires_at > $1)
-                   AND (namespace = $2 OR namespace LIKE $2 || '/%')",
+                   AND (namespace = $2 OR namespace LIKE $3 ESCAPE '\\')",
             )
             .bind(now_dt)
             .bind(prefix)
+            .bind(&descendant_pattern)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| to_store_err("get_taxonomy prefix total", e))?
@@ -12045,13 +12235,14 @@ impl MemoryStore for PostgresStore {
             sqlx::query_as(
                 "SELECT namespace, COUNT(*)::BIGINT FROM memories
                  WHERE (expires_at IS NULL OR expires_at > $1)
-                   AND (namespace = $2 OR namespace LIKE $2 || '/%')
+                   AND (namespace = $2 OR namespace LIKE $3 ESCAPE '\\')
                  GROUP BY namespace
                  ORDER BY COUNT(*) DESC, namespace ASC
-                 LIMIT $3",
+                 LIMIT $4",
             )
             .bind(now_dt)
             .bind(prefix)
+            .bind(&descendant_pattern)
             .bind(limit_i64)
             .fetch_all(&self.pool)
             .await
@@ -15977,6 +16168,139 @@ mod tests {
             .expect("re-invalidate");
         assert!(row2.found);
         assert!(row2.previous_valid_until.is_some());
+    }
+
+    /// #1568 (H1 residual) — the postgres SAL link path must run the
+    /// same pre-link gates as the sqlite `db::create_link_signed`
+    /// path. Pre-fix, `link_internal` performed FK pre-flight only, so
+    /// a `reflects_on` edge that closes a reflection cycle landed
+    /// ungoverned on postgres-backed daemons. Pins: cycle refusal with
+    /// the canonical `LINK_CYCLE_ERR_PREFIX` message (the 409-class
+    /// `StoreError::LinkRefused`), and that non-reflects_on relations
+    /// are unaffected.
+    #[tokio::test]
+    async fn live_link_reflects_on_cycle_refused_1568() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("h1res-link-{unique}");
+        let a = sample_memory(&format!("cyc-a-{unique}"), &ns, "cyc-a", "body a");
+        let b = sample_memory(&format!("cyc-b-{unique}"), &ns, "cyc-b", "body b");
+        let a_id = store.store(&ctx, &a).await.expect("store a");
+        let b_id = store.store(&ctx, &b).await.expect("store b");
+
+        let mk = |src: &str, dst: &str| crate::models::MemoryLink {
+            source_id: src.to_string(),
+            target_id: dst.to_string(),
+            relation: crate::models::MemoryLinkRelation::ReflectsOn,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+
+        // a reflects_on b lands fine (no cycle yet).
+        store.link(&ctx, &mk(&a_id, &b_id)).await.expect("a->b");
+        // b reflects_on a would close the cycle — must be refused.
+        let err = store
+            .link(&ctx, &mk(&b_id, &a_id))
+            .await
+            .expect_err("cycle-closing reflects_on edge must be refused");
+        assert!(
+            matches!(err, StoreError::LinkRefused { .. }),
+            "expected LinkRefused, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(crate::storage::LINK_CYCLE_ERR_PREFIX),
+            "wire message must carry the canonical cycle prefix, got: {err}"
+        );
+        // Direct self-link is refused too (walker's defensive arm).
+        let err_self = store
+            .link(&ctx, &mk(&a_id, &a_id))
+            .await
+            .expect_err("self reflects_on must be refused");
+        assert!(matches!(err_self, StoreError::LinkRefused { .. }));
+        // Non-reflects_on relations are unaffected (gate not over-broad).
+        let mut rel = mk(&b_id, &a_id);
+        rel.relation = crate::models::MemoryLinkRelation::RelatedTo;
+        store
+            .link(&ctx, &rel)
+            .await
+            .expect("related_to b->a must still land");
+    }
+
+    /// #1572 (M1 residual) — postgres parity for the recall-path
+    /// confidence-decay touch. Pre-fix the `AI_MEMORY_CONFIDENCE_DECAY`
+    /// opt-in only decayed on the sqlite adapter. Pins: a 30-day-old
+    /// row (one `DEFAULT_HALF_LIFE_DAYS`) touched with decay enabled
+    /// lands at ~0.5 confidence with `confidence_source = 'decayed'`
+    /// and a fresh `confidence_decayed_at` stamp; with the env unset,
+    /// the touch leaves confidence calibration untouched.
+    #[tokio::test]
+    async fn live_touch_after_recall_applies_decay_parity_1572() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("m1res-decay-{unique}");
+
+        // Control row — decay disabled: calibration columns untouched.
+        let control = sample_memory(&format!("decay-ctl-{unique}"), &ns, "decay-ctl", "body");
+        let control_id = store.store(&ctx, &control).await.expect("store control");
+        store
+            .touch_after_recall(&[control_id.clone()])
+            .await
+            .expect("touch control");
+        let got = store.get(&ctx, &control_id).await.expect("get control");
+        assert_eq!(got.confidence_source, ConfidenceSource::CallerProvided);
+        assert!(got.confidence_decayed_at.is_none());
+        assert!((got.confidence - 1.0).abs() < f64::EPSILON);
+
+        // Decay row — backdate created_at by one half-life, enable the
+        // opt-in, touch, and expect the half-life collapse to ~0.5.
+        let mem = sample_memory(&format!("decay-{unique}"), &ns, "decay-row", "body");
+        let id = store.store(&ctx, &mem).await.expect("store");
+        sqlx::query(
+            "UPDATE memories SET created_at = NOW() - ($2 || ' days')::interval WHERE id = $1",
+        )
+        .bind(&id)
+        .bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("backdate created_at");
+
+        // SAFETY: env set/remove window scoped tightly around the
+        // touch — same precedent as tests/form_5_confidence_calibration.rs.
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let touch_result = store.touch_after_recall(&[id.clone()]).await;
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+        touch_result.expect("touch with decay enabled");
+
+        let got = store.get(&ctx, &id).await.expect("get decayed row");
+        assert_eq!(
+            got.confidence_source,
+            ConfidenceSource::Decayed,
+            "decay touch must flip provenance to 'decayed'"
+        );
+        assert!(
+            got.confidence_decayed_at.is_some(),
+            "decay touch must stamp confidence_decayed_at"
+        );
+        assert!(
+            (got.confidence - 0.5).abs() < 0.02,
+            "one half-life of age must collapse confidence to ~0.5, got {}",
+            got.confidence
+        );
     }
 
     #[tokio::test]

@@ -66,6 +66,14 @@ fn install_security_bypass_for_legacy_tests() {
                 "1",
             );
         }
+        // #1570 — the lib-tier admin-gate tests model an AUTHENTICATED
+        // deployment (the pre-#1570 implicit posture). Mark request
+        // authn configured so the admin-role gate honors the header
+        // role claims these legacy tests assert. The #1570 secure
+        // default (bare header on an unauthenticated deployment →
+        // 403) is pinned by `tests/admin_header_trust_1570.rs` in its
+        // own process, where this marker is never set.
+        crate::handlers::admin_role::mark_request_authn_configured(true);
     });
 }
 

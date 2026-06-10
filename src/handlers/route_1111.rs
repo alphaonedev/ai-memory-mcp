@@ -483,7 +483,9 @@ pub async fn handle_replay_http(
         obj.insert("agent_id".to_string(), Value::String(caller.clone()));
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_replay(&lock.0, &owned, Some(&caller));
+    // #1571 — the header-attributed principal is the bound caller; the
+    // body `agent_id` was already forced to match above.
+    let result = crate::mcp::handle_replay(&lock.0, &owned, None, Some(&caller));
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),

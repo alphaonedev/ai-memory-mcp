@@ -42,6 +42,12 @@ fn fresh_dir() -> TempDir {
 
 /// Build an HTTP test fixture with the supplied admin allowlist.
 fn build_router_with_admin_allowlist(admins: Vec<String>) -> (axum::Router, NamedTempFile) {
+    // #1570 — these tests model an AUTHENTICATED deployment (api_key
+    // configured at boot), the pre-#1570 implicit posture, so the admin
+    // header role-claims they assert keep working. The #1570 secure
+    // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+    // is pinned by tests/admin_header_trust_1570.rs in its own process.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");

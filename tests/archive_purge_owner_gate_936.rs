@@ -127,6 +127,12 @@ fn build_router_fixture_with_admin(
     db_path: &std::path::Path,
     admin_ids: Vec<String>,
 ) -> axum::Router {
+    // #1570 — these tests model an AUTHENTICATED deployment (api_key
+    // configured at boot), the pre-#1570 implicit posture, so the admin
+    // header role-claims they assert keep working. The #1570 secure
+    // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+    // is pinned by tests/admin_header_trust_1570.rs in its own process.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let conn = ai_memory::db::open(db_path).expect("reopen for AppState");
     let db: Db = Arc::new(Mutex::new((
         conn,
