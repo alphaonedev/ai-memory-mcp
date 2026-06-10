@@ -3047,6 +3047,187 @@ fn governance_fail_open_on_error() -> bool {
 /// reader above and the operator-facing log hints below (#1558).
 const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR";
 
+/// #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
+/// storage hook (the L1-6 agent-action `memory_write` gate). Extracted
+/// from `bootstrap_serve` so every LONG-LIVED write surface installs
+/// the SAME closure: the HTTP daemon (`serve`) AND the MCP stdio server
+/// (`run_mcp_server`). Pre-#1583 only `serve` installed it, so
+/// operator-configured agent-action rules were silently bypassed for
+/// every MCP-driven write — the primary NHI agent interface.
+///
+/// CLI one-shot binaries (`ai-memory store …`) intentionally do NOT
+/// call this (the L1-6 E operator-as-actor exemption — see
+/// `src/storage/mod.rs` §hook doc + `cli_one_shot_does_not_install_hook`);
+/// the operator's direct substrate ops stay unimpeded by design.
+///
+/// `hook_consultation_conn` MUST be a connection distinct from the
+/// caller's main write connection (the hook fires synchronously from
+/// inside `storage::insert`, which holds the main connection). When it
+/// is `None` (open failed at install time) the hook fails CLOSED per
+/// #1455.
+pub(crate) fn install_governance_pre_write_hook(
+    db_path: &Path,
+    deferred_audit_queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    rule_cache: &Arc<crate::governance::rule_cache::RuleCache>,
+    hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+) {
+    use crate::governance::agent_action::{
+        AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
+    };
+    let rules_db_path = db_path.to_path_buf();
+    let queue_for_hook = deferred_audit_queue.clone();
+    let cache_for_hook = Arc::clone(rule_cache);
+    let conn_for_hook = hook_consultation_conn;
+    let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
+        move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
+            let action = AgentAction::Custom {
+                custom_kind: "memory_write".to_string(),
+                payload: serde_json::json!({
+                    "namespace": mem.namespace,
+                    "tier": mem.tier.as_str(),
+                    (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
+                    "title": mem.title,
+                }),
+            };
+            // Resolve the agent_id from the memory's metadata
+            // (every substrate-written memory carries it under
+            // `metadata.agent_id` — see CLAUDE.md §"Agent
+            // Identity"). Fall back to a stable hook-source tag
+            // when the metadata key is missing so the audit row
+            // still attributes the refusal.
+            let agent_id = mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("substrate:pre_write_hook")
+                .to_string();
+            let Some(conn_arc) = conn_for_hook.as_ref() else {
+                // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the hook
+                // consultation connection could not be opened at
+                // install time. The pre-#1455 posture degraded to
+                // ALLOW, which meant a daemon that lost its rules DB
+                // at boot (permissions flip, disk pressure, an
+                // attacker who can make `db::open` fail) silently
+                // disabled the entire substrate write-gate while
+                // continuing to accept writes. That is the same
+                // bypass class #1054 closed for consultation ERRORS;
+                // an unavailable connection is just a permanent
+                // consultation failure and gets the same secure
+                // default + the same operator escape hatch.
+                return governance_consultation_unavailable(
+                    &queue_for_hook,
+                    &agent_id,
+                    &action,
+                    &rules_db_path,
+                    "L1-6 governance pre-write",
+                );
+            };
+            let conn_guard = match conn_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "L1-6 governance pre-write: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let conn_for_check: &rusqlite::Connection = &conn_guard;
+            match check_agent_action_deferred_cached(
+                conn_for_check,
+                Some(&cache_for_hook),
+                &agent_id,
+                &action,
+                &queue_for_hook,
+            ) {
+                Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                    tracing::info!(
+                        "L1-6 governance pre-write refused namespace={:?} rule_id={} \
+                             reason={} (chain-logged via deferred audit queue)",
+                        mem.namespace,
+                        rule_id,
+                        reason
+                    );
+                    Err(reason)
+                }
+                Err(e) => {
+                    // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
+                    // rule-consultation error and chain-log the
+                    // refusal so an attacker who can induce
+                    // consultation errors (concurrent PRAGMA
+                    // wal_checkpoint, ATTACH-as-readonly
+                    // contention, etc.) cannot race a refused
+                    // write through the gate. The pre-#1054
+                    // posture degraded to ALLOW, which made the
+                    // gate dependent on the rule consultation
+                    // never erroring — a fragile invariant.
+                    //
+                    // Operators with a legitimate need for the
+                    // legacy fail-open posture (e.g. during a
+                    // chaos-test window where transient SQL
+                    // pressure is expected) can opt back in via
+                    // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+                    // The unsafe override is logged at WARN on
+                    // every fire and counts toward the
+                    // governance posture surface so an audit can
+                    // detect the legacy-permissive mode.
+                    let reason = format!("governance:consultation_failed: {e}");
+                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    // Emit a governance.refusal-shaped row to the
+                    // deferred audit queue regardless of the
+                    // open/closed decision so the audit chain
+                    // captures the consultation failure either
+                    // way. The synthetic Decision::Refuse uses
+                    // rule_id=`governance:consultation_failed` so
+                    // a downstream auditor can distinguish
+                    // "no rule fired" from "consultation broke".
+                    let synthetic_refusal = RuleDecision::Refuse {
+                        rule_id: "governance:consultation_failed".to_string(),
+                        reason: reason.clone(),
+                    };
+                    queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
+                    if fail_open {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: rule consultation failed: {}; \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                                 degrading to ALLOW (UNSAFE, legacy posture)",
+                            e
+                        );
+                        Ok(())
+                    } else {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: rule consultation failed: {}; \
+                                 failing CLOSED (post-#1054 secure default — \
+                                 set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                            e
+                        );
+                        Err(reason)
+                    }
+                }
+            }
+        },
+    ));
+    if install_result.is_err() {
+        // Already installed — happens if the same process boots a
+        // write surface twice (test reuse via `bootstrap_serve`, or a
+        // process that runs both `serve` and `mcp`). The OnceLock
+        // contract guarantees the FIRST installed closure wins; we log
+        // and proceed rather than abort.
+        tracing::debug!(
+            "L1-6 governance pre-write hook already installed (process-wide OnceLock); \
+             the existing hook remains active for this process"
+        );
+    } else {
+        tracing::info!(
+            "L1-6 governance pre-write hook installed (substrate-authoritative \
+             memory_write gate active + deferred chain-log on refusal)"
+        );
+    }
+}
+
 /// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
 /// where a governance hook's rule-consultation connection could not be
 /// opened at install time. Chain-logs a synthetic
@@ -3354,162 +3535,17 @@ pub async fn bootstrap_serve(
             }
         };
 
-    {
-        use crate::governance::agent_action::{
-            AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
-        };
-        let rules_db_path = db_path.to_path_buf();
-        let queue_for_hook = deferred_audit_queue.clone();
-        let cache_for_hook = Arc::clone(&rule_cache);
-        let conn_for_hook = hook_consultation_conn.clone();
-        let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
-            move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
-                let action = AgentAction::Custom {
-                    custom_kind: "memory_write".to_string(),
-                    payload: serde_json::json!({
-                        "namespace": mem.namespace,
-                        "tier": mem.tier.as_str(),
-                        (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
-                        "title": mem.title,
-                    }),
-                };
-                // Resolve the agent_id from the memory's metadata
-                // (every substrate-written memory carries it under
-                // `metadata.agent_id` — see CLAUDE.md §"Agent
-                // Identity"). Fall back to a stable hook-source tag
-                // when the metadata key is missing so the audit row
-                // still attributes the refusal.
-                let agent_id = mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("substrate:pre_write_hook")
-                    .to_string();
-                let Some(conn_arc) = conn_for_hook.as_ref() else {
-                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the hook
-                    // consultation connection could not be opened at
-                    // install time. The pre-#1455 posture degraded to
-                    // ALLOW, which meant a daemon that lost its rules DB
-                    // at boot (permissions flip, disk pressure, an
-                    // attacker who can make `db::open` fail) silently
-                    // disabled the entire substrate write-gate while
-                    // continuing to accept writes. That is the same
-                    // bypass class #1054 closed for consultation ERRORS;
-                    // an unavailable connection is just a permanent
-                    // consultation failure and gets the same secure
-                    // default + the same operator escape hatch.
-                    return governance_consultation_unavailable(
-                        &queue_for_hook,
-                        &agent_id,
-                        &action,
-                        &rules_db_path,
-                        "L1-6 governance pre-write",
-                    );
-                };
-                let conn_guard = match conn_arc.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "L1-6 governance pre-write: consultation connection mutex poisoned; \
-                             recovering inner connection and continuing"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let conn_for_check: &rusqlite::Connection = &conn_guard;
-                match check_agent_action_deferred_cached(
-                    conn_for_check,
-                    Some(&cache_for_hook),
-                    &agent_id,
-                    &action,
-                    &queue_for_hook,
-                ) {
-                    Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
-                    Ok(RuleDecision::Refuse { rule_id, reason }) => {
-                        tracing::info!(
-                            "L1-6 governance pre-write refused namespace={:?} rule_id={} \
-                             reason={} (chain-logged via deferred audit queue)",
-                            mem.namespace,
-                            rule_id,
-                            reason
-                        );
-                        Err(reason)
-                    }
-                    Err(e) => {
-                        // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
-                        // rule-consultation error and chain-log the
-                        // refusal so an attacker who can induce
-                        // consultation errors (concurrent PRAGMA
-                        // wal_checkpoint, ATTACH-as-readonly
-                        // contention, etc.) cannot race a refused
-                        // write through the gate. The pre-#1054
-                        // posture degraded to ALLOW, which made the
-                        // gate dependent on the rule consultation
-                        // never erroring — a fragile invariant.
-                        //
-                        // Operators with a legitimate need for the
-                        // legacy fail-open posture (e.g. during a
-                        // chaos-test window where transient SQL
-                        // pressure is expected) can opt back in via
-                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
-                        // The unsafe override is logged at WARN on
-                        // every fire and counts toward the
-                        // governance posture surface so an audit can
-                        // detect the legacy-permissive mode.
-                        let reason = format!("governance:consultation_failed: {e}");
-                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        // Emit a governance.refusal-shaped row to the
-                        // deferred audit queue regardless of the
-                        // open/closed decision so the audit chain
-                        // captures the consultation failure either
-                        // way. The synthetic Decision::Refuse uses
-                        // rule_id=`governance:consultation_failed` so
-                        // a downstream auditor can distinguish
-                        // "no rule fired" from "consultation broke".
-                        let synthetic_refusal = RuleDecision::Refuse {
-                            rule_id: "governance:consultation_failed".to_string(),
-                            reason: reason.clone(),
-                        };
-                        queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
-                        if fail_open {
-                            tracing::warn!(
-                                "L1-6 governance pre-write: rule consultation failed: {}; \
-                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
-                                 degrading to ALLOW (UNSAFE, legacy posture)",
-                                e
-                            );
-                            Ok(())
-                        } else {
-                            tracing::warn!(
-                                "L1-6 governance pre-write: rule consultation failed: {}; \
-                                 failing CLOSED (post-#1054 secure default — \
-                                 set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
-                                e
-                            );
-                            Err(reason)
-                        }
-                    }
-                }
-            },
-        ));
-        if install_result.is_err() {
-            // Already installed — happens if the same process boots
-            // `serve` twice (test reuse via `bootstrap_serve`). The
-            // OnceLock contract guarantees the installed closure
-            // wins; we log and proceed rather than abort.
-            tracing::debug!(
-                "L1-6 governance pre-write hook already installed (process-wide OnceLock); \
-                 the existing hook remains active for this daemon"
-            );
-        } else {
-            tracing::info!(
-                "L1-6 governance pre-write hook installed (substrate-authoritative \
-                 memory_write gate active + deferred chain-log on refusal)"
-            );
-        }
-    }
+    // #1582/#1583 (SEC) — the substrate pre-write gate is installed via
+    // the shared helper so EVERY long-lived write surface installs the
+    // SAME closure. `serve` (here) and `mcp` (`run_mcp_server`) both call
+    // it; CLI one-shot binaries intentionally do NOT (the L1-6 E
+    // operator-as-actor exemption — see the helper's doc).
+    install_governance_pre_write_hook(
+        db_path,
+        &deferred_audit_queue,
+        &rule_cache,
+        hook_consultation_conn.clone(),
+    );
 
     // v0.7.0 (issue #691 fold-1) — install the universal AgentAction
     // wire-point hook BEFORE any daemon-side write/network/spawn paths

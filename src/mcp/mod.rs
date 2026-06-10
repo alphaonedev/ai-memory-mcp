@@ -2668,6 +2668,42 @@ pub fn run_mcp_server(
         .try_init();
 
     let mut conn = db::open(db_path)?;
+
+    // #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
+    // agent-action gate on the MCP write surface. Pre-#1583 the hook
+    // was installed ONLY by the HTTP daemon (`bootstrap_serve`), so an
+    // operator's `memory_write` agent-action rules were silently
+    // bypassed for every MCP-driven `memory_store` / `memory_consolidate`
+    // / `memory_reflect` — the primary NHI agent interface. (Namespace
+    // CorePolicy standards were always enforced via `db::enforce_governance`
+    // on the store path; this closes the SEPARATE agent-action layer.)
+    //
+    // The hook fires synchronously from inside `storage::insert`, which
+    // borrows `conn`, so it needs its OWN consultation connection. When
+    // that open fails the hook fails CLOSED (#1455). The deferred-audit
+    // drainer chain-logs refusals; its supervisor thread is detached for
+    // the lifetime of the MCP process.
+    let (mcp_governance_queue, _mcp_governance_supervisor) =
+        crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+    let mcp_rule_cache = std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new());
+    let mcp_hook_conn: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> =
+        match db::open(db_path) {
+            Ok(c) => Some(std::sync::Arc::new(std::sync::Mutex::new(c))),
+            Err(e) => {
+                eprintln!(
+                    "ai-memory: #1583 — failed to open governance consultation connection \
+                     ({e}); the pre-write gate will fail CLOSED on every MCP write"
+                );
+                None
+            }
+        };
+    crate::daemon_runtime::install_governance_pre_write_hook(
+        db_path,
+        &mcp_governance_queue,
+        &mcp_rule_cache,
+        mcp_hook_conn,
+    );
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
