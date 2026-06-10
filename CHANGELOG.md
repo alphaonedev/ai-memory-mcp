@@ -105,6 +105,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via the LLM-agnostic backend (§2.7) but does not *attest* it. Tracked
   under [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
 
+### v0.7.0 #1579 performance final-gate remediation train (2026-06-10)
+
+The operator-mandated pre-tag performance audit ([#1579](https://github.com/alphaonedev/ai-memory-mcp/issues/1579), four parallel audit agents over local sqlite/MCP, HTTP daemon, postgres SAL, and the live do-1461 fleet) produced a 16-item remediation train — Tier A (5) + Tier B (10) + [#1581](https://github.com/alphaonedev/ai-memory-mcp/issues/1581) — executed across six worktree lanes, each operator-QC'd before its `--no-ff` merge. Schema advances **v55 → v56 → v57**. Tier C ([#1580](https://github.com/alphaonedev/ai-memory-mcp/issues/1580) WAL read-pool) moves to v0.8; Tier D ([#1005](https://github.com/alphaonedev/ai-memory-mcp/issues/1005) vectorlite) to v0.9.
+
+#### Security
+
+- **A3 — store-URL credential redaction.** The postgres boot line logged the full `--store-url` (password included) to journald at INFO, and six more error/CLI sites echoed the raw URL. New `logging::redact_url_password` / `redact_urls_in_message` mask the userinfo password to `****` at every store-URL log/error/report site; deliberately textual so malformed URLs still scrub. Pinned by 10 regression tests incl. the boot-log pin.
+
+#### Performance
+
+- **A1 — double-embed dedupe on the MCP store path** (writepath lane): the store path computed the same embedding twice per write; store p95 **147 → 106 ms** measured.
+- **A2 — composite list indexes + sargable `storage::list`** (schema **v56**): `idx_memories_list_order`, `idx_memories_ns_list_order`, `idx_archived_ns_archived_at` paired with distinct prepared filter shapes — list page **141 ms → 0.06 ms at 100k rows (~2000×; 156× at 10k)**.
+- **A4 — postgres backfill no-op fix**: the serve-boot embedding-backfill sweep now drains `MemoryStore::list_unembedded` through the daemon embedder (the postgres surface previously never ran ANY backfill — fleet semantic recall was effectively dead at 0.46% embedding coverage post-v29).
+- **A5 — HNSW-routed proactive conflict check + false-409 fix**: the #519 write-path near-dup check swaps the O(N)-scan-under-mutex for an ANN-candidate route with a Jaccard-floor verdict tail (81% false-409 class closed); empty-index boot routes to a bounded recency scan.
+- **B1 ([#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)) — embed-once-replicate-vector**: `sync_push` ships the sender's stored vector with the row, so receivers no longer synchronously re-embed (~1 s/row) on federation receive — **~10× design lift** on federated ingest; receive-path parity + signed-envelope coverage included.
+- **B2 — postgres stored generated tsvector** (schema **v57**): `tsv tsvector GENERATED ALWAYS … STORED` + `memories_tsv_gin`, match AND rank read the column — kills the per-matched-row `ts_rank` recompute (~305 of 306 ms at 8k rows; **PG recall ~62×**); legacy expression index dropped. Operational: the `ADD COLUMN` is an ACCESS-EXCLUSIVE table rewrite (sub-second at fleet scale).
+- **B3 — async boot HNSW warm-up**: `serve` + `mcp` become ready immediately (empty index + background build + atomic swap; **~200× time-to-ready**, was 40 s @10k / >28 min @100k rows); documented warm-window semantics + readiness lines.
+- **B4 — gzip + TOON over HTTP**: `tower-http` CompressionLayer (gzip, `Accept-Encoding`-negotiated, SSE exempt) — **4.6× measured** on recall payloads; recall/search accept `format=json|toon|toon_compact` reusing the MCP TOON encoder (`toon_compact` ≈ 79% smaller than the JSON envelope).
+- **B5 — persistent federation connections + adaptive DLQ drain**: pooled keep-alive peer clients; DLQ replay takes `min(backlog, AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH)` (default 2048, floor 64) per tick, replacing the fixed-64 take whose ceiling (128 rows/min/peer) made the #1578 62k-row backlog an 8+ hour drain.
+- **B6 — storage scale bundle**: bounded backfill scan (`get_unembedded_ids_batch` drain loop), `prepare_cached` hot statements, chunked GC transactions, archive composite index.
+- **B7 — sqlite `PRAGMA mmap_size`** default 256 MiB (new env `AI_MEMORY_DB_MMAP_SIZE`, `[storage].db_mmap_size_bytes`): the only across-the-board PRAGMA win in the A/B (15-30% on large-corpus reads).
+- **B8 — corpus-scale bench gate**: `ai-memory bench --scale <rows>` seeds a scratch corpus and gates against the `PERFORMANCE.md` §"Corpus-scale budgets" table (`SCALE_BUDGETS` SSOT); CI runs the 10k gate on every PR (the default ~500-row workload had hidden a 7× recall budget blowout at 100k rows).
+- **B10 — reranker auto-select**: `BatchedReranker::rerank` picks direct vs coalesced per call (`use_batched_rerank_path`); lexical / lone-caller traffic skips the 5 ms flush window (forced-batched was ~12× slower at N=8 lexical), neural-under-concurrency keeps the G9 ~3× batched win.
+- **[#1581](https://github.com/alphaonedev/ai-memory-mcp/issues/1581) — mTLS first-request stall**: `TCP_NODELAY` on accepted TLS sockets — **~40 ms → ~3 ms** first-request latency on real cross-region pairs.
+
+#### Infrastructure
+
+- **B9 — fleet ops bundle** (deploy-time, no code branch): PG `shared_buffers`/`work_mem`/`pg_stat_statements` tuning, `LOAD 'age'` grants on receivers, DLQ quarantine drain, fleet corpus re-embed — applied with the binary swap.
+- **New QC gate**: `scripts/check-const-name-literals.sh` HARD-BLOCKs value-encoding identifier names (e.g. `CHUNK_500 = 500`); its 9-entry grandfather baseline was **burned to empty** at train close.
+- New env vars: `AI_MEMORY_DB_MMAP_SIZE` (row 70), `AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH` (row 71) — census table + precedence tests updated.
+
 ### v0.7.0 #1558 hardcoded-literal SSOT remediation campaign (2026-06-09)
 
 Five-batch burn-down of duplicated string/numeric literals across the substrate ([#1558](https://github.com/alphaonedev/ai-memory-mcp/issues/1558)), enforced going forward by the pm-v3.1 mechanical ratchet gate `scripts/check-hardcoded-literals.sh` (companion to `scripts/check-vendor-literals.sh`; baseline counts may only shrink). Predominantly behavior-preserving; wire-visible exceptions are under **Changed**.
@@ -128,7 +159,7 @@ Five-batch burn-down of duplicated string/numeric literals across the substrate 
 
 #### Documentation
 
-- Federation operational findings (documented posture, no code change): [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565) — the default `--quorum-timeout-ms 2000` is same-DC-tuned; cross-region quorum pushes hit `deadline_exceeded` → DLQ, and the reference 3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000` (`deploy/do-1461/provision/lib.sh`). [#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566) — an embedding-dimension migration NULLs stored vectors, so receivers synchronously re-embed on federation receive (~1 s/row), inflating quorum latency + DLQ pressure during the backfill window.
+- Federation operational findings (documented posture, no code change): [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565) — the default `--quorum-timeout-ms 2000` is same-DC-tuned; cross-region quorum pushes hit `deadline_exceeded` → DLQ, and the reference 3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000` (`deploy/do-1461/provision/lib.sh`). [#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566) — an embedding-dimension migration NULLs stored vectors, and receivers used to synchronously re-embed on federation receive (~1 s/row), inflating quorum latency + DLQ pressure during the backfill window. **Resolved by the #1579 train (B1 embed-once-replicate-vector, 2026-06-10):** `sync_push` now ships the sender's stored vector with the row, so the receive path no longer re-embeds.
 
 ### v0.7.0 postgres write-path scaling — #1472 epic + #1473 read-path sibling (2026-06-02/03)
 
