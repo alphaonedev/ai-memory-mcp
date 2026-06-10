@@ -379,7 +379,7 @@ pub fn recover_from_transcript(
             continue;
         }
 
-        let Ok(sha_bytes) = hex::decode(&turn.line_sha256_hex) else {
+        let Ok(raw_sha_bytes) = hex::decode(&turn.line_sha256_hex) else {
             report.errors.push(format!(
                 "skipping turn with malformed sha256: {}",
                 turn.line_sha256_hex
@@ -387,14 +387,19 @@ pub fn recover_from_transcript(
             continue;
         };
 
-        let already: Option<String> = conn
-            .query_row(
-                "SELECT memory_id FROM transcript_line_dedup WHERE sha256 = ?1",
-                rusqlite::params![&sha_bytes],
-                |row| row.get(0),
-            )
-            .optional()
-            .unwrap_or(None);
+        // #1573 — dedup key. The canonical key is
+        // `(host_session_id, host_turn_index)` when the host format
+        // provides both (parity with the L4 `memory_capture_turn`
+        // idempotency contract); otherwise the NORMALIZED-content
+        // hash, which is invariant under host re-serialization
+        // (whitespace, JSON key order). Pre-#1573 the key was the
+        // raw-line sha256 only, so the same turn re-serialized by a
+        // host upgrade re-atomised into a duplicate memory. The
+        // raw-line hash is still probed so rows written by pre-#1573
+        // recoveries keep deduping across the upgrade.
+        let sha_bytes =
+            hex::decode(turn.normalized_sha256_hex()).unwrap_or_else(|_| raw_sha_bytes.clone());
+        let already = find_existing_dedup(&conn, &turn, &raw_sha_bytes, &sha_bytes);
         if already.is_some() {
             report.lines_skipped_dedup += 1;
             continue;
@@ -429,15 +434,50 @@ pub fn recover_from_transcript(
     Ok(report)
 }
 
-/// Stable wire string for a parsed turn's role.
+/// Stable wire string for a parsed turn's role. Delegates to the
+/// [`parsers::TurnRole::as_str`] SSOT shared with the #1573
+/// normalized dedup hash.
 fn role_label(role: parsers::TurnRole) -> &'static str {
-    match role {
-        parsers::TurnRole::User => "user",
-        parsers::TurnRole::Assistant => "assistant",
-        parsers::TurnRole::ToolUse => "tool_use",
-        parsers::TurnRole::ToolResult => "tool_result",
-        parsers::TurnRole::Other => "other",
+    role.as_str()
+}
+
+/// #1573 — probe `transcript_line_dedup` for an existing capture of
+/// this turn. Checks, in order:
+///
+/// 1. `(host_session_id, host_turn_index)` — the canonical key when
+///    the host format provides both; also bridges to rows the L4
+///    `memory_capture_turn` path wrote for the same turn.
+/// 2. `sha256 IN (normalized, raw-line)` — the normalized-content
+///    hash this version writes, plus the raw-line hash pre-#1573
+///    recoveries wrote, so an upgrade never re-atomises
+///    already-recovered turns.
+fn find_existing_dedup(
+    conn: &rusqlite::Connection,
+    turn: &parsers::ParsedTurn,
+    raw_sha: &[u8],
+    norm_sha: &[u8],
+) -> Option<String> {
+    if let (Some(sid), Some(tix)) = (turn.host_session_id.as_deref(), turn.host_turn_index) {
+        let hit: Option<String> = conn
+            .query_row(
+                "SELECT memory_id FROM transcript_line_dedup \
+                 WHERE host_session_id = ?1 AND host_turn_index = ?2",
+                rusqlite::params![sid, tix],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if hit.is_some() {
+            return hit;
+        }
     }
+    conn.query_row(
+        "SELECT memory_id FROM transcript_line_dedup WHERE sha256 IN (?1, ?2)",
+        rusqlite::params![norm_sha, raw_sha],
+        |row| row.get(0),
+    )
+    .optional()
+    .unwrap_or(None)
 }
 
 /// Write one recovered transcript turn as an `observation` memory plus
@@ -539,16 +579,22 @@ fn write_recovered_turn(
         let inserted_id =
             crate::storage::insert(conn, &mem).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
         let recovered_at_ms = chrono::Utc::now().timestamp_millis();
+        // #1573 — `sha_bytes` is the normalized-content hash and the
+        // session/turn identity columns are populated when the host
+        // format provided them, so future recoveries (and the L4
+        // capture path) can dedup on the canonical composite key.
         conn.execute(
             "INSERT INTO transcript_line_dedup \
              (sha256, memory_id, host_kind, transcript_path, \
               host_session_id, host_turn_index, recovered_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 sha_bytes,
                 inserted_id,
                 host_kind,
                 transcript_path.display().to_string(),
+                turn.host_session_id,
+                turn.host_turn_index,
                 recovered_at_ms,
             ],
         )
@@ -727,6 +773,108 @@ mod tests {
         let report = recover_from_transcript(&db, &base_opts(transcript, "ai:test:fast")).unwrap();
         assert!(report.fast_path_hit, "expected fast-path short-circuit");
         assert_eq!(report.lines_atomised, 0);
+    }
+
+    /// #1573 — the same turn re-serialized by the host with different
+    /// whitespace and JSON key order MUST dedup. Pre-fix the dedup key
+    /// was the raw-line sha256, so any byte-level re-serialization
+    /// re-atomised the turn into a duplicate memory.
+    #[test]
+    fn reserialized_turn_different_whitespace_key_order_dedups_1573() {
+        // Semantically identical to USER_LINE_1 (same sessionId-less
+        // shape, same timestamp/role/content) but with reordered keys
+        // and extra whitespace — different raw bytes, same turn.
+        const USER_LINE_1_RESERIALIZED: &str = r#"{ "type": "user",  "message": {"content": [ {"text": "operator directive one", "type": "text"} ]}, "timestamp": "2026-05-28T12:00:00Z" }"#;
+
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let t1 = write_transcript(dir.path(), &[USER_LINE_1]);
+        let first = recover_from_transcript(&db, &base_opts(t1, "ai:test:reser")).unwrap();
+        assert_eq!(first.lines_atomised, 1);
+
+        // Same turn, re-serialized. Must be a dedup skip, not a new memory.
+        let p2 = dir.path().join("session-reserialized.jsonl");
+        std::fs::write(&p2, format!("{USER_LINE_1_RESERIALIZED}\n")).unwrap();
+        let second = recover_from_transcript(&db, &base_opts(p2, "ai:test:reser")).unwrap();
+        assert_eq!(
+            second.lines_atomised, 0,
+            "re-serialized turn must not re-atomise: {second:?}"
+        );
+        assert_eq!(second.lines_skipped_dedup, 1);
+        assert!(second.memories_created.is_empty());
+    }
+
+    /// #1573 — `(host_session_id, host_turn_index)` is the canonical
+    /// dedup key when the host provides both (parity with the L4
+    /// `memory_capture_turn` idempotency contract), and rows written
+    /// by pre-#1573 recoveries (raw-line sha256) still dedup.
+    #[test]
+    fn session_turn_composite_key_and_raw_sha_backcompat_dedup_1573() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let conn = crate::storage::open(&db).unwrap();
+
+        let turn = parsers::ParsedTurn {
+            timestamp_iso: "2026-05-28T12:00:00Z".to_string(),
+            role: parsers::TurnRole::User,
+            content_text: "operator directive one".to_string(),
+            tool_calls: vec![],
+            line_sha256_hex: "aa".repeat(32),
+            host_session_id: Some("sess-1573".to_string()),
+            host_turn_index: Some(3),
+        };
+        let raw_sha = hex::decode(&turn.line_sha256_hex).unwrap();
+        let norm_sha = hex::decode(turn.normalized_sha256_hex()).unwrap();
+
+        // Nothing recorded yet — no hit on any key.
+        assert!(find_existing_dedup(&conn, &turn, &raw_sha, &norm_sha).is_none());
+
+        // An L4-style row for the same (session, turn) under a DIFFERENT
+        // sha (the L4 payload hash) — the composite key must hit.
+        conn.execute(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, 'mem-l4', 'claude-code', NULL, 'sess-1573', 3, 0)",
+            rusqlite::params![vec![0x01_u8; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            find_existing_dedup(&conn, &turn, &raw_sha, &norm_sha).as_deref(),
+            Some("mem-l4"),
+            "composite (host_session_id, host_turn_index) key must dedup"
+        );
+
+        // A different turn index of the same session must NOT hit.
+        let other = parsers::ParsedTurn {
+            host_turn_index: Some(4),
+            content_text: "operator directive two".to_string(),
+            ..turn.clone()
+        };
+        let other_norm = hex::decode(other.normalized_sha256_hex()).unwrap();
+        assert!(find_existing_dedup(&conn, &other, &raw_sha, &other_norm).is_none());
+
+        // Back-compat: a pre-#1573 row keyed on the RAW line sha (NULL
+        // session columns) must still dedup the same turn.
+        let legacy = parsers::ParsedTurn {
+            host_session_id: None,
+            host_turn_index: None,
+            ..turn.clone()
+        };
+        conn.execute(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, 'mem-legacy', 'claude-code', NULL, NULL, NULL, 0)",
+            rusqlite::params![&raw_sha],
+        )
+        .unwrap();
+        let legacy_norm = hex::decode(legacy.normalized_sha256_hex()).unwrap();
+        assert_eq!(
+            find_existing_dedup(&conn, &legacy, &raw_sha, &legacy_norm).as_deref(),
+            Some("mem-legacy"),
+            "pre-#1573 raw-line sha rows must keep deduping"
+        );
     }
 
     #[test]

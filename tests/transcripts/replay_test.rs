@@ -114,6 +114,7 @@ fn reflection_with_three_sources_returns_union_of_four_transcripts() {
         &conn,
         &json!({"memory_id": "ref-1", "agent_id": TEST_AGENT}),
         None,
+        None,
     )
     .expect("replay against reflection succeeds");
     assert_eq!(payload["count"], 4, "self + 3 source transcripts");
@@ -179,6 +180,7 @@ fn depth_cap_bounds_chain_walk_via_handler() {
         &conn,
         &json!({"memory_id": "ref-top", "agent_id": TEST_AGENT}),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(full["count"], 3);
@@ -188,6 +190,7 @@ fn depth_cap_bounds_chain_walk_via_handler() {
         &conn,
         &json!({"memory_id": "ref-top", "depth": 2, "agent_id": TEST_AGENT}),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(depth2["count"], 3);
@@ -196,6 +199,7 @@ fn depth_cap_bounds_chain_walk_via_handler() {
     let depth1 = mcp::handle_replay(
         &conn,
         &json!({"memory_id": "ref-top", "depth": 1, "agent_id": TEST_AGENT}),
+        None,
         None,
     )
     .unwrap();
@@ -214,6 +218,7 @@ fn depth_cap_bounds_chain_walk_via_handler() {
     let depth0 = mcp::handle_replay(
         &conn,
         &json!({"memory_id": "ref-top", "depth": 0, "agent_id": TEST_AGENT}),
+        None,
         None,
     )
     .unwrap();
@@ -244,6 +249,7 @@ fn non_reflection_replay_shape_unchanged_by_l2_4() {
         &conn,
         &json!({"memory_id": "obs-1", "agent_id": TEST_AGENT}),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(payload["count"], 1);
@@ -256,6 +262,7 @@ fn non_reflection_replay_shape_unchanged_by_l2_4() {
     let payload = mcp::handle_replay(
         &conn,
         &json!({"memory_id": "obs-1", "depth": 99, "agent_id": TEST_AGENT}),
+        None,
         None,
     )
     .unwrap();
@@ -283,6 +290,7 @@ fn cycle_in_reflects_on_does_not_loop_forever_via_handler() {
     let payload = mcp::handle_replay(
         &conn,
         &json!({"memory_id": "ref-a", "agent_id": TEST_AGENT}),
+        None,
         None,
     )
     .unwrap();
@@ -316,6 +324,7 @@ fn negative_depth_clamps_to_self_only() {
         &conn,
         &json!({"memory_id": "ref-top", "depth": -3, "agent_id": TEST_AGENT}),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(payload["count"], 1, "negative depth clamps to 0");
@@ -335,6 +344,7 @@ fn non_integer_depth_is_a_typed_error() {
     let err = mcp::handle_replay(
         &conn,
         &json!({"memory_id": "obs-1", "depth": "many", "agent_id": TEST_AGENT}),
+        None,
         None,
     )
     .expect_err("non-integer depth must error");
@@ -360,6 +370,7 @@ fn verbose_truncation_applies_on_reflection_union() {
         &conn,
         &json!({"memory_id": "ref-top", "agent_id": TEST_AGENT}),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(payload["count"], 1);
@@ -370,6 +381,7 @@ fn verbose_truncation_applies_on_reflection_union() {
     let payload = mcp::handle_replay(
         &conn,
         &json!({"memory_id": "ref-top", "verbose": true, "agent_id": TEST_AGENT}),
+        None,
         None,
     )
     .unwrap();

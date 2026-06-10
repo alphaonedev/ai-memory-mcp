@@ -102,6 +102,46 @@ pub fn would_create_reflection_cycle(
     target_id: &str,
     max_depth: u32,
 ) -> rusqlite::Result<CycleCheckResult> {
+    would_create_reflection_cycle_with(source_id, target_id, max_depth, &mut |node| {
+        forward_neighbors(conn, node)
+    })
+}
+
+/// #1568 (H1 residual) — derive the walk's hard hop ceiling from the
+/// caller's `max_depth` (policy default applied on 0, then the
+/// [`CYCLE_DEPTH_SAFETY_FACTOR`] headroom). Exported so the postgres
+/// SAL adapter can pre-fetch exactly the bounded `reflects_on`
+/// subgraph the generic walker will explore.
+#[must_use]
+pub fn walk_bound(max_depth: u32) -> u32 {
+    let base = if max_depth == 0 {
+        DEFAULT_MAX_DEPTH
+    } else {
+        max_depth
+    };
+    base.saturating_mul(CYCLE_DEPTH_SAFETY_FACTOR)
+}
+
+/// #1568 (H1 residual) — backend-agnostic core of
+/// [`would_create_reflection_cycle`]. The BFS semantics (visited set,
+/// predecessor tracking, fail-CLOSED on depth-ceiling truncation, SQL
+/// errors propagated as `Err`) live HERE, once; backends supply only
+/// the `neighbors` lookup. The sqlite path passes a closure over
+/// `forward_neighbors(conn, _)`; the postgres SAL adapter pre-fetches
+/// the bounded `reflects_on` subgraph via a recursive CTE and passes a
+/// closure over the in-memory adjacency map — so the two adapters
+/// cannot drift on gate semantics.
+///
+/// # Errors
+///
+/// Propagates whatever error the `neighbors` lookup surfaces
+/// (fail-CLOSED — see [`would_create_reflection_cycle`]).
+pub fn would_create_reflection_cycle_with<E>(
+    source_id: &str,
+    target_id: &str,
+    max_depth: u32,
+    neighbors: &mut dyn FnMut(&str) -> Result<Vec<String>, E>,
+) -> Result<CycleCheckResult, E> {
     // Direct self-link is already blocked by `validate_link`; handle it
     // defensively here too so the audit path is always consistent.
     if source_id == target_id {
@@ -111,12 +151,7 @@ pub fn would_create_reflection_cycle(
         });
     }
 
-    let base = if max_depth == 0 {
-        DEFAULT_MAX_DEPTH
-    } else {
-        max_depth
-    };
-    let bound = base.saturating_mul(CYCLE_DEPTH_SAFETY_FACTOR);
+    let bound = walk_bound(max_depth);
 
     // BFS / iterative DFS over the backward reflects_on graph.
     // `visited` prevents revisiting nodes in diamond-shaped subgraphs.
@@ -148,13 +183,13 @@ pub fn would_create_reflection_cycle(
         let mut next_frontier: Vec<String> = Vec::new();
 
         for current in &frontier {
-            // v0.7.0 #1090 — propagate SQL errors as Err. The forward
+            // v0.7.0 #1090 — propagate lookup errors as Err. The forward
             // walk is a substrate-level governance gate; a transient
             // BUSY/LOCKED here MUST surface so the caller refuses the
             // write rather than landing a logically-invalid edge.
-            let neighbors = forward_neighbors(conn, current)?;
+            let step = neighbors(current)?;
 
-            for neighbor in neighbors {
+            for neighbor in step {
                 if neighbor == source_id {
                     // Cycle found: reconstruct path.
                     let path = reconstruct_path(source_id, target_id, current, &predecessor);
@@ -272,6 +307,69 @@ mod tests {
     fn add_reflects_on(conn: &Connection, source_id: &str, target_id: &str) {
         crate::db::create_link(conn, source_id, target_id, "reflects_on")
             .expect("create reflects_on link");
+    }
+
+    // ── #1568 (H1 residual) — backend-agnostic walker over an
+    // in-memory adjacency map, the exact shape the postgres SAL
+    // adapter feeds after its bounded recursive-CTE prefetch. Pins
+    // that the shared core detects cycles and fail-CLOSES on
+    // truncation independent of the rusqlite-bound wrapper.
+
+    fn map_neighbors<'a>(
+        adjacency: &'a std::collections::HashMap<&'static str, Vec<&'static str>>,
+    ) -> impl FnMut(&str) -> Result<Vec<String>, std::convert::Infallible> + 'a {
+        move |node: &str| {
+            Ok(adjacency
+                .get(node)
+                .map(|v| v.iter().map(ToString::to_string).collect())
+                .unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn generic_walker_detects_cycle_over_adjacency_map_1568() {
+        // Existing edges: a→b, b→c. Proposed c→a closes the loop.
+        let adjacency = std::collections::HashMap::from([("a", vec!["b"]), ("b", vec!["c"])]);
+        let mut neighbors = map_neighbors(&adjacency);
+        let hit = would_create_reflection_cycle_with("c", "a", 8, &mut neighbors).expect("ok");
+        assert!(hit.would_cycle, "c→a must close the a→b→c chain");
+        assert_eq!(hit.cycle_path, vec!["c", "a", "b", "c"]);
+
+        // Proposed x→a touches the chain but closes nothing.
+        let legal = would_create_reflection_cycle_with("x", "a", 8, &mut neighbors).expect("ok");
+        assert!(!legal.would_cycle);
+        assert!(legal.cycle_path.is_empty());
+    }
+
+    #[test]
+    fn generic_walker_fails_closed_on_truncation_1568() {
+        // Chain a→b→c→d→e→f→g; cap 2 → bound 4. The walk from g's
+        // perspective: proposed a→g, walk forward from g — frontier
+        // empties immediately (no out-edges from g), legal. Walk for
+        // proposed g→a: forward from a runs 6 hops > bound 4 with
+        // nodes still unexplored → fail CLOSED.
+        let adjacency = std::collections::HashMap::from([
+            ("a", vec!["b"]),
+            ("b", vec!["c"]),
+            ("c", vec!["d"]),
+            ("d", vec!["e"]),
+            ("e", vec!["f"]),
+            ("f", vec!["g"]),
+        ]);
+        let mut neighbors = map_neighbors(&adjacency);
+        let truncated =
+            would_create_reflection_cycle_with("g", "a", 2, &mut neighbors).expect("ok");
+        assert!(
+            truncated.would_cycle,
+            "ceiling reached with non-empty frontier must fail CLOSED"
+        );
+        // Same walk with a high cap resolves fully: g IS reachable
+        // from a, so the proposed g→a edge genuinely closes a cycle.
+        let resolved = would_create_reflection_cycle_with("g", "a", 8, &mut neighbors).expect("ok");
+        assert!(resolved.would_cycle);
+        // And a node OFF the chain with a high cap is legal.
+        let legal = would_create_reflection_cycle_with("zz", "a", 8, &mut neighbors).expect("ok");
+        assert!(!legal.would_cycle);
     }
 
     // ── Unit tests for the internal cycle-check machinery ─────────────

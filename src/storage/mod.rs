@@ -3210,7 +3210,6 @@ pub fn validate_link_pre_create(
     // Pass 2: K9 permission eval. Skip when the caller has already
     // established external attestation (federation peer_attested).
     if !skip_governance {
-        use crate::permissions::{Decision, Op, PermissionContext, Permissions};
         // Link evaluation is scoped to the *source* memory's
         // namespace — matches the MCP path's choice at
         // `src/mcp/tools/link.rs:31`. Missing source memory falls
@@ -3220,36 +3219,56 @@ pub fn validate_link_pre_create(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
-        let ctx = PermissionContext {
-            op: Op::MemoryLink,
-            namespace: link_ns,
-            agent_id: agent_id.to_string(),
-            payload: serde_json::json!({
-                "source_id": source_id,
-                "target_id": target_id,
-                "relation": relation,
-            }),
-        };
-        match Permissions::evaluate(&ctx, &[]) {
-            Decision::Allow | Decision::Modify(_) => {}
-            Decision::Deny(reason) => {
-                // #962 typed envelope. Display preserves
-                // `LINK_PERMISSION_DENIED_ERR_PREFIX`.
-                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
-                    reason,
-                }));
-            }
-            Decision::Ask(prompt) => {
-                // Storage layer has no Ask channel; surface as Deny.
-                // MCP path handles Ask directly via its own pre-call
-                // evaluate (returns the `{"status":"ask"}` envelope).
-                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
-                    reason: format!("ask deferred to storage layer ({prompt})"),
-                }));
-            }
-        }
+        evaluate_link_permission(&link_ns, source_id, target_id, relation, agent_id)
+            .map_err(anyhow::Error::new)?;
     }
     Ok(())
+}
+
+/// #1568 (H1 residual) — backend-agnostic K9 permission evaluation for
+/// a pending link write. This is Pass 2 of [`validate_link_pre_create`]
+/// hoisted into a shared free fn so BOTH adapters consult the same
+/// governance gate: the sqlite path delegates from
+/// `validate_link_pre_create`; the postgres SAL adapter's
+/// `link_internal` (`src/store/postgres.rs`) calls it directly after
+/// resolving the source memory's namespace via SQL. Keeping the
+/// evaluation here means the two backends cannot drift on link
+/// governance semantics.
+///
+/// # Errors
+///
+/// Returns [`StorageError::LinkPermissionDenied`] (Display preserves
+/// [`LINK_PERMISSION_DENIED_ERR_PREFIX`]) on `Deny`, and on `Ask` —
+/// the storage layer has no Ask channel; entry points that want
+/// interactive Ask handling (MCP) run `Permissions::evaluate`
+/// themselves BEFORE the storage write.
+pub(crate) fn evaluate_link_permission(
+    link_ns: &str,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    agent_id: &str,
+) -> std::result::Result<(), StorageError> {
+    use crate::permissions::{Decision, Op, PermissionContext, Permissions};
+    let ctx = PermissionContext {
+        op: Op::MemoryLink,
+        namespace: link_ns.to_string(),
+        agent_id: agent_id.to_string(),
+        payload: serde_json::json!({
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": relation,
+        }),
+    };
+    match Permissions::evaluate(&ctx, &[]) {
+        Decision::Allow | Decision::Modify(_) => Ok(()),
+        // #962 typed envelope. Display preserves
+        // `LINK_PERMISSION_DENIED_ERR_PREFIX`.
+        Decision::Deny(reason) => Err(StorageError::LinkPermissionDenied { reason }),
+        Decision::Ask(prompt) => Err(StorageError::LinkPermissionDenied {
+            reason: format!("ask deferred to storage layer ({prompt})"),
+        }),
+    }
 }
 
 /// Insert a directional `(source_id, target_id, relation)` link.
@@ -4153,6 +4172,19 @@ pub fn get_taxonomy(
     let effective_depth = max_depth.min(MAX_NAMESPACE_DEPTH);
 
     let prefix = namespace_prefix.unwrap_or("");
+    // #1531 L5 — `validate_namespace` deliberately places no per-segment
+    // character restriction (historical flexibility), so a stored
+    // namespace/prefix may contain the LIKE metacharacters `%` / `_`.
+    // Escape the descendant pattern (mirroring the visibility clause at
+    // the top of this file and the postgres `taxonomy_namespaces`
+    // twin) so a prefix like `a%` cannot over-match `aX/...` subtrees.
+    let descendant_pattern = format!(
+        "{}/%",
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
 
     // Total count for the prefix is computed independently of the
     // truncated row walk so the caller-visible total stays honest even
@@ -4168,8 +4200,8 @@ pub fn get_taxonomy(
         let v: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories
              WHERE (expires_at IS NULL OR expires_at > ?1)
-               AND (namespace = ?2 OR namespace LIKE ?2 || '/%')",
-            params![now, prefix],
+               AND (namespace = ?2 OR namespace LIKE ?3 ESCAPE '\\')",
+            params![now, prefix, descendant_pattern],
             |row| row.get(0),
         )?;
         usize::try_from(v).unwrap_or(0)
@@ -4198,15 +4230,16 @@ pub fn get_taxonomy(
         let mut stmt = conn.prepare(
             "SELECT namespace, COUNT(*) FROM memories
              WHERE (expires_at IS NULL OR expires_at > ?1)
-               AND (namespace = ?2 OR namespace LIKE ?2 || '/%')
+               AND (namespace = ?2 OR namespace LIKE ?3 ESCAPE '\\')
              GROUP BY namespace
              ORDER BY COUNT(*) DESC, namespace ASC
-             LIMIT ?3",
+             LIMIT ?4",
         )?;
         let rows = stmt.query_map(
             params![
                 now,
                 prefix,
+                descendant_pattern,
                 i64::try_from(effective_limit).unwrap_or(i64::MAX)
             ],
             |row| {
@@ -11770,6 +11803,37 @@ mod tests {
         assert_eq!(tax.tree.children.len(), 1);
         assert_eq!(tax.tree.children[0].name, "platform");
         assert_eq!(tax.tree.children[0].count, 1);
+    }
+
+    /// #1531 L5 — `validate_namespace` permits the LIKE metacharacters
+    /// `%` / `_` in segments (historical flexibility), so the taxonomy
+    /// prefix walk must escape its descendant pattern. Pre-fix the
+    /// unescaped `LIKE ?2 || '/%'` let prefix `a%` aggregate the `ax/...`
+    /// subtree.
+    #[test]
+    fn taxonomy_prefix_like_metacharacters_do_not_widen_match_l5() {
+        let conn = test_db();
+        insert(&conn, &make_memory("a", "a%/child", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("b", "ax/child", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("c", "a_/child", Tier::Long, 5)).unwrap();
+
+        // Literal `a%` prefix must scope to the `a%` subtree only.
+        let tax = get_taxonomy(&conn, Some("a%"), 8, 1000).unwrap();
+        assert_eq!(
+            tax.total_count, 1,
+            "prefix 'a%' must not aggregate 'ax/...' or 'a_/...' subtrees"
+        );
+
+        // Literal `a_` prefix likewise.
+        let tax = get_taxonomy(&conn, Some("a_"), 8, 1000).unwrap();
+        assert_eq!(
+            tax.total_count, 1,
+            "prefix 'a_' must not aggregate single-char-wildcard siblings"
+        );
+
+        // Plain prefixes are unchanged.
+        let tax = get_taxonomy(&conn, Some("ax"), 8, 1000).unwrap();
+        assert_eq!(tax.total_count, 1);
     }
 
     #[test]

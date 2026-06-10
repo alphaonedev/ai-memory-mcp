@@ -273,6 +273,17 @@ pub enum StoreError {
     #[error("invalid input: {detail}")]
     InvalidInput { detail: String },
 
+    /// #1568 (H1 residual) — link write refused by a substrate
+    /// pre-link gate (the `reflects_on` cycle invariant). `detail`
+    /// carries the canonical
+    /// [`crate::storage::LINK_CYCLE_ERR_PREFIX`]-prefixed message
+    /// byte-identical to the sqlite path's
+    /// `StorageError::LinkReflectionCycle` Display, so the
+    /// trait-routed HTTP surface returns the same 409 CONFLICT body
+    /// shape on both backends.
+    #[error("{detail}")]
+    LinkRefused { detail: String },
+
     #[error("requested capability not supported by this backend: {capability}")]
     UnsupportedCapability { capability: String },
 
@@ -304,6 +315,9 @@ impl StoreError {
             Self::PermissionDenied { .. } => error_codes::GOVERNANCE_REFUSED,
             Self::BackendUnavailable { .. } => error_codes::STORE_BACKEND_UNAVAILABLE,
             Self::InvalidInput { .. } => error_codes::VALIDATION_FAILED,
+            // #1568 — a refused link is a graph-state conflict (409),
+            // matching the sqlite branch's LinkReflectionCycle mapping.
+            Self::LinkRefused { .. } => error_codes::CONFLICT,
             Self::UnsupportedCapability { .. } => error_codes::STORE_UNSUPPORTED_CAPABILITY,
             Self::IntegrityFailed { .. } => error_codes::STORE_OPERATION_FAILED,
             Self::Backend(_) => error_codes::DATABASE_ERROR,

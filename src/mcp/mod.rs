@@ -1346,7 +1346,11 @@ fn dispatch_memory_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_replay(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // v0.7.0 #1571 — bind the replay visibility/permission identity to the
+    // resolved caller so a spoofed `agent_id` param cannot widen visibility
+    // (same class as #1553 get/get_links and #1557 inbox).
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_replay(ctx.conn, ctx.arguments, ctx.mcp_client, caller.as_deref())
 }
 
 fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

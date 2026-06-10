@@ -128,6 +128,7 @@ pub fn handle_replay(
     conn: &rusqlite::Connection,
     params: &Value,
     mcp_client: Option<&str>,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let memory_id = params["memory_id"]
         .as_str()
@@ -171,8 +172,33 @@ pub fn handle_replay(
     // MCP error WITHOUT leaking which transcripts existed; on Ask we
     // surface the prompt verbatim so the operator can wire the K10
     // approval pipeline. Allow / Modify let the read proceed.
-    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-        .map_err(|e| e.to_string())?;
+    //
+    // v0.7.0 #1571 — the identity the gates run under is BOUND to the
+    // resolved caller when one is present (`resolve_read_visibility_caller`
+    // on the MCP dispatch, the header-attributed principal on HTTP). A
+    // caller-supplied `agent_id` param that disagrees is refused, mirroring
+    // the #1557 memory_inbox owner bind. Pre-#1571 the param won via
+    // `resolve_agent_id`, so a multi-tenant caller could pass
+    // `agent_id: alice` and read transcripts visible to Alice — the same
+    // spoofable-param class #1553/#1557 closed for get/get_links/inbox.
+    // `caller == None` is the single-tenant trust-all posture and preserves
+    // the legacy param/clientInfo resolution unchanged.
+    let agent_id = match caller {
+        Some(c) => {
+            if let Some(requested) = params[param_names::AGENT_ID].as_str() {
+                if requested != c {
+                    return Err(format!(
+                        "agent_id mismatch: caller '{c}' may only replay as itself"
+                    ));
+                }
+            }
+            c.to_string()
+        }
+        None => {
+            crate::identity::resolve_agent_id(params[param_names::AGENT_ID].as_str(), mcp_client)
+                .map_err(|e| e.to_string())?
+        }
+    };
 
     // v0.7.0 #1075 (SR-1 #1, HIGH) — visibility gate. Pre-#1075 the
     // replay path consulted only the K9 permission rules; in the
@@ -354,7 +380,7 @@ mod tests {
     #[test]
     fn missing_memory_id_errors() {
         let conn = fresh_conn();
-        let err = handle_replay(&conn, &json!({}), None).unwrap_err();
+        let err = handle_replay(&conn, &json!({}), None, None).unwrap_err();
         assert!(err.contains("memory_id"), "got: {err}");
     }
 
@@ -362,7 +388,7 @@ mod tests {
     #[test]
     fn invalid_memory_id_rejected() {
         let conn = fresh_conn();
-        let err = handle_replay(&conn, &json!({"memory_id": "  "}), None).unwrap_err();
+        let err = handle_replay(&conn, &json!({"memory_id": "  "}), None, None).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -375,6 +401,7 @@ mod tests {
             &conn,
             &json!({"memory_id": mid, "depth": "not-a-number"}),
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("depth must be an integer"), "got: {err}");
@@ -385,7 +412,8 @@ mod tests {
     fn negative_depth_clamped() {
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-clamp", "obs");
-        let resp = handle_replay(&conn, &json!({"memory_id": mid, "depth": -5}), None).expect("ok");
+        let resp =
+            handle_replay(&conn, &json!({"memory_id": mid, "depth": -5}), None, None).expect("ok");
         assert_eq!(resp["memory_id"].as_str(), Some(mid.as_str()));
         assert_eq!(resp["count"].as_u64(), Some(0));
     }
@@ -395,7 +423,7 @@ mod tests {
     fn no_transcripts_returns_empty() {
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-empty", "obs");
-        let resp = handle_replay(&conn, &json!({"memory_id": mid}), None).expect("ok");
+        let resp = handle_replay(&conn, &json!({"memory_id": mid}), None, None).expect("ok");
         assert_eq!(resp["count"].as_u64(), Some(0));
         assert!(resp["transcripts"].as_array().unwrap().is_empty());
     }
@@ -408,7 +436,7 @@ mod tests {
         let t =
             transcripts::store(&conn, "rp-small", "short transcript content", None).expect("store");
         transcripts::link_transcript(&conn, &mid, &t.id, None, None).expect("link");
-        let resp = handle_replay(&conn, &json!({"memory_id": mid}), None).expect("ok");
+        let resp = handle_replay(&conn, &json!({"memory_id": mid}), None, None).expect("ok");
         assert_eq!(resp["count"].as_u64(), Some(1));
         let entries = resp["transcripts"].as_array().unwrap();
         assert!(entries[0]["content"].is_string());
@@ -426,7 +454,7 @@ mod tests {
         let big = "x".repeat(101 * 1024);
         let t = transcripts::store(&conn, "rp-large", &big, None).expect("store");
         transcripts::link_transcript(&conn, &mid, &t.id, None, None).expect("link");
-        let resp = handle_replay(&conn, &json!({"memory_id": mid}), None).expect("ok");
+        let resp = handle_replay(&conn, &json!({"memory_id": mid}), None, None).expect("ok");
         let entries = resp["transcripts"].as_array().unwrap();
         assert_eq!(entries[0]["truncated"], true);
         assert!(entries[0].get("content").is_none());
@@ -480,6 +508,7 @@ mod tests {
             &conn,
             &json!({"memory_id": mid, "agent_id": "ai:bob"}),
             None,
+            None,
         )
         .expect("ok");
         assert_eq!(
@@ -494,6 +523,84 @@ mod tests {
             &conn,
             &json!({"memory_id": mid, "agent_id": "ai:alice"}),
             None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp_alice["count"].as_u64(), Some(1));
+    }
+
+    // #1571 — a spoofed `agent_id` param must NOT widen visibility when a
+    // resolved caller is bound (mirrors the #1553 memory_get / #1557
+    // memory_inbox regression shape). Pre-fix the param won via
+    // `resolve_agent_id`, so caller bob passing `agent_id: ai:alice` read
+    // transcripts visible to alice.
+    #[test]
+    fn spoofed_agent_id_param_does_not_widen_visibility_1571() {
+        let conn = fresh_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "alice-ns-1571".to_string(),
+            title: "alice-private-1571".to_string(),
+            content: "alice-secret-1571".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": "ai:alice", "scope": "private"}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let mid = db::insert(&conn, &mem).expect("insert alice memory");
+        let t = transcripts::store(&conn, "alice-ns-1571", "alice transcript 1571", None)
+            .expect("store transcript");
+        transcripts::link_transcript(&conn, &mid, &t.id, None, None).expect("link");
+
+        // Caller bob spoofs `agent_id: ai:alice` — refused (mismatch),
+        // no transcript content leaves the handler.
+        let err = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "agent_id": "ai:alice"}),
+            None,
+            Some("ai:bob"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("agent_id mismatch"),
+            "spoofed param must be refused, got: {err}"
+        );
+
+        // Caller bob with no param: bound to bob → not-found mask.
+        let resp =
+            handle_replay(&conn, &json!({"memory_id": mid}), None, Some("ai:bob")).expect("ok");
+        assert_eq!(
+            resp["count"].as_u64(),
+            Some(0),
+            "bound caller bob must not see alice's transcripts"
+        );
+
+        // Caller alice (param agrees) still sees her own row — the bind
+        // is not over-broad.
+        let resp_alice = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "agent_id": "ai:alice"}),
+            None,
+            Some("ai:alice"),
         )
         .expect("ok");
         assert_eq!(resp_alice["count"].as_u64(), Some(1));
@@ -507,8 +614,13 @@ mod tests {
         let big = "y".repeat(101 * 1024);
         let t = transcripts::store(&conn, "rp-verbose", &big, None).expect("store");
         transcripts::link_transcript(&conn, &mid, &t.id, None, None).expect("link");
-        let resp =
-            handle_replay(&conn, &json!({"memory_id": mid, "verbose": true}), None).expect("ok");
+        let resp = handle_replay(
+            &conn,
+            &json!({"memory_id": mid, "verbose": true}),
+            None,
+            None,
+        )
+        .expect("ok");
         let entries = resp["transcripts"].as_array().unwrap();
         assert!(entries[0]["content"].is_string());
         assert!(entries[0].get("truncated").is_none());
@@ -549,6 +661,7 @@ mod tests {
             &conn,
             &json!({"memory_id": mid, "agent_id": "ai:test"}),
             None,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["count"].as_u64(), Some(0));
@@ -577,6 +690,7 @@ mod tests {
         let resp = handle_replay(
             &conn,
             &json!({"memory_id": mid, "agent_id": "ai:test"}),
+            None,
             None,
         )
         .expect("ok");

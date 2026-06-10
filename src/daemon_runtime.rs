@@ -713,7 +713,10 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
     /// Deadline for quorum-ack collection. After this many ms the
-    /// write returns 503 `quorum_not_met`. Default 2000.
+    /// write returns 503 `quorum_not_met`. Default 2000 assumes
+    /// same-DC peers; cross-region (WAN) meshes need 5000-10000 —
+    /// the do-1461 reference deployment uses 8000. See
+    /// docs/federation.md for sizing guidance. (#1565)
     #[arg(long, default_value_t = 2000)]
     pub quorum_timeout_ms: u64,
     /// Optional mTLS client cert for outbound federation POSTs. Same
@@ -4081,6 +4084,27 @@ pub async fn bootstrap_serve(
         } else {
             tracing::info!("API key authentication enabled");
         }
+    }
+
+    // #1570 (H6) — record whether request authentication is configured
+    // so the shared admin-role gate can refuse to mint admin from a
+    // bare self-asserted `X-Agent-Id` header on unauthenticated
+    // deployments. Boot-time WARN when the operator configured admin
+    // ids but the gate will refuse them all (no api_key, trust flag
+    // off) — names the escape hatch so the remediation is one search
+    // away. Mirrors the #1455 fail-closed convention.
+    crate::handlers::admin_role::mark_request_authn_configured(api_key_state.key.is_some());
+    if !app_state.admin_agent_ids.is_empty()
+        && api_key_state.key.is_none()
+        && !crate::handlers::admin_role::admin_header_trust_enabled()
+    {
+        tracing::warn!(
+            "[admin].agent_ids is configured but no api_key is set: the X-Agent-Id header is \
+             self-asserted, so admin-role requests will be REFUSED (403) until you either \
+             configure an api_key or explicitly opt into the legacy header-trust posture with \
+             {}=1 (#1570 secure default)",
+            crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
+        );
     }
 
     Ok(ServeBootstrap {

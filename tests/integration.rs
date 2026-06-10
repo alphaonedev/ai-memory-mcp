@@ -87,6 +87,13 @@ fn cmd(binary: &str) -> std::process::Command {
     // it through admin-gated GETs via `curl_get_as_admin` /
     // `curl_post_as_admin`. Per-test overrides still win.
     c.env("AI_MEMORY_ADMIN_AGENT_IDS", INTEGRATION_TEST_ADMIN);
+    // #1570 — spawned daemons here run with admin ids configured but
+    // NO api_key, so the post-#1570 secure default would refuse every
+    // header-asserted admin claim with 403. These tests model the
+    // legacy header-trust posture explicitly via the documented
+    // operator escape hatch; the #1570 secure default itself is
+    // pinned by tests/admin_header_trust_1570.rs.
+    c.env("AI_MEMORY_ADMIN_HEADER_TRUST", "1");
     c
 }
 /// Spawn a command and collect its output, panicking with a descriptive
@@ -9052,6 +9059,12 @@ impl OneshotDaemon {
     /// against in-process mock peers (see `spawn_inproc_mock_peer`).
     #[allow(dead_code)]
     fn with_federation(federation: Option<ai_memory::federation::FederationConfig>) -> Self {
+        // #1570 — these tests model an AUTHENTICATED deployment (api_key
+        // configured at boot), the pre-#1570 implicit posture, so the admin
+        // header role-claims they assert keep working. The #1570 secure
+        // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+        // is pinned by tests/admin_header_trust_1570.rs in its own process.
+        ai_memory::handlers::admin_role::mark_request_authn_configured(true);
         // v0.7.0 H11 (#628 blocker) — webhook-subscriber tests POST
         // loopback URLs (`http://localhost/...`, `127.0.0.1:0`) into
         // `/api/v1/subscriptions`. The H11 SSRF guard rejects loopback

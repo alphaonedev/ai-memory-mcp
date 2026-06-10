@@ -298,6 +298,7 @@ mod arch_9_slug_tests {
                 detail: "d".into(),
             },
             StoreError::InvalidInput { detail: "d".into() },
+            StoreError::LinkRefused { detail: "d".into() },
             StoreError::UnsupportedCapability {
                 capability: "c".into(),
             },
@@ -310,6 +311,7 @@ mod arch_9_slug_tests {
             GOVERNANCE_REFUSED,
             STORE_BACKEND_UNAVAILABLE,
             VALIDATION_FAILED,
+            CONFLICT,
             STORE_UNSUPPORTED_CAPABILITY,
             STORE_OPERATION_FAILED,
             DATABASE_ERROR,

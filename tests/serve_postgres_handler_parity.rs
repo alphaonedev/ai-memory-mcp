@@ -70,6 +70,12 @@ mod common;
 use common::{DAEMON_READY_TIMEOUT, free_port, pg_test_client, postgres_url, wait_for_http_ready};
 
 async fn build_postgres_app_state(url: &str) -> AppState {
+    // #1570 — these tests model an AUTHENTICATED deployment (api_key
+    // configured at boot), the pre-#1570 implicit posture, so the admin
+    // header role-claims they assert keep working. The #1570 secure
+    // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+    // is pinned by tests/admin_header_trust_1570.rs in its own process.
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     // Match the production daemon's posture: `permissions.mode = enforce`
     // is the v0.7.0 default. Without this, the test in-process daemon
     // boots in Advisory mode (the static OnceLock fallback) and Bucket C
