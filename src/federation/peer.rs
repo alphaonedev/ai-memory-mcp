@@ -9,6 +9,32 @@ use crate::replication::QuorumPolicy;
 
 use super::{FederationConfig, PeerEndpoint};
 
+/// #1579 B5 — keep idle per-peer connections pooled for 5 minutes.
+///
+/// reqwest's default `pool_idle_timeout` is 90s. Federation traffic is
+/// bursty: quorum pushes arrive on the operator's write cadence and
+/// the DLQ replay / catchup workers tick on 30–60s intervals, so the
+/// 90s default regularly evicted the warm connection between bursts
+/// and the next push paid a fresh mTLS handshake (~4.3×RTT — 0.39s
+/// cross-region vs ~0.09s reused, measured on do-1461, P3 leg 1/leg 2).
+/// 5 minutes comfortably spans the worker cadences without holding
+/// sockets forever on a reconfigured mesh.
+const FED_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// #1579 B5 — OS-level TCP keepalive probes on pooled federation
+/// connections, every 60s.
+///
+/// Deliberately conservative: PR #314 attempted `tcp_keepalive(1s)` +
+/// `pool_idle_timeout(5s)` and ship-gate run 21 showed that
+/// combination caused 40+ minute hangs from connection-pool churn +
+/// per-socket probe traffic (see the revert note in
+/// [`FederationConfig::build`]). 60s generates negligible probe load
+/// while still detecting half-open connections (NAT/conntrack drops on
+/// cross-region paths) well inside the 5-minute pool window, so a
+/// dead pooled socket is reaped instead of donating a connect error to
+/// the next quorum push.
+const FED_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
 impl FederationConfig {
     /// Build a `FederationConfig` from the serve-time CLI flags. Returns
     /// `None` when federation is disabled (`quorum_writes == 0` or the
@@ -97,9 +123,21 @@ impl FederationConfig {
         // is a v0.6.0.1+ investigation with instrumented cycle data
         // (cycles_by_fault now landed in ship-gate, giving us per-cycle
         // visibility the next time we attempt this).
+        //
+        // #1579 B5 (2026-06-10) — persistent outbound connections. This
+        // single client is shared by every outbound federation surface
+        // (quorum push, bulk catchup, DLQ replay, /sync/since pull), so
+        // tuning it is the one-stop connection-lifecycle fix. The two
+        // knobs below are an order of magnitude more conservative than
+        // the reverted #314 attempt (300s/60s vs 5s/1s) — they EXTEND
+        // pooling rather than churn it. Measured basis: fresh mTLS ≈
+        // 4.3×RTT (1.0s cold cross-globe), reused ≈ 1×RTT (P3 leg 1);
+        // DLQ replay serialized at ~0.3s/row/peer on fresh handshakes.
         let mut client_builder = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(2))
+            .pool_idle_timeout(FED_CLIENT_POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(FED_CLIENT_TCP_KEEPALIVE)
             .use_rustls_tls();
         // --quorum-ca-cert: trust a caller-supplied root CA for outbound
         // federation POSTs. Required whenever peers present a cert NOT

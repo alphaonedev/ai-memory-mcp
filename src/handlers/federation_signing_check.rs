@@ -70,6 +70,9 @@ pub(super) async fn sync_push_via_store(
         // gap as the sqlite twin); cap it so a peer cannot bypass the batch
         // bound via an oversized links array.
         || body.links.len() > cap
+        // #1566 / #1579 B1 — shipped-vector array, the largest
+        // per-element payload on this surface (sqlite-twin parity).
+        || body.embeddings.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -94,6 +97,28 @@ pub(super) async fn sync_push_via_store(
     // v0.7.0 S6-LOW2 — observability-only sender_clock skew detection
     // (parity with the sqlite path).
     check_sender_clock_skew(&body.sender_agent_id, &body);
+
+    // #1566 / #1579 B1 — embed-once-replicate-vector + ack-after-commit
+    // (sqlite-twin parity; see `federation_receive::sync_push`). The
+    // pre-#1566 shape re-embedded EVERY applied row synchronously
+    // (~1s/row via ollama) before responding — the receive cost rode
+    // inside the sender's quorum-ack window (deadline_exceeded → DLQ)
+    // and every memory was embedded up to 9× across the fleet. Now a
+    // dim-matching shipped vector is stored directly (one UPDATE) and
+    // everything else defers to the detached background task spawned
+    // before the response below. The periodic PG embed backfill sweep
+    // is the restart safety net (fixed under #1579 A4 by WS-postgres).
+    let receiver_dim = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(crate::embeddings::Embedder::dim);
+    let shipped_by_id: std::collections::HashMap<&str, &crate::federation::ShippedEmbedding> = body
+        .embeddings
+        .iter()
+        .map(|se| (se.memory_id.as_str(), se))
+        .collect();
+    let mut deferred_embed: Vec<(String, String)> = Vec::new();
 
     // ---- memories ----------------------------------------------------
     for mem in &body.memories {
@@ -214,21 +239,34 @@ pub(super) async fn sync_push_via_store(
             Ok(applied_id) => {
                 applied += 1;
                 // v0.7.0 Wave-3 Continuation 5 (S18+S79 federation
-                // semantic recall) — re-embed the incoming memory on
-                // the receiver so the postgres `embedding` column
-                // lands populated. Federation wire shape doesn't
-                // carry the vector; without this step semantic recall
-                // queries against a peer that received the memory
-                // through sync_push would surface empty.
-                if let Some(emb) = app.embedder.as_ref().as_ref() {
-                    let embedding_text =
-                        crate::embeddings::embedding_document(&mem.title, &mem.content);
-                    if let Ok(vector) = emb.embed(&embedding_text) {
-                        let _ = app
+                // semantic recall) — the postgres `embedding` column
+                // must land populated or peer-side semantic recall
+                // surfaces empty. #1566 / #1579 B1: prefer the
+                // sender's shipped vector (dim-matching → one UPDATE,
+                // no embed at all); otherwise defer the local embed
+                // to the background task spawned before the response.
+                match shipped_by_id.get(mem.id.as_str()) {
+                    Some(se) if receiver_dim == Some(se.dim) && se.vector.len() == se.dim => {
+                        if let Err(e) = app
                             .store
-                            .update_embedding(&ctx, &applied_id, Some(&vector))
-                            .await;
+                            .update_embedding(&ctx, &applied_id, Some(&se.vector))
+                            .await
+                        {
+                            tracing::warn!(
+                                "sync_push (postgres): storing shipped embedding failed \
+                                 for {applied_id} (model {}): {e} — deferring local embed",
+                                se.model,
+                            );
+                            deferred_embed.push((
+                                applied_id.clone(),
+                                crate::embeddings::embedding_document(&mem.title, &mem.content),
+                            ));
+                        }
                     }
+                    _ => deferred_embed.push((
+                        applied_id.clone(),
+                        crate::embeddings::embedding_document(&mem.title, &mem.content),
+                    )),
                 }
                 // F2 audit-chain emit: every accepted federation push
                 // chains through the same audit log as a local Store.
@@ -280,6 +318,10 @@ pub(super) async fn sync_push_via_store(
 
     // v0.7.0 S6-M2 — quota refusal short-circuit (postgres path).
     if let Some(q) = first_quota_refusal.take() {
+        // #1566 / #1579 B1 — rows applied before the refusal are
+        // committed; their deferred embeds still run (sqlite-twin
+        // parity) instead of waiting for the backfill sweep.
+        spawn_deferred_embedding_refresh_via_store(&app, &ctx, deferred_embed);
         let reset_at = next_utc_midnight();
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -404,6 +446,11 @@ pub(super) async fn sync_push_via_store(
         + body.namespace_meta.len()
         + body.namespace_meta_clears.len();
 
+    // #1566 / #1579 B1 — ack-after-commit: the response (the sender's
+    // quorum ack) returns now; rows still needing a locally-computed
+    // vector are embedded by this detached task.
+    spawn_deferred_embedding_refresh_via_store(&app, &ctx, deferred_embed);
+
     (
         StatusCode::OK,
         Json(json!({
@@ -422,6 +469,56 @@ pub(super) async fn sync_push_via_store(
         })),
     )
         .into_response()
+}
+
+/// #1566 / #1579 B1 — deferred receive-side embedding refresh for the
+/// SAL-routed (postgres) receive path. Trait twin of
+/// `federation_receive::spawn_deferred_embedding_refresh`: the embed
+/// runs on the blocking pool OFF the request path and the vector lands
+/// via `MemoryStore::update_embedding`. Errors are logged and the row
+/// is left for the periodic PG embed backfill sweep (#1579 A4) — same
+/// best-effort posture as the pre-#1566 inline embed, minus the
+/// quorum-window coupling. No-op when `rows` is empty or the receiver
+/// runs keyword-only (no embedder).
+#[cfg(feature = "sal")]
+fn spawn_deferred_embedding_refresh_via_store(
+    app: &AppState,
+    ctx: &crate::store::CallerContext,
+    rows: Vec<(String, String)>,
+) {
+    if rows.is_empty() || app.embedder.as_ref().as_ref().is_none() {
+        return;
+    }
+    let store = app.store.clone();
+    let embedder = app.embedder.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        for (id, text) in rows {
+            let emb = embedder.clone();
+            let embed_res =
+                tokio::task::spawn_blocking(move || emb.as_ref().as_ref().map(|e| e.embed(&text)))
+                    .await;
+            let vec = match embed_res {
+                Ok(Some(Ok(v))) => v,
+                Ok(Some(Err(e))) => {
+                    tracing::warn!("sync_push (postgres): deferred embed failed for {id}: {e}");
+                    continue;
+                }
+                // Embedder vanished (impossible — checked above and the
+                // Arc is immutable) — nothing left to do for any row.
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!("sync_push (postgres): deferred embed join error for {id}: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = store.update_embedding(&ctx, &id, Some(&vec)).await {
+                tracing::warn!(
+                    "sync_push (postgres): deferred update_embedding failed for {id}: {e}"
+                );
+            }
+        }
+    });
 }
 
 /// v0.7.0 FED-P2d — process-wide federation trust bundle, loaded once
