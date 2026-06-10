@@ -17,12 +17,12 @@
 //! against a live postgres: NULL-embedding rows + a configured
 //! embedder ⇒ the sweep embeds them, in bounded batches.
 //!
-//! **B2 — stored generated tsvector column (schema v56).** Pre-fix
+//! **B2 — stored generated tsvector column (schema v57).** Pre-fix
 //! the recall/search shapes ranked with
 //! `ts_rank(to_tsvector('english', title || ' ' || content), …)` —
 //! the GIN EXPRESSION index served only the `@@` match, and `ts_rank`
 //! re-parsed the document text PER MATCHED ROW (~305 of 306 ms at 8k
-//! rows; 1.86 s measured on a worst-case all-rows-match probe). v56
+//! rows; 1.86 s measured on a worst-case all-rows-match probe). v57
 //! adds `tsv tsvector GENERATED ALWAYS AS (…) STORED` +
 //! `memories_tsv_gin`, and the queries read `tsv` for match AND rank.
 //! The timing win is asserted structurally (plan shape), not by a
@@ -203,7 +203,7 @@ async fn a4_backfill_sweep_embeds_null_embedding_rows() {
     );
 }
 
-/// B2 — schema v56 must land `tsv` as a STORED generated column with
+/// B2 — schema v57 must land `tsv` as a STORED generated column with
 /// the `memories_tsv_gin` GIN index, and must drop the legacy
 /// expression index `memories_content_fts`.
 #[tokio::test(flavor = "multi_thread")]

@@ -175,12 +175,12 @@ CREATE TABLE IF NOT EXISTS memories (
     -- Fresh schemas carry this inline; existing schemas pick it up via
     -- migrate_v42().
     version               BIGINT NOT NULL DEFAULT 1,
-    -- v0.7.0 perf #1579 B2 (schema v56) — stored generated tsvector.
+    -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
     -- re-parsing title||content per matched row per read (~305 of
     -- 306 ms at 8k rows pre-fix, P3 perf audit). The GIN index on this
-    -- column (`memories_tsv_gin`) lives in migrate_v56() per the #797
+    -- column (`memories_tsv_gin`) lives in migrate_v57() per the #797
     -- convention (see the index-block comment below); existing schemas
     -- pick the column up via the same arm's ALTER TABLE.
     tsv                   tsvector GENERATED ALWAYS AS (
@@ -273,15 +273,15 @@ CREATE INDEX IF NOT EXISTS idx_shadow_obs_memory
 
 -- Full-text search (English stemming; matches the SQLite FTS5 setup):
 -- served by the `memories_tsv_gin` GIN index on the stored generated
--- `tsv` column (schema v56, #1579 B2). The index CREATE lives in
--- `migrate_v56()` per the #797 convention — this bootstrap runs BEFORE
--- the migration ladder, so an index here referencing the v56 column
+-- `tsv` column (schema v57, #1579 B2). The index CREATE lives in
+-- `migrate_v57()` per the #797 convention — this bootstrap runs BEFORE
+-- the migration ladder, so an index here referencing the v57 column
 -- would crash on a legacy DB whose pre-existing `memories` table makes
 -- the CREATE TABLE above a no-op. Fresh installs still get the index
 -- because they enter the ladder at version 0 and execute every arm.
--- The pre-v56 EXPRESSION index (`memories_content_fts` ON
+-- The pre-v57 EXPRESSION index (`memories_content_fts` ON
 -- gin(to_tsvector('english', title || ' ' || content))) is no longer
--- created here and is dropped by migrate_v56(): it only ever served
+-- created here and is dropped by migrate_v57(): it only ever served
 -- the `@@` match (never `ts_rank`) and became pure write
 -- amplification once the query shapes moved to the `tsv` column.
 

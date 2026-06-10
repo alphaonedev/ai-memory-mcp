@@ -221,8 +221,8 @@ Expected log lines, in rough order:
 
 ```
 [INFO] opening sqlite db at ~/.local/share/ai-memory/ai-memory.db
-[INFO] current schema_version=20, target schema_version=55
-[INFO] applying migrations v21..v55 idempotent ladder
+[INFO] current schema_version=20, target schema_version=57
+[INFO] applying migrations v21..v57 idempotent ladder
 [INFO] migration v21 applied (pending_action_timeouts)
 [INFO] migration v22 applied (transcripts)
 …
@@ -236,8 +236,9 @@ Expected log lines, in rough order:
 [INFO] migration v53 applied (memories_au FTS trigger scoping #1418)
 [INFO] migration v54 applied (tier-default expiry backfill #1466)
 [INFO] migration v55 applied (idx_memories_updated_at federation-catchup index #1476)
-[INFO] migration v56 applied (postgres tsv generated column twin; sqlite no-op stamp #1579)
-[INFO] schema_version=56 — ladder complete
+[INFO] migration v56 applied (composite list/archive ordering indexes #1579)
+[INFO] migration v57 applied (postgres tsv generated column twin; sqlite no-op stamp #1579)
+[INFO] schema_version=57 — ladder complete
 [INFO] HTTP API listening on 127.0.0.1:9077
 [INFO] MCP stdio dispatch ready
 ```

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 56).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 57).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -575,7 +575,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 56;
+const CURRENT_SCHEMA_VERSION: i64 = 57;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2407,15 +2407,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // `CREATE INDEX IF NOT EXISTS` so the migration is replay-safe.
             conn.execute_batch(MIGRATION_V55_SQLITE)?;
         }
-        // v56 (#1579 B2, perf) — SQLite no-op twin of the postgres
+        // v57 (#1579 B2, perf) — SQLite no-op twin of the postgres
         // stored generated tsvector column + `memories_tsv_gin` GIN
-        // index (`src/store/postgres.rs::migrate_v56`). SQLite's FTS5
+        // index (`src/store/postgres.rs::migrate_v57`). SQLite's FTS5
         // virtual table (`memories_fts`) already materialises the
         // indexed text at write time via the sync triggers, so there
         // is nothing to precompute on this backend — the per-matched-
         // row tsvector recompute the postgres arm eliminates never
         // existed here. No DDL; the unconditional stamp below records
-        // CURRENT_SCHEMA_VERSION (= 56) so the lockstep pin holds
+        // CURRENT_SCHEMA_VERSION (= 57) so the lockstep pin holds
         // (the inverse of the v55 arm, where SQLite added an index and
         // postgres stamped a no-op).
 
@@ -2835,19 +2835,17 @@ mod tests {
     }
 
     #[test]
-    fn latest_arm_creates_updated_at_index_and_is_idempotent() {
-        // #1476 — the v55 ladder arm sources MIGRATION_V55_SQLITE
+    fn v55_arm_creates_updated_at_index_and_is_idempotent() {
+        // #1476 — the v55 arm sources MIGRATION_V55_SQLITE
         // (`CREATE INDEX IF NOT EXISTS idx_memories_updated_at`). Start a
-        // DB one version below the ARM's version (54) WITHOUT the index,
-        // run the ladder, and assert the index materialised; then rewind
-        // and re-run to prove the `IF NOT EXISTS` form is replay-safe and
-        // the version reaches CURRENT. The seed is pinned to the arm's
-        // version, NOT CURRENT_SCHEMA_VERSION - 1: when v56 landed
-        // (#1579 B2 — a postgres-only tsvector migration whose sqlite
-        // twin is a no-op stamp), the v55 arm became version-pinned
-        // (`if version < 55`), so seeding at CURRENT - 1 (= 55) would
-        // skip the index arm entirely and the test would assert the
-        // wrong thing.
+        // DB one version below the arm WITHOUT the index, run the ladder,
+        // and assert the index materialised; then rewind and re-run to
+        // prove the `IF NOT EXISTS` form is replay-safe and the version
+        // stays put. Seeds the FIXED version 54 (one below the v55 arm's
+        // trigger), NOT `CURRENT_SCHEMA_VERSION - 1` — when the tip
+        // advanced to v56 the arm became version-pinned (`if version <
+        // 55`), so its trigger no longer tracks the constant (the same
+        // fixed-trigger discipline as the v54 idempotency test above).
         const PRIOR_VERSION: i64 = 54;
         const UPDATED_AT_INDEX: &str = "idx_memories_updated_at";
 
@@ -2875,7 +2873,7 @@ mod tests {
         super::migrate(&conn).expect("first index-migration pass");
         assert!(
             index_exists(&conn, UPDATED_AT_INDEX),
-            "latest arm must create {UPDATED_AT_INDEX}"
+            "v55 arm must create {UPDATED_AT_INDEX}"
         );
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
 
