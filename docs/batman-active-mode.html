@@ -87,6 +87,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -96,7 +107,21 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Batman Mode</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v07.html" style="color:#6ee7ff">v0.7.0</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
+      <div class="menu">
+        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
+          <a href="feature-matrix.html">Feature Matrix</a>
+          <a href="data-flow.html">Data Flow</a>
+          <a href="integrations.html">Integrations</a>
+          <a href="import-history.html">Import History</a>
+          <a href="release-pipeline.html">Release Pipeline</a>
+        </div>
+      </div>
       <div class="menu">
         <button class="menu-btn">Features<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -112,6 +137,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -135,21 +161,87 @@ footer a{color:var(--text-muted)}
           <a href="governance.html">Governance</a>
           <a href="batman-active-mode.html" class="current">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 

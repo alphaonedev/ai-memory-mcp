@@ -94,7 +94,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Evidence</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="v0.7.0/release-notes.md" style="color:#ffb86b">v0.7.0</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -124,6 +124,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -145,7 +146,9 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
@@ -154,10 +157,12 @@ footer a{color:var(--text-muted)}
           <a href="evidence.html" class="current">Frozen Claims</a>
           <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
@@ -210,7 +215,7 @@ footer a{color:var(--text-muted)}
       </tbody>
     </table>
     <div class="callout">
-      <strong>Note on test-count framing.</strong> Public materials should lead with the <strong>1,809 total tests</strong> figure (1,600 lib + 209 integration); the 1,600 lib-only number remains exposed as the test-hub Tier 1 row "1 600/1 600 lib tests pass" for procurement teams who want to see library-test isolation. Older pages may reference 191 tests (~v0.6.0 era) — those are stale and should be replaced. The 1,898 figure from a raw <code>grep #[test]</code> includes attributes inside <code>#[cfg(test)]</code> guards that are not always compiled, plus benchmark scaffolding — it is <em>not</em> the canonical test-pass count.
+      <strong>Note on test-count framing.</strong> Public materials should lead with the newest verified baseline above: <strong>15,951 / 0</strong> (#1182 final baseline, 2026-05-31 — Domain 1 sqlite 7,458/0 + Domain 2 Postgres+AGE SAL-parity 8,493/0), independently reproduced at <strong>15,952 / 0</strong> on the 2026-06-01 round-2 volume-wipe re-run. Always cite the figure with its date and provenance link so readers can see <em>which</em> run produced it. Historical figures stay honest with their era attached: the <strong>1,809 total tests</strong> figure (1,600 lib + 209 integration) is the v0.6.3-era release-gate count — still exposed as the test-hub Tier 1 row "1 600/1 600 lib tests pass" for procurement teams who want library-test isolation, but it describes v0.6.3, not v0.7.0. Older pages may reference 191 tests (~v0.6.0 era) — those are stale and should be replaced. The 1,898 figure from a raw <code>grep #[test]</code> includes attributes inside <code>#[cfg(test)]</code> guards that are not always compiled, plus benchmark scaffolding — it is <em>not</em> a canonical test-pass count for any era.
     </div>
   </div>
 </section>
