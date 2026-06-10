@@ -418,3 +418,59 @@ async fn b2_search_still_returns_matches_through_sal() {
         "find_contradictions must surface same-namespace FTS candidates via tsv"
     );
 }
+
+/// B2 follow-on regression pin — the v55 ladder arm stamps the
+/// LITERAL 55, never `CURRENT_SCHEMA_VERSION`. The pre-#1579 arm
+/// stamped the constant, which was harmless while v55 was the ladder
+/// tail but became a latent replay hazard the moment later arms
+/// exist: a ladder interrupted right after the v55 arm would have
+/// recorded the TIP version, so every later arm would be skipped on
+/// the next boot's replay (`current_version` reads
+/// `MAX(schema_version.version)`).
+///
+/// Pin shape: run the full ladder once (fresh per-test schema), rewind
+/// the version history to 54 (delete every stamp above it), reconnect
+/// so the ladder replays from 54, then assert the history contains
+/// BOTH the literal 55 (the v55 arm's stamp) and the tip 57 (the v57
+/// arm's stamp). If the v55 arm regressed to stamping the constant,
+/// the 55 row would be absent. `>=` / `contains` assertions only — at
+/// merge time sibling lanes may pin additional intermediate stamps
+/// (e.g. the storage lane's v56) without invalidating this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn v55_arm_stamps_literal_55_on_ladder_replay() {
+    let Some(env) = PostgresTestEnv::new("v55_stamp_pin").await else {
+        eprintln!(
+            "skip v55_arm_stamps_literal_55_on_ladder_replay: AI_MEMORY_TEST_POSTGRES_URL not set"
+        );
+        return;
+    };
+    let _store = PostgresStore::connect(env.url())
+        .await
+        .expect("first connect runs the full ladder");
+    let pool = inspection_pool(env.url()).await;
+
+    sqlx::query("DELETE FROM schema_version WHERE version > 54")
+        .execute(&pool)
+        .await
+        .expect("rewind version history to 54");
+
+    let _store2 = PostgresStore::connect(env.url())
+        .await
+        .expect("replay connect re-runs the ladder from 54");
+
+    let versions: Vec<i32> = sqlx::query_scalar(
+        "SELECT version FROM schema_version WHERE version > 54 ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read replayed stamps");
+    assert!(
+        versions.contains(&55),
+        "v55 arm must stamp the literal 55 on replay (got {versions:?}); \
+         stamping CURRENT_SCHEMA_VERSION here is the replay hazard #1579 B2 fixed"
+    );
+    assert!(
+        versions.contains(&57),
+        "v57 tail arm must stamp the tip 57 on replay (got {versions:?})"
+    );
+}
