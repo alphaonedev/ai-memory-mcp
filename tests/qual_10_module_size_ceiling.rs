@@ -204,7 +204,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the file at 16_601. Growth justified: closes the postgres
     // ungoverned-link-write security hole + decay parity, zero
     // speculative surface. 16_700 = 16_601 + 99 headroom.
-    ("src/store/postgres.rs", 16_700),
+    //
+    // 2026-06-10 — bumped 16_700 → 16_850 by the #1579 A4+B2 postgres
+    // perf remediation: the SAL `list_unembedded` (bounded NULL-
+    // embedding scan) + `set_embeddings_batch` (single-tx chunk write)
+    // overrides closing the dead-fleet-semantic-recall backfill gap
+    // (~90 LOC incl. docs), plus the `migrate_v56` arm (stored
+    // generated `tsv` tsvector column + `memories_tsv_gin`, drops the
+    // legacy expression index; ~75 LOC incl. the operational-lock
+    // docs) and the v55-arm literal-stamp fix. Growth justified:
+    // correctness fix (fleet semantic recall was DEAD at 0.46%
+    // embedded) + a 20-37x measured FTS-rank win, zero speculative
+    // surface. 16_850 = 16_762 + 88 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 16_850),
     ("src/config.rs", 9_000),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
@@ -261,7 +273,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #1548 — the curator `--store-url` SAL store-build path
     // (`build_curator_store` + the Curator dispatch arm) added ~34 LOC.
     // Bumped in lockstep.
-    ("src/daemon_runtime.rs", 7_950),
+    //
+    // 2026-06-10 — bumped 7_950 → 8_050 by #1579 A4: the serve-boot
+    // embedding-backfill sweep spawn (detached task draining
+    // `MemoryStore::list_unembedded` through the daemon embedder under
+    // the `embedding-backfill` sentinel principal; ~46 LOC incl. the
+    // root-cause doc block). Growth justified: closes the postgres
+    // fleet dead-semantic-recall gap (the only postgres-capable
+    // surface never ran any backfill), zero speculative surface.
+    // 8_050 = 7_964 + 86 headroom; far under the 1.5x cap.
+    ("src/daemon_runtime.rs", 8_050),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

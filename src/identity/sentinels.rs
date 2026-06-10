@@ -63,6 +63,14 @@ pub const EXPORT_INTERNAL: &str = "export-internal";
 /// (`src/store/postgres.rs::governance_*`).
 pub const GOVERNANCE_INTERNAL: &str = "governance-internal";
 
+/// Internal embedding-backfill sweep principal (#1579 A4 —
+/// `src/daemon_runtime.rs` serve-boot sweep over
+/// [`crate::store::MemoryStore::list_unembedded`]). The sweep is an
+/// operator-level maintenance path: it must see and re-embed EVERY
+/// row regardless of `metadata.scope`, so it runs under
+/// `CallerContext::for_admin(EMBEDDING_BACKFILL)`.
+pub const EMBEDDING_BACKFILL: &str = "embedding-backfill";
+
 /// Default agent id stamped by the HTTP daemon surface when acting as
 /// itself (NOT a privileged carve-out — unlike [`AI_HTTP_INTERNAL`]).
 pub const AI_HTTP: &str = "ai:http";
@@ -94,6 +102,7 @@ mod tests {
             AI_MIGRATE,
             EXPORT_INTERNAL,
             GOVERNANCE_INTERNAL,
+            EMBEDDING_BACKFILL,
         ] {
             assert!(
                 crate::validate::RESERVED_AGENT_IDS.contains(&s),

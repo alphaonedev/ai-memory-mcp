@@ -306,6 +306,8 @@ pub fn validate_source(source: &str) -> Result<()> {
 /// - `"federation-catchup"` → `src/federation/receive.rs`
 /// - `"export-internal"` → `src/store/postgres.rs::export_*`
 /// - `"governance-internal"` → `src/store/postgres.rs::governance_*`
+/// - `"embedding-backfill"` → `src/daemon_runtime.rs` serve-boot
+///   embedding-backfill sweep (#1579 A4)
 /// - `"system"` → `src/handlers/hook_subscribers.rs` (stamped on
 ///   legacy-rewrite rows; also matched as the unowned-marker sentinel
 ///   in cross-tenant gates, so wire spoofing it would let the caller
@@ -319,6 +321,7 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
     crate::identity::sentinels::AI_MIGRATE,
     crate::identity::sentinels::EXPORT_INTERNAL,
     crate::identity::sentinels::GOVERNANCE_INTERNAL,
+    crate::identity::sentinels::EMBEDDING_BACKFILL,
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977

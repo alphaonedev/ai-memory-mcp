@@ -10,7 +10,7 @@
 //! (`docs/MIGRATION_v0.7.md`, CLAUDE.md §Database), v0.6.4 ships logical
 //! schema **v33** (the last v0.6.x bump — the first v0.7.0-era upgrade
 //! arm is `if version < 34` in `src/storage/migrations.rs`) and v0.7.0
-//! ships **v55** (`current_schema_version_for_tests()`).
+//! ships **v56** (`current_schema_version_for_tests()`).
 //!
 //! The existing ladder tests prove structural completeness:
 //! `migrations.rs::tests::migrate_brings_v0_to_current` proves the
