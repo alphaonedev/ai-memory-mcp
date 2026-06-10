@@ -100,8 +100,27 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // pushed the file to 16_475. Growth justified: security-gate
     // hoist + injection-class fix, no speculative surface.
     // 16_550 = 16_475 + 75 headroom.
-    ("src/storage/mod.rs", 16_550),
-    ("src/mcp/mod.rs", 14_000),
+    //
+    // 2026-06-10 — bumped 16_550 → 16_800 by the #1579 A5 writepath
+    // remediation: the proactive-conflict check gained the HNSW-routed
+    // dispatcher (`proactive_conflict_check_with_index`), the
+    // ANN-candidate verifier (`proactive_conflict_check_candidates`),
+    // the shared `proactive_conflict_verdict` scoring tail, the
+    // bounded-scan LIMIT + Jaccard-floor consts with their P2-evidence
+    // doc blocks, and `count_embedded_memories` (the B3 CLI threshold
+    // probe) — ~225 LOC, all on the existing #519 write-path surface
+    // (the O(N)-scan-under-mutex / 81%-false-409 fix), no speculative
+    // surface. Actual LOC at the bump: 16_702. 16_800 = 16_702 + 98
+    // headroom; far under the 1.5x aspirational cap.
+    ("src/storage/mod.rs", 16_800),
+    // 2026-06-10 — bumped 14_000 → 14_100 by the #1579 B3 async-boot
+    // HNSW change: the MCP stdio boot site swaps the synchronous
+    // get_all_embeddings + VectorIndex::build for the background
+    // warm thread (Arc + warm_boot + readiness stderr lines), and the
+    // backfill helper routes through the canonical
+    // `embedding_document` template — ~26 LOC net. Actual LOC at the
+    // bump: 14_016. 14_100 = 14_016 + 84 headroom.
+    ("src/mcp/mod.rs", 14_100),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -261,7 +280,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #1548 — the curator `--store-url` SAL store-build path
     // (`build_curator_store` + the Curator dispatch arm) added ~34 LOC.
     // Bumped in lockstep.
-    ("src/daemon_runtime.rs", 7_950),
+    // 2026-06-10 — bumped 7_950 → 8_300 by the #1579 B3 async-boot
+    // HNSW loader: `load_boot_index_entries` +
+    // `spawn_vector_index_boot_load` (the seed → background-build →
+    // swap orchestration with its lock-discipline doc block) and the
+    // `b3_1579_boot_loader_warms_index_off_the_startup_path`
+    // readiness regression test — ~185 LOC on the serve boot path
+    // (the 40 s @10k / >28 min @100k sync-build fix), no speculative
+    // surface. Actual LOC at the bump: 8_135. 8_300 = 8_135 + 165
+    // headroom; far under the 1.5x cap.
+    ("src/daemon_runtime.rs", 8_300),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
