@@ -261,7 +261,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #1548 — the curator `--store-url` SAL store-build path
     // (`build_curator_store` + the Curator dispatch arm) added ~34 LOC.
     // Bumped in lockstep.
-    ("src/daemon_runtime.rs", 7_950),
+    //
+    // 2026-06-10 — bumped 7_950 → 8_100 by the #1579 perf final-gate
+    // remediation (A3 + B8): A3 routed the store-URL boot/error sites
+    // through `crate::logging::redact_url_password` and added the
+    // `issue_1579_a3_boot_log_redacts_store_url_password` regression
+    // test (~75 LOC); B8 added the `--scale` corpus-scale flag to
+    // `BenchArgs` + `cmd_bench` (~25 LOC). Actual LOC at the bump:
+    // 8008. Growth is justified: a security fix on existing log/error
+    // sites plus the scale knob on the existing bench dispatch — no
+    // speculative surface. 8_100 = 8008 + 92 headroom; far under the
+    // 1.5x cap.
+    ("src/daemon_runtime.rs", 8_100),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
