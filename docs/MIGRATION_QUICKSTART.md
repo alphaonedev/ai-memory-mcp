@@ -23,9 +23,13 @@ action required for the database itself.
 
 > **Compatibility statement.** v0.7.0 is **backward-incompatible
 > at the DB schema layer past v34** (sqlite). Once a v0.7.0 binary
-> opens a v0.6.x DB and walks it to v53, a v0.6.x binary will refuse
+> opens a v0.6.x DB and walks it to v55, a v0.6.x binary will refuse
 > to open it. **Always back up the DB before upgrading.** Cross-binary
-> alternation is not supported.
+> alternation is not supported. (The migrator also takes an automatic
+> pre-migration snapshot next to the DB —
+> `<db>.pre-migration-v<from>-to-v<to>-<token>.bak`, produced via
+> `VACUUM INTO` — restoring that snapshot is the supported rollback;
+> migrations themselves are forward-only.)
 
 ---
 
@@ -41,7 +45,7 @@ action required for the database itself.
 | **MemoryLink variants** | 4 (related_to, supersedes, contradicts, derived_from) | 6 (+ reflects_on, derives_from) |
 | **MCP tools at `--profile full`** | ~60 | **74** (73 callable + memory_capabilities bootstrap) |
 | **MCP tools at `--profile core`** | 5 | **7** (added memory_load_family + memory_smart_load) |
-| **CLI subcommands** | 40 | **58** (added `config migrate`, `atomise`, `persona`, `skill <…>`, `verify-signed-events-chain`, …) |
+| **CLI subcommands** | 40 | **79** in the default build, **81** with `--features sal` (adds `migrate` + `schema-init`) — added `config migrate`, `atomise`, `persona`, `skill <…>`, `verify-signed-events-chain`, `expand`, `recover-previous-session`, … |
 | **`ai-memory doctor`** | 7 sections | **9 sections** (+ Reflection Health + LLM Reachability) |
 | **Permissions mode default** | `advisory` | **`enforce`** (#K3 governance gate) — set `AI_MEMORY_PERMISSIONS_MODE=advisory` to preserve v0.6.x posture during rollout |
 | **Federation sig required** | Off | **On by default** (`AI_MEMORY_FED_REQUIRE_SIG=1`) — set `=0` during peer Ed25519-key enrolment |
@@ -61,7 +65,7 @@ Codex CLI) on macOS or Linux. No fleet, no NFS, no Postgres.
 ```bash
 # 1. Stop ai-memory (whichever launcher you use). Pick ONE:
 pkill -INT ai-memory                                                  # CLI-launched
-launchctl unload ~/Library/LaunchAgents/com.alphaone.ai-memory.plist  # macOS launchd
+launchctl unload ~/Library/LaunchAgents/<your-ai-memory>.plist        # macOS launchd (if you created a LaunchAgent)
 systemctl --user stop ai-memory                                       # Linux systemd
 #    (If you launch via Claude Code's MCP config, just close Claude Code.)
 
@@ -72,10 +76,11 @@ cp ~/.claude/ai-memory.db{,.v064.bak}      # or wherever your DB lives;
 # 3. Install v0.7.0 (pick ONE channel)
 #    a) Homebrew (after the v0.7.0 release lands on alphaonedev/homebrew-tap):
 brew upgrade ai-memory
-#    b) Pre-built binary (verify the SHA256SUMS file):
-ARCH=$(uname -m)
-OS=$(uname -s | tr A-Z a-z)
-curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-${ARCH}-${OS}.tar.gz" \
+#    b) Pre-built binary — release assets are named by Rust target triple:
+#       ai-memory-x86_64-unknown-linux-gnu.tar.gz, ai-memory-aarch64-unknown-linux-gnu.tar.gz,
+#       ai-memory-x86_64-apple-darwin.tar.gz, ai-memory-aarch64-apple-darwin.tar.gz,
+#       ai-memory-x86_64-pc-windows-msvc.zip. Example (Linux x86_64):
+curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-x86_64-unknown-linux-gnu.tar.gz" \
   | tar -xz -C ~/.local/bin
 #    c) From source (until v0.7.0 ships on crates.io):
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp \
@@ -120,16 +125,19 @@ security-posture rollout, and federation-peer enrolment windows.
 ### Steps
 
 ```bash
-# 1. Drain + snapshot per host (run on every fleet member)
+# 1. Drain + snapshot per host (run on every fleet member).
+#    There is no `ai-memory stop` subcommand — stop via your service
+#    manager (or pkill -INT for shell-launched daemons):
 for H in $FLEET; do
-  ssh "$H" "ai-memory stop && cp ~/.local/share/ai-memory/ai-memory.db{,.v064.bak}"
+  ssh "$H" "systemctl --user stop ai-memory && cp ~/.local/share/ai-memory/ai-memory.db{,.v064.bak}"
 done
 
 # 2. NFS-shared config.toml — migrate ONCE on the leader, then rsync.
 #    (The migrator writes a timestamped .bak; running on N hosts in
 #    the same second produces colliding backup filenames.)
 LEADER=${FLEET%% *}
-ssh "$LEADER" "ai-memory config migrate --dry-run | tee /tmp/v07-config-diff.txt"
+# (--dry-run prints the diff to stderr — redirect 2>&1 to capture it)
+ssh "$LEADER" "ai-memory config migrate --dry-run 2>&1 | tee ~/v07-config-diff.txt"
 # Review the diff. When satisfied:
 ssh "$LEADER" "ai-memory config migrate"
 
@@ -138,12 +146,14 @@ for H in $FLEET; do
   rsync /nfs/ai-memory/config.toml "$H:/nfs/ai-memory/"
 done
 
-# 4. Install v0.7.0 on every host. Verify the SHA256SUMS.
+# 4. Install v0.7.0 on every host. Assets are named by Rust target
+#    triple (e.g. ai-memory-x86_64-unknown-linux-gnu.tar.gz). Pin the
+#    expected sha256 per target in your fleet inventory and verify it.
 for H in $FLEET; do
   ssh "$H" 'set -e
-    curl -fsSL https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/SHA256SUMS -o ./SHA256SUMS
-    curl -fsSL https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz -o ./m.tgz
-    sha256sum -c --ignore-missing ./SHA256SUMS
+    TARGET=x86_64-unknown-linux-gnu   # adjust per host arch
+    curl -fsSL https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-${TARGET}.tar.gz -o ./m.tgz
+    echo "${EXPECTED_SHA256}  ./m.tgz" | sha256sum -c -
     tar -xzf ./m.tgz -C /usr/local/bin/
   '
 done
@@ -163,22 +173,25 @@ AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1
 EOF
 # (Skip individual lines if your fleet was already strict at v0.6.x.)
 
-# 6. Migrate governance → permissions (v0.7.0 K9 policy refactor)
-ai-memory governance migrate-to-permissions    # dry-run
-ai-memory governance migrate-to-permissions --apply
+# 6. Migrate governance → permissions (v0.7.0 K9/K11 policy refactor).
+#    Default (no --config-out) prints the rendered [[permissions.rules]]
+#    block without writing; --config-out <config path> merges in place.
+ai-memory governance migrate-to-permissions               # preview (dry-run)
+ai-memory governance migrate-to-permissions \
+  --config-out ~/.config/ai-memory/config.toml            # apply in place
 
 # 7. Start the fleet — DB walks v33 → v55 on first open
-for H in $FLEET; do ssh "$H" 'ai-memory start'; done
+for H in $FLEET; do ssh "$H" 'systemctl --user start ai-memory'; done
 
-# 8. Verify per host
+# 8. Verify per host (the JSON report's pass field is `chain_holds`)
 for H in $FLEET; do
   ssh "$H" 'ai-memory doctor && \
-            ai-memory verify-signed-events-chain --format json | jq -e .ok'
+            ai-memory verify-signed-events-chain --format json | jq -e .chain_holds'
 done
 
 # 9. Provision federation Ed25519 keypairs across the fleet
 for H in $FLEET; do
-  ssh "$H" "ai-memory identity generate ai:daemon@$H"
+  ssh "$H" "ai-memory identity generate --agent-id ai:daemon@$H"
   # ... and distribute peer pubkeys via your existing key-distribution
   # channel (operator.key.pub, .well-known, signed allowlist, etc.)
 done
@@ -190,16 +203,20 @@ sed -i 's/AI_MEMORY_FED_REQUIRE_SIG=0/AI_MEMORY_FED_REQUIRE_SIG=1/
         s/AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1/AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0/
         s/AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1/AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=0/' \
        /etc/ai-memory/env
-for H in $FLEET; do ssh "$H" 'ai-memory restart && ai-memory doctor'; done
+for H in $FLEET; do ssh "$H" 'systemctl --user restart ai-memory && ai-memory doctor'; done
 ```
 
 ### Postgres / Apache AGE / pgvector deployments
 
 If you run `ai-memory serve --store-url postgres://…` with the
 `sal-postgres` feature, the schema upgrade happens via
-`ai-memory schema-init --upgrade` walking the in-process
-`migrate_v34()…migrate_v55()` async ladder. Apache AGE
-(`memory_graph`) is provisioned by the same command if missing.
+`ai-memory schema-init --store-url postgres://…` — opening the
+store walks the in-process `migrate_v34()…migrate_v55()` async
+ladder as a side effect (there is no `--upgrade` flag). Apache AGE
+(`memory_graph`) is provisioned by the same command if the `age`
+extension is installed. Note the pre-built release binaries are
+default-feature builds without `migrate`/`schema-init` — use a
+`--features sal,sal-postgres` build for the postgres path.
 See [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
 for the postgres-specific recipe.
 
@@ -245,8 +262,8 @@ Every step is idempotent — safe to run on every play.
 set -euo pipefail
 
 VER=v0.7.0
-ARCH=$(uname -m)
-OS=$(uname -s | tr A-Z a-z)
+TARGET=x86_64-unknown-linux-gnu   # Rust target triple — adjust per host
+EXPECTED_SHA256=<pin-from-your-inventory>
 BIN=/usr/local/bin/ai-memory
 # Project HARD RULE — no /tmp scratch. Use a local tempdir.
 TMP=$(mktemp -d "$PWD/.ai-memory-upgrade-XXXXXX")
@@ -254,9 +271,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 # --- 1. Install v0.7.0 binary (idempotent — only fetches if version differs)
 if ! "$BIN" --version 2>/dev/null | grep -q "${VER#v}"; then
-  curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/${VER}/SHA256SUMS"            -o "$TMP/sums"
-  curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/${VER}/ai-memory-${ARCH}-${OS}.tar.gz" -o "$TMP/m.tgz"
-  ( cd "$TMP" && sha256sum -c --ignore-missing sums )
+  curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/${VER}/ai-memory-${TARGET}.tar.gz" -o "$TMP/m.tgz"
+  echo "${EXPECTED_SHA256}  $TMP/m.tgz" | sha256sum -c -
   tar -xzf "$TMP/m.tgz" -C "$TMP"
   install -m 0755 "$TMP/ai-memory" "$BIN"
 fi
@@ -264,19 +280,22 @@ fi
 # --- 2. Config migration (idempotent — no-op on schema_version >= 2)
 ai-memory config migrate || true
 
-# --- 3. Postgres schema migration (idempotent — schema-init is upsert-safe)
+# --- 3. Postgres schema migration (idempotent — schema-init re-runs safely;
+#         requires a --features sal,sal-postgres build of the binary)
 if [ -n "${AI_MEMORY_STORE_URL:-}" ]; then
-  ai-memory schema-init --store-url "$AI_MEMORY_STORE_URL" --upgrade || true
+  ai-memory schema-init --store-url "$AI_MEMORY_STORE_URL" || true
 fi
 
-# --- 4. Governance → permissions (idempotent — writes only on first run)
-ai-memory governance migrate-to-permissions --apply || true
+# --- 4. Governance → permissions (idempotent — in-place merge)
+ai-memory governance migrate-to-permissions \
+  --config-out ~/.config/ai-memory/config.toml || true
 
 # --- 5. Health gate — fail the play if any check is critical
+#        (doctor also exits 2 on its own when any section is critical)
 ai-memory doctor --json | jq -e '
-  .sections[] | select(.severity == "critical") | empty
+  [.sections[] | select(.severity == "critical")] | length == 0
 ' || { echo "doctor reports CRIT"; ai-memory doctor; exit 1; }
-ai-memory verify-signed-events-chain --format json | jq -e '.ok == true'
+ai-memory verify-signed-events-chain --format json | jq -e '.chain_holds == true'
 
 # --- 6. Apply v0.7.0 secure-default posture (idempotent — env file)
 install -d /etc/ai-memory/env.d
@@ -303,10 +322,15 @@ terraform, this is a single `null_resource` with
 
 ## Rollback
 
-The DB schema migration past v34 is **irreversible**. If you need
-to roll back to v0.6.x, restore the `.v064.bak` DB you took in
-step 2 of Tier 1 / 2. The config.toml `.bak.<timestamp>` written
-by `ai-memory config migrate` can be restored similarly.
+The DB schema migration past v34 is **forward-only** (no down
+migrations). If you need to roll back to v0.6.x, restore either the
+`.v064.bak` DB you took in step 2 of Tier 1 / 2 OR the automatic
+pre-migration snapshot the migrator writes next to the DB before any
+schema-mutating upgrade
+(`<db>.pre-migration-v<from>-to-v<to>-<token>.bak`, a
+transactionally-consistent `VACUUM INTO` image). The config.toml
+`.bak.<timestamp>` written by `ai-memory config migrate` can be
+restored similarly.
 
 ---
 

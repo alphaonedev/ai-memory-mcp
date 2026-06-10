@@ -114,7 +114,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.2** | `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v28** | schema parity with SQLite at v28 (v0.7.0) |
+| ai-memory postgres schema | **v55** | `EXPECTED_SCHEMA=55`; postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 55` (`src/storage/migrations.rs`) |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -496,7 +496,7 @@ operator does not override:
 | `openrouter`     | `https://openrouter.ai/api/v1`                    | `openai/gpt-5`                                  |
 | `fireworks`      | `https://api.fireworks.ai/inference/v1`           | `accounts/fireworks/models/llama-v3p3-70b-instruct` |
 | `lmstudio`       | `http://localhost:1234/v1`                        | `local-model`                                   |
-| `openai-compatible` | _(no default — operator must set `base_url`)_ | `gpt-5`                                         |
+| `openai-compatible` | _(no meaningful default — operator must set `base_url`; the env-var path errors without it)_ | `gemma3:4b` (legacy fallthrough)                |
 
 The model defaults are intentionally aggressive — operators MUST
 verify the chosen model exists on their account before relying on it.

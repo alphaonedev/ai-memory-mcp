@@ -21,6 +21,7 @@ the local store.
   [`src/federation/quorum.rs`](../src/federation/quorum.rs),
   [`src/federation/receive.rs`](../src/federation/receive.rs),
   [`src/federation/sync.rs`](../src/federation/sync.rs),
+  [`src/federation/push_dlq.rs`](../src/federation/push_dlq.rs),
   [`src/federation/vector_clock.rs`](../src/federation/vector_clock.rs),
   [`src/federation/reflection_bookkeeping.rs`](../src/federation/reflection_bookkeeping.rs).
 - **Issue trail:** [#238](https://github.com/alphaonedev/ai-memory-mcp/issues/238),
@@ -41,7 +42,7 @@ ai-memory serve --tls-cert /etc/ai-memory/server.crt \
 The allowlist file is a newline-delimited set of SHA-256
 fingerprints in hex with optional `:` separators, `#` line comments,
 and trailing inline comments after the fingerprint
-([`src/main.rs:128-160`](../src/main.rs)). Peers without a listed cert
+([`src/tls.rs::load_fingerprint_allowlist`](../src/tls.rs)). Peers without a listed cert
 **cannot open the TCP connection** — the TLS handshake fails before
 any HTTP layer code runs.
 
@@ -56,8 +57,13 @@ When set, every endpoint except `/api/v1/health` requires the
 `?api_key=` query-parameter form is deprecated at v0.7.0 and slated
 for v0.8 rejection; see
 [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574) and
-[`production-deployment.md` §3b](production-deployment.md).) Required
-in combination with mTLS for federated peers.
+[`production-deployment.md` §3b](production-deployment.md).) When the
+mTLS allowlist is enforced, the `/api/v1/sync/*` federation endpoints
+bypass the API-key check ([#702](https://github.com/alphaonedev/ai-memory-mcp/issues/702)
+— the peer has already cleared a stronger transport-layer gate, and
+the downstream `X-Memory-Sig` requirement under
+`AI_MEMORY_FED_REQUIRE_SIG=1` binds the claimed peer-id to an
+enrolled key); all non-federation surfaces still require the key.
 
 Pinned by [`tests/federation_x_api_key.rs`](../tests/federation_x_api_key.rs).
 
@@ -87,9 +93,9 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   any suffix. Empty = peer may not pull any rows (default-deny).
 
 The attestation core is `attest_sender`
-([`src/federation/peer_attestation.rs:247`](../src/federation/peer_attestation.rs))
+([`src/federation/peer_attestation.rs:257`](../src/federation/peer_attestation.rs))
 on the inbound `/sync/push` path and `namespace_allowed`
-([`src/federation/peer_attestation.rs:338`](../src/federation/peer_attestation.rs))
+([`src/federation/peer_attestation.rs:348`](../src/federation/peer_attestation.rs))
 on the outbound `/sync/since` path. Both are pure functions over
 operator-configured allowlist rows; both default-deny.
 
@@ -118,7 +124,7 @@ write, unless the operator explicitly opts in to the peer's claim via
 the two `TRUST_*` flags. Bypass detection:
 `trust_body_agent_id_bypass()` /
 `sync_trust_peer_bypass()` at
-[`src/federation/peer_attestation.rs:211-220`](../src/federation/peer_attestation.rs).
+[`src/federation/peer_attestation.rs:221-228`](../src/federation/peer_attestation.rs).
 
 A malformed `AI_MEMORY_FED_PEER_ATTESTATION` JSON value is treated as
 an empty allowlist (default-deny) plus a `tracing::warn!` so the
@@ -137,7 +143,7 @@ v0.7.0 adds reflection-aware bookkeeping
 ([`src/federation/reflection_bookkeeping.rs`](../src/federation/reflection_bookkeeping.rs))
 so federated reflection writes carry origin metadata that prevents
 depth-cap laundering. `enforce_local_cap_on_derived`
-([`src/federation/reflection_bookkeeping.rs:200`](../src/federation/reflection_bookkeeping.rs))
+([`src/federation/reflection_bookkeeping.rs:211`](../src/federation/reflection_bookkeeping.rs))
 refuses an inbound reflection memory whose derived depth exceeds the
 local namespace cap, even if the sending peer's local cap is higher.
 
@@ -157,7 +163,7 @@ local namespace cap, even if the sending peer's local cap is higher.
 5. **Leave the two `TRUST_*` flags unset** unless your peer mesh is
    under operator-level control (e.g., the in-tree integration tests
    set both — see
-   [`src/handlers/mod.rs:822-838`](../src/handlers/mod.rs) for the
+   [`src/handlers/tests.rs`](../src/handlers/tests.rs) for the
    legacy-test bypass installation pattern).
 6. **Verify** with
    `curl --cert peer.crt --key peer.key -H "x-peer-id: peer-node-1" \
@@ -177,13 +183,16 @@ ai-memory daemon doesn't carry the X.509 verification cost on every
 fresh connection.
 
 **Sync interval.** `spawn_catchup_loop`
-([`src/federation/receive.rs:35`](../src/federation/receive.rs))
-drives the periodic pull from peers; default cadence is operator-set
-via the `FederationConfig` ([`src/federation/peer.rs:30`](../src/federation/peer.rs)).
+([`src/federation/receive.rs:69`](../src/federation/receive.rs))
+drives the periodic pull from peers; cadence is operator-set via
+`--catchup-interval-secs` (default 30s) on the `FederationConfig`
+([`src/federation/mod.rs:99`](../src/federation/mod.rs)).
 For small meshes (2-5 peers, modest write volume), 30s is fine. For
 large meshes, increase to 60-300s to spread the pull traffic.
 
-**Quorum width.** v0.6.x defaults to majority (`W = ceil(N/2 + 1)`)
+**Quorum width.** v0.6.x defaults to majority (`W = ceil((N+1)/2)` —
+the `QuorumPolicy::majority` convenience constructor,
+[`src/replication.rs`](../src/replication.rs))
 which is the correct default for partition-tolerance. For a regulated
 deployment where every write must be witnessed by every peer (W = N),
 configure explicitly — but be aware that any single-peer outage
@@ -205,6 +214,27 @@ Raising it is cheap: the write commits **locally first**, so a longer
 remote-ack wait widens only the synchronous-durability gate on the
 HTTP response — never the local commit — and async catch-up converges
 the remaining peers regardless.
+
+**Push DLQ + replay worker (Track D
+[#933](https://github.com/alphaonedev/ai-memory-mcp/issues/933)).**
+Per-peer fanout failures inside `broadcast_store_quorum` (peer
+unreachable, or no Ack before the deadline) are recorded as
+`federation_push_dlq` rows
+([`src/federation/push_dlq.rs`](../src/federation/push_dlq.rs);
+schema v48). A replay worker
+(`spawn_replay_federation_push_dlq`) is spawned alongside the catchup
+loop at the same cadence (`--catchup-interval-secs`, default 30s); it
+re-POSTs the originally captured payload via `post_once` and stamps
+`replayed_at` on Ack. Retries are bounded: after
+`MAX_REPLAY_ATTEMPTS = 100` (~50 min at the default tick) a row is
+**quarantined** — the take query excludes it
+([#1578](https://github.com/alphaonedev/ai-memory-mcp/issues/1578))
+so it cannot wedge the queue or amplify against a dead peer, and the
+`ai_memory_federation_push_dlq_quarantined` counter plus the
+`ai_memory_federation_push_dlq_depth` gauge are the operator alert
+surface. Quarantined rows are never silently dropped; no CLI drain
+surface ships at v0.7.0 — the data-layer drain procedure lives in
+[`docs/TROUBLESHOOTING.md` §federation-push-DLQ](TROUBLESHOOTING.md).
 
 **Reflection-depth interop.** When peers run different
 `max_reflection_depth` settings, the `enforce_local_cap_on_derived`
@@ -268,8 +298,8 @@ Operator procedure:
 | Mesh size | Quorum default | Sync cadence | Notes |
 |---|---|---|---|
 | 2-3 peers | W = 2 (majority) | 30s | Default; small CRDT merge load. |
-| 4-10 peers | W = ceil(N/2 + 1) | 30-60s | Catchup loop dominates network use. |
-| 11-50 peers | W = ceil(N/2 + 1) | 60-120s | Consider sharding by namespace prefix. |
+| 4-10 peers | W = ceil((N+1)/2) | 30-60s | Catchup loop dominates network use. |
+| 11-50 peers | W = ceil((N+1)/2) | 60-120s | Consider sharding by namespace prefix. |
 | 50+ peers | App-level coordinator | 120-300s | At this scale the substrate's
 peer-to-peer mesh model is the wrong shape — use a gossip layer or
 a proper consensus coordinator and treat each ai-memory daemon as a
@@ -292,7 +322,7 @@ other agents or pulling unrelated namespaces.
 | Outbound `/sync/since` returns empty payload | No matching `allowed_namespaces` entry for the requesting peer | Add a glob pattern that matches the namespace the peer is trying to pull. Verify with `namespace_allowed_test_glob`. |
 | TLS handshake fails | Peer cert not in `peer-fingerprints.allow` | Recompute the SHA-256 fingerprint and add it (or fix the typo). |
 | `AI_MEMORY_FED_PEER_ATTESTATION` parse warning at startup | JSON syntax error in the env var | `echo $AI_MEMORY_FED_PEER_ATTESTATION | jq .` — fix the syntax. Substrate is running in default-deny until you do. |
-| Reflections refused as `local_cap_refusal` | Sending peer's depth exceeds local namespace cap | Verify with `enforce_local_cap_on_derived` test. Either bump the local cap or raise the issue with the sending peer's operator. |
+| Reflections refused with `reflection depth N would exceed local cap M` | Sending peer's depth exceeds local namespace cap | Verify with the `enforce_local_cap_on_derived` tests. Either bump the local cap or raise the issue with the sending peer's operator. |
 | Quorum write hangs | One peer is unreachable; W > available peers | Inspect `tests/federation_b2_hardening.rs` for the timeout shape. Drop the unreachable peer from `FederationConfig` until the outage is resolved. |
 
 ## Operator runbook (3am procedures)

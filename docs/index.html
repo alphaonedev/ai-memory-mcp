@@ -150,9 +150,11 @@ section.dark{background:var(--bg-raised)}
 .aud h3{font-size:1.1rem;margin-bottom:.65rem;color:#fff}
 .aud p{font-size:.92rem;color:var(--text-muted);margin-bottom:1rem;line-height:1.5}
 .aud .cta{display:inline-block;font-family:var(--font-mono);font-size:.82rem;color:#fff;border-bottom:1px dashed var(--text-muted);padding-bottom:1px}
+.aud.green::before{background:var(--good)}
 .aud.cyan:hover{border-color:var(--p1)}
 .aud.amber:hover{border-color:var(--p2)}
 .aud.violet:hover{border-color:var(--p3)}
+.aud.green:hover{border-color:var(--good)}
 
 /* reference architectures topology continuum */
 .arch-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.8rem;margin:1.5rem 0}
@@ -199,6 +201,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <a href="#install">Install</a>
       <a href="#migrate">Migrate</a>
       <a href="#integrate">Integrate</a>
+      <a href="#audiences">Audiences</a>
       <a href="#architectures">Architectures</a>
       <a href="whats-new-v07.html" style="color:var(--p3)">v0.7.0</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
@@ -221,12 +224,14 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span>Ed25519 attested</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
+      <span><a href="evidence.html" style="color:#6ee7ff">15,951 / 0 regression suite</a></span>
     </div>
     <div class="cta-row">
       <a class="cta primary" href="#install">Install in 60 seconds</a>
       <a class="cta violet" href="whats-new-v07.html">What's new in v0.7.0</a>
       <a class="cta ghost" href="#why">Why ai-memory?</a>
     </div>
+    <pre style="display:inline-block;text-align:left;margin-top:1.75rem;font-size:.82rem;padding:.7rem 1.1rem"><code>brew install alphaonedev/tap/ai-memory   <span style="color:#666"># or: cargo install ai-memory</span></code></pre>
   </div>
 </header>
 
@@ -362,6 +367,16 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <span class="tag green">Sidechain transcripts</span>
         <h3>Compressed conversation replay</h3>
         <p>zstd-3 BLOBs + <code>memory_replay</code>. Full conversation context preserved out-of-band from the memory row.</p>
+      </div>
+      <div class="feat violet">
+        <span class="tag violet">Recursive learning</span>
+        <h3>Reflect, atomise, consolidate</h3>
+        <p><code>memory_reflect</code> with a hard depth cap, atomisation into linked atom rows, consolidation, persona generation, and a skills registry. Agents that improve their own memory &mdash; under governance.</p>
+      </div>
+      <div class="feat cyan">
+        <span class="tag">Observability</span>
+        <h3>Tracing, metrics, forensics</h3>
+        <p><code>tracing</code> structured logs, a bare <code>/metrics</code> Prometheus surface, the append-only signed-events audit chain, and verifiable forensic-bundle export for incident response.</p>
       </div>
     </div>
 
@@ -575,17 +590,23 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     <span class="eyebrow">Docs by audience</span>
     <h2>Pick your role. We will get to the point.</h2>
     <p class="lede">
-      Three landing pages, each answering one question in the first paragraph. Reference material lives in the linked docs; the audience pages stay short.
+      Four pathways, each answering one question in the first paragraph. Reference material lives in the linked docs; the audience pages stay short.
     </p>
 
     <div class="audience-row">
-      <a class="aud cyan" href="audience/decision-maker.html">
-        <div class="who">Decision maker &middot; procurement</div>
+      <a class="aud cyan" href="for-everyone.html">
+        <div class="who">Everyone &middot; non-technical</div>
         <h3>I want to talk to my AI and have it remember.</h3>
         <p>Install ai-memory in 60 seconds. Plug it into Claude Code or ChatGPT desktop. Your assistant remembers across sessions. No databases, no servers, no jargon.</p>
-        <span class="cta">Decision-maker deep-dive &rarr;</span>
+        <span class="cta">Plain-language tour &rarr;</span>
       </a>
-      <a class="aud amber" href="audience/developer.html">
+      <a class="aud amber" href="audience/decision-maker.html">
+        <div class="who">Decision maker &middot; C-level / procurement</div>
+        <h3>I need the risk, cost, and compliance picture.</h3>
+        <p>Apache-2.0, no SaaS billing surface, vendor-independent LLM layer, NSA CSI MCP mapping, and a federated reference architecture proven live on a 15-node, 3-region fleet.</p>
+        <span class="cta">Decision-maker brief &rarr;</span>
+      </a>
+      <a class="aud green" href="audience/developer.html">
         <div class="who">Developer &middot; integration</div>
         <h3>I am building with ai-memory.</h3>
         <p>Three interfaces: MCP, HTTP, CLI. Persistent typed memory for your AI app, agent, or harness. Generic MCP works out of the box; Claude Code, Cursor, ChatGPT desktop, others have first-class recipes.</p>
@@ -718,6 +739,10 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
         <strong>Forensic export</strong>
         <span class="desc">Verifiable bundle export for audit, compliance, incident response.</span>
       </a>
+      <a class="lk" href="tracing.html">
+        <strong>Tracing &amp; metrics</strong>
+        <span class="desc">Structured tracing, Prometheus <code>/metrics</code>, signed-event audit chain.</span>
+      </a>
       <a class="lk" href="TROUBLESHOOTING.md">
         <strong>Troubleshooting</strong>
         <span class="desc">Common errors, recovery procedures, diagnostic CLI flags.</span>
@@ -742,6 +767,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     <p class="lede">The full docs surface &mdash; concept pages, API, guides, ADRs &mdash; lives alongside the source.</p>
     <div class="links-grid">
       <a class="lk" href="compliance/index.html"><strong>Compliance &amp; Procurement</strong><span class="desc">NSA CSI MCP mapping · honest limitations · Memory Portability Spec v1</span></a>
+      <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 final baseline.</span></a>
       <a class="lk" href="USER_GUIDE.md"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
       <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">88 routes (74 unique paths)</span></a>

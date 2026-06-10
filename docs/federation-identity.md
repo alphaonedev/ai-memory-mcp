@@ -41,8 +41,10 @@ This is the **shape** of SPIFFE/SPIRE (CA-rooted, attestation-issued,
 short-lived, auto-rotating) but is **first-party**: it composes the
 Ed25519 sign/verify and canonical-CBOR primitives already in
 `src/identity/`. There is **no new dependency** — no `rcgen`, no
-`openssl`, no X.509. The full design rationale is in
-[ADR-001](../.local-runs/design/ADR-001-federation-identity-at-scale.md).
+`openssl`, no X.509. The full design rationale is recorded in
+ADR-001 ("Federation identity at scale" — a design-cycle artifact;
+the shipped decisions are mirrored in the module docs under
+[`src/federation/identity/`](../src/federation/identity/)).
 
 ---
 
@@ -123,7 +125,7 @@ zero-touch additions:
 | `AI_MEMORY_FED_CRED_PATH` | unset → boot-once keyfile | P2 | Path to this node's issued leaf credential (the outbound credential it presents). |
 | `AI_MEMORY_FED_CRED_CHAIN_PATH` | unset → direct (depth-1) | P4 | Path to the anchor-first intermediate chain this node attaches to outbound requests (hierarchical trust). |
 | `AI_MEMORY_FED_INVENTORY_PATH` | unset | P3 | Path to the declarative inventory YAML (GitOps source of truth, §6). |
-| `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | unset (off) | P2 | **Fail-closed gate.** When `=1`, a receiver rejects any peer that presents no valid CA-signed credential for the configured trust domain — `401 peer_not_enrolled` (`handlers/federation_signing_check.rs`). This is the switch that turns the trust bundle from advisory into mandatory enrollment. |
+| `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | unset (off) | P2 | **Fail-closed gate.** When `=1`, a receiver rejects any peer with no verifiable signing identity — neither an enrolled per-peer Ed25519 key nor a valid CA-signed credential for the configured trust domain — with `401 peer_not_enrolled` (`handlers/federation_signing_check.rs`). This is the switch that turns the trust bundle from advisory into mandatory enrollment. v0.8 flips the secure default. |
 | `AI_MEMORY_KEY_DIR` | boot-once keyfile dir | P2 | Directory holding **this node's** Ed25519 signing keypair at `<key_dir>/<federation-identity>.{pub,priv}`. The outbound signer loads the private half by the resolved federation identity, so the file MUST be keyed by that (slashed) identity. Not in the `AI_MEMORY_FED_*` family because it is the generic node-key location shared with the rest of the identity layer. |
 
 ### Identity resolution precedence (P1)
@@ -362,10 +364,13 @@ every renewal tick):
 | `ai_memory_federation_cred_max_age_seconds` | gauge | **max-cred-age** — alert as it approaches the leaf TTL; aging past TTL without renewal means the refresh worker stalled and outbound sync will start failing peer verification. |
 | `ai_memory_federation_renewal_lag_seconds` | gauge | **renewal-lag** — seconds since the last successful renewal; alert when it exceeds the refresh interval by a safety margin (renewals failing silently even though the worker thread is alive). |
 
-Every issue / renew / revoke is also recorded on the existing
-`signed_events` audit chain (verify with
+Credential renewals are also recorded on the existing
+`signed_events` audit chain as `federation.credential_renewed` rows
+([`src/federation/identity/renewal.rs`](../src/federation/identity/renewal.rs);
+issuance happens issuer-side and revocation is "stop renewing", so
+the renewal event is the in-tree lifecycle record). Verify with
 `ai-memory verify-signed-events-chain`; see
-[`docs/signed-events-v4.md`](signed-events-v4.md)).
+[`docs/signed-events-v4.md`](signed-events-v4.md).
 
 ---
 
@@ -494,7 +499,7 @@ mechanism) differs, and each has a supported path above.
 
 ## 11. Cross-references
 
-- [ADR-001 — Federation identity at scale](../.local-runs/design/ADR-001-federation-identity-at-scale.md) — the build decisions.
+- ADR-001 — Federation identity at scale (design-cycle artifact; the shipped decisions are mirrored in the [`src/federation/identity/`](../src/federation/identity/) module docs).
 - [Federation hardening (mTLS + X-API-Key + peer attestation)](federation.md) — the transport/identity layer beneath this one.
 - [Signed-events V-4 audit chain](signed-events-v4.md) — records issue/renew/revoke + verification outcomes.
 - [`tests/federation_identity_e2e.rs`](../tests/federation_identity_e2e.rs) — the public-API capstone exercising every path above.
