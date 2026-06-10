@@ -209,7 +209,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // perf remediation: the SAL `list_unembedded` (bounded NULL-
     // embedding scan) + `set_embeddings_batch` (single-tx chunk write)
     // overrides closing the dead-fleet-semantic-recall backfill gap
-    // (~90 LOC incl. docs), plus the `migrate_v56` arm (stored
+    // (~90 LOC incl. docs), plus the `migrate_v57` arm (stored
     // generated `tsv` tsvector column + `memories_tsv_gin`, drops the
     // legacy expression index; ~75 LOC incl. the operational-lock
     // docs) and the v55-arm literal-stamp fix. Growth justified:

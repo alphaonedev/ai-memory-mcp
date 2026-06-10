@@ -472,7 +472,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       SQLite backend, which has no pre-existing updated_at index, adds
 //       one at v55 (`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`).
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-// v56 = #1579 B2 (perf, 2026-06-10) — stored generated tsvector column.
+// v57 = #1579 B2 (perf, 2026-06-10) — stored generated tsvector column.
 //       `tsv tsvector GENERATED ALWAYS AS (to_tsvector('english',
 //       coalesce(title,'')||' '||coalesce(content,''))) STORED` +
 //       `memories_tsv_gin` GIN index on the COLUMN; the recall /
@@ -485,7 +485,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 56;
+const CURRENT_SCHEMA_VERSION: i32 = 57;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1265,7 +1265,7 @@ impl PostgresStore {
             self.migrate_v55().await?;
         }
         if current_version < CURRENT_SCHEMA_VERSION {
-            self.migrate_v56().await?;
+            self.migrate_v57().await?;
         }
 
         Ok(())
@@ -2393,9 +2393,6 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v55 tx", e))?;
 
-        // #1579 B2 follow-on: stamp the LITERAL 55 (this arm used to
-        // stamp `CURRENT_SCHEMA_VERSION` back when v55 was the ladder
-        // tail — that would have skipped every later arm on replay).
         record_schema_version(&mut tx, 55).await?;
 
         tx.commit()
@@ -2409,17 +2406,17 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// v56 (#1579 B2, perf) — stored generated tsvector column for the
+    /// v57 (#1579 B2, perf) — stored generated tsvector column for the
     /// full-text search + recall surfaces.
     ///
-    /// Pre-v56 the recall/search/contradiction queries ranked with
+    /// Pre-v57 the recall/search/contradiction queries ranked with
     /// `ts_rank(to_tsvector('english', title || ' ' || content), …)`:
     /// the GIN **expression** index (`memories_content_fts`) only ever
     /// served the `@@` match — `ts_rank` re-parsed and re-stemmed the
     /// full document text PER MATCHED ROW (~305 of 306 ms at 8k fleet
     /// rows in the P3 perf audit; ~4 s extrapolated at 100k rows).
     ///
-    /// v56 adds `tsv tsvector GENERATED ALWAYS AS (...) STORED`,
+    /// v57 adds `tsv tsvector GENERATED ALWAYS AS (...) STORED`,
     /// GIN-indexes the COLUMN (`memories_tsv_gin`), and the query
     /// shapes read `tsv` for both match and rank, so the tsvector is
     /// computed once per WRITE instead of once per matched row per
@@ -2440,12 +2437,12 @@ impl PostgresStore {
     /// SQLite twin is a version-stamp no-op (FTS5 already materialises
     /// the index text in the `memories_fts` virtual table — there is
     /// nothing to precompute), the inverse of the v55 arm.
-    async fn migrate_v56(&self) -> StoreResult<()> {
+    async fn migrate_v57(&self) -> StoreResult<()> {
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| to_store_err("begin v56 tx", e))?;
+            .map_err(|e| to_store_err("begin v57 tx", e))?;
 
         sqlx::query(
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tsv tsvector \
@@ -2454,12 +2451,12 @@ impl PostgresStore {
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| to_store_err("v56 add tsv generated column", e))?;
+        .map_err(|e| to_store_err("v57 add tsv generated column", e))?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS memories_tsv_gin ON memories USING gin (tsv)")
             .execute(&mut *tx)
             .await
-            .map_err(|e| to_store_err("v56 create memories_tsv_gin", e))?;
+            .map_err(|e| to_store_err("v57 create memories_tsv_gin", e))?;
 
         // The legacy EXPRESSION index served only the `@@` match and no
         // query references the expression any more — keeping it would
@@ -2467,17 +2464,17 @@ impl PostgresStore {
         sqlx::query("DROP INDEX IF EXISTS memories_content_fts")
             .execute(&mut *tx)
             .await
-            .map_err(|e| to_store_err("v56 drop memories_content_fts", e))?;
+            .map_err(|e| to_store_err("v57 drop memories_content_fts", e))?;
 
         record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
 
         tx.commit()
             .await
-            .map_err(|e| to_store_err("commit v56 migration", e))?;
+            .map_err(|e| to_store_err("commit v57 migration", e))?;
 
         tracing::info!(
             target: TRACE_TARGET,
-            "schema migration v56 applied (#1579 B2: stored generated tsv column + memories_tsv_gin; dropped expression index memories_content_fts)"
+            "schema migration v57 applied (#1579 B2: stored generated tsv column + memories_tsv_gin; dropped expression index memories_content_fts)"
         );
         Ok(())
     }
@@ -2937,7 +2934,7 @@ impl PostgresStore {
             .try_into()
             .unwrap_or(LIST_FALLBACK_LIMIT_I64);
         // #1579 B2 — rank + match read the stored generated `tsv`
-        // column (schema v56) instead of recomputing
+        // column (schema v57) instead of recomputing
         // to_tsvector(title||' '||content) per matched row.
         let rows = sqlx::query(
             "SELECT m.*,
@@ -9216,7 +9213,7 @@ impl MemoryStore for PostgresStore {
             Some(caller)
         };
         // #1579 B2 — rank + match read the stored generated `tsv`
-        // column (schema v56). Pre-fix, `ts_rank(to_tsvector(...))`
+        // column (schema v57). Pre-fix, `ts_rank(to_tsvector(...))`
         // recomputed the tsvector PER MATCHED ROW (~305 of 306 ms at
         // 8k rows in the P3 fleet audit); the GIN expression index
         // only ever served the `@@` match, never the rank.
@@ -9887,7 +9884,7 @@ impl MemoryStore for PostgresStore {
         // the trait-side adaptive blend can compute semantic_weight
         // per row.
         // #1579 B2 — rank + match read the stored generated `tsv`
-        // column (schema v56); see search() above for the rationale.
+        // column (schema v57); see search() above for the rationale.
         let fts_rows = sqlx::query(
             "SELECT *,
                     ts_rank(tsv, to_tsquery('english', $1))
@@ -12810,7 +12807,7 @@ impl MemoryStore for PostgresStore {
 
     async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
         // Postgres FTS via the stored generated `tsv` column (#1579 B2,
-        // schema v56) + `plainto_tsquery`, mirroring the SQLite
+        // schema v57) + `plainto_tsquery`, mirroring the SQLite
         // `memories_fts MATCH` semantics — top 5 candidates in the
         // same namespace, ranked by relevance.
         let rows = sqlx::query(
