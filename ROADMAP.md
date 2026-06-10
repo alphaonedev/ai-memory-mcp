@@ -1050,6 +1050,8 @@ Tracking: [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697) (epic)
 - **Defer to v0.8.1 if substrate slips:** V08-PE-3 subprocess-chain visibility (eBPF / dtrace work has platform-specific risk).
 - **Defer to v0.9 if slippage severe:** V08-PE-6 TPM-bound integrity, V08-PE-7 refuse-by-default profile.
 
+**Carried in from the v0.7.0 #1579 performance final-gate (Tier C):** [#1580](https://github.com/alphaonedev/ai-memory-mcp/issues/1580) — sqlite WAL read-pool (read-connection pool behind the HTTP daemon's single-connection mutex; folded with #1488). Tier D ([#1005](https://github.com/alphaonedev/ai-memory-mcp/issues/1005) vectorlite/persistent vector index) stays v0.9 — see §23.
+
 ---
 
 ## 23. v0.9 — Vector Index Substrate Development Plan
