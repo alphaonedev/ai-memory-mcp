@@ -77,9 +77,41 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
+      # #1579 B8 — corpus-scale gate. The default workload (~500 rows)
+      # cannot see corpus-scale blowouts (the P1 audit measured recall
+      # p95 361 ms vs the 50 ms budget at 100k rows while the default
+      # bench stayed green). This step seeds a 10k-row scratch corpus
+      # and gates against the per-scale budgets in PERFORMANCE.md
+      # §"Corpus-scale budgets" (store ≤120 ms, search ≤60 ms,
+      # recall ≤80 ms p95; KG rows keep their canonical budgets).
+      # Measured wall-clock on ubuntu-latest-class hardware: well
+      # under a minute including seeding.
+      - name: Run bench at 10k scale (gate)
+        run: |
+          set +e
+          target/release/ai-memory bench --scale 10000 | tee bench-table-10k.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '## ai-memory bench --scale 10000'
+            echo ''
+            echo 'Corpus-scale gate (#1579 B8): same 7 operations over a '
+            echo '10k-row seeded corpus, gated against the `[scale]` '
+            echo 'budget table in PERFORMANCE.md §"Corpus-scale budgets".'
+            echo ''
+            echo '```'
+            cat bench-table-10k.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
       - name: Run bench (JSON for artifact)
         if: always()
         run: target/release/ai-memory bench --json > bench-results.json || true
+
+      - name: Run bench at 10k scale (JSON for artifact)
+        if: always()
+        run: target/release/ai-memory bench --scale 10000 --json > bench-results-10k.json || true
 
       - name: Upload bench artifact
         if: always()
@@ -88,5 +120,7 @@ jobs:
           name: bench-results
           path: |
             bench-results.json
+            bench-results-10k.json
             bench-table.txt
+            bench-table-10k.txt
           if-no-files-found: warn
