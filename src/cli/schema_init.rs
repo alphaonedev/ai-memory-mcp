@@ -207,7 +207,15 @@ pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
     let report = if is_sqlite_url(&args.store_url) {
         let _store = migrate::open_store(&args.store_url)
             .await
-            .with_context(|| format!("open store at {}", args.store_url))?;
+            // #1579 A3 (SECURITY) — sqlite URLs carry no credential
+            // today, but route through the redactor anyway so a
+            // future scheme change cannot reintroduce the leak.
+            .with_context(|| {
+                format!(
+                    "open store at {}",
+                    crate::logging::redact_url_password(&args.store_url)
+                )
+            })?;
         let mut r = enumerate_sqlite(&args.store_url)?;
         // SQLite has no column-level vector dim — echo the flag
         // value as a metadata hint for downstream tools.
@@ -226,9 +234,11 @@ pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
             anyhow::bail!("postgres support not compiled in (build with --features sal-postgres)");
         }
     } else {
+        // #1579 A3 (SECURITY) — a mistyped scheme can still carry
+        // credentials in the userinfo; redact before echoing.
         anyhow::bail!(
             "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-            args.store_url
+            crate::logging::redact_url_password(&args.store_url)
         );
     };
 
@@ -387,7 +397,14 @@ async fn init_and_enumerate_postgres(url: &str, dim: u32) -> Result<SchemaInitRe
     // handles the alter case.
     let store = PostgresStore::connect_with_dim(url, dim)
         .await
-        .with_context(|| format!("open store at {url} with embedding dim {dim}"))?;
+        // #1579 A3 (SECURITY) — redact the URL credential in the
+        // error-context chain operators see on a failed connect.
+        .with_context(|| {
+            format!(
+                "open store at {} with embedding dim {dim}",
+                crate::logging::redact_url_password(url)
+            )
+        })?;
 
     // Run the v29 conversion if the live column dim differs from
     // what the caller requested. Returns `true` if a real conversion
@@ -422,7 +439,13 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
         .acquire_timeout(std::time::Duration::from_secs(15))
         .connect(url)
         .await
-        .with_context(|| format!("connect postgres for enumeration: {url}"))?;
+        // #1579 A3 (SECURITY) — same redaction as the connect above.
+        .with_context(|| {
+            format!(
+                "connect postgres for enumeration: {}",
+                crate::logging::redact_url_password(url)
+            )
+        })?;
 
     // Tables in the user-facing `public` schema, sorted. Filtering
     // on `public` keeps the report scoped to the application; AGE

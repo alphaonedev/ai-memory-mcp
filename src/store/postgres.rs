@@ -652,7 +652,11 @@ impl PostgresStore {
             url.parse()
                 .map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
                     backend: "postgres".to_string(),
-                    detail: format!("parse url: {e}"),
+                    // #1579 A3 (SECURITY) — sqlx parse errors can
+                    // interpolate the raw URL (credential included)
+                    // into their Display; scrub any embedded URL's
+                    // password before the detail leaves the adapter.
+                    detail: crate::logging::redact_urls_in_message(&format!("parse url: {e}")),
                 })?;
         // v0.7.0 M4/M7 — `after_connect` hook fires the moment a new
         // connection is acquired. We use it to apply per-session
