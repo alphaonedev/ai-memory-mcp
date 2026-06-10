@@ -362,7 +362,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `embedding_model` | String | `"nomic-embed-text-v1.5"` | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic-embed-text-v1.5"` (768-dim, ~280 MB) | **[LEGACY]** Sentence-transformer / Ollama embedder model. Canonical v2: `[embeddings].model`. |
 | `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"deepseek-chat"`, `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
 | `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
-| `default_namespace` | String | `"global"` | Any valid namespace (max 128 bytes, no slashes/spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
+| `default_namespace` | String | `"global"` | Any valid namespace (max 512 chars; `/` hierarchy delimiter allowed; no spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
 | `max_memory_mb` | Integer | Tier-dependent | Any positive integer | Maximum memory budget in MB; used for automatic tier selection via `from_memory_budget()` |
 | `archive_on_gc` | Bool | `true` | `true`, `false` | **[LEGACY]** Archive expired memories on GC. Canonical v2: `[storage].archive_on_gc`. |
 | `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
@@ -381,7 +381,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 
 > **Sliding-window REPLACEMENT (CLAUDE.md prime-directive contract, issue [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)):** the `*_extend_secs` fields are misnamed historically — the implementation does NOT take `max(old_expires_at, now + extend_secs)`. Each access REPLACES `expires_at` outright with `now + per-tier-extend_secs`. A short memory accessed every 30 minutes never expires, even though it started with a 6h backstop. The field-name "extend" is preserved for backward-compat with v0.6.x callers and config files.
 
-> **Note:** Restored memories have their `expires_at` cleared (set to NULL) and become permanent.
+> **Note:** Archive-restored memories re-apply the archived row's `original_tier` / `original_expires_at` where present; legacy archive rows (pre-v49) restore as `long` with no expiry.
 
 #### Complete Annotated config.toml
 
@@ -598,17 +598,23 @@ These are set in the source code and require recompilation to change:
 
 ## Profiles (v0.6.4+)
 
-The MCP server's tool surface is selected by `--profile`. Profiles compose tool **families** — `core`, `graph`, `admin`, `power`, `full` — and the always-on bootstrap (`memory_capabilities`) is unioned in regardless of which profile is active.
+The MCP server's tool surface is selected by `--profile`. The named
+profiles — `core`, `graph`, `admin`, `power`, `full` (or a
+comma-separated custom family list) — compose tool **families** (the
+eight-variant `Family` enum in `src/profile.rs`: Core, Lifecycle,
+Graph, Governance, Power, Meta, Archive, Other), and the always-on
+bootstrap (`memory_capabilities`) is unioned in regardless of which
+profile is active.
 
 | Profile | Advertised tools | Use when |
 |---|---|---|
 | `core` (default) | **7 + bootstrap at v0.7.0** (the original 5 + `memory_load_family` + `memory_smart_load`) | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
-| `graph` | core + KG family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths`. |
-| `admin` | core + governance + audit | Operator sessions doing `memory_governance_*`, `memory_audit_*`, archive purges. |
-| `power` | core + smart-tier LLM tools | Smart/autonomous tier deployments that want `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction` always available. |
+| `graph` | core + Graph family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths` / `memory_verify` / `memory_replay` / the entity + taxonomy tools. |
+| `admin` | core + Lifecycle + Governance families | Operator sessions doing `memory_pending_*`, `memory_check_agent_action`, `memory_rule_list`, agent registration, lifecycle ops. |
+| `power` | core + Power family | Smart/autonomous tier deployments that want `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_check_duplicate`, `memory_inbox`, the subscription-reliability tools, etc. always available. |
 | `full` | every family — **74 advertised entries at v0.7.0** (73 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
-**v0.7 always-on additions:** `memory_load_family(family)` and `memory_smart_load(intent)` are advertised under every profile. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
+**v0.7 core additions:** `memory_load_family(family)` and `memory_smart_load(intent)` live in the Core family, so every named profile (all of which include core) advertises them. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
 
 ```bash
 ai-memory mcp                       # --profile core (default)
@@ -648,17 +654,23 @@ Per-agent Ed25519 keypairs sign every outbound `memory_links` write. Inbound wri
 ai-memory identity generate --agent-id "ai:claude-code@host:pid-12345"
 ai-memory identity list
 ai-memory identity export-pub --agent-id "ai:claude-code@host:pid-12345"
-ai-memory identity suggest-id                # prints a sensible default for $HOSTNAME / current process
+ai-memory identity import --agent-id peer-1 --pub ./peer-1.pub   # enrol a peer's public key
 ```
 
 Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode `0644` / `0600`. The private key never leaves the host; only the `.pub` is exchanged with peers (via `identity export-pub`, by hand or out-of-band).
 
-**`attest_level` enum** stamped on every link:
+**`attest_level` enum** (five variants at v0.7.0 — `src/models/link.rs::AttestLevel`):
 - `unsigned` — no keypair present for the writer; preserves v0.6.4 backward compat
 - `self_signed` — active agent has a keypair; outbound writes are signed
-- `peer_attested` — federated link verified against the peer's pinned public key
+- `peer_attested` — federated link verified against the peer's pinned public key (H3 inbound)
+- `signed_by_peer` — L4 `memory_capture_turn` host-signed memory, verified against `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` (#1389/RFC-0001)
+- `daemon_signed` — the substrate's own signature on its governance-audit emissions
 
-The `memory_verify(link_id)` MCP tool returns `{signature_verified, attest_level, signed_by, signed_at}` for any link on demand. Use it as a verification gate in any decision path that previously trusted `metadata.agent_id` alone.
+The `memory_verify` MCP tool (and `POST /api/v1/links/verify` /
+`POST /api/v1/memory_verify`) returns
+`{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`
+for any link on demand. Use it as a verification gate in any decision
+path that previously trusted `metadata.agent_id` alone.
 
 **Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP — available only in the AgenticMem commercial layer. Software-only Ed25519 with file-mode 0600 is the OSS contract. See [MIGRATION § Ed25519 attestation](MIGRATION_v0.7.md#ed25519-attestation-opt-in) and the [`attested-cortex` RFC § Decision 1](v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20) for the threat model and the X25519 / ChaCha20 deferral rationale.
 
@@ -690,9 +702,10 @@ CREATE EXTENSION IF NOT EXISTS age;
 ```
 
 ```bash
-ai-memory doctor --kg-backend
-# kg_backend = "age"   ← AGE detected, Cypher path active
-# kg_backend = "cte"   ← AGE not detected, recursive-CTE fallback
+# schema-init enumerates the target store's catalog, including
+# installed extensions — AGE present ⇒ Cypher path; absent ⇒ the
+# recursive-CTE fallback stays in place (see docs/kg-backend-fallback.md).
+ai-memory schema-init --store-url postgres://… 
 ```
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship in a given build — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your Postgres + hardware combination, stay on the CTE path; the substrate is happy with either. See [MIGRATION § Apache AGE acceleration](MIGRATION_v0.7.md#apache-age-acceleration-opt-in) and the [`attested-cortex` RFC § Decision 3](v0.7/rfc-attested-cortex.md#decision-3--why-age-behind-a-feature-flag-vs-hard-dependency) for why AGE ships behind a feature flag instead of as a hard dependency.
@@ -758,37 +771,45 @@ ai-memory governance migrate-to-permissions --apply       # commit
 
 Re-running is safe — already-migrated rows are skipped. The dry-run output is the authoritative diff to review before `--apply`.
 
-**A2A approval API** (Track K10) — three surfaces, all HMAC-signed (mandatory, non-optional per ROADMAP §7.3):
+**A2A approval API** (Track K10) — three surfaces; the HTTP decide
+path is HMAC-gated (`X-AI-Memory-Signature: sha256=<hex>` over the
+body):
 
 | Surface | Endpoint / tool |
 |---|---|
-| HTTP | `GET /api/v1/approvals/pending`, `POST /api/v1/approvals/:id/decide` |
-| SSE | `GET /api/v1/approvals/stream` (live updates for human-in-the-loop UIs) |
-| MCP | `memory_approval_pending`, `memory_approval_decide(id, decision, remember=forever?)` |
+| HTTP | `GET /api/v1/pending` (list), `POST /api/v1/approvals/{pending_id}` (decide — body `{"decision":"approve\|deny","remember":"once\|session\|forever"}`), plus the per-id `POST /api/v1/pending/{id}/approve` / `…/reject` pair |
+| SSE | `GET /api/v1/approvals/stream` (live `approval_requested` / `approval_decided` events for human-in-the-loop UIs) |
+| MCP | `memory_pending_list`, `memory_pending_approve(id)`, `memory_pending_reject(id)` (the v0.7-alpha draft names `memory_approval_pending` / `memory_approval_decide` did not ship) |
 
-Set `remember=forever` on a `decide` call to enable **progressive trust** — subsequent identical requests auto-approve. Use sparingly; an over-eager `remember=forever` on a sensitive rule effectively turns enforcement off for that request shape.
+Set `remember: "forever"` on a decide call to enable **progressive trust** — subsequent identical requests auto-approve. Use sparingly; an over-eager `remember=forever` on a sensitive rule effectively turns enforcement off for that request shape.
 
 **G1 inheritance fix (behavior change for pre-v0.6.3.1 v0.6.x users):** `resolve_governance_policy(namespace)` now walks the full namespace chain and honors the first non-null policy encountered, instead of stopping at the leaf. A parent `Approve` policy now blocks child writes that previously slipped through. To preserve pre-v0.6.3.1 behavior on a specific child, set `inherit = false` on its policy. See [MIGRATION § G1 inheritance fix](MIGRATION_v0.7.md#g1-inheritance-fix-behavior-change) for the worked example.
 
 ## Subscriptions & Webhooks
 
-The HTTP daemon exposes **HMAC-signed webhook subscriptions** that turn the memory store into a message bus. Subscribers register a URL + filter (namespace, agent_id, event type), the daemon POSTs JSON payloads on matching events, and every payload carries an `X-Memory-Signature` header (HMAC-SHA256 over the body using the shared secret).
+The HTTP daemon exposes **HMAC-signed webhook subscriptions** that turn the memory store into a message bus. Subscribers register a URL + filter (namespace, agent_id, event type), the daemon POSTs JSON payloads on matching events, and every payload carries an `X-AI-Memory-Signature: sha256=<hex>` header (HMAC-SHA256 over the body using the shared secret).
 
 ```bash
-# Register a subscription
+# Register a subscription (`events` is a comma-separated string;
+# default "*" = every event type)
 curl -X POST http://127.0.0.1:9077/api/v1/subscriptions \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://my-app.local/webhook",
     "secret": "shared-hmac-secret",
-    "events": ["memory_stored", "approval_requested"],
-    "namespace": "team/*"
+    "events": "memory_store,approval_requested",
+    "namespace_filter": "team/project-x"
   }'
 ```
 
 **SSRF hardening:** the subscription dispatcher refuses URLs resolving to private/loopback ranges (RFC1918, link-local, loopback) unless explicitly allowlisted at daemon startup. Webhook URLs that fail the resolution check at registration time are rejected with `400 Bad Request`.
 
-**v0.7 event additions:** `transcript_stored`, `transcript_archived`, `signed_event_appended`, `permission_decision`, `approval_requested`, `approval_decided` join the v0.6.x event set. Subscribe to `approval_requested` to feed the human-in-the-loop UI; subscribe to `signed_event_appended` to feed an external audit pipeline.
+**Canonical event types** (`WEBHOOK_EVENT_TYPES` in
+`src/subscriptions.rs`): `memory_store`, `memory_promote`,
+`memory_delete`, `memory_link_created`, `memory_link_invalidated`,
+`memory_consolidated`, and the v0.7 addition `approval_requested`
+(subscribe to it to feed a human-in-the-loop UI; the paired
+`approval_decided` event rides the K10 SSE stream).
 
 For the full event catalog, payload shapes, and the retry / backoff contract, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) and the relevant [V0.7-EPIC](v0.7/V0.7-EPIC.md) tracks once they merge.
 
@@ -797,7 +818,7 @@ For the full event catalog, payload shapes, and the retry / backoff contract, se
 See [Database Management → Backup](#backup) and [Database Management → Restore](#restore) below for the canonical procedures (live `sqlite3 .backup`, JSON export, file copy with WAL checkpoint). v0.7-specific notes:
 
 - The `signed_events` table (schema v21) is **append-only through the application layer** but is a regular SQLite table at the storage layer — `.backup` and `VACUUM` work normally. Do not `DELETE` from it manually unless you're rebuilding the audit chain from a known-good source.
-- The `memory_transcripts` and `memory_transcript_links` tables (schema v22) carry the zstd-3 BLOBs. They can be large — size the backup destination accordingly. To exclude transcripts from a JSON export, pass `--exclude transcripts` to `ai-memory export`.
+- The `memory_transcripts` and `memory_transcript_links` tables (schema v22) carry the zstd-3 BLOBs. They can be large — size the backup destination accordingly. `ai-memory export` covers memories + links only; transcripts ride along in file-level backups (`sqlite3 .backup` / `VACUUM INTO`).
 - Ed25519 private keys at `~/.config/ai-memory/keys/*.priv` are **NOT** part of the database backup. Back them up separately, with the same care you'd give an SSH private key — losing them means losing the ability to sign as that agent. Public keys (`.pub`) are recoverable from peers via `identity export-pub`.
 
 ## Graceful Shutdown
@@ -1122,14 +1143,14 @@ All ID path parameters (e.g., `/memories/{id}`, `/links/{id}`) are validated bef
 ### Input Validation
 
 All write paths go through the validation layer (`validate.rs`):
-- Title: max 512 bytes, no null bytes
+- Title: max 512 chars, no control chars
 - Content: max 64KB, no null bytes
-- Namespace: max 128 bytes, no slashes/spaces/nulls
-- Source: whitelist (user, claude, hook, api, cli, import, consolidation, system)
+- Namespace: max 512 chars; `/` allowed as hierarchy delimiter (no leading/trailing/empty segments); no backslashes/spaces/nulls
+- Source: whitelist (user, nhi, claude [deprecated], hook, api, cli, import, consolidation, system, chaos, notify)
 - Tags: max 50 tags, each max 128 bytes
 - Priority: 1-10
 - Confidence: 0.0-1.0, finite
-- Relations: whitelist (related_to, supersedes, contradicts, derived_from)
+- Relations: whitelist — six at v0.7.0 (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from)
 - IDs: max 128 bytes, no null bytes
 - Timestamps: valid RFC3339
 - TTL: positive, max 1 year
@@ -1146,9 +1167,25 @@ The HTTP server uses `CorsLayer::new()` (deny-by-default) since v0.5.4-patch.6. 
 
 ### Authentication
 
-The HTTP daemon takes an optional shared API key (`ai-memory serve --api-key …`). When configured, every endpoint except `/api/v1/health` requires it. **The supported credential channel is the `x-api-key` request header**; the `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — URL-embedded credentials leak into access logs, `Referer` headers, and proxy logs. The query form is still accepted at v0.7.0 for back-compat (once-per-process WARN on first use) and is slated for rejection at v0.8 behind a temporary escape hatch. `AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses keyless daemon start on any bind host ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
+The HTTP daemon takes an optional shared API key — the top-level `api_key = "…"` field in `config.toml` (there is no `--api-key` serve flag; the Plan-C container entrypoint injects it via `AI_MEMORY_API_KEY`). When configured, every endpoint except `/api/v1/health` requires it. **The supported credential channel is the `x-api-key` request header**; the `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — URL-embedded credentials leak into access logs, `Referer` headers, and proxy logs. The query form is still accepted at v0.7.0 for back-compat (once-per-process WARN on first use) and is slated for rejection at v0.8 behind a temporary escape hatch. `AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses keyless daemon start on any bind host ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
 
-With no `--api-key` configured the standard HTTP surface is unauthenticated — acceptable only for the default localhost-bound, single-user posture. The MCP (stdio) and CLI surfaces have no key mechanism by design; they are local-process interfaces.
+With no `api_key` configured the standard HTTP surface is unauthenticated — acceptable only for the default localhost-bound, single-user posture. The MCP (stdio) and CLI surfaces have no key mechanism by design; they are local-process interfaces.
+
+**Admin-role gate (v0.7.0 #943/#945/#946 cluster + #1570).**
+Corpus-scale endpoints (`/stats`, `/gc`, `/export`, `/import`,
+`/agents` list, `/forget`, `/namespaces` list, `/taxonomy`,
+`/archive` list + stats, `/skill/*`) additionally require an **admin**
+caller. The allowlist is `[admin] agent_ids = [...]` in `config.toml`
+plus the `AI_MEMORY_ADMIN_AGENT_IDS` env var; when empty (the default)
+these endpoints return 403 to every caller. Per
+[#1570](https://github.com/alphaonedev/ai-memory-mcp/issues/1570), the
+secure default is `AI_MEMORY_ADMIN_HEADER_TRUST` **OFF**: on a
+deployment with admin ids configured but NO `api_key`, a bare
+self-asserted `X-Agent-Id` naming an admin id is REFUSED admin-role
+resolution, and the daemon emits a boot WARN naming the flag. Set
+`AI_MEMORY_ADMIN_HEADER_TRUST=1` only on isolated / mTLS-fronted
+deployments that need the legacy trust-the-header posture. Every
+admin-role decision (allow or deny) lands in the forensic audit chain.
 
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 
@@ -1295,7 +1332,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 ## HTTP API Endpoints
 
-Maximum request body size: 50 MB.
+Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
 The HTTP daemon exposes **88 production `.route(...)` registrations / 74 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
 
@@ -1353,18 +1390,18 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
 **Required fields:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `title` | string | Memory title (max 512 bytes) |
+| `title` | string | Memory title (max 512 chars) |
 | `content` | string | Memory content (max 64 KB) |
 
 **Optional fields:**
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tier` | string | `"mid"` | `"short"`, `"mid"`, or `"long"` |
-| `namespace` | string | `"global"` | Namespace for grouping (max 128 bytes, no slashes/spaces) |
+| `namespace` | string | `"global"` | Namespace for grouping (max 512 chars; `/` hierarchy delimiter allowed; no spaces) |
 | `tags` | array | `[]` | String tags (max 50 tags, each max 128 bytes) |
 | `priority` | integer | `5` | 1-10 (clamped) |
 | `confidence` | float | `1.0` | 0.0-1.0 (clamped) |
-| `source` | string | `"api"` | One of: `user`, `claude`, `hook`, `api`, `cli`, `import`, `consolidation`, `system` |
+| `source` | string | `"api"` | One of `VALID_SOURCES`: `user`, `nhi`, `claude` (deprecated), `hook`, `api`, `cli`, `import`, `consolidation`, `system`, `chaos`, `notify` |
 | `expires_at` | string | (none) | Explicit expiry timestamp (RFC3339) |
 | `ttl_secs` | integer | (none) | TTL in seconds (overrides tier default) |
 
@@ -1375,9 +1412,13 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "tier": "long",
   "namespace": "infra",
-  "title": "Project uses PostgreSQL 16"
+  "title": "Project uses PostgreSQL 16",
+  "agent_id": "alice"
 }
 ```
+
+(`agent_id` echoes the resolved caller identity per #196; `null` when
+the write landed anonymously.)
 
 If potential contradictions are found (memories with similar titles in the same namespace), the response includes:
 
@@ -1401,7 +1442,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   -d '{"title": "Quick note", "content": "Something to remember."}'
 ```
 
-Response: `{"id": "...", "tier": "mid", "namespace": "global", "title": "Quick note"}`
+Response: `{"id": "...", "tier": "mid", "namespace": "global", "title": "Quick note", "agent_id": null}`
 
 #### GET /memories/{id} (Get)
 
@@ -1461,8 +1502,8 @@ curl "http://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&na
 | `namespace` | string | (none) | Filter by namespace |
 | `limit` | integer | `10` | Max results (capped at 50) |
 | `tags` | string | (none) | Comma-separated tag filter |
-| `since` | string | (none) | Only memories updated after this RFC3339 timestamp |
-| `until` | string | (none) | Only memories updated before this RFC3339 timestamp |
+| `since` | string | (none) | Only memories created after this RFC3339 timestamp |
+| `until` | string | (none) | Only memories created before this RFC3339 timestamp |
 
 **Response (200 OK):**
 
@@ -1599,7 +1640,7 @@ curl "http://127.0.0.1:9077/api/v1/archive?namespace=infra&limit=20&offset=0"
 
 #### POST /archive/{id}/restore (Restore)
 
-Restore an archived memory back to the active memories table. The restored memory has its `expires_at` cleared (becomes permanent).
+Restore an archived memory back to the active memories table. The archived row's `original_tier` and `original_expires_at` are re-applied where present (legacy archive rows restore as `long` with no expiry).
 
 ```bash
 curl -X POST http://127.0.0.1:9077/api/v1/archive/expired-memory-id/restore
@@ -1701,11 +1742,15 @@ The project uses GitHub Actions for continuous integration and release automatio
 Runs on `ubuntu-latest` and `macos-latest`:
 
 1. **Formatting** -- `cargo fmt --check`
-2. **Linting** -- `cargo clippy -- -D warnings`
-3. **Tests** -- `cargo test` (1,600 lib tests; canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html))
-4. **Build** -- `cargo build --release`
+2. **Linting** -- `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`
+3. **Tests** -- `AI_MEMORY_NO_CONFIG=1 cargo test` (canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html))
+4. **Dependency audit** -- `cargo audit`
 
-Uses `Swatinem/rust-cache@v2` for build caching.
+Plus the script-based gates in `c8-precheck.yml` (caller-context
+allowlist, vendor-literal lint, hardcoded-literal ratchet,
+docs-vs-SSOT drift) and per-module coverage floors from
+`coverage/thresholds.toml`. Uses `Swatinem/rust-cache@v2` for build
+caching.
 
 ### Release (On Tag Push)
 

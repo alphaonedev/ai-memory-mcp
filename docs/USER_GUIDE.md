@@ -46,7 +46,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 ### How It Works
 
-With MCP configured, your AI client gains 43 memory tools (highlights below; see [API_REFERENCE.md](API_REFERENCE.md) for the full reference):
+With MCP configured, your AI client gains up to 74 memory tools at `--profile full` (highlights below; see [API_REFERENCE.md](API_REFERENCE.md) for the full reference):
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -107,7 +107,7 @@ Store a new memory. Deduplicates by title+namespace -- if a memory with the same
 | `tags` | array of strings | No | `[]` | Tags for filtering |
 | `priority` | integer (1-10) | No | `5` | Priority ranking |
 | `confidence` | number (0.0-1.0) | No | `1.0` | Certainty level |
-| `source` | string | No | `"claude"` | Origin: `"user"`, `"claude"`, `"hook"`, `"api"`, `"cli"`, `"import"`, `"consolidation"`, `"system"` |
+| `source` | string | No | `"nhi"` (v0.7.x vendor-neutral default, #1175) | Origin — one of `VALID_SOURCES`: `"user"`, `"nhi"`, `"claude"` (deprecated), `"hook"`, `"api"`, `"cli"`, `"import"`, `"consolidation"`, `"system"`, `"chaos"`, `"notify"` |
 | `kind` | string | No | `"observation"` | Memory kind. Omit for the `observation` default; a supplied value MUST be one of the canonical variants (`observation`, `reflection`, `persona`, `concept`, `entity`, `claim`, `relation`, `event`, `conversation`, `decision`) or the write is rejected (#1467). See `docs/memory-kind-vocab.md`. |
 
 **Example request:**
@@ -355,6 +355,7 @@ Promote a memory to long-term (permanent). Clears the expiry timestamp.
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `id` | string | Yes | -- | Memory ID to promote |
+| `target_tier` | string | No | -- | Stop at an intermediate tier (`"mid"` or `"long"`); omit for the historical highest-reachable-tier (long) behavior |
 | `to_namespace` | string | No | -- | Clone to ancestor namespace (Task 1.7; preserves original) |
 
 **Example request:**
@@ -411,7 +412,7 @@ Bulk delete memories matching a pattern, namespace, or tier. At least one filter
 **Example response:**
 
 ```json
-{ "deleted": 12 }
+{ "deleted": 12, "archived": true }
 ```
 
 ---
@@ -441,9 +442,10 @@ Get memory store statistics (counts, tiers, namespaces, links, database size).
 ```json
 {
   "total": 142,
-  "by_tier": { "short": 5, "mid": 37, "long": 100 },
-  "by_namespace": { "my-app": 80, "global": 62 },
-  "links": 23,
+  "by_tier": [{"tier":"short","count":5},{"tier":"mid","count":37},{"tier":"long","count":100}],
+  "by_namespace": [{"namespace":"my-app","count":80},{"namespace":"global","count":62}],
+  "expiring_soon": 5,
+  "links_count": 23,
   "db_size_bytes": 524288
 }
 ```
@@ -466,8 +468,8 @@ Update an existing memory by ID. Only provided fields are changed -- omitted fie
 | `tags` | array of strings | No | -- | New tags (replaces existing) |
 | `priority` | integer (1-10) | No | -- | New priority |
 | `confidence` | number (0.0-1.0) | No | -- | New confidence |
-| `expires_at` | string | No | -- | Expiry timestamp (RFC 3339), or null to clear |
-| `metadata` | object | No | -- | Arbitrary JSON metadata (replaces existing) |
+| `expires_at` | string | No | -- | New expiry timestamp (RFC 3339); a JSON `null` is treated as absent (no change) |
+| `metadata` | object | No | -- | Arbitrary JSON metadata (replaces existing; the original `agent_id` is preserved) |
 
 **Example request:**
 
@@ -565,7 +567,7 @@ Create a link between two memories.
 |------|------|----------|---------|-------------|
 | `source_id` | string | Yes | -- | Source memory ID |
 | `target_id` | string | Yes | -- | Target memory ID |
-| `relation` | string | No | `"related_to"` | Relation type: `"related_to"`, `"supersedes"`, `"contradicts"`, or `"derived_from"` |
+| `relation` | string | No | `"related_to"` | Relation type (six at v0.7.0): `"related_to"`, `"supersedes"`, `"contradicts"`, `"derived_from"`, `"reflects_on"`, `"derives_from"` |
 
 **Example request:**
 
@@ -700,9 +702,12 @@ Consolidate multiple memories into one long-term summary. Deletes source memorie
 
 ### memory_capabilities
 
-Report the active feature tier, loaded models, and available capabilities of the memory system. Takes no parameters. Call once per session to discover what features are available.
+Report the active feature tier, loaded models, and available capabilities of the memory system. Call once per session to discover what features are available.
 
-**Parameters:** None.
+**Parameters:** all optional — `accept` (envelope version negotiation:
+`"1"` / `"2"` / `"3"`), `family` (drill into one tool family),
+`include_schema` (bool), `verbose` (bool; also forced on by
+`AI_MEMORY_TOOLS_VERBOSE=1`).
 
 **Example request:**
 
@@ -718,7 +723,10 @@ Report the active feature tier, loaded models, and available capabilities of the
 }
 ```
 
-**Example response:**
+**Example response (abridged — the v0.7.0 envelope is
+`schema_version: "3"` and additionally carries `summary`,
+`describe_to_user`, `tools`, `governance`, and family/profile metadata;
+v1/v2 remain negotiable via the `accept` param):**
 
 ```json
 {
@@ -906,7 +914,9 @@ List archived (expired) memories. Archived memories are preserved by garbage col
 
 ### memory_archive_restore
 
-Restore an archived memory back to the active memory store. The restored memory has its `expires_at` cleared (becomes permanent).
+Restore an archived memory back to the active memory store. The row's
+`original_tier` and `original_expires_at` are re-applied where present
+(legacy archive rows without them restore as `long` with no expiry).
 
 **Parameters:**
 
@@ -992,8 +1002,8 @@ Show archive statistics: total count and breakdown by namespace.
 
 ```json
 {
-  "total": 15,
-  "by_namespace": { "my-app": 10, "global": 5 }
+  "archived_total": 15,
+  "by_namespace": [{"namespace":"my-app","count":10},{"namespace":"global","count":5}]
 }
 ```
 
@@ -1412,8 +1422,8 @@ ai-memory supports 4 feature tiers, controlled by the `--tier` flag when startin
 |------|--------------|----------------|--------------|
 | **keyword** | FTS5 only | None | None (lightest) |
 | **semantic** (default) | Hybrid: semantic + keyword blending | Embedding-based recall | HuggingFace embedding model (~256 MB RAM) |
-| **smart** | Hybrid | Query expansion, auto-tagging, contradiction detection | Ollama + LLM (~1 GB RAM) |
-| **autonomous** | Hybrid | Full autonomous memory management | Ollama + LLM (~4 GB RAM) |
+| **smart** | Hybrid | Query expansion, auto-tagging, contradiction detection | An LLM backend (#1067 — local Ollama ~1 GB RAM, or any OpenAI-compatible cloud vendor via `AI_MEMORY_LLM_BACKEND` ~256 MB) |
+| **autonomous** | Hybrid | Full autonomous memory management + cross-encoder reranking | LLM backend + local cross-encoder (~4 GB local / ~3 GB with a remote LLM) |
 
 > **Semantic tier first-run note:** The first run at the semantic tier (or above) downloads a ~100 MB embedding model from HuggingFace, which takes 30-60 seconds. Subsequent starts load from cache (~2 seconds). If the download fails, retry or use `--tier keyword` temporarily.
 
@@ -1428,7 +1438,7 @@ The final ranking blends both signals, so you get the precision of keyword match
 
 ### Query Expansion, Auto-Tagging, and Contradiction Detection (smart+ tier)
 
-At the `smart` and `autonomous` tiers, three additional capabilities are available via LLM inference (requires Ollama):
+At the `smart` and `autonomous` tiers, three additional capabilities are available via LLM inference (any backend via `AI_MEMORY_LLM_BACKEND`, #1067):
 
 - **Query expansion** (`memory_expand_query`) -- expands a recall query with synonyms, related terms, and alternative phrasings to improve recall coverage.
 - **Auto-tagging** (`memory_auto_tag`) -- analyzes memory content and suggests relevant tags automatically.
@@ -1528,7 +1538,7 @@ Store a new memory. Deduplicates by title+namespace (upserts on conflict).
 | `--tags` | | string | `""` | Comma-separated tags |
 | `--priority` | `-p` | int | `5` | Priority 1-10 |
 | `--confidence` | | float | `1.0` | Confidence 0.0-1.0 |
-| `--source` | `-S` | string | `cli` | Source: `user`, `claude`, `hook`, `api`, `cli` |
+| `--source` | `-S` | string | `cli` | Source — one of `VALID_SOURCES`: `user`, `nhi`, `claude` (deprecated), `hook`, `api`, `cli`, `import`, `consolidation`, `system`, `chaos`, `notify` |
 | `--expires-at` | | string | | Explicit expiry timestamp (RFC 3339). Overrides tier default |
 | `--ttl-secs` | | int | | TTL in seconds. Overrides tier default |
 
@@ -1652,7 +1662,7 @@ Link two memories with a typed relation.
 |------|-------|------|---------|-------------|
 | (positional 1) | | string | required | Source memory ID |
 | (positional 2) | | string | required | Target memory ID |
-| `--relation` | `-r` | string | `related_to` | Relation type: `related_to`, `supersedes`, `contradicts`, `derived_from` |
+| `--relation` | `-r` | string | `related_to` | Relation type (six at v0.7.0): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from` |
 
 ---
 
@@ -1824,7 +1834,8 @@ List archived memories.
 
 #### archive restore
 
-Restore an archived memory back to active status (expiry cleared).
+Restore an archived memory back to active status (the archived row's
+`original_tier` / `original_expires_at` are re-applied where present).
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
@@ -1892,12 +1903,16 @@ Connect related memories with typed relations:
 ai-memory link <source-id> <target-id> --relation supersedes
 ```
 
-Valid relation types: `related_to` (default), `supersedes`, `contradicts`, `derived_from`.
+Valid relation types (six at v0.7.0): `related_to` (default),
+`supersedes`, `contradicts`, `derived_from`, `reflects_on`,
+`derives_from`.
 
 - `related_to` (default) -- general association
 - `supersedes` -- this memory replaces the other
 - `contradicts` -- these memories conflict
-- `derived_from` -- this memory was created from the other
+- `derived_from` -- this memory was created from the other (consolidation provenance)
+- `reflects_on` -- a reflection points at the source it synthesised from (recursive learning)
+- `derives_from` -- an atom points at the long-form parent it was decomposed from (WT-1 atomisation)
 
 When you `get` a memory, its links are shown alongside it:
 
@@ -2090,9 +2105,12 @@ Every memory tracks its source. Valid sources:
 | `hook` | Created by an automated hook |
 | `api` | Created via the HTTP API (default for API) |
 | `cli` | Created via the CLI (default for CLI) |
+| `nhi` | v0.7.x vendor-neutral default for AI NHI writes (#1175) |
 | `import` | Imported from a backup |
 | `consolidation` | Created by consolidating other memories |
 | `system` | System-generated |
+| `chaos` | Chaos-harness probe writes |
+| `notify` | Inbox rows written by `memory_notify` |
 
 ## Tags
 
@@ -2239,7 +2257,7 @@ ai-memory archive list
 ai-memory archive restore <id>
 ```
 
-This moves the memory back to active status with its original tier and content intact. Restored memories have their expiry cleared (`expires_at` set to NULL) and become permanent.
+This moves the memory back to active status with its content intact; the archived row's `original_tier` and `original_expires_at` are re-applied where present (legacy archive rows without those columns restore as `long` with no expiry).
 
 ### Purge the archive
 
@@ -2347,14 +2365,15 @@ Common issues, their causes, and how to fix them.
 
 **Symptom:** Smart or autonomous tier tools (`memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`) fail with "connection refused" or timeout errors.
 
-**Cause:** The smart and autonomous tiers require Ollama running locally to serve the LLM.
+**Cause:** The smart and autonomous tiers need an LLM backend. With the default `ollama` backend, Ollama must be running locally.
 
 **Solution:**
 1. Install Ollama: `curl -fsSL https://ollama.com/install.sh | sh`
 2. Start it: `ollama serve`
-3. Pull the required model: `ollama pull gemma4:e2b` (smart) or `ollama pull gemma4:e4b` (autonomous).
+3. Pull the default model: `ollama pull gemma3:4b` (the v0.7.0 compiled default for the Ollama backend).
 4. Verify it is running: `curl http://localhost:11434/api/tags` should return a JSON response.
-5. If Ollama is on a non-default port or host, configure it in `~/.config/ai-memory/config.toml` under `[ollama]`.
+5. If Ollama is on a non-default port or host, set `[llm].base_url` in `~/.config/ai-memory/config.toml` (or `AI_MEMORY_LLM_BASE_URL`).
+6. Alternatively, skip Ollama entirely: post-#1067 any OpenAI-compatible vendor works via `AI_MEMORY_LLM_BACKEND` (+ the vendor API key). Run `ai-memory doctor` and check the "LLM Reachability (#1146)" section.
 
 ### Binary not found in PATH after install
 
@@ -2394,7 +2413,7 @@ Common issues, their causes, and how to fix them.
 **Cause:** ai-memory enforces input limits to keep the database healthy.
 
 **Solution:** Check your input against these limits:
-- **Title:** must not be empty and must be under 1,024 bytes.
+- **Title:** must not be empty and at most 512 characters (`MAX_TITLE_LEN`).
 - **Content:** must be under 65,536 bytes (64 KB).
 - **Priority:** integer from 1 to 10.
 - **Confidence:** float from 0.0 to 1.0.

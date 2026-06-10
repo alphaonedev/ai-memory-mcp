@@ -19,10 +19,13 @@ writers can't coexist.
 1. List any running ai-memory processes: `ps -ef | grep ai-memory`.
 2. If a daemon is running, route your operation through it (HTTP API
    or MCP) instead of the CLI.
-3. If you suspect a stale lock file, stop every process and check
-   `~/.ai-memory-wal` / `~/.ai-memory-shm` companion files.
-4. For long-running imports, the 5 s default `busy_timeout` may be
-   too short. Increase via `AI_MEMORY_BUSY_TIMEOUT_MS=30000`.
+3. If you suspect a stale lock, stop every process and check the WAL
+   companion files next to the database (`<db>.db-wal` /
+   `<db>.db-shm`); they are recovered automatically on the next open.
+4. The `busy_timeout` is a compiled 5 s PRAGMA
+   (`src/storage/connection.rs`) — it is not operator-tunable. For
+   long-running imports that keep hitting the lock, stop the competing
+   writer (or route the import through the daemon) instead.
 
 ### "could not find embedding model"
 
@@ -74,8 +77,8 @@ ai-memory serve --port 19077
 **Causes + fixes**:
 
 1. **Wrong config path**. Verify:
-   - Claude Code: `~/.claude/mcp_servers.json` or the project-local
-     `.claude/mcp_servers.json`.
+   - Claude Code: `mcpServers` in `~/.claude.json` (user scope) or
+     `.mcp.json` in the project root (NOT `settings.json`).
    - Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
    - Cursor: Settings → Features → MCP.
 
@@ -112,7 +115,7 @@ reference where the test enumerates expected tools.
 **Fix**: Every entry point reads `AI_MEMORY_DB`. Set it consistently:
 
 ```jsonc
-// Claude Code mcp_servers.json
+// Claude Code ~/.claude.json (user scope) or .mcp.json (project scope)
 {
   "mcpServers": {
     "ai-memory": {
@@ -151,8 +154,9 @@ backend is unreachable.
    (`api_key_env` / `api_key_file`) couldn't be read — fix the
    referenced env var or file perms (0400 required for
    `api_key_file` by default).
-4. Check feature tier: `ai-memory curator --tier smart` or
-   `autonomous` (CLI flag reads the tier from config if unset).
+4. Check the feature tier: `curator` has no `--tier` flag — it reads
+   the `tier` field from `config.toml`. Set `tier = "smart"` (or
+   `"autonomous"`) there and re-run.
 
 **Fix (legacy v0.6.x flat-field config)**:
 
@@ -200,7 +204,8 @@ trail is preserved.
 
 ### "401 missing or invalid API key"
 
-**Cause**: Daemon started with `--api-key` set. Pass the key:
+**Cause**: The daemon has an `api_key` configured (the `api_key` field
+in `config.toml` — there is no `--api-key` serve flag). Pass the key:
 
 ```bash
 curl -H "X-API-Key: YOUR_KEY" http://127.0.0.1:9077/api/v1/stats
@@ -255,8 +260,10 @@ synchronous-durability gate.
 
 1. On each peer: `ai-memory sync-daemon` must be running.
    `systemctl status ai-memory-sync` or check the log.
-2. Vector-clock skew: `ai-memory stats` on each peer, compare
-   `last_synced_at`.
+2. Divergence check: run `ai-memory stats` on each peer and compare
+   the `total` counts; the per-peer vector clock lives in the
+   `sync_state` table
+   (`sqlite3 <db> "SELECT * FROM sync_state"`).
 3. mTLS fingerprint drift: if you rotated certs, the allowlist must
    be regenerated on every receiver.
 4. `--batch-size 500` default may be too small for a backlog. Bump to
