@@ -815,15 +815,27 @@ pub async fn sync_push(
                 // else falls back to the deferred background embed.
                 // `se.vector.len() == se.dim` guards a malformed
                 // sender whose claimed dim disagrees with the payload.
-                match shipped_by_id.get(mem.id.as_str()) {
-                    Some(se) if receiver_dim == Some(se.dim) && se.vector.len() == se.dim => {
-                        match db::set_embedding(&lock.0, &actual_id, &se.vector) {
-                            Ok(()) => hnsw_updates.push((actual_id, se.vector.clone())),
+                // #1584 (SEC) — the dim gate is necessary but not
+                // sufficient: a shipped vector with NaN/±Inf components
+                // or a non-unit norm poisons cosine ranking.
+                // `sanitize_shipped_vector` rejects non-finite vectors
+                // and L2-normalizes the rest; `None` (or a dim mismatch)
+                // falls back to a local re-embed.
+                let clean_shipped = shipped_by_id
+                    .get(mem.id.as_str())
+                    .filter(|se| receiver_dim == Some(se.dim) && se.vector.len() == se.dim)
+                    .and_then(|se| {
+                        crate::federation::sanitize_shipped_vector(&se.vector)
+                            .map(|v| (v, se.model.clone()))
+                    });
+                match clean_shipped {
+                    Some((vector, model)) => {
+                        match db::set_embedding(&lock.0, &actual_id, &vector) {
+                            Ok(()) => hnsw_updates.push((actual_id, vector)),
                             Err(e) => {
                                 tracing::warn!(
                                     "sync_push: storing shipped embedding failed for \
-                                     {actual_id} (model {}): {e} — deferring local embed",
-                                    se.model,
+                                 {actual_id} (model {model}): {e} — deferring local embed",
                                 );
                                 deferred_embed.push((
                                     actual_id,
@@ -832,7 +844,7 @@ pub async fn sync_push(
                             }
                         }
                     }
-                    _ => deferred_embed.push((
+                    None => deferred_embed.push((
                         actual_id,
                         crate::embeddings::embedding_document(&mem.title, &mem.content),
                     )),

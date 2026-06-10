@@ -343,10 +343,14 @@ async fn shipped_vector_stored_directly_without_receiver_embed() {
     let rx = build_receiver(Some(embedder));
 
     let mem = sample_memory("ship-direct-1");
-    // A distinctive constant fill (≠ the mock server's 0.5) so the
+    // A distinctive UNIT-NORM fill (≠ the mock server's 0.5) so the
     // assertion below can tell a verbatim-stored shipped vector from a
-    // (buggy) receiver-side re-embed.
-    let shipped_vec: Vec<f32> = vec![0.337_f32; dim];
+    // (buggy) receiver-side re-embed. #1584: the fill is 1/sqrt(dim) so
+    // the vector is already L2-normalized and `sanitize_shipped_vector`
+    // stores it byte-for-byte (a well-behaved peer ships normalized
+    // vectors). A non-normalized fill is covered by
+    // `non_normalized_shipped_vector_is_stored_normalized_1584`.
+    let shipped_vec: Vec<f32> = vec![1.0_f32 / (dim as f32).sqrt(); dim];
     let shipped = vec![ShippedEmbedding::new(
         mem.id.clone(),
         "sender-model".to_string(),
@@ -534,5 +538,111 @@ async fn signature_covers_shipped_vector_tamper_yields_401() {
         std::env::remove_var(REQUIRE_SIG_ENV);
         std::env::remove_var(REQUIRE_NONCE_ENV);
         std::env::remove_var("AI_MEMORY_KEY_DIR");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. #1584 (SEC) — value-domain validation of shipped vectors.
+//    The dim gate is necessary but not sufficient: a dim-matching
+//    vector with NaN/±Inf components or a non-unit norm would poison
+//    cosine ranking if stored verbatim. `sanitize_shipped_vector`
+//    rejects non-finite vectors (→ local re-embed) and L2-normalizes
+//    the rest.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_shipped_vector_rejected_at_json_wire_boundary_1584() {
+    // #1584 — non-finite f32 components (NaN / ±Inf) cannot cross the
+    // JSON federation wire at all: serde_json serializes them to `null`,
+    // and the strict `Vec<f32>` deserializer on `/sync/push` rejects
+    // `null` with a 400 ("invalid type: null, expected f32"). This test
+    // pins that the JSON transport itself blocks the NaN-injection
+    // vector. The `federation::sanitize_shipped_vector` finite check
+    // (unit-tested in src/federation/mod.rs) + the
+    // `Embedder::cosine_similarity` finite guard are the defense-in-depth
+    // layer for any NON-JSON path (a future binary wire format, a
+    // direct-call ingest) that could carry a non-finite component past
+    // serde.
+    let _g = env_lock();
+    unsafe {
+        std::env::set_var(REQUIRE_SIG_ENV, "0");
+    }
+    let ollama = mock_ollama_embed(768, 0.5, Duration::ZERO).await;
+    let embedder = build_ollama_embedder(&ollama.uri());
+    let dim = embedder.dim();
+    let rx = build_receiver(Some(embedder));
+
+    let mem = sample_memory("ship-nan-1584");
+    let mut poisoned = vec![0.1_f32; dim];
+    poisoned[7] = f32::NAN;
+    let shipped = vec![ShippedEmbedding::new(
+        mem.id.clone(),
+        "malicious-peer".to_string(),
+        poisoned,
+    )];
+    let body = push_body(std::slice::from_ref(&mem), Some(&shipped));
+    let (status, v) = post_push(&rx.router, serde_json::to_vec(&body).unwrap(), None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#1584: a NaN shipped-vector component must be rejected at the \
+         JSON deserialization boundary, not stored: {v}"
+    );
+
+    unsafe {
+        std::env::remove_var(REQUIRE_SIG_ENV);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_normalized_shipped_vector_is_stored_normalized_1584() {
+    let _g = env_lock();
+    unsafe {
+        std::env::set_var(REQUIRE_SIG_ENV, "0");
+    }
+    let ollama = mock_ollama_embed(768, 0.5, Duration::ZERO).await;
+    let embedder = build_ollama_embedder(&ollama.uri());
+    let dim = embedder.dim();
+    let rx = build_receiver(Some(embedder));
+
+    let mem = sample_memory("ship-bignorm-1584");
+    // A finite but HIGH-magnitude vector (norm = sqrt(dim)*5 ≫ 1). Pre-#1584
+    // this stored verbatim and would inflate its dot product against
+    // every query (the cheapest ranking-manipulation primitive).
+    let shipped_vec: Vec<f32> = vec![5.0_f32; dim];
+    let shipped = vec![ShippedEmbedding::new(
+        mem.id.clone(),
+        "non-normalized-peer".to_string(),
+        shipped_vec,
+    )];
+    let body = push_body(std::slice::from_ref(&mem), Some(&shipped));
+    let (status, v) = post_push(&rx.router, serde_json::to_vec(&body).unwrap(), None, None).await;
+    assert_eq!(status, StatusCode::OK, "push acked: {v}");
+    assert_eq!(v["applied"], 1, "row applied: {v}");
+
+    // Stored synchronously with the ack (finite → no local embed), but
+    // L2-NORMALIZED, not verbatim.
+    let stored = stored_embedding(&rx.db, &mem.id)
+        .await
+        .expect("finite shipped vector stored");
+    let norm: f32 = stored.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 1e-4,
+        "#1584: a non-normalized shipped vector must be stored L2-normalized; got norm {norm}"
+    );
+    // Direction preserved: every component equal ⇒ each is 1/sqrt(dim).
+    let expected = 1.0_f32 / (dim as f32).sqrt();
+    assert!(
+        (stored[0] - expected).abs() < 1e-4,
+        "#1584: normalization must preserve direction"
+    );
+    assert_eq!(
+        embed_calls(&ollama).await,
+        0,
+        "#1584: a finite (normalizable) shipped vector must NOT trigger a re-embed"
+    );
+
+    unsafe {
+        std::env::remove_var(REQUIRE_SIG_ENV);
     }
 }

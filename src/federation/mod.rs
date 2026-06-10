@@ -147,10 +147,24 @@ pub struct PeerEndpoint {
 ///
 /// - The array rides INSIDE the JSON body that `sync::post_once`
 ///   serialises once and signs (`X-Memory-Sig` over the exact body
-///   bytes, nonce-bound per #922), so the vector's integrity is
+///   bytes, nonce-bound per #922), so the vector's TRANSIT integrity is
 ///   covered by the same Ed25519 signature + replay protection as the
-///   memory rows themselves. A tampered vector invalidates the
+///   memory rows themselves: a vector altered IN FLIGHT invalidates the
 ///   signature.
+///
+///   **Trust boundary (#1584).** The signature attests the SENDER and
+///   that the bytes were not altered in transit — it does NOT attest
+///   that the f32 values are a well-formed embedding, nor that the
+///   vector honestly embeds the shipped `(title, content)`. The
+///   content↔vector honesty is an inherent limit of shipping
+///   sender-computed vectors (the receiver trusts the enrolled peer not
+///   to mislabel). The VALUE DOMAIN, however, is receiver-enforced:
+///   [`sanitize_shipped_vector`] rejects non-finite components and
+///   L2-normalizes the rest before storage, so a peer cannot poison
+///   cosine ranking with a NaN/±Inf or high-magnitude vector. (Non-finite
+///   components additionally cannot cross the JSON wire at all — serde
+///   serialises them to `null` and the strict `Vec<f32>` decoder rejects
+///   it with `400`.)
 /// - Decode is TOLERANT of absence: the receiver's `SyncPushBody`
 ///   field defaults to an empty vec, so pushes from older peers (no
 ///   `embeddings` key) and pushes to older peers (unknown fields are
@@ -196,6 +210,108 @@ impl ShippedEmbedding {
             dim: vector.len(),
             vector,
         }
+    }
+}
+
+/// #1584 (SEC) — tolerance band around unit L2 norm within which a
+/// peer-shipped vector is accepted as-is (already normalized by the
+/// sender's embedder). Outside the band the receiver re-normalizes; a
+/// zero / non-finite norm is rejected entirely.
+pub const SHIPPED_VECTOR_NORM_TOLERANCE: f32 = 1e-3;
+
+/// #1584 (SEC, MED) — validate + L2-normalize a peer-shipped embedding
+/// before it is stored as a memory's embedding on the #1579 B1
+/// embed-ship receive path.
+///
+/// **Threat.** B1 stores the SENDER's vector directly (no receiver
+/// re-embed) once the dimension gate (`dim == vector.len() == local
+/// embedder dim`) passes. The Ed25519 envelope signature proves the
+/// bytes came from the holder of the peer key and were not altered in
+/// transit — it does NOT prove the f32 values are a well-formed
+/// embedding, and it does NOT prove the vector honestly embeds the
+/// shipped `(title, content)` (that content↔vector honesty is an
+/// inherent limit of shipping sender-computed vectors; the receiver
+/// trusts the enrolled peer not to mislabel). What the receiver CAN
+/// and MUST enforce is the value domain:
+///
+/// - **Non-finite components** (NaN / ±Inf) silently corrupt cosine
+///   ordering: NaN is unordered under `partial_cmp`, so a single
+///   poisoned row perturbs the ranking of an entire candidate set.
+/// - **Non-unit-norm vectors** break the cosine assumption: the HNSW
+///   distance (`1.0 - dot`, [`crate::hnsw`]) and the linear-scan paths
+///   assume L2-normalized operands, so a high-magnitude vector inflates
+///   its dot product against every query and ranks itself artificially
+///   high across all recalls — the cheapest ranking-manipulation
+///   primitive on this surface, needing no NaN trickery.
+///
+/// Returns `Some(v)` — a finite, L2-normalized vector safe to store —
+/// or `None` when the vector is unusable (any non-finite component, or
+/// a zero / non-finite norm), in which case the caller falls back to a
+/// local re-embed of the row's text (the SAME fallback the dim-mismatch
+/// arm already uses). Locally-computed embeddings are normalized at
+/// embed time, so a well-behaved peer's vector lands inside
+/// [`SHIPPED_VECTOR_NORM_TOLERANCE`] and is stored byte-for-byte.
+#[must_use]
+pub fn sanitize_shipped_vector(vector: &[f32]) -> Option<Vec<f32>> {
+    if vector.is_empty() || vector.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    let norm_sq: f32 = vector.iter().map(|x| x * x).sum();
+    if !norm_sq.is_finite() || norm_sq <= 0.0 {
+        return None;
+    }
+    let norm = norm_sq.sqrt();
+    if (norm - 1.0).abs() <= SHIPPED_VECTOR_NORM_TOLERANCE {
+        return Some(vector.to_vec());
+    }
+    let inv = 1.0 / norm;
+    Some(vector.iter().map(|x| x * inv).collect())
+}
+
+#[cfg(test)]
+mod sanitize_shipped_vector_tests {
+    use super::sanitize_shipped_vector;
+
+    /// #1584 — a non-finite component (NaN / ±Inf) rejects the vector
+    /// so the caller re-embeds locally instead of poisoning ranking.
+    #[test]
+    fn rejects_non_finite_components() {
+        assert!(sanitize_shipped_vector(&[0.6, f32::NAN, 0.8]).is_none());
+        assert!(sanitize_shipped_vector(&[f32::INFINITY, 0.0]).is_none());
+        assert!(sanitize_shipped_vector(&[1.0, f32::NEG_INFINITY]).is_none());
+    }
+
+    /// #1584 — a zero vector (zero norm) and an empty vector are
+    /// rejected (no meaningful direction to store).
+    #[test]
+    fn rejects_zero_and_empty() {
+        assert!(sanitize_shipped_vector(&[]).is_none());
+        assert!(sanitize_shipped_vector(&[0.0, 0.0, 0.0]).is_none());
+    }
+
+    /// #1584 — an already-unit-norm vector is stored byte-for-byte
+    /// (well-behaved peers pay no perturbation).
+    #[test]
+    fn unit_norm_vector_passes_through() {
+        let v = vec![0.6_f32, 0.8]; // norm = 1.0 exactly
+        let out = sanitize_shipped_vector(&v).expect("unit-norm accepted");
+        assert_eq!(out, v);
+    }
+
+    /// #1584 — a high-magnitude (non-normalized) vector is
+    /// L2-normalized before storage, neutralizing the "rank myself high
+    /// everywhere" dot-product-inflation primitive.
+    #[test]
+    fn high_magnitude_vector_is_normalized() {
+        let v = vec![30.0_f32, 40.0]; // norm = 50
+        let out = sanitize_shipped_vector(&v).expect("finite vector normalized");
+        let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-6,
+            "normalized to unit norm; got {norm}"
+        );
+        // Direction preserved: 30/50, 40/50.
+        assert!((out[0] - 0.6).abs() < 1e-6 && (out[1] - 0.8).abs() < 1e-6);
     }
 }
 
