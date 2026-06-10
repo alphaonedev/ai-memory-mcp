@@ -817,6 +817,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             max_links_per_day: limits.max_links_per_day,
         });
     }
+    // #1579 B7 — seed the process-wide sqlite `PRAGMA mmap_size` from
+    // the resolved `[storage]` config (env `AI_MEMORY_DB_MMAP_SIZE` >
+    // `[storage].db_mmap_size_bytes` > compiled 256 MiB default).
+    // Every subsequent `db::open` on any subcommand path (serve / mcp /
+    // CLI) applies it. Idempotent — first writer wins, same as the
+    // quota seeding above.
+    crate::storage::set_db_mmap_size(app_config.resolve_storage().db_mmap_size_bytes);
     let j = cli.json;
     let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)

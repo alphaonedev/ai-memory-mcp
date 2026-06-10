@@ -102,7 +102,7 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # M13 NaN-rerank + L5 taxonomy-LIKE fixes). Suite 7741/0 at the pin commit.
 GOLDEN_SHA256="${GOLDEN_SHA256:-21bd6899ccec85d72e8b66f774cf87a7b3ad686eb7ce9a9ee4486395a89cd91f}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
-EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"
+EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-56}"
 
 # ---------------------------------------------------------------------------
 # Batman-active MAXIMUM-SECURE posture (46_batman.sh). The full env-var battery

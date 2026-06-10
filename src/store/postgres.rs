@@ -472,7 +472,20 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       SQLite backend, which has no pre-existing updated_at index, adds
 //       one at v55 (`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`).
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 55;
+// v56 = #1579 A2 + B6d (perf, 2026-06-10) — composite list / archive
+//       ordering indexes on the SQLite side
+//       (`migrations/sqlite/0047_v56_list_composite_indexes.sql`), paired
+//       with the sargable `storage::list` rewrite so the sqlite planner
+//       walks `(priority DESC, updated_at DESC)` in ORDER BY order with
+//       early-stop under LIMIT instead of a full-table temp B-tree sort
+//       (P1-measured 141 ms -> 0.06 ms at 100k rows). The #1579 A2
+//       finding was measured against the sqlite adapter; the postgres
+//       list path builds its own SQL against `memories_priority_idx` /
+//       `memories_updated_at_idx` and is owned by the postgres
+//       workstream — so the postgres twin is a version-stamp only
+//       (v51 / v53 / v55 precedent). CURRENT_SCHEMA_VERSION stays
+//       pinned in lockstep.
+const CURRENT_SCHEMA_VERSION: i32 = 56;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1248,8 +1261,11 @@ impl PostgresStore {
         if current_version < 54 {
             self.migrate_v54().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 55 {
             self.migrate_v55().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v56().await?;
         }
 
         Ok(())
@@ -2377,7 +2393,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v55 tx", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 55).await?;
 
         tx.commit()
             .await
@@ -2386,6 +2402,37 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v55 applied (#1476: sargable federation-catchup rewrite; existing memories_updated_at_idx DESC serves the range scan — no new postgres index)"
+        );
+        Ok(())
+    }
+
+    /// v56 (#1579 A2 + B6d) — composite list / archive ordering
+    /// indexes. SQLite-only DDL
+    /// (`migrations/sqlite/0047_v56_list_composite_indexes.sql`) paired
+    /// with the sargable `storage::list` rewrite; the #1579 A2 finding
+    /// was measured on the sqlite adapter and the postgres list path
+    /// (its own SQL builder over `memories_priority_idx` /
+    /// `memories_updated_at_idx`) is owned by the postgres workstream.
+    /// The postgres twin is therefore a version-stamp only, per the
+    /// v51 / v53 / v55 precedent, keeping the SQLite/postgres
+    /// `CURRENT_SCHEMA_VERSION` pinned in lockstep so a single logical
+    /// schema number tracks both adapters.
+    async fn migrate_v56(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v56 tx", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v56 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v56 applied (#1579: composite list/archive indexes are sqlite-only; no-op postgres DDL)"
         );
         Ok(())
     }

@@ -68,6 +68,12 @@
 //!    `acquire()`). Gated on `sal` (resolver + `PoolConfig` are
 //!    SAL-feature surfaces).
 //!
+//! 8. **`test_db_mmap_size_env_overrides_config_and_default`** (#1579
+//!    B7) — the sqlite `PRAGMA mmap_size` knob resolves
+//!    `AI_MEMORY_DB_MMAP_SIZE env > [storage].db_mmap_size_bytes >
+//!    compiled 256 MiB default` through `AppConfig::resolve_storage()`;
+//!    explicit `0` (mmap disabled) is honoured, garbage falls through.
+//!
 //! All tests serialize env mutation through the shared `ENV_LOCK`: the
 //! single-key tests via [`EnvVarGuard`], and the multi-key `[limits]`
 //! tests via [`MultiEnvVarGuard`] (which acquires the non-reentrant
@@ -503,5 +509,72 @@ fn test_pg_pool_zero_falls_through() {
     assert!(
         resolved.min_connections > 0,
         "min_connections must never resolve to 0 when config supplied a 0",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. SQLite mmap sizing (#1579 B7) — AI_MEMORY_DB_MMAP_SIZE overrides
+//    `[storage].db_mmap_size_bytes`, which overrides the compiled
+//    256 MiB default (`ai_memory::db::DEFAULT_DB_MMAP_SIZE_BYTES`).
+//    `0` is a deliberate operator choice (disable memory-mapped I/O)
+//    and is honoured at every layer; negative / unparseable values
+//    fall through. Mirrors the [limits] ladder for the PRAGMA knob.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_db_mmap_size_env_overrides_config_and_default() {
+    use ai_memory::config::StorageSection;
+
+    let cfg = AppConfig {
+        storage: Some(StorageSection {
+            db_mmap_size_bytes: Some(64 * 1024 * 1024),
+            ..StorageSection::default()
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env unset → config wins over compiled default ----
+    let guard_a = MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_DB_MMAP_SIZE, None)]);
+    let r_cfg = cfg.resolve_storage();
+    assert_eq!(
+        r_cfg.db_mmap_size_bytes,
+        64 * 1024 * 1024,
+        "[storage].db_mmap_size_bytes must beat the compiled default",
+    );
+    drop(guard_a);
+
+    // ---- Branch B: env beats config ----
+    let guard_b =
+        MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_DB_MMAP_SIZE, Some("1048576"))]);
+    let r_env = cfg.resolve_storage();
+    assert_eq!(
+        r_env.db_mmap_size_bytes, 1_048_576,
+        "AI_MEMORY_DB_MMAP_SIZE env MUST beat [storage] config",
+    );
+    drop(guard_b);
+
+    // ---- Branch C: garbage env falls through to config; the compiled
+    //                default backstops when neither layer is usable ----
+    let guard_c =
+        MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_DB_MMAP_SIZE, Some("garbage"))]);
+    let r_garbage = cfg.resolve_storage();
+    assert_eq!(
+        r_garbage.db_mmap_size_bytes,
+        64 * 1024 * 1024,
+        "unparseable env must fall through to the [storage] section",
+    );
+    let r_default = AppConfig::default().resolve_storage();
+    assert_eq!(
+        r_default.db_mmap_size_bytes,
+        ai_memory::db::DEFAULT_DB_MMAP_SIZE_BYTES,
+        "no usable env/config layer must bottom out on the compiled 256 MiB default",
+    );
+    drop(guard_c);
+
+    // ---- Branch D: explicit 0 (mmap disabled) is honoured ----
+    let _guard_d = MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_DB_MMAP_SIZE, Some("0"))]);
+    let r_zero = cfg.resolve_storage();
+    assert_eq!(
+        r_zero.db_mmap_size_bytes, 0,
+        "explicit 0 disables mmap and must NOT fall through",
     );
 }

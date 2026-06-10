@@ -3425,6 +3425,16 @@ pub struct StorageSection {
     /// Memory budget in MB for the auto tier selector. Folded from
     /// `max_memory_mb`.
     pub max_memory_mb: Option<usize>,
+
+    /// #1579 B7 — sqlite `PRAGMA mmap_size` in bytes. `0` disables
+    /// memory-mapped I/O (stock SQLite semantics); negative values are
+    /// treated as unset and fall through the ladder. Env override:
+    /// `AI_MEMORY_DB_MMAP_SIZE` (see [`ENV_DB_MMAP_SIZE`]). Compiled
+    /// default: 256 MiB
+    /// ([`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`]) — the only
+    /// across-the-board winner of the P1 perf-audit PRAGMA A/B
+    /// (15-30% on large-corpus reads).
+    pub db_mmap_size_bytes: Option<i64>,
 }
 
 /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
@@ -3697,6 +3707,11 @@ pub struct ResolvedStorage {
     pub archive_max_days: Option<i64>,
     /// Memory budget in MB for the auto tier selector.
     pub max_memory_mb: Option<usize>,
+    /// #1579 B7 — resolved sqlite `PRAGMA mmap_size` in bytes
+    /// (`AI_MEMORY_DB_MMAP_SIZE` env > `[storage].db_mmap_size_bytes`
+    /// > compiled 256 MiB default). `0` disables memory-mapped I/O.
+    /// Seeded into `crate::storage::set_db_mmap_size` at boot.
+    pub db_mmap_size_bytes: i64,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -3727,6 +3742,13 @@ pub const ENV_MAX_STORAGE_BYTES: &str = "AI_MEMORY_MAX_STORAGE_BYTES";
 pub const ENV_MAX_LINKS_PER_DAY: &str = "AI_MEMORY_MAX_LINKS_PER_DAY";
 /// Env override for `[limits].max_page_size`.
 pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
+
+/// #1579 B7 — env override for the sqlite `PRAGMA mmap_size`
+/// (`[storage].db_mmap_size_bytes`), in whole bytes. `0` disables
+/// memory-mapped I/O; negative / unparseable values fall through to
+/// the `[storage]` section, then to the compiled 256 MiB default
+/// (`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`).
+pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
 
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
@@ -6245,6 +6267,17 @@ impl AppConfig {
 
         let max_memory_mb = cfg.and_then(|s| s.max_memory_mb).or(self.max_memory_mb);
 
+        // #1579 B7 — sqlite mmap size, uniform ladder:
+        // env > [storage] section > compiled default. `0` is a
+        // deliberate operator choice (disable mmap) so the filter
+        // admits it; negative / unparseable values fall through.
+        let db_mmap_size_bytes = std::env::var(ENV_DB_MMAP_SIZE)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|n| *n >= 0)
+            .or_else(|| cfg.and_then(|s| s.db_mmap_size_bytes).filter(|n| *n >= 0))
+            .unwrap_or(crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES);
+
         let source = if cfg.is_some() {
             ConfigSource::Config
         } else if self.default_namespace.is_some()
@@ -6262,6 +6295,7 @@ impl AppConfig {
             archive_on_gc,
             archive_max_days,
             max_memory_mb,
+            db_mmap_size_bytes,
             source,
         }
     }
@@ -8889,6 +8923,84 @@ max_page_size = 1000000
         let resolved = cfg.resolve_embeddings();
         assert_eq!(resolved.backfill_batch, 500, "env must beat config");
         scrub_llm_env();
+    }
+
+    // ── #1579 B7 — `[storage].db_mmap_size_bytes` / AI_MEMORY_DB_MMAP_SIZE ──
+
+    #[test]
+    fn resolve_storage_1579_mmap_compiled_default() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes,
+            crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES,
+            "no env + no section must bottom out on the compiled 256 MiB default"
+        );
+    }
+
+    #[test]
+    fn resolve_storage_1579_mmap_env_overrides_config() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::set_var(ENV_DB_MMAP_SIZE, "1048576");
+        }
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            db_mmap_size_bytes: Some(2_097_152),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes, 1_048_576,
+            "env must beat the [storage] section"
+        );
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+    }
+
+    #[test]
+    fn resolve_storage_1579_mmap_config_zero_disables() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            db_mmap_size_bytes: Some(0),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes, 0,
+            "explicit 0 (mmap disabled) is a deliberate operator choice and must be honoured"
+        );
+    }
+
+    #[test]
+    fn resolve_storage_1579_mmap_garbage_falls_through() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::set_var(ENV_DB_MMAP_SIZE, "not-a-number");
+        }
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            db_mmap_size_bytes: Some(-5),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes,
+            crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES,
+            "unparseable env + negative section value must both fall through to the compiled default"
+        );
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
     }
 
     #[test]
