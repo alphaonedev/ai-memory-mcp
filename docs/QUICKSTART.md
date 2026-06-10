@@ -20,7 +20,7 @@ on how you want to use it.
 # macOS / Linux (with Homebrew or prebuilt binary)
 curl -sSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh | sh
 
-# Or from cargo (any platform with Rust 1.88+)
+# Or from cargo (any platform with Rust 1.96+)
 cargo install --git https://github.com/alphaonedev/ai-memory-mcp ai-memory
 ```
 
@@ -28,7 +28,7 @@ Verify:
 
 ```bash
 ai-memory --version
-# ai-memory 0.6.3+patch.1   (release tag: v0.6.3.1; +patch.N is the crates.io-compatible encoding)
+# ai-memory 0.7.0
 ```
 
 Full install reference including Windows, Docker, Fedora COPR, Debian
@@ -50,8 +50,11 @@ ai-memory recall "what did I store"
 ai-memory stats
 ```
 
-That's it. Memories live in `~/ai-memory.db` (override with `--db` or
-`AI_MEMORY_DB`). Store anything, recall anything, no server running.
+That's it. Memories live in `./ai-memory.db` — the compiled default is
+relative to the current directory (override with `--db`, the
+`AI_MEMORY_DB` env var, or `db = "..."` in
+`~/.config/ai-memory/config.toml`). Store anything, recall anything,
+no server running.
 
 ## Path B — Claude Code / Claude Desktop / Cursor / Codex (MCP)
 
@@ -135,9 +138,11 @@ Verify: `ai-memory boot --quiet --limit 1` should report
 > `api_key_env` (process-env reference) or `api_key_file` (file path;
 > mode 0400 enforced).
 
-Restart the IDE. You'll now see 23 `memory_*` tools in the tool list.
-Ask the assistant "remember that my preferred deploy target is
-Kubernetes" and next session it'll recall it.
+Restart the IDE. You'll now see 7 `memory_*` tools in the tool list at
+the default `--profile core` (plus the always-on `memory_capabilities`
+bootstrap; `--profile full` advertises 74 entries). Ask the assistant
+"remember that my preferred deploy target is Kubernetes" and next
+session it'll recall it.
 
 Full MCP setup for every IDE: `docs/INSTALL.md` § "MCP client setup".
 

@@ -46,7 +46,7 @@ columns, Batman Form-4/5 provenance + confidence-calibration
 columns, optimistic-concurrency `version` column at v45,
 `federation_push_dlq` table at v48, archive_memories +14
 columns at v49, per-namespace K8 quota dimension at v50 #1156,
-`federation_nonces` persistence table at v51 #1255 / PR #1296,
+`federation_nonce_cache` persistence table at v51 #1255 / PR #1296,
 `transcript_line_dedup` idempotency table at v52 #1389, the
 `memories_au` FTS5 trigger scoping at v53 #1418, the tier-default
 expiry backfill at v54 #1466, and the federation-catchup
@@ -56,12 +56,13 @@ expiry backfill at v54 #1466, and the federation-catchup
 range scan via Index Scan Backward, so `migrate_v55()` is a
 version-stamp no-op on the postgres side).
 The v34 → v55 deltas land via in-process
-`migrate_v34() … migrate_v55()` async functions invoked by
-`schema-init --upgrade`; they are NOT separate `.sql` files.
+`migrate_v34() … migrate_v55()` async functions that run as a side
+effect of `ai-memory schema-init --store-url <url>` opening the store
+(there is no `--upgrade` flag); they are NOT separate `.sql` files.
 
 If you migrated from sqlite to postgres on v0.7-alpha, your
-postgres db is at v15. Run `ai-memory schema-init --upgrade`
-against v0.7.0 (see "In-place v15 → v55" below) before
+postgres db is at v15. Run `ai-memory schema-init --store-url <url>`
+with the v0.7.0 binary (see "In-place v15 → v55" below) before
 pointing a v0.7.0 daemon at it.
 
 ## Pre-flight checklist
@@ -83,8 +84,8 @@ Before you start:
   sqlite3 ~/.local/share/ai-memory/memory.db \
     "SELECT MAX(version) FROM schema_version;"
   ```
-  If this is **less than 53**, upgrade first: start `ai-memory serve`
-  briefly against the sqlite db (it auto-migrates on connect to v53),
+  If this is **less than 55**, upgrade first: start `ai-memory serve`
+  briefly against the sqlite db (it auto-migrates on connect to v55),
   then stop it. The postgres side won't accept a partial migration.
 
 ## Step 1 — Bootstrap the postgres schema
@@ -94,8 +95,20 @@ ai-memory schema-init \
   --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
 ```
 
-Idempotent on rerun. Exit code 0 + `schema-init complete:
-schema_version=55, kg_backend=AGE` is the success signal.
+Idempotent on rerun. Exit code 0 + the human summary reporting
+`schema_version: 55` is the success signal (pass `--json` for the
+machine-parseable report, which also carries `age_projection_created`
+and `embedding_dim`):
+
+```text
+schema initialized at <url>
+  tables: <count>
+  indices: <count>
+  views: <count>
+  functions: <count>
+  extensions: [<list>]
+  schema_version: 55
+```
 
 ## Step 2 — Dry-run the migration
 
@@ -106,17 +119,20 @@ ai-memory migrate \
   --dry-run
 ```
 
-The dry-run reports:
+The dry-run emits the same `MigrationReport` the real run does, with
+nothing written to the destination:
 
-- Source row counts per table (memories, memory_links, namespaces,
-  signed_events, transcripts, subscriptions, …).
-- Target row counts (should be 0 for a fresh schema-init).
-- Estimated migration time (back-of-envelope: ~5k rows / sec on a
-  modern dev laptop; pgvector HNSW build time scales with corpus
-  size, dominates the post-import phase).
-- Schema parity check — confirms both sides are at v53.
+- `memories_read` / `memories_written` (0 on dry-run) — memory rows
+  enumerated from the source.
+- `links_read` / `links_written` / `links_skipped` — `memory_links`
+  rows (F6 Gap 2: links migrate alongside memories).
+- `batches`, `dry_run: true`, and an `errors` array.
 
-Read the report. Investigate any "WARN" line before proceeding.
+Pass `--json` for the machine-parseable shape. Read the report and
+investigate any `errors` entry before proceeding. Note the current
+migrator reads one page capped at 1,000,000 rows (`MAX_ROWS` in
+`src/migrate.rs`) and refuses loudly past it; `--batch` is an
+API-compatibility hint only.
 
 ## Step 3 — Real migration
 
@@ -126,26 +142,27 @@ ai-memory migrate \
   --to   postgres://aimemory:PASSWORD@HOST:5432/aimemory
 ```
 
-What it does:
+What it does (see `src/migrate.rs`):
 
-1. Opens both stores via the SAL trait (sqlite read-only, postgres
-   read-write).
-2. For each table in dependency order: walks `from.list_*()`, writes
-   via `to.store_*()` in transactional batches (default 1000 rows
-   per commit).
-3. Walks `from.list_links()` (Wave 1 Stream A wire-up) and writes
-   each via `to.store_link()`. Edge migration was missing in
-   v0.7-alpha — v0.7.0 closes that gap.
-4. Builds the pgvector HNSW index (deferred until after bulk insert
-   to avoid per-row HNSW maintenance cost).
-5. Primes the AGE projection with the migrated entity + memory
-   nodes and edges.
-6. Reports a per-table delta + a sha256 fingerprint of the canonical
-   ordered content of every memory row (used for verification in
-   step 4).
+1. Opens both stores via the SAL trait (`open_store` on each URL —
+   opening the destination runs its schema bootstrap as a side
+   effect).
+2. Walks the source's memories via a single admin-scope `list` call
+   (capped at `MAX_ROWS` = 1,000,000 — it refuses loudly past the cap
+   rather than truncating) and writes each row via the destination's
+   `store`, preserving ids verbatim.
+3. Walks the source's `memory_links` rows and replays each into the
+   destination (v0.7.0 F6 Gap 2 — edge migration was missing in
+   v0.7-alpha; v0.7.0 closes that gap). Duplicate
+   `(source_id, target_id, relation)` triples count as
+   `links_skipped`.
+4. Emits the `MigrationReport` (memories/links read + written +
+   skipped, batches, errors) — human-readable, or JSON with `--json`.
 
-Idempotent on rerun: re-running the same migrate command UPSERTs
-through `(id)` and is a no-op when the source hasn't changed.
+Idempotent on rerun: each write uses the source memory's id verbatim,
+so the adapter's upsert-on-id semantics make a re-run a no-op when the
+source hasn't changed (links land via `ON CONFLICT DO NOTHING` /
+`INSERT OR IGNORE`).
 
 ## Step 4 — Verification
 
@@ -166,28 +183,33 @@ psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' -c "
   UNION ALL SELECT 'memory_transcripts', COUNT(*) FROM memory_transcripts;"
 ```
 
-Counts must match. If `memory_links` is short on the postgres side,
-you migrated against a pre-Wave-1 binary — re-run with the v0.7.0
-binary that has Stream A's `migrate.rs` link-walk.
+Counts must match for `memories` and `memory_links` (the migrate tool
+copies those two tables; operational tables such as `signed_events` and
+`memory_transcripts` start fresh on the postgres side). If
+`memory_links` is short on the postgres side, you migrated against a
+pre-Wave-1 binary — re-run with the v0.7.0 binary that has Stream A's
+`migrate.rs` link-walk.
 
 ```bash
 # Schema parity.
 psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
-  -tAc "SELECT version FROM _ai_memory_schema_version ORDER BY version DESC LIMIT 1;"
-# → 53
+  -tAc "SELECT MAX(version) FROM schema_version;"
+# → 55
 ```
 
 ```bash
-# Content fingerprint.
-ai-memory verify-migration \
+# Idempotency probe — a second run against an unchanged source should
+# report links_skipped == links_read and zero errors.
+ai-memory migrate \
   --from sqlite:///$HOME/.local/share/ai-memory/memory.db \
-  --to   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+  --to   postgres://aimemory:PASSWORD@HOST:5432/aimemory \
+  --dry-run --json
 ```
 
-`verify-migration` is provided by the migration tool and computes a
-sha256 over the canonical-ordered contents of both stores. Identical
-hashes ⇒ verified migration. Mismatched hashes ⇒ stop the cutover and
-file an issue with the per-table count delta from above.
+(There is no separate `verify-migration` subcommand at v0.7.0 — the
+row-count parity queries above plus the dry-run report are the
+verification surface. Mismatched counts ⇒ stop the cutover and file an
+issue with the per-table count delta.)
 
 ## Step 5 — Cutover
 
@@ -197,25 +219,27 @@ Once verification passes:
 # (a) Stop the sqlite-backed daemon if it's still running.
 sudo systemctl stop ai-memory   # or your service manager
 
-# (b) Reconfigure for postgres. Recommended: systemd drop-in.
+# (b) Reconfigure for postgres. The daemon takes the URL via the
+#     --store-url FLAG only (the AI_MEMORY_STORE_URL env fallback was
+#     deliberately dropped — commit 1e8ad69b). Recommended: systemd
+#     drop-in that overrides ExecStart:
 sudo systemctl edit ai-memory <<EOF
 [Service]
-Environment="AI_MEMORY_STORE_URL=postgres://aimemory:PASSWORD@HOST:5432/aimemory"
+ExecStart=
+ExecStart=/usr/local/bin/ai-memory serve --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
 EOF
 
-# (c) Start the daemon. It picks up the postgres URL from the env.
+# (c) Start the daemon.
 sudo systemctl start ai-memory
-sudo systemctl status ai-memory   # confirm "store backend: PostgresStore"
+journalctl -u ai-memory | grep "Postgres KG backend"
+# → "Postgres KG backend: AGE" (or CTE without the AGE extension)
 ```
 
-Verify the live MCP / HTTP path:
+Verify the live HTTP path (the CLI `recall` subcommand reads the local
+sqlite file, not the daemon's postgres store — use the HTTP API):
 
 ```bash
-curl -s http://localhost:9077/api/v1/capabilities | jq '.kg_backend, .store_backend'
-# → "Age"
-# → "PostgresStore"
-
-ai-memory recall "smoke test" --json | jq '.mode, .memories | length'
+curl -s "http://localhost:9077/api/v1/recall?context=smoke%20test" | jq '.memories | length'
 # Should return your existing memories. If you get 0, double-check
 # the URL — you may have started the daemon against an empty postgres.
 ```
@@ -241,18 +265,17 @@ Same dry-run / verify dance. Useful for:
 ## In-place v15 → v55 (postgres → postgres on the same host)
 
 If you're upgrading an existing v0.7-alpha postgres db (schema v15)
-to v0.7.0's v53 parity:
+to v0.7.0's v55 parity:
 
 ```bash
 ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory \
-  --upgrade
+  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
 ```
 
-`schema-init --upgrade` walks the v15 → v55 deltas idempotently (the v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()` async functions invoked by `--upgrade`).
-Existing data is preserved; only DDL changes. The migration tool's
-`--in-place` mode is the moral equivalent — pick whichever fits your
-workflow.
+Opening the store walks the v15 → v55 deltas idempotently (the
+v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()`
+async functions that run on connect; there is no `--upgrade` flag).
+Existing data is preserved; only DDL changes.
 
 ## Rollback strategy
 
@@ -268,9 +291,11 @@ The cleanest rollback path:
    ```
 3. **If you need to roll back** within the first 24-48h after cutover:
    - Stop the postgres-backed daemon.
-   - Reverse-migrate any new writes that landed on postgres after
-     cutover (use `--since <ISO8601>` on the migrate tool to pick up
-     only the delta).
+   - Reverse-migrate the postgres store back onto the sqlite file
+     (`ai-memory migrate --from postgres://… --to sqlite:///…`). The
+     migrator has no time-window flag — it replays the full corpus,
+     and upsert-on-id semantics make re-copying unchanged rows a
+     no-op, so the effective result is the post-cutover delta.
    - Restart the daemon pointing at the sqlite file.
 
 If the postgres deployment is stable for >1 week, the rollback
@@ -299,20 +324,28 @@ underlying rankers differ slightly.
 
 ### AGE projection rebuild on first daemon start
 
-If you migrate without the AGE projection priming step (e.g. you ran
-the v0.7-alpha migrate tool, or you ran `schema-init --skip-age`),
-the first time a v0.7.0 daemon connects with AGE enabled it will
-prime the projection lazily on the first `kg_query`. That first
-query may take 10-60 seconds on a large KG — subsequent queries are
-fast. Pre-prime by running `ai-memory schema-init --upgrade` once.
+If you migrate into a postgres whose AGE `memory_graph` projection was
+never created (e.g. you ran the v0.7-alpha migrate tool, or AGE was
+installed after schema-init), the first time a v0.7.0 daemon connects
+with AGE enabled it bootstraps the `memory_graph` projection at
+connect time, and link writes `MERGE` nodes/edges into it lazily. The
+first heavy `kg_query` on a large KG may take 10-60 seconds —
+subsequent queries are fast. Pre-prime by running
+`ai-memory schema-init --store-url <url>` once (it issues the
+idempotent `SELECT create_graph('memory_graph')` when AGE is
+installed).
 
 ### Auth secrets in URLs
 
 If you put `aimemory:PASSWORD@…` directly in `--store-url`, the URL
 appears in `ps` output and (on some shells) in `~/.bash_history`.
-Prefer the `AI_MEMORY_STORE_URL` env var — set it via systemd
-`EnvironmentFile=` from a `chmod 0600` file. The daemon reads the
-env var and never logs the URL plaintext.
+Note the daemon does NOT read an `AI_MEMORY_STORE_URL` env var (that
+fallback was deliberately dropped in commit `1e8ad69b`) — `--store-url`
+is a flag-only surface. To keep the password out of `ps` / history,
+reference it indirectly inside the unit, e.g. a systemd
+`EnvironmentFile=` (`chmod 0600`) defining `PGPASS_URL` and
+`ExecStart=… serve --store-url ${PGPASS_URL}`, or use a `.pgpass`-style
+credential and a password-less URL where your postgres setup allows it.
 
 ## References
 

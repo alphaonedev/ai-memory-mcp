@@ -2,7 +2,7 @@
 
 **Audience:** operators standing up `ai-memory` for real workloads — single-instance, hub-spoke teams, or W-of-N federations. **Reading time:** 10 minutes.
 
-This guide collects the must-do steps for a hardened deployment. It assumes you have the binary on disk (`brew install ai-memory`, `cargo install ai-memory`, `apt install ai-memory`, or `docker pull ghcr.io/alphaonedev/ai-memory:latest`) and a host with persistent storage. For the threat model and disclosure policy see [`SECURITY.md`](../SECURITY.md). For telemetry and observability see [`telemetry.md`](telemetry.md).
+This guide collects the must-do steps for a hardened deployment. It assumes you have the binary on disk (`brew install alphaonedev/tap/ai-memory`, `cargo install ai-memory`, `sudo dpkg -i ai-memory_<ver>_<arch>.deb` from the GH release, COPR `dnf install ai-memory`, or `docker pull ghcr.io/alphaonedev/ai-memory:latest`) and a host with persistent storage. For the threat model and disclosure policy see [`SECURITY.md`](../SECURITY.md). For telemetry and observability see [`telemetry.md`](telemetry.md).
 
 ---
 
@@ -37,7 +37,7 @@ Default storage paths (overridable with `--key-dir` or `AI_MEMORY_KEY_DIR`):
 - **macOS:** `~/Library/Application Support/ai-memory/keys/`
 - **Windows:** `%APPDATA%\ai-memory\keys\`
 
-Files land with `0600` permissions on Unix. `generate` refuses an existing `--agent-id` unless you pass `--force` — rotation is opt-in. Two agents sharing a keypair is a configuration error; the substrate cannot detect it but every audit chain you produce afterwards will be ambiguous about provenance.
+Files land with strict permissions on Unix (`0600` private key / `0644` public key). `generate` refuses an existing `--agent-id` unless you pass `--force` — rotation is opt-in. Two agents sharing a keypair is a configuration error; the substrate cannot detect it but every audit chain you produce afterwards will be ambiguous about provenance.
 
 Hardware-backed key storage (TPM 2.0, PKCS#11 HSMs, Apple Secure Enclave, cloud KMS adapters) is intentionally out of OSS scope and ships in the commercial tier.
 
@@ -63,7 +63,7 @@ Allowlist format: a directory of public-key files keyed by agent id. There is no
 
 ## 3b. HTTP API key authentication
 
-The HTTP daemon takes an optional shared API key (`ai-memory serve --api-key "$(cat /etc/ai-memory/api.key)"`). When set, every endpoint except `/api/v1/health` requires the key; `AI_MEMORY_REQUIRE_API_KEY=1` additionally hard-refuses daemon start without a key on ANY bind host, including loopback ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)) — set it for reverse-proxy / `--network=host` deployments.
+The HTTP daemon takes an optional shared API key from the `api_key` field of `~/.config/ai-memory/config.toml` (there is no `--api-key` CLI flag on `serve`; container deployments inject it via the `AI_MEMORY_API_KEY` env consumed by `entrypoint.plan-c.sh`, which renders it into the config file). When set, every endpoint except `/api/v1/health` requires the key; `AI_MEMORY_REQUIRE_API_KEY=1` additionally hard-refuses daemon start without a key on ANY bind host, including loopback ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)) — set it for reverse-proxy / `--network=host` deployments.
 
 **The supported credential channel is the `x-api-key` request header** (constant-time compared in `handlers::transport::api_key_auth`). The `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)): a credential in the URL leaks into access logs, `Referer` headers, and proxy logs, all of which may outlive your key-rotation window. At v0.7.0 the query form is still accepted for back-compat and emits a once-per-process operator-visible WARN on first use; v0.8 is slated to reject it outright, with a temporary opt-back-in escape hatch for callers that cannot migrate in time. Migrate callers to the header now:
 
@@ -94,7 +94,7 @@ pg_dump --format=custom ai_memory > ai-memory-$(date -u +%Y%m%dT%H%M%SZ).pgdump
 pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
 ```
 
-**Post-restore verification.** v0.7.0 substrate verifies the reflection chain (L1-L3 recursive learning) automatically on next daemon start; corruption surfaces as a startup refusal with the offending row id. The dedicated `ai-memory verify-reflection-chain` admin CLI for ad-hoc verification of a quiescent database lands in v0.8.0; until then the on-start check is load-bearing.
+**Post-restore verification.** v0.7.0 ships two ad-hoc verifiers: `ai-memory verify-reflection-chain <memory_id>` (L1-3 — walks `reflects_on` edges backward to depth 0 and verifies each Ed25519 signature; exit 0 on a fully-verified chain) and `ai-memory verify-signed-events-chain --format json` (V-4 — walks the cross-row `signed_events` hash chain; `chain_holds: true` is the pass signal). Run both against the restored database before promoting it.
 
 Backup cadence target: hourly snapshots, 48-hour rotation, weekly off-host transfer to a separate failure domain. Sizing: a 1 GB SQLite file produces a ~700-900 MB snapshot after `VACUUM INTO`.
 
@@ -106,7 +106,7 @@ Migrations are forward-only and run automatically on the first daemon start afte
 
 **Forward-only is by design; snapshot-restore is the rollback** ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576)). Before any schema-mutating upgrade runs, the binary automatically snapshots the live SQLite file as a sibling of the database: `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak` (`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`). The snapshot is produced with `VACUUM INTO` — transactionally consistent, folds pending WAL frames, inherits the source's SQLCipher keying — and the migration refuses to mutate the schema if the snapshot fails. To roll back: stop the daemon, reinstall the previous binary, copy the `.pre-migration-…bak` snapshot over the live DB file (removing stale `-wal`/`-shm` siblings), and start. See [`ADMIN_GUIDE.md` §Migration](ADMIN_GUIDE.md) for the step-by-step procedure.
 
-A dry-run flag for offline previewing of a pending migration ships in v0.8.0 (`ai-memory migrate --dry-run`). Until then, the recommended workflow on a major-version upgrade is:
+There is no offline dry-run preview for the schema ladder itself (the existing `ai-memory migrate --dry-run` in `--features sal` builds is the *cross-backend copy tool*, not a schema-migration preview). The recommended workflow on a major-version upgrade is:
 
 1. Take a snapshot (`ai-memory backup --to <path>`).
 2. Start the new binary against a copy of the snapshot in a scratch directory.
@@ -123,9 +123,9 @@ Out-of-the-box observability lands in three places:
 
 - **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug` for deep traces. Note (post-#1562, 2026-06-09): the postgres SAL adapter emits under the literal targets `store::postgres` / `store::postgres::kg`, which an `ai_memory=...` filter does not match — postgres-backed deployments wanting those events must add e.g. `store::postgres=debug` to the filter.
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
-- **`ai-memory doctor`.** A 7-section health dashboard run locally: database integrity, schema version, retention drift, embedder availability, hook pipeline status, federation peer reachability, recent audit summary. Nothing leaves the host.
+- **`ai-memory doctor`.** A 9-section health dashboard run locally at v0.7.0: Storage / Index / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146). Nothing leaves the host except the opt-in LLM reachability probe against your configured backend.
 
-Hooks (`pre_store`, `post_store`, `post_recall`, `pre_federation_send`, etc.) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.md).
+Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc. — 25 lifecycle events, see [`hook-pipeline.md`](hook-pipeline.md)) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.md).
 
 ---
 
@@ -135,7 +135,7 @@ Hooks (`pre_store`, `post_store`, `post_recall`, `pre_federation_send`, etc.) ar
 
 **Hub-spoke (team).** One PostgreSQL+AGE hub, N spoke agents pushing federated memories on a schedule. The hub is the source of truth for cross-agent recall; spokes hold their own local SQLite for offline work. mTLS allowlist on the hub names every spoke; spokes have an allowlist of one entry (the hub).
 
-**W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with an attested commit requiring W signatures out of N peers before a write is accepted as canonical. Resolves the "any single operator can rewrite history" problem. CRDT-based eventual consistency by default; opt-in MVCC strict-consistency mode ships in v1.0.
+**W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with a quorum commit requiring the local write plus W−1 peer acknowledgements within `--quorum-timeout-ms` before the write returns OK (per [`ADR-0001`](ADR-0001-quorum-replication.md); per-message Ed25519 signing rides on `AI_MEMORY_FED_REQUIRE_SIG`). Default 2000 ms assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 ms — the do-1461 reference deployment uses 8000 (#1565). Resolves the "any single operator can rewrite history" problem. CRDT-based eventual consistency by default; opt-in MVCC strict-consistency mode ships in v1.0.
 
 Sizing guide (Apple M2, 16 GB, SQLite reference):
 
@@ -203,7 +203,9 @@ Fleet rollout pattern (systemd):
 # /etc/systemd/system/ai-memory.service
 [Service]
 EnvironmentFile=/etc/ai-memory/llm.env
-ExecStart=/usr/local/bin/ai-memory serve --tier autonomous --store-url postgres://...
+# NOTE: `serve` does NOT accept a --tier flag — the daemon's tier comes
+# from the `tier` field in config.toml (compiled default: semantic).
+ExecStart=/usr/local/bin/ai-memory serve --store-url postgres://...
 User=ai-memory
 Group=ai-memory
 ```

@@ -2,17 +2,16 @@
 
 <div align="center">
 
-## 🎯 Current stable release · **v0.6.3.1** · A2A-CERTIFIED · 1,886 lib tests + 49+ integration · 93.84% line coverage
+## 🎯 Current release · **v0.7.0** (`attested-cortex`) · ≥92% line coverage (ratchet pinned in [`.coverage-baseline`](../.coverage-baseline))
 
-[![Release](https://img.shields.io/badge/release-v0.6.3.1-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.6.3.1)
+[![Release](https://img.shields.io/badge/release-v0.7.0-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.7.0)
 [![A2A Gate](https://img.shields.io/badge/A2A_gate-9%2F9_green-brightgreen)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)
 [![Ship Gate](https://img.shields.io/badge/ship_gate-green-brightgreen)](https://alphaonedev.github.io/ai-memory-ship-gate/)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
-**v0.6.3** cleared the a2a-gate certification bar: three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens.
+**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v55). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md).
 
-**📦 [Release v0.6.3.1](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.6.3.1)** ·
-**🟢 [v0.6.3.1 a2a campaign — testing in flight](https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/)** ·
+**📦 [Release v0.7.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.7.0)** ·
 **📊 [A2A gate (umbrella spec)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)** ·
 **🚢 [Ship gate](https://alphaonedev.github.io/ai-memory-ship-gate/)** ·
 **📖 [AI-NHI insights](https://alphaonedev.github.io/ai-memory-ai2ai-gate/insights/)** ·
@@ -37,7 +36,7 @@ authoritative for its topic; this page is just the map.
 - **[USER_GUIDE.md](USER_GUIDE.md)** — MCP tool reference (every
   `memory_*` tool), agent identity, worked examples.
 - **[CLI_REFERENCE.md](CLI_REFERENCE.md)** — every subcommand, flag,
-  env var. Auto-synced to `src/main.rs` clap defs.
+  env var. Synced to the clap defs in `src/daemon_runtime.rs` (+ `src/cli/`).
 - **[API_REFERENCE.md](API_REFERENCE.md)** — every HTTP endpoint,
   payload, status code, `curl` example.
 - **[INSTALL.md](INSTALL.md)** — install recipes per platform +
@@ -63,8 +62,8 @@ authoritative for its topic; this page is just the map.
   curator soak procedure against a production corpus. Defines
   reversal rate `R` as the honest autonomy metric.
 - **[RUNBOOK-adapter-selection.md](RUNBOOK-adapter-selection.md)** —
-  scoped design for the v0.7.1 `serve --store-url postgres://…`
-  refactor. NOT shipping in v0.7-alpha.
+  design history for the `serve --store-url postgres://…` adapter
+  selection (originally scoped to v0.7.1; **shipped in v0.7.0**).
 
 ## For developers
 
@@ -86,6 +85,10 @@ authoritative for its topic; this page is just the map.
 
 - **[ADR-0001-quorum-replication.md](ADR-0001-quorum-replication.md)** —
   W-of-N quorum write model + chaos-testing methodology.
+- **[ADR-0002-kg-schema-v15-backward-incompat.md](ADR-0002-kg-schema-v15-backward-incompat.md)** —
+  KG schema v15 wire-level backward incompatibility.
+- **[ADR-0003-kg-invalidation-eventual-consistency.md](ADR-0003-kg-invalidation-eventual-consistency.md)** —
+  why KG link invalidation replicates eventually (not quorum-broadcast).
 
 ## SDKs
 

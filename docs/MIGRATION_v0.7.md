@@ -208,7 +208,7 @@ What v0.7.0 ships:
 - `memory_check_agent_action` MCP tool — dry-run check against the rule corpus.
 - `memory_rule_list` MCP tool — read-only listing.
 - Substrate `storage::insert` pre-write hook surfaces structured refusal via the `MemoryError::RefusedByGovernance` error variant.
-- `ai-memory install --harness claude-code --enforce-policy` wires the policy at install time.
+- `ai-memory install claude-code --hook pretool --apply` wires the policy hook at install time (routes Bash / Edit / Write tool calls through `memory_check_agent_action`).
 
 What v0.7.0 does NOT ship (v0.8.0 cover):
 
