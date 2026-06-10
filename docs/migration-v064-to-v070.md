@@ -18,7 +18,7 @@
 
 ## 1. TL;DR migration verdict
 
-- **What changes.** The sqlite schema jumps from **v20 → v55** — 11 new columns
+- **What changes.** The sqlite schema jumps from **v20 → v57** — 11 new columns
   on the `memories` table (citations, source URIs, byte-range spans, memory
   kind, entity id, persona version, confidence provenance + signals + decay
   stamp, optimistic-concurrency `version`, plus the PERF-8
@@ -139,7 +139,7 @@ ai-memory serve                                                 # or: systemctl 
 ```
 
 That's it. The first daemon start after the upgrade walks the schema
-ladder v20 → v55 against your DB in place. It's idempotent — if you Ctrl-C
+ladder v20 → v57 against your DB in place. It's idempotent — if you Ctrl-C
 during the migration, restart and the unfinished bumps resume from where they
 stopped.
 
@@ -207,7 +207,7 @@ ai-memory --version
 ### 4.4 First-boot schema migration
 
 Start the daemon. The first boot detects `schema_version=20` (your v0.6.4 state)
-and walks the ladder up to 55.
+and walks the ladder up to 57.
 
 ```bash
 # `serve` runs in the foreground by default (no --foreground flag exists)

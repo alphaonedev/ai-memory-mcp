@@ -1611,7 +1611,7 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
   vars, 88 production HTTP route registrations (74 unique URL paths), 33+ sqlite migrations on disk + the in-
   process arms that converge sqlite + postgres on the single
-  logical `CURRENT_SCHEMA_VERSION = 55`).
+  logical `CURRENT_SCHEMA_VERSION = 57`).
 
 ## Backward compatibility
 

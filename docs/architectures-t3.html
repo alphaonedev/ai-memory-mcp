@@ -555,7 +555,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
         <tr><td>Apache AGE</td><td><strong>1.7.0</strong></td><td><code>AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code> · <code>EXPECTED_AGE_VERSION=1.7.0</code></td></tr>
         <tr><td>pgvector (server extension)</td><td><strong>0.8.2</strong></td><td><code>PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1</code></td></tr>
         <tr><td>pgvector (Rust binding crate)</td><td><strong>0.4</strong></td><td><code>Cargo.toml</code> → <code>pgvector = "0.4"</code></td></tr>
-        <tr><td>ai-memory postgres schema</td><td><strong>v55</strong></td><td>schema parity with SQLite at v55 (v0.7.0; <code>CURRENT_SCHEMA_VERSION = 55</code> in both adapters)</td></tr>
+        <tr><td>ai-memory postgres schema</td><td><strong>v57</strong></td><td>schema parity with SQLite at v57 (v0.7.0; <code>CURRENT_SCHEMA_VERSION = 57</code> in both adapters; Track C validated at v55 — the v56/v57 arms are additive index/column DDL)</td></tr>
       </tbody>
     </table>
     <p>The bundled stacked image at <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> (<code>ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code>, <code>ARG PG_MAJOR=18</code>) layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run operators don't build AGE from source. <strong>Alternate tested matrix:</strong> <code>infra/lan-parity-test/</code> legitimately runs PG 16 + AGE 1.6.0 + pgvector 0.8.2 as a second tested combination; the <em>recommended</em> install targets the PG 18.4 / AGE 1.7.0 matrix above.</p>

@@ -37,7 +37,7 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sqlite-over-NFS is not.
 
 The two backends have **schema parity at v55** as of v0.7.0
-(`CURRENT_SCHEMA_VERSION = 55` on both ladders) — every feature that
+(`CURRENT_SCHEMA_VERSION = 57` on both ladders) — every feature that
 works on sqlite works on postgres.
 
 ## Prerequisites
@@ -189,7 +189,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v55 as a side effect. The `vector` (pgvector) extension is
+   schema v57 as a side effect. The `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
 2. If the `age` extension is installed, additionally bootstraps the
@@ -704,7 +704,7 @@ bootstrap.
 
 If you're pointing at a v0.7-alpha postgres database (schema v15),
 run `ai-memory schema-init --store-url postgres://…` with the v0.7.0
-binary — opening the store applies the upgrade ladder to v55
+binary — opening the store applies the upgrade ladder to v57
 idempotently. (See `migration-v0.7.0-postgres.md` for the full
 migration guide.)
 
@@ -743,7 +743,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v55 | v55 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v57 | v57 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |
