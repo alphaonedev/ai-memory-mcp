@@ -111,7 +111,7 @@ footer a{color:var(--muted)}
     </div>
     <div class="surface-card http">
       <div class="label">HTTP &mdash; /api/v1/*</div>
-      <div class="count">87</div>
+      <div class="count">88</div>
       <p class="body">Production <code>.route(...)</code> registrations in <code>src/lib.rs</code> (74 unique URL paths &times; multiple HTTP methods per path) plus the bare <code>/metrics</code> Prometheus surface. Authoritative source: codegraph <code>codegraph_search kind=route limit=100</code>.</p>
     </div>
     <div class="surface-card cli">
@@ -120,7 +120,7 @@ footer a{color:var(--muted)}
       <p class="body">Top-level <code>Command</code> enum variants in <code>src/daemon_runtime.rs</code> (default build ships 79; <code>--features sal</code>/<code>sal-postgres</code> unlocks 81 by adding <code>migrate</code> + <code>schema-init</code>, both <code>#[cfg(feature = "sal")]</code> &mdash; not postgres-only).</p>
     </div>
   </div>
-  <p>Each count is asserted by a regression test. The architectural North Star (per CLAUDE.md prime directive): long-term codebase manageability. Growth narrative: 70 MCP / 73 HTTP / 40 CLI at v0.6.4 &rarr; 74 / 88 / 79 at v0.7.0 (FX-12/ARCH-3 + FX-C3 batch2 added 16 CLI subcommands closing MCP/CLI parity; v0.7.0 attested-cortex feature surface + #1146 sectioned-config + #1156 per-namespace K8 quota + #1255 federation_nonces persistence drove the HTTP + schema bumps).</p>
+  <p>Each count is asserted by a regression test. The architectural North Star (per CLAUDE.md prime directive): long-term codebase manageability. Growth narrative: 70 MCP / 73 HTTP / 40 CLI at v0.6.4 &rarr; 74 / 88 / 79 at v0.7.0 (FX-12/ARCH-3 + FX-C3 batch2 added 16 CLI subcommands closing MCP/CLI parity; v0.7.0 attested-cortex feature surface + #1146 sectioned-config + #1156 per-namespace K8 quota + #1255 federation-nonce persistence (<code>federation_nonce_cache</code>) drove the HTTP + schema bumps).</p>
 </section>
 
 <section class="wrap-mid">
@@ -201,7 +201,7 @@ footer a{color:var(--muted)}
     <li><strong>v48</strong> (#933 Track D) &mdash; <code>federation_push_dlq</code> table.</li>
     <li><strong>v49</strong> (#1025) &mdash; 14 nullable columns on <code>archived_memories</code> so archive&rarr;restore is lossless for the full v0.7.0 Memory shape on both backends.</li>
     <li><strong>v50</strong> (#1156) &mdash; <code>agent_quotas</code> PRIMARY KEY extended from <code>(agent_id)</code> to <code>(agent_id, namespace)</code>. Per-namespace K8 quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the <code>_global</code> sentinel namespace.</li>
-    <li><strong>v51</strong> (#1255 / PR #1296) &mdash; added the <code>federation_nonces</code> table so peer-replay-prevention nonces persist across daemon restarts.</li>
+    <li><strong>v51</strong> (#1255 / PR #1296) &mdash; added the <code>federation_nonce_cache</code> table so peer-replay-prevention nonces persist across daemon restarts.</li>
     <li><strong>v52</strong> (#1389 L4) &mdash; added the <code>transcript_line_dedup</code> idempotency table (<code>(host_pubkey_b64, line_sha256)</code> composite key) so a SIGKILL between turns never double-ingests the same transcript line on rehydration.</li>
     <li><strong>v53</strong> (#1418, R5.F5.2) &mdash; scoped the <code>memories_au</code> FTS5 sync trigger to <code>AFTER UPDATE OF title, content, tags</code> so non-FTS column updates no longer pay spurious FTS5 row ops. Pure DDL, idempotent.</li>
     <li><strong>v54</strong> (#1466) &mdash; backfilled tier-default expiry (<code>created_at + tier.default_ttl_secs()</code>) onto legacy NULL-expiry mid/short rows to close the TTL-leak immortal-rows class. In-code backfill arm, no new <code>.sql</code> file.</li>

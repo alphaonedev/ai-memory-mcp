@@ -77,7 +77,8 @@ footer a{color:var(--muted)}
   <h2><span class="step-num">01</span> Boot &mdash; load identity and policy</h2>
   <p>The agent's launch hook calls <code>memory_session_start</code>. The substrate stamps a session id, surfaces the agent's prior reflections, and loads any operator-signed substrate rules that scope to this agent. The agent now knows who it is and what it is allowed to do.</p>
   <div class="label">Tool call</div>
-  <pre><code>memory_session_start({ "agent_id": "ai:curator-agent@host01:pid-4815" })</code></pre>
+  <pre><code>memory_session_start({})   // identity ai:curator-agent@host01:pid-4815
+                           // resolved via the agent_id ladder (env / clientInfo)</code></pre>
   <div class="label">Excerpt</div>
   <pre><code>{ "session_id": "sess-2026-05-18-a3f9",
   "prior_reflections": 3,
@@ -91,9 +92,9 @@ footer a{color:var(--muted)}
   <div class="label">Excerpt</div>
   <pre><code>{ "results": [
     { "id": "...a1f7", "title": "PR #810 introduced async test race",
-      "kind": "finding", "confidence": 0.92, "score": 0.78 },
+      "kind": "observation", "confidence": 0.92, "score": 0.78 },
     { "id": "...b3c2", "title": "Test isolation policy &mdash; no shared DB",
-      "kind": "policy", "confidence": 1.00, "score": 0.71 } ] }</code></pre>
+      "kind": "decision", "confidence": 1.00, "score": 0.71 } ] }</code></pre>
 
   <h2><span class="step-num">03</span> Store &mdash; record the new observation</h2>
   <p>The agent reproduces the flake and learns it only fails when two suites run in parallel. It stores a finding. The substrate stamps <code>agent_id</code> from the resolution ladder (env, then process default), assigns a tier (<code>mid</code>: 7-day TTL), and writes a signed event into the audit chain.</p>
@@ -102,7 +103,7 @@ footer a{color:var(--muted)}
   "title": "Flake reproduces only under parallel suite execution",
   "content": "test_handler_parity::bucket_b flakes 30% with -j 2; never with -j 1",
   "tier": "mid",
-  "kind": "finding",
+  "kind": "observation",
   "confidence": 0.85,
   "tags": ["flake", "test-isolation", "pr-810"] })</code></pre>
 
@@ -110,17 +111,16 @@ footer a{color:var(--muted)}
   <p>The new finding extends the earlier "PR #810 introduced async test race" memory. The agent records the relationship with a typed directional link and (because the autonomous tier is on) signs the link with the agent's Ed25519 key. <code>valid_from</code> is set; <code>valid_until</code> is left open until something invalidates the claim.</p>
   <div class="label">Tool call</div>
   <pre><code>memory_link({
-  "from": "...new-finding-id",
-  "to":   "...a1f7",
-  "kind": "derived_from",
-  "attest_level": "signed_by_agent" })</code></pre>
+  "source_id": "...new-finding-id",
+  "target_id": "...a1f7",
+  "relation":  "derived_from" })</code></pre>
 
   <h2><span class="step-num">05</span> Consolidate &mdash; do I have duplicates</h2>
   <p>The autonomous-tier curator (a background loop) periodically calls <code>memory_consolidate</code> on neighborhoods of the graph. It uses the configured LLM to detect that two earlier memories &mdash; one a tag drift report, one the new finding above &mdash; describe the same underlying defect. The curator merges them into a single canonical memory, preserves both source <code>agent_id</code>s under <code>consolidated_from_agents</code>, and emits a <code>supersedes</code> link from the old to the new.</p>
   <div class="label">Tool call</div>
   <pre><code>memory_consolidate({
-  "candidates": ["...old-id-1", "...old-id-2", "...new-finding-id"],
-  "strategy": "llm_merge" })</code></pre>
+  "ids": ["...old-id-1", "...old-id-2", "...new-finding-id"],
+  "title": "PR #810 flake &mdash; parallel-execution race (consolidated)" })</code></pre>
   <div class="label">Excerpt</div>
   <pre><code>{ "consolidated_id": "...c8d4",
   "consolidated_from_agents":
@@ -131,7 +131,11 @@ footer a{color:var(--muted)}
   <h2><span class="step-num">06</span> Reflect &mdash; what does the chain now mean</h2>
   <p>After the consolidation, the agent calls <code>memory_reflect</code> against its working scope. Reflection is bounded (default depth cap 3 to prevent runaway recursion); the substrate refuses depth 4 with <code>REFLECTION_DEPTH_EXCEEDED</code>. The reflection is signed by the agent's key and stored as a memory of kind <code>reflection</code>, which the next session will surface via <code>memory_session_start</code>.</p>
   <div class="label">Tool call</div>
-  <pre><code>memory_reflect({ "scope": "pr-810 flake investigation", "depth": 2 })</code></pre>
+  <pre><code>memory_reflect({
+  "source_ids": ["...a1f7", "...c8d4"],
+  "title":   "pr-810 flake investigation",
+  "content": "Flake is parallel-execution race; fix is per-suite DB.",
+  "depth": 2 })</code></pre>
   <div class="label">Excerpt</div>
   <pre><code>{ "reflection_id": "...refl-aa1",
   "summary": "Flake is parallel-execution race; fix is per-suite DB
@@ -143,7 +147,7 @@ footer a{color:var(--muted)}
   <h2><span class="step-num">07</span> Handoff &mdash; the next session inherits</h2>
   <p>The session ends. Nothing is lost. The next session of any agent that boots into the same namespace gets the reflection surfaced via <code>memory_session_start</code>, the consolidated finding via <code>memory_recall</code>, and the typed link chain via <code>memory_get_links</code>. The signed audit chain replays cleanly; the substrate rules still apply; the <code>agent_id</code> trail records who did what; the operator can verify any of it.</p>
   <div class="label">Next session boot</div>
-  <pre><code>memory_session_start({ "agent_id": "ai:next-agent@host01:pid-9001" })
+  <pre><code>memory_session_start({})   // booting as ai:next-agent@host01:pid-9001
   &rarr; surfaces reflection ...refl-aa1, points at consolidated ...c8d4</code></pre>
 
   <p class="callout">This is what "the substrate AI agents run on" means in concrete terms. Memory persists. Identity persists. Audit persists. Governance persists. The agent did its work; nothing of value vanished when the process died.</p>

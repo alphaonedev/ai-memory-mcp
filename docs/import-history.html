@@ -311,17 +311,17 @@ ai-memory mine ./slack-export/eng-decisions/ --format slack \
     <h2>After the import.</h2>
     <p>Your imported memories are immediately part of the live recall mix:</p>
 <pre><code># Recall ranks across imported + native memories together
-ai-memory recall "kubernetes deployment strategy" --tier long
+ai-memory recall "kubernetes deployment strategy"
 
 # Filter to just the imported set
 ai-memory list --namespace chatgpt-export
-ai-memory list --source mine-chatgpt
 
-# Promote the standout decisions to long-tier permanently
-ai-memory promote &lt;id&gt; --tier long --priority 9
+# Promote the standout decisions to long-tier permanently (promote jumps to long)
+ai-memory promote &lt;id&gt;
 
 # Consolidate two redundant decisions into one canonical memory
-ai-memory consolidate &lt;id1&gt; &lt;id2&gt; -T "Auth strategy — final decision"</code></pre>
+ai-memory consolidate &lt;id1&gt;,&lt;id2&gt; -T "Auth strategy — final decision" \
+  -s "Summary of the final decision"</code></pre>
   </div>
 </section>
 

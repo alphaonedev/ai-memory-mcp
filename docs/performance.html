@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Performance — bench tool, p95 budgets, regression gating</title>
-<meta name="description" content="ai-memory v0.7.0 performance surface. bench tool with --baseline, --history, --update-performance-md flags. p95 latency budgets in PERFORMANCE.md. CI bench job that fails on regressions. v0.6.3 Stream E + F.">
+<meta name="description" content="ai-memory v0.7.0 performance surface. bench tool with --baseline, --regression-threshold, --history, --json flags. p95 latency budgets in PERFORMANCE.md. CI bench job that fails on regressions. v0.6.3 Stream E + F.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/performance.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -155,7 +155,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Performance — measured, gated, public.</h1>
-  <p class="tagline">v0.6.3 ships a <strong>bench tool</strong> with three operator-friendly flags: <code>--baseline</code> for regression detection, <code>--history</code> for JSONL accumulation, <code>--update-performance-md</code> for auto-spliced docs. CI runs the bench on every PR. Regressions &gt;N% fail the gate. The numbers in <code>PERFORMANCE.md</code> are the public contract.</p>
+  <p class="tagline">v0.6.3 ships a <strong>bench tool</strong> with three operator-friendly flags: <code>--baseline</code> for regression detection (with <code>--regression-threshold</code>, default 10%), <code>--history</code> for JSONL accumulation, <code>--json</code> for machine-readable output. CI runs the bench on every PR. Regressions &gt;N% fail the gate. The numbers in <code>PERFORMANCE.md</code> are the public contract.</p>
   <div class="pills">
     <span class="pill">bench tool (Stream E)</span>
     <span class="pill">PERFORMANCE.md (Stream F)</span>
@@ -168,7 +168,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Public p95 budgets</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">The numbers, committed to source.</h2>
-    <p class="lede">Every operation has a target p95 latency budget on a reference machine (Apple M2, 8GB free RAM, SQLite). PRs that regress beyond a configurable threshold fail the bench CI gate. v0.7's Apache AGE work will extend this with KG-query budgets; v0.8 adds task-queue p95.</p>
+    <p class="lede">Every operation has a target p95 latency budget on a reference machine (Apple M4, 32 GB unified memory, SQLite — per <code>PERFORMANCE.md</code>). PRs that regress beyond a configurable threshold fail the bench CI gate. v0.7's Apache AGE work will extend this with KG-query budgets; v0.8 adds task-queue p95.</p>
     <p class="lede" style="font-size:.95rem;color:var(--text-dim)">Rows tagged <em>[advisory]</em> are published targets without a matching bench in <code>src/bench.rs</code> yet (Stream E follow-up — embedder-bound, background-job, or federation paths). Unmarked rows are exercised by <code>ai-memory bench</code> on every PR. <code>PERFORMANCE.md</code> is the canonical budget contract.</p>
     <table class="budget-table">
       <thead><tr><th>Operation</th><th>Tier</th><th style="text-align:right">p95 budget</th><th>Notes</th></tr></thead>
@@ -178,11 +178,11 @@ footer a{color:var(--text-muted)}
         <tr><td class="op">memory_store</td><td>autonomous</td><td class="num">≤ 60 ms</td><td><em>[advisory]</em> + nomic embedding (768d)</td></tr>
         <tr><td class="op">memory_get</td><td>any</td><td class="num">≤ 2 ms</td><td><em>[advisory]</em> indexed PK lookup + access bump</td></tr>
         <tr><td class="op">memory_search</td><td>keyword</td><td class="num">≤ 8 ms</td><td>FTS5 query, top-20</td></tr>
-        <tr><td class="op">memory_recall</td><td>semantic</td><td class="num">≤ 35 ms</td><td><em>[advisory]</em> FTS5 70% + HNSW 30% fusion</td></tr>
+        <tr><td class="op">memory_recall</td><td>semantic</td><td class="num">≤ 35 ms</td><td><em>[advisory]</em> adaptive FTS5+HNSW fusion (semantic weight 0.50→0.15 by content length)</td></tr>
         <tr><td class="op">memory_recall</td><td>autonomous</td><td class="num">≤ 90 ms</td><td><em>[advisory]</em> + cross-encoder rerank (top-100→top-10)</td></tr>
         <tr><td class="op">memory_link</td><td>any</td><td class="num">≤ 4 ms</td><td><em>[advisory]</em> FK insert + idempotency check</td></tr>
         <tr><td class="op">memory_promote</td><td>any</td><td class="num">≤ 8 ms</td><td><em>[advisory]</em> + governance verdict</td></tr>
-        <tr><td class="op">memory_consolidate</td><td>smart</td><td class="num warn">≤ 1500 ms</td><td><em>[advisory]</em> LLM-bound · Gemma 4 E2B</td></tr>
+        <tr><td class="op">memory_consolidate</td><td>smart</td><td class="num warn">≤ 1500 ms</td><td><em>[advisory]</em> LLM-bound · <code>gemma4:e4b</code> reference</td></tr>
         <tr><td class="op">memory_kg_query</td><td>any</td><td class="num">≤ 50 ms</td><td>recursive CTE · depth 3 · &lt; 1k edges</td></tr>
         <tr><td class="op">memory_get_taxonomy</td><td>any</td><td class="num">≤ 30 ms</td><td><em>[advisory]</em> tree walk · default depth 8 · limit 1000</td></tr>
         <tr><td class="op">memory_archive_purge</td><td>any</td><td class="num">≤ 200 ms</td><td><em>[advisory]</em> per 1000 archived rows</td></tr>
@@ -190,7 +190,7 @@ footer a{color:var(--text-muted)}
         <tr><td class="op">bulk_create</td><td>any</td><td class="num">≤ 2000 ms</td><td><em>[advisory]</em> 100 rows + fanout · concurrent post W12</td></tr>
       </tbody>
     </table>
-    <p class="lede" style="margin-top:1rem"><em>Reference machine: Apple M2, 16GB RAM, macOS 14, SQLite default settings, single-process daemon. Numbers degrade gracefully on lower-spec hardware; budgets are headroom-aware. Live numbers under <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md" style="color:var(--p1)">PERFORMANCE.md</a>.</em></p>
+    <p class="lede" style="margin-top:1rem"><em>Reference machine: Apple M4, 32 GB unified memory, macOS, SQLite default settings, single-process daemon. Numbers degrade gracefully on lower-spec hardware; budgets are headroom-aware. Live numbers under <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md" style="color:var(--p1)">PERFORMANCE.md</a>.</em></p>
   </div>
 </section>
 
@@ -224,17 +224,16 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="flag update">
-      <div class="flag-head"><span class="flag-name">--update-performance-md</span></div>
-      <div class="flag-desc">Splice the latest measurements into the public <code>PERFORMANCE.md</code> file, in-place between the marker comments. The next git commit captures the doc update. Operators run this after a known-good release to keep the public numbers fresh.</div>
-      <div class="snip"><span class="ok">$</span> ai-memory bench --update-performance-md ./PERFORMANCE.md
-<span class="ok">→ Updated 12 budget rows · staged for commit · git diff PERFORMANCE.md</span>
+      <div class="flag-head"><span class="flag-name">--json</span></div>
+      <div class="flag-desc">Emit results as machine-readable JSON instead of the human table. A saved <code>--json</code> payload is exactly what <code>--baseline</code> consumes on the next run, so the release workflow is: bench on the reference machine, save the JSON, feed it back as the baseline for every PR. <code>PERFORMANCE.md</code> is updated by hand from a reviewed known-good run.</div>
+      <div class="snip"><span class="ok">$</span> ai-memory bench --json &gt; ./bench/baseline-v0.7.0.json
 
 <span class="cm"># Workflow:
 #   1. cut a release candidate
-#   2. run bench on the reference machine
-#   3. ai-memory bench --update-performance-md
-#   4. git diff to review the splice
-#   5. commit + ship</span></div>
+#   2. run bench on the reference machine with --json
+#   3. review + commit the baseline JSON
+#   4. CI feeds it back via --baseline on every PR
+#   5. update PERFORMANCE.md from the reviewed run</span></div>
     </div>
   </div>
 </section>
@@ -268,7 +267,7 @@ jobs:
   <div class="container">
     <span class="eyebrow">Tracing — span-level attribution</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Why was that one slow?</h2>
-    <p class="lede">Every MCP tool dispatch is wrapped in a <code>tracing::info_span!("mcp_tool_call")</code> with attributes including <code>tool</code>, <code>elapsed_ms</code>, <code>outcome</code>. Operators can chart per-tool p95/p99 against the public budgets — and when a single call regresses, the trace tree shows which sub-operation took the time. v0.7's tracing layer extends this with hook-pipeline spans.</p>
+    <p class="lede">Every MCP tool dispatch is wrapped in a <code>tracing::info_span!("mcp_tool_call")</code> with attributes including <code>tool</code>, <code>elapsed_ms</code>, <code>outcome</code>. Operators can chart per-tool p95/p99 against the public budgets — and when a single call regresses, the trace tree shows which sub-operation took the time (see the <a href="tracing.html" style="color:var(--p1)">tracing atlas</a> for the full target list).</p>
     <div class="snip"><span class="cm"># Example — find recall calls slower than 100ms in the last hour</span>
 <span class="ok">$</span> grep <span class="val">"mcp_tool_call"</span> daemon.log | jq <span class="val">'select(.tool=="memory_recall" and .elapsed_ms &gt; 100)'</span>
 

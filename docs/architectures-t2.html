@@ -370,32 +370,33 @@ table tr:last-child td{border-bottom:none}
 
     <h3>Per-namespace governance</h3>
     <p>Set a policy with <code>memory_namespace_set_standard</code>:</p>
-<pre><code>ai-memory namespace set-standard agents/secops --governance '{
-  "write": "approve",
-  "promote": "owner",
-  "delete": "approve"
-}'</code></pre>
-    <p>Now any agent writing into <code>agents/secops</code> triggers <code>governance::check()</code> which returns <code>Pending(action_id)</code>. The write isn't committed — it's parked in <code>pending_actions</code>. The owning operator (or a designated approver agent) calls <code>memory_pending_list</code>, inspects the diff, and either <code>memory_pending_approve</code> or <code>memory_pending_reject</code>. Approved writes get committed; rejected ones are dropped with an audit row.</p>
+<pre><code># 1. store the standard memory that carries the policy, capture its id
+ai-memory --json store -T "secops namespace standard" -c "write gating" -n agents/secops
+# 2. bind it — the JSON merges into the standard's metadata.governance
+ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-memory-uuid&gt; \
+  --governance '{"write":"approve","promote":"owner","delete":"approve"}'</code></pre>
+    <p>Now any agent writing into <code>agents/secops</code> triggers the governance gate (<code>check_agent_action()</code>) which returns <code>Pending(action_id)</code>. The write isn't committed — it's parked in <code>pending_actions</code>. The owning operator (or a designated approver agent) calls <code>memory_pending_list</code>, inspects the diff, and either <code>memory_pending_approve</code> or <code>memory_pending_reject</code>. Approved writes get committed; rejected ones are dropped with an audit row.</p>
     <p>Per-namespace policy means a strict-write namespace can sit next to a permissive one. The hierarchy lets you set a default at <code>org/</code> and override at <code>org/team/</code>.</p>
 
     <h3>Capabilities introspection (v0.6.3)</h3>
     <p>Before an agent invokes a skill, it can ask: <em>"is auto-tag actually wired here?"</em></p>
-<pre><code>$ ai-memory capabilities --json
+<pre><code>$ curl -s http://127.0.0.1:9077/api/v1/capabilities   # or the memory_capabilities MCP tool
 {
-  "version": "0.6.3",
+  "schema_version": "3",
   "tier": "semantic",
+  "version": "0.7.0",
   "features": {
+    "keyword_search": true,
     "hybrid_recall": true,
     "auto_tagging": false,
     "contradiction_analysis": false,
-    "approval_workflow": true,
-    "kg_temporal": true
+    "cross_encoder_reranking": false,
+    ...
   },
-  "permissions": ["read", "write", "promote", "approve"],
-  "hooks": ["pre_store", "post_recall"],
-  "approval": {"queue_depth": 7, "policies": 3}
+  "permissions": { ... }, "hooks": { ... },
+  "approval": {"pending_requests": 7, ...}
 }</code></pre>
-    <p>Capabilities v2 ships in v0.6.3 — agents discover what's available at runtime instead of hard-coding assumptions.</p>
+    <p>Capabilities v2 shipped in v0.6.3; at v0.7.0 the envelope defaults to <code>schema_version "3"</code> (v1/v2 still negotiable via <code>Accept-Capabilities</code>) — agents discover what's available at runtime instead of hard-coding assumptions.</p>
   </div>
 </section>
 
@@ -405,8 +406,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Workstation, multi-agent, multi-namespace.</h2>
 <pre><code># Run as a long-lived HTTP daemon on the workstation
 ai-memory --db /var/lib/ai-memory/store.db serve \
-  --bind 127.0.0.1:9077 \
-  --tier semantic
+  --host 127.0.0.1 --port 9077
 
 # Each agent is a separate MCP client (or HTTP client) pointing at the same store.
 # MCP is stdio JSON-RPC, not an HTTP endpoint — spawn ai-memory mcp directly.
@@ -427,7 +427,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
 
 # Agents pass as_agent=agents/&lt;role&gt; on every recall
 # Per-namespace policies set once, enforced forever:
-ai-memory namespace set-standard agents/secops \
+ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-memory-uuid&gt; \
   --governance '{"write":"approve","delete":"approve"}'</code></pre>
   </div>
 </section>
@@ -438,8 +438,8 @@ ai-memory namespace set-standard agents/secops \
     <h2>Governance, skills, and attestations at T2.</h2>
     <ul>
       <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models/mod.rs</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
-      <li><strong>Skills</strong> — Skills register themselves as agents (<code>mcp__memory__memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
-      <li><strong>Attestations</strong> — Field-level reservation only. <code>memory_links.signature</code> (schema v15 column) is now POPULATED at v0.7.0 with Ed25519 per-link attestation — see <code>src/signed_events.rs</code> + the V-4 cross-row hash chain at schema v34. Peers verify signatures on receive.</li>
+      <li><strong>Skills</strong> — Skills register themselves as agents (<code>memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
+      <li><strong>Attestations</strong> — <code>memory_links.signature</code> (reserved as a schema v15 column at v0.6.3) is POPULATED at v0.7.0 with Ed25519 per-link attestation — see <code>src/signed_events.rs</code> + the V-4 cross-row hash chain at schema v34. Peers verify signatures on receive.</li>
     </ul>
   </div>
 </section>

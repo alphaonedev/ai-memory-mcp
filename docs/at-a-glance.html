@@ -908,12 +908,12 @@ footer.site-foot a { color: var(--text-muted); }
      ============================================================= -->
 <div class="stats-strip">
   <div class="container" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1.5rem;">
-    <div class="stat-item"><span class="stat-num">73</span><span class="stat-label">MCP tools (--profile full)</span></div>
+    <div class="stat-item"><span class="stat-num">74</span><span class="stat-label">MCP tools (--profile full)</span></div>
     <div class="stat-item"><span class="stat-num">88</span><span class="stat-label">HTTP routes (74 unique paths)</span></div>
     <div class="stat-item"><span class="stat-num">79</span><span class="stat-label">CLI commands</span></div>
     <div class="stat-item"><span class="stat-num">5</span><span class="stat-label">Platforms (macOS·Linux·Windows·iOS·Android)</span></div>
     <div class="stat-item"><span class="stat-num">15+</span><span class="stat-label">LLM vendors (Ollama + cloud)</span></div>
-    <div class="stat-item"><span class="stat-num">v53</span><span class="stat-label">Schema version (v0.7.0)</span></div>
+    <div class="stat-item"><span class="stat-num">v55</span><span class="stat-label">Schema version (v0.7.0)</span></div>
     <div class="stat-item"><span class="stat-num">10/10</span><span class="stat-label"><a href="compliance/nsa-csi-mcp.html">NSA CSI MCP concerns</a> structurally addressed</span></div>
   </div>
 </div>
@@ -1104,7 +1104,7 @@ footer.site-foot a { color: var(--text-muted); }
         <rect class="stage-box" x="10"   y="80"  width="160" height="60" rx="8"/>
         <text class="stage-text" x="90"  y="105" text-anchor="middle">memory_store</text>
         <text class="stage-label" x="90" y="125" text-anchor="middle">CREATED</text>
-        <text x="90" y="160" fill="#999" font-size="11" text-anchor="middle">tier=short</text>
+        <text x="90" y="160" fill="#999" font-size="11" text-anchor="middle">tier=mid (default)</text>
         <text x="90" y="173" fill="#666" font-size="10" text-anchor="middle">access_count=0</text>
       </g>
 
@@ -1120,8 +1120,8 @@ footer.site-foot a { color: var(--text-muted); }
         <rect class="stage-box" x="390" y="80"  width="160" height="60" rx="8" stroke="#ffb86b"/>
         <text class="stage-text" x="470" y="105" text-anchor="middle" fill="#ffb86b">auto_promote</text>
         <text class="stage-label" x="470" y="125" text-anchor="middle">PROMOTED</text>
-        <text x="470" y="160" fill="#999" font-size="11" text-anchor="middle">tier: short → mid</text>
-        <text x="470" y="173" fill="#666" font-size="10" text-anchor="middle">5 accesses + recent</text>
+        <text x="470" y="160" fill="#999" font-size="11" text-anchor="middle">tier: mid → long</text>
+        <text x="470" y="173" fill="#666" font-size="10" text-anchor="middle">at 5 accesses</text>
       </g>
 
       <g>
@@ -1196,7 +1196,7 @@ footer.site-foot a { color: var(--text-muted); }
     </svg>
 
     <div class="callout">
-      <strong>Reversibility is the rule, not the exception.</strong> Every destructive operation has an undo path. Archive instead of delete. Supersede instead of overwrite. The only hard delete is <code>memory_archive_purge --older-than-days &lt;N&gt;</code>, and that fires governance approval.
+      <strong>Reversibility is the rule, not the exception.</strong> Every destructive operation has an undo path. Archive instead of delete. Supersede instead of overwrite. The only hard delete is <code>memory_archive_purge</code> (CLI: <code>ai-memory archive purge --older-than-days &lt;N&gt;</code>) — scoped by the <code>older_than_days</code> safety knob and audit-logged.
     </div>
   </div>
 </section>
@@ -1569,7 +1569,7 @@ footer.site-foot a { color: var(--text-muted); }
 <section id="roadmap">
   <div class="container">
     <span class="eyebrow">Roadmap</span>
-    <h2>From v0.6.3 today to v1.0 federation maturity.</h2>
+    <h2>From v0.7.0 today to v1.0 federation maturity.</h2>
     <p class="lede">
       Public release sequence. Each release ships one demoable headline plus operational substrate the next release builds on. No version skipping. No quiet feature drift. <a href="https://github.com/alphaonedev/ai-memory-mcp-dev/blob/develop/ROADMAP.md" style="color:var(--pillar-1)">Public ROADMAP.md →</a>
     </p>
@@ -1789,17 +1789,17 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">MCP tools</div>
-        <div class="dash-num">73</div>
+        <div class="dash-num">74</div>
         <div class="dash-sub">--profile full (7 core / 74 full) · Claude / Cursor / Codex / Continue</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">HTTP routes</div>
-        <div class="dash-num">87</div>
+        <div class="dash-num">88</div>
         <div class="dash-sub">88 production .route(…) bindings · 74 unique URL paths · REST + SSE + mTLS + HMAC-signed webhooks</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">CLI commands</div>
-        <div class="dash-num">58</div>
+        <div class="dash-num">79</div>
         <div class="dash-sub">store, recall, sync, config migrate, doctor, ...</div>
       </div>
       <div class="dash-tile p3">
@@ -1819,8 +1819,8 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile">
         <div class="dash-label">main.rs lines</div>
-        <div class="dash-num">75</div>
-        <div class="dash-sub">down from 4,511 · 98.3% reduction</div>
+        <div class="dash-num">218</div>
+        <div class="dash-sub">down from 4,511 · ~95% reduction (W6 thin-shim refactor)</div>
       </div>
       <div class="dash-tile">
         <div class="dash-label">Modules at 100%</div>
@@ -1904,7 +1904,7 @@ footer.site-foot a { color: var(--text-muted); }
         <p style="color:var(--text-muted); margin-bottom:.75rem">
           AI mandates are real. Cloud bans are real. Foreign-vendor concerns are real. <strong>An OSS Rust binary that runs entirely on your hardware, requires zero outbound traffic, and ships with auditable source code is the only AI-memory primitive that works for federal, state, local, and municipal deployments.</strong>
         </p>
-        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.6.3 already runs air-gapped with no compromise.</p>
+        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.7.0 already runs air-gapped with no compromise.</p>
       </div>
     </div>
   </div>
@@ -1960,7 +1960,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ EVERY AI HOST</div>
           <div class="card-title">Integrations</div>
-          <p class="card-body">13 AI clients tested with one-block setup snippets each. Claude · ChatGPT · Cursor · Windsurf · Continue · Codex · Gemini · Grok · OpenClaw · Hermes · Llama.</p>
+          <p class="card-body">14 AI clients tested with one-block setup snippets each. Claude · ChatGPT · Cursor · Windsurf · Continue · Codex · Gemini · Grok · OpenClaw · Hermes · Llama.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">integrations.html →</div>
         </div>
       </a>
@@ -2120,7 +2120,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ RUST TYPE REFERENCE</div>
           <div class="card-title">Types</div>
-          <p class="card-body">Every public struct and enum from <code>src/models/</code>. 5 enums, 22 structs, 5 consts. Field-level types, defaults, serde tags. The wire-format contract.</p>
+          <p class="card-body">Every public struct and enum from <code>src/models/</code>. 16 enums, 50 structs at v0.7.0. Field-level types, defaults, serde tags. The wire-format contract.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">types.html →</div>
         </div>
       </a>
@@ -2129,7 +2129,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p3" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ INPUT-CHECK ATLAS</div>
           <div class="card-title">Validators</div>
-          <p class="card-body">23 validate_* functions, every limit explicit, every closed set enumerated. Defense in depth — same checks on HTTP, MCP, CLI, federation receive.</p>
+          <p class="card-body">42 validate_* functions, every limit explicit, every closed set enumerated. Defense in depth — same checks on HTTP, MCP, CLI, federation receive.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">validators.html →</div>
         </div>
       </a>
@@ -2147,7 +2147,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ OBSERVABILITY ATLAS</div>
           <div class="card-title">Tracing</div>
-          <p class="card-body">176 log call sites across 11 modules. Setup, level taxonomy, canonical phrases AI clients can grep for. Incident-review recipes.</p>
+          <p class="card-body">600+ tracing call sites across the codebase. Setup, level taxonomy, canonical phrases AI clients can grep for (incl. the #1562 <code>store::postgres</code> targets). Incident-review recipes.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">tracing.html →</div>
         </div>
       </a>

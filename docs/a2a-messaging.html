@@ -202,23 +202,23 @@ footer a{color:var(--text-muted)}
   <span class="key">"tier"</span>:            <span class="val">"short"</span>            <span class="cm">// expires in 6h by default — match urgency</span>
 }
 
-<span class="ok">→ {"notification_id": "550e8400-…", "delivered_to": "alphaone/eng/platform/team-a/bob"}</span></div>
+<span class="ok">→ {"id": "550e8400-…", "from": "…", "to": "alphaone/eng/platform/team-a/bob",
+   "namespace": "…", "tier": "short", "delivered_at": "…"}</span></div>
     </div>
 
     <div class="tool notify">
       <div class="tool-head"><span class="tool-name">memory_inbox</span><span class="tool-tag">since v0.6.0</span></div>
-      <div class="tool-desc">Recipient drains their inbox. Returns unread notifications, optionally marks them read. Filter by since/tier/priority for triage workflows.</div>
+      <div class="tool-desc">Recipient drains their inbox. Returns messages sent via <code>memory_notify</code> — <code>access_count == 0</code> is the unread marker. Filter with <code>unread_only</code> and cap with <code>limit</code> (default 50, max 500).</div>
       <div class="snip"><span class="cm">// MCP — memory_inbox</span>
 {
-  <span class="key">"as_agent"</span>:        <span class="val">"alphaone/eng/platform/team-a/bob"</span>,
+  <span class="key">"agent_id"</span>:        <span class="val">"alphaone/eng/platform/team-a/bob"</span>,    <span class="cm">// optional · defaults to caller</span>
   <span class="key">"unread_only"</span>:     <span class="ok">true</span>,
-  <span class="key">"limit"</span>:           <span class="num">50</span>,
-  <span class="key">"min_priority"</span>:    <span class="num">5</span>,
-  <span class="key">"mark_read"</span>:       <span class="ok">true</span>          <span class="cm">// optional · auto-mark on read</span>
+  <span class="key">"limit"</span>:           <span class="num">50</span>
 }
 
-<span class="ok">→ {"notifications": [{"id": "…", "from": "…", "title": "OKR review — your input needed",
-                       "payload": "…", "priority": 7, "received_at": "…"}, …], "count": 3}</span></div>
+<span class="ok">→ {"messages": [{"id": "…", "from": "…", "title": "OKR review — your input needed",
+                  "payload": "…", "priority": 7, "tier": "short", "created_at": "…",
+                  "read": false, "access_count": 0}, …], "count": 3, "unread_only": true}</span></div>
     </div>
   </div>
 </section>
@@ -267,12 +267,13 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4e5f6…</span>
   <span class="key">"event"</span>:        <span class="val">"memory_store"</span>,
   <span class="key">"memory_id"</span>:    <span class="val">"550e8400-…"</span>,
   <span class="key">"namespace"</span>:    <span class="val">"alphaone/eng/platform"</span>,
-  <span class="key">"tier"</span>:         <span class="val">"mid"</span>,
   <span class="key">"agent_id"</span>:     <span class="val">"alphaone/eng/platform/alice"</span>,
-  <span class="key">"timestamp"</span>:    <span class="val">"2026-04-27T05:30:00Z"</span>
+  <span class="key">"delivered_at"</span>: <span class="val">"2026-04-27T05:30:00Z"</span>,
+  <span class="key">"correlation_id"</span>: <span class="val">"0190…-uuidv7"</span>
 }
 
-<span class="cm">// Receiver verifies: HMAC-SHA256(secret, "{timestamp}.{rawBody}") == signature</span></div>
+<span class="cm">// Receiver verifies: HMAC-SHA256(SHA256(secret), "{timestamp}.{rawBody}") == signature
+// — the HMAC key is the SHA-256 hash of the plaintext secret (the stored form).</span></div>
   </div>
 </section>
 
@@ -364,7 +365,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4e5f6…</span>
 </section>
 
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · A2A flows in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/src/handlers/">src/handlers/</a> (notify/inbox) + <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/subscriptions.rs">subscriptions.rs</a> (webhooks)</p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · A2A flows in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/">src/handlers/</a> (notify/inbox) + <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/subscriptions.rs">subscriptions.rs</a> (webhooks)</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="data-flow.html">Data flow</a> · <a href="encryption.html">Encryption</a></p>
 </footer>
 

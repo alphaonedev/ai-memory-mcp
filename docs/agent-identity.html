@@ -263,7 +263,7 @@ ai-memory search --agent-id alice "deploy"
 {"name": "memory_search", "arguments": {"query": "deploy", "agent_id": "alice"}}
 
 # HTTP
-curl 'http://127.0.0.1:9077/api/v1/memories?agent_id=alice&query=deploy'</code></pre>
+curl 'http://127.0.0.1:9077/api/v1/search?q=deploy&agent_id=alice'</code></pre>
   </div>
 </section>
 
@@ -291,7 +291,7 @@ curl 'http://127.0.0.1:9077/api/v1/memories?agent_id=alice&query=deploy'</code><
     <h2>Scrub the leaky default.</h2>
     <p>The fallback <code>host:&lt;hostname&gt;:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> exposes hostname and PID. <strong>When writing memories to a shared or upstream database, set an opaque <code>--agent-id</code> or <code>AI_MEMORY_AGENT_ID</code>.</strong> Tracking issue: #198.</p>
 <pre><code># Production daemon — opaque identity
-AI_MEMORY_AGENT_ID=fleet-prod-9 ai-memory serve --bind 0.0.0.0:9077
+AI_MEMORY_AGENT_ID=fleet-prod-9 ai-memory serve --host 0.0.0.0 --port 9077
 
 # Or per-CLI-call
 ai-memory --agent-id alice store -T "Auth flow notes" -c "..."</code></pre>

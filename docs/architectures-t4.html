@@ -172,7 +172,7 @@ table tr:last-child td{border-bottom:none}
   <span class="cap-badge cap-today">CORE TODAY · v0.7.0</span>
   <span class="cap-badge cap-today">PG+pgvector + Apache AGE · v0.7.0 SHIPPED</span>
   <h1>Tier 4 — Data-center swarm</h1>
-  <p class="tagline">Hundreds of nodes. Thousands of agents. Multiple racks. <strong>One coherent memory fabric.</strong> The core fabric ships in v0.6.3; the piece still maturing toward GA at this scale is the shared distributed store (Postgres + pgvector).</p>
+  <p class="tagline">Hundreds of nodes. Thousands of agents. Multiple racks. <strong>One coherent memory fabric.</strong> The core fabric shipped at v0.6.3; the shared distributed store (Postgres + pgvector + Apache AGE) shipped GA at v0.7.0.</p>
   <div class="pills">
     <span class="pill">100s nodes · 1000s agents</span>
     <span class="pill">multi-rack</span>
@@ -183,7 +183,7 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <p>The core fabric ships in v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The piece still maturing toward GA at this scale is the <strong>shared distributed store</strong> (Postgres + pgvector, behind the <code>sal-postgres</code> Cargo feature today, SHIPPED at v0.7.0 via `--features sal-postgres`).</p>
+    <p>The core fabric shipped at v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The <strong>shared distributed store</strong> (Postgres + pgvector) SHIPPED at v0.7.0 via <code>--features sal-postgres</code>.</p>
     <p>The diagram distinguishes layers: solid edges = always-on at v0.7.0; the Postgres + Apache AGE + pgvector layer ships at v0.7.0 via `--features sal-postgres`.</p>
   </div>
 </section>
@@ -350,8 +350,8 @@ table tr:last-child td{border-bottom:none}
     <h2>Shipping today.</h2>
     <p>The big T4-relevant capability that's already wired:</p>
     <ul>
-      <li><code>src/main.rs:405-411</code> — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
-      <li><code>src/handlers/mod.rs</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
+      <li><code>src/handlers/</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
       <li>Same wiring on <code>link</code>, <code>consolidate</code>, <code>pending_decision</code>, <code>namespace_meta</code>, and the <code>clear_namespace_meta</code> path.</li>
       <li>mTLS for the outbound side via <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code>.</li>
     </ul>
@@ -365,7 +365,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Postgres + pgvector backbone.</h2>
     <p>The single-SQLite-per-node ceiling bites at T4 scale (>10⁶ memories per node, hot writers). The structural fix is a <strong>shared store</strong>.</p>
     <p><strong>Today (v0.6.x):</strong> <code>sal-postgres</code> Cargo feature flag exists; <code>sqlx</code> + <code>pgvector</code> deps wired. The Postgres adapter compiles and runs; correctness fixes shipped in v0.6.0 pre-tag (#294 SAL upsert key alignment, #295 <code>metadata.agent_id</code> immutability via <code>jsonb_set</code>, #296 tier-downgrade protection via SQL <code>tier_rank()</code>, #297 schema parity with 6 tables + generated <code>scope_idx</code> column). That work is the foundation.</p>
-    <p><strong>v0.7.0 SHIPPED:</strong> Performance maturation complete, <code>ai-memory migrate --from sqlite:// --to postgres://</code> migration tool wired, pgvector + Apache AGE recipes in <a href="migration-v0.7.0-postgres.html">docs/migration-v0.7.0-postgres.md</a>, official deployment via <code>--features sal-postgres</code>.</p>
+    <p><strong>v0.7.0 SHIPPED:</strong> Performance maturation complete, <code>ai-memory migrate --from sqlite:// --to postgres://</code> migration tool wired, pgvector + Apache AGE recipes in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/migration-v0.7.0-postgres.md">docs/migration-v0.7.0-postgres.md</a>, official deployment via <code>--features sal-postgres</code>.</p>
     <p>What the shared store unlocks at GA:</p>
     <ul>
       <li>Horizontal read scaling (Postgres read replicas).</li>
@@ -418,8 +418,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Today: quorum + mTLS allowlist.</h2>
 <pre><code># rack-a/node-2 — quorum 3-of-5 across the rack, mTLS enforced
 ai-memory --db /var/lib/ai-memory/store.db serve \
-  --bind 0.0.0.0:9077 \
-  --tier semantic \
+  --host 0.0.0.0 --port 9077 \
   --quorum-writes 3 \
   --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077,https://rack-b-2:9077,https://rack-c-1:9077 \
   --quorum-timeout-ms 1500 \
@@ -434,8 +433,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <p>v0.7.0 — same node, swap to Postgres-backed store:</p>
 <pre><code>ai-memory serve \
   --store-url postgres://ai-memory@pg-cluster.svc.cluster.local:5432/store \
-  --bind 0.0.0.0:9077 \
-  --tier semantic \
+  --host 0.0.0.0 --port 9077 \
   --quorum-writes 3 \
   --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077</code></pre>
 
@@ -450,7 +448,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <ul>
       <li><strong>Governance</strong> — Same machinery as T2/T3, just at scale. The federated control plane is the central nervous system: a single policy update on <code>org/eu/finance</code> reaches every node within seconds. Pending-action queues are visible per-rack for on-call routing.</li>
       <li><strong>Skills</strong> — Skills register as agents and get the same scope visibility. At T4, skills are typically pinned to specific racks (latency, data-residency) but their outputs (tags, contradictions, consolidations) propagate fleet-wide via <code>sync_push</code>.</li>
-      <li><strong>Attestations</strong> — v0.7 attested identity is the gating capability for trustworthy multi-tenant T4. Without it, the cluster is "trust-the-network" — operationally fine inside a controlled VPC, not fine for cross-tenant or cross-organization deployments.</li>
+      <li><strong>Attestations</strong> — v0.7.0 attested identity (#626 Layer-3 Ed25519 store-surface signatures) is the gating capability for trustworthy multi-tenant T4. Unsigned writes still land <code>attest_level = "claimed"</code> unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code> — without enforcement the cluster is "trust-the-network": operationally fine inside a controlled VPC, not fine for cross-tenant or cross-organization deployments.</li>
     </ul>
   </div>
 </section>
@@ -460,11 +458,11 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>src/main.rs:405-447</code> — quorum-write CLI surface</li>
-      <li><code>src/main.rs:230</code> — <code>--store-url postgres://...</code> URL syntax</li>
-      <li><code>src/main.rs:380-393</code> — TLS / mTLS allowlist enforcement</li>
-      <li><code>src/src/handlers/:442-454, 524-540</code> — <code>broadcast_store_quorum</code> + ack counting</li>
-      <li><code>src/replication.rs</code> (422 lines) — <code>QuorumWriter</code> + <code>AckTracker</code> (functional)</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI surface</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs::store_url</code>) — <code>--store-url postgres://...</code> URL syntax</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist enforcement</li>
+      <li><code>src/handlers/</code> + <code>src/federation/{sync,quorum}.rs</code> — <code>broadcast_store_quorum</code> + ack counting</li>
+      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code> (functional)</li>
       <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature, sqlx + pgvector deps</li>
       <li><code>CHANGELOG.md</code> — v0.6.0 pre-tag SAL fixes (#294-#297), v0.6.2 fanout bugs (#325-#327)</li>
       <li><code>docs/ADR-0001-quorum-replication.md</code> — realised design</li>

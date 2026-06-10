@@ -197,7 +197,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Working memory. Notes from <em>right now</em>. Things you'd lose if you slept on them. Auto-expires unless explicitly extended. Use for: call logs, transient observations, "remind me at 3pm," intermediate reasoning steps.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">6 × 3600s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">+1h on access</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">reset to now+1h on access</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">0</span></div>
         </div>
@@ -208,7 +208,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Episodic memory. Project context. The default tier. A week is enough for a sprint, a deal cycle, or a research thread. Auto-expires unless promoted to Long. Use for: sprint goals, customer notes, debugging sessions, draft decisions.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">7 × 86400s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">+1d on access</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">reset to now+1d on access</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">1</span></div>
         </div>
@@ -232,7 +232,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The TTL ladder</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">From hours to days to forever — three slopes.</h2>
-    <p class="lede">Each tier has its own decay slope. Short bleeds out in hours. Mid in days. Long holds. Access bumps the expiry forward by a tier-specific extend interval, so memories that matter get used and earn more time.</p>
+    <p class="lede">Each tier has its own decay slope. Short bleeds out in hours. Mid in days. Long holds. Access resets the expiry to <code>now +</code> a tier-specific extend interval (a sliding window), so memories that matter get used and earn more time.</p>
     <svg class="ladder-svg" viewBox="0 0 1180 360" xmlns="http://www.w3.org/2000/svg">
       <style>
         .axis{stroke:#3d3d3d;stroke-width:1.2}
@@ -323,7 +323,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Promotion path</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Mid → Long, the only edit that affects retention.</h2>
-    <p class="lede">A memory's tier can change. The most important transition is <code>Mid → Long</code> — the moment something stops being session context and starts being durable knowledge. ai-memory routes promotion through governance, so the right caller (or the right approver) decides what lives forever.</p>
+    <p class="lede">A memory's tier can change. The most important transition is <code>Mid → Long</code> — the moment something stops being session context and starts being durable knowledge. ai-memory routes promotion through governance, so the right caller (or the right approver) decides what lives forever. There are two paths: <strong>automatic</strong> — a Mid-tier memory auto-promotes to Long at 5 accesses (<code>PROMOTION_THRESHOLD</code> in <code>src/models/mod.rs</code>) — and <strong>explicit</strong> via <code>memory_promote</code> (jumps to Long in a single call by default; an optional <code>target_tier</code> parameter stops at Mid).</p>
     <div class="flow">
       <div class="step"><div class="t">step 1</div><div class="h">Caller submits</div><div class="b"><code>memory_promote</code> with the target id. The daemon resolves the memory's namespace.</div></div>
       <div class="step"><div class="t">step 2</div><div class="h">Governance check</div><div class="b">Pick <code>policy.promote</code> from the namespace standard. Default <code>Any</code>. Other levels: <code>Registered</code>, <code>Owner</code>, <code>Approve</code>.</div></div>
@@ -355,8 +355,8 @@ footer a{color:var(--text-muted)}
 short_ttl_secs = <span class="num">3600</span>     <span class="cm"># 1h instead of 6h</span>
 mid_ttl_secs   = <span class="num">2592000</span>  <span class="cm"># 30d instead of 7d</span>
 long_ttl_secs  = <span class="val">0</span>        <span class="cm"># 0 = no TTL (default for Long)</span>
-short_extend_secs = <span class="num">1800</span>  <span class="cm"># bump expiry 30min on access</span>
-mid_extend_secs   = <span class="num">86400</span> <span class="cm"># bump 1d on access</span></div>
+short_extend_secs = <span class="num">1800</span>  <span class="cm"># access resets expiry to now+30min</span>
+mid_extend_secs   = <span class="num">86400</span> <span class="cm"># access resets expiry to now+1d</span></div>
     <h3 style="margin-top:1.5rem">Per-namespace governance — gate the promotion</h3>
     <div class="snip"><span class="cm">// namespace standard's metadata.governance</span>
 {
@@ -374,7 +374,7 @@ mid_extend_secs   = <span class="num">86400</span> <span class="cm"># bump 1d on
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Garbage collection — automatic, observable.</h2>
     <p class="lede">When a memory's <code>expires_at</code> passes, GC sweeps it on the next cycle. Two paths: hard delete, or archive-on-GC (configurable). Archived memories are restorable; deleted ones are not. Default is archive — recoverable by design.</p>
     <div class="flow">
-      <div class="step"><div class="t">cycle</div><div class="h">memory_gc tick</div><div class="b">Periodic sweep. Walks <code>memories WHERE expires_at &lt; now()</code>. Default cadence configurable; can also be invoked on-demand via the MCP <code>memory_gc</code> tool.</div></div>
+      <div class="step"><div class="t">cycle</div><div class="h">memory_gc tick</div><div class="b">Periodic sweep. Walks <code>memories WHERE expires_at &lt; now()</code>. The daemon's background loop runs every 30 minutes (<code>GC_INTERVAL_SECS</code>); can also be invoked on-demand via the MCP <code>memory_gc</code> tool.</div></div>
       <div class="step"><div class="t">option A</div><div class="h">archive_on_gc=true (default)</div><div class="b">Row moves to <code>archived_memories</code> with full metadata. Restorable via <code>memory_archive_restore</code>. Purge-able via <code>memory_archive_purge</code> when you really want it gone.</div></div>
       <div class="step"><div class="t">option B</div><div class="h">archive_on_gc=false</div><div class="b">Hard delete. Row removed from <code>memories</code>. FTS index updated. HNSW vector evicted. Federation fanout deletes peer copies.</div></div>
       <div class="step"><div class="t">forever</div><div class="h">Long tier untouched</div><div class="b">No <code>expires_at</code> means GC's WHERE clause never matches. Long memories survive every sweep until something else (delete, forget, archive) touches them.</div></div>

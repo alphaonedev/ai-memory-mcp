@@ -204,13 +204,13 @@ footer a{color:var(--text-muted)}
           <td class="form-id">Form 5</td>
           <td>Auto-confidence + shadow-mode calibration + freshness decay</td>
           <td class="verdict opt-in">OPT-IN</td>
-          <td>Per-namespace <code>shadow_mode</code> policy + curator daemon</td>
+          <td>Process env vars — <code>AI_MEMORY_AUTO_CONFIDENCE=1</code> / <code>AI_MEMORY_CONFIDENCE_SHADOW=1</code> / <code>AI_MEMORY_CONFIDENCE_DECAY=1</code> — + curator daemon</td>
         </tr>
         <tr>
           <td class="form-id">Form 6</td>
           <td>MemoryKind vocabulary (Concept / Entity / Claim / Relation / Event / Conversation / Decision / Observation / Reflection / Persona)</td>
           <td class="verdict opt-in">OPT-IN</td>
-          <td>Per-namespace <code>auto_classify</code> policy + curator backfills</td>
+          <td>Per-namespace <code>auto_classify_kind</code> policy (<code>"regex_then_llm"</code> / <code>"regex_only"</code>) + curator backfills</td>
         </tr>
         <tr>
           <td class="form-id">7th</td>
@@ -239,7 +239,7 @@ footer a{color:var(--text-muted)}
       <div class="card optin">
         <div class="lbl">step 5 + 7</div>
         <h3 style="color:var(--warn)">Forms 5 + 6</h3>
-        <p>Form 5 freshness decay + shadow-mode and Form 6 auto-classify are per-namespace policies + curator daemon. Default off so operators choose the LLM-call surface.</p>
+        <p>Form 5 freshness decay + shadow-mode are process env vars on the MCP server + curator daemon; Form 6 auto-classify is a per-namespace policy. Default off so operators choose the LLM-call surface.</p>
       </div>
       <div class="card gov">
         <div class="lbl">steps 1–4</div>
@@ -259,21 +259,15 @@ footer a{color:var(--text-muted)}
 export AI_MEMORY_DB=~/.claude/ai-memory.db</div>
 
     <div class="warn-box">
-      <strong>Known wart in v0.7.0</strong>
-      <code>ai-memory rules keygen</code> writes the operator key to <code>&lt;config-dir&gt;/operator.key</code>, but <code>ai-memory rules enable</code> looks in <code>&lt;config-dir&gt;/keys/operator.key</code>. Step 1 below includes the one-line workaround. Fix is tracked in the follow-up wart issue cross-linked at the bottom of this page.
+      <strong>Resolved wart (earlier v0.7.0 builds)</strong>
+      <code>ai-memory rules keygen</code> wrote the operator key to <code>&lt;config-dir&gt;/operator.key</code> while the mutation verbs only looked under <code>&lt;config-dir&gt;/keys/</code>. <strong>Fixed</strong> (#800 Gap #6 / #822): <code>load_operator_signing_key_from_dir</code> now resolves the key across all three layouts (legacy <code>keys/operator.priv</code>+<code>.pub</code>, staged <code>keys/operator.key</code>+<code>.pub</code>, and the parent-dir singleton keygen writes). No <code>mv</code> workaround is needed.
     </div>
 
     <div class="step">
       <span class="num">Step 1 — Operator keypair</span>
       <h3>Generate the Ed25519 keypair that signs rule mutations.</h3>
       <p>Without it, <code>rules enable / disable / remove / add</code> all refuse with <code>governance.no_operator_key</code>. Read-only verbs (<code>list</code>, <code>check</code>) work unsigned.</p>
-      <div class="snip">ai-memory rules keygen
-
-<span class="cm"># Workaround for the path-mismatch wart (macOS):</span>
-KEYDIR="$HOME/Library/Application Support/ai-memory/keys"
-mv "$(dirname "$KEYDIR")/operator.key"     "$KEYDIR/operator.key"
-mv "$(dirname "$KEYDIR")/operator.key.pub" "$KEYDIR/operator.key.pub"
-<span class="cm"># Linux: KEYDIR="$HOME/.config/ai-memory/keys" — same dance</span></div>
+      <div class="snip">ai-memory rules keygen</div>
     </div>
 
     <div class="step">
@@ -341,31 +335,25 @@ ai-memory curator --daemon \
     </div>
 
     <div class="step">
-      <span class="num">Step 7 — Per-namespace Form 5 + 6 policies</span>
-      <h3>Flip <code>shadow_mode</code>, <code>auto_classify</code>, <code>freshness_decay</code> per namespace.</h3>
-      <p>These are MCP-tool-set (<code>memory_namespace_set_standard</code>), not CLI-set. Three paths:</p>
-      <div class="snip"><span class="cm"># Option A — call memory_namespace_set_standard from any connected MCP agent:</span>
-{
-  <span class="key">"namespace"</span>: <span class="val">"main"</span>,
-  <span class="key">"shadow_mode_enabled"</span>: <span class="ok">true</span>,
-  <span class="key">"auto_classify_enabled"</span>: <span class="ok">true</span>,
-  <span class="key">"freshness_decay_enabled"</span>: <span class="ok">true</span>,
-  <span class="key">"max_reflection_depth"</span>: <span class="val">3</span>
-}
+      <span class="num">Step 7 — Form 5 env vars + per-namespace Form 2/6 policies</span>
+      <h3>Form 5 is process env vars; Forms 2 + 6 ride a namespace standard memory.</h3>
+      <p>Form 5 lives on the MCP server + curator daemon process environment. Forms 2 + 6 live in a standard memory's <code>metadata.governance</code>, bound via <code>memory_namespace_set_standard</code> (MCP) or <code>ai-memory namespace set-standard</code> (CLI):</p>
+      <div class="snip"><span class="cm"># Form 5 — set on BOTH the MCP server invocation and the curator daemon:</span>
+export AI_MEMORY_AUTO_CONFIDENCE=<span class="num">1</span>
+export AI_MEMORY_CONFIDENCE_SHADOW=<span class="num">1</span>
+export AI_MEMORY_CONFIDENCE_DECAY=<span class="num">1</span>
 
-<span class="cm"># Option B — POST to the HTTP daemon (ai-memory serve):</span>
-curl -X POST "http://localhost:9077/api/v1/namespaces/main/standard" \
-  -H 'Content-Type: application/json' \
-  -d '{"shadow_mode_enabled":true,"auto_classify_enabled":true,
-       "freshness_decay_enabled":true,"max_reflection_depth":3}'
+<span class="cm"># Forms 2 + 6 — Option A: MCP. 1) memory_store a standard memory whose
+# metadata.governance carries the policy; 2) bind it:</span>
+{ <span class="key">"namespace"</span>: <span class="val">"main"</span>, <span class="key">"id"</span>: <span class="val">"&lt;standard-memory-uuid&gt;"</span> }   <span class="cm">// memory_namespace_set_standard</span>
+<span class="cm"># governance keys: auto_atomise, auto_atomise_mode ("synchronous"),
+#   auto_atomise_threshold_cl100k, auto_atomise_max_atom_tokens,
+#   auto_classify_kind ("regex_then_llm" | "regex_only"), max_reflection_depth</span>
 
-<span class="cm"># Option C — SQL direct (last resort, sidesteps validation):</span>
-sqlite3 "$AI_MEMORY_DB" &lt;&lt;'SQL'
-INSERT OR REPLACE INTO namespace_standards
-  (namespace, shadow_mode_enabled, auto_classify_enabled,
-   freshness_decay_enabled, max_reflection_depth, updated_at)
-VALUES ('main', 1, 1, 1, 3, strftime('%s','now'));
-SQL</div>
+<span class="cm"># Option B — CLI, merging the governance JSON in the same bind:</span>
+ai-memory namespace set-standard --namespace main --id &lt;standard-memory-uuid&gt; \
+  --governance '{"auto_atomise":true,"auto_atomise_mode":"synchronous",
+                 "auto_classify_kind":"regex_then_llm","max_reflection_depth":3}'</div>
     </div>
   </div>
 </section>
@@ -388,9 +376,9 @@ ai-memory rules check --kind filesystem_write \
 <span class="cm"># Expect: {"decision":"refuse","rule_id":"R001"}</span>
 
 <span class="cm"># 4. Namespace standards populated</span>
-sqlite3 "$AI_MEMORY_DB" "SELECT namespace, shadow_mode_enabled, \
-  auto_classify_enabled, freshness_decay_enabled FROM namespace_standards;"
-<span class="cm"># Expect: a row per Batman-active namespace, all flags = 1</span></div>
+ai-memory namespace get-standard --namespace main --json
+<span class="cm"># Expect: the bound standard memory whose metadata.governance carries
+#   auto_atomise / auto_classify_kind / max_reflection_depth</span></div>
   </div>
 </section>
 
@@ -433,9 +421,9 @@ for r in R001 R002 R003 R004; do
   ai-memory rules disable --id "$r" --sign
 done
 
-<span class="cm"># (Optional) Flip namespace policies off</span>
-sqlite3 "$AI_MEMORY_DB" "UPDATE namespace_standards SET \
-  shadow_mode_enabled=0, auto_classify_enabled=0, freshness_decay_enabled=0;"</div>
+<span class="cm"># (Optional) Drop the namespace policy binding + unset the Form 5 env vars</span>
+ai-memory namespace clear-standard --namespace main
+unset AI_MEMORY_AUTO_CONFIDENCE AI_MEMORY_CONFIDENCE_SHADOW AI_MEMORY_CONFIDENCE_DECAY</div>
     <p style="margin-top:1rem;font-size:.9rem">The operator key on disk is left alone — keep it, rotate it via a fresh <code>ai-memory rules keygen</code> if you suspect compromise, or <code>rm</code> it if you genuinely want to retire the operator role on this node. Disabled rules remain in the database with signatures intact; <code>enable</code> flips them back on without re-signing.</p>
   </div>
 </section>

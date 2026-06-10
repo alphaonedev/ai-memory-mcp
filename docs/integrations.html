@@ -158,7 +158,7 @@ footer a{color:var(--text-muted)}
   <h1>Every AI. Every IDE.</h1>
   <p class="tagline">ai-memory speaks MCP — the open Model Context Protocol. Any compliant host autodiscovers all 74 tools at <code>--profile full</code> (7 at the default <code>--profile core</code>). <strong>Plug in once, share memory across every AI you use.</strong></p>
   <div class="pill-row">
-    <span class="pill">13 clients tested</span>
+    <span class="pill">14 clients tested</span>
     <span class="pill">3 tiers (first-class · supported · works-with-MCP)</span>
     <span class="pill">All MCP-compliant hosts work</span>
   </div>
@@ -167,14 +167,14 @@ footer a{color:var(--text-muted)}
 <section>
   <div class="container">
     <span class="eyebrow">Tested · Verified</span>
-    <h2>13 AI clients in production use.</h2>
+    <h2>14 AI clients in production use.</h2>
     <p class="lede">Each card below shows the exact setup snippet for that client. Tier 1 (cyan) means tested every release with deep integration. Tier 2 (orange) means tested release-cycle. Tier 3 (purple) means works-via-MCP-spec but not formally tested per-release.</p>
 
     <div class="summary-grid">
       <div class="summary-tile"><div class="num" style="color:var(--p1)">3</div><div class="lab">Tier 1 · first-class</div></div>
-      <div class="summary-tile"><div class="num" style="color:var(--p2)">7</div><div class="lab">Tier 2 · supported</div></div>
+      <div class="summary-tile"><div class="num" style="color:var(--p2)">8</div><div class="lab">Tier 2 · supported</div></div>
       <div class="summary-tile"><div class="num" style="color:var(--p3)">3</div><div class="lab">Tier 3 · works-via-MCP</div></div>
-      <div class="summary-tile"><div class="num">43</div><div class="lab">Tools auto-discovered</div></div>
+      <div class="summary-tile"><div class="num">74</div><div class="lab">Tools auto-discovered (--profile full)</div></div>
     </div>
 
     <div class="client-grid">
@@ -218,7 +218,7 @@ footer a{color:var(--text-muted)}
   }
 }</pre>
         <div class="client-meta-row">
-          <span><span class="ok">✓</span> tool count: 73 at --profile full / 7 at --profile core (v0.7.0)</span>
+          <span><span class="ok">✓</span> tool count: 74 at --profile full / 7 at --profile core (v0.7.0)</span>
           <span><span class="ok">✓</span> envFile support</span>
         </div>
       </div>
@@ -361,7 +361,7 @@ memory:
             <span class="client-tier t2">▸ TIER 2 · TESTED</span>
           </div>
         </div>
-        <p class="client-desc">Direct xAI API integration via the HTTP daemon. Authorization header passes through; per-agent_id quotas enforced server-side (v0.7).</p>
+        <p class="client-desc">Direct xAI API integration via the HTTP daemon. Authorization header passes through; per-agent_id quotas enforced server-side (v0.7.0).</p>
         <pre class="client-config"><span class="cmt"># Reach the HTTP daemon directly</span>
 curl https://memory.local:9077/api/v1/recall \
   -H <span class="str">"x-api-key: $MEMORY_KEY"</span> \
@@ -442,7 +442,7 @@ r = requests.post(<span class="str">"http://localhost:9077/api/v1/recall"</span>
         <li>Host sends JSON-RPC <code>initialize</code> with protocolVersion + clientInfo</li>
         <li>ai-memory responds with capabilities + serverInfo</li>
         <li>Host sends <code>tools/list</code></li>
-        <li>ai-memory responds with all 73 tool definitions at <code>--profile full</code> (name, description, JSON Schema) — 7 at the default <code>--profile core</code></li>
+        <li>ai-memory responds with all 74 tool definitions at <code>--profile full</code> (name, description, JSON Schema) — 7 at the default <code>--profile core</code></li>
         <li>Host registers the tools with its model, presents to user as available actions</li>
         <li>User says "remember that I prefer..." → host calls <code>tools/call memory_store ...</code></li>
         <li>ai-memory does the work, returns the result</li>

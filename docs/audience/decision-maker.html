@@ -106,7 +106,7 @@ footer a{color:var(--muted)}
     <thead><tr><th>Capability</th><th>Vector DB only</th><th>ai-memory</th></tr></thead>
     <tbody>
       <tr><td>Semantic similarity search</td><td class="yes">Yes</td><td class="yes">Yes (hybrid: FTS5 + cosine)</td></tr>
-      <tr><td>Typed memory kinds</td><td class="no">No</td><td class="yes">15+ kinds, governed taxonomy</td></tr>
+      <tr><td>Typed memory kinds</td><td class="no">No</td><td class="yes">10 governed kinds (Form-6 vocabulary)</td></tr>
       <tr><td>Knowledge graph with temporal validity</td><td class="no">No</td><td class="yes">Apache AGE, <code>valid_from</code> / <code>valid_until</code></td></tr>
       <tr><td>Ed25519-signed memory links</td><td class="no">No</td><td class="yes">Per-link attest_level</td></tr>
       <tr><td>Operator-signed substrate rules</td><td class="no">No</td><td class="yes">L1&ndash;L6, key on disk</td></tr>
@@ -158,7 +158,7 @@ footer a{color:var(--muted)}
       <tr><td><strong>2. CPU-only cloud VPS</strong></td><td>Any $5/mo VPS (Linode, Hetzner, DigitalOcean droplet)</td><td>1 vCPU / 1 GB / none</td><td>Cloud LLM only (no local inference floor)</td><td>~$5/mo host + LLM-metered</td></tr>
       <tr><td><strong>3. CPU-only container (Plan C)</strong></td><td>GHCR Docker image, K8s, ECS, Cloud Run</td><td>1 vCPU / 512 MB / none</td><td>Cloud LLM (env-injected)</td><td>Container-metered + LLM-metered</td></tr>
       <tr><td><strong>4. CPU-only sidecar (in-pod)</strong></td><td>Sidecar to an existing app pod</td><td>0.25 vCPU / 256 MB / none</td><td>Cloud LLM via vendor API</td><td>Negligible host + LLM-metered</td></tr>
-      <tr><td><strong>5. GPU workstation</strong></td><td>Dev box with NVIDIA / Apple-Silicon NPU</td><td>4 core / 8 GB / 8 GB VRAM</td><td>Local Ollama (gemma3:e4b, llama3, qwen3)</td><td>$0 marginal once hardware owned</td></tr>
+      <tr><td><strong>5. GPU workstation</strong></td><td>Dev box with NVIDIA / Apple-Silicon NPU</td><td>4 core / 8 GB / 8 GB VRAM</td><td>Local Ollama (gemma3:4b, llama3, qwen3)</td><td>$0 marginal once hardware owned</td></tr>
       <tr><td><strong>6. GPU server (single-node)</strong></td><td>Bare-metal or cloud GPU instance</td><td>8 core / 32 GB / 24 GB VRAM</td><td>Local vLLM / Ollama / llama.cpp-server (OpenAI-compatible)</td><td>$0.5-3/hr GPU instance</td></tr>
       <tr><td><strong>7. Private DC vLLM cluster</strong></td><td>On-prem K8s + vLLM autoscaler</td><td>Cluster-scale</td><td>Self-hosted vLLM (OpenAI-compatible endpoint)</td><td>Capex + power; no per-token fees</td></tr>
       <tr><td><strong>8. Multi-region federation (T4-T5)</strong></td><td>Multi-region quorum sync, per-region LLM choice</td><td>3+ nodes</td><td>Mixed: each region picks Ollama / cloud / vLLM independently</td><td>Region-aggregated</td></tr>
@@ -175,7 +175,7 @@ footer a{color:var(--muted)}
   <div class="timeline">
     <div class="tl-item">
       <div class="when">v0.7.0 &mdash; attested-cortex (shipping)</div>
-      <h4>Ed25519 attestation chain + 20-event hook pipeline + Apache AGE acceleration.</h4>
+      <h4>Ed25519 attestation chain + 25-event hook pipeline + Apache AGE acceleration.</h4>
       <p>Per-agent signed events, programmable hooks, operator-signed substrate rules L1&ndash;L6, capabilities v3, real permission system. 6/6 PASS on the NHI Discovery Gate vs. live xAI Grok 4.3.</p>
     </div>
     <div class="tl-item">

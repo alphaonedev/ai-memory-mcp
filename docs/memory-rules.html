@@ -200,7 +200,7 @@ footer a{color:var(--text-muted)}
       <rect class="b l1" x="180" y="40" width="200" height="80"/>
       <text class="h" x="280" y="68" text-anchor="middle">L1 · Validation</text>
       <text class="s" x="280" y="88" text-anchor="middle">size · format · charset</text>
-      <text class="s" x="280" y="105" text-anchor="middle">23 validate_* fns</text>
+      <text class="s" x="280" y="105" text-anchor="middle">31 validate_* fns</text>
 
       <!-- Layer 2: Scope -->
       <rect class="b l2" x="180" y="135" width="200" height="80"/>
@@ -284,7 +284,7 @@ footer a{color:var(--text-muted)}
 
     <div class="layer l1">
       <div class="layer-head"><span class="layer-num">L1</span><span class="layer-name">Validation</span><span class="layer-tag">structural · per-write · always-on</span></div>
-      <div class="layer-desc">23 single-purpose validators in <code>src/validate.rs</code>. Reject malformed input before anything else runs. The same checks run on HTTP, MCP, CLI, and federation receive — there is no privileged path that bypasses them.</div>
+      <div class="layer-desc">31 single-purpose validators in <code>src/validate.rs</code>. Reject malformed input before anything else runs. The same checks run on HTTP, MCP, CLI, and federation receive — there is no privileged path that bypasses them.</div>
       <ul class="checklist">
         <li><code>validate_title</code> — non-empty, ≤512 chars, no control chars</li>
         <li><code>validate_content</code> — non-empty, ≤65 536 bytes, no control chars</li>
@@ -294,7 +294,7 @@ footer a{color:var(--text-muted)}
         <li><code>validate_confidence</code> — 0.0–1.0, finite (no NaN, no Inf)</li>
         <li><code>validate_tags</code> — ≤50 tags, ≤128 bytes each</li>
         <li><code>validate_ttl_secs</code> — positive, ≤1 year (caps "accidental immortality")</li>
-        <li><code>validate_source</code> — closed set: <code>user</code>, <code>claude</code>, <code>hook</code>, <code>api</code>, <code>cli</code>, <code>import</code>, <code>consolidation</code>, <code>system</code>, <code>chaos</code>, <code>notify</code></li>
+        <li><code>validate_source</code> — closed set: <code>user</code>, <code>nhi</code> (v0.7 vendor-neutral default), <code>claude</code> (deprecated), <code>hook</code>, <code>api</code>, <code>cli</code>, <code>import</code>, <code>consolidation</code>, <code>system</code>, <code>chaos</code>, <code>notify</code></li>
       </ul>
       <p style="margin-top:.85rem;color:var(--text-muted);font-size:.88rem"><a href="validators.html" style="color:var(--p1)">Full validators atlas →</a></p>
     </div>
@@ -323,7 +323,7 @@ footer a{color:var(--text-muted)}
 
     <div class="layer l3">
       <div class="layer-head"><span class="layer-num">L3</span><span class="layer-name">Governance — Allow / Deny / Pending</span><span class="layer-tag">write-time gate · per-action</span></div>
-      <div class="layer-desc">Three actions are gated: <code>store</code>, <code>promote</code>, <code>delete</code>. Four levels: <code>Any</code>, <code>Registered</code>, <code>Owner</code>, <code>Approve</code>. Three approver types: <code>Human</code>, <code>Agent(id)</code>, <code>Consensus(N)</code>. The default policy opens writes/promotes wide and gates deletes to owners — operators tighten as needed.</div>
+      <div class="layer-desc">Four actions are gated: <code>store</code>, <code>promote</code>, <code>delete</code>, and (v0.7.0 L1-8) <code>reflect</code>. Four levels: <code>Any</code>, <code>Registered</code>, <code>Owner</code>, <code>Approve</code>. Three approver types: <code>Human</code>, <code>Agent(id)</code>, <code>Consensus(N)</code>. The default policy opens writes/promotes wide and gates deletes to owners — operators tighten as needed (allow-on-silence, #1569: a namespace with no standard falls through to the permissive default). v0.7.0 also adds the <strong>K11 substrate rules engine</strong> (<code>src/governance/</code>, <code>governance_rules</code> table): operator-signed Ed25519 rules evaluated on agent actions, listed via the <code>memory_rule_list</code> MCP tool, and <strong>fail-CLOSED on rule-consultation errors by default</strong> (#1054; escape hatch <code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR</code>).</div>
       <div class="snip">// Default policy
 { <span class="key">"write"</span>: <span class="val">"any"</span>, <span class="key">"promote"</span>: <span class="val">"any"</span>, <span class="key">"delete"</span>: <span class="val">"owner"</span>, <span class="key">"approver"</span>: <span class="val">"human"</span> }
 

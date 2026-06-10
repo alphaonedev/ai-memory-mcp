@@ -79,7 +79,7 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// v0.7.0 ladder summary (v48 → v53):
 /// v48 added `federation_push_dlq` (#933); v49 added 14 nullable
 /// `archived_memories` columns (#1025); v50 extended `agent_quotas`
-/// PK with `namespace` (#1156); v51 added `federation_nonces` (#1255
+/// PK with `namespace` (#1156); v51 added `federation_nonce_cache` (#1255
 /// / PR #1296); v52 added `transcript_line_dedup` backing #1389
 /// L4/RFC-0001 capture_turn; v53 scoped the `memories_au` FTS5 trigger
 /// to `(title, content, tags)` only (R5.F5.2 / #1418).

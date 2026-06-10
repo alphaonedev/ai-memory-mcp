@@ -122,7 +122,7 @@ footer a:hover{color:var(--accent)}
 
 <section class="hero">
   <div class="container">
-    <span class="badge">v0.7.0 &middot; attested-cortex &middot; in flight</span>
+    <span class="badge">v0.7.0 &middot; attested-cortex &middot; release</span>
     <h1>More articulate.<br>Cryptographically attested.</h1>
     <p class="subtitle">
       ai-memory v0.7.0 closes two long-standing gaps in one release. The substrate <strong>says what it can do</strong> &mdash; capabilities v3 pre-computes the calibration strings LLMs would otherwise improvise &mdash; and <strong>signs what it remembers</strong> &mdash; per-agent Ed25519 keypairs sign every memory link, with an append-only <code>signed_events</code> audit chain. Plus the K1/G1 namespace-inheritance cutline, a programmable 25-event hook pipeline, sidechain transcripts, and an opt-in Apache AGE acceleration path.
@@ -170,14 +170,14 @@ footer a:hover{color:var(--accent)}
         <tr>
           <td><strong>B</strong> &mdash; Loader tools</td>
           <td><code>memory_load_family</code>, <code>memory_smart_load(intent)</code></td>
-          <td>Always-on, callable from any harness</td>
-          <td><span class="status partial">⚠️ partial &mdash; B-track lands progressively</span></td>
+          <td>Always-on, callable from any harness (both are in the default <code>core</code> profile)</td>
+          <td><span class="status ok">✅ shipped</span></td>
         </tr>
         <tr>
           <td><strong>C</strong> &mdash; Schema compaction</td>
-          <td><code>--profile full</code> drops to &le;3,500 input tokens</td>
+          <td>Wire-trimmed <code>tools/list</code> at <code>--profile full</code> held under a CI token ceiling (the pre-D1.6 hand-coded surface held &le;3,500 cl100k tokens; the post-D1.6 schemars surface is gated at &le;11,000 by <code>tests/token_budget_guard.rs</code>)</td>
           <td>CI-gated</td>
-          <td><span class="status partial">⚠️ partial &mdash; C-track lands progressively</span></td>
+          <td><span class="status ok">✅ shipped (ceiling revised by D1.6)</span></td>
         </tr>
         <tr>
           <td><strong>D</strong> &mdash; Per-harness positioning</td>
@@ -195,7 +195,7 @@ footer a:hover{color:var(--accent)}
           <td><strong>F</strong> &mdash; Docs + release</td>
           <td>Migration guide, RFC, this page, top-nav refresh, CHANGELOG</td>
           <td>Released alongside the binary</td>
-          <td><span class="status partial">⚠️ partial (F1, F2, F6, D2 merged; F3-F5 in flight)</span></td>
+          <td><span class="status ok">✅ shipped (release-gate docs sweep complete)</span></td>
         </tr>
         <tr>
           <td><strong>G</strong> &mdash; Hook pipeline</td>
@@ -212,20 +212,20 @@ footer a:hover{color:var(--accent)}
         <tr>
           <td><strong>I</strong> &mdash; Sidechain transcripts</td>
           <td>zstd-3 BLOB store, <code>memory_transcript_links</code>, <code>memory_replay</code>, archive&rarr;prune</td>
-          <td>Off (per-namespace TTL opt-in)</td>
-          <td><span class="status partial">⚠️ partial &mdash; I1+I2 in v0.7.0; I3-I5 spillover</span></td>
+          <td>Off (per-namespace TTL opt-in via the <code>[transcripts]</code> config block)</td>
+          <td><span class="status ok">✅ shipped (<code>memory_transcripts</code> + <code>memory_replay</code> + lifecycle sweeper)</span></td>
         </tr>
         <tr>
           <td><strong>J</strong> &mdash; Apache AGE acceleration</td>
           <td>Cypher backend on Postgres-with-AGE; recursive CTE on SQLite</td>
           <td>Auto-detected if AGE extension present; CTE fallback otherwise</td>
-          <td><span class="status future">🚧 v0.7.1+ (CTE path stays default in v0.7.0)</span></td>
+          <td><span class="status ok">✅ shipped (<code>--features sal-postgres</code>; sqlite stays on the CTE path)</span></td>
         </tr>
         <tr>
           <td><strong>K</strong> &mdash; Permissions + G1 cutline</td>
           <td>K1 namespace-inheritance enforcement (mandatory); rules + modes + hooks &rarr; decision; approval API</td>
-          <td>K1 enforces inheritance; <code>permissions.mode = "advisory"</code> preserves v0.6.4 semantics on first boot</td>
-          <td><span class="status ok">✅ K1 shipping</span> &middot; <span class="status partial">⚠️ K6-K11 partial</span></td>
+          <td>K1 enforces inheritance; the v0.7.0 secure default is <code>enforce</code> when <code>permissions.mode</code> is unconfigured (boot WARN); set <code>permissions.mode = "advisory"</code> to opt back to v0.6.4 semantics</td>
+          <td><span class="status ok">✅ shipped (incl. the K9 gate + K11 signed rules engine)</span></td>
         </tr>
       </tbody>
     </table>
@@ -244,7 +244,7 @@ footer a:hover{color:var(--accent)}
         <span class="who">👤 If you USE AI</span>
         <h3>Your AI describes its memory accurately. And signs it.</h3>
         <p class="pitch">
-          When your AI assistant (Claude, ChatGPT, Cursor, Codex, Grok, Gemini) reaches for ai-memory v0.7.0, the cortex experience now <strong>reliably arrives across LLMs</strong>. Capabilities v3 ships pre-computed <code>summary</code> and <code>to_describe_to_user</code> strings &mdash; reasoning-class LLMs converge on the same accurate first-answer descriptions instead of improvising. Hooks let your agents react to memory operations (<code>post_store</code>, <code>post_link</code>, &hellip;). And every memory link is <strong>cryptographically attested</strong> &mdash; per-agent Ed25519 keypairs, signed <code>memory_links</code>, and an append-only <code>signed_events</code> audit chain back every change. Permissions actually enforce now (was advisory-only in v0.6.x; opt into <code>enforce</code> mode).
+          When your AI assistant (Claude, ChatGPT, Cursor, Codex, Grok, Gemini) reaches for ai-memory v0.7.0, the cortex experience now <strong>reliably arrives across LLMs</strong>. Capabilities v3 ships pre-computed <code>summary</code> and <code>to_describe_to_user</code> strings &mdash; reasoning-class LLMs converge on the same accurate first-answer descriptions instead of improvising. Hooks let your agents react to memory operations (<code>post_store</code>, <code>post_link</code>, &hellip;). And every memory link is <strong>cryptographically attested</strong> &mdash; per-agent Ed25519 keypairs, signed <code>memory_links</code>, and an append-only <code>signed_events</code> audit chain back every change. Permissions actually enforce now (was advisory-only in v0.6.x; <code>enforce</code> is the v0.7.0 secure default when unconfigured).
         </p>
         <pre>brew upgrade ai-memory
 ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
@@ -260,8 +260,8 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
           <li><strong>Sidechain transcripts:</strong> zstd-3 compressed BLOBs in <code>memory_transcripts</code>, joined to memories via <code>memory_transcript_links</code>, per-namespace TTL with archive&rarr;prune lifecycle, <code>memory_replay(memory_id)</code> reconstructs the chain.</li>
           <li><strong>Apache AGE:</strong> opt-in property graph backend (Postgres only); auto-detected via <code>pg_extension</code>. SQLite installs fall back to recursive CTE. Cypher implementations of <code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code> &mdash; and the new <code>memory_find_paths(source, target, max_depth=5)</code> tool (recovers commitment R2).</li>
           <li><strong>New permission system:</strong> replaces v0.6.x advisory governance. Rules + modes (<code>enforce</code>/<code>advisory</code>/<code>off</code>) + hooks &rarr; <code>Decision</code>; deny-first semantics. Migration tool: <code>ai-memory governance migrate-to-permissions</code> (idempotent, dry-run by default).</li>
-          <li><strong>Loader tools:</strong> <code>memory_load_family(family)</code> (always-on) and <code>memory_smart_load(intent)</code> (embedding-matched) &mdash; reasoning-class LLMs find the loader of last resort on first ask. <em>(B-track lands progressively.)</em></li>
-          <li><strong>Token-budget compaction:</strong> <code>--profile full</code> drops to &le;3,500 tokens (CI-gated). <em>(C-track lands progressively.)</em></li>
+          <li><strong>Loader tools:</strong> <code>memory_load_family(family)</code> (always-on) and <code>memory_smart_load(intent)</code> (embedding-matched) &mdash; reasoning-class LLMs find the loader of last resort on first ask. Both ship in the default <code>core</code> profile.</li>
+          <li><strong>Token-budget compaction:</strong> the wire-trimmed <code>tools/list</code> at <code>--profile full</code> is CI-gated at &le;11,000 cl100k tokens post-D1.6 (<code>tests/token_budget_guard.rs</code>; the pre-D1.6 hand-coded surface held &le;3,500).</li>
         </ul>
       </div>
 
@@ -334,7 +334,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
       <div class="card violet">
         <span class="tag">Track H &middot; Ed25519 attestation</span>
         <h3>The dead column gets filled</h3>
-        <p>The <code>signature</code> column shipped in v0.6.3 finally carries real Ed25519 signatures. Per-agent keypairs at <code>~/.config/ai-memory/keys/&lt;agent_id&gt;.{pub,priv}</code> (mode 0600 / 0644). Outbound link writes sign canonical-CBOR-encoded link content. <code>attest_level</code> enum: <code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code>. Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) landed at schema v34 as part of the v33 &rarr; v55 migration ladder.</p>
+        <p>The <code>signature</code> column shipped in v0.6.3 finally carries real Ed25519 signatures. Per-agent keypairs at <code>~/.config/ai-memory/keys/&lt;agent_id&gt;.{pub,priv}</code> (mode 0600 / 0644). Outbound link writes sign canonical-CBOR-encoded link content. <code>attest_level</code> enum: <code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code> (+ <code>signed_by_peer</code> / <code>daemon_signed</code> added later in the v0.7.0 cycle via #1389 L4 + governance-audit). Append-only <code>signed_events</code> audit table with V-4 cross-row hash chain (<code>prev_hash</code> + <code>sequence</code>) landed at schema v34 as part of the v33 &rarr; v55 migration ladder.</p>
         <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.7/rfc-attested-cortex.md">RFC &sect;Why Ed25519 over X25519+ChaCha20 &rarr;</a></p>
       </div>
 
@@ -427,7 +427,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
         <tr><td>Apache AGE Cypher backend</td><td>❌</td><td>✅ opt-in (Postgres only); SQLite/CTE fallback unchanged</td></tr>
         <tr><td>Namespace policy inheritance enforcement</td><td>❌ leaf-only</td><td>✅ walks the chain (K1/G1 cutline)</td></tr>
         <tr><td>Permissions actually enforce</td><td>⚠️ advisory-only</td><td>✅ <code>enforce</code> / <code>advisory</code> / <code>off</code> modes</td></tr>
-        <tr><td>Approval API (HTTP + SSE + MCP)</td><td>❌</td><td>✅ <code>memory_approval_*</code> tools + HMAC-mandatory</td></tr>
+        <tr><td>Approval API (HTTP + SSE + MCP)</td><td>❌</td><td>✅ <code>memory_pending_*</code> tools + HMAC-mandatory webhooks</td></tr>
         <tr><td>SDK back-compat (v0.6.4 clients)</td><td>baseline</td><td>✅ preserved &mdash; v3 additive over v2</td></tr>
       </tbody>
     </table>
@@ -457,8 +457,8 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
         <tr><td><code>memory_find_paths(source, target, max_depth=5)</code></td><td>J7 (R2)</td><td>Returns paths through the knowledge graph &mdash; Cypher on AGE, recursive CTE on SQLite</td></tr>
         <tr><td><code>memory_replay(memory_id)</code></td><td>I4</td><td>Reconstructs the transcript chain for a memory by traversing <code>memory_transcript_links</code></td></tr>
         <tr><td><code>memory_verify(link_id)</code></td><td>H4</td><td>Returns <code>{signature_verified, attest_level, signed_by, signed_at}</code> for a link</td></tr>
-        <tr><td><code>memory_approval_pending</code></td><td>K10</td><td>Lists pending approval requests</td></tr>
-        <tr><td><code>memory_approval_decide(id, decision, remember=forever?)</code></td><td>K10</td><td>Decides a pending approval; <code>remember=forever</code> enables progressive trust</td></tr>
+        <tr><td><code>memory_pending_list</code></td><td>K10</td><td>Lists pending approval requests</td></tr>
+        <tr><td><code>memory_pending_approve(id)</code> / <code>memory_pending_reject(id)</code></td><td>K10</td><td>Decides a pending approval (approve replays the queued action; reject closes it)</td></tr>
       </tbody>
     </table>
   </div>
@@ -510,7 +510,7 @@ ai-memory identity generate --agent-id ai:claude-code@$(hostname)</pre>
   <div class="container">
     <span class="eyebrow">Install shortcuts (when v0.7.0 lands)</span>
     <h2>Stay on v0.6.4 today; upgrade when v0.7.0 ships</h2>
-    <p class="lede">v0.7.0 is in flight. The <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.7/V0.7-EPIC.md">epic</a> tracks remaining work. v0.6.4 install paths below remain canonical until v0.7.0 is tagged; the same channels publish v0.7.0 once F5 lands the release.</p>
+    <p class="lede">v0.7.0 is at the release gate on <code>release/v0.7.0</code> (the tag cut is operator-gated). v0.6.4 install paths below remain canonical until v0.7.0 is tagged; the same channels publish v0.7.0 at tag-cut.</p>
 
     <div class="grid-3">
       <div class="card">

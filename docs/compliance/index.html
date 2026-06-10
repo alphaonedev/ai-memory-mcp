@@ -173,11 +173,11 @@ footer a{color:var(--text-muted)}
         <div class="card">
           <div class="card-eyebrow">▸ Evidence page</div>
           <h3>Ship-gate evidence</h3>
-          <p class="card-body">6,961 test attributes; ≥92% project line coverage; performance budgets validated against PERFORMANCE.md; A2A-gate certification across four channels at 48/48 mTLS scenarios; LongMemEval-S R@5 97.8% / R@10 99.0% / R@20 99.8%.</p>
+          <p class="card-body">Final-baseline regression 15,951 / 0 off a pristine rig (reproduced at 15,952 / 0 on an independent re-run); 1,809 canonical tests (1,600 lib + 209 integration); performance budgets validated against PERFORMANCE.md; A2A-gate certification; LongMemEval-S R@5 96.4&ndash;97.8% (binary-faithful matrix; the 97.8% headline is the LLM-query-expansion shadow harness).</p>
           <div class="card-arrow">evidence.html →</div>
         </div>
       </a>
-      <a href="../../SECURITY.md" style="text-decoration:none">
+      <a href="../SECURITY.md" style="text-decoration:none">
         <div class="card">
           <div class="card-eyebrow">▸ Security advisory channel</div>
           <h3>Security policy</h3>
@@ -199,25 +199,25 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="section-eyebrow">▸ Active gap-fixes in this release</span>
-    <h2>Substrate-side tightenings landing in this PR.</h2>
-    <p class="lede">During the codegraph-driven audit of issue #1153, three substrate-level gap-fix candidates were identified. These are NOT NSA CSI gaps (the mapping claims 100% structural coverage); they are substrate-side tightenings that close partial-coverage edges and consumer-default friction.</p>
+    <span class="section-eyebrow">▸ Gap-fixes shipped in this release</span>
+    <h2>Substrate-side tightenings landed in v0.7.0.</h2>
+    <p class="lede">During the codegraph-driven audit of issue #1153, three substrate-level gap-fix candidates were identified. These are NOT NSA CSI gaps (the mapping claims 100% structural coverage); they are substrate-side tightenings that close partial-coverage edges and consumer-default friction. All three have since shipped.</p>
 
     <div class="grid-2">
       <div class="card">
-        <div class="card-eyebrow">▸ #1154 · In this PR</div>
+        <div class="card-eyebrow">▸ #1154 · Shipped</div>
         <h3>Daemon serverInfo Ed25519 signing at MCP initialize</h3>
         <p class="card-body">Closes the partial-coverage edge on NSA concern (j) Tool invocation path confusion. Substrate already has <code>load_daemon_signing_key</code> at <code>src/governance/audit.rs:558</code>; #1154 threads it into the MCP initialize response so clients can TOFU-pin daemon identity on first connect.</p>
       </div>
       <div class="card">
-        <div class="card-eyebrow">▸ #1155 · In this PR</div>
+        <div class="card-eyebrow">▸ #1155 · Shipped</div>
         <h3>Accept-Provenance verbose capability negotiation</h3>
         <p class="card-body">Closes the consumer-responsibility gap on output-poisoning. HTTP <code>Accept-Provenance: verbose</code> header + MCP capability negotiation flag lets consumers opt into Form 4/5/6 provenance signals per-session without flipping the wire default (backwards-compat preserved).</p>
       </div>
       <div class="card">
-        <div class="card-eyebrow">▸ #1156 · v0.7.x follow-up</div>
+        <div class="card-eyebrow">▸ #1156 · Shipped (schema v50)</div>
         <h3>Per-namespace rate-limit dimension</h3>
-        <p class="card-body">Extends K8 quota dimension from <code>(agent_id)</code> to <code>(agent_id, namespace)</code> compound so a malicious agent operating across namespaces cannot bypass per-namespace allotments. Requires schema v50 migration; operator-authorised v0.7.x follow-up.</p>
+        <p class="card-body">Extends K8 quota dimension from <code>(agent_id)</code> to <code>(agent_id, namespace)</code> compound so a malicious agent operating across namespaces cannot bypass per-namespace allotments. Shipped at schema v50 (pre-v50 rows backfill to the <code>_global</code> sentinel namespace).</p>
       </div>
     </div>
   </div>

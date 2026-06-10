@@ -77,7 +77,7 @@ footer a{color:var(--muted)}
   <p>This essay is not anti-vector-DB. ai-memory uses one (HNSW over MiniLM embeddings, blended with FTS5 keyword score, in the recall pipeline). The argument is narrower: <strong>if all you have is similarity search, you do not have a substrate</strong>. Eight things you also need.</p>
 
   <h2><span class="num">01.</span> Typed memory_kind taxonomy</h2>
-  <p>A vector DB stores text + a vector. ai-memory stores text + a vector + a <strong>kind</strong>: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision (the Batman Form-6 vocabulary, v0.7.0). Plus an open-ended free-form kind field for project-specific taxonomies.</p>
+  <p>A vector DB stores text + a vector. ai-memory stores text + a vector + a <strong>kind</strong>: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision (the Batman Form-6 vocabulary, v0.7.0). Plus free-form tags for project-specific taxonomies.</p>
   <p>Why this matters: an agent recalling "what policies apply here" is a different query from "what did I observe last Tuesday." Without typed kinds, you smear them together and the LLM has to disambiguate every time. With typed kinds, you filter at SQL.</p>
   <div class="fact"><dt>Source of truth</dt><dd><code>src/models/memory.rs</code> &mdash; the 26-field Memory struct, kind is a first-class column</dd></div>
 
@@ -87,7 +87,7 @@ footer a{color:var(--muted)}
   <div class="fact"><dt>Source of truth</dt><dd><code>src/models/link.rs::MemoryLinkRelation</code> + <code>docs/knowledge-graph.html</code></dd></div>
 
   <h2><span class="num">03.</span> Ed25519-signed links (attest_level)</h2>
-  <p>When the autonomous tier writes a link, it signs the link with the agent's Ed25519 key. The link's <code>attest_level</code> field records the signing strength &mdash; <code>unsigned</code>, <code>signed_by_agent</code>, <code>signed_by_operator</code>. The verifier replays the signature on read; tampering breaks verification; the substrate refuses to surface a tampered edge in a high-attest query.</p>
+  <p>When the autonomous tier writes a link, it signs the link with the agent's Ed25519 key. The link's <code>attest_level</code> field records the signing strength &mdash; <code>unsigned</code>, <code>self_signed</code>, <code>peer_attested</code>, <code>signed_by_peer</code>, <code>daemon_signed</code>. The verifier replays the signature on read; tampering breaks verification; the substrate refuses to surface a tampered edge in a high-attest query.</p>
   <p>A plain vector DB has no notion of "who said this link is true and can I cryptographically verify it."</p>
 
   <h2><span class="num">04.</span> Operator-signed substrate rules (L1&ndash;L6)</h2>
@@ -96,7 +96,7 @@ footer a{color:var(--muted)}
   <div class="fact"><dt>Surface</dt><dd><code>ai-memory governance check-action</code> (CLI, #863), the governance HTTP endpoint, and the <code>memory_check_agent_action</code> MCP tool</dd></div>
 
   <h2><span class="num">05.</span> HMAC-required subscriptions + SSRF gate</h2>
-  <p>The hook pipeline fires on 20 named substrate events. External subscribers (webhooks) must register an HMAC secret at subscription time; events are POSTed with an <code>X-AI-Memory-Signature</code> header; unsigned subscriptions are refused at registration. Loopback URLs are refused unless <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code> &mdash; an SSRF gate (issue #628, H11) so a compromised agent cannot pivot to localhost services.</p>
+  <p>The hook pipeline fires on 25 named substrate events. External subscribers (webhooks) must register an HMAC secret at subscription time; events are POSTed with an <code>X-AI-Memory-Signature</code> header; unsigned subscriptions are refused at registration. Loopback URLs are refused unless <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code> &mdash; an SSRF gate (issue #628, H11) so a compromised agent cannot pivot to localhost services.</p>
 
   <h2><span class="num">06.</span> Autonomous tier (LLM consolidate / contradict / auto-tag)</h2>
   <p>When you wire in an LLM (local Ollama, OpenAI-compatible endpoint, whatever), the substrate runs:</p>

@@ -183,7 +183,7 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <p>This tier is <strong>vision territory</strong>. It is what ai-memory is being built toward. The honest framing: every primitive on every diagram below is either shipping in v0.6.3, on the v0.7 roadmap, or scoped explicitly for v1.0+ with the design documented in an ADR or roadmap doc. There is <strong>no fiction</strong> on this page — only the destination, drawn explicitly so the path is legible.</p>
+    <p>This tier is <strong>vision territory</strong>. It is what ai-memory is being built toward. The honest framing: every primitive on every diagram below is either shipped by v0.7.0, or scoped explicitly for v1.0+ with the design documented in an ADR or roadmap doc. There is <strong>no fiction</strong> on this page — only the destination, drawn explicitly so the path is legible.</p>
   </div>
 </section>
 
@@ -349,19 +349,19 @@ table tr:last-child td{border-bottom:none}
     </ul>
     <p>What's needed to reach the T5 trust model:</p>
     <ul>
-      <li>Agent keypair issuance and rotation.</li>
-      <li>Signature verification on every <code>sync_push</code> ingress — peers refuse incoming memories with bad signatures.</li>
+      <li>Agent keypair rotation (issuance shipped — Ed25519 keypairs at v0.7.0).</li>
+      <li>Per-row signature verification on every <code>sync_push</code> ingress — the push <em>envelope</em> is already verified at v0.7.0 (#791 <code>AI_MEMORY_FED_REQUIRE_SIG=1</code> default rejects missing/invalid <code>X-Memory-Sig</code>, plus #922 nonce anti-replay); per-row memory signatures across federation remain ahead.</li>
       <li>Revocation list distribution.</li>
       <li>Hardware-backed key custody for high-trust agents (TPM / Secure Enclave / Cloud KMS).</li>
     </ul>
-    <p>This is <strong>v1.0+ work</strong>. The schema reservation at v0.6.3 is the down-payment.</p>
+    <p>The remaining chain is <strong>v1.0+ work</strong>. The v0.6.3 schema reservation was the down-payment; v0.7.0 wired Ed25519 signing + envelope verification.</p>
 
     <h3>Distributed consensus for governance</h3>
     <p>At T3/T4, governance policies and pending decisions are <strong>eventually consistent</strong>. Two operators on partitioned sides of the cluster can both approve the same pending action. Last-write-wins resolves it on rejoin.</p>
     <p>At T5 — with millions of agents and cross-jurisdictional rules — that's not enough. A change to <code>org/eu/personal-data</code> policy under GDPR has to be <strong>strongly consistent</strong> before any agent in any region commits a write under the new rule. This is the use case for a Raft-class consensus log on the <strong>governance plane only</strong> (not on the memory write path — that stays eventually consistent for performance).</p>
     <p>The architectural separation:</p>
     <ul>
-      <li><strong>Memory writes</strong> — eventually consistent, quorum-bounded (v0.7 Track C).</li>
+      <li><strong>Memory writes</strong> — eventually consistent, quorum-bounded (shipped — Track C).</li>
       <li><strong>Governance writes</strong> — strongly consistent via consensus rail (v1.0+).</li>
     </ul>
     <p>Memories are append-mostly; governance is small, infrequent, and high-stakes. Different consistency models for different planes.</p>
@@ -379,7 +379,7 @@ table tr:last-child td{border-bottom:none}
     <p>What makes T5 a <strong>hive</strong> rather than just a big cluster:</p>
     <ul>
       <li><strong>Cross-region knowledge transfer</strong> — A discovery in NA can propagate (or be rejected) by every other region's policy engine within seconds.</li>
-      <li><strong>Temporal-validity KG replay</strong> — v0.6.3's <code>memory_kg_query(as_of=...)</code> plus the temporal columns (<code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>) means an agent can ask "what did the collective know at 14:23 UTC last Tuesday?" and get a deterministic answer across the fleet.</li>
+      <li><strong>Temporal-validity KG replay</strong> — v0.6.3's <code>memory_kg_query(valid_at=...)</code> plus the temporal columns (<code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>) means an agent can ask "what did the collective know at 14:23 UTC last Tuesday?" and get a deterministic answer across the fleet.</li>
       <li><strong>Point-in-time provenance</strong> — Every memory has a signed origin and a tracked validity window. A regulator's request "show me what informed this decision" returns a verifiable lineage.</li>
       <li><strong>Differential privacy on cross-tenant recall</strong> — Roadmap. The scope-visibility filter is the foundational primitive; DP noise on aggregated recalls is the v1.0+ cap.</li>
     </ul>
@@ -400,7 +400,7 @@ table tr:last-child td{border-bottom:none}
       <li><strong>Temporal-validity KG (v0.6.3)</strong> — <code>valid_from</code> / <code>valid_until</code> / <code>observed_by</code> columns on every link.</li>
       <li><strong>Capabilities introspection v2 (v0.6.3)</strong> — runtime trust assessment per node.</li>
       <li><strong>Hierarchical taxonomy (v0.6.3)</strong> — tree views over the global namespace tree.</li>
-      <li><strong><code>signature</code> column reserved (v0.6.3)</strong> — the schema down-payment for attestation.</li>
+      <li><strong><code>signature</code> column (reserved v0.6.3, populated v0.7.0)</strong> — the schema down-payment for attestation, now carrying Ed25519 per-link signatures.</li>
       <li><strong>Entity registry &amp; aliases (v0.6.3)</strong> — global entity identity, the substrate for cross-tenant identity resolution.</li>
     </ul>
   </div>
@@ -415,9 +415,9 @@ table tr:last-child td{border-bottom:none}
         <tr><th>Capability</th><th>Today</th><th>v0.7</th><th>v1.0+</th></tr>
       </thead>
       <tbody>
-        <tr><td>Quorum-write contract</td><td>—</td><td>Track C</td><td>—</td></tr>
-        <tr><td>Postgres + pgvector backbone</td><td>—</td><td>Track B</td><td>—</td></tr>
-        <tr><td>Cryptographic agent attestation</td><td>reserved</td><td>partial wiring</td><td>full chain</td></tr>
+        <tr><td>Quorum-write contract</td><td>shipped (v0.7.0)</td><td>Track C ✓</td><td>—</td></tr>
+        <tr><td>Postgres + pgvector backbone</td><td>shipped (v0.7.0, <code>sal-postgres</code>)</td><td>Track B ✓</td><td>—</td></tr>
+        <tr><td>Cryptographic agent attestation</td><td>wired (Ed25519, #626)</td><td>✓</td><td>full chain</td></tr>
         <tr><td>Distributed consensus (governance plane)</td><td>—</td><td>—</td><td>designed</td></tr>
         <tr><td>Gossip / DHT (many-node discovery)</td><td>—</td><td>—</td><td>designed</td></tr>
         <tr><td>Cross-region failover / quorum bounds</td><td>—</td><td>—</td><td>designed</td></tr>
@@ -452,7 +452,7 @@ table tr:last-child td{border-bottom:none}
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>docs/ROADMAP-ladybug.md</code> — Track A (T1/T2 polish), B (Postgres), C (quorum), D (attestation)</li>
+      <li><code>ROADMAP.md</code> — Track A (T1/T2 polish), B (Postgres), C (quorum), D (attestation)</li>
       <li><code>docs/ADR-0001-quorum-replication.md</code> — quorum write design</li>
       <li><code>docs/ARCHITECTURAL_LIMITS.md</code> — honest ceiling on every dimension</li>
       <li><code>src/models/</code> — <code>MemoryLink</code> (with v15 <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, <code>signature</code>)</li>

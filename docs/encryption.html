@@ -168,13 +168,13 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Encryption — at rest, in transit, integrity, supply chain.</h1>
-  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 at rest. mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. Signed git tags + SBOM for supply chain. <strong>What's covered, what isn't, and what's coming in v0.7.</strong></p>
+  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 at rest. mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. Signed git tags + SBOM for supply chain. <strong>What's covered, what isn't, and what v0.7.0 added (Ed25519 attested identity).</strong></p>
   <div class="pills">
     <span class="pill">SQLCipher at-rest</span>
     <span class="pill">mTLS federation</span>
     <span class="pill">HMAC-SHA256 webhooks</span>
     <span class="pill">signed tags + SBOM</span>
-    <span class="pill">v0.7: Ed25519 attested</span>
+    <span class="pill">Ed25519 attested (v0.7.0)</span>
   </div>
 </section>
 
@@ -219,13 +219,15 @@ footer a{color:var(--text-muted)}
     <div class="feature rest">
       <div class="feature-head"><span class="feature-name">PRAGMA key</span><span class="feature-tag live">live since v0.5</span></div>
       <div class="feature-desc">When the daemon opens an encrypted DB, it issues <code>PRAGMA key = '…'</code> with the operator's passphrase. SQLCipher's libsqlcipher (drop-in libsqlite3 replacement) handles AES-256-CBC of every page + PBKDF2-HMAC-SHA512 key derivation. A wrong key → loud error at startup.</div>
-      <div class="snip"><span class="cm">// from src/storage/mod.rs::open</span>
-<span class="key">conn</span>.execute_batch(<span class="val">"PRAGMA key = 'YOUR_PASSPHRASE'"</span>)
+      <div class="snip"><span class="cm">// from src/storage/connection.rs (sqlcipher build)</span>
+<span class="key">conn</span>.execute_batch(<span class="val">"PRAGMA key = '…'"</span>)
     .context(<span class="val">"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</span>)?;
 
-<span class="cm">// Operator workflow</span>
-<span class="ok">$</span> export AI_MEMORY_DB_PASSPHRASE=<span class="val">"$(cat /run/secrets/db-passphrase)"</span>
-<span class="ok">$</span> ai-memory serve --db /var/lib/ai-memory/data.sqlite
+<span class="cm">// Operator workflow — pass the passphrase by FILE (mode 0400), not env:
+// the CLI reads it once and exports AI_MEMORY_DB_PASSPHRASE for the process.</span>
+<span class="ok">$</span> chmod 0400 /run/secrets/db-passphrase
+<span class="ok">$</span> ai-memory --db-passphrase-file /run/secrets/db-passphrase \
+    serve --db /var/lib/ai-memory/data.sqlite
 
 <span class="cm">// On the wire — encrypted database file is opaque to anyone without the key.
 // Even page headers are encrypted; the file looks like noise to a forensic
@@ -269,7 +271,7 @@ sha256:111222…aaa888    <span class="cm"># node-3 backup</span>
       <div class="feature-desc">Outbound webhook URLs pass through two SSRF guards before any HTTP attempt: a URL guard (rejects non-http/https schemes, file://, data:) and a DNS guard (resolves the host, rejects loopback / RFC1918 / link-local addresses). Two SSRF defects were closed in commit <code>9eeb453</code> for v0.6.3 final.</div>
     </div>
 
-    <div class="honest"><strong>Honest assessment — what mTLS does and doesn't do</strong><p>mTLS authenticates the <em>peer node</em>, not the <em>memory author</em>. Once a peer is allowlisted, every memory it pushes is trusted. v0.7 Bucket 1 (Ed25519 attested identity) closes that gap by attaching a per-memory signature so individual memories' provenance is verifiable independent of which peer relayed them.</p></div>
+    <div class="honest"><strong>Honest assessment — what mTLS does and doesn't do</strong><p>mTLS authenticates the <em>peer node</em>, not the <em>memory author</em>. Once a peer is allowlisted, every memory it pushes is trusted at the node level. v0.7.0 (#791/#922) adds envelope-level Ed25519 push signatures + nonce anti-replay (<code>AI_MEMORY_FED_REQUIRE_SIG=1</code> / <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> secure defaults), and #626 Layer-3 verifies caller-presented per-memory signatures on the store surfaces; per-row signature verification across federation relay remains v0.8 hardening (#1464).</p></div>
   </div>
 </section>
 
@@ -285,7 +287,7 @@ sha256:111222…aaa888    <span class="cm"># node-3 backup</span>
 {
   <span class="key">"url"</span>:    <span class="val">"https://hooks.example.com/ai-memory"</span>,
   <span class="key">"secret"</span>: <span class="val">"…32+ random bytes…"</span>,            <span class="cm">// HMAC key (operator-supplied)</span>
-  <span class="key">"events"</span>: [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>]
+  <span class="key">"event_types"</span>: [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>]   <span class="cm">// #912 typed array; legacy `events` comma-list still parses</span>
 }
 
 <span class="cm">// Outbound POST to the webhook URL</span>
@@ -340,18 +342,18 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 
 <section>
   <div class="container">
-    <span class="eyebrow">v0.7 roadmap</span>
+    <span class="eyebrow">Shipped at v0.7.0</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Per-memory cryptographic identity.</h2>
-    <p class="lede">v0.6.3 ships a placeholder <code>signature</code> column on <code>memory_links</code> + a deferred <code>observed_by</code> column. v0.7 Bucket 1 fills that contract.</p>
+    <p class="lede">v0.6.3 shipped a placeholder <code>signature</code> column on <code>memory_links</code> + a deferred <code>observed_by</code> column. v0.7.0 fills that contract.</p>
 
     <div class="feature future">
-      <div class="feature-head"><span class="feature-name">Ed25519 attested identity</span><span class="feature-tag future">v0.7 Bucket 1</span></div>
-      <div class="feature-desc">Each agent gets an Ed25519 keypair. Every memory write attaches a signature over the canonical row (id + content hash + timestamp). Receivers verify the signature before accepting the memory. Cross-peer provenance becomes verifiable end-to-end — not "this peer says X authored this" but "we have a cryptographic proof X authored this."</div>
+      <div class="feature-head"><span class="feature-name">Ed25519 attested identity</span><span class="feature-tag live">SHIPPED · v0.7.0 (#626 Layer-3)</span></div>
+      <div class="feature-desc">Agents hold Ed25519 keypairs. A caller can attach a detached signature over the canonical <code>SignableWrite</code> envelope on every store surface; the daemon verifies it against the agent's bound public key and stamps <code>attest_level = "agent_attested"</code> (forged → 403). Links carry per-link signatures + <code>attest_level</code> + <code>signed_at</code>. Unsigned writes stay permitted (landing <code>claimed</code>) unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code>.</div>
     </div>
 
     <div class="feature future">
-      <div class="feature-head"><span class="feature-name">Sidechain transcripts</span><span class="feature-tag future">v0.7 Bucket 1.7</span></div>
-      <div class="feature-desc">Every governed action lands a row in a transcript table with the full payload + verdict + signature. Independent of the daemon log, queryable, and tamper-evident (each transcript row signs the previous row's hash, forming a chain).</div>
+      <div class="feature-head"><span class="feature-name">Sidechain transcripts + signed-events chain</span><span class="feature-tag live">SHIPPED · v0.7.0</span></div>
+      <div class="feature-desc">Governed actions land rows in the append-only <code>signed_events</code> audit chain with the V-4 cross-row hash chain — independent of the daemon log, queryable (<code>memory_replay</code>), and tamper-evident (each row chains the previous row's hash).</div>
     </div>
 
     <div class="feature future">
@@ -375,7 +377,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 </section>
 
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · crypto modules: <code>db.rs</code> (SQLCipher) · <code>federation.rs</code> (rustls) · <code>subscriptions.rs</code> (HMAC-SHA256) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · crypto modules: <code>src/storage/connection.rs</code> (SQLCipher) · <code>src/federation/</code> (rustls) · <code>src/subscriptions.rs</code> (HMAC-SHA256) · <code>src/identity/</code> (Ed25519) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="release-pipeline.html">Release pipeline</a> · <a href="memory-rules.html">Memory rules</a></p>
 </footer>
 

@@ -166,7 +166,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Timeline</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">A memory through time.</h2>
-    <p class="lede">An illustrative example: a memory enters at Mid tier, gets accessed twice (each access bumps the TTL), gets linked to a related memory, gets consolidated with siblings into a Long-tier retro, the original ages into the archive, and finally gets purged after a 30-day compliance window.</p>
+    <p class="lede">An illustrative example: a memory enters at Mid tier, gets accessed twice (each access resets the expiry window to <code>now + 1d</code>), gets linked to a related memory, gets consolidated with siblings into a Long-tier retro, the original ages into the archive, and finally gets purged after a 30-day compliance window.</p>
     <svg class="timeline-svg" viewBox="0 0 1180 320" xmlns="http://www.w3.org/2000/svg">
       <style>
         .axis{stroke:#3d3d3d;stroke-width:1.2}
@@ -213,7 +213,7 @@ footer a{color:var(--text-muted)}
 
       <circle class="pt t2" cx="280" cy="240" r="6"/>
       <text class="ev t2" x="280" y="220" text-anchor="middle">access</text>
-      <text class="ev t2" x="280" y="205" text-anchor="middle">expires_at += 1d</text>
+      <text class="ev t2" x="280" y="205" text-anchor="middle">expires_at = now+1d</text>
 
       <circle class="pt t3" cx="460" cy="240" r="6"/>
       <text class="ev t3" x="460" y="220" text-anchor="middle">link added</text>
@@ -266,7 +266,7 @@ footer a{color:var(--text-muted)}
 
     <div class="stage s2">
       <div class="stage-head"><span class="stage-num">stage 2</span><span class="stage-name">Active — accessed, recalled, linked</span><span class="stage-when">days 0–N · while live</span></div>
-      <div class="stage-desc">Every <code>memory_get</code>, recall hit, and search hit bumps <code>access_count</code> and <code>last_accessed_at</code>. Mid-tier memories also get their <code>expires_at</code> bumped forward by <code>mid_extend_secs</code> (default 1 day). Memories that get used earn more time. Updates (<code>memory_update</code>) preserve <code>created_at</code> but bump <code>updated_at</code>. KG edges added via <code>memory_link</code> at any time.</div>
+      <div class="stage-desc">Every <code>memory_get</code>, recall hit, and search hit bumps <code>access_count</code> and <code>last_accessed_at</code>. Mid-tier memories also get their <code>expires_at</code> <strong>reset to <code>now + mid_extend_secs</code></strong> (default 1 day; Short resets to <code>now + short_extend_secs</code>, default 1h) — a sliding-window replacement, not an additive extend. At 5 accesses (<code>PROMOTION_THRESHOLD</code>) a Mid-tier memory auto-promotes to Long. Memories that get used earn more time. Updates (<code>memory_update</code>) preserve <code>created_at</code> but bump <code>updated_at</code>. KG edges added via <code>memory_link</code> at any time.</div>
       <div class="snip">{<span class="key">"event"</span>: <span class="val">"accessed"</span>,  <span class="key">"access_count"</span>: <span class="num">3</span>, <span class="key">"last_accessed_at"</span>: <span class="val">"day 3"</span>, <span class="key">"expires_at"</span>: <span class="val">"+1d"</span>}
 {<span class="key">"event"</span>: <span class="val">"link_added"</span>, <span class="key">"relation"</span>: <span class="val">"related_to"</span>, <span class="key">"target_id"</span>: <span class="val">"…"</span>}
 {<span class="key">"event"</span>: <span class="val">"updated"</span>,   <span class="key">"updated_at"</span>: <span class="val">"day 5"</span>, <span class="key">"changes"</span>: [<span class="val">"tags"</span>, <span class="val">"priority"</span>]}</div>

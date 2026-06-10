@@ -158,10 +158,10 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The validators, every check.</h1>
-  <p class="tagline">Defense in depth at the API boundary. 23 validator functions, every limit explicit, every closed set enumerated. The same checks run on HTTP, MCP, CLI, and inbound federation sync — there is no privileged path that bypasses them.</p>
+  <p class="tagline">Defense in depth at the API boundary. 31 validator functions, every limit explicit, every closed set enumerated. The same checks run on HTTP, MCP, CLI, and inbound federation sync — there is no privileged path that bypasses them.</p>
   <div class="pills">
-    <span class="pill">23 functions</span>
-    <span class="pill">9 limits</span>
+    <span class="pill">31 functions</span>
+    <span class="pill">15 limits</span>
     <span class="pill">3 closed sets</span>
     <span class="pill">red-team #235 / #240 hardened</span>
   </div>
@@ -249,7 +249,8 @@ footer a{color:var(--text-muted)}
       <div class="v-desc">Closed-set discriminator stored on each memory. Adding a value here is a wire-format change — peers running older versions will reject the new value on sync.</div>
       <div class="v-rules"><div class="lbl">Accepted values</div><ul>
         <li><code>user</code> — human-typed</li>
-        <li><code>claude</code> — Claude Code or other Claude client</li>
+        <li><code>nhi</code> — v0.7.x (#1175) vendor-neutral substrate default for AI-NHI writes</li>
+        <li><code>claude</code> — deprecated (back-compat only; remove in v0.8.x) — Claude Code or other Claude client</li>
         <li><code>hook</code> — emitted by a Claude Code hook</li>
         <li><code>api</code> — generic HTTP API</li>
         <li><code>cli</code> — local <code>ai-memory</code> CLI</li>

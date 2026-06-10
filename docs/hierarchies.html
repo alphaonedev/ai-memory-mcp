@@ -360,17 +360,24 @@ footer a{color:var(--text-muted)}
     <span class="eyebrow">Namespace standards — inheritance</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Set policy once, inherit everywhere.</h2>
     <p class="lede">Every namespace can have a <strong>standard memory</strong> — the canonical row at that path whose <code>metadata</code> carries the per-namespace policy (governance + default scope + parent_namespace pointer). When a write hits a namespace with no standard, the resolver walks up the path until it finds one. Set the standard at <code>alphaone/eng</code> once, every sub-namespace inherits.</p>
-    <div class="snip"><span class="cm">// Set the standard at the platform group level</span>
-<span class="cm">// MCP — memory_namespace_set_standard</span>
+    <div class="snip"><span class="cm">// Set the standard at the platform group level — two steps:</span>
+<span class="cm">// 1. memory_store the standard memory whose metadata carries the policy</span>
 {
   <span class="key">"namespace"</span>: <span class="val">"alphaone/engineering/platform"</span>,
   <span class="key">"title"</span>:     <span class="val">"Platform standard"</span>,
   <span class="key">"content"</span>:   <span class="val">"Platform-wide architectural decisions and conventions."</span>,
   <span class="key">"metadata"</span>: {
     <span class="key">"governance"</span>: { <span class="key">"write"</span>: <span class="val">"registered"</span>, <span class="key">"promote"</span>: <span class="val">"approve"</span>, <span class="key">"delete"</span>: <span class="val">"owner"</span>, <span class="key">"approver"</span>: {<span class="key">"consensus"</span>: <span class="num">2</span>} },
-    <span class="key">"scope"</span>: <span class="val">"team"</span>,                              <span class="cm">// default scope for new memories under this ns</span>
-    <span class="key">"parent_namespace"</span>: <span class="val">"alphaone/engineering"</span>     <span class="cm">// explicit parent link</span>
+    <span class="key">"scope"</span>: <span class="val">"team"</span>                               <span class="cm">// default scope for new memories under this ns</span>
   }
+}
+<span class="cm">// → returns {"id": "&lt;standard-uuid&gt;"}
+
+// 2. memory_namespace_set_standard binds it (parent sets the inheritance link)</span>
+{
+  <span class="key">"namespace"</span>: <span class="val">"alphaone/engineering/platform"</span>,
+  <span class="key">"id"</span>:        <span class="val">"&lt;standard-uuid&gt;"</span>,
+  <span class="key">"parent"</span>:    <span class="val">"alphaone/engineering"</span>            <span class="cm">// explicit parent link</span>
 }
 
 <span class="cm">// Now — every write to alphaone/engineering/platform/* applies these rules.
@@ -410,7 +417,7 @@ walk to: alphaone/engineering/platform
 </section>
 
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · namespace logic in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/validate.rs">validate.rs</a> · <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/mod.rs">db.rs</a> (<code>namespace_meta</code> table) · taxonomy walker in <code>src/handlers/</code></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · namespace logic in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/validate.rs">src/validate.rs</a> · <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/mod.rs">src/storage/mod.rs</a> (<code>namespace_meta</code> table) · taxonomy walker in <code>src/handlers/</code></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="memory-rules.html">Rules</a> · <a href="knowledge-graph.html">Knowledge Graph</a></p>
 </footer>
 

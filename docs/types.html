@@ -236,17 +236,17 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     <div class="ty k-struct" id="memory">
       <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · grew to 26 fields at v0.7.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index. <strong>26 fields at v0.7.0</strong> (was 15 at v0.6.x; canonical truth in <code>src/models/memory.rs:401</code>) — adds <code>reflection_depth</code> (Task 1/8 recursive learning), <code>memory_kind</code> (Batman Form-6 vocabulary), <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact), <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance), <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 calibration), and the <code>version</code> BIGINT (Gap-1 optimistic concurrency, schema v45).</div>
+      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index. <strong>26 fields at v0.7.0</strong> (was 15 at v0.6.x; canonical truth in <code>src/models/memory.rs::Memory</code>, <code>FIELD_COUNT = 26</code>) — adds <code>reflection_depth</code> (Task 1/8 recursive learning), <code>memory_kind</code> (Batman Form-6 vocabulary), <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact), <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance), <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 calibration), and the <code>version</code> BIGINT (Gap-1 optimistic concurrency, schema v45).</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>UUIDv4 primary key.</td></tr>
         <tr><td class="fname">tier</td><td class="ftype">Tier</td><td class="fnote"><span class="flag req">REQ</span>One of <code>short</code> · <code>mid</code> · <code>long</code>.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>Hierarchical path; up to 8 segments; default <code>"global"</code>.</td></tr>
-        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–500 chars; required.</td></tr>
+        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–512 chars (<code>MAX_TITLE_LEN</code>); required.</td></tr>
         <tr><td class="fname">content</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–65 536 bytes (<code>MAX_CONTENT_SIZE</code>).</td></tr>
-        <tr><td class="fname">tags</td><td class="ftype">Vec&lt;String&gt;</td><td class="fnote"><span class="flag def">DEF</span>Default <code>[]</code>; max 32 tags, 64 chars each.</td></tr>
+        <tr><td class="fname">tags</td><td class="ftype">Vec&lt;String&gt;</td><td class="fnote"><span class="flag def">DEF</span>Default <code>[]</code>; max 50 tags (<code>MAX_TAGS_COUNT</code>), 128 bytes each (<code>MAX_TAG_LEN</code>).</td></tr>
         <tr><td class="fname">priority</td><td class="ftype">i32</td><td class="fnote"><span class="flag def">DEF</span>Default 5; range 1-10.</td></tr>
         <tr><td class="fname">confidence</td><td class="ftype">f64</td><td class="fnote"><span class="flag def">DEF</span>Default 1.0; range 0.0-1.0.</td></tr>
-        <tr><td class="fname">source</td><td class="ftype">String</td><td class="fnote"><span class="flag def">DEF</span>Default <code>"api"</code>; closed set: user · claude · hook · api · import.</td></tr>
+        <tr><td class="fname">source</td><td class="ftype">String</td><td class="fnote"><span class="flag def">DEF</span>Default <code>"api"</code>; closed set (<code>VALID_SOURCES</code>): user · nhi · claude (deprecated) · hook · api · cli · import · consolidation · system · chaos · notify.</td></tr>
         <tr><td class="fname">access_count</td><td class="ftype">i64</td><td class="fnote">Server-tracked; bumps on each <code>memory_get</code>/<code>memory_recall</code> hit.</td></tr>
         <tr><td class="fname">created_at</td><td class="ftype">String</td><td class="fnote">RFC3339; server-stamped.</td></tr>
         <tr><td class="fname">updated_at</td><td class="ftype">String</td><td class="fnote">RFC3339; updated on each <code>memory_update</code>.</td></tr>
@@ -274,8 +274,12 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">source_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
         <tr><td class="fname">target_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
-        <tr><td class="fname">relation</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code> · <code>reflects_on</code> (v0.7.0 Task 1/8 recursive learning) · <code>derives_from</code> (v0.7.0 WT-1-A atomisation atom→parent, schema v36 sqlite / v35 postgres).</td></tr>
+        <tr><td class="fname">relation</td><td class="ftype">MemoryLinkRelation</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code> · <code>reflects_on</code> (v0.7.0 Task 1/8 recursive learning) · <code>derives_from</code> (v0.7.0 WT-1-A atomisation atom→parent, schema v36 sqlite / v35 postgres).</td></tr>
         <tr><td class="fname">created_at</td><td class="ftype">String</td><td class="fnote">RFC3339; server-stamped.</td></tr>
+        <tr><td class="fname">valid_from / valid_until</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.6.3 temporal validity window; <code>valid_until = None</code> means still valid.</td></tr>
+        <tr><td class="fname">observed_by</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>agent_id of the observer; powers per-agent visibility.</td></tr>
+        <tr><td class="fname">signature</td><td class="ftype">Option&lt;Vec&lt;u8&gt;&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 H4 — Ed25519 per-link attestation bytes.</td></tr>
+        <tr><td class="fname">attest_level</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 H4 — <code>unsigned</code> · <code>self_signed</code> · <code>peer_attested</code> · <code>signed_by_peer</code> · <code>daemon_signed</code>.</td></tr>
       </tbody></table>
     </div>
   </div>
@@ -292,7 +296,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">tier</td><td class="ftype">Tier</td><td class="fnote"><span class="flag def">DEF</span>Default <code>Mid</code>.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">String</td><td class="fnote"><span class="flag def">DEF</span>Default <code>"global"</code>.</td></tr>
-        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–500 chars.</td></tr>
+        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–512 chars (<code>MAX_TITLE_LEN</code>).</td></tr>
         <tr><td class="fname">content</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–65 536 bytes.</td></tr>
         <tr><td class="fname">tags</td><td class="ftype">Vec&lt;String&gt;</td><td class="fnote"><span class="flag def">DEF</span>Default <code>[]</code>.</td></tr>
         <tr><td class="fname">priority</td><td class="ftype">i32</td><td class="fnote"><span class="flag def">DEF</span>Default 5.</td></tr>
@@ -303,6 +307,11 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <tr><td class="fname">metadata</td><td class="ftype">Value</td><td class="fnote"><span class="flag def">DEF</span>Default <code>{}</code>.</td></tr>
         <tr><td class="fname">agent_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Auto-resolved by <code>identity</code> when omitted.</td></tr>
         <tr><td class="fname">scope</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>One of <code>VALID_SCOPES</code>; default <code>"private"</code>.</td></tr>
+        <tr><td class="fname">on_conflict / detect_conflicts / force</td><td class="ftype">Option&lt;String&gt; / Option&lt;bool&gt; / bool</td><td class="fnote"><span class="flag opt">OPT</span>Dedup-and-synthesis controls (Form 1): conflict disposition, contradiction probe, duplicate-gate override.</td></tr>
+        <tr><td class="fname">citations / source_uri / source_span</td><td class="ftype">Vec&lt;Citation&gt; / Option&lt;String&gt; / Option&lt;SourceSpan&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Form-4 fact provenance (#757).</td></tr>
+        <tr><td class="fname">kind</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Batman Form-6 <code>memory_kind</code> discriminator.</td></tr>
+        <tr><td class="fname">signature</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Layer-3 — caller-presented Ed25519 write attestation (verified against the agent's bound key).</td></tr>
+        <tr><td class="fname">created_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339 backdating for imports; server-stamped when omitted.</td></tr>
       </tbody></table>
     </div>
 
@@ -311,7 +320,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <div class="ty-derive"><code>#[derive(Debug, Deserialize)]</code></div>
       <div class="ty-desc">Body of <code>PUT /memories/:id</code> and <code>memory_update</code>. Every field is optional — only the present fields are mutated; the rest are preserved.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
-        <tr><td class="fname">title</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1–500 chars when set.</td></tr>
+        <tr><td class="fname">title</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1–512 chars (<code>MAX_TITLE_LEN</code>) when set.</td></tr>
         <tr><td class="fname">content</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1–65 536 bytes when set.</td></tr>
         <tr><td class="fname">tier</td><td class="ftype">Option&lt;Tier&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Promoting Mid→Long passes through governance.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Re-namespacing; depth ≤ 8.</td></tr>
@@ -319,7 +328,9 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <tr><td class="fname">priority</td><td class="ftype">Option&lt;i32&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1-10 range.</td></tr>
         <tr><td class="fname">confidence</td><td class="ftype">Option&lt;f64&gt;</td><td class="fnote"><span class="flag opt">OPT</span>0.0-1.0 range.</td></tr>
         <tr><td class="fname">expires_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339.</td></tr>
-        <tr><td class="fname">metadata</td><td class="ftype">Option&lt;Value&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Replaces metadata wholesale (not merged).</td></tr>
+        <tr><td class="fname">metadata</td><td class="ftype">Option&lt;Value&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Replaces metadata wholesale (not merged); <code>metadata.agent_id</code> is preserved.</td></tr>
+        <tr><td class="fname">source_uri</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Form-4 provenance pointer update.</td></tr>
+        <tr><td class="fname">agent_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Caller identity for owner-write checks; the stored row's <code>metadata.agent_id</code> remains immutable.</td></tr>
       </tbody></table>
     </div>
 
@@ -387,7 +398,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     <div class="ty k-struct" id="recallquery">
       <div class="ty-head"><span class="ty-name">RecallQuery</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · budget_tokens Task 1.11</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Deserialize)]</code></div>
-      <div class="ty-desc">Query string for <code>GET /recall</code>. Hybrid 70/30 fusion (FTS5 + HNSW); optional context-budget pruning.</div>
+      <div class="ty-desc">Query string for <code>GET /recall</code>. Hybrid FTS5 + HNSW fusion with adaptive blending — semantic weight 0.50 (short content) → 0.15 (long content), cosine gate <code>RECALL_COSINE_GATE = 0.2</code>; optional context-budget pruning.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">context</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Free-form context to retrieve against.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span></td></tr>
@@ -476,6 +487,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <div class="v"><span class="vn">Store</span><span class="vd">creating a new memory in a governed namespace.</span></div>
         <div class="v"><span class="vn">Delete</span><span class="vd">deleting an existing memory.</span></div>
         <div class="v"><span class="vn">Promote</span><span class="vd">tier promotion (Mid → Long).</span></div>
+        <div class="v"><span class="vn">Reflect</span><span class="vd">v0.7.0 L1-8 — <code>memory_reflect</code> approval gate; queued when the proposed reflection depth exceeds <code>require_approval_above_depth</code>.</span></div>
       </div>
     </div>
 
@@ -533,7 +545,7 @@ GovernancePolicy::default() // { write: Any, promote: Any, delete: Owner, approv
       <div class="ty-desc">Row returned by <code>db::list_pending_actions</code>. Mirrors the <code>pending_actions</code> table.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">id</td><td class="ftype">String</td><td class="fnote">UUID.</td></tr>
-        <tr><td class="fname">action_type</td><td class="ftype">String</td><td class="fnote"><code>store</code> · <code>delete</code> · <code>promote</code>.</td></tr>
+        <tr><td class="fname">action_type</td><td class="ftype">String</td><td class="fnote"><code>store</code> · <code>delete</code> · <code>promote</code> · <code>reflect</code> (v0.7.0).</td></tr>
         <tr><td class="fname">memory_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote">Set for delete/promote; null for pending stores.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">String</td><td class="fnote"></td></tr>
         <tr><td class="fname">payload</td><td class="ftype">Value</td><td class="fnote">Action-shaped JSON for replay.</td></tr>
@@ -646,7 +658,7 @@ VectorClock::latest_from(&amp;self, peer_id: &amp;str) -&gt; Option&lt;&amp;str&
 
     <div class="ty k-const">
       <div class="ty-head"><span class="ty-name">VALID_AGENT_TYPES</span><span class="ty-kind const">const</span></div>
-      <div class="ty-desc">Closed set of agent types accepted by <code>POST /agents/register</code>. Persisted; extend carefully.</div>
+      <div class="ty-desc">Curated short-list of agent types accepted by <code>POST /agents/register</code>. NOT a hard closed set since red-team #235: any <code>ai:&lt;name&gt;</code> form matching <code>^ai:[A-Za-z0-9_.-]{1,60}$</code> is also accepted (max 64 bytes total), so operators can register future models without a code release.</div>
       <div class="snip">&amp;[
   "ai:claude-opus-4.6",
   "ai:claude-opus-4.7",
@@ -654,7 +666,8 @@ VectorClock::latest_from(&amp;self, peer_id: &amp;str) -&gt; Option&lt;&amp;str&
   "ai:grok-4.2",
   "human",
   "system",
-]</div>
+]
+// plus the open form: ai:&lt;alphanumeric _-.&gt; (validate_agent_type)</div>
     </div>
 
     <div class="ty k-const">
