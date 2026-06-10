@@ -93,13 +93,14 @@ FED_CRED_TTL_SECS="${FED_CRED_TTL_SECS:-604800}"   # 7 * SECS_PER_DAY
 FED_ISSUER_ID="${FED_ISSUER_ID:-$CAMPAIGN-ca}"
 FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # Golden ai-memory linux-x86_64 sha256, --features sal,sal-postgres,sqlite-bundled.
-# Re-pinned for release/v0.7.0 @ dab26f7d (2026-06-09/10 GA drive): carries the
+# Re-pinned for release/v0.7.0 @ 4bb54c4d (2026-06-10 GA drive v2): adds the
+# #1578 DLQ replay-starvation fix on top of the dab26f7d golden, which carries the
 # #1553-#1557 security fixes (the prior c3aba0af pin predated them), the full
 # #1558 literal-SSOT campaign (497→28 baseline), and the #1531 residual round
 # (#1568 postgres link governance, #1570 admin-header secure default, #1571
 # replay visibility, #1572 decay parity, #1573 recover dedup, #1575 staging,
 # M13 NaN-rerank + L5 taxonomy-LIKE fixes). Suite 7741/0 at the pin commit.
-GOLDEN_SHA256="${GOLDEN_SHA256:-f520221e921d97fe81190e477bc3cc829e097ba47bb12ba42b4a9d61c3368b8d}"
+GOLDEN_SHA256="${GOLDEN_SHA256:-21bd6899ccec85d72e8b66f774cf87a7b3ad686eb7ce9a9ee4486395a89cd91f}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"
 
