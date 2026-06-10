@@ -1054,6 +1054,17 @@ pub fn build_router_with_timeout(
         ))
         .layer(TraceLayer::new_for_http())
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
+        // #1579 B4 — gzip response compression (4.6× measured
+        // response-size win on recall payloads in the perf audit).
+        // Honors the request's `Accept-Encoding` header; requests
+        // without `gzip` in the accept list pass through
+        // identity-coded. The layer's DEFAULT predicate
+        // (`SizeAbove(32) AND NotForContentType`) already exempts
+        // `text/event-stream`, so the SSE `/approvals/stream`
+        // surface is never wrapped in a gzip stream that would
+        // buffer events — pinned by the
+        // `issue_1579_b4_*` router tests.
+        .layer(tower_http::compression::CompressionLayer::new())
         .layer(CorsLayer::new())
         // H7 (v0.7.0 round-2) — per-request wall-clock timeout.
         // Applied outermost (last in the layer stack) so it bounds
