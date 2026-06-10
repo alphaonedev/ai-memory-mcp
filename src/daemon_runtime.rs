@@ -3857,6 +3857,52 @@ pub async fn bootstrap_serve(
         }
     }
 
+    // #1579 A4 — serve-boot embedding-backfill sweep over the SAL
+    // store. The legacy backfill (`crate::mcp::run_embedding_backfill*`)
+    // is rusqlite-`Connection`-bound and runs ONLY at MCP stdio boot,
+    // so postgres-backed daemons (which exist exclusively behind
+    // `serve --store-url postgres://…`) never re-embedded the rows the
+    // v29 embedding-dim migration NULLed — fleet semantic recall was
+    // dead (P3 audit: 37/7,994 rows embedded, 0 backfill journal
+    // lines). This sweep drains `MemoryStore::list_unembedded` in
+    // bounded `[embeddings].backfill_batch` chunks through the daemon
+    // embedder. SQLite-backed serve daemons are a structural no-op
+    // (the sqlite adapter inherits the empty `list_unembedded`
+    // default — its side-table embeddings are backfilled by the MCP
+    // boot path), so this changes nothing for them. Detached task:
+    // boot readiness never blocks on the sweep.
+    #[cfg(feature = "sal")]
+    if embedder_arc.is_some() {
+        let backfill_store = store_handle.clone();
+        let backfill_embedder = embedder_arc.clone();
+        let backfill_batch = usize::try_from(app_config.resolve_embeddings().backfill_batch)
+            .unwrap_or(crate::mcp::DEFAULT_EMBED_BACKFILL_BATCH_SIZE);
+        task_handles.push(tokio::spawn(async move {
+            let Some(emb) = backfill_embedder.as_ref() else {
+                return;
+            };
+            // Operator-level maintenance path: must see (and re-embed)
+            // every row regardless of metadata.scope — same posture as
+            // the federation catchup loop. Sentinel principal, not a
+            // literal, per the #1558 identity-sentinel SSOT.
+            let ctx = crate::store::CallerContext::for_admin(
+                crate::identity::sentinels::EMBEDDING_BACKFILL,
+            );
+            let written = crate::store::run_embedding_backfill_on_store(
+                backfill_store.as_ref(),
+                &ctx,
+                emb,
+                backfill_batch,
+            )
+            .await;
+            if written > 0 {
+                tracing::info!(
+                    "embedding backfill (serve boot, #1579 A4): {written} row(s) embedded"
+                );
+            }
+        }));
+    }
+
     // FED-P3b — outbound credential renewal worker. When this node holds a
     // CA-issued credential file (`AI_MEMORY_FED_CRED_PATH`), keep it fresh:
     // an external issuer rewrites the short-lived credential on renewal and

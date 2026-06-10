@@ -472,7 +472,20 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       SQLite backend, which has no pre-existing updated_at index, adds
 //       one at v55 (`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`).
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 55;
+// v56 = #1579 B2 (perf, 2026-06-10) — stored generated tsvector column.
+//       `tsv tsvector GENERATED ALWAYS AS (to_tsvector('english',
+//       coalesce(title,'')||' '||coalesce(content,''))) STORED` +
+//       `memories_tsv_gin` GIN index on the COLUMN; the recall /
+//       search / contradiction query shapes read `tsv` for both the
+//       `@@` match and `ts_rank`, eliminating the per-matched-row
+//       tsvector recompute (~305 of 306 ms at 8k rows, P3 audit). The
+//       legacy expression index `memories_content_fts` is dropped.
+//       NOTE: the ADD COLUMN takes an ACCESS EXCLUSIVE table rewrite —
+//       sub-second at fleet scale (~8k rows), plan a window for very
+//       large deployments. SQLite twin is a version-stamp no-op (FTS5
+//       already materialises the text in `memories_fts`); lockstep
+//       pinned.
+const CURRENT_SCHEMA_VERSION: i32 = 56;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1248,8 +1261,11 @@ impl PostgresStore {
         if current_version < 54 {
             self.migrate_v54().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 55 {
             self.migrate_v55().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v56().await?;
         }
 
         Ok(())
@@ -2377,7 +2393,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v55 tx", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #1579 B2 follow-on: stamp the LITERAL 55 (this arm used to
+        // stamp `CURRENT_SCHEMA_VERSION` back when v55 was the ladder
+        // tail — that would have skipped every later arm on replay).
+        record_schema_version(&mut tx, 55).await?;
 
         tx.commit()
             .await
@@ -2386,6 +2405,79 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v55 applied (#1476: sargable federation-catchup rewrite; existing memories_updated_at_idx DESC serves the range scan — no new postgres index)"
+        );
+        Ok(())
+    }
+
+    /// v56 (#1579 B2, perf) — stored generated tsvector column for the
+    /// full-text search + recall surfaces.
+    ///
+    /// Pre-v56 the recall/search/contradiction queries ranked with
+    /// `ts_rank(to_tsvector('english', title || ' ' || content), …)`:
+    /// the GIN **expression** index (`memories_content_fts`) only ever
+    /// served the `@@` match — `ts_rank` re-parsed and re-stemmed the
+    /// full document text PER MATCHED ROW (~305 of 306 ms at 8k fleet
+    /// rows in the P3 perf audit; ~4 s extrapolated at 100k rows).
+    ///
+    /// v56 adds `tsv tsvector GENERATED ALWAYS AS (...) STORED`,
+    /// GIN-indexes the COLUMN (`memories_tsv_gin`), and the query
+    /// shapes read `tsv` for both match and rank, so the tsvector is
+    /// computed once per WRITE instead of once per matched row per
+    /// read. The now-unreferenced expression index is dropped (pure
+    /// write amplification otherwise); fresh bootstraps no longer
+    /// create it (`src/store/postgres_schema.sql` carries the column
+    /// inline; this arm attaches the index per the #797 convention —
+    /// indexes on ALTER-added columns live in the migration arm, which
+    /// fresh installs also execute because they enter the ladder at
+    /// version 0).
+    ///
+    /// **Operational note (fleet apply):** `ADD COLUMN ... GENERATED
+    /// ALWAYS AS ... STORED` takes an ACCESS EXCLUSIVE lock and
+    /// rewrites the table to backfill the column. At the fleet's ~8k
+    /// rows this is sub-second; plan a maintenance window before
+    /// running it against multi-million-row deployments.
+    ///
+    /// SQLite twin is a version-stamp no-op (FTS5 already materialises
+    /// the index text in the `memories_fts` virtual table — there is
+    /// nothing to precompute), the inverse of the v55 arm.
+    async fn migrate_v56(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v56 tx", e))?;
+
+        sqlx::query(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tsv tsvector \
+             GENERATED ALWAYS AS (to_tsvector('english', \
+             coalesce(title, '') || ' ' || coalesce(content, ''))) STORED",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v56 add tsv generated column", e))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS memories_tsv_gin ON memories USING gin (tsv)")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v56 create memories_tsv_gin", e))?;
+
+        // The legacy EXPRESSION index served only the `@@` match and no
+        // query references the expression any more — keeping it would
+        // be pure write amplification on every memories INSERT/UPDATE.
+        sqlx::query("DROP INDEX IF EXISTS memories_content_fts")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v56 drop memories_content_fts", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v56 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v56 applied (#1579 B2: stored generated tsv column + memories_tsv_gin; dropped expression index memories_content_fts)"
         );
         Ok(())
     }
@@ -2844,13 +2936,14 @@ impl PostgresStore {
             .clamp(1, crate::storage::LIST_MAX_LIMIT)
             .try_into()
             .unwrap_or(LIST_FALLBACK_LIMIT_I64);
+        // #1579 B2 — rank + match read the stored generated `tsv`
+        // column (schema v56) instead of recomputing
+        // to_tsvector(title||' '||content) per matched row.
         let rows = sqlx::query(
             "SELECT m.*,
-                    ts_rank(to_tsvector('english', m.title || ' ' || m.content),
-                            plainto_tsquery('english', $1)) AS rank
+                    ts_rank(m.tsv, plainto_tsquery('english', $1)) AS rank
              FROM memories m
-             WHERE to_tsvector('english', m.title || ' ' || m.content)
-                   @@ plainto_tsquery('english', $1)
+             WHERE m.tsv @@ plainto_tsquery('english', $1)
                AND ($2::text IS NULL OR m.namespace = $2)
                AND ($3::text IS NULL OR m.tier = $3)
                AND (m.expires_at IS NULL OR m.expires_at > NOW())
@@ -8617,6 +8710,76 @@ impl MemoryStore for PostgresStore {
         Ok(())
     }
 
+    /// #1579 A4 — bounded NULL-embedding scan for the serve-boot
+    /// backfill sweep. Oldest-first so the sweep replays the v29
+    /// dim-migration damage in insertion order; the `LIMIT` keeps each
+    /// pass bounded (F5.6 semantics — the sweep loop in
+    /// [`crate::store::run_embedding_backfill_on_store`] re-scans
+    /// until empty).
+    async fn list_unembedded(
+        &self,
+        _ctx: &CallerContext,
+        limit: usize,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
+        let rows = sqlx::query(
+            "SELECT id, title, content FROM memories \
+              WHERE embedding IS NULL \
+              ORDER BY created_at ASC \
+              LIMIT $1",
+        )
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list_unembedded", e))?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("id")
+                        .map_err(|e| to_store_err("read unembedded id", e))?,
+                    r.try_get::<String, _>("title")
+                        .map_err(|e| to_store_err("read unembedded title", e))?,
+                    r.try_get::<String, _>("content")
+                        .map_err(|e| to_store_err("read unembedded content", e))?,
+                ))
+            })
+            .collect()
+    }
+
+    /// #1579 A4 — single-transaction batch embedding write. One commit
+    /// per chunk instead of N autocommit round-trips; the postgres twin
+    /// of sqlite's `db::set_embeddings_batch`. Returns rows actually
+    /// updated (a row deleted between scan and write counts 0).
+    async fn set_embeddings_batch(
+        &self,
+        _ctx: &CallerContext,
+        entries: &[(String, Vec<f32>)],
+    ) -> StoreResult<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin set_embeddings_batch tx", e))?;
+        let mut written = 0usize;
+        for (id, vec) in entries {
+            let emb_pgvec = pgvector::Vector::from(vec.clone());
+            let res = sqlx::query("UPDATE memories SET embedding = $2 WHERE id = $1")
+                .bind(id)
+                .bind(emb_pgvec)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("set_embeddings_batch update", e))?;
+            written += usize::try_from(res.rows_affected()).unwrap_or(0);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit set_embeddings_batch tx", e))?;
+        Ok(written)
+    }
+
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
         let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
             .bind(id)
@@ -9052,12 +9215,14 @@ impl MemoryStore for PostgresStore {
         } else {
             Some(caller)
         };
+        // #1579 B2 — rank + match read the stored generated `tsv`
+        // column (schema v56). Pre-fix, `ts_rank(to_tsvector(...))`
+        // recomputed the tsvector PER MATCHED ROW (~305 of 306 ms at
+        // 8k rows in the P3 fleet audit); the GIN expression index
+        // only ever served the `@@` match, never the rank.
         let rows = sqlx::query(
             "SELECT *,
-                    ts_rank(
-                        to_tsvector('english', title || ' ' || content),
-                        to_tsquery('english', $1)
-                    )
+                    ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
                     + (LEAST(access_count, 50) * 0.1)
                     + (confidence * 2.0)
@@ -9070,7 +9235,7 @@ impl MemoryStore for PostgresStore {
                         EXTRACT(EPOCH FROM (NOW() - updated_at)) / 86400.0 * 0.1))
                       AS rank
              FROM memories
-             WHERE to_tsvector('english', title || ' ' || content) @@ to_tsquery('english', $1)
+             WHERE tsv @@ to_tsquery('english', $1)
                AND ($2::text IS NULL OR namespace = $2)
                AND ($3::text IS NULL OR tier = $3)
                AND ($4::text IS NULL OR tags @> to_jsonb(ARRAY[$4]))
@@ -9721,12 +9886,11 @@ impl MemoryStore for PostgresStore {
         // `rank` (see search() above). Also surfaces content_len so
         // the trait-side adaptive blend can compute semantic_weight
         // per row.
+        // #1579 B2 — rank + match read the stored generated `tsv`
+        // column (schema v56); see search() above for the rationale.
         let fts_rows = sqlx::query(
             "SELECT *,
-                    ts_rank(
-                        to_tsvector('english', title || ' ' || content),
-                        to_tsquery('english', $1)
-                    )
+                    ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
                     + (LEAST(access_count, 50) * 0.1)
                     + (confidence * 2.0)
@@ -9740,7 +9904,7 @@ impl MemoryStore for PostgresStore {
                       AS fts_score,
                     octet_length(content) AS content_len
              FROM memories
-             WHERE to_tsvector('english', title || ' ' || content) @@ to_tsquery('english', $1)
+             WHERE tsv @@ to_tsquery('english', $1)
                AND ($2::text IS NULL OR namespace = $2)
                AND ($3::text IS NULL OR tier = $3)
                AND ($4::text IS NULL OR tags @> to_jsonb(ARRAY[$4]))
@@ -12645,18 +12809,15 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
-        // Postgres FTS via `to_tsvector` + `plainto_tsquery` mirroring
-        // the SQLite `memories_fts MATCH` semantics — top 5 candidates
-        // in the same namespace, ranked by relevance.
+        // Postgres FTS via the stored generated `tsv` column (#1579 B2,
+        // schema v56) + `plainto_tsquery`, mirroring the SQLite
+        // `memories_fts MATCH` semantics — top 5 candidates in the
+        // same namespace, ranked by relevance.
         let rows = sqlx::query(
             "SELECT m.* FROM memories m
              WHERE m.namespace = $2
-               AND to_tsvector('english', m.title || ' ' || m.content)
-                   @@ plainto_tsquery('english', $1)
-             ORDER BY ts_rank(
-                 to_tsvector('english', m.title || ' ' || m.content),
-                 plainto_tsquery('english', $1)
-             ) DESC
+               AND m.tsv @@ plainto_tsquery('english', $1)
+             ORDER BY ts_rank(m.tsv, plainto_tsquery('english', $1)) DESC
              LIMIT 5",
         )
         .bind(title)
