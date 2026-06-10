@@ -215,13 +215,14 @@ spec:
       env:
         - name: AI_MEMORY_DB
           value: "/data/ai-memory.db"
-        - name: AI_MEMORY_CONFIG
-          value: "/etc/ai-memory/config.toml"
       volumeMounts:
         - name: ai-memory-data
           mountPath: /data
+        # The daemon reads its config from the fixed path
+        # ~/.config/ai-memory/config.toml (no config-path env var).
+        # The image runs as user `aimem` (HOME=/home/aimem).
         - name: ai-memory-config
-          mountPath: /etc/ai-memory
+          mountPath: /home/aimem/.config/ai-memory
           readOnly: true
         - name: ai-memory-passphrase
           mountPath: /run/secrets
@@ -280,13 +281,12 @@ spec:
           env:
             - name: AI_MEMORY_DB
               value: "/data/ai-memory.db"
-            - name: AI_MEMORY_CONFIG
-              value: "/etc/ai-memory/config.toml"
           volumeMounts:
             - name: ai-memory-data
               mountPath: /data
+            # Fixed config path — see the ConfigMap note below.
             - name: ai-memory-config
-              mountPath: /etc/ai-memory
+              mountPath: /home/aimem/.config/ai-memory
               readOnly: true
       volumes:
         - name: ai-memory-data
@@ -344,13 +344,12 @@ spec:
           env:
             - name: AI_MEMORY_DB
               value: {{ .Values.dbPath | quote }}
-            - name: AI_MEMORY_CONFIG
-              value: "/etc/ai-memory/config.toml"
           volumeMounts:
             - name: data
               mountPath: /data
+            # Fixed config path — see the ConfigMap note below.
             - name: config
-              mountPath: /etc/ai-memory
+              mountPath: /home/aimem/.config/ai-memory
               readOnly: true
       volumes:
         - name: data
@@ -370,8 +369,12 @@ spec:
 
 ### ConfigMap-mounted config
 
-Mount your `config.toml` from a ConfigMap so the binary picks it up via
-`AI_MEMORY_CONFIG`:
+Mount your `config.toml` from a ConfigMap. The daemon reads its
+config from the **fixed path** `~/.config/ai-memory/config.toml`
+(`AppConfig::config_path` in `src/config.rs`); there is **no**
+config-path environment variable, so the ConfigMap must be mounted at
+that path inside the container (the official image runs as user
+`aimem`, HOME `/home/aimem`):
 
 ```yaml
 apiVersion: v1
@@ -391,13 +394,11 @@ Pair with the volume mount shown in the sidecar / DaemonSet snippets:
 
 ```yaml
 env:
-  - name: AI_MEMORY_CONFIG
-    value: "/etc/ai-memory/config.toml"
   - name: AI_MEMORY_DB
     value: "/data/ai-memory.db"
 volumeMounts:
   - name: ai-memory-config
-    mountPath: /etc/ai-memory
+    mountPath: /home/aimem/.config/ai-memory
     readOnly: true
   - name: ai-memory-data
     mountPath: /data

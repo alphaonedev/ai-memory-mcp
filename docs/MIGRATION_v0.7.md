@@ -201,7 +201,7 @@ What v0.7.0 ships:
 - Operator-keypair-signed seed rules `R001..R004` (`~/.config/ai-memory/operator.key`).
 - `memory_check_agent_action` MCP tool — dry-run check against the rule corpus.
 - `memory_rule_list` MCP tool — read-only listing.
-- Substrate `storage::insert` pre-write hook surfaces structured refusal via the `RuleRefused` error variant.
+- Substrate `storage::insert` pre-write hook surfaces structured refusal via the `MemoryError::RefusedByGovernance` error variant.
 - `ai-memory install --harness claude-code --enforce-policy` wires the policy at install time.
 
 What v0.7.0 does NOT ship (v0.8.0 cover):

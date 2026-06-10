@@ -452,7 +452,7 @@ script (Docker / Plan C deployments).
 are pinned by `tests/config_precedence.rs`:
 
 - `test_cli_flag_overrides_env` — `--db /a.db` with `AI_MEMORY_DB=/b.db`
-  in env must resolve to `/a.db`. Tests `Cli::parse_from` directly so
+  in env must resolve to `/a.db`. Tests `Cli::try_parse_from` directly so
   the clap binding is verified end-to-end.
 - `test_env_overrides_config` — `AI_MEMORY_DB=/x.db` with
   `config.toml` `db = "/y.db"`; env wins because clap merges env

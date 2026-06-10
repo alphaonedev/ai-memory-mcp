@@ -218,7 +218,7 @@ bypass-prevention property — see §4.2.
 |---|---|---|---|
 | **Substrate write path** (HTTP `POST /api/v1/memories`, MCP `memory_store`, federation inbound, CLI `ai-memory mine`) | `src/storage/mod.rs::consult_governance_pre_write` (OnceLock-installed closure in `src/daemon_runtime.rs`, daemon `serve` only) | `AgentAction::Custom { custom_kind: "memory_write", payload: {namespace, tier, memory_kind, title} }` evaluated by `check_agent_action_no_audit` | HTTP `403 FORBIDDEN` + `GOVERNANCE_REFUSED` code; MCP `GOVERNANCE_REFUSED` error data; typed `MemoryError::RefusedByGovernance` |
 | **MCP** `memory_check_agent_action` (Power family) | `src/mcp/tools/check_agent_action.rs::handle_check_agent_action` → `check_agent_action` (audited) | Caller-supplied — `{kind, ...}` per §2.3 | MCP tool returns `{"decision":"refuse", "rule_id": "...", "reason": "..."}`; harness PreToolUse hook of type `mcp_tool` reads this and blocks |
-| **CLI** `ai-memory rules check` | `src/cli/rules.rs::cmd_rules` (`Check` variant) → `check_agent_action` (audited) | Caller-supplied via `--kind` + `--command`/`--path`/`--host`/`--binary` | Non-zero exit code on refuse; JSON output via `--json` |
+| **CLI** `ai-memory rules check` | `src/cli/rules.rs::run` (`RulesAction::Check` variant) → `check_agent_action` (audited) | Caller-supplied via `--kind` + `--command`/`--path`/`--host`/`--binary` | Non-zero exit code on refuse; JSON output via `--json` |
 
 All three production wire-points share the **same combinator** and
 the **same `governance_rules` table**. The audit emit differs only

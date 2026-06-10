@@ -501,7 +501,7 @@ before the #1067 / #1068 substrate work.
   `403 FORBIDDEN` before any state change.
 - **[#1050](https://github.com/alphaonedev/ai-memory-mcp/issues/1050)
   (CRITICAL) — `memory_share` advertised but dispatch arm missing.**
-  `registered_tools()` shipped `memory_share`, `src/mcp/share.rs::handle_share`
+  `registered_tools()` shipped `memory_share`, `src/mcp/tools/share.rs::handle_share`
   exists, capabilities v3 reports `callable_now=true` under any
   profile containing `Family::Power` — but `TOOL_DISPATCH_TABLE`
   (`src/mcp/mod.rs`) contained no `register_mcp_tool!("memory_share", …)`
@@ -1390,7 +1390,7 @@ The v0.7.0 Option B substrate-authority foundation:
   [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691))
   wires `check_agent_action` into the `storage::insert` pre-write
   path. The HTTP handler surfaces the structured refusal via the
-  new `RuleRefused` error variant
+  `MemoryError::RefusedByGovernance` error variant
   ([`src/errors.rs`](../../src/errors.rs)). Other adapter write
   paths (link insert, consolidate, reflect, federation receive)
   continue to enforce reflection-specific authority via the

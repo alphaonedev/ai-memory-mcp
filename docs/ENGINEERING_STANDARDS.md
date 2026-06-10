@@ -61,7 +61,7 @@ PRs to `develop` do not require owner approval but must pass all CI checks (fmt,
   ```
 - No new production `unwrap()` calls. Use `?`, `.map_err()`, `unwrap_or_default()`, or match expressions.
 - All SQL queries must use parameterized queries (`params![]`). No string interpolation in SQL.
-- FTS5 input sanitized via `sanitize_fts5_query()`.
+- FTS5 input sanitized via `sanitize_fts_query()`.
 
 ### 1.5 Commit Messages
 
