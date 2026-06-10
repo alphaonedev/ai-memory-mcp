@@ -131,7 +131,12 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
         return Ok(Box::new(store));
     }
 
-    anyhow::bail!("unrecognised store URL: {url} (expected sqlite:///path or postgres://...)")
+    // #1579 A3 (SECURITY) — a mistyped scheme can still carry
+    // credentials in the userinfo; redact before echoing.
+    anyhow::bail!(
+        "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
+        crate::logging::redact_url_password(url)
+    )
 }
 
 /// Run the migration. Streams through the source in pages of

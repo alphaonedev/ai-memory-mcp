@@ -155,6 +155,106 @@ fn rotation_for(cfg: &LoggingConfig) -> Rotation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #1579 A3 (SECURITY) — store-URL credential redaction for logs
+// ---------------------------------------------------------------------------
+
+/// Mask substituted for the userinfo password portion of a URL by
+/// [`redact_url_password`] / [`redact_urls_in_message`]. The username
+/// and host stay readable so operators can still correlate the log
+/// line with the deployment; only the secret is destroyed.
+pub const URL_PASSWORD_MASK: &str = "****";
+
+/// #1579 A3 (SECURITY) — redact the userinfo *password* portion of a
+/// single URL: `postgres://user:hunter2@host:5432/db` becomes
+/// `postgres://user:****@host:5432/db`.
+///
+/// The P3 perf-audit found the daemon boot line logging the FULL
+/// `--store-url` (password included) to journald at INFO
+/// (`src/daemon_runtime.rs::build_store_handle`). Every log / error /
+/// trace / CLI-output site that emits a store URL routes through this
+/// helper (or [`redact_urls_in_message`] for free-text diagnostics).
+///
+/// Behaviour:
+/// - URL without userinfo (`postgres://host/db`, `sqlite:///path`)
+///   → returned unchanged.
+/// - Userinfo without a password (`postgres://user@host/db`)
+///   → returned unchanged (no secret present).
+/// - Non-URL input (plain filesystem path) → returned unchanged.
+///
+/// Deliberately textual (no `url` crate parse) so a *malformed* URL
+/// containing credentials is still scrubbed rather than passed
+/// through on a parse error.
+#[must_use]
+pub fn redact_url_password(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    // The authority component ends at the first '/', '?' or '#'.
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+    let authority = &url[authority_start..authority_end];
+    // Userinfo is everything before the LAST '@' in the authority
+    // (RFC 3986 — the host may not contain '@', so the last one wins).
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &authority[..at_pos];
+    // Password is everything after the FIRST ':' in the userinfo.
+    let Some(colon_pos) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..authority_start + colon_pos + 1]);
+    out.push_str(URL_PASSWORD_MASK);
+    out.push_str(&url[authority_start + at_pos..]);
+    out
+}
+
+/// #1579 A3 (SECURITY) — companion to [`redact_url_password`] for
+/// free-text diagnostics that may EMBED a URL (e.g. a wrapped
+/// `sqlx::Error::Configuration("invalid url postgres://…")` whose
+/// Display interpolates the connection target). Scans the message for
+/// `scheme://` runs and masks the userinfo password inside each one;
+/// every other byte passes through unchanged.
+#[must_use]
+pub fn redact_urls_in_message(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(sep) = rest.find("://") {
+        // Walk back over scheme characters already buffered.
+        let mut scheme_start = sep;
+        while scheme_start > 0 {
+            let c = rest.as_bytes()[scheme_start - 1];
+            if c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.' {
+                scheme_start -= 1;
+            } else {
+                break;
+            }
+        }
+        out.push_str(&rest[..scheme_start]);
+        // The URL run ends at the first whitespace / quote / brace /
+        // paren / comma / semicolon / angle bracket — same boundary
+        // set as `handlers::postgres_gate::sanitize_store_err_message`.
+        let url_end = rest[sep..]
+            .find(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '"' | '\'' | '`' | '{' | '}' | '(' | ')' | ',' | ';' | '<' | '>'
+                    )
+            })
+            .map_or(rest.len(), |i| sep + i);
+        out.push_str(&redact_url_password(&rest[scheme_start..url_end]));
+        rest = &rest[url_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,4 +606,96 @@ mod tests {
     // COVERAGE: tracing::debug! lazy-format closure unreachable when
     //           subscriber level < DEBUG (default INFO in tests);
     //           exercised by operators running with RUST_LOG=debug.
+
+    // -----------------------------------------------------------------
+    // #1579 A3 (SECURITY) — store-URL credential redaction
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn redact_masks_postgres_password() {
+        let url = "postgres://ai_memory:hunter2@db.internal:5432/ai_memory";
+        let redacted = redact_url_password(url);
+        assert_eq!(
+            redacted,
+            "postgres://ai_memory:****@db.internal:5432/ai_memory"
+        );
+        assert!(!redacted.contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_masks_postgresql_scheme_too() {
+        let url = "postgresql://u:s3cr3t@h:5432/db";
+        let redacted = redact_url_password(url);
+        assert_eq!(redacted, "postgresql://u:****@h:5432/db");
+    }
+
+    #[test]
+    fn redact_without_password_is_unchanged() {
+        // Userinfo with no password — nothing to mask.
+        assert_eq!(
+            redact_url_password("postgres://user@host:5432/db"),
+            "postgres://user@host:5432/db"
+        );
+        // No userinfo at all.
+        assert_eq!(
+            redact_url_password("postgres://host:5432/db"),
+            "postgres://host:5432/db"
+        );
+    }
+
+    #[test]
+    fn redact_leaves_sqlite_paths_unchanged() {
+        assert_eq!(
+            redact_url_password("sqlite:///var/lib/ai-memory/mem.db"),
+            "sqlite:///var/lib/ai-memory/mem.db"
+        );
+        // Plain filesystem path (no scheme) passes through verbatim.
+        assert_eq!(
+            redact_url_password("/var/lib/ai-memory/mem.db"),
+            "/var/lib/ai-memory/mem.db"
+        );
+    }
+
+    #[test]
+    fn redact_handles_password_containing_at_and_colon() {
+        // Password "p@:ss" — the LAST '@' in the authority separates
+        // userinfo from host, the FIRST ':' in the userinfo starts the
+        // password, so the whole odd password is masked.
+        let url = "postgres://user:p@:ss@host/db";
+        let redacted = redact_url_password(url);
+        assert_eq!(redacted, "postgres://user:****@host/db");
+        assert!(!redacted.contains("p@:ss"));
+    }
+
+    #[test]
+    fn redact_does_not_touch_password_like_text_in_path_or_query() {
+        // ':'/'@' AFTER the authority must not confuse the scanner.
+        let url = "postgres://host/db?options=a:b@c";
+        assert_eq!(redact_url_password(url), url);
+    }
+
+    #[test]
+    fn redact_message_masks_embedded_url() {
+        let msg = "connect failed: invalid url postgres://admin:hunter2@db:5432/mem (timeout)";
+        let clean = redact_urls_in_message(msg);
+        assert!(!clean.contains("hunter2"), "password leaked: {clean}");
+        assert!(clean.contains("postgres://admin:****@db:5432/mem"));
+        assert!(clean.starts_with("connect failed: invalid url "));
+        assert!(clean.ends_with(" (timeout)"));
+    }
+
+    #[test]
+    fn redact_message_handles_multiple_urls() {
+        let msg = "from postgres://a:pw1@h1/db to postgres://b:pw2@h2/db";
+        let clean = redact_urls_in_message(msg);
+        assert!(!clean.contains("pw1") && !clean.contains("pw2"));
+        assert!(clean.contains("postgres://a:****@h1/db"));
+        assert!(clean.contains("postgres://b:****@h2/db"));
+    }
+
+    #[test]
+    fn redact_message_without_urls_is_identity() {
+        let msg = "plain diagnostic with no connection string";
+        assert_eq!(redact_urls_in_message(msg), msg);
+    }
 }

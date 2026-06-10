@@ -21,6 +21,63 @@ use std::fmt::Write;
 /// dispatch sites.
 pub const FORMAT_TOON_COMPACT: &str = "toon_compact";
 
+/// #1579 B4 — canonical wire name of the JSON format (the HTTP
+/// default; MCP keeps its own `toon_compact` default at the dispatch
+/// layer in `src/mcp/mod.rs`).
+pub const FORMAT_JSON: &str = "json";
+
+/// #1579 B4 — canonical wire name of the non-compact TOON format.
+pub const FORMAT_TOON: &str = "toon";
+
+/// #1579 B4 — negotiated response format for the HTTP recall/search
+/// surfaces (`?format=` query param / `format` body field). The MCP
+/// surface has shipped TOON since v0.6.x with a `toon_compact`
+/// default (~79% smaller than JSON); this enum exposes the SAME
+/// encoder over HTTP with a backwards-compatible `json` default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireFormat {
+    /// `application/json` envelope — the HTTP default (v0.6.x
+    /// backwards compat).
+    #[default]
+    Json,
+    /// Non-compact TOON (`text/plain`): full column set.
+    Toon,
+    /// Compact TOON (`text/plain`): trimmed column set, ~79% smaller
+    /// than the JSON envelope on memory rows.
+    ToonCompact,
+}
+
+/// #1579 B4 — SSOT rejection message for an unrecognised `format`
+/// value. Composed from the canonical format-name consts so the wire
+/// message can never drift from the accepted set.
+#[must_use]
+pub fn invalid_format_msg(got: &str) -> String {
+    format!(
+        "invalid format '{got}': expected one of {FORMAT_JSON}, {FORMAT_TOON}, {FORMAT_TOON_COMPACT}"
+    )
+}
+
+impl WireFormat {
+    /// Parse the HTTP `format` parameter. `None` (param omitted)
+    /// resolves to the [`Self::Json`] default; an unrecognised value
+    /// is an `Err` carrying the SSOT message from
+    /// [`invalid_format_msg`] (the handlers map it to `400`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(message)` when `raw` is `Some` of anything other
+    /// than [`FORMAT_JSON`] / [`FORMAT_TOON`] / [`FORMAT_TOON_COMPACT`].
+    pub fn parse_http(raw: Option<&str>) -> Result<Self, String> {
+        match raw {
+            None => Ok(Self::Json),
+            Some(s) if s == FORMAT_JSON => Ok(Self::Json),
+            Some(s) if s == FORMAT_TOON => Ok(Self::Toon),
+            Some(s) if s == FORMAT_TOON_COMPACT => Ok(Self::ToonCompact),
+            Some(other) => Err(invalid_format_msg(other)),
+        }
+    }
+}
+
 /// Standard memory fields in TOON column order.
 const MEMORY_FIELDS: &[&str] = &[
     "id",
@@ -206,6 +263,37 @@ mod tests {
     use super::*;
     use crate::models::Tier;
     use serde_json::json;
+
+    // -----------------------------------------------------------------
+    // #1579 B4 — HTTP `format` param negotiation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn issue_1579_b4_wire_format_parse_http() {
+        assert_eq!(WireFormat::parse_http(None), Ok(WireFormat::Json));
+        assert_eq!(
+            WireFormat::parse_http(Some(FORMAT_JSON)),
+            Ok(WireFormat::Json)
+        );
+        assert_eq!(
+            WireFormat::parse_http(Some(FORMAT_TOON)),
+            Ok(WireFormat::Toon)
+        );
+        assert_eq!(
+            WireFormat::parse_http(Some(FORMAT_TOON_COMPACT)),
+            Ok(WireFormat::ToonCompact)
+        );
+    }
+
+    #[test]
+    fn issue_1579_b4_wire_format_rejects_unknown_with_ssot_message() {
+        let err = WireFormat::parse_http(Some("yaml")).unwrap_err();
+        assert_eq!(err, invalid_format_msg("yaml"));
+        assert!(err.contains("json") && err.contains("toon") && err.contains("toon_compact"));
+        // Case-sensitive on purpose: the MCP dispatch matches the
+        // exact literals too, so the two surfaces agree.
+        assert!(WireFormat::parse_http(Some("TOON")).is_err());
+    }
 
     #[test]
     fn empty_memories() {

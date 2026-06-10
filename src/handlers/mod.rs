@@ -94,6 +94,9 @@ pub mod skills;
 pub mod subscriptions;
 pub mod system;
 pub mod transport;
+// #1579 B4 — HTTP response-format negotiation (json | toon |
+// toon_compact) for the recall/search surfaces.
+pub mod wire_format;
 
 // Re-export the public-facing handler surface so external callers
 // (router wiring in `src/lib.rs`, integration tests) can still

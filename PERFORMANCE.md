@@ -89,6 +89,61 @@ and uses the recall pipeline's linear-scan fallback, which answers in
 (`embed_batch` + one multi-row UPDATE per chunk) per the #1146
 `[embeddings].backfill_batch` resolver.
 
+## Corpus-scale budgets (#1579 B8)
+
+The budget table above is enforced by the **default** `ai-memory bench`
+workload, which (per-op seeding included) never grows past ~500 rows —
+small enough that corpus-scale regressions are invisible (the #1579 P1
+perf audit measured `memory_recall` p95 at **361 ms vs the 50 ms
+budget on a 100k-row corpus** while the default bench stayed green).
+
+`ai-memory bench --scale <rows>` closes that blind spot: it seeds a
+scratch corpus of `<rows>` rows into the disposable in-memory DB
+before running the same 7 operations, and gates the verdict against
+the per-scale budget table below instead of the default budgets.
+Omitting `--scale` keeps the default workload and default budgets
+byte-for-byte.
+
+### `[scale]` budget table
+
+| Scale (rows) | Operation | Target (p95) | Notes |
+|---|---|---|---|
+| 10,000 | `memory_store` (no embedding) | < 120 ms | keyword-tier write incl. FTS5 trigger sync at scale |
+| 10,000 | `memory_search` (FTS5) | < 60 ms | |
+| 10,000 | `memory_recall` (hot, keyword) | < 80 ms | |
+| 10,000 | `memory_list` | < 10 ms | *[advisory]* — no bench row yet (the 7-op workload does not cover list); pinned per the #1579 remediation plan |
+| 10,000 | `memory_kg_query` / `memory_kg_timeline` | unchanged | KG fixtures are fixed-size (50×4 fan-out, 50×5 chains) — corpus scale does not change traversal cost, so the canonical budgets above apply |
+
+SSOT: `src/bench.rs::SCALE_BUDGETS` (pinned by the
+`operation_scale_targets_match_performance_md` test — change both
+together).
+
+**Rationale for the 10k numbers.** Pinned per the operator-approved
+#1579 remediation plan from the audit's POST-fix expectations,
+verified by a measured release-build run on this branch
+(`ai-memory bench --scale 10000`, Linux x86_64 reference hardware —
+see the table below). Each pinned budget keeps ≥ 50% headroom over
+the measured p95 and never exceeds the plan's conservative ceilings
+(store ≤ 120 ms, search ≤ 60 ms, recall ≤ 80 ms). Scales beyond the
+largest pinned row reuse the largest row's budgets best-effort — pin
+a new table row before gating larger scales.
+
+Measured on this branch at `--scale 10000` (release build):
+
+| Operation | Measured p95 | Pinned budget | Headroom |
+|---|---|---|---|
+| `memory_store` (no embedding) | 0.45 ms | 120 ms | ~266× |
+| `memory_search` (FTS5) | 1.42 ms | 60 ms | ~42× |
+| `memory_recall` (hot, keyword) | 15.44 ms | 80 ms | ~5.2× |
+
+### CI enforcement
+
+`.github/workflows/bench.yml` runs `ai-memory bench --scale 10000`
+as a dedicated gate step on every PR + trunk push (alongside the
+default-workload gate) and uploads `bench-results-10k.json` with the
+artifact set. The run fails when any operation's measured p95 exceeds
+its scale budget by more than the published 10% tolerance.
+
 ## Autonomous-Tier Latency Tax — Batman-Active Write Path
 
 > **v0.7.0 Gap #4 (issue #805) attack plan.** Cross-refs #654 (distilled
@@ -242,6 +297,9 @@ memory_kg_timeline              <  100 ms           0.1 ms         0.1      0.1 
 `--iterations` and `--warmup` (clamped to `[1, 100_000]` and
 `[0, 10_000]` respectively) tune the sample size. `--json` emits the
 same numbers as a single JSON document for downstream tooling.
+`--scale <rows>` (#1579 B8, clamped to `[1, 1_000_000]`) seeds a
+scratch corpus of `<rows>` rows first and gates against the
+"Corpus-scale budgets" table above instead of the default budgets.
 
 The KG rows seed two in-process fixtures so every traversal runs
 end-to-end with no external service:

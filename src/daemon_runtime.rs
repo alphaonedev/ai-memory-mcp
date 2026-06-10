@@ -632,6 +632,13 @@ pub struct BenchArgs {
     /// still prints; this flag only adds the append side effect.
     #[arg(long, value_name = "PATH")]
     pub history: Option<PathBuf>,
+    /// #1579 B8 — seed a scratch corpus of N rows before running the
+    /// workload and gate the verdict against the per-scale budget
+    /// table in `PERFORMANCE.md` §"Corpus-scale budgets". Omitting the
+    /// flag keeps the legacy ~500-row workload and legacy budgets.
+    /// Clamped to `[1, 1_000_000]`.
+    #[arg(long, value_name = "ROWS")]
+    pub scale: Option<usize>,
 }
 
 /// Default `--batch` page-size hint for `ai-memory migrate`. Currently
@@ -854,11 +861,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 let db_was_explicit =
                     std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
                 if db_was_explicit {
+                    // #1579 A3 (SECURITY) — redact the URL credential
+                    // before it lands in the error output.
                     anyhow::bail!(
                         "--db and --store-url are mutually exclusive. \
                          Pass exactly one. Got --db={} and --store-url={}",
                         db_path.display(),
-                        url,
+                        crate::logging::redact_url_password(url),
                     );
                 }
             }
@@ -1229,11 +1238,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 let db_was_explicit =
                     std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
                 if db_was_explicit {
+                    // #1579 A3 (SECURITY) — redact the URL credential
+                    // before it lands in the error output.
                     anyhow::bail!(
                         "--db and --store-url are mutually exclusive. \
                          Pass exactly one. Got --db={} and --store-url={}",
                         db_path.display(),
-                        url,
+                        crate::logging::redact_url_password(url),
                     );
                 }
             }
@@ -2935,9 +2946,14 @@ async fn build_store_handle(
                     // so the *fresh* schema lands `vector(<dim>)` from
                     // the very first INIT; the auto-migrate then handles
                     // the pre-existing-schema-at-wrong-dim case.
+                    // #1579 A3 (SECURITY) — log the password-redacted
+                    // URL. Pre-fix this line shipped the full
+                    // `--store-url` (credential included) to journald
+                    // at INFO.
+                    let display_url = crate::logging::redact_url_password(url);
                     let store = if let Some(dim) = configured_embedding_dim {
                         tracing::info!(
-                            "Wave-3 (issue #877): opening Postgres SAL store at {url} \
+                            "Wave-3 (issue #877): opening Postgres SAL store at {display_url} \
                              (statement_timeout={timeout}s, embedding_dim={dim}, auto_migrate=on, \
                              pool_max={}, pool_min={}, acquire_timeout={}s)",
                             pool.max_connections,
@@ -2951,7 +2967,7 @@ async fn build_store_handle(
                         .context("connect postgres adapter (auto-migrate dim)")?
                     } else {
                         tracing::info!(
-                            "Wave-3: opening Postgres SAL store at {url} \
+                            "Wave-3: opening Postgres SAL store at {display_url} \
                              (statement_timeout={timeout}s, no embedder configured, \
                              pool_max={}, pool_min={}, acquire_timeout={}s)",
                             pool.max_connections,
@@ -2992,8 +3008,11 @@ async fn build_store_handle(
                     .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
                 Ok((StorageBackend::Sqlite, Arc::new(store)))
             } else {
+                // #1579 A3 (SECURITY) — a mistyped scheme can still
+                // carry credentials; redact before echoing.
                 anyhow::bail!(
-                    "unrecognised --store-url: {url} (expected sqlite:///path or postgres://...)"
+                    "unrecognised --store-url: {} (expected sqlite:///path or postgres://...)",
+                    crate::logging::redact_url_password(url)
                 )
             }
         }
@@ -4523,10 +4542,13 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     // main DB (and disk) are untouched. SQLite's `:memory:` URL and
     // WAL-less mode keep the workload bounded by RAM and CPU.
     let conn = db::open(Path::new(":memory:"))?;
+    // #1579 B8 — corpus scale (None = legacy default workload).
+    let scale = args.scale.map(|s| s.clamp(1, crate::bench::MAX_SCALE));
     let config = bench::BenchConfig {
         iterations,
         warmup,
         namespace: bench::BENCH_NAMESPACE.to_string(),
+        scale,
     };
     let results = bench::run(&conn, &config)?;
 
@@ -4547,6 +4569,7 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "iterations": iterations,
                 "warmup": warmup,
+                "scale": scale,
                 "results": results,
                 "regressions": regressions,
             }))?
@@ -4561,7 +4584,14 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
 
     if let Some(history_path) = &args.history {
         let captured_at = chrono::Utc::now().to_rfc3339();
-        bench::append_history(history_path, &captured_at, iterations, warmup, &results)?;
+        bench::append_history(
+            history_path,
+            &captured_at,
+            iterations,
+            warmup,
+            scale,
+            &results,
+        )?;
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
             stderr,
@@ -4609,10 +4639,15 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         args.dry_run,
     )
     .await;
+    // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
+    // mask the userinfo password so credentials never land in stdout /
+    // captured CI logs.
+    let from_display = crate::logging::redact_url_password(&args.from);
+    let to_display = crate::logging::redact_url_password(&args.to);
     if args.json {
         let value = serde_json::json!({
-            "from_url": args.from,
-            "to_url": args.to,
+            "from_url": from_display,
+            "to_url": to_display,
             "memories_read": report.memories_read,
             "memories_written": report.memories_written,
             "batches": report.batches,
@@ -4622,8 +4657,8 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("migration report");
-        println!("  from:              {}", args.from);
-        println!("  to:                {}", args.to);
+        println!("  from:              {from_display}");
+        println!("  to:                {to_display}");
         println!("  memories_read:     {}", report.memories_read);
         println!("  memories_written:  {}", report.memories_written);
         println!("  batches:           {}", report.batches);
@@ -5057,6 +5092,68 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
+    /// path must log the REDACTED store URL. Pre-fix,
+    /// `build_store_handle` interpolated the raw `--store-url`
+    /// (password included) into the INFO boot line, shipping the
+    /// credential to journald / any log sink. The INFO line fires
+    /// before the connect attempt, so an unreachable port (`:1`)
+    /// still exercises the log site; the connect error itself is
+    /// expected and asserted as `Err`.
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn issue_1579_a3_boot_log_redacts_store_url_password() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buf lock").extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let writer_buf = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer_buf.clone())
+            .finish();
+        // Thread-local default — `#[tokio::test]` runs the future on
+        // the current thread, so every log the boot path emits during
+        // the await lands in `buf`.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let secret = "sup3r-s3cret-pw";
+        let url = format!("postgres://ai_memory:{secret}@127.0.0.1:1/ai_memory");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("unused.db");
+        let res = build_store_handle(
+            Some(&url),
+            &db_path,
+            None,
+            Some(384),
+            crate::store::PoolConfig::default(),
+        )
+        .await;
+        assert!(res.is_err(), "port 1 must refuse the connection");
+
+        let logs = String::from_utf8_lossy(&buf.0.lock().expect("buf lock")).to_string();
+        assert!(
+            logs.contains("opening Postgres SAL store at postgres://ai_memory:****@127.0.0.1:1"),
+            "boot line must log the redacted URL; got:\n{logs}"
+        );
+        assert!(
+            !logs.contains(secret),
+            "store-URL password leaked into the boot log:\n{logs}"
+        );
+    }
 
     /// #1455 (SEC, MED) — when a governance hook's rule-consultation
     /// connection could not be opened at install time, the gate MUST
