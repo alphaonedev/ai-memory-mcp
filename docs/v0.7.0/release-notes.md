@@ -172,15 +172,60 @@ are called out explicitly below.
 - **[#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)**
   — the default `--quorum-timeout-ms 2000` is same-DC-tuned;
   cross-region quorum pushes hit `deadline_exceeded` → DLQ (do-1461
-  finding). The reference 3-region deploy runs
-  `FED_QUORUM_TIMEOUT_MS=8000`
-  (`deploy/do-1461/provision/lib.sh`); operators federating across
-  regions should raise the flag accordingly.
+  finding). Cross-region meshes need **5000-10000 ms**; the reference
+  3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000`
+  (`deploy/do-1461/provision/lib.sh` carries the rationale — the
+  receiver's embed-on-receive after a dimension migration can add
+  ~1 s/row, see #1566 below). Raising the deadline is safe: the write
+  commits locally first, so a longer remote-ack wait widens only the
+  synchronous-durability gate, never the local commit. WAN guidance
+  documented in `docs/federation.md` §Tuning,
+  `docs/ADR-0001-quorum-replication.md`, and
+  `docs/TROUBLESHOOTING.md`.
 - **[#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)**
   — an embedding-dimension migration NULLs stored vectors, so
   receivers synchronously re-embed on federation receive (~1 s/row),
   inflating quorum latency + DLQ pressure during the backfill window.
   Plan dimension changes as a maintenance window on federated fleets.
+
+## Known operational postures at v0.7.0 ([#1531](https://github.com/alphaonedev/ai-memory-mcp/issues/1531) residual round, 2026-06-09)
+
+Documented dispositions — deliberate v0.7.0 behavior, stated
+explicitly so operators don't have to reverse-engineer it from source.
+
+- **Security posture —
+  [#1569](https://github.com/alphaonedev/ai-memory-mcp/issues/1569):
+  namespace governance defaults are allow-on-silence.** Absent an
+  explicit namespace standard, `CorePolicy::default()` is
+  `write: Any`, `promote: Any`, `delete: Owner`
+  (`src/models/namespace.rs`) — **write/promote are ungated by design
+  at v0.7.0**; the governance pipeline gates only what operators
+  configure. Hardening knob: attach a standard via
+  `memory_namespace_set_standard` with a `metadata.governance`
+  policy. Set standards on every production namespace. Documented in
+  `docs/governance.md` §"Namespace-standard defaults" + CLAUDE.md
+  §Data Model.
+- **Deprecation —
+  [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574):
+  `?api_key=` query-parameter authentication.** The supported
+  credential channel is the `x-api-key` request header. The query
+  form leaks credentials into access logs, `Referer` headers, and
+  proxy logs; at v0.7.0 it is still accepted for back-compat with a
+  once-per-process WARN (`handlers::transport::api_key_auth`), and is
+  slated for v0.8 rejection behind a temporary escape hatch. Migrate
+  callers now. Documented in `docs/production-deployment.md` §3b.
+- **Rollback contract —
+  [#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576):
+  migrations are forward-only by design; snapshot-restore is the
+  rollback.** Every schema-mutating upgrade first writes an automatic
+  sibling snapshot
+  `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak`
+  (`PRE_MIGRATION_BACKUP_INFIX`, `src/storage/migrations.rs`;
+  `VACUUM INTO`, transactionally consistent, SQLCipher keying
+  inherited) and refuses to mutate the schema if the snapshot fails.
+  Rollback = stop daemon → reinstall previous binary → restore the
+  snapshot → start. Procedure in `docs/ADMIN_GUIDE.md`
+  §Migration → Rollback.
 
 ## v0.7.0 provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067), 2026-05-21)
 
