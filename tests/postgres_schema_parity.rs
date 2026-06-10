@@ -111,8 +111,9 @@ async fn inspection_pool(url: &str) -> PgPool {
 ///
 /// Excludes:
 ///   - `memories_fts` — `SQLite` FTS5 virtual table; equivalent
-///     function on `Postgres` is the GIN tsvector index
-///     `memories_content_fts`.
+///     function on `Postgres` is the stored generated `tsv` column +
+///     its GIN index `memories_tsv_gin` (schema v57, #1579 B2; the
+///     pre-v57 expression index `memories_content_fts` is dropped).
 ///   - `SQLite` triggers (`memories_ai`, `memories_ad`,
 ///     `memories_au`) — FTS5 sync triggers; `Postgres`' tsvector is
 ///     materialized by the index expression and does not require
@@ -259,11 +260,12 @@ async fn sqlite_only_artefacts_documented() {
     //
     // SQLite-only:
     //   - `memories_fts` virtual table (FTS5).
-    //     Postgres equivalent: `memories_content_fts` GIN tsvector
-    //     index. Both surface as `db::search_*` / `PostgresStore::search`.
+    //     Postgres equivalent: stored generated `tsv` column +
+    //     `memories_tsv_gin` GIN index (schema v57, #1579 B2). Both
+    //     surface as `db::search_*` / `PostgresStore::search`.
     //   - Triggers `memories_ai` / `memories_ad` / `memories_au`.
-    //     Postgres equivalent: tsvector index expression evaluated
-    //     at insert / update — no triggers needed.
+    //     Postgres equivalent: the STORED generated tsvector column
+    //     materialised at insert / update — no triggers needed.
     //   - `scope_idx` / `agent_id_idx` as VIRTUAL columns.
     //     Postgres equivalent: STORED generated columns — same
     //     semantics, slightly more disk space, no per-read recomputation.

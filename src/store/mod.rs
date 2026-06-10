@@ -635,6 +635,56 @@ pub trait MemoryStore: Send + Sync {
         Ok(())
     }
 
+    /// #1579 A4 — bounded scan of memories whose inline `embedding`
+    /// column is NULL. Returns up to `limit` `(id, title, content)`
+    /// triples for the serve-boot embedding-backfill sweep
+    /// ([`run_embedding_backfill_on_store`]).
+    ///
+    /// **Why this exists.** The legacy backfill
+    /// (`crate::mcp::run_embedding_backfill*`) is implemented against
+    /// a `rusqlite::Connection` and is invoked ONLY from the MCP stdio
+    /// boot path — the `serve` daemon (the only postgres-capable
+    /// surface) never ran any sweep, so rows whose embeddings were
+    /// NULLed by the v29 embedding-dim migration stayed NULL forever
+    /// on postgres fleets (P3 audit: 37/7,994 rows embedded). This
+    /// trait method is the SAL-level enumerator that closes that gap.
+    ///
+    /// Default returns an empty vec: adapters that don't store
+    /// embeddings inline (sqlite — embeddings live in a side table and
+    /// are backfilled by the MCP-boot path / the `src/storage` sweep)
+    /// make the serve-boot sweep a structural no-op, preserving their
+    /// existing behaviour exactly.
+    async fn list_unembedded(
+        &self,
+        _ctx: &CallerContext,
+        _limit: usize,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// #1579 A4 — write a batch of freshly-computed embeddings in as
+    /// few round-trips as the backend allows. Mirrors the sqlite-side
+    /// `db::set_embeddings_batch` bounded-batch shape (F5.6 semantics:
+    /// one transaction per chunk, so a fault aborts at most one chunk
+    /// of work). Returns the number of rows actually updated.
+    ///
+    /// Default implementation loops [`update_embedding`]
+    /// (Self::update_embedding) so every adapter is correct without an
+    /// override; `PostgresStore` overrides it with a single-transaction
+    /// multi-UPDATE so an N-row chunk costs one commit instead of N.
+    async fn set_embeddings_batch(
+        &self,
+        ctx: &CallerContext,
+        entries: &[(String, Vec<f32>)],
+    ) -> StoreResult<usize> {
+        let mut written = 0usize;
+        for (id, vec) in entries {
+            self.update_embedding(ctx, id, Some(vec)).await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`
@@ -2271,6 +2321,117 @@ pub struct VerifyLinkReport {
     pub findings: Vec<String>,
 }
 
+/// #1579 A4 — SAL-level embedding-backfill sweep. Drains every row the
+/// adapter reports as unembedded ([`MemoryStore::list_unembedded`]) in
+/// bounded `batch_size` chunks: embed via [`crate::embeddings::Embed::embed_batch`],
+/// persist via [`MemoryStore::set_embeddings_batch`] (one transaction
+/// per chunk — F5.6 bounded-batch semantics), repeat until the scan
+/// comes back empty. Returns the total number of rows written.
+///
+/// This is the serve-daemon twin of the MCP-boot
+/// [`crate::mcp::run_embedding_backfill_with_batch_size`] (which is
+/// rusqlite-`Connection`-bound and therefore never ran on
+/// postgres-backed daemons — the #1579 A4 root cause). Adapters whose
+/// `list_unembedded` default to empty (sqlite) make this a true no-op,
+/// so spawning it unconditionally on `serve` boot changes nothing for
+/// sqlite deployments.
+///
+/// **Failure semantics** mirror the MCP twin: a per-chunk embedder or
+/// writer fault is logged and the sweep STOPS (rather than skipping —
+/// a failed chunk would be re-scanned by the next pass and spin the
+/// loop forever); the remaining rows are retried on the next daemon
+/// boot. A zero-progress pass also terminates the loop defensively.
+/// Nothing propagates — the sweep must never block daemon readiness.
+pub async fn run_embedding_backfill_on_store(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    emb: &dyn crate::embeddings::Embed,
+    batch_size: usize,
+) -> usize {
+    // Defensive: a zero chunk size would make the scan a no-op loop.
+    // Same coercion as the MCP twin (`chunks(0)` panics there; here a
+    // `LIMIT 0` scan would return empty and silently skip the sweep).
+    let batch_size = if batch_size == 0 {
+        crate::mcp::DEFAULT_EMBED_BACKFILL_BATCH_SIZE
+    } else {
+        batch_size
+    };
+
+    let mut total = 0usize;
+    loop {
+        let chunk = match store.list_unembedded(ctx, batch_size).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("embedding backfill: unembedded scan failed: {e} (sweep stopped)");
+                break;
+            }
+        };
+        if chunk.is_empty() {
+            break;
+        }
+
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|(_, t, c)| crate::embeddings::embedding_document(t, c))
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let embeddings = match emb.embed_batch(&text_refs) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "embedding backfill: embed_batch failed for chunk of {} rows: {e} \
+                     (sweep stopped; remaining rows retry on next boot)",
+                    chunk.len()
+                );
+                break;
+            }
+        };
+        // Defensive: a well-behaved embedder returns one vector per
+        // input. Misalignment would pair ids with the wrong vectors —
+        // stop rather than corrupt semantic recall.
+        if embeddings.len() != chunk.len() {
+            tracing::warn!(
+                "embedding backfill: embed_batch returned {} vectors for {} inputs (sweep stopped)",
+                embeddings.len(),
+                chunk.len()
+            );
+            break;
+        }
+
+        let entries: Vec<(String, Vec<f32>)> = chunk
+            .iter()
+            .zip(embeddings)
+            .map(|((id, _, _), v)| (id.clone(), v))
+            .collect();
+        let written = match store.set_embeddings_batch(ctx, &entries).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "embedding backfill: set_embeddings_batch failed for chunk of {} rows: {e} \
+                     (sweep stopped; remaining rows retry on next boot)",
+                    entries.len()
+                );
+                break;
+            }
+        };
+        total += written;
+        tracing::info!(
+            "embedding backfill: wrote {written}/{} embeddings this pass ({total} total)",
+            entries.len()
+        );
+        if written == 0 {
+            // Zero-progress guard: the same rows would be re-scanned
+            // forever. Terminate; next boot retries.
+            tracing::warn!(
+                "embedding backfill: zero-progress pass on {} candidate row(s); sweep stopped",
+                chunk.len()
+            );
+            break;
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3180,5 +3341,188 @@ mod tests {
         let s = MinimalStore;
         let v = s.schema_version().await.expect("default schema_version");
         assert_eq!(v, 0, "default body MUST return 0");
+    }
+
+    // ------------------------------------------------------------------
+    // #1579 A4 — serve-boot embedding-backfill sweep
+    // (`run_embedding_backfill_on_store`) loop-termination pins. The
+    // sweep re-scans `list_unembedded` until empty, so every "stop"
+    // arm (zero-progress, embedder fault, vector-count misalignment)
+    // is load-bearing against an infinite boot-task loop.
+    // ------------------------------------------------------------------
+
+    /// Configurable backfill double for the sweep loop-termination
+    /// pins: `list_unembedded` always reports `rows` candidate rows
+    /// (a stalled scan — the pathological re-scan-forever shape), and
+    /// `set_embeddings_batch` reports `written_per_chunk` rows
+    /// actually updated (0 models every row vanishing between scan
+    /// and write).
+    struct StalledBackfillStore {
+        rows: usize,
+        written_per_chunk: usize,
+    }
+
+    #[async_trait]
+    impl MemoryStore for StalledBackfillStore {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::DURABLE
+        }
+        async fn store(&self, _: &CallerContext, m: &Memory) -> StoreResult<String> {
+            Ok(m.id.clone())
+        }
+        async fn get(&self, _: &CallerContext, id: &str) -> StoreResult<Memory> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+        async fn update(&self, _: &CallerContext, _: &str, _: UpdatePatch) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &CallerContext, _: &str) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list(&self, _: &CallerContext, _: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn search(&self, _: &CallerContext, _: &str, _: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn verify(&self, _: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+            Ok(VerifyReport {
+                memory_id: id.to_string(),
+                integrity_ok: true,
+                findings: vec![],
+                signature_verified: false,
+            })
+        }
+        async fn link(&self, _: &CallerContext, _: &MemoryLink) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_links(&self, _: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+            Ok(vec![])
+        }
+        async fn register_agent(
+            &self,
+            _: &CallerContext,
+            _: &AgentRegistration,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_unembedded(
+            &self,
+            _ctx: &CallerContext,
+            limit: usize,
+        ) -> StoreResult<Vec<(String, String, String)>> {
+            Ok((0..self.rows.min(limit))
+                .map(|i| {
+                    (
+                        format!("stalled-{i}"),
+                        format!("title {i}"),
+                        format!("content {i}"),
+                    )
+                })
+                .collect())
+        }
+        async fn set_embeddings_batch(
+            &self,
+            _ctx: &CallerContext,
+            _entries: &[(String, Vec<f32>)],
+        ) -> StoreResult<usize> {
+            Ok(self.written_per_chunk)
+        }
+    }
+
+    /// #1579 A4 — adapters that inherit the `list_unembedded` default
+    /// (sqlite) make the serve-boot sweep a structural no-op: the
+    /// first scan is empty, the loop exits immediately, zero rows are
+    /// written. This is the "sqlite serve surface unchanged" pin.
+    #[tokio::test]
+    async fn backfill_sweep_is_noop_on_default_list_unembedded() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let written = run_embedding_backfill_on_store(&s, &ctx, &emb, 8).await;
+        assert_eq!(
+            written, 0,
+            "default (sqlite-shape) adapters must make the sweep a no-op"
+        );
+    }
+
+    /// #1579 A4 — the default `set_embeddings_batch` body loops
+    /// `update_embedding` and reports one written row per entry, so
+    /// every adapter is correct without an override.
+    #[tokio::test]
+    async fn default_set_embeddings_batch_loops_update_embedding() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let entries = vec![
+            ("a".to_string(), vec![0.1_f32]),
+            ("b".to_string(), vec![0.2_f32]),
+        ];
+        let written = s
+            .set_embeddings_batch(&ctx, &entries)
+            .await
+            .expect("default batch write");
+        assert_eq!(written, 2, "default body reports one row per entry");
+    }
+
+    /// #1579 A4 — zero-progress guard: a scan that keeps reporting the
+    /// same candidate rows while the batch write lands 0 of them (rows
+    /// deleted between scan and write, or a pathological adapter) MUST
+    /// terminate the sweep instead of re-scanning forever. Also passes
+    /// `batch_size = 0` to pin the zero→default chunk-size coercion
+    /// (a `LIMIT 0` scan would otherwise silently skip the sweep). The
+    /// timeout converts a guard regression into a test failure rather
+    /// than a hung suite.
+    #[tokio::test]
+    async fn backfill_sweep_zero_progress_guard_terminates() {
+        let s = StalledBackfillStore {
+            rows: 3,
+            written_per_chunk: 0,
+        };
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_embedding_backfill_on_store(&s, &ctx, &emb, 0),
+        )
+        .await
+        .expect("zero-progress sweep must terminate, not loop forever");
+        assert_eq!(written, 0, "zero-progress pass writes nothing");
+    }
+
+    /// #1579 A4 — embedder/scan misalignment guard: when `embed_batch`
+    /// returns a different number of vectors than inputs, pairing ids
+    /// with the wrong vectors would corrupt semantic recall. The sweep
+    /// must stop WITHOUT writing the misaligned chunk (and without
+    /// spinning on the unchanged scan).
+    #[tokio::test]
+    async fn backfill_sweep_stops_on_embedder_vector_count_mismatch() {
+        /// Trait-only fake: always returns ONE vector regardless of
+        /// input count (the `MockEmbedder` is documented never to
+        /// misalign, so the guard arm needs this fake to be reachable).
+        struct MisalignedEmbedder;
+        impl crate::embeddings::Embed for MisalignedEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32])
+            }
+            fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![0.0_f32]])
+            }
+        }
+
+        let s = StalledBackfillStore {
+            rows: 3,
+            // Would-be progress if the misaligned chunk were written —
+            // the guard must stop BEFORE the write, so the sweep still
+            // returns 0.
+            written_per_chunk: 3,
+        };
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_embedding_backfill_on_store(&s, &ctx, &MisalignedEmbedder, 8),
+        )
+        .await
+        .expect("misaligned sweep must terminate, not loop forever");
+        assert_eq!(written, 0, "misaligned chunk must be dropped, not written");
     }
 }
