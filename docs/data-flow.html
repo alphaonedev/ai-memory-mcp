@@ -260,7 +260,7 @@ footer a{color:var(--text-muted)}
 
       <!-- Group: core write -->
       <rect class="group-bg" x="200" y="10" width="600" height="320"/>
-      <text class="group-label" x="210" y="30">▸ src/storage/mod.rs::store</text>
+      <text class="group-label" x="210" y="30">▸ src/storage/mod.rs::insert</text>
 
       <!-- Group: post-write -->
       <rect class="group-bg" x="810" y="10" width="360" height="320"/>
@@ -360,7 +360,7 @@ footer a{color:var(--text-muted)}
       <!-- Filters -->
       <g><rect class="stage-box" x="890" y="60" width="80" height="60" rx="10"/><text x="930" y="95" text-anchor="middle" style="font-size:11px">budget</text><text x="930" y="110" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">tokens</text></g>
       <g><rect class="stage-box" x="890" y="150" width="80" height="60" rx="10"/><text x="930" y="185" text-anchor="middle" style="font-size:11px">scope</text><text x="930" y="200" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">visibility</text></g>
-      <g><rect class="stage-box" x="890" y="240" width="80" height="60" rx="10"/><text x="930" y="275" text-anchor="middle" style="font-size:11px">TTL ext</text><text x="930" y="290" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">touch hits</text></g>
+      <g><rect class="stage-box" x="890" y="240" width="80" height="60" rx="10"/><text x="930" y="275" text-anchor="middle" style="font-size:11px">TTL reset</text><text x="930" y="290" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">touch hits</text></g>
 
       <!-- Result -->
       <g><rect class="stage-box hot" x="1010" y="150" width="140" height="80" rx="10"/><text x="1080" y="185" text-anchor="middle">top-K ranked</text><text x="1080" y="205" text-anchor="middle" class="label" style="fill:var(--good);font-size:9px">18ms p95 hot</text></g>
@@ -403,9 +403,9 @@ footer a{color:var(--text-muted)}
         <p><code>embed(context_tokens.join(" "))</code> — recent conversation tokens. Biases toward "what the agent is currently thinking about".</p>
       </div>
       <div class="fusion-card f3">
-        <h3>L2-renormalize</h3>
-        <div class="pct p3">unit</div>
-        <p>Final query vector = unit-norm(0.7·primary + 0.3·context). Same magnitude as either input — drop-in for HNSW search.</p>
+        <h3>weighted sum</h3>
+        <div class="pct p3">raw</div>
+        <p>Final query vector = 0.7·primary + 0.3·context, deliberately un-normalized — cosine similarity divides out magnitudes downstream, so only direction matters (<code>Embedder::fuse</code>).</p>
       </div>
     </div>
 
@@ -420,7 +420,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow p3">Federation · W-of-N Quorum</span>
     <h2>Multi-machine sync without a coordinator.</h2>
-    <p class="lede">Each node accepts writes locally and fans out to peers via mTLS. Quorum threshold W of N (default 2 of 3) must ack before commit. Eventual consistency. Per-peer cursors for catchup after partition. Federation private endpoints under <code>/api/v1/sync/*</code>.</p>
+    <p class="lede">Each node accepts writes locally and fans out to peers via mTLS. The local commit lands first; the quorum (default W=2, counting the local commit) is met once W−1 peers ack within the deadline. Eventual consistency. Per-peer cursors for catchup after partition. Federation private endpoints under <code>/api/v1/sync/*</code>.</p>
 
     <svg class="flow-svg" viewBox="0 0 1180 460" xmlns="http://www.w3.org/2000/svg">
       <!-- Three peers -->
@@ -462,8 +462,8 @@ footer a{color:var(--text-muted)}
       <path class="data-line" d="M 490 370 Q 350 370 210 280"/>
 
       <!-- Quorum threshold annotation -->
-      <text x="350" y="50" text-anchor="middle" style="fill:var(--good);font-family:monospace;font-size:14px;font-weight:700">W=2 of N=3 reached → COMMIT</text>
-      <text x="350" y="70" text-anchor="middle" class="label" style="fill:var(--text-muted)">leader returns 200 to caller after 410ms (slowest of 2 acks)</text>
+      <text x="350" y="50" text-anchor="middle" style="fill:var(--good);font-family:monospace;font-size:14px;font-weight:700">W=2 met (local commit + first peer ack) → COMMIT</text>
+      <text x="350" y="70" text-anchor="middle" class="label" style="fill:var(--text-muted)">leader returns 200 after 240ms (first ack; node-3's 410ms ack lands post-quorum)</text>
 
       <!-- Catchup annotation -->
       <text x="1025" y="330" text-anchor="middle" style="fill:var(--text-muted);font-family:monospace;font-size:11px">when node-4 returns:</text>
@@ -484,7 +484,7 @@ footer a{color:var(--text-muted)}
       </div>
       <div class="fusion-card f2">
         <h3>quorum write</h3>
-        <p>Writes return 200 only after W peers ACK. Slowest ACK determines latency. Default W=2.</p>
+        <p>Local commit lands first; the write returns 200 once W is met — the local commit plus W−1 peer ACKs within the deadline. Default W=2 (majority).</p>
       </div>
       <div class="fusion-card f3">
         <h3>catchup loop</h3>

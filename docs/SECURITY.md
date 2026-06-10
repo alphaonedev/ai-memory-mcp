@@ -53,12 +53,12 @@ Out of scope (non-goals):
 ## Trust boundaries
 
 ```
-┌──────────────┐   mTLS + API key    ┌──────────────┐
+┌──────────────┐   no auth           ┌──────────────┐
 │ MCP client   │───────────────────▶│ ai-memory    │
 │ (Claude Code)│  stdio JSON-RPC     │ daemon /     │
 ├──────────────┤                     │ MCP server / │
 │ HTTP client  │────────────────────▶│ CLI          │
-│ (SDK, curl)  │                     │              │
+│ (SDK, curl)  │  API key + mTLS     │              │
 ├──────────────┤   mTLS + sync       └──────┬───────┘
 │ peer daemon  │◀────────────────────┐      │
 └──────────────┘                     │      │ SQLite mutex

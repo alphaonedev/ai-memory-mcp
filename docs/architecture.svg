@@ -95,11 +95,11 @@
 
     <rect x="345" y="140" width="160" height="60" class="card-green"/>
     <text x="425" y="164" text-anchor="middle" class="title">HTTP API</text>
-    <text x="425" y="181" text-anchor="middle" class="subtitle">REST · 73 routes · :9077</text>
+    <text x="425" y="181" text-anchor="middle" class="subtitle">REST · 88 routes / 74 paths · :9077</text>
 
     <rect x="600" y="140" width="160" height="60" class="card-green"/>
     <text x="680" y="164" text-anchor="middle" class="title">CLI</text>
-    <text x="680" y="181" text-anchor="middle" class="subtitle">57 subcommands · scriptable</text>
+    <text x="680" y="181" text-anchor="middle" class="subtitle">79 subcommands · scriptable</text>
   </g>
 
   <!-- Flow lines down to validation -->
@@ -115,7 +115,7 @@
   <g class="fade3">
     <rect x="300" y="250" width="250" height="50" class="card"/>
     <text x="425" y="272" text-anchor="middle" class="title">Validation &amp; Error Handling</text>
-    <text x="425" y="288" text-anchor="middle" class="subtitle">validate.rs · errors.rs · models.rs</text>
+    <text x="425" y="288" text-anchor="middle" class="subtitle">validate.rs · errors.rs · models/</text>
   </g>
 
   <!-- Flow down to core -->
@@ -129,7 +129,7 @@
 
     <!-- DB -->
     <text x="220" y="355" text-anchor="middle" class="title">SQLite + FTS5</text>
-    <text x="220" y="372" text-anchor="middle" class="subtitle">WAL mode · 3 tables</text>
+    <text x="220" y="372" text-anchor="middle" class="subtitle">WAL mode · 26 tables</text>
     <text x="220" y="398" text-anchor="middle" class="subtitle">storage/ · schema v55</text>
 
     <!-- Divider -->
@@ -137,7 +137,7 @@
 
     <!-- Recall -->
     <text x="425" y="355" text-anchor="middle" class="title">Hybrid Recall</text>
-    <text x="425" y="372" text-anchor="middle" class="subtitle">60/40 semantic/keyword</text>
+    <text x="425" y="372" text-anchor="middle" class="subtitle">adaptive semantic 0.50→0.15</text>
     <text x="425" y="398" text-anchor="middle" class="subtitle">reranker.rs · hnsw.rs</text>
 
     <!-- Divider -->
@@ -164,7 +164,7 @@
 
     <rect x="440" y="445" width="280" height="65" class="card-orange"/>
     <text x="580" y="468" text-anchor="middle" class="title">LLM Pipeline</text>
-    <text x="580" y="484" text-anchor="middle" class="subtitle">Ollama · Gemma 4 E2B/E4B</text>
+    <text x="580" y="484" text-anchor="middle" class="subtitle">Ollama gemma3:4b · 15+ providers</text>
     <text x="580" y="499" text-anchor="middle" class="subtitle">query expansion · auto-tag · smart+</text>
   </g>
 
@@ -186,8 +186,8 @@
     <text x="530" y="575" text-anchor="middle" class="subtitle">permanent</text>
 
     <!-- Auto-promote arrow -->
-    <path d="M 380 590 Q 400 608 420 590" class="line-green flow-anim-green" marker-end="none"/>
-    <text x="400" y="615" text-anchor="middle" class="subtitle" style="fill:#3fb950">auto-promote @ 5 accesses</text>
+    <path d="M 400 590 Q 465 615 530 590" class="line-green flow-anim-green" marker-end="none"/>
+    <text x="465" y="615" text-anchor="middle" class="subtitle" style="fill:#3fb950">mid → long auto-promote @ 5 accesses</text>
   </g>
 
   <!-- Pulsing dots on flow lines -->

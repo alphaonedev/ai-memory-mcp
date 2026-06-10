@@ -291,11 +291,11 @@ footer a{color:var(--text-muted)}
 
       <!-- Live → Archived paths -->
       <line class="ll" x1="260" y1="160" x2="500" y2="160"/>
-      <text class="lab" x="380" y="150" text-anchor="middle">memory_gc (TTL)</text>
+      <text class="lab" x="380" y="150" text-anchor="middle">memory_gc (TTL + archive_on_gc)</text>
       <line class="ll" x1="260" y1="180" x2="500" y2="180"/>
-      <text class="lab" x="380" y="125" text-anchor="middle">memory_forget (pattern)</text>
+      <text class="lab" x="380" y="125" text-anchor="middle">memory_forget (pattern, archive_on_gc)</text>
       <line class="ll" x1="260" y1="200" x2="500" y2="200"/>
-      <text class="lab" x="380" y="225" text-anchor="middle">memory_delete + archive_on_gc</text>
+      <text class="lab" x="380" y="225" text-anchor="middle">explicit archive (POST /api/v1/archive)</text>
 
       <!-- Archived → Live (restore) -->
       <line class="ll dash" x1="610" y1="220" x2="610" y2="280"/>
@@ -309,7 +309,7 @@ footer a{color:var(--text-muted)}
 
       <!-- Live → Gone (hard delete) -->
       <line class="ll" x1="260" y1="160" x2="950" y2="120" stroke-dasharray="6 6"/>
-      <text class="lab" x="600" y="105" text-anchor="middle">memory_delete + archive_on_gc=false (rare)</text>
+      <text class="lab" x="600" y="105" text-anchor="middle">memory_delete (hard delete — never archives)</text>
     </svg>
   </div>
 </section>

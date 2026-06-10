@@ -24,13 +24,13 @@ without joining through a relation table.
 ## Flow
 
 ```
-insert long memory  →  curator (Gemma 4 + tiktoken-rs)  →  N atoms
-       │                       │                              │
-       │                       │                              ├─→ atom_of = parent_id (FK)
-       │                       │                              ├─→ MemoryLink(derives_from, signed)
-       │                       │                              └─→ post_store hook chain fires per atom
+insert long memory  →  curator (resolved LLM + tiktoken-rs)  →  N atoms
+       │                       │                                  │
+       │                       │                                  ├─→ atom_of = parent_id (FK)
+       │                       │                                  ├─→ MemoryLink(derives_from, signed)
+       │                       │                                  └─→ pre/post_store hook chain fires per atom
        │                       │
-       │                       └──→ signed_events: atomisation_complete (×2)
+       │                       └──→ signed_events: atomisation_complete (×1 per atomisation)
        │
        └─→ archived_at stamped, atomised_into = N (separate transaction)
 ```
