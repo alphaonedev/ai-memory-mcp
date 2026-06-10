@@ -2296,6 +2296,122 @@ pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<V
     }
 }
 
+/// #1579 B3 — read the boot warm-up entry set (every stored
+/// embedding) over a private connection. Opened fresh so the boot
+/// loader thread never touches the request-serving connection;
+/// failures degrade to "no warm-up" with a WARN (the daemon keeps
+/// serving keyword/FTS recall — the pre-#1579 failure posture).
+pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec<f32>)>> {
+    let conn = match db::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                err = %e,
+                "HNSW boot warm-up: could not open DB; semantic index stays cold (#1579 B3)"
+            );
+            return None;
+        }
+    };
+    match db::get_all_embeddings(&conn) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "HNSW boot warm-up: get_all_embeddings failed; semantic index stays cold (#1579 B3)"
+            );
+            None
+        }
+    }
+}
+
+/// #1579 B3 — async boot HNSW warm-up for `serve`.
+///
+/// Pre-#1579 the daemon built the HNSW graph SYNCHRONOUSLY at boot
+/// (`get_all_embeddings` + `VectorIndex::build` on the startup path):
+/// P1 measured spawn→initialize at 40 s for a 10k-vector corpus and
+/// >28 min at 100k. This loader moves the whole load+build off the
+/// startup path onto a background thread, reusing the #968
+/// double-buffer rebuild machinery: the daemon binds and answers
+/// immediately with an EMPTY index; semantic recall degrades to its
+/// keyword/FTS blend until the warmed graph swaps in (the #519
+/// proactive conflict check routes to its bounded-scan fallback for
+/// the same window via [`hnsw::VectorIndex::is_fully_searchable`]).
+///
+/// Locking discipline: the `AppState.vector_index` outer mutex is
+/// held only for microsecond-scale steps (seed-extend, schedule,
+/// swap) — NEVER across the graph build, which runs detached on the
+/// #968 rebuild thread. Request handlers therefore keep making
+/// progress throughout the warm-up.
+///
+/// Emits one INFO line when the swap lands so operators can see
+/// time-to-semantic-ready in the daemon log.
+pub fn spawn_vector_index_boot_load(
+    db_path: std::path::PathBuf,
+    vector_index: Arc<tokio::sync::Mutex<Option<VectorIndex>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let Some(entries) = load_boot_index_entries(&db_path) else {
+            return;
+        };
+        if entries.is_empty() {
+            tracing::info!(
+                "HNSW boot warm-up: no stored embeddings — index starts empty (#1579 B3)"
+            );
+            return;
+        }
+        let total = entries.len();
+        // Step 1 — seed + schedule the background build under a BRIEF
+        // outer lock. The returned handle is detached from the borrow
+        // (the rebuild thread captures Arc'd internals, not `&self`),
+        // so we can join it after dropping the guard.
+        let build_handle = {
+            let guard = vector_index.blocking_lock();
+            let Some(idx) = guard.as_ref() else {
+                return;
+            };
+            idx.seed_and_rebuild_async(entries)
+        };
+        let _ = build_handle.join();
+        // Step 2 — swap the warmed graph in; loop covers the
+        // rebuild-CAS race with any routine 200-overflow rebuild that
+        // was scheduled by boot-window writes (see
+        // `VectorIndex::warm_boot` for the same contract).
+        loop {
+            let pending = {
+                let guard = vector_index.blocking_lock();
+                let Some(idx) = guard.as_ref() else {
+                    return;
+                };
+                if idx.is_fully_searchable() {
+                    None
+                } else {
+                    Some(idx.rebuild_async())
+                }
+            };
+            match pending {
+                None => break,
+                Some(handle) => {
+                    let _ = handle.join();
+                    // A no-op handle (rebuild CAS busy) joins
+                    // instantly — pace the retry so the loop doesn't
+                    // spin while the in-flight build finishes.
+                    std::thread::sleep(crate::hnsw::REBUILD_WAIT_POLL_INTERVAL);
+                }
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            entries = total,
+            elapsed_ms,
+            "HNSW index warm (#1579 B3): async boot build swapped in; \
+             semantic recall is now index-backed"
+        );
+    })
+}
+
 // ---------------------------------------------------------------------------
 // v0.7 Track H — H2 active keypair loading
 // ---------------------------------------------------------------------------
@@ -3518,7 +3634,22 @@ pub async fn bootstrap_serve(
     let feature_tier = app_config.effective_tier(None);
     let tier_config = feature_tier.config();
     let embedder = build_embedder(feature_tier, app_config).await;
-    let vector_index = build_vector_index(&conn, embedder.is_some());
+    // #1579 B3 — async boot HNSW. The daemon binds with an EMPTY
+    // index and becomes ready immediately; a background loader
+    // (`spawn_vector_index_boot_load`) reads the stored embeddings
+    // over its own connection, builds the graph on the #968 rebuild
+    // thread, and swaps it in (INFO line on swap). Until then,
+    // semantic recall serves its keyword/FTS blend and the #519
+    // proactive conflict check uses its bounded-scan fallback. The
+    // pre-#1579 synchronous build held boot for 40 s at 10k vectors
+    // and >28 min at 100k (P1 audit).
+    let vector_index_state: Arc<Mutex<Option<VectorIndex>>> = Arc::new(Mutex::new(
+        embedder.is_some().then(hnsw::VectorIndex::empty),
+    ));
+    if embedder.is_some() {
+        let _boot_index_loader =
+            spawn_vector_index_boot_load(db_path.to_path_buf(), Arc::clone(&vector_index_state));
+    }
 
     // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
     // (smart/autonomous). The HTTP `create_memory` handler reaches for
@@ -3890,7 +4021,7 @@ pub async fn bootstrap_serve(
     let app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
-        vector_index: Arc::new(Mutex::new(vector_index)),
+        vector_index: vector_index_state,
         federation: Arc::new(federation),
         tier_config: Arc::new(tier_config),
         scoring: Arc::new(app_config.effective_scoring()),
@@ -5950,6 +6081,92 @@ mod tests {
             idx.len() >= 1,
             "expected non-empty index, got len={}",
             idx.len()
+        );
+    }
+
+    // ----- #1579 B3: async boot HNSW loader ------------------------------
+
+    /// Boot-readiness contract: `spawn_vector_index_boot_load` returns
+    /// immediately (the daemon can serve requests with the EMPTY
+    /// index), the outer mutex stays responsive throughout the warm-up,
+    /// and after the loader finishes the index covers every stored
+    /// embedding and reports fully-searchable.
+    #[tokio::test]
+    async fn b3_1579_boot_loader_warms_index_off_the_startup_path() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut expected_ids = Vec::new();
+        for i in 0..3 {
+            let mem = crate::models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: crate::models::Tier::Long,
+                namespace: "ns-b3".to_string(),
+                title: format!("warm-{i}"),
+                content: format!("warm body {i}"),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".to_string(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: crate::models::default_metadata(),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+            };
+            let id = db::insert(&conn, &mem).unwrap();
+            let mut v = [0.0_f32; 3];
+            v[i] = 1.0;
+            db::set_embedding(&conn, &id, &v).unwrap();
+            expected_ids.push(id);
+        }
+        drop(conn);
+
+        // The daemon-shaped state: empty index behind the AppState
+        // mutex — exactly what `serve` now constructs before binding.
+        let state: Arc<Mutex<Option<VectorIndex>>> =
+            Arc::new(Mutex::new(Some(hnsw::VectorIndex::empty())));
+        let handle = spawn_vector_index_boot_load(env.db_path.clone(), Arc::clone(&state));
+
+        // Readiness: the state is immediately lockable (no long-held
+        // guard) — a request-path access during warm-up must not
+        // deadlock or block on the graph build.
+        {
+            let guard = state.lock().await;
+            assert!(
+                guard.is_some(),
+                "index present (possibly cold) during warm-up"
+            );
+        }
+
+        tokio::task::spawn_blocking(move || handle.join().expect("loader thread"))
+            .await
+            .expect("join task");
+
+        let guard = state.lock().await;
+        let idx = guard.as_ref().expect("index");
+        assert_eq!(idx.len(), 3, "every stored embedding seeded");
+        assert!(
+            idx.is_fully_searchable(),
+            "loader must drive the #968 rebuild to a swapped-in graph"
+        );
+        let hits = idx.search(&[1.0, 0.0, 0.0], 1);
+        assert_eq!(
+            hits.first().map(|h| h.id.as_str()),
+            Some(expected_ids[0].as_str()),
+            "warmed index serves the seeded rows"
         );
     }
 
