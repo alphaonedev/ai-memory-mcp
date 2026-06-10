@@ -1278,6 +1278,72 @@ mod tests {
         assert!(mapped.message().contains("AI_MEMORY_DB_PASSPHRASE"));
     }
 
+    // ---------------------------------------------------------------
+    // #1558 batch 5 wave 2 — `msg::` canonical wire-prose helpers.
+    // Every templated `format!` helper is pinned byte-exact (against
+    // the sibling const where one exists) so a future wording change
+    // fails loudly here instead of drifting the HTTP / MCP / CLI wire
+    // surfaces apart. Also restores the errors.rs per-module coverage
+    // floor (99%) after the helpers landed under-covered (GA-drive
+    // 2026-06-09, HEAD 90929dfd: 98.13% < 99%).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn msg_invalid_and_error_line_shapes() {
+        assert_eq!(msg::invalid("limit", "boom"), "invalid limit: boom");
+        assert_eq!(msg::error_line("boom"), "error: boom");
+    }
+
+    #[test]
+    fn msg_not_found_family_shapes() {
+        assert_eq!(
+            msg::memory_not_found("m-1"),
+            format!("{}: m-1", msg::MEMORY_NOT_FOUND)
+        );
+        assert_eq!(
+            msg::skill_not_found("sk-1"),
+            format!("{}: sk-1", msg::SKILL_NOT_FOUND)
+        );
+        assert_eq!(
+            msg::pending_action_not_found("pa-1"),
+            "pending action not found: pa-1"
+        );
+        assert_eq!(msg::not_found("x-9"), "not found: x-9");
+    }
+
+    #[test]
+    fn msg_governance_and_quota_shapes() {
+        assert_eq!(
+            msg::approve_rejected("consensus pending"),
+            "approve rejected: consensus pending"
+        );
+        assert_eq!(
+            msg::older_than_days_negative(-3),
+            "older_than_days must be non-negative (got -3)"
+        );
+    }
+
+    #[test]
+    fn msg_transport_error_shapes() {
+        assert_eq!(
+            msg::signature_verify_failed("bad sig"),
+            "signature verify failed: bad sig"
+        );
+        assert_eq!(
+            msg::zstd_decompress_body("truncated"),
+            "zstd decompress body: truncated"
+        );
+        assert_eq!(msg::network("timeout"), "network: timeout");
+        assert_eq!(msg::unsubscribe("missing id"), "unsubscribe: missing id");
+    }
+
+    #[test]
+    fn msg_fs_context_label_shapes() {
+        assert_eq!(msg::opening("/a/b.toml"), "opening /a/b.toml");
+        assert_eq!(msg::reading("/a/b.toml"), "reading /a/b.toml");
+        assert_eq!(msg::writing("/a/b.toml"), "writing /a/b.toml");
+    }
+
     #[test]
     fn from_anyhow_storage_governance_refusal_still_wins_when_chained() {
         // The original substrate `GovernanceRefusal` mapping is checked

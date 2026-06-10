@@ -2378,4 +2378,452 @@ mod tests {
             "idempotent sign-seed must preserve the existing signature bytes"
         );
     }
+
+    /// Coverage restoration (post-#1558 floor dip): drive the FULL
+    /// `run()` Add path with a `command_regex`-only matcher so the
+    /// SEC-12 deprecation-warn branch executes, the operator-key
+    /// load + sign path runs, and the rule lands in the store.
+    #[cfg(unix)]
+    #[test]
+    fn rules_add_command_regex_only_fires_deprecation_branch_and_lands_rule() {
+        let _g = forensic_lock();
+        let tdir = tempfile::tempdir().unwrap();
+        let key_path = tdir.path().join("operator.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_path, false, &mut out).unwrap();
+
+        // Full migration ladder so governance_rules (v30) exists at
+        // the path `run()` opens.
+        let db_path = tdir.path().join("rules.db");
+        drop(crate::storage::open(&db_path).expect("init schema"));
+
+        let args = RulesArgs {
+            key_dir: Some(tdir.path().to_path_buf()),
+            action: RulesAction::Add {
+                id: "R900-cov".into(),
+                kind: "bash".into(),
+                matcher: r#"{"command_regex":"rm -rf"}"#.into(),
+                severity: "refuse".into(),
+                reason: "coverage: deprecated-field branch".into(),
+                namespace: crate::quotas::GLOBAL_NAMESPACE.into(),
+                disabled: false,
+                sign: true,
+            },
+        };
+        run(&db_path, args, false, &mut out).expect("rules add --sign");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rule = rules_store::get(&conn, "R900-cov")
+            .unwrap()
+            .expect("rule landed");
+        assert!(
+            rule.signature.is_some(),
+            "rules add --sign must store a signature"
+        );
+        assert_eq!(rule.namespace, crate::quotas::GLOBAL_NAMESPACE);
+    }
+
+    /// Coverage restoration: the clap `default_value =
+    /// crate::quotas::GLOBAL_NAMESPACE` expansion on `--namespace`
+    /// (today's #1558 batch-1 routing) only executes through a real
+    /// parse — direct enum construction skips it.
+    #[test]
+    fn rules_add_namespace_clap_default_is_global() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(flatten)]
+            rules: RulesArgs,
+        }
+        let h = Harness::try_parse_from([
+            "harness",
+            "add",
+            "--id",
+            "RX",
+            "--kind",
+            "bash",
+            "--matcher",
+            "{}",
+            "--reason",
+            "cov",
+            "--sign",
+        ])
+        .expect("parse");
+        match h.rules.action {
+            RulesAction::Add { namespace, .. } => {
+                assert_eq!(namespace, crate::quotas::GLOBAL_NAMESPACE);
+            }
+            _ => panic!("expected Add"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // GA-drive 2026-06-09 (per-module floor 95%) — targeted coverage
+    // for the remaining uncovered branches: the keygen-layout parent-
+    // dir fallback (#800 Gap #6, layout 3), the layout-2 tampered-pub
+    // refusals, the `sign-seed --db` open failure, the keygen error
+    // branches, and the no-key-anywhere refusal.
+    // -----------------------------------------------------------------
+
+    /// Writer that always fails — drives the `?` error branch on the
+    /// keygen `writeln!` sites (broken-pipe propagation contract).
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test writer: broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_rules_sign_seed_db_override_open_failure_errors() {
+        let (_dir, db_path, key_dir) = fresh_env_with_operator_key();
+        // A db path whose parent directory does not exist — the
+        // subcommand-level `--db` reopen must fail with the
+        // `rules.sign-seed: open db at` context.
+        let bad_db = _dir.path().join("no-such-dir").join("x.db");
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::SignSeed {
+                key: None,
+                db: Some(bad_db),
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let err = run(&db_path, args, true, &mut out).expect_err("open must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rules.sign-seed: open db"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_create_parent_dir_failure_errors() {
+        // The `--out` parent path component is a REGULAR FILE, so
+        // create_dir_all fails (ENOTDIR) and the with_context label
+        // names the parent dir.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let key_path = blocker.join("sub").join("op.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let err = keygen_operator(&key_path, false, &mut out).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("create parent dir"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_force_warning_broken_pipe_propagates() {
+        // Existing key + --force: the stderr WARNING writeln must
+        // propagate a write failure instead of panicking.
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("operator.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_path, false, &mut out).expect("first keygen");
+
+        let mut failing = FailingWriter;
+        let mut stdout2: Vec<u8> = Vec::new();
+        let mut out2 = CliOutput {
+            stdout: &mut stdout2,
+            stderr: &mut failing,
+        };
+        let res = keygen_operator(&key_path, true, &mut out2);
+        assert!(res.is_err(), "stderr write failure must propagate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_success_line_broken_pipe_propagates() {
+        // The final fingerprint writeln to stdout fails — keys are on
+        // disk but the handler must surface the I/O error.
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("operator.key");
+        let mut failing = FailingWriter;
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut failing,
+            stderr: &mut stderr,
+        };
+        let res = keygen_operator(&key_path, false, &mut out);
+        assert!(res.is_err(), "stdout write failure must propagate");
+        assert!(key_path.exists(), "key material still lands on disk");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_seed_update_signature_failure_propagates() {
+        // An abort trigger on governance_rules makes the UPDATE fail
+        // so sign_seed_rules' update_signature `?` branch executes.
+        let tdir = tempfile::tempdir().unwrap();
+        let key_path = tdir.path().join("operator.key");
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_path, false, &mut out).unwrap();
+
+        let conn = fresh_rules_conn();
+        rules_store::insert(
+            &conn,
+            &Rule {
+                id: "R-fail-upd".into(),
+                kind: "bash".into(),
+                matcher: r#"{"command_substring":"x"}"#.into(),
+                severity: "refuse".into(),
+                reason: "t".into(),
+                namespace: "_global".into(),
+                created_by: "test".into(),
+                created_at: 0,
+                enabled: false,
+                signature: None,
+                attest_level: "unsigned".into(),
+            },
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER test_fail_sig_update BEFORE UPDATE ON governance_rules \
+             BEGIN SELECT RAISE(ABORT, 'test trigger: signature update refused'); END;",
+        )
+        .unwrap();
+        let err = sign_seed_rules(&conn, Some(&key_path), true, &mut out).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("signature update refused"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_verb_legacy_layout_load_failure_cites_key_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // operator.priv + operator.pub both present (layout 1 entry
+        // condition) but the priv mode bits are insecure → kp::load
+        // refuses and the with_context label names both files.
+        let (_dir, db_path, key_dir) = fresh_env_with_operator_key();
+        let priv_path = key_dir.join("operator.priv");
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::Enable {
+                id: "R-any".into(),
+                sign: true,
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let err = run(&db_path, args, false, &mut out).expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed loading operator.priv/operator.pub"),
+            "got: {msg}"
+        );
+        // Restore so tempdir cleanup works.
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Set up a key_dir holding the layout-2 singleton-file pair
+    /// (`operator.key` + `operator.key.pub`) and an initialized DB.
+    /// Returns (tempdir guard, db_path, key_dir).
+    #[cfg(unix)]
+    fn fresh_env_with_keygen_layout() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        drop(crate::db::open(&db_path).expect("db::open"));
+        let key_dir = dir.path().join("keys-l2");
+        std::fs::create_dir_all(&key_dir).expect("mkdir");
+        let key_file = key_dir.join(OPERATOR_KEY_FILENAME);
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_file, false, &mut out).expect("keygen");
+        (dir, db_path, key_dir)
+    }
+
+    /// Drive a mutation verb (`enable --sign`) so the key load runs;
+    /// returns the error (the rule id never resolves — every test
+    /// using this asserts on the key-load refusal that fires first).
+    #[cfg(unix)]
+    fn enable_err_with_key_dir(db_path: &Path, key_dir: std::path::PathBuf) -> anyhow::Error {
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::Enable {
+                id: "R-never".into(),
+                sign: true,
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        run(db_path, args, false, &mut out).expect_err("must error")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_layout_pub_not_base64_refused() {
+        let (_dir, db_path, key_dir) = fresh_env_with_keygen_layout();
+        std::fs::write(key_dir.join("operator.key.pub"), "!!!not-base64!!!").unwrap();
+        let err = enable_err_with_key_dir(&db_path, key_dir);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("decode base64url public key"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_layout_pub_wrong_length_refused() {
+        use base64::Engine;
+        let (_dir, db_path, key_dir) = fresh_env_with_keygen_layout();
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16]);
+        std::fs::write(key_dir.join("operator.key.pub"), short).unwrap();
+        let err = enable_err_with_key_dir(&db_path, key_dir);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("decoded to 16 bytes"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_layout_pub_mismatch_refused() {
+        use base64::Engine;
+        let (_dir, db_path, key_dir) = fresh_env_with_keygen_layout();
+        // A syntactically valid but WRONG 32-byte public key.
+        let other = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]);
+        std::fs::write(key_dir.join("operator.key.pub"), other).unwrap();
+        let err = enable_err_with_key_dir(&db_path, key_dir);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not match public key"), "got: {msg}");
+    }
+
+    /// Set up the layout-3 shape: the keygen pair lives in the PARENT
+    /// of the key_dir (`resolve_operator_key_path` singleton rationale)
+    /// while the key_dir itself is an empty `keys/` subdir.
+    #[cfg(unix)]
+    fn fresh_env_with_parent_keygen_layout()
+    -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ai-memory.db");
+        drop(crate::db::open(&db_path).expect("db::open"));
+        let key_file = dir.path().join(OPERATOR_KEY_FILENAME);
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        keygen_operator(&key_file, false, &mut out).expect("keygen");
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("mkdir keys");
+        (dir, db_path, key_dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_dir_keygen_fallback_signs_mutation_verbs() {
+        // #800 Gap #6 — a fresh `rules keygen` (parent-dir layout) +
+        // immediate `rules add --sign` must just work.
+        let (_dir, db_path, key_dir) = fresh_env_with_parent_keygen_layout();
+        let args = RulesArgs {
+            key_dir: Some(key_dir),
+            action: RulesAction::Add {
+                id: "R-l3".into(),
+                kind: "bash".into(),
+                matcher: r#"{"command_substring":"halt"}"#.into(),
+                severity: "refuse".into(),
+                reason: "layout-3 coverage".into(),
+                namespace: "_global".into(),
+                disabled: false,
+                sign: true,
+            },
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        run(&db_path, args, false, &mut out).expect("layout-3 add --sign");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let r = rules_store::get(&conn, "R-l3")
+            .unwrap()
+            .expect("rule landed");
+        assert_eq!(r.attest_level, OPERATOR_SIGNED_LEVEL);
+        assert!(r.signature.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_dir_keygen_fallback_pub_wrong_length_refused() {
+        use base64::Engine;
+        let (dir, db_path, key_dir) = fresh_env_with_parent_keygen_layout();
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 8]);
+        std::fs::write(dir.path().join("operator.key.pub"), short).unwrap();
+        let err = enable_err_with_key_dir(&db_path, key_dir);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("decoded to 8 bytes"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_dir_keygen_fallback_pub_mismatch_refused() {
+        use base64::Engine;
+        let (dir, db_path, key_dir) = fresh_env_with_parent_keygen_layout();
+        let other = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4u8; 32]);
+        std::fs::write(dir.path().join("operator.key.pub"), other).unwrap();
+        let err = enable_err_with_key_dir(&db_path, key_dir);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not match public key"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_operator_key_anywhere_names_all_layouts() {
+        // key_dir AND its parent hold no key material — the unified
+        // refusal must name every accepted layout so the operator can
+        // pick one to materialise.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ai-memory.db");
+        drop(crate::db::open(&db_path).expect("db::open"));
+        let key_dir = dir.path().join("empty-parent").join("empty-keys");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let err = enable_err_with_key_dir(&db_path, key_dir);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no operator key found"), "got: {msg}");
+        assert!(msg.contains("operator.priv"), "got: {msg}");
+        assert!(msg.contains("rules keygen"), "got: {msg}");
+    }
 }

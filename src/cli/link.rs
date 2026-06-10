@@ -260,4 +260,214 @@ mod tests {
             post.access_count
         );
     }
+
+    /// Coverage restoration (post-#1558 floor dip): `cmd_resolve`'s
+    /// validate-error propagation path — `cmd_link`'s twin is pinned
+    /// by `test_link_self_link_validation_error`, but resolve's
+    /// validate call (winner == loser ⇒ self-supersede) was not.
+    #[test]
+    fn test_resolve_self_resolve_validation_error() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let only = seed_memory(&db, "ns", "only", "self");
+        let args = ResolveArgs {
+            winner_id: only.clone(),
+            loser_id: only,
+        };
+        let mut out = env.output();
+        let err = cmd_resolve(&db, &args, false, &mut out).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("self"),
+            "self-resolve must be refused by validate_link: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // GA-drive 2026-06-09 (per-module floor 96%) — error-branch
+    // coverage for the remaining `?` propagation sites. Each fallible
+    // call's closing `)?;` line carries the error-branch region; these
+    // tests drive each Err path so the line counts as covered.
+    // -----------------------------------------------------------------
+
+    /// Writer that always fails — drives the `?` error branch on the
+    /// `writeln!` sites (the broken-pipe propagation contract that
+    /// `cli::io_writer` documents: handlers must return the I/O error,
+    /// not panic).
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test writer: broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_resolve_missing_ids_create_link_error() {
+        // Valid-format IDs that don't exist: validate passes, the
+        // create_link write refuses with the typed MemoryNotFound.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Initialize schema so the failure comes from the link write,
+        // not from a missing table.
+        drop(db::open(&db).unwrap());
+        let args = ResolveArgs {
+            winner_id: "nonexistent-winner-id".into(),
+            loser_id: "nonexistent-loser-id".into(),
+        };
+        let mut out = env.output();
+        let res = cmd_resolve(&db, &args, false, &mut out);
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains(crate::errors::msg::MEMORY_NOT_FOUND),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_update_failure_propagates() {
+        // Force db::update on the loser to fail AFTER the supersedes
+        // link landed, via an abort trigger keyed on the loser row.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let winner = seed_memory(&db, "ns", "winner", "wins");
+        let loser = seed_memory(&db, "ns", "loser", "loses");
+        let conn = db::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER test_fail_loser_update BEFORE UPDATE ON memories \
+             WHEN NEW.id = '{loser}' \
+             BEGIN SELECT RAISE(ABORT, 'test trigger: loser update refused'); END;"
+        ))
+        .unwrap();
+        drop(conn);
+        let args = ResolveArgs {
+            winner_id: winner,
+            loser_id: loser,
+        };
+        let mut out = env.output();
+        let res = cmd_resolve(&db, &args, false, &mut out);
+        assert!(res.is_err());
+        // storage::update maps the RAISE(ABORT) into its canonical
+        // constraint-violation wrap; the raw trigger prose may be
+        // swallowed by that mapping, so accept either spelling.
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("update failed") || msg.contains("loser update refused"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_touch_failure_propagates() {
+        // db::update targets only the loser; an abort trigger keyed on
+        // the winner row fires first inside db::touch.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let winner = seed_memory(&db, "ns", "winner", "wins");
+        let loser = seed_memory(&db, "ns", "loser", "loses");
+        let conn = db::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER test_fail_winner_touch BEFORE UPDATE ON memories \
+             WHEN NEW.id = '{winner}' \
+             BEGIN SELECT RAISE(ABORT, 'test trigger: winner touch refused'); END;"
+        ))
+        .unwrap();
+        drop(conn);
+        let args = ResolveArgs {
+            winner_id: winner,
+            loser_id: loser,
+        };
+        let mut out = env.output();
+        let res = cmd_resolve(&db, &args, true, &mut out);
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("winner touch refused"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_link_human_output_broken_pipe_propagates() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id1 = seed_memory(&db, "ns", "a", "ca");
+        let id2 = seed_memory(&db, "ns", "b", "cb");
+        let args = LinkArgs {
+            source_id: id1,
+            target_id: id2,
+            relation: "related_to".to_string(),
+        };
+        let mut failing = FailingWriter;
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut failing,
+            stderr: &mut stderr,
+        };
+        let res = cmd_link(&db, &args, false, &mut out);
+        assert!(res.is_err(), "broken pipe must propagate, not panic");
+    }
+
+    #[test]
+    fn test_link_json_output_broken_pipe_propagates() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id1 = seed_memory(&db, "ns", "a", "ca");
+        let id2 = seed_memory(&db, "ns", "b", "cb");
+        let args = LinkArgs {
+            source_id: id1,
+            target_id: id2,
+            relation: "related_to".to_string(),
+        };
+        let mut failing = FailingWriter;
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut failing,
+            stderr: &mut stderr,
+        };
+        let res = cmd_link(&db, &args, true, &mut out);
+        assert!(res.is_err(), "broken pipe must propagate, not panic");
+    }
+
+    #[test]
+    fn test_resolve_json_output_broken_pipe_propagates() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let winner = seed_memory(&db, "ns", "winner", "wins");
+        let loser = seed_memory(&db, "ns", "loser", "loses");
+        let args = ResolveArgs {
+            winner_id: winner,
+            loser_id: loser,
+        };
+        let mut failing = FailingWriter;
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut failing,
+            stderr: &mut stderr,
+        };
+        let res = cmd_resolve(&db, &args, true, &mut out);
+        assert!(res.is_err(), "broken pipe must propagate, not panic");
+    }
+
+    #[test]
+    fn test_resolve_human_output_broken_pipe_propagates() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let winner = seed_memory(&db, "ns", "winner", "wins");
+        let loser = seed_memory(&db, "ns", "loser", "loses");
+        let args = ResolveArgs {
+            winner_id: winner,
+            loser_id: loser,
+        };
+        let mut failing = FailingWriter;
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut failing,
+            stderr: &mut stderr,
+        };
+        let res = cmd_resolve(&db, &args, false, &mut out);
+        assert!(res.is_err(), "broken pipe must propagate, not panic");
+    }
 }

@@ -76,7 +76,11 @@ use crate::cli::CliOutput;
 use crate::migrate;
 
 /// Tracing target for schema-init events (#1562 — was emitted as a
-/// field via `target = `; now the real metadata target).
+/// field via `target = `; now the real metadata target). All three
+/// emit sites live in the postgres/AGE bootstrap branch, so the const
+/// is gated to match (sal-only builds compile this file but not the
+/// AGE path — an ungated const is dead code there).
+#[cfg(feature = "sal-postgres")]
 const TRACE_TARGET: &str = "schema_init";
 
 // ---------------------------------------------------------------------------
