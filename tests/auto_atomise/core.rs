@@ -577,9 +577,9 @@ fn test_auto_atomise_does_not_block_store_response() {
     // own work. The 50ms absolute ceiling above remains the
     // load-bearing "non-blocking" assertion.
     if m_off > Duration::from_millis(1) {
-        let ratio_x100 = m_on.as_nanos() * 100 / m_off.as_nanos().max(1);
+        let overhead_ratio_pct = m_on.as_nanos() * 100 / m_off.as_nanos().max(1);
         assert!(
-            ratio_x100 < 1000,
+            overhead_ratio_pct < 1000,
             "on/off ratio must be <10x ({m_on:?} / {m_off:?})"
         );
     }

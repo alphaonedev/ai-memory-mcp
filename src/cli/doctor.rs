@@ -1099,8 +1099,9 @@ fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
     }
 
     // ── depth-limit refusals last 24h ────────────────────────────────
-    let cutoff_24h = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-    let refusals_24h = db::doctor_reflection_depth_exceeded_count(conn, &cutoff_24h).unwrap_or(0);
+    let last_day_cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let refusals_24h =
+        db::doctor_reflection_depth_exceeded_count(conn, &last_day_cutoff).unwrap_or(0);
     facts.push(("depth_limit_refusals_24h".into(), refusals_24h.to_string()));
 
     if refusals_24h > 0 {

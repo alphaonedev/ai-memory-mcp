@@ -1,12 +1,4 @@
-# const-name-literals grandfathered baseline — burn-down to EMPTY
-# scheduled in the #1579 merge-train. Entries: relpath:identifier.
+# const-name-literals grandfathered baseline — burned down to EMPTY
+# at #1579 merge-train close (2026-06-10): all 9 grandfathered
+# value-encoding names renamed semantically. Entries: relpath:identifier.
 # Regenerate ONLY via --update-baseline (operator-gated).
-src/cli/doctor.rs:cutoff_24h
-src/mcp/tools/reflect.rs:stable_768
-src/storage/mod.rs:cutoff_24h
-tests/auto_atomise/core.rs:ratio_x100
-tests/federation_b2_hardening.rs:ahead_70s
-tests/federation_b2_hardening.rs:behind_70s
-tests/recall_scoring_parity.rs:pg_top10
-tests/recall_scoring_parity.rs:sqlite_top10
-tests/reranker_reflection_test.rs:r99

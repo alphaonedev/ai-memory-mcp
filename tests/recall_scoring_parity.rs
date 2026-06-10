@@ -179,28 +179,28 @@ async fn recall_scoring_parity_top_10_within_2_swaps() {
     // ts_rank, so absolute scores differ but the dominant factors
     // (priority + tier + access_count) line the orderings up to a
     // bounded swap.
-    let sqlite_top10: Vec<String> = sqlite_hits.iter().take(10).map(|m| m.id.clone()).collect();
-    let pg_top10: Vec<String> = pg_hits.iter().take(10).map(|m| m.id.clone()).collect();
+    let sqlite_top_hits: Vec<String> = sqlite_hits.iter().take(10).map(|m| m.id.clone()).collect();
+    let pg_top_hits: Vec<String> = pg_hits.iter().take(10).map(|m| m.id.clone()).collect();
 
-    let drift = max_position_drift(&sqlite_top10, &pg_top10);
+    let drift = max_position_drift(&sqlite_top_hits, &pg_top_hits);
     assert!(
         drift <= TOLERANCE_SWAPS,
         "top-10 ordering drift exceeded tolerance: \
-         sqlite_top10={sqlite_top10:?} \
-         pg_top10={pg_top10:?} \
+         sqlite_top_hits={sqlite_top_hits:?} \
+         pg_top_hits={pg_top_hits:?} \
          max_drift={drift} (tolerance={TOLERANCE_SWAPS})"
     );
 
     // Sanity: the union of the two top-10s must cover at least 8
     // shared ids — otherwise the orderings are recommending different
     // memories, not just shuffling.
-    let shared: usize = sqlite_top10
+    let shared: usize = sqlite_top_hits
         .iter()
-        .filter(|id| pg_top10.contains(id))
+        .filter(|id| pg_top_hits.contains(id))
         .count();
     assert!(
         shared >= 8,
         "top-10 sets must overlap on at least 8 ids (got {shared}); \
-         sqlite_top10={sqlite_top10:?} pg_top10={pg_top10:?}"
+         sqlite_top_hits={sqlite_top_hits:?} pg_top_hits={pg_top_hits:?}"
     );
 }

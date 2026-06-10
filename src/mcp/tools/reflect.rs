@@ -1163,8 +1163,8 @@ mod tests {
         // the 384-dim MiniLM mock, tripwiring the dim invariant
         // inside set_embedding.
         let src = seed_observation(&conn, "rfl-emb-fail", "obs");
-        let stable_768: Vec<f32> = (0..768).map(|i| (i as f32) * 0.001).collect();
-        db::set_embedding(&conn, &src, &stable_768).expect("seed 768-dim embedding");
+        let stable_seed_embedding: Vec<f32> = (0..768).map(|i| (i as f32) * 0.001).collect();
+        db::set_embedding(&conn, &src, &stable_seed_embedding).expect("seed 768-dim embedding");
         let emb = MockEmbedder::new_local().unwrap(); // 384-dim
         // Handle_reflect must succeed end-to-end; the substrate write
         // is independent of the embedding-store side-effect.
