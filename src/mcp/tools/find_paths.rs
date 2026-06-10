@@ -49,11 +49,10 @@ impl McpTool for FindPathsTool {
         "J7: undirected BFS over memory_links with cycle detection. Returns id chains source-first. max_depth<=7, max_results<=50."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(FindPathsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<FindPathsRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -70,10 +69,10 @@ impl McpTool for FindPathsTool {
 pub fn handle_find_paths(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     let target_id = params["target_id"]
         .as_str()
-        .ok_or("target_id is required")?;
+        .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
     validate::validate_id(target_id).map_err(|e| e.to_string())?;
 
@@ -87,7 +86,9 @@ pub fn handle_find_paths(conn: &rusqlite::Connection, params: &Value) -> Result<
     // exclude edges whose `valid_until` lies in the past. Caller can
     // pass `include_invalidated=true` to traverse the full historical
     // link graph (still covered by `memory_kg_timeline`).
-    let include_invalidated = params["include_invalidated"].as_bool().unwrap_or(false);
+    let include_invalidated = params[crate::models::field_names::INCLUDE_INVALIDATED]
+        .as_bool()
+        .unwrap_or(false);
 
     let paths = db::find_paths(
         conn,

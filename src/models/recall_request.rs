@@ -29,9 +29,17 @@
 //! runtime DTO are now the same type — option (a) in the issue rubric.
 
 use crate::models::MemoryKind;
+use crate::models::field_names;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// #1558 batch 5 wave 3 — canonical recall-mode label stamped on the
+/// `mode` response field and the `recall_observations` ledger when the
+/// hybrid (FTS+semantic) pipeline ran AND the cross-encoder reranker
+/// re-ordered the results. The plain `"hybrid"` / `"keyword"` labels
+/// stay short literals at the two emit sites.
+pub const RECALL_MODE_HYBRID_RERANK: &str = "hybrid+rerank";
 
 /// v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.
 ///
@@ -208,7 +216,7 @@ impl RecallRequest {
         // serde would surface "missing field `context`" instead; pin the
         // legacy wording here so the wire-level error envelope is stable.
         if params.get("context").and_then(Value::as_str).is_none() {
-            return Err("context is required".to_string());
+            return Err(crate::errors::msg::CONTEXT_REQUIRED.to_string());
         }
         // Clamp `limit` / `budget_tokens` so an unsigned overflow value
         // (e.g. `u64::MAX` per `limit_overflow_saturates`) doesn't
@@ -218,7 +226,7 @@ impl RecallRequest {
         // behaviour — only that it doesn't crash.
         let mut owned = params.clone();
         if let Some(obj) = owned.as_object_mut() {
-            for key in ["limit", "budget_tokens"] {
+            for key in ["limit", field_names::BUDGET_TOKENS] {
                 if let Some(v) = obj.get(key)
                     && let Some(n) = v.as_u64()
                     && n > i64::MAX as u64

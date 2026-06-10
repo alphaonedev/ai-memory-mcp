@@ -10,6 +10,40 @@ use std::time::Duration;
 
 use super::FederationConfig;
 
+// ---------------------------------------------------------------------------
+// #1558 batch 5 wave 2 — file-local catchup log helpers.
+//
+// The three catchup variants (`catchup_once_with_store`,
+// `catchup_once_legacy`, `catchup_once_for_tests`) previously spelled
+// each of these tracing templates inline, tripling every wording. The
+// helpers below are the single spelling; message bytes are IDENTICAL
+// to the prior inline macros (`tracing` level per helper unchanged).
+// ---------------------------------------------------------------------------
+
+fn log_catchup_http_skip(peer_id: &str, status: impl std::fmt::Display) {
+    tracing::debug!("catchup: peer {peer_id} returned HTTP {status} — skipping this tick");
+}
+
+fn log_catchup_unreachable(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::debug!("catchup: peer {peer_id} unreachable: {e}");
+}
+
+fn log_catchup_unparseable_body(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: peer {peer_id} returned unparseable body: {e}");
+}
+
+fn log_catchup_pull_ok(peer_id: &str, rows: usize) {
+    tracing::info!("catchup: pull: {peer_id} ok ({rows} row(s) returned)");
+}
+
+fn log_catchup_unparseable_memory(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: unparseable memory from peer {peer_id}: {e}");
+}
+
+fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
+}
+
 /// v0.6.0.1 (#320) — post-partition catchup poller.
 ///
 /// Previously a node rejoining the mesh after SIGSTOP / network blip / restart
@@ -117,7 +151,7 @@ pub(super) async fn catchup_once_with_store(
         // /api/v1/sync/since endpoint without recomputing peer config.
         let base = peer
             .sync_push_url
-            .trim_end_matches("/api/v1/sync/push")
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
 
         // Load our local vector-clock entry for this peer so we only pull
@@ -131,13 +165,7 @@ pub(super) async fn catchup_once_with_store(
             }
         };
 
-        let url = match since_opt.as_deref() {
-            Some(s) => format!(
-                "{base}/api/v1/sync/since?since={}&peer={local_id}",
-                urlencoding_encode(s)
-            ),
-            None => format!("{base}/api/v1/sync/since?peer={local_id}"),
-        };
+        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
 
         // v0.7.0 #239 — attach `x-peer-id` to the outbound /sync/since
         // GET so the peer's per-peer namespace allowlist can scope
@@ -168,20 +196,16 @@ pub(super) async fn catchup_once_with_store(
                 local_id.as_str(),
             );
         if let Some(ref key) = config.api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                tracing::debug!(
-                    "catchup: peer {} returned HTTP {} — skipping this tick",
-                    peer.id,
-                    r.status()
-                );
+                log_catchup_http_skip(&peer.id, r.status());
                 continue;
             }
             Err(e) => {
-                tracing::debug!("catchup: peer {} unreachable: {e}", peer.id);
+                log_catchup_unreachable(&peer.id, e);
                 continue;
             }
         };
@@ -189,7 +213,7 @@ pub(super) async fn catchup_once_with_store(
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("catchup: peer {} returned unparseable body: {e}", peer.id);
+                log_catchup_unparseable_body(&peer.id, e);
                 continue;
             }
         };
@@ -206,11 +230,7 @@ pub(super) async fn catchup_once_with_store(
         // The "pull: <peer-id> ok" tag pins the canonical wording
         // pinned by the regression test in
         // `tests/federation_catchup_api_key.rs`.
-        tracing::info!(
-            "catchup: pull: {} ok ({} row(s) returned)",
-            peer.id,
-            memories.len(),
-        );
+        log_catchup_pull_ok(&peer.id, memories.len());
 
         if memories.is_empty() {
             continue;
@@ -231,12 +251,14 @@ pub(super) async fn catchup_once_with_store(
             // it MUST round-trip every row regardless of metadata.scope
             // so the receiving daemon has the full snapshot. Use the
             // admin builder to bypass the SAL visibility filter.
-            let ctx = crate::store::CallerContext::for_admin("federation-catchup");
+            let ctx = crate::store::CallerContext::for_admin(
+                crate::identity::sentinels::FEDERATION_CATCHUP,
+            );
             for raw in &memories {
                 let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::warn!("catchup: unparseable memory from peer {}: {e}", peer.id);
+                        log_catchup_unparseable_memory(&peer.id, e);
                         continue;
                     }
                 };
@@ -262,7 +284,7 @@ pub(super) async fn catchup_once_with_store(
             if let Some(ts) = latest_ts.as_deref() {
                 let lock = db.lock().await;
                 if let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts) {
-                    tracing::warn!("catchup: sync_state_observe failed for {}: {e}", peer.id);
+                    log_catchup_sync_state_observe_failed(&peer.id, e);
                 }
             }
         } else {
@@ -271,7 +293,7 @@ pub(super) async fn catchup_once_with_store(
                 let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::warn!("catchup: unparseable memory from peer {}: {e}", peer.id);
+                        log_catchup_unparseable_memory(&peer.id, e);
                         continue;
                     }
                 };
@@ -291,7 +313,7 @@ pub(super) async fn catchup_once_with_store(
             if let Some(ts) = latest_ts.as_deref()
                 && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts)
             {
-                tracing::warn!("catchup: sync_state_observe failed for {}: {e}", peer.id);
+                log_catchup_sync_state_observe_failed(&peer.id, e);
             }
         }
 
@@ -316,7 +338,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
     for peer in &config.peers {
         let base = peer
             .sync_push_url
-            .trim_end_matches("/api/v1/sync/push")
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
 
         let since_opt: Option<String> = {
@@ -327,13 +349,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             }
         };
 
-        let url = match since_opt.as_deref() {
-            Some(s) => format!(
-                "{base}/api/v1/sync/since?since={}&peer={local_id}",
-                urlencoding_encode(s)
-            ),
-            None => format!("{base}/api/v1/sync/since?peer={local_id}"),
-        };
+        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
 
         // v0.7.0 #239 — attach `x-peer-id` so the peer's per-peer
         // namespace allowlist can scope the returned rows (sqlite
@@ -352,20 +368,16 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 local_id.as_str(),
             );
         if let Some(ref key) = config.api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                tracing::debug!(
-                    "catchup: peer {} returned HTTP {} — skipping this tick",
-                    peer.id,
-                    r.status()
-                );
+                log_catchup_http_skip(&peer.id, r.status());
                 continue;
             }
             Err(e) => {
-                tracing::debug!("catchup: peer {} unreachable: {e}", peer.id);
+                log_catchup_unreachable(&peer.id, e);
                 continue;
             }
         };
@@ -373,7 +385,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("catchup: peer {} returned unparseable body: {e}", peer.id);
+                log_catchup_unparseable_body(&peer.id, e);
                 continue;
             }
         };
@@ -385,11 +397,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
 
         // #935 — emit the canonical "pull: <peer> ok" success line
         // pinned by `tests/federation_catchup_api_key.rs`.
-        tracing::info!(
-            "catchup: pull: {} ok ({} row(s) returned)",
-            peer.id,
-            memories.len(),
-        );
+        log_catchup_pull_ok(&peer.id, memories.len());
 
         if memories.is_empty() {
             continue;
@@ -403,7 +411,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::warn!("catchup: unparseable memory from peer {}: {e}", peer.id);
+                        log_catchup_unparseable_memory(&peer.id, e);
                         continue;
                     }
                 };
@@ -423,7 +431,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             if let Some(ts) = latest_ts.as_deref()
                 && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts)
             {
-                tracing::warn!("catchup: sync_state_observe failed for {}: {e}", peer.id);
+                log_catchup_sync_state_observe_failed(&peer.id, e);
             }
         }
 
@@ -460,9 +468,9 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
     for peer in &config.peers {
         let base = peer
             .sync_push_url
-            .trim_end_matches("/api/v1/sync/push")
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
-        let url = format!("{base}/api/v1/sync/since?peer={local_id}");
+        let url = sync_since_url(&base, &local_id, None);
 
         let mut req = config
             .client
@@ -473,20 +481,16 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
                 local_id.as_str(),
             );
         if let Some(ref key) = config.api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                tracing::debug!(
-                    "catchup: peer {} returned HTTP {} — skipping this tick",
-                    peer.id,
-                    r.status()
-                );
+                log_catchup_http_skip(&peer.id, r.status());
                 continue;
             }
             Err(e) => {
-                tracing::debug!("catchup: peer {} unreachable: {e}", peer.id);
+                log_catchup_unreachable(&peer.id, e);
                 continue;
             }
         };
@@ -494,7 +498,7 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("catchup: peer {} returned unparseable body: {e}", peer.id);
+                log_catchup_unparseable_body(&peer.id, e);
                 continue;
             }
         };
@@ -503,11 +507,26 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        tracing::info!(
-            "catchup: pull: {} ok ({} row(s) returned)",
-            peer.id,
-            memories.len(),
-        );
+        log_catchup_pull_ok(&peer.id, memories.len());
+    }
+}
+
+/// Build the outbound `/api/v1/sync/since` catch-up URL for `base`
+/// (the peer base URL with the push suffix already trimmed): optional
+/// `since` vector-clock cursor + the local peer id. ONE builder so the
+/// three catch-up paths (store-backed, legacy, test harness) cannot
+/// drift on the query shape (#1558 batch 4).
+fn sync_since_url(base: &str, local_id: &str, since: Option<&str>) -> String {
+    match since {
+        Some(s) => format!(
+            "{base}{}?since={}&peer={local_id}",
+            crate::handlers::routes::SYNC_SINCE,
+            urlencoding_encode(s)
+        ),
+        None => format!(
+            "{base}{}?peer={local_id}",
+            crate::handlers::routes::SYNC_SINCE
+        ),
     }
 }
 

@@ -62,7 +62,7 @@ pub fn run(
     } else if let Some(mem) = db::get_by_prefix(&conn, &args.id)? {
         mem.id
     } else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     };
     let tier = args.tier.as_deref().and_then(Tier::from_str);
@@ -134,7 +134,7 @@ pub fn run(
         args.expected_version,
     )?;
     if !found {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
     if let Some(mem) = db::get(&conn, &resolved_id)? {
@@ -146,7 +146,7 @@ pub fn run(
                     .get("agent_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default(),
-                "default_fallback",
+                crate::audit::synthesis_sources::DEFAULT_FALLBACK,
                 None,
             ),
             crate::audit::target_memory(

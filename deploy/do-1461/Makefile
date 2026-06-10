@@ -85,7 +85,13 @@ report: ## Print the most recent verification + full-spectrum-test + atlas repor
 	      || echo "no $$pfx report yet — run 'make $$([ $$pfx = verify ] && echo validate || ([ $$pfx = atlas ] && echo atlas || echo test))'"; \
 	  done
 
-down: preflight require-token ## terraform destroy (DESTRUCTIVE — tears the fleet down)
+down: preflight require-token ## terraform destroy (DESTRUCTIVE) + wipe per-fleet state for a clean rebuild
 	@echo "About to DESTROY the entire do-1461 fleet. Ctrl-C within 5s to abort."; sleep 5
-	cd $(TF_DIR) && terraform destroy -input=false -auto-approve
-	@echo "down OK — fleet destroyed"
+	-cd $(TF_DIR) && terraform destroy -input=false -auto-approve
+	@$(MAKE) --no-print-directory clean-state
+	@echo "down OK — fleet destroyed (note: a region's DEFAULT VPC cannot be deleted by DO and persists as an empty, dataless container; it is reused on the next 'up' and does not affect reproducibility)"
+
+clean-state: ## wipe per-fleet IP-bound generated state (TLS/secrets/render/inventory) so a fresh provision regenerates certs/secrets for the NEW fleet's IPs
+	@RUN="$${DO_1461_RUN_DIR:-../../.local-runs/do-1461}"; \
+	  rm -rf "$$RUN/tls" "$$RUN/secrets" "$$RUN/render" "$$RUN/inventory.json"; \
+	  echo "clean-state OK — wiped $$RUN/{tls,secrets,render,inventory.json} (reports/ retained). REQUIRED between a teardown and a fresh rebuild: TLS server certs embed the fleet's per-node IPs (Leg-3 verify-full), so reusing them across a destroy+apply (which reassigns IPs) fails cert validation. A fresh provision now regenerates everything bound to the new IPs — the reproducible clean-room contract."

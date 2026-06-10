@@ -1,0 +1,31 @@
+# hardcoded-literal duplication baseline (ratchet; counts may only DECREASE).
+# Regenerate with: scripts/check-hardcoded-literals.sh --update-baseline
+# Format: <site-count><TAB><literal>. Burn this down; never grow it.
+3	AI_MEMORY_LLM_API_KEY
+3	AI_MEMORY_LLM_BACKEND
+4	AI_MEMORY_LLM_BASE_URL
+3	ANTHROPIC_API_KEY
+4	{}/api/tags
+3	application/json
+3	confidence
+3	content-type
+4	create_time
+4	{decision}
+3	GOOGLE_API_KEY
+9	http://localhost:11434
+5	mini_lm_l6_v2
+3	nomic-ai/nomic-embed-text-v1.5
+4	nomic-embed-text-v1.5
+4	nomic_embed_v15
+3	OPENAI_API_KEY
+6	openrouter
+3	schema_version
+4	sentence-transformers/all-MiniLM-L6-v2
+5	T0-A1-CORE
+4	T0-A2-CORE
+3	T0-A2-FULL
+3	T0-A2-GRAPH
+3	T0-CONTRACT
+6	to_describe_to_user
+3	What tools do you have available right now? Answer in one sentence to a non-technical user.
+3	XAI_API_KEY

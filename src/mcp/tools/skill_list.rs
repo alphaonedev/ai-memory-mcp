@@ -8,6 +8,7 @@
 //! metadata (name, description, id, namespace, created_at, digest_hex)
 //! but does NOT decompress or return the `body_blob`.
 
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -81,24 +82,24 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
             "id": id,
             "namespace": ns,
             "name": name,
-            "description": description,
+            (field_names::DESCRIPTION): description,
             "digest": digest_hex,
-            "created_at": created_at,
+            (field_names::CREATED_AT): created_at,
         });
 
         if let Some(lic) = license {
             entry["license"] = json!(lic);
         }
         if let Some(compat) = compatibility {
-            entry["compatibility"] = json!(compat);
+            entry[field_names::COMPATIBILITY] = json!(compat);
         }
         if let Some(tools_json) = allowed_tools {
             if let Ok(v) = serde_json::from_str::<Value>(&tools_json) {
-                entry["allowed_tools"] = v;
+                entry[field_names::ALLOWED_TOOLS] = v;
             }
         }
         if let Some(agent) = signing_agent {
-            entry["signing_agent"] = json!(agent);
+            entry[field_names::SIGNING_AGENT] = json!(agent);
         }
         // metadata is a JSON string — include it parsed.
         if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
@@ -150,11 +151,10 @@ impl McpTool for SkillListTool {
         "L1-5: discovery (name, description, id, namespace, digest, metadata). Use memory_skill_get for body."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillListRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

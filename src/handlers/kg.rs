@@ -25,6 +25,7 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::models::Memory;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -35,6 +36,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::validate;
 
 use super::AppState;
@@ -88,7 +90,7 @@ pub async fn entity_register(
     if let Err(e) = validate::validate_namespace(&body.namespace) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid namespace: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
     }
@@ -109,7 +111,7 @@ pub async fn entity_register(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid agent_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
     }
@@ -194,11 +196,11 @@ pub async fn entity_register(
                         StatusCode::ACCEPTED,
                         Json(json!({
                             "status": "pending",
-                            "pending_id": pending_id,
-                            "reason": "governance requires approval",
+                            (field_names::PENDING_ID): pending_id,
+                            "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                             "action": "store",
                             "namespace": body.namespace,
-                            "storage_backend": "postgres",
+                            (field_names::STORAGE_BACKEND): "postgres",
                         })),
                     )
                         .into_response();
@@ -227,7 +229,7 @@ pub async fn entity_register(
                 },
                 Json(json!({
                     "entity_id": reg.entity_id,
-                    "canonical_name": reg.canonical_name,
+                    (field_names::CANONICAL_NAME): reg.canonical_name,
                     "namespace": reg.namespace,
                     "aliases": reg.aliases,
                     "created": reg.created,
@@ -257,7 +259,7 @@ pub async fn entity_register(
                 status,
                 Json(json!({
                     "entity_id": reg.entity_id,
-                    "canonical_name": reg.canonical_name,
+                    (field_names::CANONICAL_NAME): reg.canonical_name,
                     "namespace": reg.namespace,
                     "aliases": reg.aliases,
                     "created": reg.created,
@@ -273,12 +275,7 @@ pub async fn entity_register(
             if msg.contains("non-entity memory") {
                 return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }
@@ -313,7 +310,7 @@ pub async fn entity_get_by_alias(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid namespace: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
     }
@@ -339,7 +336,7 @@ pub async fn entity_get_by_alias(
                         .get(crate::HEADER_AGENT_ID)
                         .and_then(|v| v.to_str().ok());
                     crate::identity::resolve_http_agent_id(None, header_agent_id)
-                        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+                        .unwrap_or_else(|_| crate::identity::anonymous_request_id())
                 };
                 let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
                 let ctx_admin =
@@ -356,7 +353,7 @@ pub async fn entity_get_by_alias(
                     return Json(json!({
                         "found": true,
                         "entity_id": rec.entity_id,
-                        "canonical_name": rec.canonical_name,
+                        (field_names::CANONICAL_NAME): rec.canonical_name,
                         "namespace": rec.namespace,
                         "aliases": rec.aliases,
                     }))
@@ -408,7 +405,7 @@ pub async fn entity_get_by_alias(
                         return Json(json!({
                             "found": true,
                             "entity_id": m.id,
-                            "canonical_name": m.title,
+                            (field_names::CANONICAL_NAME): m.title,
                             "namespace": m.namespace,
                             "aliases": aliases,
                         }))
@@ -418,7 +415,7 @@ pub async fn entity_get_by_alias(
                 Json(json!({
                     "found": false,
                     "entity_id": null,
-                    "canonical_name": null,
+                    (field_names::CANONICAL_NAME): null,
                     "namespace": null,
                     "aliases": [],
                 }))
@@ -437,7 +434,7 @@ pub async fn entity_get_by_alias(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
@@ -462,7 +459,7 @@ pub async fn entity_get_by_alias(
                 return Json(json!({
                     "found": false,
                     "entity_id": null,
-                    "canonical_name": null,
+                    (field_names::CANONICAL_NAME): null,
                     "namespace": null,
                     "aliases": [],
                 }))
@@ -471,7 +468,7 @@ pub async fn entity_get_by_alias(
             Json(json!({
                 "found": true,
                 "entity_id": rec.entity_id,
-                "canonical_name": rec.canonical_name,
+                (field_names::CANONICAL_NAME): rec.canonical_name,
                 "namespace": rec.namespace,
                 "aliases": rec.aliases,
             }))
@@ -480,19 +477,12 @@ pub async fn entity_get_by_alias(
         Ok(None) => Json(json!({
             "found": false,
             "entity_id": null,
-            "canonical_name": null,
+            (field_names::CANONICAL_NAME): null,
             "namespace": null,
             "aliases": [],
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -516,7 +506,7 @@ pub async fn kg_timeline(
     if let Err(e) = validate::validate_id(&p.source_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -577,7 +567,7 @@ pub async fn kg_timeline(
             .to_string();
         let target = mem
             .metadata
-            .get("target_agent_id")
+            .get(field_names::TARGET_AGENT_ID)
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -597,7 +587,7 @@ pub async fn kg_timeline(
                         tracing::error!("kg_timeline: source lookup failed (postgres): {e:?}");
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": "internal server error"})),
+                            Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                         )
                             .into_response();
                     }
@@ -612,7 +602,7 @@ pub async fn kg_timeline(
                     tracing::error!("kg_timeline: source lookup failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }
@@ -628,7 +618,7 @@ pub async fn kg_timeline(
                     tracing::error!("kg_timeline: source lookup failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }
@@ -641,22 +631,26 @@ pub async fn kg_timeline(
             Json(json!({
                 "found": false,
                 "source_id": p.source_id,
-                "error": "source memory not found",
+                "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
             })),
         )
             .into_response();
     };
     let is_unowned_legacy = owner.is_empty();
-    if !is_unowned_legacy && owner != caller && target != caller && caller != "daemon" {
+    if !is_unowned_legacy
+        && owner != caller
+        && target != caller
+        && caller != sentinels::DAEMON_PRINCIPAL
+    {
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "GET /api/v1/kg/timeline 403: caller {caller} != owner {owner} (source_id={})",
             p.source_id
         );
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "caller does not own this source memory",
+                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
                 "owner": owner,
                 "caller": caller,
                 "source_id": p.source_id,
@@ -688,11 +682,11 @@ pub async fn kg_timeline(
                         json!({
                             "target_id": e.target_id,
                             "relation": e.relation,
-                            "valid_from": e.valid_from,
-                            "valid_until": e.valid_until,
-                            "observed_by": e.observed_by,
+                            (field_names::VALID_FROM): e.valid_from,
+                            (field_names::VALID_UNTIL): e.valid_until,
+                            (field_names::OBSERVED_BY): e.observed_by,
                             "title": e.title,
-                            "target_namespace": e.target_namespace,
+                            (field_names::TARGET_NAMESPACE): e.target_namespace,
                         })
                     })
                     .collect();
@@ -716,11 +710,11 @@ pub async fn kg_timeline(
                     json!({
                         "target_id": e.target_id,
                         "relation": e.relation,
-                        "valid_from": e.valid_from,
-                        "valid_until": e.valid_until,
-                        "observed_by": e.observed_by,
+                        (field_names::VALID_FROM): e.valid_from,
+                        (field_names::VALID_UNTIL): e.valid_until,
+                        (field_names::OBSERVED_BY): e.observed_by,
                         "title": e.title,
-                        "target_namespace": e.target_namespace,
+                        (field_names::TARGET_NAMESPACE): e.target_namespace,
                     })
                 })
                 .collect();
@@ -731,14 +725,7 @@ pub async fn kg_timeline(
             }))
             .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -816,7 +803,7 @@ pub async fn kg_invalidate(
                     .to_string();
                 let target = mem
                     .metadata
-                    .get("target_agent_id")
+                    .get(field_names::TARGET_AGENT_ID)
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -827,7 +814,7 @@ pub async fn kg_invalidate(
                 tracing::error!("kg_invalidate: source lookup failed: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response();
             }
@@ -841,22 +828,26 @@ pub async fn kg_invalidate(
                 "source_id": body.source_id,
                 "target_id": body.target_id,
                 "relation": body.relation,
-                "error": "source memory not found",
+                "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
             })),
         )
             .into_response();
     };
     let is_unowned_legacy = owner.is_empty();
-    if !is_unowned_legacy && owner != caller && target != caller && caller != "daemon" {
+    if !is_unowned_legacy
+        && owner != caller
+        && target != caller
+        && caller != sentinels::DAEMON_PRINCIPAL
+    {
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/kg/invalidate 403: caller {caller} != owner {owner} (source_id={})",
             body.source_id
         );
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "caller does not own this source memory",
+                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
                 "owner": owner,
                 "caller": caller,
                 "source_id": body.source_id,
@@ -889,8 +880,8 @@ pub async fn kg_invalidate(
                     "source_id": body.source_id,
                     "target_id": body.target_id,
                     "relation": body.relation,
-                    "valid_until": res.valid_until,
-                    "previous_valid_until": res.previous_valid_until,
+                    (field_names::VALID_UNTIL): res.valid_until,
+                    (field_names::PREVIOUS_VALID_UNTIL): res.previous_valid_until,
                 })),
             )
                 .into_response(),
@@ -923,8 +914,8 @@ pub async fn kg_invalidate(
                 "source_id": body.source_id,
                 "target_id": body.target_id,
                 "relation": body.relation,
-                "valid_until": res.valid_until,
-                "previous_valid_until": res.previous_valid_until,
+                (field_names::VALID_UNTIL): res.valid_until,
+                (field_names::PREVIOUS_VALID_UNTIL): res.previous_valid_until,
             })),
         )
             .into_response(),
@@ -938,14 +929,7 @@ pub async fn kg_invalidate(
             })),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -988,7 +972,7 @@ pub async fn kg_find_paths(
     if let Err(e) = validate::validate_id(&body.source_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -1012,7 +996,7 @@ pub async fn kg_find_paths(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -1036,7 +1020,7 @@ pub async fn kg_find_paths(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Recall,
-                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::actor(sentinels::AI_HTTP, "http_body", None),
                         crate::audit::target_memory(
                             body.source_id.clone(),
                             String::new(),
@@ -1185,7 +1169,7 @@ pub async fn kg_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -1206,7 +1190,7 @@ pub async fn kg_query(
     if let Err(e) = validate::validate_id(&source_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -1380,11 +1364,11 @@ pub async fn kg_query(
                     json!({
                         "target_id": n.target_id,
                         "relation": n.relation,
-                        "valid_from": n.valid_from,
-                        "valid_until": n.valid_until,
-                        "observed_by": n.observed_by,
+                        (field_names::VALID_FROM): n.valid_from,
+                        (field_names::VALID_UNTIL): n.valid_until,
+                        (field_names::OBSERVED_BY): n.observed_by,
                         "title": n.title,
-                        "target_namespace": n.target_namespace,
+                        (field_names::TARGET_NAMESPACE): n.target_namespace,
                         "depth": n.depth,
                         "path": n.path,
                     })
@@ -1412,12 +1396,7 @@ pub async fn kg_query(
                 )
                     .into_response();
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }

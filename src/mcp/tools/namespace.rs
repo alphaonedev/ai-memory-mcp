@@ -3,8 +3,11 @@
 
 //! MCP namespace standard-policy handlers and governance helpers.
 
+use crate::identity::sentinels;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::GovernancePolicy;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,11 +50,10 @@ impl McpTool for NamespaceSetStandardTool {
         "Standard memory auto-prepended to recall + session_start. Rule layering: global '*' + parent chain + namespace. Task 1.8: governance policy merged into metadata. P4/G1: inherit flag."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NamespaceSetStandardRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NamespaceSetStandardRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -82,11 +84,10 @@ impl McpTool for NamespaceGetStandardTool {
         "Returns the standard. inherit=true (Task 1.6) returns the resolved chain (global '*' -> ancestors -> namespace)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NamespaceGetStandardRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NamespaceGetStandardRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -113,11 +114,10 @@ impl McpTool for NamespaceClearStandardTool {
         "Clear the namespace standard."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(NamespaceClearStandardRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<NamespaceClearStandardRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -127,9 +127,11 @@ pub fn handle_namespace_set_standard(
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let parent = params["parent"].as_str();
     if let Some(p) = parent {
@@ -142,7 +144,7 @@ pub fn handle_namespace_set_standard(
     // audit trail captures intent even on validate/storage failure
     // downstream. MCP callers resolve via `identity::resolve_agent_id`.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -150,9 +152,9 @@ pub fn handle_namespace_set_standard(
         "",
         serde_json::json!({
             "namespace": namespace,
-            "standard_id": id,
+            (field_names::STANDARD_ID): id,
             "parent": parent,
-            "has_governance": params.get("governance").is_some_and(|v| !v.is_null()),
+            "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
         }),
     );
 
@@ -178,17 +180,17 @@ pub fn handle_namespace_set_standard(
     // remain gated by this check; daemon-internal callers and tests
     // that don't claim identity get the legacy posture.
     let identity_claimed = params
-        .get("agent_id")
+        .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
     if identity_claimed && let Ok(Some(existing_mem)) = db::get(conn, id) {
         let recorded_owner = existing_mem
             .metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
             return Err(format!(
                 "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
             ));
@@ -196,7 +198,7 @@ pub fn handle_namespace_set_standard(
         // Unowned-legacy claim — rewrite metadata.agent_id to caller
         // so subsequent calls are gated. No-op when caller is the
         // anonymous fallback (don't anchor ownership to anonymous).
-        if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+        if is_unowned && !caller.is_empty() && caller != sentinels::ANONYMOUS_INVALID {
             let mut new_meta = if existing_mem.metadata.is_object() {
                 existing_mem.metadata.clone()
             } else {
@@ -253,23 +255,23 @@ pub fn handle_namespace_set_standard(
     // validate the merged blob's typed shape, and write the FULL merged
     // JSON back — so unknown-to-the-struct fields on either side survive
     // the round-trip.
-    let governance_val = params.get("governance").filter(|v| !v.is_null());
+    let governance_val = params.get(param_names::GOVERNANCE).filter(|v| !v.is_null());
     if let Some(g) = governance_val {
         // Load the standard memory first so we can read its existing
         // governance blob and merge.
         let mut mem = db::get(conn, id)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("memory not found: {id}"))?;
+            .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
         // Compute the merged governance JSON: existing fields preserved,
         // incoming overrides applied per-key.
-        let merged = merge_governance_fields(mem.metadata.get("governance"), g);
+        let merged = merge_governance_fields(mem.metadata.get(param_names::GOVERNANCE), g);
         // Validate the typed shape of the result. Deserialising drops
         // unknown fields but the typed sub-set must still parse + pass
         // policy validation — this catches operator typos in known
         // fields without rejecting extras like
         // `require_approval_above_depth`.
         let policy: crate::models::GovernancePolicy = serde_json::from_value(merged.clone())
-            .map_err(|e| format!("invalid governance: {e}"))?;
+            .map_err(|e| crate::errors::msg::invalid(param_names::GOVERNANCE, e))?;
         validate::validate_governance_policy(&policy).map_err(|e| e.to_string())?;
 
         let mut metadata = if mem.metadata.is_object() {
@@ -278,7 +280,7 @@ pub fn handle_namespace_set_standard(
             serde_json::json!({})
         };
         if let Some(obj) = metadata.as_object_mut() {
-            obj.insert("governance".to_string(), merged);
+            obj.insert(crate::META_KEY_GOVERNANCE.to_string(), merged);
         }
         let (found, _) = db::update(
             conn,
@@ -301,12 +303,12 @@ pub fn handle_namespace_set_standard(
     }
 
     db::set_namespace_standard(conn, namespace, id, parent).map_err(|e| e.to_string())?;
-    let mut resp = json!({"set": true, "namespace": namespace, "standard_id": id});
+    let mut resp = json!({"set": true, "namespace": namespace, (field_names::STANDARD_ID): id});
     if let Some(p) = parent {
         resp["parent"] = json!(p);
     }
     if let Some(g) = governance_val {
-        resp["governance"] = g.clone();
+        resp[field_names::GOVERNANCE] = g.clone();
     }
     Ok(resp)
 }
@@ -317,7 +319,7 @@ pub fn handle_namespace_get_standard(
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
 
     // Task 1.6: --inherit returns the full resolved chain, most-general-first.
@@ -330,11 +332,11 @@ pub fn handle_namespace_get_standard(
                 let gov = extract_governance(&std);
                 let entry = json!({
                     "namespace": link,
-                    "standard_id": std["id"].clone(),
+                    (field_names::STANDARD_ID): std["id"].clone(),
                     "title": std["title"].clone(),
                     "content": std["content"].clone(),
                     "priority": std["priority"].clone(),
-                    "governance": gov,
+                    (field_names::GOVERNANCE): gov,
                 });
                 standards.push(entry);
             }
@@ -369,19 +371,19 @@ pub fn handle_namespace_get_standard(
                     let gov = merge_governance_for_response(&m.metadata);
                     Ok(json!({
                         "namespace": namespace,
-                        "standard_id": id,
+                        (field_names::STANDARD_ID): id,
                         "title": m.title,
                         "content": m.content,
                         "priority": m.priority,
-                        "governance": gov,
+                        (field_names::GOVERNANCE): gov,
                     }))
                 }
                 None => Ok(
-                    json!({"namespace": namespace, "standard_id": id, "warning": "standard memory not found — may have been deleted"}),
+                    json!({"namespace": namespace, (field_names::STANDARD_ID): id, "warning": "standard memory not found — may have been deleted"}),
                 ),
             }
         }
-        None => Ok(json!({"namespace": namespace, "standard_id": null})),
+        None => Ok(json!({"namespace": namespace, (field_names::STANDARD_ID): null})),
     }
 }
 
@@ -452,7 +454,10 @@ fn merge_governance_for_response(metadata: &Value) -> Value {
     // every key that wasn't already produced by the typed serialisation
     // (keys present in both are byte-equal because the typed struct
     // was deserialised from the same JSON).
-    if let Some(raw) = metadata.get("governance").and_then(Value::as_object) {
+    if let Some(raw) = metadata
+        .get(param_names::GOVERNANCE)
+        .and_then(Value::as_object)
+    {
         for (k, v) in raw {
             merged.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -470,7 +475,7 @@ fn merge_governance_for_response(metadata: &Value) -> Value {
 /// the typed [`GovernancePolicy`] whitelist, dropping every off-struct
 /// field. See [`merge_governance_for_response`] for the merge contract.
 pub(super) fn extract_governance(mem_val: &Value) -> Value {
-    let Some(meta) = mem_val.get("metadata") else {
+    let Some(meta) = mem_val.get(param_names::METADATA) else {
         return serde_json::to_value(GovernancePolicy::default()).unwrap_or(Value::Null);
     };
     merge_governance_for_response(meta)
@@ -482,12 +487,12 @@ pub(crate) fn handle_namespace_clear_standard(
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     validate::validate_namespace(namespace).map_err(|e| e.to_string())?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",

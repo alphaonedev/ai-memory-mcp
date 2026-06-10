@@ -36,6 +36,9 @@ use std::path::Path;
 
 use crate::cli::CliOutput;
 
+/// Shared `.context` label for the chain-report write paths (#1558 batch 6).
+const CTX_WRITE_CHAIN_REPORT: &str = "write chain report";
+
 /// Arguments for `ai-memory verify-signed-events-chain`.
 #[derive(clap::Args, Debug)]
 pub struct VerifySignedEventsChainArgs {
@@ -94,7 +97,7 @@ pub fn run(
                 chain_holds: holds,
             };
             let json = serde_json::to_string_pretty(&wire).context("serialize chain report")?;
-            writeln!(out.stdout, "{json}").context("write chain report")?;
+            writeln!(out.stdout, "{json}").context(CTX_WRITE_CHAIN_REPORT)?;
         }
         _ => {
             // text — one-line summary on stdout.
@@ -104,7 +107,7 @@ pub fn run(
                     "verify-signed-events-chain OK: {} row(s) walked, chain holds",
                     report.rows_checked,
                 )
-                .context("write chain report")?;
+                .context(CTX_WRITE_CHAIN_REPORT)?;
             } else {
                 let where_ = report
                     .chain_break
@@ -115,7 +118,7 @@ pub fn run(
                      ({} row(s) walked)",
                     report.rows_checked,
                 )
-                .context("write chain report")?;
+                .context(CTX_WRITE_CHAIN_REPORT)?;
             }
         }
     }

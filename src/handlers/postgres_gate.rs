@@ -11,6 +11,8 @@
 #![allow(clippy::too_many_lines)]
 
 #[cfg(feature = "sal")]
+use crate::models::field_names;
+#[cfg(feature = "sal")]
 use axum::{
     Json,
     extract::{Request, State},
@@ -57,7 +59,7 @@ pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
     // current binary — this branch survives so historic clients on
     // older binaries still get a useful pointer instead of a
     // confusing "feature missing" message.
-    let remediation = if endpoint == "/api/v1/find_paths" {
+    let remediation = if endpoint == super::routes::FIND_PATHS {
         "POST /api/v1/kg/find_paths instead (same handler; the bare /find_paths path is now an alias on v0.7.0+ binaries). Accepts both `source_id`/`target_id` and `from_id`/`to_id` body fields."
     } else {
         "use sqlite-backed daemon or wait for v0.7.x trait coverage"
@@ -67,7 +69,7 @@ pub fn postgres_not_implemented(endpoint: &'static str) -> Response {
         Json(json!({
             "error": "endpoint not yet implemented for postgres-backed daemon",
             "endpoint": endpoint,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
             "remediation": remediation,
         })),
     )
@@ -96,95 +98,94 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
     use axum::http::Method;
 
     // Health and metadata always pass through — they don't touch user data.
-    if path == "/api/v1/health"
-        || path == "/api/v1/capabilities"
-        || path == "/metrics"
-        || path == "/api/v1/metrics"
+    if path == super::routes::HEALTH
+        || path == super::routes::CAPABILITIES
+        || path == super::routes::METRICS_BARE
+        || path == super::routes::METRICS
     {
         return true;
     }
 
     // Approval SSE stream — read-only metadata stream, not user-data.
-    if path == "/api/v1/approvals/stream" && method == Method::GET {
+    if path == super::routes::APPROVALS_STREAM && method == Method::GET {
         return true;
     }
 
     match (method.as_str(), path) {
         // Wave-3 phase 3 — core CRUD (commit c049500).
-        ("POST", "/api/v1/memories") | ("GET", "/api/v1/memories") => true,
+        ("POST", super::routes::MEMORIES) | ("GET", super::routes::MEMORIES) => true,
         ("GET" | "PUT" | "DELETE", p) if memory_id_path(p) => true,
-        ("GET", "/api/v1/search") => true,
-        ("POST", "/api/v1/links") => true,
+        ("GET", super::routes::SEARCH) => true,
+        ("POST", super::routes::LINKS) => true,
         ("GET", p) if links_id_path(p) => true,
         // Wave-3 continuation — list_pending (read-only).
-        ("GET", "/api/v1/pending") => true,
+        ("GET", super::routes::PENDING) => true,
         // Wave-3 continuation — list_agents (read-only).
-        ("GET", "/api/v1/agents") => true,
+        ("GET", super::routes::AGENTS) => true,
         // Wave-3 continuation — list_namespaces (read-only).
-        ("GET", "/api/v1/namespaces") => {
+        ("GET", super::routes::NAMESPACES) => {
             // GET /api/v1/namespaces with no query string lists namespaces.
             // The same path with ?namespace=... fetches a standard which is
             // also gated through SAL via get_namespace_standard_qs.
             true
         }
         // Wave-3 continuation — KG endpoints (postgres adapter has impls).
-        ("POST", "/api/v1/kg/query")
-        | ("GET", "/api/v1/kg/timeline")
-        | ("POST", "/api/v1/kg/invalidate") => true,
+        ("POST", super::routes::KG_QUERY)
+        | ("GET", super::routes::KG_TIMELINE)
+        | ("POST", super::routes::KG_INVALIDATE) => true,
         // Continuation 6 — three new HTTP endpoints (S52, S61, S65).
-        ("POST", "/api/v1/kg/find_paths")
-        | ("POST", "/api/v1/links/verify")
-        | ("POST", "/api/v1/quota/status") => true,
+        ("POST", super::routes::KG_FIND_PATHS)
+        | ("POST", super::routes::LINKS_VERIFY)
+        | ("POST", super::routes::QUOTA_STATUS) => true,
         // Wave-3 continuation — entity registry.
-        ("POST", "/api/v1/entities") | ("GET", "/api/v1/entities/by_alias") => true,
+        ("POST", super::routes::ENTITIES) | ("GET", super::routes::ENTITIES_BY_ALIAS) => true,
         // Wave-3 continuation — stats (basic count).
-        ("GET", "/api/v1/stats") => true,
+        ("GET", super::routes::STATS) => true,
         // Wave-3 continuation — bulk write.
-        ("POST", "/api/v1/memories/bulk") => true,
+        ("POST", super::routes::MEMORIES_BULK) => true,
         // Wave-3 continuation — recall fallback (keyword via search).
-        ("GET" | "POST", "/api/v1/recall") => true,
+        ("GET" | "POST", super::routes::RECALL) => true,
         // Wave-3 continuation — archive list/stats (read-only).
-        ("GET", "/api/v1/archive") => true,
-        ("GET", "/api/v1/archive/stats") => true,
+        ("GET", super::routes::ARCHIVE) => true,
+        ("GET", super::routes::ARCHIVE_STATS) => true,
         // Wave-3 continuation — taxonomy and check_duplicate.
-        ("GET", "/api/v1/taxonomy") => true,
-        ("POST", "/api/v1/check_duplicate") => true,
+        ("GET", super::routes::TAXONOMY) => true,
+        ("POST", super::routes::CHECK_DUPLICATE) => true,
         // Wave-3 continuation — list_subscriptions, inbox.
-        ("GET", "/api/v1/subscriptions") => true,
-        ("GET", "/api/v1/inbox") => true,
+        ("GET", super::routes::SUBSCRIPTIONS) => true,
+        ("GET", super::routes::INBOX) => true,
         // Wave-3 Continuation 2 — federation push/pull (Phase 8).
-        ("POST", "/api/v1/sync/push") => true,
-        ("GET", "/api/v1/sync/since") => true,
+        ("POST", super::routes::SYNC_PUSH) => true,
+        ("GET", super::routes::SYNC_SINCE) => true,
         // Wave-3 Continuation 2 — governance write paths (Phase 11).
         ("POST", p) if pending_decide_path(p) => true,
         ("POST", p) if namespace_standard_post_path(p) => true,
         ("DELETE", p) if namespace_standard_delete_path(p) => true,
-        ("POST", "/api/v1/namespaces") => true,
-        ("DELETE", "/api/v1/namespaces") => true,
+        ("POST", super::routes::NAMESPACES) => true,
+        ("DELETE", super::routes::NAMESPACES) => true,
         // Wave-3 Continuation 3 — lifecycle write paths (Phase 13/14/16/17/18/19).
-        ("POST", "/api/v1/forget") => true,
-        ("POST", "/api/v1/consolidate") => true,
-        ("GET", "/api/v1/contradictions") => true,
+        ("POST", super::routes::FORGET) => true,
+        ("POST", super::routes::CONSOLIDATE) => true,
+        ("GET", super::routes::CONTRADICTIONS) => true,
         // v0.7.0 L6 — S51 autonomous-tier endpoints. Both are
         // LLM-only (no DB access for the request body itself) so the
         // postgres gate just needs to pass them through to the
         // handler, which handles the 503 fallback when no LLM is
         // wired.
-        ("POST", "/api/v1/auto_tag") => true,
-        ("POST", "/api/v1/expand_query") => true,
+        ("POST", super::routes::AUTO_TAG) => true,
+        ("POST", super::routes::EXPAND_QUERY) => true,
         // v0.7.0 L9 / L10 — HTTP parity for `tools/list` and
         // `memory_load_family`. `tools/list` is pure config
         // enumeration (no DB); `memory_load_family` reads through the
         // SAL trait on the postgres path.
-        ("GET", "/api/v1/tools/list") => true,
-        ("POST", "/api/v1/memory_load_family") => true,
-        ("POST", "/api/v1/notify") => true,
-        ("POST", "/api/v1/gc") => true,
-        ("POST", "/api/v1/import") => true,
-        ("GET", "/api/v1/export") => true,
-        ("POST", "/api/v1/archive") => true,
-        ("DELETE", "/api/v1/archive") => true,
-        ("POST", "/api/v1/archive/purge") => true,
+        ("GET", super::routes::TOOLS_LIST) => true,
+        ("POST", super::routes::MEMORY_LOAD_FAMILY) => true,
+        ("POST", super::routes::NOTIFY) => true,
+        ("POST", super::routes::GC) => true,
+        ("POST", super::routes::IMPORT) => true,
+        ("GET", super::routes::EXPORT) => true,
+        ("POST", super::routes::ARCHIVE) => true,
+        ("DELETE", super::routes::ARCHIVE) => true,
         ("POST", p) if archive_restore_path(p) => true,
         // Wave-3 Continuation 3 — remaining write paths the sqlite path
         // already wires through `app.store` in their handlers (these
@@ -194,19 +195,19 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // daemon. Each handler internally enforces postgres-vs-sqlite
         // dispatch, so the gate's job is just to permit the request to
         // reach the handler).
-        ("POST", "/api/v1/agents") => true,
-        ("DELETE", "/api/v1/links") => true,
-        ("POST", "/api/v1/subscriptions") | ("DELETE", "/api/v1/subscriptions") => true,
-        ("POST", "/api/v1/session/start") => true,
+        ("POST", super::routes::AGENTS) => true,
+        ("DELETE", super::routes::LINKS) => true,
+        ("POST", super::routes::SUBSCRIPTIONS) | ("DELETE", super::routes::SUBSCRIPTIONS) => true,
+        ("POST", super::routes::SESSION_START) => true,
         ("POST", p) if memory_promote_path(p) => true,
         ("POST", p) if approvals_decide_path(p) => true,
         // #1548/#1549 — recursive-learning surfaces now routed through
         // the SAL trait on postgres (`MemoryStore::reflect` /
         // `get_reflection_origin` / `list_recall_observations`), so the
         // gate permits them to reach the handler's postgres branch.
-        ("POST", "/api/v1/memory_reflect") => true,
-        ("POST", "/api/v1/memory_reflection_origin") => true,
-        ("POST", "/api/v1/memory_recall_observations") => true,
+        ("POST", super::routes::MEMORY_REFLECT) => true,
+        ("POST", super::routes::MEMORY_REFLECTION_ORIGIN) => true,
+        ("POST", super::routes::MEMORY_RECALL_OBSERVATIONS) => true,
         _ => false,
     }
 }
@@ -323,99 +324,99 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
     #[allow(clippy::match_same_arms)]
     let fixed_match = match (method.as_str(), path) {
         // Core health + metadata.
-        ("GET", "/api/v1/health") => true,
-        ("GET", "/metrics") => true,
-        ("GET", "/api/v1/metrics") => true,
-        ("GET", "/api/v1/capabilities") => true,
+        ("GET", super::routes::HEALTH) => true,
+        ("GET", super::routes::METRICS_BARE) => true,
+        ("GET", super::routes::METRICS) => true,
+        ("GET", super::routes::CAPABILITIES) => true,
         // Memories CRUD + bulk.
-        ("GET", "/api/v1/memories") => true,
-        ("POST", "/api/v1/memories") => true,
-        ("POST", "/api/v1/memories/bulk") => true,
+        ("GET", super::routes::MEMORIES) => true,
+        ("POST", super::routes::MEMORIES) => true,
+        ("POST", super::routes::MEMORIES_BULK) => true,
         // Search + recall.
-        ("GET", "/api/v1/search") => true,
-        ("GET", "/api/v1/recall") => true,
-        ("POST", "/api/v1/recall") => true,
+        ("GET", super::routes::SEARCH) => true,
+        ("GET", super::routes::RECALL) => true,
+        ("POST", super::routes::RECALL) => true,
         // Lifecycle.
-        ("POST", "/api/v1/forget") => true,
-        ("POST", "/api/v1/consolidate") => true,
-        ("GET", "/api/v1/contradictions") => true,
+        ("POST", super::routes::FORGET) => true,
+        ("POST", super::routes::CONSOLIDATE) => true,
+        ("GET", super::routes::CONTRADICTIONS) => true,
         // L6 autonomous-tier.
-        ("POST", "/api/v1/auto_tag") => true,
-        ("POST", "/api/v1/expand_query") => true,
+        ("POST", super::routes::AUTO_TAG) => true,
+        ("POST", super::routes::EXPAND_QUERY) => true,
         // L9 / L10 — tools/list + load_family.
-        ("GET", "/api/v1/tools/list") => true,
-        ("POST", "/api/v1/memory_load_family") => true,
+        ("GET", super::routes::TOOLS_LIST) => true,
+        ("POST", super::routes::MEMORY_LOAD_FAMILY) => true,
         // Links.
-        ("POST", "/api/v1/links") => true,
-        ("DELETE", "/api/v1/links") => true,
+        ("POST", super::routes::LINKS) => true,
+        ("DELETE", super::routes::LINKS) => true,
         // Namespaces (qs form).
-        ("GET", "/api/v1/namespaces") => true,
-        ("POST", "/api/v1/namespaces") => true,
-        ("DELETE", "/api/v1/namespaces") => true,
+        ("GET", super::routes::NAMESPACES) => true,
+        ("POST", super::routes::NAMESPACES) => true,
+        ("DELETE", super::routes::NAMESPACES) => true,
         // Pillar 1 / Stream A — taxonomy.
-        ("GET", "/api/v1/taxonomy") => true,
+        ("GET", super::routes::TAXONOMY) => true,
         // Pillar 2 / Stream D — check_duplicate.
-        ("POST", "/api/v1/check_duplicate") => true,
+        ("POST", super::routes::CHECK_DUPLICATE) => true,
         // Pillar 2 / Stream B — entities.
-        ("POST", "/api/v1/entities") => true,
-        ("GET", "/api/v1/entities/by_alias") => true,
+        ("POST", super::routes::ENTITIES) => true,
+        ("GET", super::routes::ENTITIES_BY_ALIAS) => true,
         // Pillar 2 / Stream C — KG endpoints.
-        ("GET", "/api/v1/kg/timeline") => true,
-        ("POST", "/api/v1/kg/invalidate") => true,
-        ("POST", "/api/v1/kg/query") => true,
-        ("POST", "/api/v1/kg/find_paths") => true,
+        ("GET", super::routes::KG_TIMELINE) => true,
+        ("POST", super::routes::KG_INVALIDATE) => true,
+        ("POST", super::routes::KG_QUERY) => true,
+        ("POST", super::routes::KG_FIND_PATHS) => true,
         // #934 — bare /find_paths alias.
-        ("POST", "/api/v1/find_paths") => true,
+        ("POST", super::routes::FIND_PATHS) => true,
         // Continuation 6 — link verify + quota status.
-        ("POST", "/api/v1/links/verify") => true,
-        ("POST", "/api/v1/quota/status") => true,
+        ("POST", super::routes::LINKS_VERIFY) => true,
+        ("POST", super::routes::QUOTA_STATUS) => true,
         // Admin / stats / GC.
-        ("GET", "/api/v1/stats") => true,
-        ("POST", "/api/v1/gc") => true,
-        ("GET", "/api/v1/export") => true,
-        ("POST", "/api/v1/import") => true,
+        ("GET", super::routes::STATS) => true,
+        ("POST", super::routes::GC) => true,
+        ("GET", super::routes::EXPORT) => true,
+        ("POST", super::routes::IMPORT) => true,
         // Archive surface.
-        ("GET", "/api/v1/archive") => true,
-        ("POST", "/api/v1/archive") => true,
-        ("DELETE", "/api/v1/archive") => true,
-        ("GET", "/api/v1/archive/stats") => true,
+        ("GET", super::routes::ARCHIVE) => true,
+        ("POST", super::routes::ARCHIVE) => true,
+        ("DELETE", super::routes::ARCHIVE) => true,
+        ("GET", super::routes::ARCHIVE_STATS) => true,
         // Agents.
-        ("GET", "/api/v1/agents") => true,
-        ("POST", "/api/v1/agents") => true,
+        ("GET", super::routes::AGENTS) => true,
+        ("POST", super::routes::AGENTS) => true,
         // Pending governance.
-        ("GET", "/api/v1/pending") => true,
+        ("GET", super::routes::PENDING) => true,
         // Approvals SSE stream (path form not parameterised).
-        ("GET", "/api/v1/approvals/stream") => true,
+        ("GET", super::routes::APPROVALS_STREAM) => true,
         // Federation sync.
-        ("POST", "/api/v1/sync/push") => true,
-        ("GET", "/api/v1/sync/since") => true,
+        ("POST", super::routes::SYNC_PUSH) => true,
+        ("GET", super::routes::SYNC_SINCE) => true,
         // Notify / inbox / subscriptions.
-        ("POST", "/api/v1/notify") => true,
-        ("GET", "/api/v1/inbox") => true,
-        ("POST", "/api/v1/subscriptions") => true,
-        ("DELETE", "/api/v1/subscriptions") => true,
-        ("GET", "/api/v1/subscriptions") => true,
-        ("POST", "/api/v1/session/start") => true,
+        ("POST", super::routes::NOTIFY) => true,
+        ("GET", super::routes::INBOX) => true,
+        ("POST", super::routes::SUBSCRIPTIONS) => true,
+        ("DELETE", super::routes::SUBSCRIPTIONS) => true,
+        ("GET", super::routes::SUBSCRIPTIONS) => true,
+        ("POST", super::routes::SESSION_START) => true,
         // Cluster E API-2 — Agent Skills (parameterless variants).
-        ("POST", "/api/v1/skill/register") => true,
-        ("GET", "/api/v1/skill/list") => true,
+        ("POST", super::routes::SKILL_REGISTER) => true,
+        ("GET", super::routes::SKILL_LIST) => true,
         // #1095 — share.
-        ("POST", "/api/v1/share") => true,
+        ("POST", super::routes::SHARE) => true,
         // #1111 — 14 MCP-tool parity routes.
-        ("POST", "/api/v1/memory_smart_load") => true,
-        ("POST", "/api/v1/memory_reflect") => true,
-        ("POST", "/api/v1/memory_recall_observations") => true,
-        ("POST", "/api/v1/memory_reflection_origin") => true,
-        ("POST", "/api/v1/memory_dependents_of_invalidated") => true,
-        ("POST", "/api/v1/memory_export_reflection") => true,
-        ("POST", "/api/v1/memory_atomise") => true,
-        ("POST", "/api/v1/memory_calibrate_confidence") => true,
-        ("POST", "/api/v1/memory_verify") => true,
-        ("POST", "/api/v1/memory_replay") => true,
-        ("POST", "/api/v1/memory_subscription_replay") => true,
-        ("POST", "/api/v1/memory_subscription_dlq_list") => true,
-        ("POST", "/api/v1/memory_rule_list") => true,
-        ("POST", "/api/v1/memory_check_agent_action") => true,
+        ("POST", super::routes::MEMORY_SMART_LOAD) => true,
+        ("POST", super::routes::MEMORY_REFLECT) => true,
+        ("POST", super::routes::MEMORY_RECALL_OBSERVATIONS) => true,
+        ("POST", super::routes::MEMORY_REFLECTION_ORIGIN) => true,
+        ("POST", super::routes::MEMORY_DEPENDENTS_OF_INVALIDATED) => true,
+        ("POST", super::routes::MEMORY_EXPORT_REFLECTION) => true,
+        ("POST", super::routes::MEMORY_ATOMISE) => true,
+        ("POST", super::routes::MEMORY_CALIBRATE_CONFIDENCE) => true,
+        ("POST", super::routes::MEMORY_VERIFY) => true,
+        ("POST", super::routes::MEMORY_REPLAY) => true,
+        ("POST", super::routes::MEMORY_SUBSCRIPTION_REPLAY) => true,
+        ("POST", super::routes::MEMORY_SUBSCRIPTION_DLQ_LIST) => true,
+        ("POST", super::routes::MEMORY_RULE_LIST) => true,
+        ("POST", super::routes::MEMORY_CHECK_AGENT_ACTION) => true,
         _ => false,
     };
 
@@ -557,7 +558,7 @@ pub async fn postgres_route_gate(
             "error": "endpoint not yet implemented for postgres-backed daemon",
             "endpoint": path,
             "method": method.as_str(),
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
             "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage; \
                             see docs/postgres-age-guide.md for the supported endpoint inventory",
         })),
@@ -595,6 +596,13 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
             StatusCode::BAD_REQUEST,
             sanitize_store_err_message(&e.to_string()),
         ),
+        // #1568 — pre-link gate refusal (reflects_on cycle). 409
+        // CONFLICT with the canonical LINK_CYCLE_ERR_PREFIX message,
+        // byte-parity with the sqlite branch in handlers/links.rs.
+        StoreError::LinkRefused { .. } => (
+            StatusCode::CONFLICT,
+            sanitize_store_err_message(&e.to_string()),
+        ),
         StoreError::UnsupportedCapability { capability } => (
             StatusCode::NOT_IMPLEMENTED,
             format!("backend does not support capability: {capability}"),
@@ -610,7 +618,7 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
             tracing::error!("store backend error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error".to_string(),
+                crate::errors::msg::INTERNAL_SERVER_ERROR.to_string(),
             )
         }
     };
@@ -640,6 +648,16 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
 /// less specific error message). Operators who need the raw
 /// diagnostic still get it via the structured tracing log emitted at
 /// the call site.
+/// #1558 batch 5 wave 3 — sanitizer sentinel substituted for a leaked
+/// URL run (`scheme://…`) by [`sanitize_store_err_message`].
+#[cfg(feature = "sal")]
+const REDACTED_URL_SENTINEL: &str = "[redacted-url]";
+
+/// #1558 batch 5 wave 3 — sanitizer sentinel substituted for a leaked
+/// absolute filesystem path by [`sanitize_store_err_message`].
+#[cfg(feature = "sal")]
+const REDACTED_PATH_SENTINEL: &str = "[redacted-path]";
+
 #[cfg(feature = "sal")]
 #[must_use]
 pub fn sanitize_store_err_message(raw: &str) -> String {
@@ -664,7 +682,7 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
             }
             let pop = i - scheme_start;
             out.truncate(out.len().saturating_sub(pop));
-            out.push_str("[redacted-url]");
+            out.push_str(REDACTED_URL_SENTINEL);
             // Skip past "://" plus the rest of the URL run (anything
             // not whitespace/quote/brace/paren/comma/semicolon/angle).
             i += 3;
@@ -703,7 +721,7 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
                 || bytes[i + 1] == b'_'
                 || bytes[i + 1] == b'.')
         {
-            out.push_str("[redacted-path]");
+            out.push_str(REDACTED_PATH_SENTINEL);
             i += 1;
             while i < bytes.len() {
                 let c = bytes[i];
@@ -724,7 +742,7 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
 
 #[cfg(all(test, feature = "sal"))]
 mod store_err_sanitize_tests {
-    use super::sanitize_store_err_message;
+    use super::{REDACTED_PATH_SENTINEL, REDACTED_URL_SENTINEL, sanitize_store_err_message};
 
     #[test]
     fn sanitize_redacts_postgres_url() {
@@ -734,7 +752,7 @@ mod store_err_sanitize_tests {
         assert!(!clean.contains("hunter2"), "password leaked: {clean}");
         assert!(!clean.contains("db.internal"), "host leaked: {clean}");
         assert!(
-            clean.contains("[redacted-url]"),
+            clean.contains(REDACTED_URL_SENTINEL),
             "missing sentinel: {clean}"
         );
     }
@@ -745,7 +763,7 @@ mod store_err_sanitize_tests {
         let clean = sanitize_store_err_message(leak);
         assert!(!clean.contains("/var/lib"), "raw path leaked: {clean}");
         assert!(
-            clean.contains("[redacted-path]"),
+            clean.contains(REDACTED_PATH_SENTINEL),
             "missing sentinel: {clean}"
         );
     }
@@ -763,8 +781,8 @@ mod store_err_sanitize_tests {
         let clean = sanitize_store_err_message(leak);
         assert!(!clean.contains("postgres://"));
         assert!(!clean.contains("/etc/secret"));
-        assert!(clean.contains("[redacted-url]"));
-        assert!(clean.contains("[redacted-path]"));
+        assert!(clean.contains(REDACTED_URL_SENTINEL));
+        assert!(clean.contains(REDACTED_PATH_SENTINEL));
     }
 
     #[test]
@@ -780,14 +798,14 @@ mod store_err_sanitize_tests {
     fn sanitize_handles_unicode_in_clean_message() {
         let raw = "memory not found: \u{1F4DD}-id-with-emoji";
         let out = sanitize_store_err_message(raw);
-        assert!(out.contains("memory not found"));
+        assert!(out.contains(crate::errors::msg::MEMORY_NOT_FOUND));
     }
 
     #[test]
     fn sanitize_redacts_url_at_start_of_message() {
         let leak = "postgres://u:p@h/db is unreachable";
         let clean = sanitize_store_err_message(leak);
-        assert!(clean.starts_with("[redacted-url]"));
+        assert!(clean.starts_with(REDACTED_URL_SENTINEL));
     }
 }
 
@@ -807,27 +825,42 @@ mod transport_postgres_gate_tests {
 
     #[test]
     fn postgres_gate_always_passes_health_and_metrics() {
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/health"));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/capabilities"
+            crate::handlers::routes::HEALTH
         ));
-        assert!(postgres_endpoint_supported(&Method::GET, "/metrics"));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/metrics"));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::CAPABILITIES
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::METRICS_BARE
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::METRICS
+        ));
     }
 
     #[test]
     fn postgres_gate_passes_core_crud() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memories"
+            crate::handlers::routes::MEMORIES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/memories"
+            crate::handlers::routes::MEMORIES
         ));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/search"));
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/links"));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::SEARCH
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::LINKS
+        ));
     }
 
     #[test]
@@ -836,15 +869,15 @@ mod transport_postgres_gate_tests {
         // are now SAL-routed on postgres and must pass the gate.
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memory_reflect"
+            crate::handlers::routes::MEMORY_REFLECT
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memory_reflection_origin"
+            crate::handlers::routes::MEMORY_REFLECTION_ORIGIN
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memory_recall_observations"
+            crate::handlers::routes::MEMORY_RECALL_OBSERVATIONS
         ));
     }
 
@@ -871,7 +904,7 @@ mod transport_postgres_gate_tests {
         // /api/v1/memories/bulk is its own endpoint (not memory_id_path).
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memories/bulk"
+            crate::handlers::routes::MEMORIES_BULK
         ));
     }
 
@@ -889,19 +922,19 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_kg_paths() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/kg/query"
+            crate::handlers::routes::KG_QUERY
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/kg/timeline"
+            crate::handlers::routes::KG_TIMELINE
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/kg/invalidate"
+            crate::handlers::routes::KG_INVALIDATE
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/kg/find_paths"
+            crate::handlers::routes::KG_FIND_PATHS
         ));
     }
 
@@ -909,38 +942,45 @@ mod transport_postgres_gate_tests {
     fn postgres_gate_passes_quota_verify_entities() {
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/links/verify"
+            crate::handlers::routes::LINKS_VERIFY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/quota/status"
+            crate::handlers::routes::QUOTA_STATUS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/entities"
+            crate::handlers::routes::ENTITIES
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/entities/by_alias"
+            crate::handlers::routes::ENTITIES_BY_ALIAS
         ));
     }
 
     #[test]
     fn postgres_gate_passes_archive_paths() {
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/archive"));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/archive/stats"
+            crate::handlers::routes::ARCHIVE
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::ARCHIVE_STATS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/archive"
+            crate::handlers::routes::ARCHIVE
         ));
         assert!(postgres_endpoint_supported(
             &Method::DELETE,
-            "/api/v1/archive"
+            crate::handlers::routes::ARCHIVE
         ));
-        assert!(postgres_endpoint_supported(
+        // #1563 — the gate previously allow-listed POST
+        // /api/v1/archive/purge, a path NO router registers (purge is
+        // DELETE /api/v1/archive). The dead arm is removed; pin that
+        // the unregistered path is now refused by the gate too.
+        assert!(!postgres_endpoint_supported(
             &Method::POST,
             "/api/v1/archive/purge"
         ));
@@ -997,7 +1037,7 @@ mod transport_postgres_gate_tests {
         // /api/v1/approvals/stream is excluded from decide path.
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/approvals/stream"
+            crate::handlers::routes::APPROVALS_STREAM
         ));
     }
 
@@ -1015,90 +1055,126 @@ mod transport_postgres_gate_tests {
 
     #[test]
     fn postgres_gate_passes_remaining_write_paths() {
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/forget"));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/consolidate"
+            crate::handlers::routes::FORGET
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::CONSOLIDATE
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/contradictions"
+            crate::handlers::routes::CONTRADICTIONS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/auto_tag"
+            crate::handlers::routes::AUTO_TAG
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/expand_query"
+            crate::handlers::routes::EXPAND_QUERY
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/tools/list"
+            crate::handlers::routes::TOOLS_LIST
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memory_load_family"
-        ));
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/notify"));
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/gc"));
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/import"));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/export"));
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/agents"));
-        assert!(postgres_endpoint_supported(
-            &Method::DELETE,
-            "/api/v1/links"
+            crate::handlers::routes::MEMORY_LOAD_FAMILY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/subscriptions"
-        ));
-        assert!(postgres_endpoint_supported(
-            &Method::DELETE,
-            "/api/v1/subscriptions"
+            crate::handlers::routes::NOTIFY
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/session/start"
+            crate::handlers::routes::GC
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/sync/push"
+            crate::handlers::routes::IMPORT
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/sync/since"
-        ));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/pending"));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/agents"));
-        assert!(postgres_endpoint_supported(
-            &Method::GET,
-            "/api/v1/namespaces"
+            crate::handlers::routes::EXPORT
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/namespaces"
+            crate::handlers::routes::AGENTS
         ));
         assert!(postgres_endpoint_supported(
             &Method::DELETE,
-            "/api/v1/namespaces"
-        ));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/stats"));
-        assert!(postgres_endpoint_supported(
-            &Method::GET,
-            "/api/v1/taxonomy"
+            crate::handlers::routes::LINKS
         ));
         assert!(postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/check_duplicate"
+            crate::handlers::routes::SUBSCRIPTIONS
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::DELETE,
+            crate::handlers::routes::SUBSCRIPTIONS
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::SESSION_START
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::SYNC_PUSH
         ));
         assert!(postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/subscriptions"
+            crate::handlers::routes::SYNC_SINCE
         ));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/inbox"));
-        assert!(postgres_endpoint_supported(&Method::GET, "/api/v1/recall"));
-        assert!(postgres_endpoint_supported(&Method::POST, "/api/v1/recall"));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::PENDING
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::AGENTS
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::NAMESPACES
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::NAMESPACES
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::DELETE,
+            crate::handlers::routes::NAMESPACES
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::STATS
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::TAXONOMY
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::CHECK_DUPLICATE
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::SUBSCRIPTIONS
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::INBOX
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            crate::handlers::routes::RECALL
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::RECALL
+        ));
     }
 
     #[test]
@@ -1150,7 +1226,7 @@ mod transport_postgres_gate_tests {
         // surface instead of a fabricated 501.
         assert!(!path_is_registered_route(
             &Method::PATCH,
-            "/api/v1/memories"
+            crate::handlers::routes::MEMORIES
         ));
     }
 
@@ -1163,58 +1239,85 @@ mod transport_postgres_gate_tests {
         // test (or its sibling fixed-table tests above) must pin it.
 
         // Fixed paths.
-        assert!(path_is_registered_route(&Method::GET, "/api/v1/health"));
-        assert!(path_is_registered_route(&Method::GET, "/metrics"));
-        assert!(path_is_registered_route(&Method::POST, "/api/v1/memories"));
-        assert!(path_is_registered_route(&Method::GET, "/api/v1/memories"));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::HEALTH
+        ));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::METRICS_BARE
+        ));
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/memories/bulk"
+            crate::handlers::routes::MEMORIES
         ));
-        assert!(path_is_registered_route(&Method::GET, "/api/v1/search"));
-        assert!(path_is_registered_route(&Method::POST, "/api/v1/forget"));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::MEMORIES
+        ));
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/consolidate"
+            crate::handlers::routes::MEMORIES_BULK
         ));
-        assert!(path_is_registered_route(&Method::POST, "/api/v1/share"));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::SEARCH
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            crate::handlers::routes::FORGET
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            crate::handlers::routes::CONSOLIDATE
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            crate::handlers::routes::SHARE
+        ));
         // route_1111 family — POST-only.
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/memory_smart_load"
+            crate::handlers::routes::MEMORY_SMART_LOAD
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/memory_reflect"
+            crate::handlers::routes::MEMORY_REFLECT
         ));
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/memory_atomise"
+            crate::handlers::routes::MEMORY_ATOMISE
         ));
         // KG endpoints.
         assert!(path_is_registered_route(
             &Method::GET,
-            "/api/v1/kg/timeline"
+            crate::handlers::routes::KG_TIMELINE
         ));
-        assert!(path_is_registered_route(&Method::POST, "/api/v1/kg/query"));
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/kg/find_paths"
+            crate::handlers::routes::KG_QUERY
+        ));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            crate::handlers::routes::KG_FIND_PATHS
         ));
         // #934 alias.
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/find_paths"
+            crate::handlers::routes::FIND_PATHS
         ));
         // Namespaces (qs form + path form).
-        assert!(path_is_registered_route(&Method::GET, "/api/v1/namespaces"));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::NAMESPACES
+        ));
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/namespaces"
+            crate::handlers::routes::NAMESPACES
         ));
         assert!(path_is_registered_route(
             &Method::DELETE,
-            "/api/v1/namespaces"
+            crate::handlers::routes::NAMESPACES
         ));
 
         // Path-parameter routes.
@@ -1304,7 +1407,10 @@ mod transport_postgres_gate_tests {
         // table covers it independently. This pin makes sure we
         // don't regress into "list is treated as an {id}" or
         // "list is not registered at all".
-        assert!(path_is_registered_route(&Method::GET, "/api/v1/skill/list"));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::SKILL_LIST
+        ));
         // Trailing extras must not match.
         assert!(!path_is_registered_route(
             &Method::POST,
@@ -1327,23 +1433,32 @@ mod transport_postgres_gate_tests {
         // unknown case (no route at all). This test pins the "501
         // case" half of the contract; `unknown_path_not_a_registered_route_1410`
         // pins the "404 case" half.
-        assert!(path_is_registered_route(&Method::POST, "/api/v1/share"));
-        assert!(!postgres_endpoint_supported(&Method::POST, "/api/v1/share"));
+        assert!(path_is_registered_route(
+            &Method::POST,
+            crate::handlers::routes::SHARE
+        ));
+        assert!(!postgres_endpoint_supported(
+            &Method::POST,
+            crate::handlers::routes::SHARE
+        ));
         // Same shape — route_1111 family is registered but not
         // postgres-allowlisted.
         assert!(path_is_registered_route(
             &Method::POST,
-            "/api/v1/memory_smart_load"
+            crate::handlers::routes::MEMORY_SMART_LOAD
         ));
         assert!(!postgres_endpoint_supported(
             &Method::POST,
-            "/api/v1/memory_smart_load"
+            crate::handlers::routes::MEMORY_SMART_LOAD
         ));
         // Skill surface — registered but not postgres-allowlisted.
-        assert!(path_is_registered_route(&Method::GET, "/api/v1/skill/list"));
+        assert!(path_is_registered_route(
+            &Method::GET,
+            crate::handlers::routes::SKILL_LIST
+        ));
         assert!(!postgres_endpoint_supported(
             &Method::GET,
-            "/api/v1/skill/list"
+            crate::handlers::routes::SKILL_LIST
         ));
     }
 
@@ -1377,6 +1492,13 @@ mod transport_postgres_gate_tests {
             detail: "bad".to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        // #1568 — pre-link gate refusal maps to 409 CONFLICT.
+        let r = store_err_to_response(StoreError::LinkRefused {
+            detail: "link refused: reflection cycle: a --reflects_on--> b would close a cycle"
+                .to_string(),
+        });
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
 
         let r = store_err_to_response(StoreError::UnsupportedCapability {
             capability: "X".to_string(),

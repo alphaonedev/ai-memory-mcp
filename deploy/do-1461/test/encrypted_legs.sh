@@ -16,9 +16,11 @@
 #                               (non-allowlisted) leaf -> refused (000); a valid
 #                               cert but NO api-key on a privileged endpoint ->
 #                               401. /health is the documented exempt surface.
-#   LEG 2  Federation/quorum   — W=floor(N/2)+1 majority quorum across the CROSS-
-#          mTLS                  REGION peer mesh (W=5 of 9 on the reference
-#                               fleet). Positive: a collective write on peer-1
+#   LEG 2  Federation/quorum   — W-of-N synchronous quorum across the CROSS-
+#          mTLS                  REGION peer mesh (FED_SYNC_QUORUM_W=2 of 9 on
+#                               the reference fleet per provision/lib.sh; the
+#                               verify report row is quorum_write_W2ofN9).
+#                               Positive: a collective write on peer-1
 #                               converges on every other peer in ALL regions
 #                               within the catchup window (the outbound /sync push
 #                               presents the node's mTLS CLIENT cert + verifies

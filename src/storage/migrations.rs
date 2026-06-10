@@ -23,9 +23,20 @@
 //! `memory_capture_turn` MCP tool). Closes the #1388 substrate
 //! failure mode at the storage layer.
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
+
+/// Canonical schema-version probe — shared by both SAL adapters,
+/// `ai-memory boot`, and `schema-init` (#1558 batch 6).
+pub(crate) const SELECT_SCHEMA_VERSION_SQL: &str =
+    "SELECT COALESCE(MAX(version), 0) FROM schema_version";
+
+/// Column-introspection statement shared by the additive-column
+/// migration arms (one spelling; pm-v3.1 hardcoded-literal gate,
+/// #1558 wave 4).
+const PRAGMA_TABLE_INFO_MEMORIES: &str = "PRAGMA table_info(memories)";
 
 pub(super) const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS memories (
@@ -1053,11 +1064,7 @@ const MIGRATION_V55_SQLITE: &str =
 #[allow(clippy::too_many_lines)]
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |r| r.get(0),
-        )
+        .query_row(SELECT_SCHEMA_VERSION_SQL, [], |r| r.get(0))
         .unwrap_or(0);
 
     if version >= CURRENT_SCHEMA_VERSION {
@@ -1089,11 +1096,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         if version < 2 {
             let mut has_confidence = false;
             let mut has_source = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 match col?.as_str() {
-                    "confidence" => has_confidence = true,
+                    field_names::CONFIDENCE => has_confidence = true,
                     "source" => has_source = true,
                     _ => {}
                 }
@@ -1116,7 +1123,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         if version < 3 {
             // Add embedding column for semantic search (Phase 1+2)
             let mut has_embedding = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 if col?.as_str() == "embedding" {
@@ -1803,7 +1810,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // (matching the SCHEMA constant for fresh installs).
             let mut has_atomised_into = false;
             let mut has_atom_of = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 match col?.as_str() {
@@ -1861,7 +1868,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                         |r| r.get(0),
                     )
                     .unwrap_or_default();
-                let needs_rebuild = !existing_sql.contains("derives_from");
+                let needs_rebuild =
+                    !existing_sql.contains(crate::models::MemoryLinkRelation::DerivesFrom.as_str());
                 if needs_rebuild {
                     conn.execute_batch(MIGRATION_V36_REBUILD_LINKS_SQL)?;
                 }
@@ -1880,12 +1888,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // the partial index lives in the .sql file.
             let mut has_entity_id = false;
             let mut has_persona_version = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 match col?.as_str() {
                     "entity_id" => has_entity_id = true,
-                    "persona_version" => has_persona_version = true,
+                    field_names::PERSONA_VERSION => has_persona_version = true,
                     _ => {}
                 }
             }
@@ -1912,13 +1920,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             let mut has_citations = false;
             let mut has_source_uri = false;
             let mut has_source_span = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 match col?.as_str() {
                     "citations" => has_citations = true,
-                    "source_uri" => has_source_uri = true,
-                    "source_span" => has_source_span = true,
+                    field_names::SOURCE_URI => has_source_uri = true,
+                    field_names::SOURCE_SPAN => has_source_span = true,
                     _ => {}
                 }
             }
@@ -1949,13 +1957,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             let mut has_source = false;
             let mut has_signals = false;
             let mut has_decayed_at = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 match col?.as_str() {
-                    "confidence_source" => has_source = true,
-                    "confidence_signals" => has_signals = true,
-                    "confidence_decayed_at" => has_decayed_at = true,
+                    field_names::CONFIDENCE_SOURCE => has_source = true,
+                    field_names::CONFIDENCE_SIGNALS => has_signals = true,
+                    field_names::CONFIDENCE_DECAYED_AT => has_decayed_at = true,
                     _ => {}
                 }
             }
@@ -2039,7 +2047,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // `metadata.entity_id` + `[entity:X]` title markers also
             // lives here so the column-existence probe gates it.
             let mut has_mentioned = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 if col?.as_str() == "mentioned_entity_id" {
@@ -2122,7 +2130,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // probe gates the ALTER so replay on a database that
             // already ran this migration is a no-op.
             let mut has_envelope = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 if col?.as_str() == "encrypted_envelope" {
@@ -2147,7 +2155,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // DEFAULT clause; subsequent updates bump via
             // `storage::update`.
             let mut has_version_col = false;
-            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
                 if col?.as_str() == "version" {
@@ -2226,18 +2234,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 );
             } else {
                 for (col, ddl) in &[
-                    ("reflection_depth", "INTEGER"),
+                    (field_names::REFLECTION_DEPTH, "INTEGER"),
                     ("atomised_into", "INTEGER"),
                     ("atom_of", "TEXT"),
-                    ("memory_kind", "TEXT"),
+                    (field_names::MEMORY_KIND, "TEXT"),
                     ("entity_id", "TEXT"),
-                    ("persona_version", "INTEGER"),
+                    (field_names::PERSONA_VERSION, "INTEGER"),
                     ("citations", "TEXT"),
-                    ("source_uri", "TEXT"),
-                    ("source_span", "TEXT"),
-                    ("confidence_source", "TEXT"),
-                    ("confidence_signals", "TEXT"),
-                    ("confidence_decayed_at", "TEXT"),
+                    (field_names::SOURCE_URI, "TEXT"),
+                    (field_names::SOURCE_SPAN, "TEXT"),
+                    (field_names::CONFIDENCE_SOURCE, "TEXT"),
+                    (field_names::CONFIDENCE_SIGNALS, "TEXT"),
+                    (field_names::CONFIDENCE_DECAYED_AT, "TEXT"),
                     ("mentioned_entity_id", "TEXT"),
                     ("version", "INTEGER"),
                 ] {
@@ -2410,11 +2418,11 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(super::connection::SQL_COMMIT)?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(super::connection::SQL_ROLLBACK);
             Err(e)
         }
     }

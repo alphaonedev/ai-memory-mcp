@@ -30,6 +30,13 @@
 # deleted; nothing here mutates the baseline corpus.
 source "$(dirname "$0")/../provision/lib.sh"
 
+# lib.sh sets `set -euo pipefail`; a test harness must RECORD a failing check
+# (fail/skip) and keep going to the summary, not abort on the first non-zero
+# (a probe curl/psql returning empty is a recordable FAIL, not a fatal). Drop
+# errexit + pipefail here (keep nounset). run.sh stays strict by careful
+# construction; this harness opts for record-and-continue.
+set +e +o pipefail
+
 require_inventory
 
 REPORTS="$RUN_DIR/reports"; mkdir -p "$REPORTS"
@@ -44,8 +51,12 @@ API_PW_FILE="$RUN_DIR/secrets/api.pw"
 API_KEY=""; [ -s "$API_PW_FILE" ] && API_KEY="$(cat "$API_PW_FILE")"
 
 # Named knobs — NO hardcoded literal at any call site.
-REC_NS_LEARN="_rec_learn"                       # reflection-chain namespace
-REC_NS_IMPROVE="_rec_improve"                    # consolidation namespace
+# Convergence-checked writes land in the federation-allowlisted `_verify`
+# namespace (the same one the full-spectrum federation group converges) so
+# cross-region replication is exercised; `_rec_*` underscore namespaces are
+# NOT in the per-peer federation namespace allowlist and stay local.
+REC_NS_LEARN="${REC_NS_LEARN:-_verify}"          # reflection-chain namespace (federated)
+REC_NS_IMPROVE="${REC_NS_IMPROVE:-_verify}"      # consolidation namespace (federated)
 REC_MAX_DEPTH="${REC_MAX_DEPTH:-3}"              # compiled GovernancePolicy default
 REC_CONVERGE_TRIES="${REC_CONVERGE_TRIES:-30}"   # poll attempts per peer
 REC_CONVERGE_SLEEP_SECS="${REC_CONVERGE_SLEEP_SECS:-3}"  # > FED_CATCHUP_INTERVAL_SECS over the loop
@@ -103,7 +114,11 @@ pg_sql() {
   region="$(inv_peer_region "$h")"
   schema="$(peer_schema "$(peer_schema_index_in_region "$h")")"
   pg_pub="$(inv_pg_public_ip_for_region "$region")"
-  ssh_node "$pg_pub" "sudo -u postgres psql -d $PG_DB -tAc \"SET search_path = $schema, ag_catalog, public; $sql\"" 2>/dev/null | tr -d '[:space:]'
+  # `-tAc "SET ...; SELECT ..."` emits the `SET` command tag on its own line
+  # before the result, so take the LAST line (the SELECT scalar) and strip
+  # whitespace. `|| true` keeps the helper from tripping the inherited
+  # `set -e` when a probe row legitimately returns nothing.
+  ssh_node "$pg_pub" "sudo -u postgres psql -d $PG_DB -tAc \"SET search_path = $schema, ag_catalog, public; $sql\"" 2>/dev/null | tail -1 | tr -d '[:space:]' || true
 }
 
 log "recursive-frameworks run $TS — fleet=$CAMPAIGN port=$FEDERATION_PORT"
@@ -246,7 +261,12 @@ if [ -n "$SA" ] && [ -n "$SB" ]; then
     pass rec_improve "consolidate_merge" "consolidated id present" "$CID"
     track "$CID" "$P1_IP" "$P1_H"
     # Provenance: the consolidated row records derived_from = source ids.
-    dn="$(pg_sql "$P1_H" "SELECT count(*) FROM memories WHERE id='$CID' AND metadata->'derived_from' @> '[\"$SA\"]'::jsonb AND metadata->'derived_from' @> '[\"$SB\"]'::jsonb;")"
+    # jsonb element-membership via the `?` operator (single-quoted text) —
+    # NOT `@> '[\"...\"]'::jsonb`, whose embedded double-quotes collide with
+    # the `ssh_node "... psql -tAc \"...\""` quoting layers and silently
+    # parse-error to empty. `metadata->'derived_from'` is a flat string array
+    # written by both SAL backends' consolidate; `? '<id>'` tests membership.
+    dn="$(pg_sql "$P1_H" "SELECT count(*) FROM memories WHERE id='$CID' AND metadata->'derived_from' ? '$SA' AND metadata->'derived_from' ? '$SB';")"
     assert_eq rec_improve "consolidate_provenance" "1" "${dn:-0}"
     # Cross-region convergence of the consolidated memory.
     anchor_region="$(inv_peer_region "$P1_H")"

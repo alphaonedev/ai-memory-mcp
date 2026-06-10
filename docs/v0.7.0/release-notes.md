@@ -77,6 +77,156 @@ deliberately swallows the failure with the "continuing unsigned"
 stderr line; the cross-row hash chain itself remains tamper-evident
 in either posture).
 
+## v0.7.0 hardcoded-literal SSOT remediation — [#1558](https://github.com/alphaonedev/ai-memory-mcp/issues/1558) campaign (2026-06-09)
+
+A five-batch burn-down of duplicated string/numeric literals across the
+substrate, enforced going forward by the pm-v3.1 mechanical ratchet gate
+(`scripts/check-hardcoded-literals.sh`, companion to
+`scripts/check-vendor-literals.sh` — baseline counts may only shrink).
+Predominantly behavior-preserving refactors; the wire-visible exceptions
+are called out explicitly below.
+
+### Operator advisories (behaviour changes — read before upgrading)
+
+- **[#1562](https://github.com/alphaonedev/ai-memory-mcp/issues/1562)
+  — `RUST_LOG` target filtering now works (and changes) for the
+  postgres adapter.** 58 tracing sites used FIELD syntax
+  (`target = "..."`), which `RUST_LOG` target filtering cannot match —
+  converted to real metadata targets routed through consts
+  (`src/store/postgres.rs` `TRACE_TARGET`/`TRACE_TARGET_KG`,
+  `src/cli/schema_init.rs`, plus single-site fixes in
+  `federation/peer.rs`, `handlers/parity.rs`, `handlers/system.rs`).
+  Consequence: postgres SAL adapter events now emit under the literal
+  targets `store::postgres` / `store::postgres::kg` — an
+  `RUST_LOG=ai_memory=debug` filter no longer matches them; add
+  `store::postgres=debug` explicitly. Closed alongside
+  [#1563](https://github.com/alphaonedev/ai-memory-mcp/issues/1563)
+  (dead postgres-gate arm for an unregistered `POST
+  /api/v1/archive/purge` path removed).
+- **[#1560](https://github.com/alphaonedev/ai-memory-mcp/issues/1560)
+  — anonymous request-id suffix length unified (wire-visible).** One
+  `identity::anonymous_request_id()` helper (`anonymous:req-<uuid8>`)
+  replaces 10 divergent synthesis sites, 8 of which stamped the full
+  36-char UUID against the documented uuid8 contract. Anonymous
+  principals recorded in logs/audit rows now carry an 8-char suffix
+  everywhere; anything parsing the old 36-char form must accept the
+  documented short form.
+
+### Structural SSOT modules (batches 1-5)
+
+- **`src/identity/sentinels.rs` (batch 2)** — every internal/system
+  principal string (`DAEMON_PRINCIPAL`, `ANONYMOUS_INVALID`,
+  `AI_CURATOR`, `AI_HTTP`, federation/subscription/migrate/export/
+  governance internals, `ANONYMOUS_REQ_PREFIX`) as one named const;
+  82 production sites routed. These are authz-relevant: cross-tenant
+  ownership gates exempt callers whose principal EQUALS one of these
+  strings. `validate::RESERVED_AGENT_IDS` is now BUILT from the
+  sentinel consts (was a parallel literal list with a "MUST stay in
+  sync" comment) and a new invariant test pins every privileged
+  sentinel ∈ the list. `DAEMON_KEYPAIR_LABEL` moved to
+  `src/identity/keypair.rs` as the canonical `pub const` (key-file
+  label, deliberately distinct from `DAEMON_PRINCIPAL`).
+- **`src/mcp/jsonrpc.rs` (batch 3)** — JSON-RPC 2.0 version tag,
+  reserved error codes (`-32700`/`-32600`/`-32601`/`-32602`), MCP
+  method names, and the protocolVersion revision as named consts; the
+  crate-root `METHOD_*` consts become aliases of the domain-canonical
+  `jsonrpc::*` set.
+- **`src/handlers/routes.rs` (batch 4a)** — one const per production
+  HTTP route path (74 consts). The `src/lib.rs` router registers them
+  and the postgres surface gate (`handlers/postgres_gate.rs`, 207
+  literals), federation receiver, and CLI doctor match on them — the
+  gate now structurally cannot drift from the router registration. The
+  legacy `ROUTE_*` crate-root consts now alias the new SSOT.
+- **Postgres `agent_quotas` DDL parity (batch 1)** — the postgres
+  bootstrap DDL defaults now interpolate
+  `quotas::DEFAULT_MAX_{MEMORIES_PER_DAY,STORAGE_BYTES,LINKS_PER_DAY}`;
+  the sqlite path already routed through `quota_defaults()` and the
+  postgres twin was the drift.
+- **Batches 4b/5** — SQL transaction fragments
+  (`storage::connection::{SQL_BEGIN_IMMEDIATE,SQL_COMMIT,SQL_ROLLBACK}`,
+  49 copies), auth-header spellings (`HEADER_API_KEY` /
+  `HEADER_AI_MEMORY_SIGNATURE` / `HEADER_AI_MEMORY_TIMESTAMP` shared by
+  client + server sites), tracing-target consts across 14 duplicated
+  targets, config/installer keys, version/url/env/actor-label consts,
+  and tool-name + wire-enum values routed through owning types
+  (`MemoryLinkRelation::as_str()`, `AttestLevel::as_str()`; BOTH link
+  allowlist arrays now BUILT from the enum).
+
+### Gate + test fixes landed during the campaign
+
+- **[#1561](https://github.com/alphaonedev/ai-memory-mcp/issues/1561)**
+  — the literal gate's test boundary now includes
+  `#[cfg(test)]`-attributed modules (previously only `mod tests`
+  blocks were excluded by name).
+- **Batch 5c** — gate file-level `cfg(test)` fix: whole-file test
+  fixtures no longer count toward production literal totals.
+- **[#1577](https://github.com/alphaonedev/ai-memory-mcp/issues/1577)**
+  — the boundary must not fire on `cfg(test)` mod DECLARATIONS, and
+  `cfg(all(test, ...))` mods are now caught.
+- **[#1567](https://github.com/alphaonedev/ai-memory-mcp/issues/1567)**
+  — flaky-test fix: hold all 32 listeners alive through the #1201
+  port-uniqueness assert.
+
+### Federation operational findings (documented posture, not code changes)
+
+- **[#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)**
+  — the default `--quorum-timeout-ms 2000` is same-DC-tuned;
+  cross-region quorum pushes hit `deadline_exceeded` → DLQ (do-1461
+  finding). Cross-region meshes need **5000-10000 ms**; the reference
+  3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000`
+  (`deploy/do-1461/provision/lib.sh` carries the rationale — the
+  receiver's embed-on-receive after a dimension migration can add
+  ~1 s/row, see #1566 below). Raising the deadline is safe: the write
+  commits locally first, so a longer remote-ack wait widens only the
+  synchronous-durability gate, never the local commit. WAN guidance
+  documented in `docs/federation.md` §Tuning,
+  `docs/ADR-0001-quorum-replication.md`, and
+  `docs/TROUBLESHOOTING.md`.
+- **[#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)**
+  — an embedding-dimension migration NULLs stored vectors, so
+  receivers synchronously re-embed on federation receive (~1 s/row),
+  inflating quorum latency + DLQ pressure during the backfill window.
+  Plan dimension changes as a maintenance window on federated fleets.
+
+## Known operational postures at v0.7.0 ([#1531](https://github.com/alphaonedev/ai-memory-mcp/issues/1531) residual round, 2026-06-09)
+
+Documented dispositions — deliberate v0.7.0 behavior, stated
+explicitly so operators don't have to reverse-engineer it from source.
+
+- **Security posture —
+  [#1569](https://github.com/alphaonedev/ai-memory-mcp/issues/1569):
+  namespace governance defaults are allow-on-silence.** Absent an
+  explicit namespace standard, `CorePolicy::default()` is
+  `write: Any`, `promote: Any`, `delete: Owner`
+  (`src/models/namespace.rs`) — **write/promote are ungated by design
+  at v0.7.0**; the governance pipeline gates only what operators
+  configure. Hardening knob: attach a standard via
+  `memory_namespace_set_standard` with a `metadata.governance`
+  policy. Set standards on every production namespace. Documented in
+  `docs/governance.md` §"Namespace-standard defaults" + CLAUDE.md
+  §Data Model.
+- **Deprecation —
+  [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574):
+  `?api_key=` query-parameter authentication.** The supported
+  credential channel is the `x-api-key` request header. The query
+  form leaks credentials into access logs, `Referer` headers, and
+  proxy logs; at v0.7.0 it is still accepted for back-compat with a
+  once-per-process WARN (`handlers::transport::api_key_auth`), and is
+  slated for v0.8 rejection behind a temporary escape hatch. Migrate
+  callers now. Documented in `docs/production-deployment.md` §3b.
+- **Rollback contract —
+  [#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576):
+  migrations are forward-only by design; snapshot-restore is the
+  rollback.** Every schema-mutating upgrade first writes an automatic
+  sibling snapshot
+  `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak`
+  (`PRE_MIGRATION_BACKUP_INFIX`, `src/storage/migrations.rs`;
+  `VACUUM INTO`, transactionally consistent, SQLCipher keying
+  inherited) and refuses to mutate the schema if the snapshot fails.
+  Rollback = stop daemon → reinstall previous binary → restore the
+  snapshot → start. Procedure in `docs/ADMIN_GUIDE.md`
+  §Migration → Rollback.
+
 ## v0.7.0 provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067), 2026-05-21)
 
 The historical Ollama-only LLM client is now a **provider-agnostic LLM
@@ -173,7 +323,8 @@ inline in `~/.claude.json`. #1146 retires that fragmentation.
 **Single source of truth — sectioned config schema v2.**
 `~/.config/ai-memory/config.toml` now carries dedicated
 `[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, and `[storage]`
-sections. The compile-time tier presets (`src/config.rs:165-178`)
+sections. The compile-time tier presets (`src/config.rs::FeatureTier` preset
+constructors + `default_tier_llm_model`)
 remain as the last-resort fallback under the precedence ladder, not
 as a parallel source of truth.
 
@@ -340,7 +491,7 @@ before the #1067 / #1068 substrate work.
     daemon's IPC; until then, restart is the load-bearing remediation.
 - **[#1027](https://github.com/alphaonedev/ai-memory-mcp/issues/1027)
   (CRITICAL) — `run_gc` HTTP route missing `require_admin` gate.**
-  `src/handlers/admin.rs:492` `run_gc` emitted an audit row but did
+  `src/handlers/admin.rs::run_gc` emitted an audit row but did
   NOT enforce admin-allowlist membership. Any API-key holder could
   trigger the GC sweep which permanently DELETEs every row past
   `expires_at` — force-purge across tenants in advance of any restore
@@ -350,7 +501,7 @@ before the #1067 / #1068 substrate work.
   `403 FORBIDDEN` before any state change.
 - **[#1050](https://github.com/alphaonedev/ai-memory-mcp/issues/1050)
   (CRITICAL) — `memory_share` advertised but dispatch arm missing.**
-  `registered_tools()` shipped `memory_share`, `src/mcp/share.rs::handle_share`
+  `registered_tools()` shipped `memory_share`, `src/mcp/tools/share.rs::handle_share`
   exists, capabilities v3 reports `callable_now=true` under any
   profile containing `Family::Power` — but `TOOL_DISPATCH_TABLE`
   (`src/mcp/mod.rs`) contained no `register_mcp_tool!("memory_share", …)`
@@ -1239,7 +1390,7 @@ The v0.7.0 Option B substrate-authority foundation:
   [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691))
   wires `check_agent_action` into the `storage::insert` pre-write
   path. The HTTP handler surfaces the structured refusal via the
-  new `RuleRefused` error variant
+  `MemoryError::RefusedByGovernance` error variant
   ([`src/errors.rs`](../../src/errors.rs)). Other adapter write
   paths (link insert, consolidate, reflect, federation receive)
   continue to enforce reflection-specific authority via the

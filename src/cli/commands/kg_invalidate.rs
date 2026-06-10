@@ -16,6 +16,7 @@
 //! dispatch on supersession all live in
 //! [`crate::mcp::handle_kg_invalidate`].
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -72,7 +73,7 @@ pub fn cmd_kg_invalidate(
         "relation": args.relation,
     });
     if let Some(t) = &args.valid_until {
-        params["valid_until"] = json!(t);
+        params[field_names::VALID_UNTIL] = json!(t);
     }
     if let Some(a) = &args.agent_id {
         params["agent_id"] = json!(a);
@@ -92,7 +93,7 @@ pub fn cmd_kg_invalidate(
         .unwrap_or(false);
     if found {
         let vu = envelope
-            .get("valid_until")
+            .get(field_names::VALID_UNTIL)
             .and_then(Value::as_str)
             .unwrap_or("?");
         writeln!(out.stdout, "kg-invalidate: invalidated  valid_until={vu}")?;

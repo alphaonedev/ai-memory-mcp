@@ -35,6 +35,7 @@
 //! surfaces share that one implementation; adding a CLI verb is one
 //! `Command::Share(ShareArgs)` arm + this module.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -93,8 +94,8 @@ pub fn cmd_share(
     // ergonomics (`--memory-id` vs `source_memory_id`) but the shared
     // dispatcher only sees the canonical MCP field names.
     let params: Value = json!({
-        "source_memory_id": args.memory_id,
-        "target_agent_id": args.target_agent,
+        (field_names::SOURCE_MEMORY_ID): args.memory_id,
+        (field_names::TARGET_AGENT_ID): args.target_agent,
     });
 
     let envelope = crate::mcp::share::handle_share(&conn, &params)
@@ -114,11 +115,11 @@ pub fn cmd_share(
         .and_then(Value::as_str)
         .unwrap_or("?");
     let target_ns = envelope
-        .get("target_namespace")
+        .get(field_names::TARGET_NAMESPACE)
         .and_then(Value::as_str)
         .unwrap_or("?");
     let from_agent = envelope
-        .get("from_agent_id")
+        .get(field_names::FROM_AGENT_ID)
         .and_then(Value::as_str)
         .unwrap_or("?");
     writeln!(

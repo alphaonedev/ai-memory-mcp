@@ -4,6 +4,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Canonical `collective` scope spelling — referenced from `all_strs`,
+/// `from_str`, and `as_str` (#1558 batch 6).
+const COLLECTIVE: &str = "collective";
+/// `auto_atomise_mode` value for [`AutoAtomiseMode::Synchronous`] — shared
+/// with the CLI namespace policy template (#1558 batch 6).
+pub(crate) const AUTO_ATOMISE_SYNCHRONOUS: &str = "synchronous";
+
 /// Closed set of visibility scopes stamped into `metadata.scope` (Task 1.5).
 /// Controls which agents can see a memory via hierarchical namespace matching.
 /// Memories without a `scope` field are treated as `private` by the query layer.
@@ -73,7 +80,7 @@ impl MemoryScope {
     /// Parity-test-asserted against the `VALID_SCOPES` const.
     #[must_use]
     pub const fn all_strs() -> &'static [&'static str; Self::COUNT] {
-        &["private", "team", "unit", "org", "collective"]
+        &["private", "team", "unit", "org", COLLECTIVE]
     }
 
     /// Parse the string form stored in `metadata.scope`.
@@ -88,7 +95,7 @@ impl MemoryScope {
             "team" => Some(Self::Team),
             "unit" => Some(Self::Unit),
             "org" => Some(Self::Org),
-            "collective" => Some(Self::Collective),
+            COLLECTIVE => Some(Self::Collective),
             _ => None,
         }
     }
@@ -103,7 +110,7 @@ impl MemoryScope {
             Self::Team => "team",
             Self::Unit => "unit",
             Self::Org => "org",
-            Self::Collective => "collective",
+            Self::Collective => COLLECTIVE,
         }
     }
 }
@@ -810,7 +817,7 @@ impl AutoAtomiseMode {
         match self {
             Self::Off => "off",
             Self::Deferred => "deferred",
-            Self::Synchronous => "synchronous",
+            Self::Synchronous => AUTO_ATOMISE_SYNCHRONOUS,
         }
     }
 }
@@ -891,7 +898,7 @@ impl GovernancePolicy {
     /// `None` when the field is missing/null. Parse errors propagate so
     /// callers can surface them to the user instead of silently defaulting.
     pub fn from_metadata(metadata: &Value) -> Option<Result<Self, serde_json::Error>> {
-        let gov = metadata.get("governance")?;
+        let gov = metadata.get(crate::META_KEY_GOVERNANCE)?;
         if gov.is_null() {
             return None;
         }
@@ -1125,6 +1132,15 @@ impl GovernancePolicy {
 
 /// Namespace reserved for agent registrations (Task 1.3).
 pub const AGENTS_NAMESPACE: &str = "_agents";
+
+/// Canonical title for an agent-registration row in
+/// [`AGENTS_NAMESPACE`] — `agent:<agent_id>`. Both storage backends
+/// CONSTRUCT registration rows with this title and the subscription
+/// path MATCHES on it, so the shape must come from one place (#1558).
+#[must_use]
+pub fn agent_registration_title(agent_id: &str) -> String {
+    format!("agent:{agent_id}")
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterAgentBody {

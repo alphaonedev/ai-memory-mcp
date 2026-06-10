@@ -37,6 +37,7 @@
 //! - `attest_level` enum + `memory_verify` MCP tool (H4).
 //! - `signed_events` audit table (H5).
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use ed25519_dalek::Signer;
 
@@ -101,9 +102,9 @@ pub fn canonical_cbor(link: &SignableLink<'_>) -> Result<Vec<u8>> {
     map.insert("src_id", ciborium::Value::Text(link.src_id.to_string()));
     map.insert("dst_id", ciborium::Value::Text(link.dst_id.to_string()));
     map.insert("relation", ciborium::Value::Text(link.relation.to_string()));
-    map.insert("observed_by", text_or_null(link.observed_by));
-    map.insert("valid_from", text_or_null(link.valid_from));
-    map.insert("valid_until", text_or_null(link.valid_until));
+    map.insert(field_names::OBSERVED_BY, text_or_null(link.observed_by));
+    map.insert(field_names::VALID_FROM, text_or_null(link.valid_from));
+    map.insert(field_names::VALID_UNTIL, text_or_null(link.valid_until));
 
     // Convert the BTreeMap to a `ciborium::Value::Map` whose entries are
     // already in lexicographic key order. ciborium will preserve that
@@ -231,7 +232,7 @@ pub fn canonical_cbor_persona(p: &SignablePersona<'_>) -> Result<Vec<u8>> {
         ciborium::Value::Integer(ciborium::value::Integer::from(p.version)),
     );
     map.insert(
-        "generated_at",
+        field_names::GENERATED_AT,
         ciborium::Value::Text(p.generated_at.to_string()),
     );
     let sources_val = ciborium::Value::Array(
@@ -362,11 +363,11 @@ pub fn canonical_cbor_write(w: &SignableWrite<'_>) -> Result<Vec<u8>> {
     map.insert("title", ciborium::Value::Text(w.title.to_string()));
     map.insert("kind", ciborium::Value::Text(w.kind.to_string()));
     map.insert(
-        "created_at",
+        field_names::CREATED_AT,
         ciborium::Value::Text(w.created_at.to_string()),
     );
     map.insert(
-        "content_sha256",
+        field_names::CONTENT_SHA256,
         ciborium::Value::Bytes(w.content_sha256.to_vec()),
     );
 

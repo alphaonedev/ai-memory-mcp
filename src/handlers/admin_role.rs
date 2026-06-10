@@ -58,6 +58,50 @@ use serde_json::json;
 
 use super::AppState;
 
+/// #1570 (H6) — operator escape hatch: when truthy (`1` / `true`), the
+/// admin-role gate reverts to the legacy posture where a bare
+/// `X-Agent-Id` header naming an allowlisted admin id mints the admin
+/// role even on a deployment with NO request authentication (no
+/// `api_key` configured). Default OFF = secure: on an unauthenticated
+/// deployment the self-asserted header alone can never grant admin.
+/// Mirrors the #1455 `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR`
+/// fail-closed-with-explicit-opt-out convention.
+pub const ENV_ADMIN_HEADER_TRUST: &str = "AI_MEMORY_ADMIN_HEADER_TRUST";
+
+/// #1570 — `true` when the operator explicitly opted into the legacy
+/// trust-the-header posture via [`ENV_ADMIN_HEADER_TRUST`].
+#[must_use]
+pub fn admin_header_trust_enabled() -> bool {
+    std::env::var(ENV_ADMIN_HEADER_TRUST)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// #1570 — process-wide marker: `true` when the running daemon has
+/// request authentication configured (an `api_key`, enforced by the
+/// `api_key_auth` middleware on every non-exempt route). Set once by
+/// `bootstrap_serve`; defaults to `false` so embeddings that never ran
+/// the daemon bootstrap (and the unauthenticated default install) stay
+/// on the secure-deny side. A request that reached an admin handler on
+/// a `true` deployment has, by middleware construction, presented the
+/// key — so the `X-Agent-Id` role claim is at least bound to a caller
+/// holding the transport credential. (#626 request-level attested
+/// identity does not exist on the HTTP read surface at v0.7.0; when it
+/// lands it becomes an additional accepted authn source here.)
+static REQUEST_AUTHN_CONFIGURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #1570 — record at boot whether request authentication (`api_key`)
+/// is configured. Called by `bootstrap_serve`; test fixtures that
+/// model an authenticated deployment call it with `true`.
+pub fn mark_request_authn_configured(configured: bool) {
+    REQUEST_AUTHN_CONFIGURED.store(configured, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn request_authn_configured() -> bool {
+    REQUEST_AUTHN_CONFIGURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Pure predicate — `true` iff `caller` appears in `state`'s
 /// admin-agent allowlist.
 ///
@@ -177,13 +221,39 @@ pub fn require_admin(
             );
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response());
         }
     };
 
-    let admitted = is_admin_caller(state, &caller);
+    let allowlisted = is_admin_caller(state, &caller);
+
+    // #1570 (H6) — an allowlisted NAME is not enough by itself. The
+    // `X-Agent-Id` header is self-asserted (no cryptographic binding
+    // exists for it in v0.7.0), so on a deployment with NO request
+    // authentication any wire caller could mint admin by typing a
+    // configured id into the header. The header role-claim is honored
+    // only when (a) the daemon has an `api_key` configured — the
+    // middleware then guarantees every request reaching this gate
+    // presented the transport credential — or (b) the operator
+    // explicitly opted into the legacy posture via
+    // [`ENV_ADMIN_HEADER_TRUST`]. Default = deny (fail closed, #1455
+    // convention). The wire response stays the same generic 403 so a
+    // probe cannot distinguish "not allowlisted" from "allowlisted but
+    // unauthenticated"; the audit row carries the distinct outcome for
+    // operators.
+    let header_trusted = request_authn_configured() || admin_header_trust_enabled();
+    let admitted = allowlisted && header_trusted;
+    let outcome = if admitted {
+        "admitted"
+    } else if allowlisted {
+        // Allowlisted name, but no authn on the deployment and the
+        // trust flag is off — the #1570 secure-default refusal.
+        "rejected_unauthenticated_header_identity"
+    } else {
+        "rejected"
+    };
     crate::governance::audit::record_decision(
         &caller,
         if admitted { "allow" } else { "deny" },
@@ -191,7 +261,7 @@ pub fn require_admin(
         "",
         json!({
             "endpoint": endpoint,
-            "outcome": if admitted { "admitted" } else { "rejected" },
+            "outcome": outcome,
         }),
     );
 

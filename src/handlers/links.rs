@@ -23,6 +23,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, State},
@@ -35,6 +36,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::models::LinkBody;
 #[cfg(feature = "sal")]
 use crate::models::MemoryLink;
@@ -92,7 +94,7 @@ pub async fn verify_link_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "verify_link requires either source_id or link_id",
+                "error": crate::errors::msg::VERIFY_LINK_ARGS_REQUIRED,
                 "fields": ["source_id", "link_id"],
             })),
         )
@@ -103,7 +105,7 @@ pub async fn verify_link_handler(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid source_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("source_id", e)})),
         )
             .into_response();
     }
@@ -192,7 +194,7 @@ pub async fn verify_link_handler(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Link,
-                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::actor(sentinels::AI_HTTP, "http_body", None),
                         crate::audit::target_memory(
                             report.source_id.clone(),
                             String::new(),
@@ -243,11 +245,11 @@ const ALLOWED_LINK_BODY_FIELDS: &[&str] = &[
 /// 0027). Used to surface a structured `invalid_relation` 400 from the
 /// HTTP handler before the INSERT crashes with a generic CHECK error.
 const ALLOWED_LINK_RELATIONS: &[&str] = &[
-    "related_to",
-    "supersedes",
-    "contradicts",
-    "derived_from",
-    "reflects_on",
+    crate::models::MemoryLinkRelation::RelatedTo.as_str(),
+    crate::models::MemoryLinkRelation::Supersedes.as_str(),
+    crate::models::MemoryLinkRelation::Contradicts.as_str(),
+    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
 ];
 
 /// Return the list of unknown fields in `raw` against
@@ -378,7 +380,7 @@ pub async fn create_link(
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Link,
-                        crate::audit::actor("ai:http", "http_body", None),
+                        crate::audit::actor(sentinels::AI_HTTP, "http_body", None),
                         crate::audit::target_memory(
                             source_id.clone(),
                             String::new(),
@@ -413,7 +415,7 @@ pub async fn create_link(
                         .ok();
                     super::dispatch_event_postgres(
                         &app,
-                        "memory_link_created",
+                        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
                         &source_id,
                         &ns,
                         link_owner.as_deref(),
@@ -428,7 +430,7 @@ pub async fn create_link(
                         "source_id": source_id,
                         "target_id": target_id,
                         "relation": relation,
-                        "attest_level": attest_level,
+                        (field_names::ATTEST_LEVEL): attest_level,
                     })),
                 )
                     .into_response()
@@ -464,7 +466,7 @@ pub async fn create_link(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "source memory not found", "source_id": source_id})),
+                Json(json!({"error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND, "source_id": source_id})),
             )
                 .into_response();
         }
@@ -472,7 +474,7 @@ pub async fn create_link(
             tracing::error!("create_link: source lookup failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -484,20 +486,23 @@ pub async fn create_link(
         .unwrap_or("");
     let source_target = source_mem
         .metadata
-        .get("target_agent_id")
+        .get(field_names::TARGET_AGENT_ID)
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let is_unowned_legacy = source_owner.is_empty();
-    if !is_unowned_legacy && source_owner != caller && source_target != caller && caller != "daemon"
+    if !is_unowned_legacy
+        && source_owner != caller
+        && source_target != caller
+        && caller != sentinels::DAEMON_PRINCIPAL
     {
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/links 403: caller {caller} != source owner {source_owner} (source_id={source_id})"
         );
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "caller does not own this source memory",
+                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
                 "owner": source_owner,
                 "caller": caller,
                 "source_id": source_id,
@@ -542,7 +547,7 @@ pub async fn create_link(
         .ok();
         crate::subscriptions::dispatch_event_with_details(
             &lock.0,
-            "memory_link_created",
+            crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
             &source_id,
             &link_namespace,
             link_owner.as_deref(),
@@ -600,7 +605,7 @@ pub async fn create_link(
             // can tell signed vs unsigned without re-querying.
             (
                 StatusCode::CREATED,
-                Json(json!({"linked": true, "attest_level": attest_level})),
+                Json(json!({"linked": true, (field_names::ATTEST_LEVEL): attest_level})),
             )
                 .into_response()
         }
@@ -632,12 +637,7 @@ pub async fn create_link(
                     _ => {}
                 }
             }
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
+            crate::handlers::errors::handler_error_500(&e)
         }
     }
 }
@@ -692,7 +692,7 @@ pub async fn delete_link(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -733,7 +733,7 @@ pub async fn delete_link(
             tracing::error!("delete_link: source lookup failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -748,14 +748,7 @@ pub async fn delete_link(
             drop(lock);
             return match delete_result {
                 Ok(removed) => Json(json!({"deleted": removed})).into_response(),
-                Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response()
-                }
+                Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
         }
     };
@@ -773,7 +766,7 @@ pub async fn delete_link(
         .to_string();
     let source_target = source_mem
         .metadata
-        .get("target_agent_id")
+        .get(field_names::TARGET_AGENT_ID)
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -781,10 +774,10 @@ pub async fn delete_link(
         source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
     let owns_source = source_owner == caller || source_target == caller;
     let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
-    if !is_unowned_legacy && !owns_source && !owns_target && caller != "daemon" {
+    if !is_unowned_legacy && !owns_source && !owns_target && caller != sentinels::DAEMON_PRINCIPAL {
         drop(lock);
         tracing::warn!(
-            target: "ai_memory::authz",
+            target: super::AUTHZ_TRACE_TARGET,
             "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
             target_mem_owner.as_deref().unwrap_or("")
         );
@@ -806,14 +799,7 @@ pub async fn delete_link(
     drop(lock);
     match delete_result {
         Ok(removed) => Json(json!({"deleted": removed})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -841,7 +827,7 @@ pub async fn get_links(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()))
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
     let caller_is_admin = crate::handlers::admin_role::is_admin_caller(&app, &caller);
 
@@ -968,13 +954,6 @@ pub async fn get_links(
             };
             Json(json!({"links": visible})).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

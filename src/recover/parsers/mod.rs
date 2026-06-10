@@ -49,10 +49,55 @@ pub struct ParsedTurn {
     /// this layer (the recovered memory's content is the user-
     /// visible decision text, not the agent's tool-call trace).
     pub tool_calls: Vec<ToolCallSummary>,
-    /// Stable sha256 of the source line content. Used as the dedup
-    /// key in `transcript_line_dedup` so re-running recovery is a
-    /// no-op for already-atomised turns.
+    /// Stable sha256 of the source line content. Retained for audit
+    /// (memory title + metadata) and as the legacy back-compat dedup
+    /// probe; post-#1573 the dedup KEY is
+    /// `(host_session_id, host_turn_index)` when the host format
+    /// provides both, else [`Self::normalized_sha256_hex`].
     pub line_sha256_hex: String,
+    /// Host-assigned session identifier for the turn (e.g. the
+    /// Claude Code JSONL `sessionId` field). `None` when the host
+    /// format does not carry one. Half of the #1573 canonical dedup
+    /// key, mirroring the L4 `memory_capture_turn` envelope.
+    pub host_session_id: Option<String>,
+    /// Host-assigned monotonic per-session turn counter. `None` when
+    /// the host format does not carry one (the Claude Code JSONL
+    /// format has no numeric turn counter — a line ordinal is NOT a
+    /// substitute because it need not agree with the counter the L4
+    /// `memory_capture_turn` envelope supplies, and a coincidental
+    /// match would falsely dedup a distinct turn).
+    pub host_turn_index: Option<i64>,
+}
+
+impl ParsedTurn {
+    /// #1573 — sha256 over the turn's NORMALIZED semantic content
+    /// (session id, timestamp, role, text, tool-call summaries) with
+    /// `0x00` field separators and `0x1f`/`0x1e` intra-list
+    /// separators. Unlike the raw-line hash, this is invariant under
+    /// host re-serialization (whitespace, JSON key order), so the
+    /// same turn rewritten by a host upgrade still dedups; distinct
+    /// turns that merely share text still differ via the
+    /// session-id + timestamp components.
+    #[must_use]
+    pub fn normalized_sha256_hex(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.host_session_id.as_deref().unwrap_or("").as_bytes());
+        h.update([0x00]);
+        h.update(self.timestamp_iso.as_bytes());
+        h.update([0x00]);
+        h.update(self.role.as_str().as_bytes());
+        h.update([0x00]);
+        h.update(self.content_text.as_bytes());
+        h.update([0x00]);
+        for tc in &self.tool_calls {
+            h.update(tc.tool.as_bytes());
+            h.update([0x1f]);
+            h.update(tc.brief.as_bytes());
+            h.update([0x1e]);
+        }
+        format!("{:x}", h.finalize())
+    }
 }
 
 /// Role classification for one parsed transcript turn.
@@ -71,6 +116,22 @@ pub enum TurnRole {
     /// permission-mode toggles, etc.) — preserved as low-priority
     /// observations rather than dropped.
     Other,
+}
+
+impl TurnRole {
+    /// Stable wire string for the role. Single source for the
+    /// recovered-memory tags/metadata AND the #1573 normalized
+    /// dedup hash, so the two can never drift.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::ToolUse => "tool_use",
+            Self::ToolResult => "tool_result",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// One tool-call mention extracted from an assistant turn.

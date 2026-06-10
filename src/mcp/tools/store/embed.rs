@@ -47,7 +47,7 @@ pub(super) fn store_source_embedding(
     actual_id: &str,
     vector_index: Option<&VectorIndex>,
 ) {
-    let text = format!("{} {}", mem.title, mem.content);
+    let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
     match embedder.embed(&text) {
         Ok(embedding) => {
             if let Err(e) = db::set_embedding(conn, actual_id, &embedding) {

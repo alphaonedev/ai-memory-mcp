@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -14,6 +15,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::models::{Memory, Tier};
 use crate::validate;
 
@@ -23,6 +25,9 @@ use super::StorageBackend;
 use super::store_err_to_response;
 use super::{AppState, Db};
 use super::{fanout_or_503, list_namespaces, resolve_caller_agent_id};
+
+/// Marker tag on namespace-standard rows (#1558 batch 6).
+const NAMESPACE_STANDARD_TAG: &str = "_namespace_standard";
 
 #[derive(Deserialize)]
 pub struct InboxQuery {
@@ -55,7 +60,7 @@ pub async fn get_inbox(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id query parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_QUERY_MISMATCH})),
         )
             .into_response();
     }
@@ -109,18 +114,18 @@ pub async fn get_inbox(
                             "tier": m.tier.as_str(),
                             "namespace": m.namespace,
                             "metadata": m.metadata,
-                            "created_at": m.created_at,
-                            "updated_at": m.updated_at,
+                            (field_names::CREATED_AT): m.created_at,
+                            (field_names::UPDATED_AT): m.updated_at,
                             "agent_id": m.metadata
                                 .get("agent_id")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
-                            "from_agent_id": m.metadata
-                                .get("from_agent_id")
+                            (field_names::FROM_AGENT_ID): m.metadata
+                                .get(field_names::FROM_AGENT_ID)
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
-                            "target_agent_id": m.metadata
-                                .get("target_agent_id")
+                            (field_names::TARGET_AGENT_ID): m.metadata
+                                .get(field_names::TARGET_AGENT_ID)
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(""),
                         })
@@ -141,7 +146,7 @@ pub async fn get_inbox(
                         "agent_id": owner,
                         "messages": messages,
                         "unread_count": unread_count,
-                        "storage_backend": "postgres",
+                        (field_names::STORAGE_BACKEND): "postgres",
                     })),
                 )
                     .into_response()
@@ -152,16 +157,16 @@ pub async fn get_inbox(
 
     let mut params = json!({"agent_id": owner});
     if let Some(u) = q.unread_only {
-        params["unread_only"] = json!(u);
+        params[field_names::UNREAD_ONLY] = json!(u);
     }
     if let Some(l) = q.limit {
         params["limit"] = json!(l);
     }
     let lock = app.db.lock().await;
-    // Pass the resolved owner as `mcp_client` too so `handle_inbox`'s
-    // identity-resolution fallback lands on the same id whichever branch
-    // it consults (it prefers `params["agent_id"]` when present).
-    let result = crate::mcp::handle_inbox(&lock.0, &params, None);
+    // #1557 — pass the authenticated, already-403-checked `owner` as the
+    // visibility caller so the `handle_inbox` owner-bind double-enforces it
+    // (defense-in-depth; the upstream X-Agent-Id 403 remains the primary gate).
+    let result = crate::mcp::handle_inbox(&lock.0, &params, None, Some(owner.as_str()));
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -228,7 +233,7 @@ fn namespace_standard_params(ns: &str, body: &NamespaceStandardBody) -> serde_js
         params["parent"] = json!(p);
     }
     if let Some(ref g) = body.governance {
-        params["governance"] = g.clone();
+        params[field_names::GOVERNANCE] = g.clone();
     }
     params
 }
@@ -278,7 +283,7 @@ async fn set_namespace_standard_inner(
     let header_agent_id =
         headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -286,7 +291,7 @@ async fn set_namespace_standard_inner(
         "",
         json!({
             "namespace": ns,
-            "standard_id": body.id.clone(),
+            (field_names::STANDARD_ID): body.id.clone(),
             "parent": body.parent.clone(),
             "has_governance": body.governance.is_some(),
         }),
@@ -331,7 +336,7 @@ async fn set_namespace_standard_inner(
             let existing = match app.store.list(&ctx, &filter).await {
                 Ok(rows) => rows
                     .into_iter()
-                    .find(|m| m.tags.iter().any(|t| t == "_namespace_standard"))
+                    .find(|m| m.tags.iter().any(|t| t == NAMESPACE_STANDARD_TAG))
                     .map(|m| m.id),
                 Err(_) => None,
             };
@@ -347,11 +352,12 @@ async fn set_namespace_standard_inner(
                 // scope=shared preserves multi-reader visibility under
                 // the SAL #910 filter so consumers across the
                 // namespace can read the governance policy.
-                let placeholder_agent_id = if caller.is_empty() || caller == "anonymous:invalid" {
-                    "system".to_string()
-                } else {
-                    caller.clone()
-                };
+                let placeholder_agent_id =
+                    if caller.is_empty() || caller == sentinels::ANONYMOUS_INVALID {
+                        sentinels::SYSTEM_PRINCIPAL.to_string()
+                    } else {
+                        caller.clone()
+                    };
                 let mut metadata = serde_json::json!({
                     "agent_id": placeholder_agent_id,
                     "scope": "shared",
@@ -359,7 +365,7 @@ async fn set_namespace_standard_inner(
                 if let Some(g) = body.governance.clone()
                     && let Some(obj) = metadata.as_object_mut()
                 {
-                    obj.insert("governance".to_string(), g);
+                    obj.insert(crate::META_KEY_GOVERNANCE.to_string(), g);
                 }
                 let placeholder = Memory {
                     id: Uuid::new_v4().to_string(),
@@ -367,7 +373,7 @@ async fn set_namespace_standard_inner(
                     namespace: ns.to_string(),
                     title: format!("_standard:{ns}"),
                     content: format!("namespace standard for {ns}"),
-                    tags: vec!["_namespace_standard".to_string()],
+                    tags: vec![NAMESPACE_STANDARD_TAG.to_string()],
                     priority: 5,
                     confidence: 1.0,
                     source: "api".into(),
@@ -410,17 +416,21 @@ async fn set_namespace_standard_inner(
                 .get("agent_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+            let is_unowned =
+                recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
             let caller_principal = ctx.effective_principal();
-            if !is_unowned && recorded_owner != caller_principal && caller_principal != "daemon" {
+            if !is_unowned
+                && recorded_owner != caller_principal
+                && caller_principal != sentinels::DAEMON_PRINCIPAL
+            {
                 tracing::warn!(
-                    target: "ai_memory::authz",
+                    target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403 (postgres path): caller {caller_principal} != owner {recorded_owner} (ns={ns}, id={standard_id})"
                 );
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "error": "caller does not own this namespace standard",
+                        "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
                         "owner": recorded_owner,
                         "caller": caller_principal
                     })),
@@ -429,7 +439,9 @@ async fn set_namespace_standard_inner(
             }
             // Unowned-legacy claim: rewrite metadata.agent_id to caller
             // so subsequent calls are properly gated.
-            if is_unowned && !caller_principal.is_empty() && caller_principal != "anonymous:invalid"
+            if is_unowned
+                && !caller_principal.is_empty()
+                && caller_principal != sentinels::ANONYMOUS_INVALID
             {
                 let mut new_meta = if resolved_mem.metadata.is_object() {
                     resolved_mem.metadata.clone()
@@ -477,26 +489,30 @@ async fn set_namespace_standard_inner(
                 Ok(m) => m,
                 Err(e) => return store_err_to_response(e),
             };
-            let merged = merge_governance_fields_http(standard_mem.metadata.get("governance"), &g);
+            let merged = merge_governance_fields_http(
+                standard_mem.metadata.get(crate::META_KEY_GOVERNANCE),
+                &g,
+            );
             // Validate the merged blob's typed shape. Deserialising
             // drops unknown fields but the typed sub-set must still
             // parse + pass policy validation. Mirrors the SQLite path
             // at `mcp::tools::namespace`.
-            let policy: crate::models::GovernancePolicy =
-                match serde_json::from_value(merged.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return (
+            let policy: crate::models::GovernancePolicy = match serde_json::from_value(
+                merged.clone(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
                             StatusCode::BAD_REQUEST,
-                            Json(json!({"error": format!("invalid governance: {e}")})),
+                            Json(json!({"error": crate::errors::msg::invalid(crate::META_KEY_GOVERNANCE, e)})),
                         )
                             .into_response();
-                    }
-                };
+                }
+            };
             if let Err(e) = validate::validate_governance_policy(&policy) {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("invalid governance: {e}")})),
+                    Json(json!({"error": crate::errors::msg::invalid(crate::META_KEY_GOVERNANCE, e)})),
                 )
                     .into_response();
             }
@@ -506,7 +522,7 @@ async fn set_namespace_standard_inner(
                 json!({})
             };
             if let Some(obj) = metadata.as_object_mut() {
-                obj.insert("governance".to_string(), merged);
+                obj.insert(crate::META_KEY_GOVERNANCE.to_string(), merged);
             }
             let patch = crate::store::UpdatePatch {
                 metadata: Some(metadata),
@@ -525,9 +541,9 @@ async fn set_namespace_standard_inner(
                 StatusCode::CREATED,
                 Json(json!({
                     "namespace": ns,
-                    "standard_id": standard_id,
+                    (field_names::STANDARD_ID): standard_id,
                     "parent": body.parent,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -553,7 +569,7 @@ async fn set_namespace_standard_inner(
             None,
             None,
             None,
-            Some("_namespace_standard"),
+            Some(NAMESPACE_STANDARD_TAG),
             None,
         )
         .ok()
@@ -575,16 +591,17 @@ async fn set_namespace_standard_inner(
                 .get("agent_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-            if !is_unowned && recorded_owner != caller && caller != "daemon" {
+            let is_unowned =
+                recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
+            if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
                 tracing::warn!(
-                    target: "ai_memory::authz",
+                    target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403: caller {caller} != owner {recorded_owner} (ns={ns})"
                 );
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "error": "caller does not own this namespace standard",
+                        "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
                         "owner": recorded_owner,
                         "caller": caller
                     })),
@@ -594,7 +611,7 @@ async fn set_namespace_standard_inner(
             // Unowned-legacy fast path: claim ownership by rewriting
             // metadata.agent_id to the caller. Next request from a
             // different caller will be 403'd.
-            if is_unowned && !caller.is_empty() && caller != "anonymous:invalid" {
+            if is_unowned && !caller.is_empty() && caller != sentinels::ANONYMOUS_INVALID {
                 let mut new_meta = if m.metadata.is_object() {
                     m.metadata.clone()
                 } else {
@@ -635,18 +652,19 @@ async fn set_namespace_standard_inner(
             // #929 — first-write anchors ownership to the caller, not
             // the legacy "system" sentinel. scope=shared preserves
             // multi-reader visibility under the SAL #910 filter.
-            let placeholder_agent_id = if caller.is_empty() || caller == "anonymous:invalid" {
-                "system".to_string()
-            } else {
-                caller.clone()
-            };
+            let placeholder_agent_id =
+                if caller.is_empty() || caller == sentinels::ANONYMOUS_INVALID {
+                    sentinels::SYSTEM_PRINCIPAL.to_string()
+                } else {
+                    caller.clone()
+                };
             let placeholder = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: ns.to_string(),
                 title: format!("_standard:{ns}"),
                 content: format!("namespace standard for {ns}"),
-                tags: vec!["_namespace_standard".to_string()],
+                tags: vec![NAMESPACE_STANDARD_TAG.to_string()],
                 priority: 5,
                 confidence: 1.0,
                 source: "api".into(),
@@ -677,7 +695,7 @@ async fn set_namespace_standard_inner(
                     tracing::error!("namespace_standard: placeholder insert failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }
@@ -697,16 +715,16 @@ async fn set_namespace_standard_inner(
             .get("agent_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-        if !is_unowned && recorded_owner != caller && caller != "daemon" {
+        let is_unowned = recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
+        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
             tracing::warn!(
-                target: "ai_memory::authz",
+                target: super::AUTHZ_TRACE_TARGET,
                 "POST /namespaces/{{ns}}/standard 403 (body.id path): caller {caller} != owner {recorded_owner} (ns={ns}, id={resolved_id})"
             );
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
-                    "error": "caller does not own this namespace standard",
+                    "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
                     "owner": recorded_owner,
                     "caller": caller
                 })),
@@ -825,7 +843,7 @@ pub async fn set_namespace_standard_qs(
     else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "namespace is required"})),
+            Json(json!({"error": crate::errors::msg::NAMESPACE_REQUIRED})),
         )
             .into_response();
     };
@@ -864,7 +882,7 @@ pub async fn get_namespace_standard_qs(
         // the namespace itself. Use for_admin so the SAL #910
         // scope=private visibility filter doesn't drop the standard
         // memory when the requester is not the policy author.
-        let ctx = crate::store::CallerContext::for_admin("ai:http-internal");
+        let ctx = crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
         let inherit = q.inherit.unwrap_or(false);
         // Build chain leaf → root (most-specific first) by trimming
         // `/segment` until empty. The chain matches the SQLite
@@ -898,20 +916,20 @@ pub async fn get_namespace_standard_qs(
                     let mem_doc = match app.store.get(&ctx, &standard_id).await {
                         Ok(m) => json!({
                             "namespace": candidate,
-                            "standard_id": standard_id,
+                            (field_names::STANDARD_ID): standard_id,
                             "id": standard_id,
                             "title": m.title,
                             "content": m.content,
                             "priority": m.priority,
-                            "parent_namespace": parent,
-                            "governance": m.metadata.get("governance").cloned()
+                            (field_names::PARENT_NAMESPACE): parent,
+                            (field_names::GOVERNANCE): m.metadata.get(crate::META_KEY_GOVERNANCE).cloned()
                                 .unwrap_or(serde_json::Value::Null),
                         }),
                         Err(_) => json!({
                             "namespace": candidate,
-                            "standard_id": standard_id,
+                            (field_names::STANDARD_ID): standard_id,
                             "id": standard_id,
-                            "parent_namespace": parent,
+                            (field_names::PARENT_NAMESPACE): parent,
                         }),
                     };
                     standards.push(mem_doc);
@@ -930,13 +948,13 @@ pub async fn get_namespace_standard_qs(
                     "standards": standards,
                     "resolved_namespace": closest.get("namespace").cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "standard_id": closest.get("standard_id").cloned()
+                    (field_names::STANDARD_ID): closest.get(field_names::STANDARD_ID).cloned()
                         .unwrap_or(serde_json::Value::Null),
                     "id": closest.get("id").cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "parent_namespace": closest.get("parent_namespace").cloned()
+                    (field_names::PARENT_NAMESPACE): closest.get(field_names::PARENT_NAMESPACE).cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response();
@@ -949,10 +967,10 @@ pub async fn get_namespace_standard_qs(
                     Json(json!({
                         "namespace": ns,
                         "resolved_namespace": ns,
-                        "standard_id": standard_id,
+                        (field_names::STANDARD_ID): standard_id,
                         "id": standard_id,
-                        "parent_namespace": parent,
-                        "storage_backend": "postgres",
+                        (field_names::PARENT_NAMESPACE): parent,
+                        (field_names::STORAGE_BACKEND): "postgres",
                     })),
                 )
                     .into_response();
@@ -964,10 +982,10 @@ pub async fn get_namespace_standard_qs(
             StatusCode::OK,
             Json(json!({
                 "namespace": ns,
-                "standard_id": serde_json::Value::Null,
+                (field_names::STANDARD_ID): serde_json::Value::Null,
                 "id": serde_json::Value::Null,
-                "parent_namespace": serde_json::Value::Null,
-                "storage_backend": "postgres",
+                (field_names::PARENT_NAMESPACE): serde_json::Value::Null,
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -994,7 +1012,7 @@ pub async fn clear_namespace_standard_qs(
     let Some(ns) = q.namespace else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "namespace is required"})),
+            Json(json!({"error": crate::errors::msg::NAMESPACE_REQUIRED})),
         )
             .into_response();
     };
@@ -1019,7 +1037,7 @@ async fn clear_namespace_standard_inner(
     let header_agent_id =
         headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -1045,7 +1063,7 @@ async fn clear_namespace_standard_inner(
                 Json(json!({
                     "cleared": true,
                     "namespace": ns,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -1110,7 +1128,7 @@ pub async fn session_start(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid agent_id: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
     }
@@ -1141,7 +1159,7 @@ pub async fn session_start(
     let caller = header_agent_id
         .map(str::to_string)
         .or_else(|| body.agent_id.clone())
-        .unwrap_or_else(|| format!("anonymous:req-{}", &Uuid::new_v4().to_string()[..8]));
+        .unwrap_or_else(crate::identity::anonymous_request_id);
     let mut params = json!({});
     if let Some(ref n) = body.namespace {
         params["namespace"] = json!(n);

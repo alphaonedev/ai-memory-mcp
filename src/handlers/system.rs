@@ -6,6 +6,7 @@
 //! Extracted from `src/handlers/mod.rs` as part of the issue #650
 //! file-architecture cleanup.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -105,7 +106,7 @@ pub async fn get_capabilities(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
-                target = "capabilities",
+                target: "capabilities",
                 error = %e,
                 "schema_version lookup via SAL failed; reporting 0"
             );
@@ -124,7 +125,7 @@ pub async fn get_capabilities(
             // on the field shape.
             if let Some(obj) = v.as_object_mut() {
                 obj.insert(
-                    "storage_backend".to_string(),
+                    field_names::STORAGE_BACKEND.to_string(),
                     serde_json::Value::String(app.storage_backend.as_str().to_string()),
                 );
                 // v0.7.0.1 S75 — surface the live DB schema-migration
@@ -149,7 +150,7 @@ pub async fn get_capabilities(
             tracing::error!("capabilities: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }

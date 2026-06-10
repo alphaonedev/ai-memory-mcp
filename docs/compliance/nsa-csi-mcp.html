@@ -217,6 +217,7 @@ footer a{color:var(--text-muted)}
         <li><a href="#real-world">Real-world incident classes</a></li>
         <li><a href="#verify">For procurement reviewers</a></li>
         <li><a href="#control-feature-matrix">Control → Feature matrix</a></li>
+        <li><a href="nsa-control-test-matrix.html">Control → Test matrix (companion page)</a></li>
         <li><a href="#boundaries">Honest boundaries</a></li>
         <li><a href="honest-limitations.md">Honest-limitations companion</a></li>
         <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON</a></li>
@@ -395,6 +396,7 @@ footer a{color:var(--text-muted)}
     </table>
 
     <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.85rem">Every <code>Capability identifier</code> in the tables above corresponds to a row in the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">capability inventory JSON</a>. Every <code>Substrate anchor</code> is a real file:line in the v0.7.x codebase. Procurement reviewers can run the verification commands in §<a href="#verify">For procurement reviewers</a> to reproduce the mapping from a fresh checkout.</p>
+    <p style="color:var(--text-dim);font-size:.85rem">This table maps each control to the <em>feature</em> that addresses it. The companion <a href="nsa-control-test-matrix.html">Control → Test Matrix</a> maps the same controls to the <em>automated checks</em> that exercise them — named tests (<code>file::test_name</code>), CI workflow jobs, and do-1461 live-fleet harness check ids — with evidence gaps stated honestly.</p>
   </div>
 </section>
 

@@ -62,7 +62,7 @@ use super::pipeline::MemoryId;
 /// `ReflectionPass` fall-back so a forensic walk of `metadata.agent_id`
 /// finds curator-written rows under the same tag.
 #[cfg(feature = "sal")]
-const CONSOLIDATOR_AGENT_ID: &str = "ai:curator";
+const CONSOLIDATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 
 // ---------------------------------------------------------------------------
 // ConsolidationPass

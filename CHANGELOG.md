@@ -105,6 +105,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via the LLM-agnostic backend (§2.7) but does not *attest* it. Tracked
   under [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
 
+### v0.7.0 #1558 hardcoded-literal SSOT remediation campaign (2026-06-09)
+
+Five-batch burn-down of duplicated string/numeric literals across the substrate ([#1558](https://github.com/alphaonedev/ai-memory-mcp/issues/1558)), enforced going forward by the pm-v3.1 mechanical ratchet gate `scripts/check-hardcoded-literals.sh` (companion to `scripts/check-vendor-literals.sh`; baseline counts may only shrink). Predominantly behavior-preserving; wire-visible exceptions are under **Changed**.
+
+#### Changed
+
+- **[#1562](https://github.com/alphaonedev/ai-memory-mcp/issues/1562)** — 58 tracing sites used FIELD syntax (`target = "..."`), which `RUST_LOG` target filtering cannot match; converted to real metadata targets routed through consts. **Operator-visible:** postgres SAL adapter events now emit under the literal targets `store::postgres` / `store::postgres::kg` — `RUST_LOG=ai_memory=debug` no longer matches them; add `store::postgres=debug` explicitly (commit `71ffcd5d`; also closes [#1563](https://github.com/alphaonedev/ai-memory-mcp/issues/1563) — dead postgres-gate arm for the unregistered `POST /api/v1/archive/purge` path removed).
+- **[#1560](https://github.com/alphaonedev/ai-memory-mcp/issues/1560)** — one `identity::anonymous_request_id()` helper (`anonymous:req-<uuid8>`) replaces 10 divergent synthesis sites, 8 of which stamped the full 36-char UUID against the documented uuid8 contract. **Wire-visible:** anonymous principals in logs/audit rows now carry an 8-char suffix everywhere (commit `2ba4214d`).
+
+#### Added
+
+- `src/identity/sentinels.rs` — reserved-principal sentinel SSOT (batch 2): every internal/system principal string (`DAEMON_PRINCIPAL`, `ANONYMOUS_INVALID`, `AI_CURATOR`, `AI_HTTP`, federation/subscription/migrate/export/governance internals) as one named const; 82 production sites routed. `validate::RESERVED_AGENT_IDS` is now BUILT from the sentinel consts (was a parallel "MUST stay in sync" literal list) with a new invariant test pinning every privileged sentinel ∈ the list. `DAEMON_KEYPAIR_LABEL` moved to `src/identity/keypair.rs` as the canonical `pub const` (commit `2ba4214d`).
+- `src/mcp/jsonrpc.rs` — JSON-RPC 2.0 wire-constant SSOT (batch 3): version tag, reserved error codes, MCP method names, protocolVersion revision; the crate-root `METHOD_*` consts become aliases of the `jsonrpc::*` canonical set (commit `23ac668a`).
+- `src/handlers/routes.rs` — HTTP route-path SSOT (batch 4a): one const per production route path (74 consts); the `src/lib.rs` router registers them and the postgres surface gate (207 literals in `handlers/postgres_gate.rs`), federation receiver, and CLI doctor match on them, so gating structurally cannot drift from registration; legacy `ROUTE_*` crate-root consts now alias the SSOT (commit `23ac668a`).
+
+#### Fixed
+
+- Postgres `agent_quotas` DDL parity (batch 1) — the postgres bootstrap DDL defaults now interpolate `quotas::DEFAULT_MAX_{MEMORIES_PER_DAY,STORAGE_BYTES,LINKS_PER_DAY}`; sqlite already routed through `quota_defaults()` and the postgres twin was the drift (commit `e06cedac`).
+- Literal-gate boundary fixes ×3: [#1561](https://github.com/alphaonedev/ai-memory-mcp/issues/1561) — include `#[cfg(test)]`-attributed modules in the gate's test boundary (commit `e08649ef`); batch 5c — exclude whole-file `cfg(test)` fixtures (commit `f141acaf`); [#1577](https://github.com/alphaonedev/ai-memory-mcp/issues/1577) — don't fire on `cfg(test)` mod DECLARATIONS + catch `cfg(all(test, ...))` mods (commit `bf2d8b38`).
+- [#1567](https://github.com/alphaonedev/ai-memory-mcp/issues/1567) — flaky test: hold all 32 listeners alive through the #1201 port-uniqueness assert (commit `cf3da837`).
+
+#### Documentation
+
+- Federation operational findings (documented posture, no code change): [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565) — the default `--quorum-timeout-ms 2000` is same-DC-tuned; cross-region quorum pushes hit `deadline_exceeded` → DLQ, and the reference 3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000` (`deploy/do-1461/provision/lib.sh`). [#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566) — an embedding-dimension migration NULLs stored vectors, so receivers synchronously re-embed on federation receive (~1 s/row), inflating quorum latency + DLQ pressure during the backfill window.
+
 ### v0.7.0 postgres write-path scaling — #1472 epic + #1473 read-path sibling (2026-06-02/03)
 
 Vertical/federated scaling load tests surfaced a Postgres write ceiling that did NOT lift with vCPU. Root-caused to two non-sargable query shapes on the postgres SAL adapter (`src/store/postgres.rs`), not the SQLite single-writer limit. Each fix was proved with a live PG16 `EXPLAIN` plan-shape probe (sargable equality → `Index Cond` vs. the prior `Seq Scan`/`Filter`), gated (fmt + clippy::pedantic + full suite), and committed to `release/v0.7.0`.

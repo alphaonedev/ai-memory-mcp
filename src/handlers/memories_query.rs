@@ -12,6 +12,7 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -77,7 +78,7 @@ pub async fn list_memories(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -187,14 +188,7 @@ pub async fn list_memories(
                 .collect();
             Json(json!({"memories": &visible, "count": visible.len()})).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -229,7 +223,7 @@ pub async fn search_memories(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid as_agent: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
     }
@@ -279,7 +273,7 @@ pub async fn search_memories(
             .get(crate::HEADER_AGENT_ID)
             .and_then(|v| v.to_str().ok());
         let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id());
         let ctx = crate::store::CallerContext {
             agent_id: caller,
             as_agent: p.as_agent.clone(),
@@ -346,16 +340,10 @@ pub async fn search_memories(
                 effective_as_agent.as_deref(),
             ) {
                 Ok(r) => {
-                    Json(json!({"results": r, "count": r.len(), "source_uri": uri})).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("handler error: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
+                    Json(json!({"results": r, "count": r.len(), (field_names::SOURCE_URI): uri}))
                         .into_response()
                 }
+                Err(e) => crate::handlers::errors::handler_error_500(&e),
             };
         }
     }
@@ -375,14 +363,7 @@ pub async fn search_memories(
         source_uri,
     ) {
         Ok(r) => Json(json!({"results": r, "count": r.len(), "query": p.q})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -524,7 +505,7 @@ pub async fn bulk_create(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| format!("anonymous:req-{}", uuid::Uuid::new_v4()));
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons stream each
     // row through `app.store.store(...)`. Federation fanout below stays
@@ -633,7 +614,7 @@ pub async fn bulk_create(
                 .metadata
                 .get("agent_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("daemon");
+                .unwrap_or(crate::identity::sentinels::DAEMON_PRINCIPAL);
             let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
             match app
                 .store
@@ -660,7 +641,7 @@ pub async fn bulk_create(
                     pending.push(json!({
                         "title": mem.title,
                         "namespace": mem.namespace,
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                     }));
                     continue;
                 }

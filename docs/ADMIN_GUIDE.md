@@ -867,13 +867,32 @@ systemctl start ai-memory
 
 ### Migration
 
-The schema is auto-migrated on startup. The `schema_version` table tracks the current version (currently 4). Migrations are forward-only and non-destructive.
-
-- v1 -> v2: Added `confidence` (REAL) and `source` (TEXT) columns
-- v2 -> v3: Added `embedding` (BLOB) column for storing dense vector embeddings
-- v3 -> v4: Added `archived_memories` table for GC archival
+The schema is auto-migrated on startup. The `schema_version` table tracks the current version; the canonical tip is the `CURRENT_SCHEMA_VERSION` constant in `src/storage/migrations.rs`, whose doc-comments carry the full per-version ladder. Migrations are forward-only and non-destructive.
 
 Migration error handling: only expected errors (e.g., "duplicate column" when re-running a migration) are silently ignored. Real failures are propagated and will prevent startup, ensuring data integrity.
+
+#### Rollback — snapshot-restore ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576))
+
+There is **no migration downgrade path — forward-only is by design**; the supported rollback is restoring the automatic pre-migration snapshot.
+
+Before any schema-mutating upgrade runs, the binary snapshots the live SQLite file as a **sibling of the database** (never a temp dir), named:
+
+```
+<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak
+# e.g. ai-memory.db.pre-migration-v54-to-v55-1765300000000000000.bak
+```
+
+(`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`; `<token>` is a monotonic nanosecond timestamp so repeated upgrades never collide.) The snapshot is produced with `VACUUM INTO`, so it is a transactionally-consistent, openable database — pending WAL frames are folded in and the source connection's SQLCipher keying is inherited. The migration **refuses to mutate the schema if the snapshot fails**.
+
+Supported rollback procedure:
+
+1. Stop the daemon: `sudo systemctl stop ai-memory`
+2. Reinstall the previous binary (package downgrade, or restore the saved binary)
+3. Restore the snapshot over the live file: `cp /var/lib/ai-memory/ai-memory.db.pre-migration-v<FROM>-to-v<TO>-<token>.bak /var/lib/ai-memory/ai-memory.db`
+4. Remove stale WAL siblings: `rm -f /var/lib/ai-memory/ai-memory.db-wal /var/lib/ai-memory/ai-memory.db-shm`
+5. Start the daemon: `sudo systemctl start ai-memory`
+
+A missed step fails loudly rather than corrupting data: the substrate refuses to start a binary against a database newer than the schema it expects. Writes that landed between the migration and the rollback are lost with the snapshot restore — that is the rollback contract; drain traffic first if those writes matter. Postgres deployments roll back with their standard `pg_dump`/`pg_restore` discipline (see [`production-deployment.md` §4](production-deployment.md)).
 
 ### Upgrade Procedure
 
@@ -1127,7 +1146,9 @@ The HTTP server uses `CorsLayer::new()` (deny-by-default) since v0.5.4-patch.6. 
 
 ### Authentication
 
-There is no API-key or token authentication mechanism for the standard MCP / HTTP / CLI surface. This is by design — the daemon is intended for localhost access only by your AI client.
+The HTTP daemon takes an optional shared API key (`ai-memory serve --api-key …`). When configured, every endpoint except `/api/v1/health` requires it. **The supported credential channel is the `x-api-key` request header**; the `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — URL-embedded credentials leak into access logs, `Referer` headers, and proxy logs. The query form is still accepted at v0.7.0 for back-compat (once-per-process WARN on first use) and is slated for rejection at v0.8 behind a temporary escape hatch. `AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses keyless daemon start on any bind host ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
+
+With no `--api-key` configured the standard HTTP surface is unauthenticated — acceptable only for the default localhost-bound, single-user posture. The MCP (stdio) and CLI surfaces have no key mechanism by design; they are local-process interfaces.
 
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 

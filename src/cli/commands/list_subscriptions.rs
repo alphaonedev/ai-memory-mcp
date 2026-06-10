@@ -9,6 +9,7 @@
 //! HTTP route landed previously; this module wires the CLI surface so
 //! operators can inspect their webhook fleet from a terminal.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::Value;
@@ -47,7 +48,10 @@ pub fn cmd_list_subscriptions(
 
     let count = envelope.get("count").and_then(Value::as_u64).unwrap_or(0);
     writeln!(out.stdout, "list-subscriptions: {count} row(s)")?;
-    if let Some(arr) = envelope.get("subscriptions").and_then(Value::as_array) {
+    if let Some(arr) = envelope
+        .get(field_names::SUBSCRIPTIONS)
+        .and_then(Value::as_array)
+    {
         for s in arr {
             let id = s.get("id").and_then(Value::as_str).unwrap_or("?");
             let url = s.get("url").and_then(Value::as_str).unwrap_or("?");

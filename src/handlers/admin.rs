@@ -11,6 +11,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -82,7 +83,7 @@ pub async fn register_agent(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -90,8 +91,8 @@ pub async fn register_agent(
         "",
         json!({
             "new_agent_id": body.agent_id,
-            "agent_type": body.agent_type,
-            "capabilities": capabilities,
+            (field_names::AGENT_TYPE): body.agent_type,
+            (field_names::CAPABILITIES): capabilities,
         }),
     );
 
@@ -110,23 +111,24 @@ pub async fn register_agent(
         // #910 — admin surface (registration / list_agents / stats);
         // bypass the SAL visibility filter so admin endpoints see the
         // full row set regardless of metadata.scope.
-        let ctx = crate::store::CallerContext::for_admin("daemon");
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
         let now = Utc::now().to_rfc3339();
         let mut metadata = json!({
             "agent_id": &body.agent_id,
-            "agent_type": &body.agent_type,
+            (field_names::AGENT_TYPE): &body.agent_type,
         });
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert(
-                "capabilities".to_string(),
+                field_names::CAPABILITIES.to_string(),
                 serde_json::to_value(&capabilities).unwrap_or_else(|_| json!([])),
             );
         }
         let agent_mem = Memory {
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
-            namespace: "_agents".to_string(),
-            title: format!("agent:{}", &body.agent_id),
+            namespace: crate::models::AGENTS_NAMESPACE.to_string(),
+            title: crate::models::agent_registration_title(&body.agent_id),
             content: format!("agent registration for {}", &body.agent_id),
             tags: vec!["_agent_registration".to_string()],
             priority: 5,
@@ -156,9 +158,9 @@ pub async fn register_agent(
                 Json(json!({
                     "id": id,
                     "agent_id": body.agent_id,
-                    "agent_type": body.agent_type,
-                    "capabilities": capabilities,
-                    "storage_backend": "postgres",
+                    (field_names::AGENT_TYPE): body.agent_type,
+                    (field_names::CAPABILITIES): capabilities,
+                    (field_names::STORAGE_BACKEND): "postgres",
                 })),
             )
                 .into_response(),
@@ -198,23 +200,16 @@ pub async fn register_agent(
             (
                 StatusCode::CREATED,
                 Json(json!({
-                    "registered": true,
+                    (field_names::REGISTERED): true,
                     "id": id,
                     "agent_id": body.agent_id,
-                    "agent_type": body.agent_type,
-                    "capabilities": capabilities,
+                    (field_names::AGENT_TYPE): body.agent_type,
+                    (field_names::CAPABILITIES): capabilities,
                 })),
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -257,14 +252,7 @@ pub async fn list_agents(
             Json(json!({"count": agents.len(), "agents": agents})),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -318,7 +306,7 @@ pub async fn quota_status_handler(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -327,16 +315,14 @@ pub async fn quota_status_handler(
         if let Err(e) = validate::validate_agent_id(agent_id) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
         if agent_id != caller {
             return (
                 StatusCode::FORBIDDEN,
-                Json(
-                    json!({"error": "agent_id body parameter does not match authenticated caller"}),
-                ),
+                Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
             )
                 .into_response();
         }
@@ -368,7 +354,7 @@ pub async fn quota_status_handler(
                 tracing::error!("quota_status handler error: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
@@ -407,7 +393,7 @@ pub async fn quota_status_handler(
             tracing::error!("quota_status list handler error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -448,13 +434,13 @@ pub async fn get_stats(
                     by_namespace_map.insert(nc.namespace.clone(), json!(nc.count));
                 }
                 Json(json!({
-                    "total_memories": s.total,
+                    (field_names::TOTAL_MEMORIES): s.total,
                     "by_tier": by_tier_map,
-                    "by_namespace": by_namespace_map,
+                    (field_names::BY_NAMESPACE): by_namespace_map,
                     "expiring_soon": s.expiring_soon,
                     "links_count": s.links_count,
                     "db_size_bytes": s.db_size_bytes,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 }))
                 .into_response()
             }
@@ -465,14 +451,7 @@ pub async fn get_stats(
     let lock = app.db.lock().await;
     match db::stats(&lock.0, &lock.1) {
         Ok(s) => Json(json!(s)).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -509,7 +488,8 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
         };
         return match app.store.run_gc(archive_flag).await {
             Ok(n) => {
-                Json(json!({"expired_deleted": n, "storage_backend": "postgres"})).into_response()
+                Json(json!({(field_names::EXPIRED_DELETED): n, (field_names::STORAGE_BACKEND): "postgres"}))
+                    .into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -517,15 +497,8 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
 
     let lock = app.db.lock().await;
     match db::gc(&lock.0, lock.3) {
-        Ok(n) => Json(json!({"expired_deleted": n})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Ok(n) => Json(json!({(field_names::EXPIRED_DELETED): n})).into_response(),
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -583,8 +556,8 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             "memories": mems,
             "links": links,
             "count": count,
-            "exported_at": Utc::now().to_rfc3339(),
-            "storage_backend": "postgres",
+            (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }
@@ -594,13 +567,13 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
     match (db::export_all(&lock.0), db::export_links(&lock.0)) {
         (Ok(memories), Ok(links)) => {
             let count = memories.len();
-            Json(json!({"memories": memories, "links": links, "count": count, "exported_at": Utc::now().to_rfc3339()})).into_response()
+            Json(json!({"memories": memories, "links": links, "count": count, (field_names::EXPORTED_AT): Utc::now().to_rfc3339()})).into_response()
         }
         (Err(e), _) | (_, Err(e)) => {
             tracing::error!("export error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -684,7 +657,7 @@ pub async fn import_memories(
                 && orig != caller
             {
                 obj.insert(
-                    "imported_from_agent_id".to_string(),
+                    field_names::IMPORTED_FROM_AGENT_ID.to_string(),
                     serde_json::Value::String(orig),
                 );
             }
@@ -775,7 +748,7 @@ pub async fn import_memories(
                     pending.push(json!({
                         "id": mem.id,
                         "namespace": mem.namespace,
-                        "pending_id": pending_id,
+                        (field_names::PENDING_ID): pending_id,
                     }));
                     continue;
                 }
@@ -818,7 +791,7 @@ pub async fn import_memories(
             "imported": imported,
             "errors": errors,
             "pending": pending,
-            "storage_backend": "postgres",
+            (field_names::STORAGE_BACKEND): "postgres",
         }))
         .into_response();
     }

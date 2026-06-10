@@ -44,6 +44,7 @@
 //! safe-by-default posture, every skill HTTP surface MUST be admin-
 //! only until a future cluster lands a richer skill-ACL model.
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -54,6 +55,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
+
+/// Tracing target for the skills HTTP handlers (#1558 tracing-target SSOT).
+const SKILLS_TRACE_TARGET: &str = "ai_memory::handlers::skills";
 
 /// `POST /api/v1/skill` — register a new skill from an inline body.
 pub async fn skill_register_route(
@@ -114,13 +118,13 @@ pub async fn skill_list_route(
             // HTTP wire. Log the raw text for operators, surface a
             // generic "internal server error" to the caller.
             tracing::error!(
-                target: "ai_memory::handlers::skills",
+                target: SKILLS_TRACE_TARGET,
                 error = %e,
                 "skill_list_route: substrate error (sanitized for wire response, #1261)"
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response()
         }
@@ -145,7 +149,7 @@ pub async fn skill_get_route(
         Err(e) => {
             // Substrate uses a "skill not found:" prefix for the missing
             // case; surface that as 404. Everything else is 500.
-            if e.starts_with("skill not found") {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
                 // #1261 — never forward the raw substrate error (often
@@ -153,13 +157,13 @@ pub async fn skill_get_route(
                 // the HTTP wire. Log the raw text; emit a generic
                 // "internal server error" to the caller.
                 tracing::error!(
-                    target: "ai_memory::handlers::skills",
+                    target: SKILLS_TRACE_TARGET,
                     error = %e,
                     "skill_get_route: substrate error (sanitized for wire response, #1261)"
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }
@@ -188,7 +192,7 @@ pub async fn skill_resource_route(
     }
     let params = json!({
         "skill_id": id,
-        "resource_path": q.path,
+        (field_names::RESOURCE_PATH): q.path,
     });
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_resource(&lock.0, &params) {
@@ -229,14 +233,14 @@ pub async fn skill_export_route(
     }
     let params = json!({
         "skill_id": id,
-        "target_folder": body.target_folder,
+        (field_names::TARGET_FOLDER): body.target_folder,
     });
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
     match crate::mcp::handle_skill_export(&lock.0, &params, kp) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            if e.starts_with("skill not found") {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
                 (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
@@ -272,12 +276,12 @@ pub async fn skill_promote_route(
         return resp;
     }
     let mut params = json!({
-        "reflection_id": id,
-        "skill_name": body.name,
-        "skill_description": body.description,
+        (field_names::REFLECTION_ID): id,
+        (field_names::SKILL_NAME): body.name,
+        (field_names::SKILL_DESCRIPTION): body.description,
     });
     if let Some(ps) = body.parameters_schema {
-        params["parameters_schema"] = ps;
+        params[field_names::PARAMETERS_SCHEMA] = ps;
     }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
@@ -319,26 +323,26 @@ pub async fn skill_compose_route(
     let Json(body) = body.unwrap_or(Json(SkillComposeBody::default()));
     let mut params = json!({"skill_id": id});
     if let Some(b) = body.budget_tokens {
-        params["budget_tokens"] = json!(b);
+        params[field_names::BUDGET_TOKENS] = json!(b);
     }
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_compositional_context(&lock.0, &params) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            if e.starts_with("skill not found") {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
                 (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
             } else {
                 // #1261 — never forward the raw substrate error on
                 // the HTTP wire. Log the raw text; emit a generic
                 // "internal server error" to the caller.
                 tracing::error!(
-                    target: "ai_memory::handlers::skills",
+                    target: SKILLS_TRACE_TARGET,
                     error = %e,
                     "skill_compose_route: substrate error (sanitized for wire response, #1261)"
                 );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
             }

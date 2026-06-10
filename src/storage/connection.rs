@@ -27,6 +27,16 @@ use super::migrations::{SCHEMA, migrate};
 const CHECK_CONSTRAINT_TRIGGERS_SQLITE: &str =
     include_str!("../../migrations/sqlite/0023_v07_check_constraints.sql");
 
+/// Manual-transaction SQL fragments (#1558 batch 5) — shared by every
+/// site that drives an explicit immediate write transaction on a
+/// rusqlite connection (`execute_batch(SQL_BEGIN_IMMEDIATE)` …
+/// `execute_batch(SQL_COMMIT)` / `execute_batch(SQL_ROLLBACK)`).
+/// `BEGIN IMMEDIATE` takes the write lock up front so lock contention
+/// surfaces at BEGIN (retryable) instead of mid-transaction.
+pub const SQL_BEGIN_IMMEDIATE: &str = "BEGIN IMMEDIATE";
+pub const SQL_COMMIT: &str = "COMMIT";
+pub const SQL_ROLLBACK: &str = "ROLLBACK";
+
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;

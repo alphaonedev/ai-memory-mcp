@@ -12,6 +12,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
@@ -179,7 +180,7 @@ async fn fetch_consolidate_source_pairs(
                 Err(crate::store::StoreError::NotFound { .. }) => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(json!({"error": format!("memory not found: {id}")})),
+                        Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
                     )
                         .into_response());
                 }
@@ -207,7 +208,7 @@ async fn fetch_consolidate_source_pairs(
             Ok(None) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("memory not found: {id}")})),
+                    Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
                 )
                     .into_response());
             }
@@ -215,13 +216,43 @@ async fn fetch_consolidate_source_pairs(
                 tracing::error!("consolidate source lookup failed: {e}");
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "internal server error"})),
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response());
             }
         }
     }
     Ok(out)
+}
+
+/// #1552 / #326 — shared federation fanout for the consolidate write path,
+/// called by both the postgres SAL branch and the sqlite branch of
+/// [`consolidate_memories`]. Broadcasts the merged memory + the source-id
+/// deletions to the W-quorum so peers converge `metadata.consolidated_from_agents`
+/// + the deleted sources synchronously instead of waiting on async catch-up.
+///
+/// Returns `Some(response)` when the quorum is NOT met (a typed 503 the caller
+/// must return verbatim), or `None` on success / when federation is disabled
+/// (the single-node no-op path) so the caller proceeds to its 201 envelope.
+async fn consolidate_fanout(
+    fed: Option<&crate::federation::FederationConfig>,
+    mem: &crate::models::Memory,
+    source_ids: &[String],
+) -> Option<axum::response::Response> {
+    let fed = fed?;
+    match crate::federation::broadcast_consolidate_quorum(fed, mem, source_ids).await {
+        Ok(tracker) => {
+            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                // #869 — typed 503 envelope via the shared helper.
+                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                return Some(super::quorum_not_met_response(&payload));
+            }
+        }
+        Err(e) => {
+            tracing::warn!("consolidate fanout error (local committed): {e:?}");
+        }
+    }
+    None
 }
 
 pub async fn consolidate_memories(
@@ -245,7 +276,7 @@ pub async fn consolidate_memories(
     // gating.
     let consolidate_caller_principal =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     let summary = match body.summary.clone() {
         Some(s) if !s.is_empty() => s,
         _ => {
@@ -289,7 +320,7 @@ pub async fn consolidate_memories(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid agent_id: {e}")})),
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
             )
                 .into_response();
         }
@@ -299,7 +330,7 @@ pub async fn consolidate_memories(
     {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "agent_id body parameter does not match authenticated caller"})),
+            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
         )
             .into_response();
     }
@@ -314,7 +345,7 @@ pub async fn consolidate_memories(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(&consolidator_agent_id);
-        return match app
+        let new_id = match app
             .store
             .consolidate(
                 &ctx,
@@ -323,41 +354,60 @@ pub async fn consolidate_memories(
                 &summary,
                 &body.namespace,
                 &tier,
-                "consolidation",
+                crate::db::CONSOLIDATION_SOURCE,
                 &consolidator_agent_id,
             )
             .await
         {
-            Ok(new_id) => (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": new_id,
-                    "consolidated": body.ids.len(),
-                    "summary": summary,
-                    // v0.7.0 L7-followup — also emit the materialised summary
-                    // as `content` and inside a nested `memory` object so the
-                    // S51 scenario reader (which falls through
-                    // `cbody.get("summary") or cbody.get("content") or
-                    // (cbody.get("memory") or {}).get("content")` under a
-                    // ternary that requires `memory` to be a dict) sees a
-                    // non-empty string regardless of which branch its
-                    // operator precedence resolves to. Without the `memory`
-                    // dict the whole expression collapses to `""` even
-                    // though `summary` is set — see
-                    // `scenarios/51_autonomous_tier_suite.py:140-145`.
-                    "content": summary,
-                    "memory": {
-                        "id": new_id,
-                        "title": body.title,
-                        "content": summary,
-                        "namespace": body.namespace,
-                    },
-                    "storage_backend": "postgres",
-                })),
-            )
-                .into_response(),
-            Err(e) => store_err_to_response(e),
+            Ok(new_id) => new_id,
+            Err(e) => return store_err_to_response(e),
         };
+        // #1552 — federation fanout parity (shared `consolidate_fanout` helper,
+        // covered by the sqlite-branch fanout test). The SAL-ported postgres
+        // branch previously returned here WITHOUT broadcasting, so on a
+        // postgres-backed federated hive a consolidation only reached
+        // cross-region peers via async catch-up (`/sync/since`) rather than the
+        // synchronous W-quorum. Read the merged row back through the trait, then
+        // broadcast it + the source-id deletions; a quorum miss surfaces a typed
+        // 503 exactly like the regular create path. A read-back failure logs +
+        // falls through to the success envelope (catch-up reconciles peers).
+        if app.federation.is_some() {
+            if let Ok(mem) = app.store.get(&ctx, &new_id).await {
+                if let Some(resp) =
+                    consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &source_ids).await
+                {
+                    return resp;
+                }
+            }
+        }
+        return (
+            StatusCode::CREATED,
+            Json(json!({
+                "id": new_id,
+                (field_names::CONSOLIDATED): body.ids.len(),
+                "summary": summary,
+                // v0.7.0 L7-followup — also emit the materialised summary
+                // as `content` and inside a nested `memory` object so the
+                // S51 scenario reader (which falls through
+                // `cbody.get("summary") or cbody.get("content") or
+                // (cbody.get("memory") or {}).get("content")` under a
+                // ternary that requires `memory` to be a dict) sees a
+                // non-empty string regardless of which branch its
+                // operator precedence resolves to. Without the `memory`
+                // dict the whole expression collapses to `""` even
+                // though `summary` is set — see
+                // `scenarios/51_autonomous_tier_suite.py:140-145`.
+                "content": summary,
+                "memory": {
+                    "id": new_id,
+                    "title": body.title,
+                    "content": summary,
+                    "namespace": body.namespace,
+                },
+                (field_names::STORAGE_BACKEND): "postgres",
+            })),
+        )
+            .into_response();
     }
 
     let lock = app.db.lock().await;
@@ -368,7 +418,7 @@ pub async fn consolidate_memories(
         &summary,
         &body.namespace,
         &tier,
-        "consolidation",
+        crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
     );
     // Read the newly consolidated memory back so we can fanout — must do
@@ -389,7 +439,7 @@ pub async fn consolidate_memories(
         .ok();
         crate::subscriptions::dispatch_event_with_details(
             &lock.0,
-            "memory_consolidated",
+            crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED,
             new_id,
             &body.namespace,
             Some(&consolidator_agent_id),
@@ -402,29 +452,21 @@ pub async fn consolidate_memories(
     drop(lock);
     match consolidate_result {
         Ok(new_id) => {
-            // v0.6.2 (#326): propagate consolidation to peers so
+            // v0.6.2 (#326) / #1552: propagate consolidation to peers so
             // `metadata.consolidated_from_agents` and the deleted sources
-            // are in sync across the mesh.
-            if let (Some(fed), Some(mem)) = (app.federation.as_ref(), new_mem) {
-                match crate::federation::broadcast_consolidate_quorum(fed, &mem, &source_ids).await
+            // are in sync across the mesh (shared `consolidate_fanout` helper).
+            if let Some(mem) = new_mem {
+                if let Some(resp) =
+                    consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &source_ids).await
                 {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("consolidate fanout error (local committed): {e:?}");
-                    }
+                    return resp;
                 }
             }
             (
                 StatusCode::CREATED,
                 Json(json!({
                     "id": new_id,
-                    "consolidated": body.ids.len(),
+                    (field_names::CONSOLIDATED): body.ids.len(),
                     "summary": summary,
                     // v0.7.0 L7-followup — see postgres branch above for
                     // the rationale. Mirroring `content` and a nested
@@ -442,14 +484,7 @@ pub async fn consolidate_memories(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -509,7 +544,7 @@ pub async fn auto_tag_handler(
     // applies. Helper takes `&str` so non-sal builds compile.
     let auto_tag_caller_principal =
         crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| "anonymous:invalid".to_string());
+            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
 
     // Resolve (title, content). S51 sends `memory_id`; we fetch the
     // memory from the active backend. Ad-hoc callers may instead
@@ -626,7 +661,7 @@ pub async fn expand_query_handler(
     if query.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "query is required"})),
+            Json(json!({"error": crate::errors::msg::QUERY_REQUIRED})),
         )
             .into_response();
     }
@@ -669,7 +704,7 @@ pub async fn expand_query_handler(
         StatusCode::OK,
         Json(json!({
             "original": query,
-            "expanded_terms": expanded_terms,
+            (field_names::EXPANDED_TERMS): expanded_terms,
         })),
     )
         .into_response()
@@ -695,7 +730,7 @@ async fn fetch_memory_for_handler(
             Ok(mem) => Ok(mem),
             Err(crate::store::StoreError::NotFound { .. }) => Err((
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("memory not found: {id}")})),
+                Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
             )
                 .into_response()),
             Err(e) => Err(store_err_to_response(e)),
@@ -712,14 +747,14 @@ async fn fetch_memory_for_handler(
         Ok(Some(mem)) => Ok(mem),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("memory not found: {id}")})),
+            Json(json!({"error": crate::errors::msg::memory_not_found(id)})),
         )
             .into_response()),
         Err(e) => {
             tracing::error!("memory lookup failed: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response())
         }
@@ -754,8 +789,6 @@ pub async fn load_family_handler(
     headers: HeaderMap,
     Json(body): Json<LoadFamilyBody>,
 ) -> impl IntoResponse {
-    #[cfg(not(feature = "sal"))]
-    let _ = &headers;
     use std::str::FromStr;
 
     let family = match Family::from_str(&body.family) {
@@ -838,13 +871,26 @@ pub async fn load_family_handler(
 
     // Sqlite path — reuse the MCP `handle_load_family` SQL verbatim by
     // calling it through with the same parameter shape (a `Value`).
+    //
+    // #1555 — resolve the caller from headers and pass it so the SAME
+    // scope=private visibility filter the postgres branch gets via the SAL
+    // `list` applies on the sqlite (default) backend too. Without this the
+    // multi-tenant HTTP daemon leaked other tenants' private family-tagged
+    // rows in a shared namespace. Reuses the shared `resolve_caller_agent_id`
+    // helper (non-sal-safe; the postgres branch's `http_caller_ctx` is sal-gated
+    // and unavailable on this default-backend path) — the anonymous-fallback
+    // handling lives inside it, not duplicated here. On the rare resolution
+    // error the empty principal owns no private row, so it sees only
+    // scope=shared/public rows.
+    let caller =
+        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
     let lock = app.db.lock().await;
     let params = json!({
         "family": family_name,
         "namespace": body.namespace,
         "k": k,
     });
-    match crate::mcp::handle_load_family(&lock.0, &params) {
+    match crate::mcp::handle_load_family(&lock.0, &params, Some(caller.as_str())) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }

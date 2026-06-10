@@ -11,6 +11,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
@@ -118,7 +119,7 @@ pub async fn recall_memories_get(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid as_agent: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
     }
@@ -183,7 +184,7 @@ pub async fn recall_memories_post(
     {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid as_agent: {e}")})),
+            Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
         )
             .into_response();
     }
@@ -325,7 +326,7 @@ async fn recall_response(
         let ctx_caller = crate::store::CallerContext::for_agent(
             as_agent
                 .or(caller_principal)
-                .unwrap_or("daemon")
+                .unwrap_or(crate::identity::sentinels::DAEMON_PRINCIPAL)
                 .to_string(),
         );
         let mut filter = crate::store::Filter {
@@ -431,7 +432,10 @@ async fn recall_response(
                             if let Some(obj) = v.as_object_mut() {
                                 obj.insert(
                                     "score".to_string(),
-                                    json!((*s * 1000.0).round() / 1000.0),
+                                    json!(
+                                        (*s * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                            / crate::SCORE_DISPLAY_ROUND_FACTOR
+                                    ),
                                 );
                             }
                             Some(v)
@@ -455,12 +459,12 @@ async fn recall_response(
                 let mut resp = json!({
                     "memories": scored,
                     "count": scored.len(),
-                    "tokens_used": 0,
+                    (field_names::TOKENS_USED): 0,
                     "mode": mode,
-                    "storage_backend": "postgres",
+                    (field_names::STORAGE_BACKEND): "postgres",
                 });
                 if let Some(b) = budget_tokens {
-                    resp["budget_tokens"] = json!(b);
+                    resp[field_names::BUDGET_TOKENS] = json!(b);
                 }
                 Json(resp).into_response()
             }
@@ -673,7 +677,10 @@ async fn recall_response(
                             if let Some(obj) = v.as_object_mut() {
                                 obj.insert(
                                     "score".to_string(),
-                                    json!((*s * 1000.0).round() / 1000.0),
+                                    json!(
+                                        (*s * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                            / crate::SCORE_DISPLAY_ROUND_FACTOR
+                                    ),
                                 );
                             }
                             Some(v)
@@ -691,28 +698,21 @@ async fn recall_response(
             let mut resp = json!({
                 "memories": scored,
                 "count": scored.len(),
-                "tokens_used": outcome.tokens_used,
+                (field_names::TOKENS_USED): outcome.tokens_used,
                 "mode": mode,
             });
             if let Some(b) = budget_tokens {
-                resp["budget_tokens"] = json!(b);
+                resp[field_names::BUDGET_TOKENS] = json!(b);
                 // Phase P6 (R1) meta block — same shape as the MCP path.
                 resp["meta"] = json!({
                     "budget_tokens_used": outcome.tokens_used,
                     "budget_tokens_remaining": outcome.tokens_remaining.unwrap_or(0),
-                    "memories_dropped": outcome.memories_dropped,
+                    (field_names::MEMORIES_DROPPED): outcome.memories_dropped,
                     "budget_overflow": outcome.budget_overflow,
                 });
             }
             Json(resp).into_response()
         }
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

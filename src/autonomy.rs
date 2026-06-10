@@ -32,6 +32,7 @@
 //! are generic over `&dyn AutonomyLlm`.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,10 @@ use serde::{Deserialize, Serialize};
 use crate::db;
 use crate::llm::OllamaClient;
 use crate::models::{Memory, Tier};
+
+/// Source label stamped on memories the autonomy curator writes
+/// (one spelling across the three write paths — #1558).
+const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
 
 /// Minimum Jaccard-keyword overlap required to treat two memories as
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
@@ -143,7 +148,7 @@ pub enum RollbackEntry {
 impl RollbackEntry {
     fn action_tag(&self) -> &'static str {
         match self {
-            Self::Consolidate { .. } => "consolidate",
+            Self::Consolidate { .. } => crate::audit::OP_CONSOLIDATE,
             Self::Forget { .. } => "forget",
             Self::PriorityAdjust { .. } => "priority_adjust",
         }
@@ -185,9 +190,7 @@ pub fn run_autonomy_passes(
         match consolidate_cluster(conn, llm, &cluster, dry_run) {
             Ok(Some(entry)) => {
                 if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report
-                        .errors
-                        .push(format!("rollback-log write failed: {e}"));
+                    report.errors.push(rollback_log_write_failed(&e));
                 } else {
                     report.rollback_entries_written += 1;
                 }
@@ -205,9 +208,7 @@ pub fn run_autonomy_passes(
         match forget_if_superseded(conn, mem, candidates, dry_run) {
             Ok(Some(entry)) => {
                 if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report
-                        .errors
-                        .push(format!("rollback-log write failed: {e}"));
+                    report.errors.push(rollback_log_write_failed(&e));
                 } else {
                     report.rollback_entries_written += 1;
                 }
@@ -224,9 +225,7 @@ pub fn run_autonomy_passes(
         match apply_priority_feedback(conn, mem, dry_run) {
             Ok(Some(entry)) => {
                 if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report
-                        .errors
-                        .push(format!("rollback-log write failed: {e}"));
+                    report.errors.push(rollback_log_write_failed(&e));
                 } else {
                     report.rollback_entries_written += 1;
                 }
@@ -400,8 +399,8 @@ fn consolidate_cluster(
         &summary,
         &namespace,
         &tier,
-        "ai-memory curator (autonomy)",
-        "ai:curator",
+        CURATOR_SOURCE_LABEL,
+        crate::identity::sentinels::AI_CURATOR,
     )?;
 
     Ok(Some(RollbackEntry::Consolidate {
@@ -429,7 +428,7 @@ fn forget_if_superseded(
     // flagged this pair.
     let contradictions = mem
         .metadata
-        .get("confirmed_contradictions")
+        .get(field_names::CONFIRMED_CONTRADICTIONS)
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
@@ -539,6 +538,13 @@ fn apply_priority_feedback(
     }))
 }
 
+/// #1558 batch 5 wave 2 — canonical `"rollback-log write failed: {e}"`
+/// report-error line shared by the three [`persist_rollback_entry`]
+/// failure sites in the autonomy passes. Byte-identical message.
+fn rollback_log_write_failed(e: &dyn std::fmt::Display) -> String {
+    format!("rollback-log write failed: {e}")
+}
+
 fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()> {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
@@ -555,14 +561,14 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
         ],
         priority: 3,
         confidence: 1.0,
-        source: "ai-memory curator (autonomy)".to_string(),
+        source: CURATOR_SOURCE_LABEL.to_string(),
         access_count: 0,
         created_at: ts.clone(),
         updated_at: ts,
         last_accessed_at: None,
         expires_at: None,
         metadata: serde_json::json!({
-            "agent_id": "ai:curator",
+            "agent_id": crate::identity::sentinels::AI_CURATOR,
             "action": entry.action_tag(),
         }),
         reflection_depth: 0,
@@ -622,13 +628,13 @@ pub fn persist_self_report(
         tags: vec!["_curator".to_string(), "_report".to_string()],
         priority: 2,
         confidence: 1.0,
-        source: "ai-memory curator (autonomy)".to_string(),
+        source: CURATOR_SOURCE_LABEL.to_string(),
         access_count: 0,
         created_at: ts.clone(),
         updated_at: ts,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::json!({"agent_id": "ai:curator"}),
+        metadata: serde_json::json!({"agent_id": crate::identity::sentinels::AI_CURATOR}),
         reflection_depth: 0,
         memory_kind: crate::models::MemoryKind::Observation,
         entity_id: None,

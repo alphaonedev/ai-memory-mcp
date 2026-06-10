@@ -107,7 +107,7 @@ impl std::fmt::Debug for Keypair {
         f.debug_struct("Keypair")
             .field("agent_id", &self.agent_id)
             .field("public", &"<x25519 pubkey>")
-            .field("secret", &"<redacted>")
+            .field("secret", &crate::REDACTED_PLACEHOLDER)
             .finish()
     }
 }

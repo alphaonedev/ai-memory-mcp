@@ -4,6 +4,7 @@
 //! MCP `memory_check_duplicate` handler.
 
 use crate::embeddings::Embed;
+use crate::models::field_names;
 use crate::{db, validate};
 use serde_json::{Value, json};
 // v0.7.0 ARCH-3 / FX-12 — promoted from `pub(super)` to `pub` so the
@@ -16,8 +17,12 @@ pub fn handle_check_duplicate(
     params: &Value,
     embedder: Option<&dyn Embed>,
 ) -> Result<Value, String> {
-    let title = params["title"].as_str().ok_or("title is required")?;
-    let content = params["content"].as_str().ok_or("content is required")?;
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
+    let content = params["content"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
     let namespace = params["namespace"]
         .as_str()
         .map(str::trim)
@@ -38,7 +43,7 @@ pub fn handle_check_duplicate(
 
     let emb = embedder
         .ok_or("memory_check_duplicate requires the embedder; enable semantic tier or above")?;
-    let text = format!("{title} {content}");
+    let text = crate::embeddings::embedding_document(title, content);
     let query_embedding = emb.embed(&text).map_err(|e| e.to_string())?;
 
     // Round-2 F18 — short-circuit on raw-content hash equality before
@@ -55,7 +60,8 @@ pub fn handle_check_duplicate(
             "id": m.id,
             "title": m.title,
             "namespace": m.namespace,
-            "similarity": (m.similarity * 1000.0).round() / 1000.0,
+            (field_names::SIMILARITY): (f64::from(m.similarity) * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                / crate::SCORE_DISPLAY_ROUND_FACTOR,
         })
     });
     let suggested_merge = if check.is_duplicate {
@@ -65,11 +71,11 @@ pub fn handle_check_duplicate(
     };
 
     Ok(json!({
-        "is_duplicate": check.is_duplicate,
+        (field_names::IS_DUPLICATE): check.is_duplicate,
         "threshold": check.threshold,
         "nearest": nearest_json,
-        "suggested_merge": suggested_merge,
-        "candidates_scanned": check.candidates_scanned,
+        (field_names::SUGGESTED_MERGE): suggested_merge,
+        (field_names::CANDIDATES_SCANNED): check.candidates_scanned,
     }))
 }
 
@@ -113,11 +119,10 @@ impl McpTool for CheckDuplicateTool {
         "Pillar 2 / Stream D: pre-write near-dup check. Embeds title+content, returns highest-cosine match + is_duplicate + suggested_merge. Threshold floor 0.5. Requires semantic tier+."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(CheckDuplicateRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<CheckDuplicateRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

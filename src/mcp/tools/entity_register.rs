@@ -3,7 +3,9 @@
 
 //! MCP `memory_entity_register` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -49,11 +51,10 @@ impl McpTool for EntityRegisterTool {
         "Pillar 2 / Stream B: register entity as long-tier memory (metadata.kind='entity'). Idempotent on (canonical_name, namespace); merges new aliases. Errors if name collides with a non-entity row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(EntityRegisterRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<EntityRegisterRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -62,12 +63,12 @@ pub fn handle_entity_register(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let canonical_name = params["canonical_name"]
+    let canonical_name = params[param_names::CANONICAL_NAME]
         .as_str()
         .ok_or("canonical_name is required")?;
     let namespace = params["namespace"]
         .as_str()
-        .ok_or("namespace is required")?;
+        .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
     let aliases: Vec<String> = params["aliases"]
         .as_array()
         .map(|arr| {
@@ -104,7 +105,7 @@ pub fn handle_entity_register(
 
     Ok(json!({
         "entity_id": reg.entity_id,
-        "canonical_name": reg.canonical_name,
+        (field_names::CANONICAL_NAME): reg.canonical_name,
         "namespace": reg.namespace,
         "aliases": reg.aliases,
         "created": reg.created,

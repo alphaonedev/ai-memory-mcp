@@ -6,6 +6,11 @@ use serde_json::Value;
 
 use super::default_metadata;
 
+// Canonical `MemoryKind` spellings duplicated across `as_str` / `from_str`
+// (#1558 batch 6).
+const KIND_OBSERVATION: &str = "observation";
+const KIND_REFLECTION: &str = "reflection";
+
 /// L1-1 (v0.7.0) — typed memory-kind discriminator stored in the
 /// `memories.memory_kind` column (schema v30).
 ///
@@ -89,8 +94,8 @@ impl MemoryKind {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Observation => "observation",
-            Self::Reflection => "reflection",
+            Self::Observation => KIND_OBSERVATION,
+            Self::Reflection => KIND_REFLECTION,
             Self::Persona => "persona",
             Self::Concept => "concept",
             Self::Entity => "entity",
@@ -108,8 +113,8 @@ impl MemoryKind {
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "observation" => Some(Self::Observation),
-            "reflection" => Some(Self::Reflection),
+            KIND_OBSERVATION => Some(Self::Observation),
+            KIND_REFLECTION => Some(Self::Reflection),
             "persona" => Some(Self::Persona),
             "concept" => Some(Self::Concept),
             "entity" => Some(Self::Entity),

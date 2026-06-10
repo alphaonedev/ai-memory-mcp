@@ -25,6 +25,10 @@ use super::StorageBackend;
 use super::federation_signing_check::sync_push_via_store;
 use super::federation_signing_check::verify_signature_or_reject;
 
+/// Tracing target for receive-side peer-attestation checks
+/// (#1558 tracing-target SSOT).
+const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
+
 /// v0.7.0 federation security — extract the peer's self-claimed
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
 /// axum's `HeaderMap` lookup is case-insensitive so callers can send
@@ -328,7 +332,7 @@ pub async fn sync_push(
         let attest_cfg = peer_attestation::PeerAttestationConfig::from_env();
         if attest_cfg.has_allowlist() && attest_cfg.scope_for(peer_id).is_none() {
             tracing::warn!(
-                target: "federation::attestation",
+                target: ATTESTATION_TRACE_TARGET,
                 peer_id = %peer_id,
                 "sync_push: x-peer-id is not in operator allowlist — refusing (#1056 TOFU guard)"
             );
@@ -382,7 +386,7 @@ pub async fn sync_push(
             &attest_cfg,
         ) {
             tracing::warn!(
-                target: "federation::attestation",
+                target: ATTESTATION_TRACE_TARGET,
                 tag = e.tag(),
                 claimed = %body.sender_agent_id,
                 peer_header = %peer_header_owned.as_deref().unwrap_or(""),
@@ -394,7 +398,7 @@ pub async fn sync_push(
         // Bypass set — log once per request at WARN so the operator
         // can see the legacy posture is in effect.
         tracing::warn!(
-            target: "federation::attestation",
+            target: ATTESTATION_TRACE_TARGET,
             "sync_push: AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1 — bypassing #238 \
              sender_agent_id attestation (legacy compat)"
         );
@@ -498,6 +502,24 @@ pub async fn sync_push(
             Json(json!({
                 "error": format!(
                     "sync_push limited to {} namespace_meta_clears per request",
+                    app.max_page_size
+                )
+            })),
+        )
+            .into_response();
+    }
+    // #1556 — `links` was the sole subcollection missing this cap. The link
+    // loop below does a synchronous insert (and an Ed25519 verify when the
+    // link carries signature+observed_by) per element while holding the shared
+    // write Mutex; without a bound a peer could send ~15-20k links per 2 MiB
+    // body (15-20x every sibling cap) to saturate the lock — the red-team #242
+    // DoS the other caps exist to prevent. Checked pre-lock like its siblings.
+    if body.links.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} links per request",
                     app.max_page_size
                 )
             })),
@@ -679,7 +701,10 @@ pub async fn sync_push(
         match db::insert_if_newer(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
-                embedding_refresh.push((actual_id, format!("{} {}", mem.title, mem.content)));
+                embedding_refresh.push((
+                    actual_id,
+                    crate::embeddings::embedding_document(&mem.title, &mem.content),
+                ));
             }
             Err(e) => {
                 // Best-effort refund so a downstream insert failure
@@ -720,7 +745,7 @@ pub async fn sync_push(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
-                "quota_refused": quota_refused,
+                (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 "reset_at": reset_at,
             })),
         )
@@ -1096,7 +1121,7 @@ pub async fn sync_push(
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,
             "skipped": skipped,
-            "quota_refused": quota_refused,
+            (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
             "receiver_clock": receiver_clock,

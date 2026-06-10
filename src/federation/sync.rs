@@ -4,6 +4,7 @@
 //! Quorum-broadcast fan-out logic: post_once, post_and_classify,
 //! broadcast_*_quorum, bulk_catchup_push.
 
+use crate::models::field_names;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,11 @@ use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingAction, Pendi
 use crate::replication::{AckTracker, QuorumError};
 
 use super::FederationConfig;
+
+/// #1558 batch 5 wave 2 — `QuorumError::LocalWriteFailed` detail used
+/// at every `Arc::try_unwrap(tracker)` finalise point in this file
+/// (one per fanout variant). File-local const; byte-identical detail.
+const TRACKER_ARC_STILL_REFERENCED: &str = "tracker arc still referenced at finalise";
 
 #[derive(Debug)]
 pub(super) enum AckOutcome {
@@ -101,7 +107,7 @@ pub(super) async fn post_once(
     // cross-host quorum can never converge. Backwards-compatible:
     // `None` means no header attached.
     if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
+        req = req.header(crate::HEADER_API_KEY, key);
     }
     // v0.7.0 #791 + #922 — Ed25519 signature header + nonce header
     // bound into signature input so byte-for-byte replays are refused.
@@ -123,7 +129,7 @@ pub(super) async fn post_once(
     // results in no header attached + the receiver enforces via the
     // body field alone.
     if let Some(peer_id) = body
-        .get("sender_agent_id")
+        .get(field_names::SENDER_AGENT_ID)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
@@ -140,7 +146,7 @@ pub(super) async fn post_once(
         match cred.to_header_value() {
             Ok(value) => req = req.header(CREDENTIAL_HEADER, value),
             Err(e) => {
-                tracing::warn!(target: "federation::signing", error = %e,
+                tracing::warn!(target: super::SIGNING_TRACE_TARGET, error = %e,
                     "failed to encode outbound federation credential header; omitting");
             }
         }
@@ -154,7 +160,7 @@ pub(super) async fn post_once(
             Ok(Some(value)) => req = req.header(CHAIN_HEADER, value),
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(target: "federation::signing", error = %e,
+                tracing::warn!(target: super::SIGNING_TRACE_TARGET, error = %e,
                     "failed to encode outbound federation chain header; omitting");
             }
         }
@@ -179,7 +185,7 @@ pub(super) async fn post_once(
             }
         }
         Ok(resp) => AckOutcome::Fail(format!("http {}", resp.status())),
-        Err(e) => AckOutcome::Fail(format!("network: {e}")),
+        Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
     }
 }
 
@@ -300,7 +306,7 @@ pub async fn broadcast_store_quorum(
     // operators tailing `docker logs alice | grep federation` see
     // it without flipping `RUST_LOG=debug`.
     tracing::info!(
-        target: "ai_memory::federation::sync",
+        target: super::SYNC_TRACE_TARGET,
         memory_id = %mem.id,
         namespace = %mem.namespace,
         peer_count = config.peers.len(),
@@ -315,7 +321,7 @@ pub async fn broadcast_store_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [mem],
         "dry_run": false,
     });
@@ -460,7 +466,7 @@ pub async fn broadcast_store_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     // H9 (v0.7.0 round-2) — partial-quorum WARN. When the leader returns
@@ -528,7 +534,7 @@ pub async fn broadcast_store_quorum(
                 .await
             {
                 tracing::warn!(
-                    target: "ai_memory::federation::push_dlq",
+                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
                     memory_id = %mem.id,
                     peer_id = %peer_id,
                     "federation: failed to enqueue push-failure DLQ row \
@@ -537,7 +543,7 @@ pub async fn broadcast_store_quorum(
                 );
             } else {
                 tracing::info!(
-                    target: "ai_memory::federation::push_dlq",
+                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
                     memory_id = %mem.id,
                     peer_id = %peer_id,
                     reason = %reason,
@@ -570,7 +576,7 @@ pub async fn broadcast_delete_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "deletions": [id],
         "dry_run": false,
@@ -640,7 +646,7 @@ pub async fn broadcast_delete_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -668,7 +674,7 @@ pub async fn broadcast_archive_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "archives": [id],
         "dry_run": false,
@@ -738,7 +744,7 @@ pub async fn broadcast_archive_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -767,7 +773,7 @@ pub async fn broadcast_restore_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "restores": [id],
         "dry_run": false,
@@ -837,7 +843,7 @@ pub async fn broadcast_restore_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -860,7 +866,7 @@ pub async fn broadcast_link_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "links": [link],
         "dry_run": false,
@@ -931,7 +937,7 @@ pub async fn broadcast_link_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -955,7 +961,7 @@ pub async fn broadcast_consolidate_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [new_mem],
         "deletions": source_ids,
         "dry_run": false,
@@ -1028,7 +1034,7 @@ pub async fn broadcast_consolidate_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1054,7 +1060,7 @@ pub async fn broadcast_pending_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "pendings": [pending],
         "dry_run": false,
@@ -1127,7 +1133,7 @@ pub async fn broadcast_pending_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1152,7 +1158,7 @@ pub async fn broadcast_pending_decision_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "pending_decisions": [decision],
         "dry_run": false,
@@ -1225,7 +1231,7 @@ pub async fn broadcast_pending_decision_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1251,7 +1257,7 @@ pub async fn broadcast_namespace_meta_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "namespace_meta": [entry],
         "dry_run": false,
@@ -1325,7 +1331,7 @@ pub async fn broadcast_namespace_meta_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1353,7 +1359,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     tracker.lock().await.record_local();
 
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "namespace_meta_clears": namespaces,
         "dry_run": false,
@@ -1429,7 +1435,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
 
     let tracker = Arc::try_unwrap(tracker)
         .map_err(|_| QuorumError::LocalWriteFailed {
-            detail: "tracker arc still referenced at finalise".to_string(),
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
     Ok(tracker)
@@ -1477,7 +1483,7 @@ pub async fn bulk_catchup_push(
         return Vec::new();
     }
     let body = serde_json::json!({
-        "sender_agent_id": config.sender_agent_id,
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": memories,
         "dry_run": false,
     });
@@ -1523,13 +1529,13 @@ pub async fn bulk_catchup_push(
             // catchup against a peer that runs with api-key auth fails
             // 401 and the row gap stays open.
             if let Some(key) = api_key.as_deref() {
-                req = req.header("x-api-key", key);
+                req = req.header(crate::HEADER_API_KEY, key);
             }
             // v0.7.0 #238 — attach `x-peer-id` so catchup batches
             // attest against the receiver's allowlist exactly like
             // the per-row fanout in `post_once`.
             if let Some(peer_id) = payload
-                .get("sender_agent_id")
+                .get(field_names::SENDER_AGENT_ID)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
@@ -1538,7 +1544,7 @@ pub async fn bulk_catchup_push(
             let outcome = match req.send().await {
                 Ok(resp) if resp.status().is_success() => Ok(()),
                 Ok(resp) => Err(format!("http {}", resp.status())),
-                Err(e) => Err(format!("network: {e}")),
+                Err(e) => Err(crate::errors::msg::network(e)),
             };
             (id, outcome)
         });

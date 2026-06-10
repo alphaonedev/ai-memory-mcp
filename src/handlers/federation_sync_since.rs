@@ -10,6 +10,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{OriginalUri, Query, State},
@@ -191,13 +192,13 @@ pub async fn sync_since(
             Json(json!({
                 "count": 0,
                 "limit": limit,
-                "updated_since": q.since,
-                "earliest_updated_at": serde_json::Value::Null,
-                "latest_updated_at": serde_json::Value::Null,
+                (field_names::UPDATED_SINCE): q.since,
+                (field_names::EARLIEST_UPDATED_AT): serde_json::Value::Null,
+                (field_names::LATEST_UPDATED_AT): serde_json::Value::Null,
                 "memories": Vec::<Memory>::new(),
-                "excluded_for_scope": 0,
-                "excluded_for_scope_private": 0,
-                "scope_status": "no_allowlist_default_deny",
+                (field_names::EXCLUDED_FOR_SCOPE): 0,
+                (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): 0,
+                (field_names::SCOPE_STATUS): "no_allowlist_default_deny",
             })),
         )
             .into_response();
@@ -249,14 +250,14 @@ pub async fn sync_since(
             Json(json!({
                 "count": filtered.len(),
                 "limit": limit,
-                "updated_since": q.since,
-                "earliest_updated_at": earliest_updated_at,
-                "latest_updated_at": latest_updated_at,
+                (field_names::UPDATED_SINCE): q.since,
+                (field_names::EARLIEST_UPDATED_AT): earliest_updated_at,
+                (field_names::LATEST_UPDATED_AT): latest_updated_at,
                 "memories": filtered,
-                "storage_backend": "postgres",
-                "excluded_for_scope": excluded,
-                "excluded_for_scope_private": excluded_for_scope_private,
-                "scope_status": if allow_all_legacy { "legacy_bypass" } else { "scoped" },
+                (field_names::STORAGE_BACKEND): "postgres",
+                (field_names::EXCLUDED_FOR_SCOPE): excluded,
+                (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): excluded_for_scope_private,
+                (field_names::SCOPE_STATUS): if allow_all_legacy { "legacy_bypass" } else { "scoped" },
             })),
         )
             .into_response();
@@ -269,7 +270,7 @@ pub async fn sync_since(
             tracing::error!("sync_since: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
             )
                 .into_response();
         }
@@ -331,13 +332,13 @@ pub async fn sync_since(
         Json(json!({
             "count": mems.len(),
             "limit": limit,
-            "updated_since": q.since,
-            "earliest_updated_at": earliest_updated_at,
-            "latest_updated_at": latest_updated_at,
+            (field_names::UPDATED_SINCE): q.since,
+            (field_names::EARLIEST_UPDATED_AT): earliest_updated_at,
+            (field_names::LATEST_UPDATED_AT): latest_updated_at,
             "memories": mems,
-            "excluded_for_scope": excluded,
-            "excluded_for_scope_private": excluded_for_scope_private,
-            "scope_status": if allow_all_legacy { "legacy_bypass" } else { "scoped" },
+            (field_names::EXCLUDED_FOR_SCOPE): excluded,
+            (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): excluded_for_scope_private,
+            (field_names::SCOPE_STATUS): if allow_all_legacy { "legacy_bypass" } else { "scoped" },
         })),
     )
         .into_response()

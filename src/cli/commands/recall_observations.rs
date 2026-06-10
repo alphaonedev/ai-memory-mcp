@@ -105,7 +105,10 @@ pub fn cmd_recall_observations(
 
     let count = envelope.get("count").and_then(Value::as_u64).unwrap_or(0);
     writeln!(out.stdout, "recall-observations: {count} row(s)")?;
-    if let Some(arr) = envelope.get("observations").and_then(Value::as_array) {
+    if let Some(arr) = envelope
+        .get(crate::models::field_names::OBSERVATIONS)
+        .and_then(Value::as_array)
+    {
         for r in arr {
             let recall = r.get("recall_id").and_then(Value::as_str).unwrap_or("?");
             let mid = r.get("memory_id").and_then(Value::as_str).unwrap_or("?");

@@ -56,6 +56,7 @@
 //! `dedup_hit: false` + a placeholder memory_id so the wire shape
 //! is exercisable from MCP clients during the implementation cycle.
 
+use crate::models::field_names;
 use std::time::Instant;
 
 use base64::Engine;
@@ -65,6 +66,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{Memory, MemoryKind, Tier};
 use crate::signed_events::{self, SignedEvent};
@@ -80,6 +82,11 @@ use crate::signed_events::{self, SignedEvent};
 /// for enrollment changes (each call re-reads the env). Documented
 /// in CLAUDE.md §"Environment Variables".
 pub(crate) const L4_HOST_PUBKEY_ALLOWLIST_ENV: &str = "AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST";
+
+/// #1558 batch 5 wave 3 — action label for the L4 capture-turn write
+/// gate (deny-message verb + the `action` field on ask/pending
+/// envelopes). File-local: no other surface uses this label.
+const ACTION_CAPTURE_TURN: &str = "capture_turn";
 
 /// `memory_capture_turn` request body per RFC-0001 §"Tool input schema".
 ///
@@ -220,14 +227,13 @@ impl McpTool for MemoryCaptureTurnTool {
     }
 
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(MemoryCaptureTurnRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<MemoryCaptureTurnRequest>()
     }
 
     fn family() -> &'static str {
         // Lifecycle — capture is a substrate-lifecycle primitive
         // (every host-volunteered turn produces one memory row).
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 
@@ -346,7 +352,7 @@ pub fn handle_capture_turn(
             crate::permissions::Decision::Allow | crate::permissions::Decision::Modify(_) => {}
             crate::permissions::Decision::Deny(reason) => {
                 return Err(crate::governance::deny_message(
-                    "capture_turn",
+                    ACTION_CAPTURE_TURN,
                     crate::governance::DenyGate::PermissionRule,
                     &reason,
                 ));
@@ -355,7 +361,7 @@ pub fn handle_capture_turn(
                 return Ok(json!({
                     "status": "ask",
                     "reason": prompt,
-                    "action": "capture_turn",
+                    "action": ACTION_CAPTURE_TURN,
                     "namespace": gate_namespace,
                 }));
             }
@@ -376,7 +382,7 @@ pub fn handle_capture_turn(
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
                 return Err(crate::governance::deny_message(
-                    "capture_turn",
+                    ACTION_CAPTURE_TURN,
                     crate::governance::DenyGate::Governance,
                     &refusal.reason,
                 ));
@@ -384,9 +390,9 @@ pub fn handle_capture_turn(
             GovernanceDecision::Pending(pending_id) => {
                 return Ok(json!({
                     "status": "pending",
-                    "pending_id": pending_id,
-                    "reason": "governance requires approval",
-                    "action": "capture_turn",
+                    (field_names::PENDING_ID): pending_id,
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                    "action": ACTION_CAPTURE_TURN,
                     "namespace": gate_namespace,
                 }));
             }
@@ -401,15 +407,15 @@ pub fn handle_capture_turn(
             "memory_id": result.memory_id,
             "dedup_hit": true,
             "layer": "L4",
-            "elapsed_ms": elapsed_ms,
+            (field_names::ELAPSED_MS): elapsed_ms,
         }))
     } else {
         Ok(json!({
             "memory_id": result.memory_id,
             "dedup_hit": false,
             "layer": "L4",
-            "attest_level": attest_level,
-            "elapsed_ms": elapsed_ms,
+            (field_names::ATTEST_LEVEL): attest_level,
+            (field_names::ELAPSED_MS): elapsed_ms,
         }))
     }
 }
@@ -436,7 +442,7 @@ pub(crate) fn prepare_capture_turn(
     if let Some(meta_agent) = req
         .metadata
         .as_ref()
-        .and_then(|v| v.get("agent_id"))
+        .and_then(|v| v.get(param_names::AGENT_ID))
         .and_then(|v| v.as_str())
         && meta_agent != caller
     {

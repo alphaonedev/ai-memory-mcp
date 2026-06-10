@@ -51,9 +51,13 @@ any HTTP layer code runs.
 ai-memory serve --api-key "$(cat /etc/ai-memory/api.key)"
 ```
 
-When set, every endpoint except `/api/v1/health` requires either the
-`X-API-Key` header or the `?api_key=` query parameter. Required in
-combination with mTLS for federated peers.
+When set, every endpoint except `/api/v1/health` requires the
+`X-API-Key` header — the supported credential channel. (The
+`?api_key=` query-parameter form is deprecated at v0.7.0 and slated
+for v0.8 rejection; see
+[#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574) and
+[`production-deployment.md` §3b](production-deployment.md).) Required
+in combination with mTLS for federated peers.
 
 Pinned by [`tests/federation_x_api_key.rs`](../tests/federation_x_api_key.rs).
 
@@ -184,6 +188,23 @@ which is the correct default for partition-tolerance. For a regulated
 deployment where every write must be witnessed by every peer (W = N),
 configure explicitly — but be aware that any single-peer outage
 becomes a write outage.
+
+**Quorum timeout (WAN meshes).** The compiled default
+`--quorum-timeout-ms 2000` assumes same-DC peers (one remote-ack RTT
+~150-250 ms). Cross-region meshes need **5000-10000 ms**: the do-1461
+3-region reference deploy (fra1↔nyc3↔sgp1) pins
+`FED_QUORUM_TIMEOUT_MS=8000` (rationale in
+`deploy/do-1461/provision/lib.sh`) because the synchronous ack must
+cover a cross-continent round trip PLUS the receiver's per-memory
+work — embed-on-receive after an embedding-dimension migration can
+add ~1 s/row
+([#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)).
+A too-tight deadline shows up as push `deadline_exceeded` → DLQ
+([#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)).
+Raising it is cheap: the write commits **locally first**, so a longer
+remote-ack wait widens only the synchronous-durability gate on the
+HTTP response — never the local commit — and async catch-up converges
+the remaining peers regardless.
 
 **Reflection-depth interop.** When peers run different
 `max_reflection_depth` settings, the `enforce_local_cap_on_derived`

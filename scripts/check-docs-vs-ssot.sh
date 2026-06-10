@@ -240,9 +240,33 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
     done
 }
 
+# Env-var census rule (#836 3B / 2026-06-09 GA drive). Every
+# AI_MEMORY_* env var READ by production code must appear somewhere in
+# CLAUDE.md (the env-var table is the operator-facing contract; 13
+# missing rows were found by hand on 2026-06-09 — this makes the class
+# mechanical). Production boundary: skip *test* files and lines below
+# the first `mod tests {`. Intentionally one-directional — extra rows
+# in CLAUDE.md for removed vars are caught by the symbol census, and
+# vars only set (not read) by code are not operator knobs.
+check_env_var_census_rule() {
+    local rule_name="ENV_VAR_CENSUS" var
+    local code_vars
+    code_vars=$(grep -rhoE 'env::var(_os)?\("(AI_MEMORY_[A-Z0-9_]+)"' "$REPO_ROOT/src" \
+        --include='*.rs' 2>/dev/null \
+        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u)
+    for var in $code_vars; do
+        if ! grep -q "$var" "$REPO_ROOT/CLAUDE.md"; then
+            printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
+                "$rule_name" "$var" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+}
+
 run_all_rules() {
     fail_count=0
     check_schema_version_rule
+    check_env_var_census_rule
     # MCP tool count at --profile full
     check_narrative_count_rule \
         "Profile::full().expected_tool_count() (registry tools)" \

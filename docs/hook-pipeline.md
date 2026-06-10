@@ -168,9 +168,10 @@ the recall path for a full second.
 
 ## Hot-reload (SIGHUP)
 
-`spawn_reload_task` ([`src/hooks/config.rs:411`](../src/hooks/config.rs))
+`spawn_reload_task` ([`src/hooks/config.rs:424`](../src/hooks/config.rs))
 listens for `SIGHUP` on Linux/macOS and atomically swaps the chain's
-config snapshot via `ArcSwap`. Read-side dispatch resolves the
+config snapshot (a shared `Arc<HookConfigSnapshot>`, i.e.
+`RwLock<Vec<HookConfig>>`). Read-side dispatch resolves the
 snapshot once per fire, so a reload mid-fire never tears: any
 in-flight chain finishes against the old config; new chains see the
 new config. On non-Unix targets the function is a no-op

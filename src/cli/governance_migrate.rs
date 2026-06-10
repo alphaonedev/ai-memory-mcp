@@ -39,6 +39,7 @@
 //!   array is appended (existing `[[permissions.rules]]` entries are
 //!   preserved as well — this is an additive append, NOT a replace).
 
+use crate::models::field_names;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -46,6 +47,10 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::CliOutput;
+
+/// Repeated `.expect` label for args validated earlier in the same fn
+/// (#1558 batch 6).
+const EXPECT_CHECKED_ABOVE: &str = "checked above";
 
 // ---------------------------------------------------------------------------
 // CLI arg surface
@@ -184,7 +189,7 @@ pub fn translate(legacy: &LegacyGovernance) -> PermissionsBlock {
 /// `result.policy.is_empty()`.
 pub fn parse_legacy_governance(raw: &str) -> Result<LegacyGovernance> {
     let value: toml::Value = toml::from_str(raw).context("parse config.toml")?;
-    let Some(gov) = value.get("governance") else {
+    let Some(gov) = value.get(field_names::GOVERNANCE) else {
         return Ok(LegacyGovernance::default());
     };
     let parsed: LegacyGovernance = gov.clone().try_into().context("parse [governance] block")?;
@@ -303,7 +308,7 @@ pub fn run(args: MigrateToPermissionsArgs, out: &mut CliOutput<'_>) -> Result<()
     // (same file as the input). Compare canonical paths so a relative
     // and absolute reference to the same file still take the merge
     // branch.
-    let out_path = args.config_out.clone().expect("checked above");
+    let out_path = args.config_out.clone().expect(EXPECT_CHECKED_ABOVE);
     let same_file = same_path(&in_path, &out_path);
     if same_file {
         let merged = merge_in_place(&raw, &rendered);
@@ -375,7 +380,7 @@ pub fn run_with_paths(
         return Ok(rendered);
     }
 
-    let out_path = config_out.expect("checked above");
+    let out_path = config_out.expect(EXPECT_CHECKED_ABOVE);
     if same_path(in_path, out_path) {
         let merged = merge_in_place(&raw, &rendered);
         std::fs::write(out_path, merged)

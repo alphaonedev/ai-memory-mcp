@@ -8,11 +8,20 @@
 // file are caught by the lint at PR-time instead of silently growing.
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
+
+// ── #1558 batch 6 — file-local SQL SSOT (pm-v3.1 hardcoded-literal gate) ──
+const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
+const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
+    "DELETE FROM namespace_meta WHERE standard_id = ?1";
+const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
+const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
+const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
 
 /// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
 /// precision. Companion of the same-named helper in
@@ -306,7 +315,7 @@ fn archived_source_clause(include_archived: bool, table_alias: &str) -> &'static
 /// path.
 fn is_archived_source(mem: &Memory) -> bool {
     mem.metadata
-        .get("atomisation_archived_at")
+        .get(field_names::ATOMISATION_ARCHIVED_AT)
         .is_some_and(|v| !v.is_null())
 }
 
@@ -432,23 +441,23 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         None => Vec::new(),
     };
     let source_span: Option<SourceSpan> = row
-        .get::<_, Option<String>>("source_span")
+        .get::<_, Option<String>>(field_names::SOURCE_SPAN)
         .unwrap_or(None)
         .and_then(|s| match serde_json::from_str::<SourceSpan>(&s) {
             Ok(span) => Some(span),
             Err(e) => {
                 tracing::warn!(
                     row_id = %row_id,
-                    column = "source_span",
+                    column = field_names::SOURCE_SPAN,
                     error = %e,
                     "corrupt source_span JSON in DB row, defaulting to None"
                 );
-                crate::metrics::record_corrupt_provenance("source_span");
+                crate::metrics::record_corrupt_provenance(field_names::SOURCE_SPAN);
                 None
             }
         });
     let confidence_signals = row
-        .get::<_, Option<String>>("confidence_signals")
+        .get::<_, Option<String>>(field_names::CONFIDENCE_SIGNALS)
         .unwrap_or(None)
         .and_then(
             |s| match serde_json::from_str::<crate::models::ConfidenceSignals>(&s) {
@@ -456,11 +465,11 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
                 Err(e) => {
                     tracing::warn!(
                         row_id = %row_id,
-                        column = "confidence_signals",
+                        column = field_names::CONFIDENCE_SIGNALS,
                         error = %e,
                         "corrupt confidence_signals JSON in DB row, defaulting to None"
                     );
-                    crate::metrics::record_corrupt_provenance("confidence_signals");
+                    crate::metrics::record_corrupt_provenance(field_names::CONFIDENCE_SIGNALS);
                     None
                 }
             },
@@ -473,24 +482,24 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         content: row.get("content")?,
         tags,
         priority: row.get("priority")?,
-        confidence: row.get("confidence").unwrap_or(1.0),
+        confidence: row.get(field_names::CONFIDENCE).unwrap_or(1.0),
         source: row.get("source").unwrap_or_else(|_| "api".to_string()),
-        access_count: row.get("access_count")?,
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
-        last_accessed_at: row.get("last_accessed_at")?,
-        expires_at: row.get("expires_at")?,
+        access_count: row.get(field_names::ACCESS_COUNT)?,
+        created_at: row.get(field_names::CREATED_AT)?,
+        updated_at: row.get(field_names::UPDATED_AT)?,
+        last_accessed_at: row.get(field_names::LAST_ACCESSED_AT)?,
+        expires_at: row.get(field_names::EXPIRES_AT)?,
         metadata,
         // v0.7.0 Task 1/8 — schema v29 column. `.unwrap_or(0)` keeps the
         // reader tolerant of pre-v29 row reads (no panic if the migration
         // ladder hasn't reached this DB yet) and is consistent with the
         // SQL-side `DEFAULT 0`.
-        reflection_depth: row.get("reflection_depth").unwrap_or(0_i32),
+        reflection_depth: row.get(field_names::REFLECTION_DEPTH).unwrap_or(0_i32),
         // v0.7.0 L1-1 — schema v30 column. Falls back to `Observation` on
         // pre-v30 rows (column absent) and on any unrecognised value from a
         // future schema (forward-compat).
         memory_kind: row
-            .get::<_, String>("memory_kind")
+            .get::<_, String>(field_names::MEMORY_KIND)
             .ok()
             .and_then(|s| crate::models::MemoryKind::from_str(&s))
             .unwrap_or_default(),
@@ -499,14 +508,18 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // every observation/reflection row. Pre-v36 rows lack the
         // column entirely — the `.ok()` fallthrough yields None.
         entity_id: row.get::<_, Option<String>>("entity_id").unwrap_or(None),
-        persona_version: row.get::<_, Option<i32>>("persona_version").unwrap_or(None),
+        persona_version: row
+            .get::<_, Option<i32>>(field_names::PERSONA_VERSION)
+            .unwrap_or(None),
         // v0.7.0 Form 4 — schema v38 fact-provenance columns. `citations`
         // / `source_span` corruption now logs WARN + bumps the
         // `corrupt_provenance_rows_total` counter above so silent JSON
         // drops surface in operator observability (Cluster-A COR-3 fix).
         // `source_uri` is a plain TEXT column (NULL on legacy rows).
         citations,
-        source_uri: row.get::<_, Option<String>>("source_uri").unwrap_or(None),
+        source_uri: row
+            .get::<_, Option<String>>(field_names::SOURCE_URI)
+            .unwrap_or(None),
         source_span,
         // v0.7.0 Form 5 — schema v39 columns. Legacy rows resolve
         // to `CallerProvided` (SQL DEFAULT), NULL signals, NULL
@@ -514,13 +527,13 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // of pre-v39 row reads (no panic when migrate hasn't fired
         // yet).
         confidence_source: row
-            .get::<_, String>("confidence_source")
+            .get::<_, String>(field_names::CONFIDENCE_SOURCE)
             .ok()
             .and_then(|s| crate::models::ConfidenceSource::from_str(&s))
             .unwrap_or_default(),
         confidence_signals,
         confidence_decayed_at: row
-            .get::<_, Option<String>>("confidence_decayed_at")
+            .get::<_, Option<String>>(field_names::CONFIDENCE_DECAYED_AT)
             .unwrap_or(None),
         // v0.7.0 Provenance Gap 1 (#884) — schema v45 optimistic-
         // concurrency column. Pre-v45 rows lack the column entirely
@@ -829,7 +842,7 @@ pub fn capture_turn_idempotent(
         });
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE")
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
@@ -860,7 +873,7 @@ pub fn capture_turn_idempotent(
 
     match tx_result {
         Ok(memory_id) => {
-            conn.execute_batch("COMMIT")
+            conn.execute_batch(connection::SQL_COMMIT)
                 .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
             Ok(crate::models::CaptureTurnResult {
                 memory_id,
@@ -868,7 +881,7 @@ pub fn capture_turn_idempotent(
             })
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -1008,7 +1021,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     match rows.next() {
         Some(Ok(m)) => Ok(Some(m)),
@@ -1105,7 +1118,7 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
     let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
     let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<()> {
         conn.execute(
@@ -1139,11 +1152,11 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(())
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in touch: {}", rb);
             }
             Err(e)
@@ -1183,7 +1196,7 @@ pub fn touch_many(
     let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
     let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<()> {
         // Cache the three prepared statements once for the whole
@@ -1219,11 +1232,11 @@ pub fn touch_many(
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(ids.len())
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in touch_many: {}", rb);
             }
             Err(e)
@@ -1309,7 +1322,7 @@ pub fn update_with_expected_version(
     source_uri: Option<&str>,
     expected_version: Option<i64>,
 ) -> Result<(bool, bool)> {
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         return Ok((false, false));
@@ -1531,7 +1544,7 @@ pub fn update_with_archive_on_supersede(
     edit_source: crate::models::EditSource,
 ) -> Result<SupersedeResult> {
     // Read the existing row so we can compose the patched NEW row.
-    let mut stmt = conn.prepare("SELECT * FROM memories WHERE id = ?1")?;
+    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
@@ -1599,7 +1612,7 @@ pub fn update_with_archive_on_supersede(
             serde_json::Value::String(edit_source.as_str().to_string()),
         );
         m.insert(
-            "superseded_id".to_string(),
+            field_names::SUPERSEDED_ID.to_string(),
             serde_json::Value::String(existing.id.clone()),
         );
     }
@@ -1676,11 +1689,8 @@ pub fn update_with_archive_on_supersede(
 
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     // Clean up namespace_meta if this memory was a namespace standard
-    conn.execute(
-        "DELETE FROM namespace_meta WHERE standard_id = ?1",
-        params![id],
-    )?;
-    let changed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+    conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+    let changed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
     Ok(changed > 0)
 }
 
@@ -1702,14 +1712,10 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or("archive");
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
             .unwrap_or(false);
         if !exists {
             return Ok(false);
@@ -1740,20 +1746,17 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
         )?;
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
-        conn.execute(
-            "DELETE FROM namespace_meta WHERE standard_id = ?1",
-            params![id],
-        )?;
-        let removed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
     match result {
         Ok(moved) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(moved)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -1788,7 +1791,7 @@ pub fn archive_memory_for_caller(
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or("archive");
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
         // inbox-target row whose recipient is the caller).
@@ -1832,20 +1835,17 @@ pub fn archive_memory_for_caller(
         )?;
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
-        conn.execute(
-            "DELETE FROM namespace_meta WHERE standard_id = ?1",
-            params![id],
-        )?;
-        let removed = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
     match result {
         Ok(moved) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(moved)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -1861,7 +1861,7 @@ pub fn forget_count(
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "at least one of namespace, pattern, or tier is required".to_string(),
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
         }));
     }
     if let Some(pat) = pattern {
@@ -1901,7 +1901,7 @@ pub fn forget(
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "at least one of namespace, pattern, or tier is required".to_string(),
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
         }));
     }
 
@@ -2245,7 +2245,7 @@ pub fn list_by_source_uri(
     limit: Option<usize>,
     as_agent: Option<&str>,
 ) -> Result<Vec<Memory>> {
-    let cap = limit.unwrap_or(200).min(1000);
+    let cap = limit.unwrap_or(LIST_DEFAULT_CAP).min(LIST_MAX_LIMIT);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
     // Placeholder layout: ?1 = uri, ?2 = namespace, ?3 = limit,
     // ?4..?7 = visibility prefixes (private/team/unit/org).
@@ -2880,7 +2880,12 @@ pub fn promote_to_namespace(
     let actual_id = insert(conn, &clone)?;
     // Clone → source: derived_from. Safe to ignore if the link layer
     // short-circuits on self-link (impossible here — distinct IDs).
-    create_link(conn, &actual_id, source_id, "derived_from")?;
+    create_link(
+        conn,
+        &actual_id,
+        source_id,
+        crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    )?;
     Ok(actual_id)
 }
 
@@ -3205,7 +3210,6 @@ pub fn validate_link_pre_create(
     // Pass 2: K9 permission eval. Skip when the caller has already
     // established external attestation (federation peer_attested).
     if !skip_governance {
-        use crate::permissions::{Decision, Op, PermissionContext, Permissions};
         // Link evaluation is scoped to the *source* memory's
         // namespace — matches the MCP path's choice at
         // `src/mcp/tools/link.rs:31`. Missing source memory falls
@@ -3215,36 +3219,56 @@ pub fn validate_link_pre_create(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
-        let ctx = PermissionContext {
-            op: Op::MemoryLink,
-            namespace: link_ns,
-            agent_id: agent_id.to_string(),
-            payload: serde_json::json!({
-                "source_id": source_id,
-                "target_id": target_id,
-                "relation": relation,
-            }),
-        };
-        match Permissions::evaluate(&ctx, &[]) {
-            Decision::Allow | Decision::Modify(_) => {}
-            Decision::Deny(reason) => {
-                // #962 typed envelope. Display preserves
-                // `LINK_PERMISSION_DENIED_ERR_PREFIX`.
-                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
-                    reason,
-                }));
-            }
-            Decision::Ask(prompt) => {
-                // Storage layer has no Ask channel; surface as Deny.
-                // MCP path handles Ask directly via its own pre-call
-                // evaluate (returns the `{"status":"ask"}` envelope).
-                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
-                    reason: format!("ask deferred to storage layer ({prompt})"),
-                }));
-            }
-        }
+        evaluate_link_permission(&link_ns, source_id, target_id, relation, agent_id)
+            .map_err(anyhow::Error::new)?;
     }
     Ok(())
+}
+
+/// #1568 (H1 residual) — backend-agnostic K9 permission evaluation for
+/// a pending link write. This is Pass 2 of [`validate_link_pre_create`]
+/// hoisted into a shared free fn so BOTH adapters consult the same
+/// governance gate: the sqlite path delegates from
+/// `validate_link_pre_create`; the postgres SAL adapter's
+/// `link_internal` (`src/store/postgres.rs`) calls it directly after
+/// resolving the source memory's namespace via SQL. Keeping the
+/// evaluation here means the two backends cannot drift on link
+/// governance semantics.
+///
+/// # Errors
+///
+/// Returns [`StorageError::LinkPermissionDenied`] (Display preserves
+/// [`LINK_PERMISSION_DENIED_ERR_PREFIX`]) on `Deny`, and on `Ask` —
+/// the storage layer has no Ask channel; entry points that want
+/// interactive Ask handling (MCP) run `Permissions::evaluate`
+/// themselves BEFORE the storage write.
+pub(crate) fn evaluate_link_permission(
+    link_ns: &str,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    agent_id: &str,
+) -> std::result::Result<(), StorageError> {
+    use crate::permissions::{Decision, Op, PermissionContext, Permissions};
+    let ctx = PermissionContext {
+        op: Op::MemoryLink,
+        namespace: link_ns.to_string(),
+        agent_id: agent_id.to_string(),
+        payload: serde_json::json!({
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": relation,
+        }),
+    };
+    match Permissions::evaluate(&ctx, &[]) {
+        Decision::Allow | Decision::Modify(_) => Ok(()),
+        // #962 typed envelope. Display preserves
+        // `LINK_PERMISSION_DENIED_ERR_PREFIX`.
+        Decision::Deny(reason) => Err(StorageError::LinkPermissionDenied { reason }),
+        Decision::Ask(prompt) => Err(StorageError::LinkPermissionDenied {
+            reason: format!("ask deferred to storage layer ({prompt})"),
+        }),
+    }
 }
 
 /// Insert a directional `(source_id, target_id, relation)` link.
@@ -3319,11 +3343,7 @@ pub fn create_link_signed(
     )?;
     // Verify both IDs exist before creating link
     let source_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![source_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![source_id], |r| r.get(0))
         .unwrap_or(false);
     if !source_exists {
         // #962 typed envelope — MemoryNotFound{role=Source}.
@@ -3333,11 +3353,7 @@ pub fn create_link_signed(
         }));
     }
     let target_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![target_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![target_id], |r| r.get(0))
         .unwrap_or(false);
     if !target_exists {
         // #962 typed envelope — MemoryNotFound{role=Target}.
@@ -3460,7 +3476,7 @@ pub fn create_link_signed(
                 };
                 if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
                     tracing::warn!(
-                        target: "signed_events",
+                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                         source_id, target_id, relation,
                         "failed to append memory_link.created audit row: {e}"
                     );
@@ -3468,7 +3484,7 @@ pub fn create_link_signed(
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     source_id, target_id, relation,
                     "failed to encode canonical CBOR for memory_link.created audit: {e}"
                 );
@@ -3594,11 +3610,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
     // peer raced ahead of us; we surface that to the caller's warn log
     // rather than papering over with INSERT OR IGNORE silently.
     let source_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![link.source_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![link.source_id], |r| r.get(0))
         .unwrap_or(false);
     if !source_exists {
         // #962 typed envelope — MemoryNotFound{role=Source}.
@@ -3608,11 +3620,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         }));
     }
     let target_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-            params![link.target_id],
-            |r| r.get(0),
-        )
+        .query_row(SQL_MEMORY_EXISTS, params![link.target_id], |r| r.get(0))
         .unwrap_or(false);
     if !target_exists {
         // #962 typed envelope — MemoryNotFound{role=Target}.
@@ -3691,7 +3699,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
                 };
                 if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
                     tracing::warn!(
-                        target: "signed_events",
+                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                         source_id = %link.source_id,
                         target_id = %link.target_id,
                         relation = %link.relation,
@@ -3701,7 +3709,7 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     source_id = %link.source_id,
                     target_id = %link.target_id,
                     relation = %link.relation,
@@ -3840,6 +3848,12 @@ pub fn get_link_for_verify(
 
 // --- Consolidation ---
 
+/// #1558 batch 5 wave 3 — canonical `source` value stamped on rows
+/// minted by [`consolidate`] (MCP `memory_consolidate` + the HTTP
+/// power-consolidation handler pass it verbatim). Listed in
+/// `validate::VALID_SOURCES`; one spelling, hoist-only.
+pub const CONSOLIDATION_SOURCE: &str = "consolidation";
+
 /// Consolidate multiple memories into one. Returns the new memory ID.
 /// Deletes the source memories and creates links from new → old (`derived_from`).
 #[allow(clippy::too_many_arguments)]
@@ -3856,7 +3870,7 @@ pub fn consolidate(
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<String> {
         // Verify all IDs exist and collect metadata in one pass
@@ -3918,7 +3932,9 @@ pub fn consolidate(
         let tags_json = serde_json::to_string(&all_tags)?;
         // Record source IDs in metadata for provenance (links would be CASCADE-deleted)
         merged_metadata.insert(
-            "derived_from".to_string(),
+            crate::models::MemoryLinkRelation::DerivedFrom
+                .as_str()
+                .to_string(),
             serde_json::Value::Array(
                 ids.iter()
                     .map(|id| serde_json::Value::String(id.clone()))
@@ -4011,11 +4027,11 @@ pub fn consolidate(
 
     match result {
         Ok(id) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(id)
         }
         Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+            if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
                 tracing::error!("ROLLBACK failed in consolidate: {}", rb);
             }
             Err(e)
@@ -4112,7 +4128,14 @@ pub fn list_namespaces(conn: &Connection) -> Result<Vec<NamespaceCount>> {
 /// Hard cap on input groups walked when assembling a taxonomy tree.
 /// Even when callers pass a wildly large `limit`, we never walk more
 /// than this many `(namespace, count)` rows — bounds memory + time.
-const TAXONOMY_MAX_LIMIT: usize = 10_000;
+/// Shared by the sqlite + postgres taxonomy paths and the HTTP / MCP
+/// taxonomy surfaces so all four clamp identically.
+pub const TAXONOMY_MAX_LIMIT: usize = 10_000;
+
+/// Default group budget for taxonomy listings when the caller passes
+/// no explicit `limit` (HTTP `/api/v1/namespaces`, MCP
+/// `memory_get_taxonomy`).
+pub const TAXONOMY_DEFAULT_LIMIT: usize = 1000;
 
 /// Build a hierarchical namespace taxonomy (Pillar 1 / Stream A).
 ///
@@ -4149,6 +4172,19 @@ pub fn get_taxonomy(
     let effective_depth = max_depth.min(MAX_NAMESPACE_DEPTH);
 
     let prefix = namespace_prefix.unwrap_or("");
+    // #1531 L5 — `validate_namespace` deliberately places no per-segment
+    // character restriction (historical flexibility), so a stored
+    // namespace/prefix may contain the LIKE metacharacters `%` / `_`.
+    // Escape the descendant pattern (mirroring the visibility clause at
+    // the top of this file and the postgres `taxonomy_namespaces`
+    // twin) so a prefix like `a%` cannot over-match `aX/...` subtrees.
+    let descendant_pattern = format!(
+        "{}/%",
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
 
     // Total count for the prefix is computed independently of the
     // truncated row walk so the caller-visible total stays honest even
@@ -4164,8 +4200,8 @@ pub fn get_taxonomy(
         let v: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories
              WHERE (expires_at IS NULL OR expires_at > ?1)
-               AND (namespace = ?2 OR namespace LIKE ?2 || '/%')",
-            params![now, prefix],
+               AND (namespace = ?2 OR namespace LIKE ?3 ESCAPE '\\')",
+            params![now, prefix, descendant_pattern],
             |row| row.get(0),
         )?;
         usize::try_from(v).unwrap_or(0)
@@ -4194,15 +4230,16 @@ pub fn get_taxonomy(
         let mut stmt = conn.prepare(
             "SELECT namespace, COUNT(*) FROM memories
              WHERE (expires_at IS NULL OR expires_at > ?1)
-               AND (namespace = ?2 OR namespace LIKE ?2 || '/%')
+               AND (namespace = ?2 OR namespace LIKE ?3 ESCAPE '\\')
              GROUP BY namespace
              ORDER BY COUNT(*) DESC, namespace ASC
-             LIMIT ?3",
+             LIMIT ?4",
         )?;
         let rows = stmt.query_map(
             params![
                 now,
                 prefix,
+                descendant_pattern,
                 i64::try_from(effective_limit).unwrap_or(i64::MAX)
             ],
             |row| {
@@ -4407,6 +4444,32 @@ pub fn fold_taxonomy_groups(
     }
 }
 
+/// Default row cap for memory list/search surfaces when the caller
+/// passes no explicit limit. Mirrored by the postgres SAL adapter
+/// (`src/store/postgres.rs::list_by_source_uri`) so both backends
+/// page identically.
+pub const LIST_DEFAULT_CAP: usize = 200;
+
+/// Hard ceiling on rows returned by the memory list/search surfaces.
+/// One shared knob across the sqlite + postgres SAL adapters; same
+/// family as `KG_TIMELINE_MAX_LIMIT` / `KG_QUERY_MAX_LIMIT`.
+pub const LIST_MAX_LIMIT: usize = 1000;
+
+/// Post-clamp `usize → i64` conversion fallback for list/query limits.
+/// Unreachable in practice (values are already clamped to at most
+/// `LIST_MAX_LIMIT`, which always fits `i64`); kept as a named knob so
+/// the fallback page size is explicit rather than magic.
+pub const LIST_FALLBACK_LIMIT: usize = 100;
+
+/// Default page size for archive listings (HTTP `/api/v1/archive` and
+/// MCP `memory_archive_list`) when the caller passes no explicit
+/// `limit` — one knob so both surfaces page identically.
+pub const ARCHIVE_DEFAULT_PAGE_LIMIT: usize = 50;
+
+/// Default page size for governance pending-action listings (MCP
+/// `memory_pending_list` / subscription approval feeds).
+pub const PENDING_DEFAULT_PAGE_LIMIT: usize = 100;
+
 /// Hard floor for duplicate-check threshold. Below this, anything can match
 /// random unrelated content — refuse to honor the lookup so callers don't
 /// silently get garbage merge suggestions.
@@ -4545,7 +4608,7 @@ pub fn check_duplicate(
 /// similarity from saturating at 1.0.
 ///
 /// The input is the *exact* text the MCP/HTTP layer hands to the
-/// embedder — `format!("{title} {content}")` — and we hash its raw
+/// embedder — `crate::embeddings::embedding_document(title, content)` — and we hash its raw
 /// UTF-8 bytes with no normalization. Lower-casing or whitespace
 /// stripping at this layer would re-introduce the very ambiguity we
 /// are trying to short-circuit (two semantically-identical strings
@@ -4766,7 +4829,7 @@ pub fn proactive_conflict_check(
 /// candidate via an index — flagged for a separate migration PR.
 ///
 /// `query_text` MUST be the exact string used to produce
-/// `query_embedding` (typically `format!("{title} {content}")`).
+/// `query_embedding` (typically `crate::embeddings::embedding_document(title, content)`).
 /// Passing a different string is not a correctness bug — the function
 /// just falls through to the embedding-similarity path — but it
 /// defeats the point of the short-circuit.
@@ -4818,12 +4881,12 @@ pub fn check_duplicate_with_text(
     };
 
     // Phase 1 — SHA-256 exact-match short-circuit. We hash the same
-    // `format!("{title} {content}")` shape the MCP/HTTP layers use to
+    // `crate::embeddings::embedding_document(title, content)` shape the MCP/HTTP layers use to
     // build the embedding text so an identical store-then-check sequence
     // surfaces as similarity=1.0 even when the embedding pipeline would
     // otherwise cap at ~0.92 due to prefix asymmetry.
     for (id, title, ns, content) in &rows {
-        let row_text = format!("{title} {content}");
+        let row_text = crate::embeddings::embedding_document(title, content);
         let row_hash = canonical_content_hash(&row_text);
         if row_hash == query_hash {
             return Ok(DuplicateCheck {
@@ -5237,10 +5300,10 @@ pub fn invalidate_link(
     // signature) and the audit INSERT leaves H5's silent-supersession
     // state — the exact thing H5 was added to prevent. RESERVED-lock
     // semantics also serialise concurrent writers across processes.
-    conn.execute("BEGIN IMMEDIATE", [])?;
+    conn.execute(connection::SQL_BEGIN_IMMEDIATE, [])?;
     // From here on, every early return MUST `ROLLBACK` first.
     let rollback = || {
-        let _ = conn.execute("ROLLBACK", []);
+        let _ = conn.execute(connection::SQL_ROLLBACK, []);
     };
 
     // Pull the prior `valid_until` AND the signing surface so the
@@ -5373,7 +5436,7 @@ pub fn invalidate_link(
         }
     }
 
-    conn.execute("COMMIT", [])?;
+    conn.execute(connection::SQL_COMMIT, [])?;
     Ok(Some(InvalidateResult {
         valid_until: stamp,
         previous_valid_until: prior,
@@ -5441,7 +5504,7 @@ pub fn kg_query(
     if max_depth == 0 {
         // #962 typed envelope.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "max_depth must be >= 1".to_string(),
+            reason: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
         }));
     }
     if max_depth > KG_QUERY_MAX_SUPPORTED_DEPTH {
@@ -5669,7 +5732,7 @@ pub fn find_paths(
     if depth == 0 {
         // #962 typed envelope.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: "max_depth must be >= 1".to_string(),
+            reason: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
         }));
     }
     if depth > FIND_PATHS_MAX_DEPTH {
@@ -5791,7 +5854,7 @@ pub fn register_agent(
     agent_type: &str,
     capabilities: &[String],
 ) -> Result<String> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
 
     // Preserve original registered_at across re-registration.
@@ -5813,17 +5876,17 @@ pub fn register_agent(
 
     let metadata = serde_json::json!({
         "agent_id": agent_id,
-        "agent_type": agent_type,
-        "capabilities": caps_json,
-        "registered_at": registered_at,
-        "last_seen_at": now,
+        (field_names::AGENT_TYPE): agent_type,
+        (field_names::CAPABILITIES): caps_json,
+        (field_names::REGISTERED_AT): registered_at,
+        (field_names::LAST_SEEN_AT): now,
         // #910 (SAL-level enforcement) — agent-registration rows live
         // in the `_agents` namespace and are a public roster: every
         // agent has a legitimate need to know which other agents are
         // registered (consensus voting, peer attestation, etc.). Stamp
         // scope=collective so the SAL visibility filter doesn't drop
         // them on cross-agent reads.
-        "scope": "collective",
+        "scope": crate::models::MemoryScope::Collective.as_str(),
     });
 
     let content = serde_json::to_string(&metadata)
@@ -5886,12 +5949,12 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
             .unwrap_or_default()
             .to_string();
         let agent_type = meta
-            .get("agent_type")
+            .get(field_names::AGENT_TYPE)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
         let capabilities: Vec<String> = meta
-            .get("capabilities")
+            .get(field_names::CAPABILITIES)
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -5900,12 +5963,12 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
             })
             .unwrap_or_default();
         let registered_at = meta
-            .get("registered_at")
+            .get(field_names::REGISTERED_AT)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
         let last_seen_at = meta
-            .get("last_seen_at")
+            .get(field_names::LAST_SEEN_AT)
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
@@ -5945,7 +6008,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
 /// - the agent is not registered (no `_agents` row for `agent_id`)
 /// - the underlying `UPDATE` fails
 pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) -> Result<()> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
     let affected = conn.execute(
         "UPDATE memories SET
@@ -5977,7 +6040,7 @@ pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) ->
 ///
 /// Surfaces only underlying query failures.
 pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let pubkey = conn
         .query_row(
             "SELECT json_extract(metadata, '$.agent_pubkey') FROM memories
@@ -6007,7 +6070,7 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
 /// - the agent is not registered (no `_agents` row for `agent_id`)
 /// - the underlying `UPDATE` fails
 pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     let now = Utc::now().to_rfc3339();
     let affected = conn.execute(
         "UPDATE memories SET
@@ -6115,7 +6178,7 @@ pub fn auto_purge_archive(conn: &Connection, max_days: Option<i64>) -> Result<us
 
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<usize> {
         if archive {
             // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
@@ -6150,7 +6213,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     })();
     match result {
         Ok(n) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             // Clean up namespace_meta rows pointing to deleted memories
             let _ = conn.execute(
                 "DELETE FROM namespace_meta WHERE standard_id NOT IN (SELECT id FROM memories)",
@@ -6159,7 +6222,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
             Ok(n)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -6235,15 +6298,15 @@ pub fn list_archived(
             "content": row.get::<_, String>(4)?,
             "tags": tags,
             "priority": row.get::<_, i32>(6)?,
-            "confidence": row.get::<_, f64>(7)?,
+            (field_names::CONFIDENCE): row.get::<_, f64>(7)?,
             "source": row.get::<_, String>(8)?,
-            "access_count": row.get::<_, i64>(9)?,
-            "created_at": row.get::<_, String>(10)?,
-            "updated_at": row.get::<_, String>(11)?,
-            "last_accessed_at": row.get::<_, Option<String>>(12)?,
-            "expires_at": row.get::<_, Option<String>>(13)?,
-            "archived_at": row.get::<_, String>(14)?,
-            "archive_reason": row.get::<_, String>(15)?,
+            (field_names::ACCESS_COUNT): row.get::<_, i64>(9)?,
+            (field_names::CREATED_AT): row.get::<_, String>(10)?,
+            (field_names::UPDATED_AT): row.get::<_, String>(11)?,
+            (field_names::LAST_ACCESSED_AT): row.get::<_, Option<String>>(12)?,
+            (field_names::EXPIRES_AT): row.get::<_, Option<String>>(13)?,
+            (field_names::ARCHIVED_AT): row.get::<_, String>(14)?,
+            (field_names::ARCHIVE_REASON): row.get::<_, String>(15)?,
             "metadata": metadata,
         }))
     })?;
@@ -6253,7 +6316,7 @@ pub fn list_archived(
 
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
             .query_row(
@@ -6267,11 +6330,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         }
         // Check if ID already exists in active memories to prevent silent overwrite
         let active_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
             .unwrap_or(false);
         if active_exists {
             // #962 typed envelope — ArchiveRestoreCollision (409).
@@ -6352,11 +6411,11 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     })();
     match result {
         Ok(v) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -6380,7 +6439,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 /// surface cannot be used to probe other owners' archived ids.
 pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
         // inbox-target row whose recipient is the caller, or be a
@@ -6405,11 +6464,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         }
         // Check if ID already exists in active memories to prevent silent overwrite.
         let active_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
+            .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
             .unwrap_or(false);
         if active_exists {
             // #962 typed envelope — ArchiveRestoreCollision (409).
@@ -6481,11 +6536,11 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
     })();
     match result {
         Ok(v) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(connection::SQL_COMMIT)?;
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -6526,7 +6581,7 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
         Some(days) if days < 0 => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                reason: format!("older_than_days must be non-negative (got {days})"),
+                reason: crate::errors::msg::older_than_days_negative(days),
             }));
         }
         Some(days) => {
@@ -6574,7 +6629,7 @@ pub fn purge_archive_for_caller(
         Some(days) if days < 0 => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
-                reason: format!("older_than_days must be non-negative (got {days})"),
+                reason: crate::errors::msg::older_than_days_negative(days),
             }));
         }
         Some(days) => {
@@ -6618,7 +6673,7 @@ pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(serde_json::json!({
         "archived_total": total,
-        "by_namespace": by_ns,
+        (field_names::BY_NAMESPACE): by_ns,
     }))
 }
 
@@ -8616,7 +8671,7 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
             _ => continue,
         };
         // Governance blob must exist and not be null.
-        let gov = match mem.metadata.get("governance") {
+        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
             Some(g) if !g.is_null() => g,
             _ => continue,
         };
@@ -8684,7 +8739,7 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
             Ok(Some(m)) => m,
             _ => continue,
         };
-        let gov = match mem.metadata.get("governance") {
+        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
             Some(g) if !g.is_null() => g,
             _ => continue,
         };
@@ -8718,7 +8773,7 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
 
 /// Return true if `agent_id` matches a registered agent in `_agents`.
 pub fn is_registered_agent(conn: &Connection, agent_id: &str) -> bool {
-    let title = format!("agent:{agent_id}");
+    let title = crate::models::agent_registration_title(agent_id);
     conn.query_row(
         "SELECT 1 FROM memories WHERE namespace = ?1 AND title = ?2",
         params![AGENTS_NAMESPACE, &title],
@@ -9181,14 +9236,23 @@ fn emit_pending_action_event(
         .unwrap_or_default();
     let timestamp = Utc::now().to_rfc3339();
     let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
-    map.insert("pending_id", ciborium::Value::Text(pa.id.clone()));
-    map.insert("action_type", ciborium::Value::Text(pa.action_type.clone()));
+    map.insert(
+        field_names::PENDING_ID,
+        ciborium::Value::Text(pa.id.clone()),
+    );
+    map.insert(
+        field_names::ACTION_TYPE,
+        ciborium::Value::Text(pa.action_type.clone()),
+    );
     map.insert("namespace", ciborium::Value::Text(pa.namespace.clone()));
     map.insert(
-        "requested_by",
+        field_names::REQUESTED_BY,
         ciborium::Value::Text(pa.requested_by.clone()),
     );
-    map.insert("decided_by", ciborium::Value::Text(decided_by.clone()));
+    map.insert(
+        field_names::DECIDED_BY,
+        ciborium::Value::Text(decided_by.clone()),
+    );
     map.insert("status", ciborium::Value::Text(pa.status.clone()));
     map.insert("timestamp", ciborium::Value::Text(timestamp.clone()));
     let entries: Vec<(ciborium::Value, ciborium::Value)> = map
@@ -9199,7 +9263,7 @@ fn emit_pending_action_event(
     let mut cbor: Vec<u8> = Vec::with_capacity(128);
     if let Err(e) = ciborium::ser::into_writer(&value, &mut cbor) {
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             pending_id = %pa.id,
             event_type,
             "failed to encode canonical CBOR for pending_action event: {e}"
@@ -9233,7 +9297,7 @@ fn emit_pending_action_event(
     );
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(
-            target: "signed_events",
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             pending_id = %pa.id,
             event_type,
             "failed to append pending_action audit row: {e}"
@@ -9306,9 +9370,9 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
 ) -> Result<ApproveOutcome> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
-        return Ok(ApproveOutcome::Rejected(format!(
-            "pending action not found: {pending_id}"
-        )));
+        return Ok(ApproveOutcome::Rejected(
+            crate::errors::msg::pending_action_not_found(pending_id),
+        ));
     };
     if pa.status != "pending" {
         return Ok(ApproveOutcome::Rejected(format!(
@@ -9329,7 +9393,9 @@ pub fn approve_with_approver_type(
             if ok {
                 Ok(ApproveOutcome::Approved)
             } else {
-                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+                Ok(ApproveOutcome::Rejected(
+                    crate::errors::msg::DECISION_WRITE_FAILED.into(),
+                ))
             }
         }
         ApproverType::Agent(required) => {
@@ -9342,7 +9408,9 @@ pub fn approve_with_approver_type(
             if ok {
                 Ok(ApproveOutcome::Approved)
             } else {
-                Ok(ApproveOutcome::Rejected("decision write failed".into()))
+                Ok(ApproveOutcome::Rejected(
+                    crate::errors::msg::DECISION_WRITE_FAILED.into(),
+                ))
             }
         }
         ApproverType::Consensus(quorum) => {
@@ -9473,7 +9541,11 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
         }
         "promote" => {
             if let Some(mid) = pa.memory_id.clone() {
-                if let Some(to_ns) = pa.payload.get("to_namespace").and_then(|v| v.as_str()) {
+                if let Some(to_ns) = pa
+                    .payload
+                    .get(field_names::TO_NAMESPACE)
+                    .and_then(|v| v.as_str())
+                {
                     // Vertical promotion to ancestor.
                     let clone_id = promote_to_namespace(conn, &mid, to_ns)?;
                     Some(clone_id)
@@ -9549,7 +9621,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
     let payload = &pa.payload;
     let source_ids: Vec<String> = payload
-        .get("source_ids")
+        .get(field_names::SOURCE_IDS)
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -9610,7 +9682,7 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
     )
     .unwrap_or(5);
     let confidence = payload
-        .get("confidence")
+        .get(field_names::CONFIDENCE)
         .and_then(|v| v.as_f64())
         .unwrap_or(1.0);
     // Use the queued payload's agent_id when present (already verified
@@ -11731,6 +11803,37 @@ mod tests {
         assert_eq!(tax.tree.children.len(), 1);
         assert_eq!(tax.tree.children[0].name, "platform");
         assert_eq!(tax.tree.children[0].count, 1);
+    }
+
+    /// #1531 L5 — `validate_namespace` permits the LIKE metacharacters
+    /// `%` / `_` in segments (historical flexibility), so the taxonomy
+    /// prefix walk must escape its descendant pattern. Pre-fix the
+    /// unescaped `LIKE ?2 || '/%'` let prefix `a%` aggregate the `ax/...`
+    /// subtree.
+    #[test]
+    fn taxonomy_prefix_like_metacharacters_do_not_widen_match_l5() {
+        let conn = test_db();
+        insert(&conn, &make_memory("a", "a%/child", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("b", "ax/child", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("c", "a_/child", Tier::Long, 5)).unwrap();
+
+        // Literal `a%` prefix must scope to the `a%` subtree only.
+        let tax = get_taxonomy(&conn, Some("a%"), 8, 1000).unwrap();
+        assert_eq!(
+            tax.total_count, 1,
+            "prefix 'a%' must not aggregate 'ax/...' or 'a_/...' subtrees"
+        );
+
+        // Literal `a_` prefix likewise.
+        let tax = get_taxonomy(&conn, Some("a_"), 8, 1000).unwrap();
+        assert_eq!(
+            tax.total_count, 1,
+            "prefix 'a_' must not aggregate single-char-wildcard siblings"
+        );
+
+        // Plain prefixes are unchanged.
+        let tax = get_taxonomy(&conn, Some("ax"), 8, 1000).unwrap();
+        assert_eq!(tax.total_count, 1);
     }
 
     #[test]

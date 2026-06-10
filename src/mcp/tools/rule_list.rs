@@ -14,10 +14,12 @@
 //! HTTP admin endpoints (`POST /api/v1/governance/rules` with the
 //! `X-AI-Memory-Operator-Signature` header).
 
+use crate::models::field_names;
 use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::governance::rules_store::{self, Rule};
+use crate::mcp::param_names;
 
 /// Handler for `memory_rule_list`. Accepts:
 ///
@@ -37,7 +39,7 @@ use crate::governance::rules_store::{self, Rule};
 /// }
 /// ```
 pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Result<Value, String> {
-    let kind_filter = arguments.get("kind").and_then(Value::as_str);
+    let kind_filter = arguments.get(param_names::KIND).and_then(Value::as_str);
     let enabled_only = arguments
         .get("enabled_only")
         .and_then(Value::as_bool)
@@ -101,11 +103,11 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
             "severity": r.severity,
             "reason": r.reason,
             "namespace": r.namespace,
-            "created_by": r.created_by,
-            "created_at": r.created_at,
+            (field_names::CREATED_BY): r.created_by,
+            (field_names::CREATED_AT): r.created_at,
             "enabled": r.enabled,
             "signature_b64": sig_b64,
-            "attest_level": r.attest_level,
+            (field_names::ATTEST_LEVEL): r.attest_level,
         }));
     }
     Ok(json!({
@@ -148,11 +150,10 @@ impl McpTool for RuleListTool {
         "#691: governance_rules read. Mutation operator-only (CLI/HTTP signed); MCP read-only by design 2026-05-13."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(RuleListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<RuleListRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

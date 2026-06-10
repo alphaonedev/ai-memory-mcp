@@ -5,6 +5,7 @@
 //! tool. Returns recent rows from the `recall_observations` ledger
 //! filtered by recall_id, consumed-flag, and an optional time window.
 
+use crate::mcp::param_names;
 use crate::observations;
 use serde_json::{Value, json};
 
@@ -22,19 +23,19 @@ pub fn handle_recall_observations(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let consumed = params.get("consumed").and_then(Value::as_bool);
+    let consumed = params.get(param_names::CONSUMED).and_then(Value::as_bool);
     let since = params
-        .get("since")
+        .get(param_names::SINCE)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let until = params
-        .get("until")
+        .get(param_names::UNTIL)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let limit = params
-        .get("limit")
+        .get(param_names::LIMIT)
         .and_then(Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .map_or(DEFAULT_LIMIT, |n| n.min(MAX_LIMIT));
@@ -43,7 +44,7 @@ pub fn handle_recall_observations(
         .map_err(|e| e.to_string())?;
     let count = rows.len();
     Ok(json!({
-        "observations": rows,
+        (crate::models::field_names::OBSERVATIONS): rows,
         "count": count,
     }))
 }
@@ -94,11 +95,10 @@ impl McpTool for RecallObservationsTool {
         "Gap 3 (#886): recall-consumption ledger filter."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(RecallObservationsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<RecallObservationsRequest>()
     }
     fn family() -> &'static str {
-        "meta"
+        crate::profile::Family::Meta.name()
     }
 }
 

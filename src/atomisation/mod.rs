@@ -260,6 +260,17 @@ impl std::error::Error for AtomiseError {}
 /// without strangling legitimate two-step curator hand-offs.
 pub const MAX_ATOMISATION_DEPTH: u32 = 3;
 
+/// Smallest accepted `max_atom_tokens` — below this an "atom" can't
+/// hold a self-contained proposition.
+pub const MIN_ATOM_TOKENS: u32 = 50;
+
+/// Largest accepted `max_atom_tokens` — above this an "atom" is no
+/// longer atomic.
+pub const MAX_ATOM_TOKENS: u32 = 1000;
+
+/// Default `max_atom_tokens` when the caller passes none (or null).
+pub const DEFAULT_ATOM_TOKENS: u32 = 200;
+
 thread_local! {
     /// Per-thread counter tracking how deep into the
     /// atomisation-pass call stack the current `atomise_sync*`
@@ -862,7 +873,7 @@ fn archive_source(
     atom_count: i64,
     archived_at: &str,
 ) -> anyhow::Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> anyhow::Result<()> {
         // Merge the existing metadata with the new
         // `atomisation_archived_at` key — never clobber other keys.
@@ -879,7 +890,7 @@ fn archive_source(
         let mut meta: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&existing_metadata_str).unwrap_or_default();
         meta.insert(
-            "atomisation_archived_at".to_string(),
+            crate::models::field_names::ATOMISATION_ARCHIVED_AT.to_string(),
             serde_json::Value::String(archived_at.to_string()),
         );
         let merged = serde_json::Value::Object(meta).to_string();
@@ -892,11 +903,11 @@ fn archive_source(
     })();
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)?;
             Ok(())
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -923,7 +934,7 @@ fn emit_atomisation_complete_event(
         "event_type": "atomisation_complete",
         "source_id": source_id,
         "atom_ids": atom_ids,
-        "atom_count": atom_count,
+        (crate::models::field_names::ATOM_COUNT): atom_count,
         "calling_agent_id": calling_agent_id,
         "atomisation_timestamp": archived_at,
         "curator_model": curator_model,

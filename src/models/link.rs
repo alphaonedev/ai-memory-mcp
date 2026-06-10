@@ -3,6 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 
+// Canonical relation spellings duplicated across `from_str` / `as_str`
+// and the reflect / contradiction response keys (#1558 batch 6).
+pub(crate) const REL_CONTRADICTS: &str = "contradicts";
+pub(crate) const REL_REFLECTS_ON: &str = "reflects_on";
+pub(crate) const REL_DERIVES_FROM: &str = "derives_from";
+
 /// v0.7 Track H — attestation level for a `memory_links` row.
 ///
 /// H2 (#566) and H3 (#572) already write the three string variants
@@ -149,10 +155,10 @@ impl MemoryLinkRelation {
         match s {
             "related_to" => Some(Self::RelatedTo),
             "supersedes" => Some(Self::Supersedes),
-            "contradicts" => Some(Self::Contradicts),
+            REL_CONTRADICTS => Some(Self::Contradicts),
             "derived_from" => Some(Self::DerivedFrom),
-            "reflects_on" => Some(Self::ReflectsOn),
-            "derives_from" => Some(Self::DerivesFrom),
+            REL_REFLECTS_ON => Some(Self::ReflectsOn),
+            REL_DERIVES_FROM => Some(Self::DerivesFrom),
             _ => None,
         }
     }
@@ -165,10 +171,10 @@ impl MemoryLinkRelation {
         match self {
             Self::RelatedTo => "related_to",
             Self::Supersedes => "supersedes",
-            Self::Contradicts => "contradicts",
+            Self::Contradicts => REL_CONTRADICTS,
             Self::DerivedFrom => "derived_from",
-            Self::ReflectsOn => "reflects_on",
-            Self::DerivesFrom => "derives_from",
+            Self::ReflectsOn => REL_REFLECTS_ON,
+            Self::DerivesFrom => REL_DERIVES_FROM,
         }
     }
 
@@ -332,7 +338,7 @@ impl LinkBody {
 }
 
 fn default_relation() -> String {
-    "related_to".to_string()
+    MemoryLinkRelation::RelatedTo.as_str().to_string()
 }
 
 /// Tag stamped on entity-typed memories so `(title, namespace)` can be

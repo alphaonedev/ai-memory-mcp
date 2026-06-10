@@ -3,7 +3,9 @@
 
 //! MCP `memory_link` and `memory_get_links` handlers.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -42,11 +44,10 @@ impl McpTool for LinkTool {
         "Directional link. Relations: related_to | supersedes | contradicts | derived_from | reflects_on (Task 3/8). H-track signs with active Ed25519 (verify via memory_verify)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(LinkRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<LinkRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -73,11 +74,10 @@ impl McpTool for GetLinksTool {
         "In + outbound links with relation, attest_level (unsigned/self_signed/peer_attested), valid_from/until/observed_by."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(GetLinksRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<GetLinksRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -98,11 +98,13 @@ pub(super) fn handle_link(
 ) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
-        .ok_or("source_id is required")?;
+        .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     let target_id = params["target_id"]
         .as_str()
-        .ok_or("target_id is required")?;
-    let relation = params["relation"].as_str().unwrap_or("related_to");
+        .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
+    let relation = params["relation"]
+        .as_str()
+        .unwrap_or(crate::models::MemoryLinkRelation::RelatedTo.as_str());
 
     validate::RequestValidator::validate_link_triple(source_id, target_id, relation)
         .map_err(|e| e.to_string())?;
@@ -206,7 +208,7 @@ pub(super) fn handle_link(
             };
             if let Err(e) = crate::signed_events::append_signed_event(conn, &audit_event) {
                 tracing::warn!(
-                    target: "signed_events",
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                     source_id, target_id,
                     "failed to append reflects_on.cycle_refused audit row: {e}"
                 );
@@ -235,7 +237,7 @@ pub(super) fn handle_link(
     let link_owner = db::get(conn, source_id).ok().flatten();
     let link_agent_id = link_owner.as_ref().and_then(|mem| {
         mem.metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string)
     });
@@ -277,7 +279,7 @@ pub(super) fn handle_link(
                         &link_namespace,
                         crate::quotas::QuotaOp::Link,
                     ) {
-                        tracing::warn!("quota refund_op failed for agent {}: {}", aid, re);
+                        crate::quotas::log_refund_op_failed(aid, &re);
                     }
                 }
                 return Err(e.to_string());
@@ -293,7 +295,7 @@ pub(super) fn handle_link(
         Ok(Some(mem)) => {
             let owner = mem
                 .metadata
-                .get("agent_id")
+                .get(param_names::AGENT_ID)
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             (mem.namespace, owner)
@@ -307,7 +309,7 @@ pub(super) fn handle_link(
     .ok();
     crate::subscriptions::dispatch_event_with_details(
         conn,
-        "memory_link_created",
+        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED,
         source_id,
         &event_namespace,
         event_agent_id.as_deref(),
@@ -399,17 +401,33 @@ pub(super) fn handle_link(
         // signed by an Ed25519 keypair on this writer. "self_signed"
         // when active_keypair was Some + signing succeeded;
         // "unsigned" when no keypair was loaded.
-        "attest_level": attest_level,
+        (field_names::ATTEST_LEVEL): attest_level,
     }))
 }
 
 pub(super) fn handle_get_links(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
-    let links = db::get_links(conn, id).map_err(|e| e.to_string())?;
+    // #1553 — visibility gate. `memory_get_links` is both an id-leak primitive
+    // (neighbor ids) and a relationship oracle for a row's existence. Resolve
+    // the anchor row and, in the multi-tenant posture, return the same empty
+    // shape an unknown id yields when the caller cannot see the anchor — so it
+    // cannot confirm a private row's existence or enumerate its neighbors.
+    // `caller == None` is the single-tenant trust-all posture (unchanged).
+    let resolved = db::resolve_id(conn, id).map_err(|e| e.to_string())?;
+    if let (Some(c), Some(mem)) = (caller, resolved.as_ref()) {
+        if !crate::visibility::is_visible_to_caller(mem, c) {
+            return Ok(json!({"links": [], "count": 0}));
+        }
+    }
+    let anchor = resolved.as_ref().map_or(id, |m| m.id.as_str());
+    let links = db::get_links(conn, anchor).map_err(|e| e.to_string())?;
     Ok(json!({"links": links, "count": links.len()}))
 }
 
@@ -657,7 +675,7 @@ mod tests {
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         db::create_link(&conn, &a, &b, "related_to").unwrap();
-        let out = handle_get_links(&conn, &json!({"id": a})).expect("ok");
+        let out = handle_get_links(&conn, &json!({"id": a}), None).expect("ok");
         assert_eq!(out["count"].as_u64(), Some(1));
         let links = out["links"].as_array().unwrap();
         assert_eq!(links.len(), 1);
@@ -667,7 +685,7 @@ mod tests {
     #[test]
     fn handle_get_links_missing_id_errors() {
         let conn = fresh_conn();
-        let err = handle_get_links(&conn, &json!({})).unwrap_err();
+        let err = handle_get_links(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("id"));
     }
 
@@ -675,8 +693,38 @@ mod tests {
     #[test]
     fn handle_get_links_invalid_id_errors() {
         let conn = fresh_conn();
-        let err = handle_get_links(&conn, &json!({"id": ""})).unwrap_err();
+        let err = handle_get_links(&conn, &json!({"id": ""}), None).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    // #1553 — visibility gate: a caller who cannot see the anchor row gets the
+    // same empty shape an unknown id yields (no neighbor-id leak / existence oracle).
+    #[test]
+    fn handle_get_links_masks_other_agents_private_anchor() {
+        let conn = fresh_conn();
+        let (a, b) = insert_two(&conn);
+        db::create_link(&conn, &a, &b, "related_to").unwrap();
+        // Mark the anchor row `a` scope=private owned by alice.
+        conn.execute(
+            "UPDATE memories SET metadata = json_object('agent_id','alice','scope','private') WHERE id = ?1",
+            [&a],
+        )
+        .unwrap();
+        // Bob sees the empty shape; alice (owner) and None (trust-all) see the edge.
+        let bob = handle_get_links(&conn, &json!({"id": a}), Some("bob")).expect("ok");
+        assert_eq!(
+            bob["count"].as_u64(),
+            Some(0),
+            "neighbor ids must be hidden"
+        );
+        let alice = handle_get_links(&conn, &json!({"id": &a}), Some("alice")).expect("ok");
+        assert_eq!(alice["count"].as_u64(), Some(1), "owner still sees edges");
+        let trust_all = handle_get_links(&conn, &json!({"id": &a}), None).expect("ok");
+        assert_eq!(
+            trust_all["count"].as_u64(),
+            Some(1),
+            "single-tenant unchanged"
+        );
     }
 
     // parse_link_id — happy

@@ -21,6 +21,11 @@ pub fn finalise_quorum(tracker: &AckTracker) -> Result<usize, QuorumError> {
     tracker.finalise(Instant::now())
 }
 
+/// #1558 batch 5 wave 3 — `error` slug on the serialised 503 payload
+/// for failed quorum writes. File-local: only the three
+/// [`QuorumNotMetPayload::from_err`] arms emit it.
+const QUORUM_NOT_MET: &str = "quorum_not_met";
+
 /// Serialised 503 payload for failed quorum writes.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuorumNotMetPayload {
@@ -39,7 +44,7 @@ impl QuorumNotMetPayload {
                 needed,
                 reason,
             } => Self {
-                error: "quorum_not_met",
+                error: QUORUM_NOT_MET,
                 got: *got,
                 needed: *needed,
                 // InFlight shouldn't surface in the HTTP payload — the
@@ -57,13 +62,13 @@ impl QuorumNotMetPayload {
                 },
             },
             QuorumError::InvalidPolicy { detail } => Self {
-                error: "quorum_not_met",
+                error: QUORUM_NOT_MET,
                 got: 0,
                 needed: 0,
                 reason: format!("invalid_policy:{detail}"),
             },
             QuorumError::LocalWriteFailed { detail } => Self {
-                error: "quorum_not_met",
+                error: QUORUM_NOT_MET,
                 got: 0,
                 needed: 0,
                 reason: format!("local_write_failed:{detail}"),

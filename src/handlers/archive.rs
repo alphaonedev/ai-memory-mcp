@@ -16,6 +16,7 @@
 //! * `POST   /api/v1/archive/{id}/restore` → [`restore_archive`]
 //! * `GET    /api/v1/archive/stats`        → [`archive_stats`]
 
+use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -26,6 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::sentinels;
 use crate::validate;
 
 use super::AppState;
@@ -46,7 +48,7 @@ pub struct ArchiveListQuery {
 
 #[allow(clippy::unnecessary_wraps)]
 fn default_archive_limit() -> Option<usize> {
-    Some(50)
+    Some(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
 }
 
 pub async fn list_archive(
@@ -83,7 +85,10 @@ pub async fn list_archive(
     // via the `as_any_for_postgres` hatch.
     #[cfg(feature = "sal-postgres")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+        let limit = q
+            .limit
+            .unwrap_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+            .clamp(1, crate::storage::LIST_MAX_LIMIT);
         let offset = q.offset.unwrap_or(0);
         return match app
             .store
@@ -95,7 +100,10 @@ pub async fn list_archive(
         };
     }
 
-    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let limit = q
+        .limit
+        .unwrap_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+        .clamp(1, crate::storage::LIST_MAX_LIMIT);
     let offset = q.offset.unwrap_or(0);
     // PERF-1 (FX-3): wrap rusqlite scan in `db_op`. archived_memories
     // can carry hundreds of thousands of rows on long-running daemons;
@@ -108,14 +116,7 @@ pub async fn list_archive(
     .await;
     match result {
         Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -141,11 +142,11 @@ pub async fn restore_archive(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "archive_restore",
+        crate::governance::action_labels::ARCHIVE_RESTORE,
         "",
         json!({ "id": &id }),
     );
@@ -183,12 +184,14 @@ pub async fn restore_archive(
                     )
                     .await;
                 }
-                Json(json!({"restored": true, "id": id, "storage_backend": "postgres"}))
-                    .into_response()
+                Json(
+                    json!({"restored": true, "id": id, (field_names::STORAGE_BACKEND): "postgres"}),
+                )
+                .into_response()
             }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": "not found in archive"})),
+                Json(json!({"error": crate::errors::msg::NOT_FOUND_IN_ARCHIVE})),
             )
                 .into_response(),
             Err(e) => store_err_to_response(e),
@@ -219,18 +222,13 @@ pub async fn restore_archive(
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("handler error: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response();
+            return crate::handlers::errors::handler_error_500(&e);
         }
     };
     if !restored {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "not found in archive"})),
+            Json(json!({"error": crate::errors::msg::NOT_FOUND_IN_ARCHIVE})),
         )
             .into_response();
     }
@@ -281,7 +279,7 @@ pub async fn purge_archive(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
 
     // #936 (security-critical, 2026-05-20) — caller-vs-row-owner gate.
     // Pre-#936 the SAL trait method took NO caller and the handler
@@ -305,11 +303,11 @@ pub async fn purge_archive(
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "archive_purge",
+        crate::governance::action_labels::ARCHIVE_PURGE,
         "",
         json!({
-            "older_than_days": q.older_than_days,
-            "owner_scope": if is_admin { "admin" } else { "caller" },
+            (field_names::OLDER_THAN_DAYS): q.older_than_days,
+            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
         }),
     );
 
@@ -328,8 +326,8 @@ pub async fn purge_archive(
         return match app.store.archive_purge(&ctx, q.older_than_days).await {
             Ok(n) => Json(json!({
                 "purged": n,
-                "owner_scope": if is_admin { "admin" } else { "caller" },
-                "storage_backend": "postgres",
+                (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
+                (field_names::STORAGE_BACKEND): "postgres",
             }))
             .into_response(),
             Err(e) => store_err_to_response(e),
@@ -352,17 +350,10 @@ pub async fn purge_archive(
     match purge_result {
         Ok(n) => Json(json!({
             "purged": n,
-            "owner_scope": if is_admin { "admin" } else { "caller" },
+            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -394,14 +385,7 @@ pub async fn archive_stats(
     let result = super::db_op(app.db.clone(), move |guard| db::archive_stats(&guard.0)).await;
     match result {
         Ok(archive_stats) => Json(archive_stats).into_response(),
-        Err(e) => {
-            tracing::error!("handler error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "internal server error"})),
-            )
-                .into_response()
-        }
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -466,7 +450,7 @@ pub async fn archive_by_ids(
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -518,8 +502,15 @@ pub async fn archive_by_ids(
             // namespace anchor — downstream subscribers match by
             // event_type + memory_id, not namespace, for archive
             // events.
-            super::dispatch_event_postgres(&app, "memory_archive", id, "", Some(&caller), None)
-                .await;
+            super::dispatch_event_postgres(
+                &app,
+                crate::governance::OP_MEMORY_ARCHIVE,
+                id,
+                "",
+                Some(&caller),
+                None,
+            )
+            .await;
         }
         return (
             StatusCode::OK,
@@ -528,7 +519,7 @@ pub async fn archive_by_ids(
                 "missing": missing,
                 "count": archived.len(),
                 "reason": reason,
-                "storage_backend": "postgres",
+                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -557,7 +548,7 @@ pub async fn archive_by_ids(
                     tracing::error!("archive_by_ids: archive_memory({id}) failed: {e}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                     )
                         .into_response();
                 }

@@ -33,6 +33,7 @@
 //! - [`run_curator_daemon_with_shutdown`],
 //!   [`run_curator_daemon_with_primitives`] — the curator-daemon body.
 
+use crate::models::field_names;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -633,6 +634,12 @@ pub struct BenchArgs {
     pub history: Option<PathBuf>,
 }
 
+/// Default `--batch` page-size hint for `ai-memory migrate`. Currently
+/// an API-compatibility hint only — see the `MAX_ROWS` note in
+/// `src/migrate.rs::migrate`.
+#[cfg(feature = "sal")]
+const MIGRATE_BATCH_DEFAULT: usize = 1000;
+
 #[cfg(feature = "sal")]
 #[derive(Args)]
 pub struct MigrateArgs {
@@ -643,8 +650,10 @@ pub struct MigrateArgs {
     /// Destination URL. Same URL shape as `--from`.
     #[arg(long)]
     pub to: String,
-    /// Page size. Clamped to [1, 10000]. Default 1000.
-    #[arg(long, default_value_t = 1000)]
+    /// Page-size hint. Default 1000. Retained for API compatibility —
+    /// the current migrator reads one page capped at `MAX_ROWS`
+    /// (1,000,000) and refuses loudly past it; see `src/migrate.rs`.
+    #[arg(long, default_value_t = MIGRATE_BATCH_DEFAULT)]
     pub batch: usize,
     /// Only migrate memories in this namespace.
     #[arg(long)]
@@ -704,7 +713,10 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
     /// Deadline for quorum-ack collection. After this many ms the
-    /// write returns 503 `quorum_not_met`. Default 2000.
+    /// write returns 503 `quorum_not_met`. Default 2000 assumes
+    /// same-DC peers; cross-region (WAN) meshes need 5000-10000 —
+    /// the do-1461 reference deployment uses 8000. See
+    /// docs/federation.md for sizing guidance. (#1565)
     #[arg(long, default_value_t = 2000)]
     pub quorum_timeout_ms: u64,
     /// Optional mTLS client cert for outbound federation POSTs. Same
@@ -1940,9 +1952,11 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
 pub fn apply_anonymize_default(app_config: &AppConfig) {
     // #198: config → env mapping for agent_id anonymization. Env var already
     // set by the caller wins; config is only applied when the env is unset.
-    if app_config.effective_anonymize_default() && std::env::var("AI_MEMORY_ANONYMIZE").is_err() {
+    if app_config.effective_anonymize_default()
+        && std::env::var(crate::identity::ENV_ANONYMIZE).is_err()
+    {
         // SAFETY: single-threaded startup before any worker threads spawn.
-        unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "1") };
+        unsafe { std::env::set_var(crate::identity::ENV_ANONYMIZE, "1") };
     }
 }
 
@@ -2113,9 +2127,10 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
     // blocking is not allowed." Move the whole construction onto the blocking
     // pool so the inner runtime is owned by a dedicated thread.
     let build = match tokio::task::spawn_blocking(move || {
-        let embed_client = llm::OllamaClient::new_with_url(&embed_url, "nomic-embed-text")
-            .ok()
-            .map(Arc::new);
+        let embed_client =
+            llm::OllamaClient::new_with_url(&embed_url, crate::embeddings::NOMIC_OLLAMA_MODEL)
+                .ok()
+                .map(Arc::new);
         embeddings::Embedder::for_model(emb_model, embed_client)
     })
     .await
@@ -2285,21 +2300,10 @@ pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<V
 // v0.7 Track H — H2 active keypair loading
 // ---------------------------------------------------------------------------
 
-/// The well-known stable label used by the daemon when auto-generating
-/// and loading its outbound link-signing keypair.
-///
-/// Round-3 F12 fix — the daemon's signing identity is process-wide
-/// (one daemon = one signing key) and decoupled from the per-request
-/// `agent_id` resolution. Using a fixed label avoids two prior bugs:
-///   1. The pre-fix code resolved `agent_id` via
-///      [`crate::identity::resolve_agent_id`] which produces a
-///      hostname/PID-bearing default (`host:<host>:pid-…-<uuid>`).
-///      That value differs across daemon restarts, so `load_*` looked
-///      for a file that `ensure_keypair("daemon", …)` never created.
-///   2. The auto-gen call ran AFTER the load attempt, so even if the
-///      labels matched, the load would fire on a freshly-built
-///      deployment before the file existed.
-const DAEMON_KEYPAIR_LABEL: &str = "daemon";
+// Round-3 F12 — the daemon's fixed signing-key label. Canonical const
+// (with the full F12 rationale) now lives at
+// `crate::identity::keypair::DAEMON_KEYPAIR_LABEL` (#1558).
+use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 
 /// Round-3 F12 — ensure the daemon's signing keypair exists on disk and
 /// load it for the serve [`AppState`]. Returns the in-memory keypair
@@ -2797,7 +2801,7 @@ async fn build_store_handle(
     match store_url {
         Some(url) => {
             let lowered = url.to_ascii_lowercase();
-            if lowered.starts_with("postgres://") || lowered.starts_with("postgresql://") {
+            if crate::migrate::is_postgres_url(&lowered) {
                 #[cfg(feature = "sal-postgres")]
                 {
                     let timeout = postgres_statement_timeout_secs
@@ -2888,11 +2892,18 @@ async fn build_store_handle(
 /// `false` keeps the fail-CLOSED secure default. Shared by the storage
 /// pre-write hook and the wire-check hook so the two read the same
 /// override identically.
+/// Actor/queue label for wire-action governance consultations.
+const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
+
 fn governance_fail_open_on_error() -> bool {
-    std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+    std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
+
+/// #1455 legacy fail-open opt-out env var — one spelling shared by the
+/// reader above and the operator-facing log hints below (#1558).
+const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR";
 
 /// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
 /// where a governance hook's rule-consultation connection could not be
@@ -2947,14 +2958,14 @@ fn governance_consultation_unavailable_inner(
     if fail_open {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); \
-             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — degrading to ALLOW (UNSAFE, legacy posture)",
+             {ENV_GOVERNANCE_FAIL_OPEN}=1 — degrading to ALLOW (UNSAFE, legacy posture)",
             rules_db_path.display(),
         );
         Ok(())
     } else {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
-             (#1455 secure default — set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+             (#1455 secure default — set {ENV_GOVERNANCE_FAIL_OPEN}=1 to revert)",
             rules_db_path.display(),
         );
         Err(reason)
@@ -3216,7 +3227,7 @@ pub async fn bootstrap_serve(
                     payload: serde_json::json!({
                         "namespace": mem.namespace,
                         "tier": mem.tier.as_str(),
-                        "memory_kind": mem.memory_kind.as_str(),
+                        (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
                         "title": mem.title,
                     }),
                 };
@@ -3403,7 +3414,7 @@ pub async fn bootstrap_serve(
                     // open. Same secure default + escape hatch.
                     return governance_consultation_unavailable(
                         &queue_for_wire_check,
-                        "daemon:wire_action",
+                        WIRE_ACTION_ACTOR,
                         action,
                         &rules_db_path,
                         "wire_check",
@@ -3423,7 +3434,7 @@ pub async fn bootstrap_serve(
                 match check_agent_action_deferred_cached(
                     conn_for_check,
                     Some(&cache_for_wire_check),
-                    "daemon:wire_action",
+                    WIRE_ACTION_ACTOR,
                     action,
                     &queue_for_wire_check,
                 ) {
@@ -3458,7 +3469,7 @@ pub async fn bootstrap_serve(
                             reason: reason.clone(),
                         };
                         queue_for_wire_check.submit_refusal(
-                            "daemon:wire_action",
+                            WIRE_ACTION_ACTOR,
                             action,
                             &synthetic_refusal,
                         );
@@ -4075,6 +4086,27 @@ pub async fn bootstrap_serve(
         }
     }
 
+    // #1570 (H6) — record whether request authentication is configured
+    // so the shared admin-role gate can refuse to mint admin from a
+    // bare self-asserted `X-Agent-Id` header on unauthenticated
+    // deployments. Boot-time WARN when the operator configured admin
+    // ids but the gate will refuse them all (no api_key, trust flag
+    // off) — names the escape hatch so the remediation is one search
+    // away. Mirrors the #1455 fail-closed convention.
+    crate::handlers::admin_role::mark_request_authn_configured(api_key_state.key.is_some());
+    if !app_state.admin_agent_ids.is_empty()
+        && api_key_state.key.is_none()
+        && !crate::handlers::admin_role::admin_header_trust_enabled()
+    {
+        tracing::warn!(
+            "[admin].agent_ids is configured but no api_key is set: the X-Agent-Id header is \
+             self-asserted, so admin-role requests will be REFUSED (403) until you either \
+             configure an api_key or explicitly opt into the legacy header-trust posture with \
+             {}=1 (#1570 secure default)",
+            crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
+        );
+    }
+
     Ok(ServeBootstrap {
         app_state,
         api_key_state,
@@ -4095,7 +4127,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("ai_memory=info".parse().unwrap())
+                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse().unwrap())
                 .add_directive("tower_http=info".parse().unwrap()),
         )
         .try_init();
@@ -4290,9 +4322,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 // ---------------------------------------------------------------------------
 
 fn cmd_bench(args: &BenchArgs) -> Result<()> {
-    let iterations = args.iterations.clamp(1, 100_000);
-    let warmup = args.warmup.min(10_000);
-    let regression_threshold = args.regression_threshold.clamp(0.0, 1000.0);
+    let iterations = args.iterations.clamp(1, crate::bench::MAX_ITERATIONS);
+    let warmup = args.warmup.min(crate::bench::MAX_WARMUP);
+    let regression_threshold = args
+        .regression_threshold
+        .clamp(0.0, crate::bench::MAX_REGRESSION_THRESHOLD_PCT);
     // Bench always seeds a disposable in-memory DB so the operator's
     // main DB (and disk) are untouched. SQLite's `:memory:` URL and
     // WAL-less mode keep the workload bounded by RAM and CPU.
@@ -4533,7 +4567,7 @@ pub async fn sync_cycle_once(
             local_agent_id,
         );
     if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
+        req = req.header(crate::HEADER_API_KEY, key);
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -4569,7 +4603,7 @@ pub async fn sync_cycle_once(
 
     if !outgoing.is_empty() {
         let body = serde_json::json!({
-            "sender_agent_id": local_agent_id,
+            (field_names::SENDER_AGENT_ID): local_agent_id,
             "sender_clock": { "entries": {} },
             "memories": outgoing,
             "dry_run": false,
@@ -4586,7 +4620,7 @@ pub async fn sync_cycle_once(
             .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
             .json(&body);
         if let Some(key) = api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {

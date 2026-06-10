@@ -119,16 +119,16 @@ pub const DEFAULT_NHI_SOURCE: &str = "nhi";
 //                      label — operators tracing reflection chains see them
 //                      surface alongside the other relations.
 const VALID_RELATIONS: &[&str] = &[
-    "related_to",
-    "supersedes",
-    "contradicts",
-    "derived_from",
-    "reflects_on",
+    crate::models::MemoryLinkRelation::RelatedTo.as_str(),
+    crate::models::MemoryLinkRelation::Supersedes.as_str(),
+    crate::models::MemoryLinkRelation::Contradicts.as_str(),
+    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
     // v0.7.0 WT-1-A — atomisation-provenance edge (atom -> parent). The
     // typed, signable, federation-safe expression of the structural
     // `memories.atom_of` FK. Distinct from `derived_from` (consolidation
-    // provenance). Mirrors `crate::models::MemoryLinkRelation::DerivesFrom`.
-    "derives_from",
+    // provenance).
+    crate::models::MemoryLinkRelation::DerivesFrom.as_str(),
 ];
 
 fn is_valid_rfc3339(s: &str) -> bool {
@@ -296,7 +296,10 @@ pub fn validate_source(source: &str) -> Result<()> {
 /// `CallerContext::for_admin(...)` directly and never traverses this
 /// validator):
 ///
-/// - `"daemon"` → `src/handlers/admin.rs:110,239,441`
+/// - `"daemon"` → `src/handlers/admin.rs` (single `for_admin` site at
+///   `register_agent`; this list previously cited three line numbers
+///   that drifted — sites are now grep-able via
+///   `sentinels::DAEMON_PRINCIPAL`)
 /// - `"subscription-dispatch"` → `src/handlers/subscriptions.rs::dispatch_approval_requested`
 /// - `"ai:http-internal"` → `src/handlers/{http,power,hook_subscribers}.rs`
 /// - `"ai:migrate"` → `src/migrate.rs`
@@ -307,23 +310,23 @@ pub fn validate_source(source: &str) -> Result<()> {
 ///   legacy-rewrite rows; also matched as the unowned-marker sentinel
 ///   in cross-tenant gates, so wire spoofing it would let the caller
 ///   silently claim ownership of legacy-unowned rows).
-const RESERVED_AGENT_IDS: &[&str] = &[
-    "daemon",
-    "system",
-    "federation-catchup",
-    "subscription-dispatch",
-    "ai:http-internal",
-    "ai:migrate",
-    "export-internal",
-    "governance-internal",
+pub const RESERVED_AGENT_IDS: &[&str] = &[
+    crate::identity::sentinels::DAEMON_PRINCIPAL,
+    crate::identity::sentinels::SYSTEM_PRINCIPAL,
+    crate::identity::sentinels::FEDERATION_CATCHUP,
+    crate::identity::sentinels::SUBSCRIPTION_DISPATCH,
+    crate::identity::sentinels::AI_HTTP_INTERNAL,
+    crate::identity::sentinels::AI_MIGRATE,
+    crate::identity::sentinels::EXPORT_INTERNAL,
+    crate::identity::sentinels::GOVERNANCE_INTERNAL,
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977
 /// behaviour, separated so internal callers that legitimately need to
 /// load/generate keypairs with reserved-sentinel labels (e.g. the
-/// daemon's own `"daemon"` self-signing keypair at
-/// `src/daemon_runtime.rs:1724 DAEMON_KEYPAIR_LABEL`) can opt into the
-/// looser check.
+/// daemon's own self-signing keypair under
+/// [`crate::identity::keypair::DAEMON_KEYPAIR_LABEL`]) can opt into
+/// the looser check.
 ///
 /// Allowed characters: alphanumeric plus `_`, `-`, `:`, `@`, `.`, `/`.
 /// Length: 1..=128 bytes. Rejects whitespace, null bytes, control

@@ -11,6 +11,24 @@ use tokenizers::Tokenizer;
 
 use crate::config::EmbeddingModel;
 
+/// #1558 batch 5 wave 2 — the canonical embedding/rerank document
+/// template: `"{title} {content}"`.
+///
+/// LOAD-BEARING: every surface that embeds a memory (store / update /
+/// dedup-check / reflect / federation refresh / backfill) and the
+/// cross-encoder reranker must build the document text with this exact
+/// template — a drifted spelling at any one site would silently skew
+/// similarity scores between write-time vectors and query-time
+/// comparisons. One definition; byte-identical to the prior inline
+/// `format!` at every routed site.
+#[must_use]
+pub fn embedding_document(
+    title: impl std::fmt::Display,
+    content: impl std::fmt::Display,
+) -> String {
+    format!("{title} {content}")
+}
+
 const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 #[allow(dead_code)]
 const MINILM_DIM: usize = 384;
@@ -31,7 +49,14 @@ const FALLBACK_MODEL_SUBDIR: &str =
     ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main";
 
 /// Nomic model ID and Ollama tag
-const NOMIC_OLLAMA_MODEL: &str = "nomic-embed-text";
+pub(crate) const NOMIC_OLLAMA_MODEL: &str = "nomic-embed-text";
+/// HF model-artifact file names — shared with the reranker loader
+/// (#1558 batch 6).
+pub(crate) const HF_CONFIG_FILE: &str = "config.json";
+/// HF tokenizer artifact file name.
+pub(crate) const HF_TOKENIZER_FILE: &str = "tokenizer.json";
+/// HF safetensors weights artifact file name.
+pub(crate) const HF_WEIGHTS_FILE: &str = "model.safetensors";
 #[allow(dead_code)]
 const NOMIC_DIM: usize = 768;
 
@@ -746,13 +771,13 @@ impl Embedder {
         let api = Api::new().context("failed to initialise HuggingFace Hub API")?;
         let repo = api.repo(Repo::new(MINILM_MODEL_ID.to_string(), RepoType::Model));
         let config_path = repo
-            .get("config.json")
+            .get(HF_CONFIG_FILE)
             .context("failed to download config.json")?;
         let tokenizer_path = repo
-            .get("tokenizer.json")
+            .get(HF_TOKENIZER_FILE)
             .context("failed to download tokenizer.json")?;
         let weights_path = repo
-            .get("model.safetensors")
+            .get(HF_WEIGHTS_FILE)
             .context("failed to download model.safetensors")?;
         Ok((config_path, tokenizer_path, weights_path))
     }
@@ -776,9 +801,9 @@ impl Embedder {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let dir = std::path::PathBuf::from(home).join(FALLBACK_MODEL_SUBDIR);
         let dir = dir.as_path();
-        let config = dir.join("config.json");
-        let tokenizer = dir.join("tokenizer.json");
-        let weights = dir.join("model.safetensors");
+        let config = dir.join(HF_CONFIG_FILE);
+        let tokenizer = dir.join(HF_TOKENIZER_FILE);
+        let weights = dir.join(HF_WEIGHTS_FILE);
         if config.exists() && tokenizer.exists() && weights.exists() {
             Ok((config, tokenizer, weights))
         } else {

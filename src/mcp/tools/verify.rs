@@ -3,7 +3,9 @@
 
 //! MCP `memory_verify` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,11 +49,10 @@ impl McpTool for VerifyTool {
         "H4: re-verify link signature. Returns {signature_verified, attest_level, signed_by, signed_at}. Pass link_id composite ('source--relation-->target') or explicit triple."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(VerifyRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<VerifyRequest>()
     }
     fn family() -> &'static str {
-        "graph"
+        crate::profile::Family::Graph.name()
     }
 }
 
@@ -98,7 +99,7 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
     //   1. link_id="<src>--<rel>-->\<dst>"
     //   2. source_id=… target_id=… [relation="related_to"]
     let (source_id, target_id, relation): (String, String, String) =
-        if let Some(lid) = params.get("link_id").and_then(Value::as_str) {
+        if let Some(lid) = params.get(param_names::LINK_ID).and_then(Value::as_str) {
             super::link::parse_link_id(lid).ok_or_else(|| {
                 format!(
                     "link_id '{lid}' is not in the expected form \
@@ -107,17 +108,17 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
             })?
         } else {
             let src = params
-                .get("source_id")
+                .get(param_names::SOURCE_ID)
                 .and_then(Value::as_str)
                 .ok_or("link_id or source_id+target_id is required")?;
             let dst = params
-                .get("target_id")
+                .get(param_names::TARGET_ID)
                 .and_then(Value::as_str)
                 .ok_or("link_id or source_id+target_id is required")?;
             let rel = params
-                .get("relation")
+                .get(param_names::RELATION)
                 .and_then(Value::as_str)
-                .unwrap_or("related_to");
+                .unwrap_or(crate::models::MemoryLinkRelation::RelatedTo.as_str());
             (src.to_string(), dst.to_string(), rel.to_string())
         };
 
@@ -218,7 +219,7 @@ pub fn handle_verify(conn: &rusqlite::Connection, params: &Value) -> Result<Valu
 
     Ok(json!({
         "signature_verified": verified,
-        "attest_level": attest_out.as_str(),
+        (field_names::ATTEST_LEVEL): attest_out.as_str(),
         "signed_by": signed_by,
         "signed_at": signed_at,
     }))

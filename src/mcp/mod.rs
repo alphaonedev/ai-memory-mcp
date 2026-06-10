@@ -12,6 +12,7 @@
 // budget while the deferred-registration substrate threads through.
 #![allow(clippy::too_many_lines)]
 
+use crate::models::field_names;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
@@ -25,6 +26,11 @@ use crate::embeddings::{Embed, Embedder};
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
 use crate::reranker::{BatchedReranker, CrossEncoder};
+
+/// Effective-tier banner label for the fully-provisioned tier — the
+/// `config.rs` `FeatureTier` spellings are vendor-carve-out-frozen, so the
+/// banner keeps a file-local spelling (#1558 batch 6).
+const EFFECTIVE_TIER_AUTONOMOUS: &str = "autonomous";
 
 pub(super) mod registry;
 
@@ -40,6 +46,10 @@ pub mod server_identity;
 // sweep: every `.get("X")` / `["X"]` extraction-site literal under
 // `src/mcp/` is allowlist-pinned by `tests/mcp_param_names_invariant.rs`.
 pub mod param_names;
+
+// #1558 batch 3 — JSON-RPC 2.0 wire-layer SSOT: version tag, reserved
+// error codes, method names, MCP protocol revision.
+pub mod jsonrpc;
 
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
@@ -108,7 +118,7 @@ struct RpcError {
 
 fn ok_response(id: Value, result: Value) -> RpcResponse {
     RpcResponse {
-        jsonrpc: "2.0".into(),
+        jsonrpc: jsonrpc::VERSION.into(),
         id,
         result: Some(result),
         error: None,
@@ -117,7 +127,7 @@ fn ok_response(id: Value, result: Value) -> RpcResponse {
 
 fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
     RpcResponse {
-        jsonrpc: "2.0".into(),
+        jsonrpc: jsonrpc::VERSION.into(),
         id,
         result: None,
         error: Some(RpcError {
@@ -177,7 +187,9 @@ fn audit_emit_for_mcp_dispatch(
         action,
         crate::audit::actor(
             agent_id,
-            mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+            mcp_client.map_or(crate::audit::synthesis_sources::HOST_FALLBACK, |_| {
+                crate::audit::synthesis_sources::MCP_CLIENT_INFO
+            }),
             None,
         ),
         crate::audit::AuditTarget {
@@ -278,7 +290,11 @@ fn emit_capture_lag(
     );
     let mut builder = crate::audit::EventBuilder::new(
         crate::audit::AuditAction::CaptureLag,
-        crate::audit::actor(agent_id.to_string(), "mcp_client_info", None),
+        crate::audit::actor(
+            agent_id.to_string(),
+            crate::audit::synthesis_sources::MCP_CLIENT_INFO,
+            None,
+        ),
         crate::audit::AuditTarget {
             memory_id: "*".to_string(),
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
@@ -299,18 +315,18 @@ pub fn prompt_definitions() -> Value {
         "prompts": [
             {
                 "name": "recall-first",
-                "description": "System prompt for AI clients: proactive memory recall, TOON format, tier strategy.",
+                (field_names::DESCRIPTION): "System prompt for AI clients: proactive memory recall, TOON format, tier strategy.",
                 "arguments": [
                     {
                         "name": "namespace",
-                        "description": "Optional namespace to scope recall.",
+                        (field_names::DESCRIPTION): "Optional namespace to scope recall.",
                         "required": false
                     }
                 ]
             },
             {
                 "name": "memory-workflow",
-                "description": "Quick reference card for memory tool usage patterns."
+                (field_names::DESCRIPTION): "Quick reference card for memory tool usage patterns."
             }
         ]
     })
@@ -1221,11 +1237,15 @@ fn dispatch_memory_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_load_family(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_load_family(ctx.conn, ctx.arguments)
+    // v0.7.0 #1555 — scope=private visibility gate, parity with recall/list/search.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_load_family(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_smart_load(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_smart_load(ctx.conn, ctx.arguments, ctx.embedder)
+    // v0.7.0 #1555 — the always-on intent loader forwards to load_family; gate it too.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_smart_load(ctx.conn, ctx.arguments, ctx.embedder, caller.as_deref())
 }
 
 fn dispatch_memory_get_taxonomy(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1305,7 +1325,9 @@ fn dispatch_memory_update(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_get(ctx.conn, ctx.arguments)
+    // v0.7.0 #1553 — scope=private visibility gate, parity with recall/list/search.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_get(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1313,7 +1335,10 @@ fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_get_links(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_get_links(ctx.conn, ctx.arguments)
+    // v0.7.0 #1553 — visibility gate so neighbor-id enumeration / existence
+    // oracling of another tenant's scope=private row is blocked.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_get_links(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1321,7 +1346,11 @@ fn dispatch_memory_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_replay(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // v0.7.0 #1571 — bind the replay visibility/permission identity to the
+    // resolved caller so a spoofed `agent_id` param cannot widen visibility
+    // (same class as #1553 get/get_links and #1557 inbox).
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_replay(ctx.conn, ctx.arguments, ctx.mcp_client, caller.as_deref())
 }
 
 fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1447,9 +1476,12 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
         }
         if matches!(accept, CapabilitiesAccept::V1)
             && let Some(obj) = value.as_object_mut()
-            && !obj.contains_key("schema_version")
+            && !obj.contains_key(field_names::SCHEMA_VERSION)
         {
-            obj.insert("schema_version".to_string(), Value::String("1".to_string()));
+            obj.insert(
+                field_names::SCHEMA_VERSION.to_string(),
+                Value::String("1".to_string()),
+            );
         }
         if let Some(obj) = value.as_object_mut() {
             obj.insert("tier".to_string(), Value::String(runtime_tier.to_string()));
@@ -1552,7 +1584,10 @@ fn dispatch_memory_share(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_inbox(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // v0.7.0 #1557 — bind the inbox owner to the resolved caller so a
+    // multi-tenant caller cannot read another agent's private inbox.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_inbox(ctx.conn, ctx.arguments, ctx.mcp_client, caller.as_deref())
 }
 
 fn dispatch_memory_subscribe(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1998,16 +2033,19 @@ fn handle_request(
     let id = req.id.clone().unwrap_or(Value::Null);
 
     // Validate JSON-RPC 2.0 version
-    if req.jsonrpc != "2.0" {
+    if req.jsonrpc != jsonrpc::VERSION {
         return err_response(
             id,
-            -32600,
-            "invalid JSON-RPC version (must be \"2.0\")".into(),
+            jsonrpc::INVALID_REQUEST,
+            format!(
+                "invalid JSON-RPC version (must be \"{}\")",
+                jsonrpc::VERSION
+            ),
         );
     }
 
     match req.method.as_str() {
-        "initialize" => {
+        jsonrpc::METHOD_INITIALIZE => {
             // v0.7.x (#1154) — daemon serverInfo Ed25519 signing.
             // Closes NSA CSI MCP Security concern (j) Tool invocation
             // path confusion at the substrate boundary. When the
@@ -2023,7 +2061,7 @@ fn handle_request(
             // response fields, so this is zero-risk on wire compat.
             let mut server_info = json!({
                 "name": "ai-memory",
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::PKG_VERSION,
             });
             let now_rfc3339 = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             if let Ok(Some(identity_block)) =
@@ -2035,29 +2073,43 @@ fn handle_request(
             ok_response(
                 id,
                 json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {}, "prompts": {} },
+                    "protocolVersion": jsonrpc::PROTOCOL_REVISION,
+                    (field_names::CAPABILITIES): { "tools": {}, "prompts": {} },
                     "serverInfo": server_info,
                 }),
             )
         }
-        "notifications/initialized" | "ping" => ok_response(id, json!({})),
-        "tools/list" => ok_response(id, tool_definitions_for_profile(profile)),
-        "prompts/list" => ok_response(id, prompt_definitions()),
-        "prompts/get" => {
+        jsonrpc::METHOD_NOTIFICATIONS_INITIALIZED | jsonrpc::METHOD_PING => {
+            ok_response(id, json!({}))
+        }
+        jsonrpc::METHOD_TOOLS_LIST => ok_response(id, tool_definitions_for_profile(profile)),
+        jsonrpc::METHOD_PROMPTS_LIST => ok_response(id, prompt_definitions()),
+        jsonrpc::METHOD_PROMPTS_GET => {
             let prompt_name = match req.params["name"].as_str() {
                 Some(name) if !name.is_empty() => name,
-                _ => return err_response(id, -32602, "missing or empty prompt name".into()),
+                _ => {
+                    return err_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        "missing or empty prompt name".into(),
+                    );
+                }
             };
             match prompt_content(prompt_name, &req.params) {
                 Ok(val) => ok_response(id, val),
-                Err(e) => err_response(id, -32602, e),
+                Err(e) => err_response(id, jsonrpc::INVALID_PARAMS, e),
             }
         }
-        "tools/call" => {
+        jsonrpc::METHOD_TOOLS_CALL => {
             let tool_name = match req.params["name"].as_str() {
                 Some(name) if !name.is_empty() => name,
-                _ => return err_response(id, -32602, "missing or empty tool name".into()),
+                _ => {
+                    return err_response(
+                        id,
+                        jsonrpc::INVALID_PARAMS,
+                        "missing or empty tool name".into(),
+                    );
+                }
             };
 
             // v0.6.4-002 (RFC S28) — reject calls to tools that are not
@@ -2111,7 +2163,7 @@ fn handle_request(
                     );
                     format!("unknown tool: {tool_name}")
                 };
-                return err_response(id, -32601, hint);
+                return err_response(id, jsonrpc::METHOD_NOT_FOUND, hint);
             }
 
             // Pillar 3 / Stream E — emit a structured tracing span around
@@ -2187,7 +2239,11 @@ fn handle_request(
                 // switch on error code can then misroute / retry
                 // correctly. We surface the tool name in `data` so
                 // clients can log it without parsing the message.
-                return err_response(id, -32601, format!("unknown tool: {tool_name}"));
+                return err_response(
+                    id,
+                    jsonrpc::METHOD_NOT_FOUND,
+                    format!("unknown tool: {tool_name}"),
+                );
             };
             let result = dispatch(&ctx);
 
@@ -2213,7 +2269,7 @@ fn handle_request(
                     let format_str = arguments
                         .get("format")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("toon_compact");
+                        .unwrap_or(crate::toon::FORMAT_TOON_COMPACT);
                     use crate::mcp::registry::tool_names as tn;
                     let text = match format_str {
                         "toon"
@@ -2224,7 +2280,7 @@ fn handle_request(
                         {
                             crate::toon::memories_to_toon(&val, false)
                         }
-                        "toon_compact"
+                        crate::toon::FORMAT_TOON_COMPACT
                             if matches!(
                                 tool_name,
                                 tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
@@ -2235,7 +2291,7 @@ fn handle_request(
                         "toon" if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, false)
                         }
-                        "toon_compact" if tool_name == tn::MEMORY_SEARCH => {
+                        crate::toon::FORMAT_TOON_COMPACT if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, true)
                         }
                         _ => serde_json::to_string_pretty(&val).unwrap_or_default(),
@@ -2284,7 +2340,11 @@ fn handle_request(
                 ),
             }
         }
-        _ => err_response(id, -32601, format!("method not found: {}", req.method)),
+        _ => err_response(
+            id,
+            jsonrpc::METHOD_NOT_FOUND,
+            format!("method not found: {}", req.method),
+        ),
     }
 }
 
@@ -2337,7 +2397,7 @@ fn load_active_keypair_for_mcp_in(
     }
     // Fallback: substrate-managed daemon keypair (created by the
     // serve/mcp boot path; see daemon_runtime::ensure_and_load_daemon_keypair).
-    match crate::identity::keypair::load("daemon", dir) {
+    match crate::identity::keypair::load(crate::identity::keypair::DAEMON_KEYPAIR_LABEL, dir) {
         Ok(kp) if kp.can_sign() => Some(kp),
         Ok(_) => None,
         Err(e) => {
@@ -2497,7 +2557,7 @@ pub fn run_embedding_backfill_with_batch_size(
                 chunk.len()
             );
             for (id, title, content) in chunk {
-                let text = format!("{title} {content}");
+                let text = crate::embeddings::embedding_document(title, content);
                 if let Ok(v) = emb.embed(&text)
                     && db::set_embedding(conn, id, &v).is_ok()
                 {
@@ -2570,8 +2630,9 @@ pub fn run_mcp_server(
     // command in the same process.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ai_memory=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(crate::logging::DEFAULT_LOG_DIRECTIVE)
+            }),
         )
         .with_writer(std::io::stderr)
         .try_init();
@@ -2732,7 +2793,7 @@ pub fn run_mcp_server(
                      building dedicated Ollama embed client at {embed_url} (#1143)"
                 );
             }
-            match OllamaClient::new_with_url(embed_url, "nomic-embed-text") {
+            match OllamaClient::new_with_url(embed_url, crate::embeddings::NOMIC_OLLAMA_MODEL) {
                 Ok(client) => Some(Arc::new(client)),
                 Err(e) => {
                     eprintln!(
@@ -2822,7 +2883,7 @@ pub fn run_mcp_server(
 
     // Report effective tier
     let effective_tier = if llm.is_some() && embedder.is_some() && reranker.is_some() {
-        "autonomous"
+        EFFECTIVE_TIER_AUTONOMOUS
     } else if llm.is_some() && embedder.is_some() {
         "smart"
     } else if embedder.is_some() {
@@ -2971,7 +3032,7 @@ pub fn run_mcp_server(
                     // serve an infinitely-streaming peer.
                     let resp = err_response(
                         Value::Null,
-                        -32700,
+                        jsonrpc::PARSE_ERROR,
                         format!(
                             "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
                              and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
@@ -2995,7 +3056,7 @@ pub fn run_mcp_server(
             }
             let resp = err_response(
                 Value::Null,
-                -32700,
+                jsonrpc::PARSE_ERROR,
                 format!("parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes"),
             );
             let out = serde_json::to_string(&resp)?;
@@ -3015,7 +3076,7 @@ pub fn run_mcp_server(
             Err(e) => {
                 let resp = err_response(
                     Value::Null,
-                    -32700,
+                    jsonrpc::PARSE_ERROR,
                     format!("parse error: invalid UTF-8: {e}"),
                 );
                 let out = serde_json::to_string(&resp)?;
@@ -3031,7 +3092,11 @@ pub fn run_mcp_server(
         let req: RpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = err_response(Value::Null, -32700, format!("parse error: {e}"));
+                let resp = err_response(
+                    Value::Null,
+                    jsonrpc::PARSE_ERROR,
+                    format!("parse error: {e}"),
+                );
                 let out = serde_json::to_string(&resp)?;
                 writeln!(stdout, "{out}")?;
                 stdout.flush()?;
@@ -3040,7 +3105,7 @@ pub fn run_mcp_server(
         };
 
         // Capture clientInfo.name on initialize (even if id is Null / notification-style).
-        if req.method == "initialize"
+        if req.method == jsonrpc::METHOD_INITIALIZE
             && let Some(name) = req.params["clientInfo"]["name"].as_str()
             && !name.is_empty()
         {
@@ -11428,6 +11493,122 @@ mod tests {
 
     /// Insert a memory tagged with `metadata.family` so the
     /// `memory_load_family` query catches it.
+    /// #1555 — seed a family-tagged row owned by `owner` with an explicit
+    /// `scope`, so the visibility post-filter on the family loaders can be
+    /// exercised across the owner / other-tenant / trust-all axes.
+    fn seed_family_owned(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        family: &str,
+        owner: &str,
+        scope: &str,
+    ) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: namespace.to_string(),
+            title: format!("{family}-{owner}"),
+            content: format!("owned by {owner}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"family": family, "agent_id": owner, "scope": scope}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        db::insert(conn, &mem).unwrap()
+    }
+
+    #[test]
+    fn load_family_filters_other_agents_private_1555() {
+        // Fixtures bound once (owners + namespace + family) so no literal is
+        // scattered across the assertions.
+        let (owner_a, owner_b) = ("alice", "bob");
+        let (ns, fam) = ("shared-fam-ns", "core");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let a_id = seed_family_owned(&conn, ns, fam, owner_a, "private");
+        let b_id = seed_family_owned(&conn, ns, fam, owner_b, "private");
+        let q = json!({"family": fam, "namespace": ns, "k": 100});
+        let ids = |resp: &Value| -> Vec<String> {
+            resp["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // owner_b caller: sees only their own private row; owner_a's is filtered.
+        let r_b = crate::mcp::handle_load_family(&conn, &q, Some(owner_b)).unwrap();
+        let b_ids = ids(&r_b);
+        assert!(b_ids.contains(&b_id), "{owner_b} sees own row");
+        assert!(
+            !b_ids.contains(&a_id),
+            "{owner_a}'s private row filtered for {owner_b}"
+        );
+        assert_eq!(
+            r_b["count"].as_u64(),
+            Some(1),
+            "count recomputed post-filter"
+        );
+        // owner_a caller: sees their own row.
+        let r_a = crate::mcp::handle_load_family(&conn, &q, Some(owner_a)).unwrap();
+        assert!(ids(&r_a).contains(&a_id));
+        // None caller: single-tenant trust-all sees both, unchanged.
+        let r_all = crate::mcp::handle_load_family(&conn, &q, None).unwrap();
+        assert_eq!(
+            r_all["count"].as_u64(),
+            Some(2),
+            "None == trust-all (legacy)"
+        );
+    }
+
+    #[test]
+    fn smart_load_filters_other_agents_private_1555() {
+        let (owner_a, owner_b) = ("alice", "bob");
+        let (ns, fam) = ("shared-fam-ns2", "core");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let a_id = seed_family_owned(&conn, ns, fam, owner_a, "private");
+        let b_id = seed_family_owned(&conn, ns, fam, owner_b, "collective");
+        // Empty intent routes to Core → forwards to load_family with the caller.
+        let resp = crate::mcp::handle_smart_load(
+            &conn,
+            &json!({"intent": "", "namespace": ns, "k": 100}),
+            None,
+            Some(owner_b),
+        )
+        .unwrap();
+        let ids: Vec<String> = resp["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !ids.contains(&a_id),
+            "{owner_a}'s private row filtered via smart_load for {owner_b}"
+        );
+        assert!(
+            ids.contains(&b_id),
+            "{owner_b}'s own collective row is visible"
+        );
+    }
+
     fn chunkc_seed_family_memory(
         conn: &rusqlite::Connection,
         namespace: &str,
@@ -12555,7 +12736,7 @@ mod tests {
             ] {
                 let _ = chunkc_seed_family_memory(&conn, "ns", fam);
             }
-            let resp = handle_smart_load(&conn, &json!({"intent": intent}), None)
+            let resp = handle_smart_load(&conn, &json!({"intent": intent}), None, None)
                 .expect("smart_load must succeed");
             assert_eq!(
                 resp["chosen_family"], *expected,
@@ -12575,6 +12756,7 @@ mod tests {
         let resp = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "ns", "k": 0}),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["k"], 1);
@@ -12588,6 +12770,7 @@ mod tests {
         let err = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "bad ns with spaces!"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("namespace") || err.contains("invalid"));
@@ -12635,6 +12818,7 @@ mod tests {
         let resp = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "ns-exp"}),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["count"], 1, "expired row must be filtered");
@@ -12667,6 +12851,7 @@ mod tests {
             &conn,
             &json!({"intent": "blortzfribblequx zarflargle"}),
             Some(&embedder as &dyn Embed),
+            None,
         )
         .expect("smart_load must succeed");
         // Either the embedder pick took precedence (source = "embedder")
@@ -13313,6 +13498,7 @@ mod tests {
             &conn,
             &json!({"intent": "call memory_notify on the other agent"}),
             Some(&embedder as &dyn Embed),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["chosen_family"], "other");
@@ -13335,6 +13521,7 @@ mod tests {
             &conn,
             &json!({"intent": "   ", "namespace": "ns-empty", "k": 5}),
             None,
+            None,
         )
         .expect("smart_load must succeed on whitespace intent");
         assert_eq!(resp["chosen_family"], "core");
@@ -13352,8 +13539,9 @@ mod tests {
     fn chunkc_smart_load_punctuation_only_intent_keyword_fallback() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_family_memory(&conn, "ns-punct", "core");
-        let resp = crate::mcp::handle_smart_load(&conn, &json!({"intent": "!!!---???"}), None)
-            .expect("smart_load must succeed on punctuation-only intent");
+        let resp =
+            crate::mcp::handle_smart_load(&conn, &json!({"intent": "!!!---???"}), None, None)
+                .expect("smart_load must succeed on punctuation-only intent");
         assert_eq!(resp["chosen_family"], "core");
         assert_eq!(resp["chosen_family_source"], "fallback");
     }
@@ -13392,6 +13580,7 @@ mod tests {
             &conn,
             &json!({"intent": "delete and forget stale memories"}),
             Some(&embedder as &dyn Embed),
+            None,
         )
         .expect("smart_load must succeed even when embedder fails");
         // When embedder fails, kw_pick wins — keyword scorer routes
@@ -13409,6 +13598,7 @@ mod tests {
         let resp = crate::mcp::handle_load_family(
             &conn,
             &json!({"family": "core", "namespace": "ns-cap", "k": 5_000}),
+            None,
         )
         .expect("must succeed");
         assert_eq!(resp["k"], 100);
@@ -13419,8 +13609,8 @@ mod tests {
     #[test]
     fn chunkc_load_family_unknown_family_rejected() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let err =
-            crate::mcp::handle_load_family(&conn, &json!({"family": "not-a-family"})).unwrap_err();
+        let err = crate::mcp::handle_load_family(&conn, &json!({"family": "not-a-family"}), None)
+            .unwrap_err();
         assert!(
             err.to_lowercase().contains("family") || err.to_lowercase().contains("unknown"),
             "expected an UnknownFamily diagnostic, got: {err}"
@@ -13431,7 +13621,7 @@ mod tests {
     #[test]
     fn chunkc_load_family_missing_family_rejected() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let err = crate::mcp::handle_load_family(&conn, &json!({"k": 5})).unwrap_err();
+        let err = crate::mcp::handle_load_family(&conn, &json!({"k": 5}), None).unwrap_err();
         assert!(err.contains("family"));
     }
 

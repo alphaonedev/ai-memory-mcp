@@ -42,6 +42,7 @@
 //! counted against the budget (it's the entry point of the
 //! composition — every caller wants it).
 
+use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -99,11 +100,11 @@ pub fn handle_skill_compositional_context(
         },
     ) {
         Ok(t) => t,
-        Err(_) => return Err(format!("skill not found: {skill_id}")),
+        Err(_) => return Err(crate::errors::msg::skill_not_found(skill_id)),
     };
 
-    let body_bytes =
-        zstd::decode_all(body.as_slice()).map_err(|e| format!("zstd decompress body: {e}"))?;
+    let body_bytes = zstd::decode_all(body.as_slice())
+        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
     let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
 
     // -----------------------------------------------------------------------
@@ -231,10 +232,10 @@ pub fn handle_skill_compositional_context(
             "namespace": r.namespace,
             "title": r.title,
             "content": r.content,
-            "created_at": r.created_at,
-            "access_count": r.access_count,
-            "reflection_depth": r.reflection_depth,
-            "memory_kind": r.memory_kind,
+            (field_names::CREATED_AT): r.created_at,
+            (field_names::ACCESS_COUNT): r.access_count,
+            (field_names::REFLECTION_DEPTH): r.reflection_depth,
+            (field_names::MEMORY_KIND): r.memory_kind,
             "score": r.score,
         }));
     }
@@ -242,13 +243,13 @@ pub fn handle_skill_compositional_context(
     Ok(json!({
         "skill_id": skill_id,
         "skill_namespace": namespace,
-        "skill_name": name,
+        (field_names::SKILL_NAME): name,
         "body": body_str,
         "compositional_namespaces": bounded_namespaces,
         "reflections": emitted,
-        "budget_tokens": budget_tokens,
-        "tokens_used": tokens_used,
-        "memories_dropped": dropped,
+        (field_names::BUDGET_TOKENS): budget_tokens,
+        (field_names::TOKENS_USED): tokens_used,
+        (field_names::MEMORIES_DROPPED): dropped,
     }))
 }
 
@@ -270,7 +271,7 @@ struct ScoredReflection {
 
 fn parse_budget_tokens(params: &Value) -> usize {
     let raw = params
-        .get("budget_tokens")
+        .get(field_names::BUDGET_TOKENS)
         .and_then(serde_json::Value::as_u64);
     match raw {
         Some(n) => {
@@ -368,11 +369,10 @@ impl McpTool for SkillCompositionalContextTool {
         "L2-7 (#672): compose skill activation with reflections from SKILL.md composes_with_reflections list. Per-entry min_depth filter; per-namespace max_reflection_depth is the authoritative ceiling (CANNOT bypass bounded-recursion). Reflections ranked recency + recall_count; budget_tokens caps cumulative reflection content (default 4000, max 32000)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillCompositionalContextRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillCompositionalContextRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

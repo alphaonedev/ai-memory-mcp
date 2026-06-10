@@ -47,6 +47,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::config::FeatureTier;
+use crate::mcp::param_names;
+use crate::models::field_names;
 #[cfg(test)]
 use crate::multistep_ingest::MockLlmDispatch;
 use crate::multistep_ingest::{
@@ -103,8 +105,8 @@ pub fn handle_ingest_multistep(
 ) -> Result<Value, String> {
     // ── Argument validation ─────────────────────────────────────────
     let content = params
-        .get("content")
-        .ok_or("content is required")?
+        .get(param_names::CONTENT)
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .as_str()
         .ok_or("content must be a string")?;
     if content.is_empty() {
@@ -112,22 +114,22 @@ pub fn handle_ingest_multistep(
     }
 
     let namespace = params
-        .get("namespace")
+        .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
         .unwrap_or(crate::DEFAULT_NAMESPACE);
 
     // ── Tier gate ───────────────────────────────────────────────────
     if tier == FeatureTier::Keyword || handler.is_none() {
         return Ok(json!({
-            "tier-locked": "memory_ingest_multistep requires smart tier or higher",
-            "current_tier": tier.as_str(),
-            "required_tier": REQUIRED_TIER,
+            (field_names::TIER_LOCKED): "memory_ingest_multistep requires smart tier or higher",
+            (field_names::CURRENT_TIER): tier.as_str(),
+            (field_names::REQUIRED_TIER): REQUIRED_TIER,
         }));
     }
     let handler = handler.expect("checked above");
 
     // ── Pipeline resolution ─────────────────────────────────────────
-    let pipeline = if let Some(override_value) = params.get("pipeline_override") {
+    let pipeline = if let Some(override_value) = params.get(param_names::PIPELINE_OVERRIDE) {
         if !override_value.is_null() {
             serde_json::from_value::<Pipeline>(override_value.clone())
                 .map_err(|e| format!("pipeline_override is malformed: {e}"))?
@@ -226,11 +228,10 @@ impl McpTool for IngestMultistepTool {
         "Form 3 (#756): two_phase (FTS + Jaccard -> synthesise) or four_step (load_context -> classify -> enrich -> emit). Helpers run first; LLM stages receive helper output under explicit-trust banner + SHARED PREFIX for cache-key reuse. Response carries trace + cache-key set + final output. Smart+ tier only."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(IngestMultistepRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<IngestMultistepRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

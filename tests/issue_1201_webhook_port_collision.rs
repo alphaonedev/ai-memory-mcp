@@ -50,8 +50,6 @@
 
 use std::collections::HashSet;
 use std::net::TcpListener;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use wiremock::MockServer;
 
 /// Layer 1: the kernel hands out distinct ephemeral ports under
@@ -121,33 +119,41 @@ async fn issue_1201_sequential_listeners_get_unique_ports() {
 /// the #1201 fix tolerates parallel-binary load.
 #[tokio::test(flavor = "multi_thread")]
 async fn issue_1201_concurrent_listeners_get_unique_ports() {
-    let seen: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
+    // #1567 — each task RETURNS its (port, server) so every listener
+    // stays alive until the uniqueness assert below. The previous
+    // shape dropped each server at task end, letting the kernel
+    // legitimately recycle an early-finishing task's port to a
+    // later-binding task — a false "collision" between listeners that
+    // were never concurrently alive (observed as a full-suite flake
+    // on port 36755, 2026-06-09).
     let mut handles = Vec::new();
     for _ in 0..32 {
-        let seen = Arc::clone(&seen);
         handles.push(tokio::spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("addr").port();
             let server = MockServer::builder().listener(listener).start().await;
             assert_eq!(server.address().port(), port);
-            let mut guard = seen.lock().await;
-            assert!(
-                guard.insert(port),
-                "#1201: concurrent ephemeral-port allocation collided on \
-                 port {port} — pool-bypass fix is leaking the OS port back \
-                 between tasks"
-            );
-            // Hold the server until the task completes so the port
-            // can't be recycled mid-test.
-            drop(server);
+            (port, server)
         }));
     }
+    let mut servers = Vec::with_capacity(handles.len());
+    let mut seen: HashSet<u16> = HashSet::new();
     for h in handles {
-        h.await.expect("task join");
+        let (port, server) = h.await.expect("task join");
+        assert!(
+            seen.insert(port),
+            "#1201: concurrent ephemeral-port allocation collided on \
+             port {port} — pool-bypass fix is leaking the OS port back \
+             between tasks"
+        );
+        // Hold every server until ALL ports are checked so the kernel
+        // cannot recycle a port mid-assert.
+        servers.push(server);
     }
-    let final_count = seen.lock().await.len();
     assert_eq!(
-        final_count, 32,
+        seen.len(),
+        32,
         "#1201: all 32 concurrent listeners must have observed unique ports"
     );
+    drop(servers);
 }

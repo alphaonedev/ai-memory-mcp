@@ -57,7 +57,15 @@ FED_SYNC_QUORUM_W="${FED_SYNC_QUORUM_W:-2}"
 # FED_SYNC_QUORUM_W=2). FED_CATCHUP_INTERVAL_SECS: async /sync/since pull cadence
 # (the PRIMARY convergence mechanism). FED_SHUTDOWN_GRACE_SECS: graceful-drain
 # window on daemon stop. Override any via env for tighter/looser SLAs.
-FED_QUORUM_TIMEOUT_MS="${FED_QUORUM_TIMEOUT_MS:-2000}"
+# 8000ms (was 2000): the synchronous quorum ack must cover a CROSS-CONTINENT
+# round trip (fra1↔nyc3↔sgp1) PLUS the receiver's per-memory work — which can
+# include a ~1s nomic embed-on-receive when the incoming row carries no vector
+# (e.g. after a v29 embedding-dim migration NULLs embeddings) and the AGE
+# projection. 2000ms was tuned for same-DC and is too tight here, causing
+# push `deadline_exceeded` → DLQ. The write still commits LOCALLY first, so a
+# longer remote-ack wait only affects the synchronous-durability gate, not the
+# local write; async catch-up converges the remaining peers regardless.
+FED_QUORUM_TIMEOUT_MS="${FED_QUORUM_TIMEOUT_MS:-8000}"
 FED_CATCHUP_INTERVAL_SECS="${FED_CATCHUP_INTERVAL_SECS:-30}"
 FED_SHUTDOWN_GRACE_SECS="${FED_SHUTDOWN_GRACE_SECS:-30}"
 
@@ -85,9 +93,13 @@ FED_CRED_TTL_SECS="${FED_CRED_TTL_SECS:-604800}"   # 7 * SECS_PER_DAY
 FED_ISSUER_ID="${FED_ISSUER_ID:-$CAMPAIGN-ca}"
 FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # Golden ai-memory linux-x86_64 sha256, --features sal,sal-postgres,sqlite-bundled.
-# Re-pinned for release/v0.7.0 @ dc8666cc (PR #1523 merged: nomic asymmetric
-# search_document:/search_query: prefixes, #1520) — tree afa409bf, reproducible.
-GOLDEN_SHA256="${GOLDEN_SHA256:-2b5579104ad81b7241922d5163b9adb20c4c37c06013fdb967875267ba5718fe}"
+# Re-pinned for release/v0.7.0 @ dab26f7d (2026-06-09/10 GA drive): carries the
+# #1553-#1557 security fixes (the prior c3aba0af pin predated them), the full
+# #1558 literal-SSOT campaign (497→28 baseline), and the #1531 residual round
+# (#1568 postgres link governance, #1570 admin-header secure default, #1571
+# replay visibility, #1572 decay parity, #1573 recover dedup, #1575 staging,
+# M13 NaN-rerank + L5 taxonomy-LIKE fixes). Suite 7741/0 at the pin commit.
+GOLDEN_SHA256="${GOLDEN_SHA256:-f520221e921d97fe81190e477bc3cc829e097ba47bb12ba42b4a9d61c3368b8d}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-55}"
 

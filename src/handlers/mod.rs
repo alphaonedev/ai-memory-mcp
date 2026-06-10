@@ -45,6 +45,18 @@
 //! - [`parity`]      — cross-cutting HTTP-parity helpers.
 //! - [`approvals`]   — v0.7.0 K10 approval API.
 
+/// Tracing target for HTTP-layer authorization (ownership-gate /
+/// caller-resolution) denials, shared across the handler sub-modules
+/// (#1558 tracing-target SSOT).
+pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
+
+/// #1558 batch 5 wave 3 — `quota_refused` count field on the
+/// federation `/sync/push` response envelope (sqlite + postgres
+/// arms, quota-413 + success shapes). One spelling across the four
+/// production emit sites in `federation_receive` /
+/// `federation_signing_check`.
+pub(crate) const QUOTA_REFUSED_FIELD: &str = "quota_refused";
+
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;
@@ -73,6 +85,10 @@ pub mod recall;
 /// wrapper around the existing `crate::mcp::handle_<name>` substrate
 /// primitive; wire envelopes are byte-equal across the two surfaces.
 pub mod route_1111;
+/// #1558 batch 4 — HTTP route-path SSOT: one named const per
+/// production route; registration (lib.rs) and match sites
+/// (postgres_gate, federation receive, CLI doctor) share them.
+pub mod routes;
 pub mod share;
 pub mod skills;
 pub mod subscriptions;

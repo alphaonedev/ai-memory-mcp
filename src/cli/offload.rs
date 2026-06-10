@@ -88,7 +88,7 @@ pub fn run_offload(db_path: &Path, args: &OffloadArgs, out: &mut CliOutput<'_>) 
             "{}",
             serde_json::to_string(&json!({
                 "ref_id": result.ref_id,
-                "content_sha256": result.content_sha256,
+                (crate::models::field_names::CONTENT_SHA256): result.content_sha256,
                 "stored_at": result.stored_at,
                 "namespace": namespace,
                 "agent_id": agent_id,

@@ -30,6 +30,7 @@ use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::llm::OllamaClient;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -159,11 +160,10 @@ impl McpTool for StoreTool {
         "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(StoreRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<StoreRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 
@@ -424,7 +424,7 @@ pub(crate) fn handle_store(
                 return Ok(json!({
                     "status": "pending",
                     "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": "store",
                     "namespace": mem.namespace,
                 }));
@@ -597,7 +597,7 @@ pub(crate) fn handle_store(
         .map_err(|e| e.to_string())?;
         // Regenerate embedding if content changed during dedup update
         if content_changed && let Some(emb) = embedder {
-            let text = format!("{} {}", mem.title, mem.content);
+            let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
             if let Ok(embedding) = emb.embed(&text) {
                 let _ = db::set_embedding(conn, &dup.id, &embedding);
                 if let Some(idx) = vector_index {
@@ -608,7 +608,7 @@ pub(crate) fn handle_store(
         }
         // #196: echo the preserved agent_id (original on dedup, not the caller's)
         let echoed_agent_id = preserved_metadata
-            .get("agent_id")
+            .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
         return Ok(json!({
@@ -634,7 +634,7 @@ pub(crate) fn handle_store(
     // curator pass that intends to revise an earlier claim).
     let force_write = params["force"].as_bool().unwrap_or(false);
     if !force_write && let Some(emb) = embedder {
-        let text = format!("{} {}", mem.title, mem.content);
+        let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
         if let Ok(query_embedding) = emb.embed(&text)
             && let Ok(Some(conflict)) = db::proactive_conflict_check(conn, &mem, &query_embedding)
         {
@@ -705,7 +705,7 @@ pub(crate) fn handle_store(
                     bytes: payload_bytes,
                 },
             ) {
-                tracing::warn!("quota refund_op failed for agent {}: {}", &agent_id, re);
+                crate::quotas::log_refund_op_failed(&agent_id, &re);
             }
             // v0.7.0 L1-6 Deliverable E — surface the substrate
             // governance pre-write hook's refusal with a clearly-
@@ -744,7 +744,9 @@ pub(crate) fn handle_store(
         crate::audit::AuditAction::Store,
         crate::audit::actor(
             agent_id.clone(),
-            mcp_client.map_or("host_fallback", |_| "mcp_client_info"),
+            mcp_client.map_or(crate::audit::synthesis_sources::HOST_FALLBACK, |_| {
+                crate::audit::synthesis_sources::MCP_CLIENT_INFO
+            }),
             explicit_scope.clone(),
         ),
         crate::audit::target_memory(

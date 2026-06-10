@@ -21,6 +21,7 @@
 //! The matching `signed_events` row is appended for the Bucket 1
 //! attestation chain.
 
+use crate::models::field_names;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,10 +106,10 @@ pub(super) fn register_core(
     let canonical_fm = serde_json::to_vec(&json!({
         "namespace": namespace,
         "name": name,
-        "description": description,
+        (field_names::DESCRIPTION): description,
         "license": license,
-        "compatibility": compatibility,
-        "allowed_tools": allowed_tools,
+        (field_names::COMPATIBILITY): compatibility,
+        (field_names::ALLOWED_TOOLS): allowed_tools,
     }))
     .map_err(|e| format!("frontmatter JSON error: {e}"))?;
 
@@ -289,7 +290,7 @@ pub fn handle_skill_register(
     // write so the audit trail captures intent regardless of downstream
     // signing / storage outcome.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -328,7 +329,7 @@ pub fn handle_skill_register(
 
     let digest_hex = hex::encode(&result.digest);
     let mut response = json!({
-        "registered": true,
+        (field_names::REGISTERED): true,
         "id": result.id,
         "namespace": manifest.namespace,
         "name": manifest.name,
@@ -336,7 +337,7 @@ pub fn handle_skill_register(
         "signed": active_keypair.is_some(),
     });
     if let Some(prev) = result.superseded {
-        response["superseded_id"] = json!(prev);
+        response[field_names::SUPERSEDED_ID] = json!(prev);
     }
     Ok(response)
 }
@@ -443,11 +444,10 @@ impl McpTool for SkillRegisterTool {
         "L1-5: Ed25519-attested skill registration with version chaining. Re-register same (name, namespace) supersedes prior row."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SkillRegisterRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SkillRegisterRequest>()
     }
     fn family() -> &'static str {
-        "other"
+        crate::profile::Family::Other.name()
     }
 }
 

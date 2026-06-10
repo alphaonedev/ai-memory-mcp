@@ -90,6 +90,7 @@
 //! JSON serialisation of the initialize response itself. The 50 ms
 //! recall p95 budget is untouched.
 
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -98,6 +99,10 @@ use serde_json::{Value, json};
 
 use crate::identity::keypair::AgentKeypair;
 use crate::storage::migrations::current_schema_version;
+
+/// Signed-block / response field for the daemon public key (#1558 batch 6).
+/// A signed-envelope field, NOT an MCP tool param — deliberately local.
+const PUBLIC_KEY_FIELD: &str = "public_key";
 
 /// Field set canonically serialised for the daemon-identity Ed25519
 /// signature. Mirrors the discipline established by
@@ -144,9 +149,9 @@ pub struct DaemonIdentityToSign<'a> {
 /// for the field set above, but surfaced for completeness).
 pub fn canonical_bytes_for_identity(identity: &DaemonIdentityToSign<'_>) -> Result<Vec<u8>> {
     let canonical = json!({
-        "schema_version": identity.schema_version,
+        (field_names::SCHEMA_VERSION): identity.schema_version,
         "daemon_id": identity.daemon_id,
-        "public_key": identity.public_key,
+        (PUBLIC_KEY_FIELD): identity.public_key,
         "signed_at": identity.signed_at,
     });
     serde_json::to_vec(&canonical)
@@ -197,9 +202,9 @@ pub fn build_signed_identity(
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     Ok(Some(json!({
-        "schema_version": schema_version,
+        (field_names::SCHEMA_VERSION): schema_version,
         "daemon_id": kp.agent_id,
-        "public_key": public_key,
+        (PUBLIC_KEY_FIELD): public_key,
         "signed_at": now_rfc3339,
         "signature": sig_b64,
     })))
@@ -232,7 +237,7 @@ pub fn verify_signed_identity(block: &Value) -> Result<(), ed25519_dalek::Signat
 
     let obj = block.as_object().ok_or_else(make_err)?;
     let schema_version = obj
-        .get("schema_version")
+        .get(field_names::SCHEMA_VERSION)
         .and_then(Value::as_str)
         .ok_or_else(make_err)?;
     let daemon_id = obj
@@ -240,7 +245,7 @@ pub fn verify_signed_identity(block: &Value) -> Result<(), ed25519_dalek::Signat
         .and_then(Value::as_str)
         .ok_or_else(make_err)?;
     let public_key_b64 = obj
-        .get("public_key")
+        .get(PUBLIC_KEY_FIELD)
         .and_then(Value::as_str)
         .ok_or_else(make_err)?;
     let signed_at = obj

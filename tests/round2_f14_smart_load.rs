@@ -86,7 +86,8 @@ fn route(intent: &str) -> Value {
     ] {
         seed_family(&conn, fam);
     }
-    handle_smart_load(&conn, &json!({"intent": intent}), None).expect("smart_load must succeed")
+    handle_smart_load(&conn, &json!({"intent": intent}), None, None)
+        .expect("smart_load must succeed")
 }
 
 // ---------------------------------------------------------------------------

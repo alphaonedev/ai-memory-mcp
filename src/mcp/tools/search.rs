@@ -3,6 +3,7 @@
 
 //! MCP `memory_search` handler.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::Tier;
 use crate::{db, validate};
@@ -59,11 +60,10 @@ impl McpTool for SearchTool {
         "Exact keyword AND search. Deterministic; no fuzzy/semantic. Filters: namespace, tier, agent_id, as_agent (Task 1.5 scope). WT-1-E: atomised sources hidden by default."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SearchRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SearchRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 
@@ -106,7 +106,7 @@ pub(super) fn handle_search(
     // The partial `idx_memories_source_uri` index (v38) covers the
     // lookup so the reciprocal "everything from this document"
     // query is O(log N), not O(N) JSON-path scan.
-    let source_uri = params["source_uri"]
+    let source_uri = params[param_names::SOURCE_URI]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -128,7 +128,7 @@ pub(super) fn handle_search(
             let results = filter_visible(results, caller);
             return Ok(json!({"results": results, "count": results.len()}));
         }
-        return Err("query is required".into());
+        return Err(crate::errors::msg::QUERY_REQUIRED.into());
     }
 
     let results = db::search_with_source_uri(

@@ -4,16 +4,27 @@
 //! MCP archive management handlers (list, restore, purge, stats, gc).
 
 use crate::db;
+use crate::mcp::param_names;
+use crate::models::field_names;
 use serde_json::{Value, json};
 pub(super) fn handle_archive_list(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(50)).unwrap_or(usize::MAX);
+    let limit = params["limit"]
+        .as_u64()
+        .map_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        });
     let offset = usize::try_from(params["offset"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
-    let items =
-        db::list_archived(conn, namespace, limit.min(1000), offset).map_err(|e| e.to_string())?;
+    let items = db::list_archived(
+        conn,
+        namespace,
+        limit.min(crate::storage::LIST_MAX_LIMIT),
+        offset,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(json!({"archived": items, "count": items.len()}))
 }
 
@@ -21,11 +32,13 @@ pub(super) fn handle_archive_restore(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     crate::validate::validate_id(id).map_err(|e| e.to_string())?;
     let restored = db::restore_archived(conn, id).map_err(|e| e.to_string())?;
     if !restored {
-        return Err("not found in archive".into());
+        return Err(crate::errors::msg::NOT_FOUND_IN_ARCHIVE.into());
     }
     Ok(json!({"restored": true, "id": id}))
 }
@@ -34,7 +47,7 @@ pub(super) fn handle_archive_purge(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let older_than_days = params["older_than_days"].as_i64();
+    let older_than_days = params[param_names::OLDER_THAN_DAYS].as_i64();
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // state-change audit. Archive purge permanently deletes archived
@@ -43,7 +56,7 @@ pub(super) fn handle_archive_purge(
     // permission-gate / storage outcome. Mirrors the #911 HTTP
     // `purge_archive` fix.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| "anonymous:invalid".to_string());
+        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
     // #936 (security-critical, 2026-05-20) — MCP-side owner gate.
     // The MCP entry is a second attack surface for the same gap the
     // HTTP `purge_archive` handler had: pre-#936 the dispatch reached
@@ -60,11 +73,11 @@ pub(super) fn handle_archive_purge(
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "archive_purge",
+        crate::governance::action_labels::ARCHIVE_PURGE,
         "",
         json!({
-            "older_than_days": older_than_days,
-            "owner_scope": if as_admin { "admin" } else { "caller" },
+            (field_names::OLDER_THAN_DAYS): older_than_days,
+            (field_names::OWNER_SCOPE): if as_admin { "admin" } else { "caller" },
         }),
     );
 
@@ -81,7 +94,7 @@ pub(super) fn handle_archive_purge(
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
             agent_id,
             payload: json!({
-                "older_than_days": older_than_days,
+                (field_names::OLDER_THAN_DAYS): older_than_days,
                 "as_admin": as_admin,
             }),
         };
@@ -111,7 +124,7 @@ pub(super) fn handle_archive_purge(
     };
     Ok(json!({
         "purged": purged,
-        "owner_scope": if as_admin { "admin" } else { "caller" },
+        (field_names::OWNER_SCOPE): if as_admin { "admin" } else { "caller" },
     }))
 }
 
@@ -179,11 +192,10 @@ impl McpTool for ArchiveListTool {
         "List archived memories. Filter by namespace; paginate via offset/limit."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchiveListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchiveListRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 
@@ -211,11 +223,10 @@ impl McpTool for ArchivePurgeTool {
         "Purge archive. Scope via older_than_days. Unrecoverable."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchivePurgeRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchivePurgeRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 
@@ -242,11 +253,10 @@ impl McpTool for ArchiveRestoreTool {
         "Restore archived row; expires_at cleared."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchiveRestoreRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchiveRestoreRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 
@@ -280,11 +290,10 @@ impl McpTool for GcTool {
         "GC expired memories. Archives first when archive_on_gc is on (default). dry_run previews."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(GcRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<GcRequest>()
     }
     fn family() -> &'static str {
-        "lifecycle"
+        crate::profile::Family::Lifecycle.name()
     }
 }
 
@@ -303,11 +312,10 @@ impl McpTool for ArchiveStatsTool {
         "Archive total + per-namespace counts."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(ArchiveStatsRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<ArchiveStatsRequest>()
     }
     fn family() -> &'static str {
-        "archive"
+        crate::profile::Family::Archive.name()
     }
 }
 

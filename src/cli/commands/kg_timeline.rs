@@ -9,6 +9,7 @@
 //! landed previously; this module wires the CLI surface so operators
 //! can read the outbound-link timeline for an entity from a terminal.
 
+use crate::models::field_names;
 use anyhow::Result;
 use clap::Args;
 use serde_json::{Value, json};
@@ -79,7 +80,10 @@ pub fn cmd_kg_timeline(
         for e in arr {
             let tid = e.get("target_id").and_then(Value::as_str).unwrap_or("?");
             let rel = e.get("relation").and_then(Value::as_str).unwrap_or("?");
-            let vf = e.get("valid_from").and_then(Value::as_str).unwrap_or("");
+            let vf = e
+                .get(field_names::VALID_FROM)
+                .and_then(Value::as_str)
+                .unwrap_or("");
             writeln!(out.stdout, "  {vf}  {rel}  {tid}")?;
         }
     }

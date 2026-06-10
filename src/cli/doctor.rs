@@ -47,11 +47,30 @@
 
 use crate::cli::CliOutput;
 use crate::db;
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
+
+// ── #1558 batch 6 — repeated doctor fact / section labels ──────────────
+const FACT_DIM_VIOLATIONS: &str = "dim_violations";
+const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
+const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
+const FACT_RERANKER_ACTIVE: &str = "reranker_active";
+const SECTION_LLM_REACHABILITY: &str = "LLM Reachability (#1146)";
+const MSG_RAW_SQL_DB_MODE: &str = "raw SQL section — only available in --db mode";
+
+/// #1558 batch 5 wave 3 — placeholder fact value rendered when the
+/// probed capabilities payload does not carry the requested feature
+/// key (older daemons).
+const NOT_IN_RESPONSE: &str = "not_in_response";
+
+/// #1558 batch 5 wave 3 — placeholder fact value for the recall-mode /
+/// reranker distribution rows, which need the P3 rolling counter that
+/// has not landed yet.
+const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 
 /// Severity bucket attached to every doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -225,7 +244,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
         // Always include the full per-tool table when --raw-table is
         // set; --json gives the rolled-up view.
         let payload = serde_json::json!({
-            "schema_version": "v0.6.4-tokens-1",
+            (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
             "tokenizer": "cl100k_base",
             "active_profile": profile.families().iter().map(|f| f.name()).collect::<Vec<_>>(),
             "active_total_tokens": active_total,
@@ -359,7 +378,7 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
 
     if args.json {
         let payload = serde_json::json!({
-            "schema_version": "v0.7-hooks-1",
+            (field_names::SCHEMA_VERSION): "v0.7-hooks-1",
             "config_path": path_opt.as_ref().map(|p| p.display().to_string()),
             "hooks_loaded": hooks.len(),
             "executors": hooks.iter().map(|h| serde_json::json!({
@@ -544,7 +563,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
 
     match db::stats(conn, db_path) {
         Ok(stats) => {
-            facts.push(("total_memories".into(), stats.total.to_string()));
+            facts.push((field_names::TOTAL_MEMORIES.into(), stats.total.to_string()));
             facts.push(("expiring_within_1h".into(), stats.expiring_soon.to_string()));
             facts.push(("links".into(), stats.links_count.to_string()));
             facts.push(("db_size_bytes".into(), stats.db_size_bytes.to_string()));
@@ -564,10 +583,10 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
     // dim_violations (P2 surface). Pre-P2: Ok(None) -> render N/A line, no severity bump.
     match db::doctor_dim_violations(conn) {
         Ok(Some(0)) => {
-            facts.push(("dim_violations".into(), "0".into()));
+            facts.push((FACT_DIM_VIOLATIONS.into(), "0".into()));
         }
         Ok(Some(n)) => {
-            facts.push(("dim_violations".into(), n.to_string()));
+            facts.push((FACT_DIM_VIOLATIONS.into(), n.to_string()));
             severity = Severity::Critical;
             note = Some(format!(
                 "{n} memories have an embedding dim that disagrees with their namespace's modal dim"
@@ -575,7 +594,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         }
         Ok(None) => {
             facts.push((
-                "dim_violations".into(),
+                FACT_DIM_VIOLATIONS.into(),
                 "not_observed (pre-P2 schema)".into(),
             ));
         }
@@ -654,11 +673,11 @@ fn section_recall_local() -> ReportSection {
         facts: vec![
             (
                 "recall_mode_distribution".into(),
-                "not_observed (pre-P3 rolling counter)".into(),
+                NOT_OBSERVED_PRE_P3.into(),
             ),
             (
                 "reranker_used_distribution".into(),
-                "not_observed (pre-P3 rolling counter)".into(),
+                NOT_OBSERVED_PRE_P3.into(),
             ),
             (
                 "hint".into(),
@@ -747,7 +766,7 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
 
     if peer_count == 0 {
         facts.push((
-            "max_skew_secs".into(),
+            FACT_MAX_SKEW_SECS.into(),
             "not_observed (no peers registered)".into(),
         ));
         return ReportSection {
@@ -760,7 +779,7 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
 
     match db::doctor_max_sync_skew_secs(conn) {
         Ok(Some(skew)) => {
-            facts.push(("max_skew_secs".into(), skew.to_string()));
+            facts.push((FACT_MAX_SKEW_SECS.into(), skew.to_string()));
             if skew > 600 {
                 severity = Severity::Critical;
                 note = Some(format!(
@@ -769,7 +788,7 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
             }
         }
         Ok(None) => {
-            facts.push(("max_skew_secs".into(), "not_observed".into()));
+            facts.push((FACT_MAX_SKEW_SECS.into(), "not_observed".into()));
         }
         Err(e) => {
             facts.push(("sync_query_error".into(), e.to_string()));
@@ -830,7 +849,7 @@ fn section_capabilities_local() -> ReportSection {
         name: "Capabilities".into(),
         severity: Severity::NotAvailable,
         facts: vec![(
-            "capabilities".into(),
+            field_names::CAPABILITIES.into(),
             "use --remote <url> to query the live capabilities endpoint".into(),
         )],
         note: None,
@@ -875,7 +894,7 @@ fn section_llm_reachability_1146() -> ReportSection {
         ("base_url".into(), resolved.base_url.clone()),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
-            "key_source".into(),
+            field_names::KEY_SOURCE.into(),
             resolved.api_key_source.as_str().to_string(),
         ),
     ];
@@ -895,7 +914,7 @@ fn section_llm_reachability_1146() -> ReportSection {
     // pinned by `tests/doctor_cli.rs::doctor_reports_clean_on_fresh_db`).
     if matches!(resolved.source, ConfigSource::CompiledDefault) {
         return ReportSection {
-            name: "LLM Reachability (#1146)".into(),
+            name: SECTION_LLM_REACHABILITY.into(),
             severity: Severity::Info,
             facts,
             note: Some(
@@ -930,7 +949,7 @@ fn section_llm_reachability_1146() -> ReportSection {
         Err(e) => {
             facts.push(("error".into(), format!("http client build failed: {e}")));
             return ReportSection {
-                name: "LLM Reachability (#1146)".into(),
+                name: SECTION_LLM_REACHABILITY.into(),
                 severity: Severity::Critical,
                 facts,
                 note: Some("could not build HTTP client for probe".into()),
@@ -948,7 +967,7 @@ fn section_llm_reachability_1146() -> ReportSection {
             let status = resp.status();
             let elapsed_ms = started.elapsed().as_millis();
             facts.push(("http_status".into(), status.as_u16().to_string()));
-            facts.push(("latency_ms".into(), elapsed_ms.to_string()));
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
 
             if status.is_success() {
                 (Severity::Info, None)
@@ -988,7 +1007,7 @@ fn section_llm_reachability_1146() -> ReportSection {
         }
         Err(e) => {
             let elapsed_ms = started.elapsed().as_millis();
-            facts.push(("latency_ms".into(), elapsed_ms.to_string()));
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
             facts.push(("error".into(), e.to_string()));
             let kind = if e.is_timeout() {
                 "timeout"
@@ -1008,7 +1027,7 @@ fn section_llm_reachability_1146() -> ReportSection {
     };
 
     ReportSection {
-        name: "LLM Reachability (#1146)".into(),
+        name: SECTION_LLM_REACHABILITY.into(),
         severity,
         facts,
         note,
@@ -1133,8 +1152,8 @@ fn run_remote(url: &str, db_path: &Path) -> Report {
     let mut sections = Vec::with_capacity(2);
 
     let base = url.trim_end_matches('/');
-    let cap_url = format!("{base}/api/v1/capabilities");
-    let stats_url = format!("{base}/api/v1/stats");
+    let cap_url = format!("{base}{}", crate::handlers::routes::CAPABILITIES);
+    let stats_url = format!("{base}{}", crate::handlers::routes::STATS);
 
     sections.push(section_capabilities_remote(&cap_url));
     sections.push(section_recall_remote(&cap_url));
@@ -1142,37 +1161,25 @@ fn run_remote(url: &str, db_path: &Path) -> Report {
     sections.push(ReportSection {
         name: "Index".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
     sections.push(ReportSection {
         name: "Governance".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
     sections.push(ReportSection {
         name: "Sync".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
     sections.push(ReportSection {
         name: "Webhook".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
 
@@ -1209,34 +1216,40 @@ fn section_capabilities_remote(url: &str) -> ReportSection {
         Ok(v) => {
             // schema_version: "1" (legacy v0.6.3) or "2" (post-P1).
             let schema = v
-                .get("schema_version")
+                .get(field_names::SCHEMA_VERSION)
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            facts.push(("schema_version".into(), schema.to_string()));
+            facts.push((field_names::SCHEMA_VERSION.into(), schema.to_string()));
 
             // P1 v2 fields — best-effort lookup. The legacy v1 shape
             // doesn't carry these; we render the missing ones as
             // "not_in_response" rather than failing.
             let recall_mode = v
                 .get("features")
-                .and_then(|f| f.get("recall_mode_active"))
+                .and_then(|f| f.get(FACT_RECALL_MODE_ACTIVE))
                 .and_then(Value::as_str)
-                .unwrap_or("not_in_response");
-            facts.push(("recall_mode_active".into(), recall_mode.to_string()));
+                .unwrap_or(NOT_IN_RESPONSE);
+            facts.push((FACT_RECALL_MODE_ACTIVE.into(), recall_mode.to_string()));
 
             let reranker = v
                 .get("features")
-                .and_then(|f| f.get("reranker_active"))
+                .and_then(|f| f.get(FACT_RERANKER_ACTIVE))
                 .and_then(Value::as_str)
-                .unwrap_or("not_in_response");
-            facts.push(("reranker_active".into(), reranker.to_string()));
+                .unwrap_or(NOT_IN_RESPONSE);
+            facts.push((FACT_RERANKER_ACTIVE.into(), reranker.to_string()));
 
             // Severity hints. recall_mode in {"degraded", "disabled",
             // "keyword_only"} bumps to Warning when the tier is supposed
             // to support hybrid (semantic / smart / autonomous).
             if matches!(recall_mode, "degraded" | "disabled" | "keyword_only") {
                 let tier = v.get("feature_tier").and_then(Value::as_str).unwrap_or("");
-                if matches!(tier, "semantic" | "smart" | "autonomous") {
+                if [
+                    crate::config::FeatureTier::Semantic.as_str(),
+                    crate::config::FeatureTier::Smart.as_str(),
+                    crate::config::FeatureTier::Autonomous.as_str(),
+                ]
+                .contains(&tier)
+                {
                     severity = Severity::Warning;
                     note = Some(format!(
                         "tier={tier} but recall_mode_active={recall_mode} — silent degradation"
@@ -1266,19 +1279,19 @@ fn section_recall_remote(cap_url: &str) -> ReportSection {
     if let Ok(v) = http_get_json(cap_url) {
         let recall_mode = v
             .get("features")
-            .and_then(|f| f.get("recall_mode_active"))
+            .and_then(|f| f.get(FACT_RECALL_MODE_ACTIVE))
             .and_then(Value::as_str)
-            .unwrap_or("not_in_response");
+            .unwrap_or(NOT_IN_RESPONSE);
         facts.push(("active_recall_mode".into(), recall_mode.to_string()));
         let reranker = v
             .get("features")
-            .and_then(|f| f.get("reranker_active"))
+            .and_then(|f| f.get(FACT_RERANKER_ACTIVE))
             .and_then(Value::as_str)
-            .unwrap_or("not_in_response");
+            .unwrap_or(NOT_IN_RESPONSE);
         facts.push(("active_reranker".into(), reranker.to_string()));
         facts.push((
             "recall_mode_distribution".into(),
-            "not_observed (pre-P3 rolling counter)".into(),
+            NOT_OBSERVED_PRE_P3.into(),
         ));
     } else {
         facts.push(("error".into(), "could not fetch capabilities".into()));
@@ -1299,7 +1312,7 @@ fn section_storage_remote(stats_url: &str) -> ReportSection {
     match http_get_json(stats_url) {
         Ok(v) => {
             if let Some(total) = v.get("total").and_then(Value::as_u64) {
-                facts.push(("total_memories".into(), total.to_string()));
+                facts.push((field_names::TOTAL_MEMORIES.into(), total.to_string()));
             }
             if let Some(exp) = v.get("expiring_soon").and_then(Value::as_u64) {
                 facts.push(("expiring_within_1h".into(), exp.to_string()));
@@ -1308,7 +1321,7 @@ fn section_storage_remote(stats_url: &str) -> ReportSection {
                 facts.push(("links".into(), links.to_string()));
             }
             facts.push((
-                "dim_violations".into(),
+                FACT_DIM_VIOLATIONS.into(),
                 "not_in_remote_response (P2 surface lands at /api/v1/stats)".into(),
             ));
         }

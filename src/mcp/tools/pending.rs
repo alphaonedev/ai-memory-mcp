@@ -3,7 +3,9 @@
 
 //! MCP pending-approval handlers and decision recording.
 
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
+use crate::models::field_names;
 use crate::{db, validate};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -39,11 +41,10 @@ impl McpTool for PendingListTool {
         "Task 1.9: list governance-queued actions. status filter (default pending). Limit cap 1000."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PendingListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PendingListRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -74,11 +75,10 @@ impl McpTool for PendingApproveTool {
         "Task 1.9 approve. decided_by = caller. K10: remember (once|session|forever) writes a synthetic permit rule."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PendingApproveRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PendingApproveRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -109,11 +109,10 @@ impl McpTool for PendingRejectTool {
         "Task 1.9 reject. decided_by = caller. K10: remember writes a synthetic deny rule."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(PendingRejectRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<PendingRejectRequest>()
     }
     fn family() -> &'static str {
-        "governance"
+        crate::profile::Family::Governance.name()
     }
 }
 
@@ -127,10 +126,13 @@ pub fn handle_subscription_dlq_list(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let subscription_id = params["subscription_id"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
-        .unwrap_or(100)
-        .clamp(1, 1000);
+    let subscription_id = params[param_names::SUBSCRIPTION_ID].as_str();
+    let limit = params["limit"]
+        .as_u64()
+        .map_or(crate::storage::PENDING_DEFAULT_PAGE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        })
+        .clamp(1, crate::storage::LIST_MAX_LIMIT);
 
     // v0.7.0 #1118 (SR-1 #6, HIGH) — caller-ownership gate.
     //
@@ -161,7 +163,7 @@ pub fn handle_subscription_dlq_list(
             // not-found.
             return Ok(json!({
                 "count": 0,
-                "subscription_id": subscription_id,
+                (field_names::SUBSCRIPTION_ID): subscription_id,
                 "limit": limit,
                 "entries": Vec::<Value>::new(),
             }));
@@ -200,7 +202,7 @@ pub fn handle_subscription_dlq_list(
     }
     Ok(json!({
         "count": rows.len(),
-        "subscription_id": subscription_id,
+        (field_names::SUBSCRIPTION_ID): subscription_id,
         "limit": limit,
         "entries": rows,
     }))
@@ -211,9 +213,12 @@ pub(super) fn handle_pending_list(
     params: &Value,
 ) -> Result<Value, String> {
     let status = params["status"].as_str();
-    let limit = usize::try_from(params["limit"].as_u64().unwrap_or(100))
-        .unwrap_or(usize::MAX)
-        .min(1000);
+    let limit = params["limit"]
+        .as_u64()
+        .map_or(crate::storage::PENDING_DEFAULT_PAGE_LIMIT, |v| {
+            usize::try_from(v).unwrap_or(usize::MAX)
+        })
+        .min(crate::storage::LIST_MAX_LIMIT);
     let items = db::list_pending_actions(conn, status, limit).map_err(|e| e.to_string())?;
     Ok(json!({"count": items.len(), "pending": items}))
 }
@@ -297,7 +302,9 @@ pub fn handle_pending_approve(
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     use crate::db::ApproveOutcome;
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;
@@ -313,7 +320,7 @@ pub fn handle_pending_approve(
         "allow",
         "pending_approve",
         "",
-        json!({ "pending_id": id }),
+        json!({ (field_names::PENDING_ID): id }),
     );
 
     match db::approve_with_approver_type(conn, id, &agent_id).map_err(|e| e.to_string())? {
@@ -324,7 +331,7 @@ pub fn handle_pending_approve(
             Ok(json!({
                 "approved": true,
                 "id": id,
-                "decided_by": agent_id,
+                (field_names::DECIDED_BY): agent_id,
                 "executed": true,
                 "memory_id": executed,
                 "remember": match remember {
@@ -340,9 +347,9 @@ pub fn handle_pending_approve(
             "id": id,
             "votes": votes,
             "quorum": quorum,
-            "reason": "consensus threshold not yet reached",
+            "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
         })),
-        ApproveOutcome::Rejected(reason) => Err(format!("approve rejected: {reason}")),
+        ApproveOutcome::Rejected(reason) => Err(crate::errors::msg::approve_rejected(reason)),
     }
 }
 
@@ -384,11 +391,10 @@ impl McpTool for SubscriptionDlqListTool {
         "K7: DLQ inspector."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(SubscriptionDlqListRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<SubscriptionDlqListRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 
@@ -699,7 +705,9 @@ pub fn handle_pending_reject(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params["id"].as_str().ok_or("id is required")?;
+    let id = params["id"]
+        .as_str()
+        .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;

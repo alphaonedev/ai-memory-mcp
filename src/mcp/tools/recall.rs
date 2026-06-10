@@ -5,6 +5,7 @@
 
 use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
+use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
@@ -43,11 +44,10 @@ impl McpTool for RecallTool {
         "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller)."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(RecallRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<RecallRequest>()
     }
     fn family() -> &'static str {
-        "core"
+        crate::profile::Family::Core.name()
     }
 }
 
@@ -204,7 +204,9 @@ pub async fn handle_recall_with_pre_recall_hook(
 ) -> Result<Value, String> {
     // Resolve the (query, namespace, k) triple once so the hook
     // sees exactly what the recall would see.
-    let context = params["context"].as_str().ok_or("context is required")?;
+    let context = params["context"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTEXT_REQUIRED)?;
     let namespace = params["namespace"].as_str().unwrap_or("");
     let k = u32::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(u32::MAX);
 
@@ -309,7 +311,9 @@ pub(crate) fn decorate_memory(
     };
     obj.insert(
         "score".to_string(),
-        json!((score * 1000.0).round() / 1000.0),
+        json!(
+            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round() / crate::SCORE_DISPLAY_ROUND_FACTOR
+        ),
     );
     if !verbose_provenance {
         return val;
@@ -540,7 +544,10 @@ pub fn decorate_memory_many(
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert(
                         "score".to_string(),
-                        json!((score * 1000.0).round() / 1000.0),
+                        json!(
+                            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                / crate::SCORE_DISPLAY_ROUND_FACTOR
+                        ),
                     );
                 }
                 val
@@ -557,7 +564,10 @@ pub fn decorate_memory_many(
             };
             obj.insert(
                 "score".to_string(),
-                json!((score * 1000.0).round() / 1000.0),
+                json!(
+                    (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                        / crate::SCORE_DISPLAY_ROUND_FACTOR
+                ),
             );
             obj.insert(
                 "confidence_tier".to_string(),
@@ -590,7 +600,7 @@ fn record_recall_observations(
     let mut candidates: Vec<observations::Candidate<'_>> = Vec::with_capacity(memories_json.len());
     let mut id_holders: Vec<&str> = Vec::with_capacity(memories_json.len());
     for (idx, m) in memories_json.iter().enumerate() {
-        if let Some(id) = m.get("id").and_then(Value::as_str) {
+        if let Some(id) = m.get(param_names::ID).and_then(Value::as_str) {
             id_holders.push(id);
             let score = m.get("score").and_then(Value::as_f64).unwrap_or(0.0);
             #[allow(clippy::cast_possible_wrap)]
@@ -789,7 +799,7 @@ pub fn handle_recall_dto(
     let _ = db::gc_if_needed(conn, archive_on_gc);
     let context = req.context.as_str();
     if context.is_empty() {
-        return Err("context is required".to_string());
+        return Err(crate::errors::msg::CONTEXT_REQUIRED.to_string());
     }
     // v0.7.0 (issue #518) — when the caller passed
     // `session_default=true` AND a given filter axis is absent,
@@ -955,7 +965,8 @@ pub fn handle_recall_dto(
         // Round blend_weight to 3 decimals — matches the score field
         // precision and keeps the wire shape stable regardless of f64
         // representation jitter.
-        let blend_weight = (telemetry.blend_weight_avg * 1000.0).round() / 1000.0;
+        let blend_weight = (telemetry.blend_weight_avg * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+            / crate::SCORE_DISPLAY_ROUND_FACTOR;
         let meta = RecallMeta {
             recall_mode: recall_mode.to_string(),
             reranker_used: reranker_used.to_string(),
@@ -1047,12 +1058,17 @@ pub fn handle_recall_dto(
                         session_tracker,
                     );
                     let memories = scored_memories(ce_reranked, conn);
-                    record_recall_observations(conn, &recall_id, &memories, "hybrid+rerank");
+                    record_recall_observations(
+                        conn,
+                        &recall_id,
+                        &memories,
+                        crate::models::RECALL_MODE_HYBRID_RERANK,
+                    );
                     let mut resp = json!({
                         "recall_id": recall_id,
                         "memories": memories,
                         "count": memories.len(),
-                        "mode": "hybrid+rerank",
+                        "mode": crate::models::RECALL_MODE_HYBRID_RERANK,
                     });
                     decorate_budget(&mut resp, &outcome);
                     attach_meta(&mut resp, "hybrid", &telemetry);

@@ -8,6 +8,7 @@
 //! fits the shape of the shipped code.
 
 use crate::models::ConfidenceSource;
+use crate::models::field_names;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -80,7 +81,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         let v: i64 = conn
             .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
                 [],
                 |row| row.get(0),
             )
@@ -546,7 +547,7 @@ impl MemoryStore for SqliteStore {
         // v0.7.0 #1079 — wrap the per-id decay-touch loop in a single
         // BEGIN/COMMIT pair so each id pays only the UPDATE cost.
         if crate::confidence::decay::decay_enabled() {
-            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE) {
                 tracing::warn!("decay-touch BEGIN failed: {e}");
             } else {
                 for id in ids {
@@ -554,9 +555,9 @@ impl MemoryStore for SqliteStore {
                         tracing::warn!("confidence decay touch failed for memory {id}: {e}");
                     }
                 }
-                if let Err(e) = conn.execute_batch("COMMIT") {
+                if let Err(e) = conn.execute_batch(crate::storage::connection::SQL_COMMIT) {
                     tracing::warn!("decay-touch COMMIT failed: {e}");
-                    let _ = conn.execute_batch("ROLLBACK");
+                    let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
                 }
             }
         }
@@ -642,7 +643,7 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<usize> {
         if namespace.is_none() && pattern.is_none() && tier.is_none() {
             return Err(StoreError::InvalidInput {
-                detail: "at least one of namespace, pattern, or tier is required".to_string(),
+                detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
             });
         }
         let conn = self.state.lock().await;
@@ -879,7 +880,7 @@ impl MemoryStore for SqliteStore {
         // honors the same convention so the wire shape is stable.
         if filter.source_id.is_none() && filter.link_id.is_none() {
             return Err(StoreError::InvalidInput {
-                detail: "verify_link requires either source_id or link_id".to_string(),
+                detail: crate::errors::msg::VERIFY_LINK_ARGS_REQUIRED.to_string(),
             });
         }
 
@@ -1036,7 +1037,7 @@ impl MemoryStore for SqliteStore {
                     match crate::identity::verify::verify(&pubkey, &signable, sig_bytes) {
                         Ok(()) => true,
                         Err(e) => {
-                            findings.push(format!("signature verify failed: {e}"));
+                            findings.push(crate::errors::msg::signature_verify_failed(e));
                             false
                         }
                     }
@@ -1250,7 +1251,7 @@ impl MemoryStore for SqliteStore {
         let priority = priority.unwrap_or(5);
         let metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
-            "target_agent_id": target_agent,
+            (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
         let mem = Memory {

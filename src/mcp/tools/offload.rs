@@ -22,6 +22,7 @@
 
 use serde_json::{Value, json};
 
+use crate::mcp::param_names;
 use crate::offload::{ContextOffloader, OffloadConfig};
 
 /// Resolve the namespace for an offload call. Falls back to
@@ -29,7 +30,7 @@ use crate::offload::{ContextOffloader, OffloadConfig};
 /// non-empty, audit-friendly bucket rather than a NULL violation.
 fn resolve_namespace(params: &Value) -> String {
     params
-        .get("namespace")
+        .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map_or_else(|| "auto".to_string(), str::to_string)
@@ -47,11 +48,11 @@ pub fn handle_offload(
     agent_id: &str,
 ) -> Result<Value, String> {
     let content = params
-        .get("content")
+        .get(param_names::CONTENT)
         .and_then(Value::as_str)
-        .ok_or("content is required")?;
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
     let namespace = resolve_namespace(params);
-    let ttl_seconds = params.get("ttl_seconds").and_then(Value::as_u64);
+    let ttl_seconds = params.get(param_names::TTL_SECONDS).and_then(Value::as_u64);
 
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
@@ -59,7 +60,7 @@ pub fn handle_offload(
         .map_err(|e| e.to_string())?;
     Ok(json!({
         "ref_id": result.ref_id,
-        "content_sha256": result.content_sha256,
+        (crate::models::field_names::CONTENT_SHA256): result.content_sha256,
         "stored_at": result.stored_at,
         "namespace": namespace,
     }))
@@ -131,11 +132,10 @@ impl McpTool for OffloadTool {
         "QW-3 follow-up: store verbatim in offloaded_blobs. Returns {ref_id, content_sha256, stored_at}. Dereference via memory_deref. Semantic+ tier."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(OffloadRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<OffloadRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 
@@ -162,11 +162,10 @@ impl McpTool for DerefTool {
         "QW-3 follow-up: sha256-verified lookup. Returns {ref_id, content, stored_at, sha256}. Refuses tampered rows. Semantic+ tier."
     }
     fn input_schema() -> Value {
-        let schema = schemars::schema_for!(DerefRequest);
-        serde_json::to_value(schema).expect("schemars schema must serialize to Value")
+        crate::mcp::registry::input_schema_for::<DerefRequest>()
     }
     fn family() -> &'static str {
-        "power"
+        crate::profile::Family::Power.name()
     }
 }
 

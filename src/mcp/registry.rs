@@ -455,7 +455,30 @@ pub trait McpTool {
     /// Family tag (one of `core` / `lifecycle` / `graph` /
     /// `governance` / `power` / `meta` / `archive` / `other`) used by
     /// [`Profile::loads`] for per-profile filtering on `tools/list`.
+    /// Impls return `crate::profile::Family::<Variant>.name()` so the
+    /// taxonomy has exactly one spelling site (#1558 batch 4).
     fn family() -> &'static str;
+}
+
+/// Derive a tool's `input_schema` JSON value from its request struct —
+/// the one place the schemars→`Value` conversion (and its expect
+/// message) lives, instead of per-impl copies at every `McpTool`
+/// (#1558 batch 4; pre-sweep the expect string was duplicated at 74
+/// sites).
+///
+/// # Panics
+///
+/// Panics if the derived schema fails to serialize to a
+/// `serde_json::Value` — impossible for schemars-generated schemas;
+/// a panic here means a schemars regression, caught at `tools/list`
+/// time in every test run.
+/// The one spelling of the schema-serialization expect message —
+/// pre-#1558 this string was duplicated at 74 `input_schema()` sites.
+const SCHEMA_TO_VALUE_EXPECT: &str = "schemars schema must serialize to Value";
+
+#[must_use]
+pub fn input_schema_for<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect(SCHEMA_TO_VALUE_EXPECT)
 }
 
 // --- v0.7.0 #972 D1.6 (#987) — registered_tools() iterator ---
