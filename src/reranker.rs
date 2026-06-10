@@ -1027,6 +1027,35 @@ pub const DEFAULT_MAX_BATCH: usize = 32;
 /// negligible while still benefiting parallel callers.
 pub const DEFAULT_MAX_WAIT_MS: u64 = 5;
 
+/// #1579 B10 — minimum number of in-flight rerank requests (including
+/// the current one) before [`BatchedReranker::rerank`] routes through
+/// the coalescing worker on a *neural* encoder. Below this threshold
+/// there is nothing to coalesce WITH: the lone caller pays the worker
+/// channel round-trip plus up to [`DEFAULT_MAX_WAIT_MS`] of flush-window
+/// wait for zero amortisation gain.
+///
+/// **Criterion evidence (perf-audit P1, 2026-06, `cargo bench --bench
+/// reranker_throughput`, lexical default):** at N=8 concurrent queries
+/// × 10 candidates the batched path measured ~7.6 ms vs ~0.65 ms direct
+/// — 12× SLOWER, because the per-batch flush window (5 ms) dwarfs the
+/// sub-millisecond lexical compute. The lexical variant therefore NEVER
+/// routes through the worker (it holds no shared-model mutex, so
+/// coalescing has nothing to amortise at ANY N — see
+/// [`BatchedReranker::rerank`]); the neural variant keeps the batched
+/// path at concurrency ≥ this threshold, where the G9 measurement
+/// showed ~3× throughput gain from holding the BERT mutex once per
+/// batch instead of once per (query, candidate).
+pub const BATCHED_RERANK_MIN_CONCURRENCY: usize = 2;
+
+/// #1579 B10 — the auto-select predicate, extracted as a free function
+/// so the threshold arithmetic is unit-testable without standing up a
+/// worker thread or downloading model weights. `true` ⇒ route through
+/// the coalescing worker; `false` ⇒ direct encoder call.
+#[must_use]
+pub const fn use_batched_rerank_path(encoder_is_neural: bool, inflight_now: usize) -> bool {
+    encoder_is_neural && inflight_now >= BATCHED_RERANK_MIN_CONCURRENCY
+}
+
 /// Job submitted to the coalescer worker.
 struct RerankJob {
     query: String,
@@ -1080,6 +1109,16 @@ pub struct BatchedReranker {
     /// 0.363) opt in via [`Self::with_score_floor`] to drop the
     /// low-confidence tail entirely.
     score_floor: RerankerScoreFloor,
+    /// #1579 B10 — number of rerank requests currently inside
+    /// [`Self::rerank`] (incremented on entry, decremented on exit).
+    /// Drives the auto-select between the direct encoder call and the
+    /// coalescing worker; see [`use_batched_rerank_path`].
+    inflight: std::sync::atomic::AtomicUsize,
+    /// #1579 B10 — observability counter: how many jobs this wrapper
+    /// has submitted to the coalescing worker over its lifetime. The
+    /// auto-select regression tests pin "lexical / lone-caller traffic
+    /// never reaches the worker" on this counter.
+    worker_submissions: std::sync::atomic::AtomicUsize,
 }
 
 /// v0.7.0 #1319 — post-blend score floor applied by [`BatchedReranker`].
@@ -1311,12 +1350,26 @@ impl BatchedReranker {
             encoder,
             reflection_boost,
             score_floor,
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            worker_submissions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Submit a single rerank request. Blocks until the batcher returns
-    /// the result. Concurrent callers are coalesced into a single
-    /// `rerank_batch` call inside the worker thread.
+    /// Submit a single rerank request. Blocks until the result is
+    /// available.
+    ///
+    /// #1579 B10 — **auto-select.** The wrapper keeps BOTH execution
+    /// paths and picks per call via [`use_batched_rerank_path`]:
+    ///
+    /// - **Direct** (no worker round-trip) when the encoder is
+    ///   lexical / degraded-lexical (no shared-model mutex to
+    ///   amortise — criterion proved the coalescing flush window made
+    ///   the batched path 12× slower at N=8: ~7.6 ms vs ~0.65 ms), or
+    ///   when fewer than [`BATCHED_RERANK_MIN_CONCURRENCY`] requests
+    ///   are in flight (nothing to coalesce with).
+    /// - **Coalesced** (worker thread, one `rerank_batch` per flush)
+    ///   for neural encoders under real concurrency — the G9 win
+    ///   (~3× at N=8 neural) is preserved.
     ///
     /// If the worker is unavailable for any reason (channel closed),
     /// falls back to a direct `rerank` call on the underlying encoder
@@ -1330,18 +1383,70 @@ impl BatchedReranker {
         scored
     }
 
+    /// #1579 B10 — force the COALESCED (worker) path regardless of the
+    /// auto-select. Kept public so the throughput bench
+    /// (`benches/reranker_throughput.rs`) and regression tests can keep
+    /// measuring the raw batched machinery after `rerank` started
+    /// auto-selecting away from it at small N. Applies the same
+    /// post-blend score floor as [`Self::rerank`].
+    #[must_use]
+    pub fn rerank_coalesced(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+    ) -> Vec<(Memory, f64)> {
+        let mut scored = self.rerank_coalesced_unfloored(query, candidates);
+        self.score_floor.apply(&mut scored);
+        scored
+    }
+
     /// Internal — same shape as [`Self::rerank`] but skips the
     /// post-blend score floor. Pre-#1319 callsites that explicitly
     /// want the raw blended output (regression tests, the byte-equal
     /// pin in `g9_batched_reranker_serial_calls_match_rerank`) call
     /// this directly.
     fn rerank_unfloored(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        use std::sync::atomic::Ordering;
+        // #1579 B10 — RAII in-flight guard so a panicking encoder call
+        // can't leak the counter and wedge the auto-select high.
+        struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let inflight_now = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InflightGuard(&self.inflight);
+
+        if use_batched_rerank_path(self.encoder.is_neural(), inflight_now) {
+            self.rerank_coalesced_unfloored(query, candidates)
+        } else {
+            self.rerank_direct_unfloored(query, candidates)
+        }
+    }
+
+    /// #1579 B10 — the DIRECT path: one synchronous encoder call on the
+    /// caller's thread, no worker round-trip, no flush-window wait.
+    fn rerank_direct_unfloored(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+    ) -> Vec<(Memory, f64)> {
+        self.encoder
+            .rerank_with_reflection_boost(query, candidates, &self.reflection_boost)
+    }
+
+    /// The COALESCED path: submit to the worker thread and block for
+    /// the reply. Concurrent callers are coalesced into a single
+    /// `rerank_batch` call inside the worker. (Pre-#1579-B10 this was
+    /// the body of `rerank_unfloored`.)
+    fn rerank_coalesced_unfloored(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+    ) -> Vec<(Memory, f64)> {
         let Some(sender) = self.sender.as_ref() else {
-            return self.encoder.rerank_with_reflection_boost(
-                query,
-                candidates,
-                &self.reflection_boost,
-            );
+            return self.rerank_direct_unfloored(query, candidates);
         };
         let (reply_tx, reply_rx) = sync_channel::<Vec<(Memory, f64)>>(1);
         let job = RerankJob {
@@ -1356,10 +1461,22 @@ impl BatchedReranker {
                 &self.reflection_boost,
             );
         }
+        self.worker_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         reply_rx.recv().unwrap_or_else(|_| {
             self.encoder
                 .rerank_with_reflection_boost(query, Vec::new(), &self.reflection_boost)
         })
+    }
+
+    /// #1579 B10 — lifetime count of jobs submitted to the coalescing
+    /// worker. Observability hook for the auto-select regression tests
+    /// ("lexical traffic never reaches the worker") and operator
+    /// diagnostics.
+    #[must_use]
+    pub fn worker_submissions(&self) -> usize {
+        self.worker_submissions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// v0.7.0 #1319 — expose the configured score floor for the
@@ -2054,6 +2171,95 @@ mod tests {
         }
         for h in handles {
             h.join().expect("worker thread panicked");
+        }
+    }
+
+    /// #1579 B10 — the auto-select predicate: lexical NEVER batches
+    /// (criterion: batched 7.6 ms vs direct 0.65 ms at N=8 — 12×
+    /// inversion from the flush window); neural batches only at
+    /// concurrency ≥ `BATCHED_RERANK_MIN_CONCURRENCY`.
+    #[test]
+    fn issue_1579_b10_auto_select_predicate() {
+        use super::{BATCHED_RERANK_MIN_CONCURRENCY, use_batched_rerank_path};
+        // Lexical: direct at every concurrency level.
+        assert!(!use_batched_rerank_path(false, 1));
+        assert!(!use_batched_rerank_path(false, 8));
+        assert!(!use_batched_rerank_path(false, 1024));
+        // Neural: lone caller goes direct (nothing to coalesce with)…
+        assert!(!use_batched_rerank_path(true, 1));
+        // …real concurrency keeps the G9 batched win.
+        assert!(use_batched_rerank_path(
+            true,
+            BATCHED_RERANK_MIN_CONCURRENCY
+        ));
+        assert!(use_batched_rerank_path(true, 8));
+    }
+
+    /// #1579 B10 — behavioral pin: a lexical `BatchedReranker` routes
+    /// every call (serial AND concurrent) down the DIRECT path; the
+    /// coalescing worker never sees a job. Pre-fix, all 8 concurrent
+    /// lexical calls funneled through the worker and paid the 5 ms
+    /// flush window per batch.
+    #[test]
+    fn issue_1579_b10_lexical_rerank_never_reaches_worker() {
+        use super::BatchedReranker;
+        use std::sync::Arc;
+        let batched = Arc::new(BatchedReranker::new(CrossEncoder::new()));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let b = Arc::clone(&batched);
+            handles.push(std::thread::spawn(move || {
+                let cands: Vec<(Memory, f64)> = (0..5)
+                    .map(|j| {
+                        (
+                            make_memory(&format!("b10-{i}-{j}"), &format!("body {j} alpha gamma")),
+                            0.5,
+                        )
+                    })
+                    .collect();
+                let out = b.rerank(&format!("alpha {i}"), cands);
+                assert_eq!(out.len(), 5);
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        assert_eq!(
+            batched.worker_submissions(),
+            0,
+            "lexical rerank must auto-select the direct path (no worker jobs)"
+        );
+    }
+
+    /// #1579 B10 — the forced coalesced path stays alive (both paths
+    /// are kept per the remediation contract) and produces output
+    /// byte-equal to the direct path on a lexical encoder.
+    #[test]
+    fn issue_1579_b10_forced_coalesced_path_matches_direct() {
+        use super::BatchedReranker;
+        let batched = BatchedReranker::new(CrossEncoder::new());
+        let cands: Vec<(Memory, f64)> = (0..4)
+            .map(|i| {
+                (
+                    make_memory(
+                        &format!("b10-forced-{i}"),
+                        &format!("alpha gamma body {i} content words"),
+                    ),
+                    f64::from(i) * 0.1,
+                )
+            })
+            .collect();
+        let direct = batched.rerank("alpha", cands.clone());
+        let coalesced = batched.rerank_coalesced("alpha", cands);
+        assert_eq!(
+            batched.worker_submissions(),
+            1,
+            "rerank_coalesced must route through the worker"
+        );
+        assert_eq!(coalesced.len(), direct.len());
+        for (a, b) in coalesced.iter().zip(direct.iter()) {
+            assert_eq!(a.0.id, b.0.id);
+            assert!((a.1 - b.1).abs() < 1e-12);
         }
     }
 
