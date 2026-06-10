@@ -174,19 +174,29 @@ are called out explicitly below.
   cross-region quorum pushes hit `deadline_exceeded` → DLQ (do-1461
   finding). Cross-region meshes need **5000-10000 ms**; the reference
   3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000`
-  (`deploy/do-1461/provision/lib.sh` carries the rationale — the
-  receiver's embed-on-receive after a dimension migration can add
-  ~1 s/row, see #1566 below). Raising the deadline is safe: the write
+  (`deploy/do-1461/provision/lib.sh` carries the rationale — written
+  when the receiver's embed-on-receive after a dimension migration
+  could add ~1 s/row; that cost no longer rides the ack window, see
+  #1566 below). Raising the deadline is safe: the write
   commits locally first, so a longer remote-ack wait widens only the
   synchronous-durability gate, never the local commit. WAN guidance
   documented in `docs/federation.md` §Tuning,
   `docs/ADR-0001-quorum-replication.md`, and
   `docs/TROUBLESHOOTING.md`.
 - **[#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)**
-  — an embedding-dimension migration NULLs stored vectors, so
-  receivers synchronously re-embed on federation receive (~1 s/row),
-  inflating quorum latency + DLQ pressure during the backfill window.
-  Plan dimension changes as a maintenance window on federated fleets.
+  — **fixed pre-tag under #1579 B1 (embed-once-replicate-vector +
+  ack-after-commit).** Pre-fix, receivers synchronously re-embedded
+  every federation-received row (~1 s/row) inside the sender's
+  quorum-ack window — after an embedding-dimension migration this
+  inflated quorum latency + DLQ pressure fleet-wide. Now the push
+  payload ships the sender's embedding vector inside the
+  Ed25519-signed body (optional `embeddings` field; older peers
+  interoperate), dim-matching receivers store it directly, and rows
+  without a usable shipped vector are embedded by a background task
+  after the ack. Companion #1579 B5: persistent pooled outbound
+  federation connections (5-min idle pool, 60 s TCP keepalive, error
+  bodies drained for connection reuse) + adaptive DLQ replay batching
+  (`AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH`, default cap 2048, floor 64).
 
 ## Known operational postures at v0.7.0 ([#1531](https://github.com/alphaonedev/ai-memory-mcp/issues/1531) residual round, 2026-06-09)
 

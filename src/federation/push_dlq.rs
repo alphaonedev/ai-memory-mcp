@@ -138,7 +138,9 @@ pub trait FederationDlqSink: Send + Sync {
 /// Runs alongside the catchup loop (also in `daemon_runtime`). Every
 /// `interval` ticks it:
 ///
-/// 1. Reads up to `REPLAY_BATCH_SIZE` pending rows from the sink.
+/// 1. Reads up to `backlog.clamp(REPLAY_BATCH_SIZE, replay_max_batch())`
+///    pending rows from the sink (#1579 B5 adaptive batch — the
+///    fixed-64 take capped bulk drains at 128 rows/min/peer).
 /// 2. For each row, attempts `post_once` against the matching peer's
 ///    `sync_push_url`. On `AckOutcome::Ack` it stamps `replayed_at`
 ///    via `mark_dlq_row_replayed`. On any other outcome it bumps the
@@ -173,12 +175,56 @@ pub fn spawn_replay_federation_push_dlq(
     })
 }
 
-/// Default batch size for one replay tick. Tuned high enough to drain
-/// a steady-state backlog quickly (a peer down for an hour with a
+/// Baseline batch size for one replay tick — also the floor of the
+/// #1579 B5 adaptive batch below. Tuned high enough to drain a
+/// steady-state backlog quickly (a peer down for an hour with a
 /// 100/min ingest rate accumulates ~6000 rows) but low enough that a
 /// single tick won't monopolise the runtime if every replay attempt
 /// itself succeeds against a peer that's now healthy.
 pub const REPLAY_BATCH_SIZE: usize = 64;
+
+/// #1579 B5 — env knob naming the upper cap of the adaptive replay
+/// batch. The fixed 64-row tick gave a drain ceiling of 128 rows/min/
+/// peer at the 30s cadence — a 62k-row backlog (the #1578 event) took
+/// 8+ hours to drain. The worker now scales the per-tick take to
+/// `backlog.clamp(REPLAY_BATCH_SIZE, cap)`; this env var overrides the
+/// compiled cap ([`DEFAULT_REPLAY_MAX_BATCH`]). Zero / garbage values
+/// fall through to the default (house style — a stray `0` can never
+/// wedge the drain). Quarantine semantics (`MAX_REPLAY_ATTEMPTS`, the
+/// #1578 `attempt_count` take-exclusion) are unchanged.
+pub const ENV_FED_DLQ_REPLAY_MAX_BATCH: &str = "AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH";
+
+/// #1579 B5 — compiled default for the adaptive replay-batch cap.
+/// 2048 rows/tick at the default 30s cadence = ~4096 rows/min/peer
+/// bulk-drain ceiling (vs the fixed-64 ceiling of 128/min), while
+/// bounding per-tick memory: DLQ payloads are single-memory push
+/// bodies (KB-scale), so a full cap-sized take stays in the low tens
+/// of MB even on a 62k-row backlog.
+pub const DEFAULT_REPLAY_MAX_BATCH: usize = 2048;
+
+/// #1579 B5 — resolve the adaptive replay-batch cap: env override
+/// ([`ENV_FED_DLQ_REPLAY_MAX_BATCH`]) > compiled default. Values that
+/// fail to parse, are zero, or undercut the [`REPLAY_BATCH_SIZE`]
+/// floor fall through to the default with a warn — the cap may never
+/// shrink the worker below its historical fixed batch.
+#[must_use]
+pub fn replay_max_batch() -> usize {
+    match std::env::var(ENV_FED_DLQ_REPLAY_MAX_BATCH) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) if v >= REPLAY_BATCH_SIZE => v,
+            _ => {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    raw = %raw,
+                    "ignoring {ENV_FED_DLQ_REPLAY_MAX_BATCH}={raw} (must be an integer >= \
+                     {REPLAY_BATCH_SIZE}); using default {DEFAULT_REPLAY_MAX_BATCH}"
+                );
+                DEFAULT_REPLAY_MAX_BATCH
+            }
+        },
+        Err(_) => DEFAULT_REPLAY_MAX_BATCH,
+    }
+}
 
 /// #1032 (HIGH, 2026-05-21) — quarantine threshold for DLQ rows.
 ///
@@ -207,7 +253,27 @@ pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
 /// `tests/federation_dlq_replay.rs` can advance the worker manually
 /// without waiting on the `tokio::time::sleep` cadence.
 pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink) {
-    let rows = match sink.take_pending_dlq_rows(REPLAY_BATCH_SIZE).await {
+    // #1579 B5 — adaptive drain batch. Scale the per-tick take with
+    // the live backlog (`min(backlog, configurable cap)`, floored at
+    // the historical REPLAY_BATCH_SIZE) so a bulk backlog drains at
+    // thousands of rows/min instead of the fixed-64 ceiling of
+    // 128/min, while an idle queue keeps paying exactly one small
+    // SELECT per tick. A count error degrades to the legacy fixed
+    // batch — the worker stays best-effort.
+    let batch = match sink.pending_dlq_count().await {
+        Ok(backlog) => usize::try_from(backlog)
+            .unwrap_or(REPLAY_BATCH_SIZE)
+            .clamp(REPLAY_BATCH_SIZE, replay_max_batch()),
+        Err(e) => {
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                "replay_federation_push_dlq: pending count failed ({e}); \
+                 using fixed batch {REPLAY_BATCH_SIZE}"
+            );
+            REPLAY_BATCH_SIZE
+        }
+    };
+    let rows = match sink.take_pending_dlq_rows(batch).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(

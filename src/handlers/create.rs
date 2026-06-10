@@ -545,6 +545,21 @@ async fn fanout_and_assemble_create_response(
     contradiction_ids: Vec<String>,
     embed_status: EmbedStatus,
 ) -> axum::response::Response {
+    // #1566 / #1579 B1 — embed-once-replicate-vector: capture the
+    // just-computed vector for the federation fanout BEFORE the HNSW
+    // warm-up consumes it. Shipping it inside the signed push payload
+    // lets dim-matching receivers store it directly instead of
+    // re-embedding (~1s/row via ollama, up to 9× per memory across the
+    // fleet pre-#1566). `None` (keyword tier / embed-degraded store)
+    // keeps the pre-#1566 wire bytes.
+    let shipped = match (&embedding, app.embedder.as_ref().as_ref()) {
+        (Some(vec), Some(emb)) => Some(crate::federation::ShippedEmbedding::new(
+            actual_id.to_string(),
+            emb.model_description().to_string(),
+            vec.clone(),
+        )),
+        _ => None,
+    };
     // HNSW warm-up after the DB lock dropped (done by the caller).
     if let Some(vec) = embedding {
         let mut idx_lock = app.vector_index.lock().await;
@@ -634,7 +649,14 @@ async fn fanout_and_assemble_create_response(
     if let Some(fed) = app.federation.as_ref() {
         let mut mem_echo = mem.clone();
         mem_echo.id = actual_id.to_string();
-        match crate::federation::broadcast_store_quorum(fed, &mem_echo).await {
+        // #1566 / #1579 B1 — ship the source vector with the push.
+        match crate::federation::broadcast_store_quorum_with_embedding(
+            fed,
+            &mem_echo,
+            shipped.as_ref(),
+        )
+        .await
+        {
             Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
                 Ok(got) => {
                     response["quorum_acks"] = json!(got);
@@ -871,9 +893,24 @@ async fn create_memory_postgres(
                 "create_memory_postgres: pipelining broadcast_store_quorum with local write",
             );
             let mem_echo = mem.clone();
+            // #1566 / #1579 B1 — ship the source vector with the push
+            // (embed-once-replicate-vector; postgres twin of the
+            // sqlite fanout in `fanout_and_assemble_create_response`).
+            let shipped = match (&embedding, app.embedder.as_ref().as_ref()) {
+                (Some(vec), Some(emb)) => Some(crate::federation::ShippedEmbedding::new(
+                    mem.id.clone(),
+                    emb.model_description().to_string(),
+                    vec.clone(),
+                )),
+                _ => None,
+            };
             let (store_res, quorum_res) = tokio::join!(
                 store_fut,
-                crate::federation::broadcast_store_quorum(fed, &mem_echo)
+                crate::federation::broadcast_store_quorum_with_embedding(
+                    fed,
+                    &mem_echo,
+                    shipped.as_ref(),
+                )
             );
             // Local durability gates everything: a failed local write
             // returns the store error and DISCARDS the already-in-flight

@@ -184,7 +184,20 @@ pub(super) async fn post_once(
                 Err(_) => AckOutcome::Ack, // body unparseable but 2xx = ack
             }
         }
-        Ok(resp) => AckOutcome::Fail(format!("http {}", resp.status())),
+        Ok(resp) => {
+            // #1579 B5 — drain the error body before classifying the
+            // failure so hyper can return the pooled connection to the
+            // keep-alive pool. Dropping a `Response` with an unread
+            // body tears the connection down, and the next POST to the
+            // same peer pays a fresh mTLS handshake (~4.3×RTT measured
+            // on do-1461 — the mechanism behind the 0.3s/row serial
+            // DLQ-replay floor during error regimes like the #1578
+            // 429 era). The body is small (a JSON error envelope) and
+            // already in flight; reading it is microseconds.
+            let status = resp.status();
+            let _ = resp.bytes().await;
+            AckOutcome::Fail(format!("http {status}"))
+        }
         Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
     }
 }
@@ -292,6 +305,28 @@ pub async fn broadcast_store_quorum(
     config: &FederationConfig,
     mem: &Memory,
 ) -> Result<AckTracker, QuorumError> {
+    broadcast_store_quorum_with_embedding(config, mem, None).await
+}
+
+/// #1566 / #1579 B1 — [`broadcast_store_quorum`] variant that ships
+/// the source-side embedding vector alongside the memory row
+/// (embed-once-replicate-vector). When `shipped` is `Some`, the push
+/// body carries an `embeddings: [ShippedEmbedding]` array INSIDE the
+/// signed payload so dim-matching receivers store the vector directly
+/// instead of re-embedding (~1s/row via ollama, paid up to 9× across
+/// the fleet pre-#1566). `None` preserves the exact pre-#1566 wire
+/// bytes (no `embeddings` key at all) — older peers and embedder-less
+/// senders are unaffected.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` if the internal tracker Arc
+/// cannot be unwrapped (only occurs under a pathological detach race).
+pub async fn broadcast_store_quorum_with_embedding(
+    config: &FederationConfig,
+    mem: &Memory,
+    shipped: Option<&super::ShippedEmbedding>,
+) -> Result<AckTracker, QuorumError> {
     // #931 (v0.7.0 Track D, 2026-05-20) — entry-line debug + info
     // logs so the silent-bypass case where this function is never
     // called (e.g. `app.federation` resolves to `None` on a path
@@ -320,11 +355,17 @@ pub async fn broadcast_store_quorum(
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [mem],
         "dry_run": false,
     });
+    // #1566 / #1579 B1 — attach the shipped vector inside the signed
+    // body. Conditional insertion keeps the wire bytes IDENTICAL to
+    // the pre-#1566 shape when no vector is available.
+    if let Some(se) = shipped {
+        body[field_names::EMBEDDINGS] = serde_json::json!([se]);
+    }
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     // v0.7.0 Track D #933 — collect the set of peer ids that were
@@ -1542,8 +1583,19 @@ pub async fn bulk_catchup_push(
                 req = req.header(crate::federation::peer_attestation::PEER_ID_HEADER, peer_id);
             }
             let outcome = match req.send().await {
-                Ok(resp) if resp.status().is_success() => Ok(()),
-                Ok(resp) => Err(format!("http {}", resp.status())),
+                Ok(resp) if resp.status().is_success() => {
+                    // #1579 B5 — drain the (success) body so the
+                    // connection returns to the keep-alive pool.
+                    let _ = resp.bytes().await;
+                    Ok(())
+                }
+                Ok(resp) => {
+                    // #1579 B5 — same drain on the error arm; see
+                    // `post_once` for the fresh-handshake rationale.
+                    let status = resp.status();
+                    let _ = resp.bytes().await;
+                    Err(format!("http {status}"))
+                }
                 Err(e) => Err(crate::errors::msg::network(e)),
             };
             (id, outcome)
