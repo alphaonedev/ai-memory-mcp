@@ -245,3 +245,233 @@ fn create_memory_body_force_defaults_to_false() {
     let body2: CreateMemory = serde_json::from_value(raw_with_force).expect("parse");
     assert!(body2.force, "force=true round-trips");
 }
+
+// ---------------------------------------------------------------------------
+// #1579 A5 — false-409 regression + HNSW-routed candidate pool.
+// ---------------------------------------------------------------------------
+
+use ai_memory::hnsw::VectorIndex;
+use ai_memory::storage::{
+    PROACTIVE_CONFLICT_SCAN_LIMIT, proactive_conflict_check_candidates,
+    proactive_conflict_check_with_index,
+};
+
+/// Mirror of `loadtest::make_payload` — deterministic random-ish
+/// alphanumeric filler, the exact payload shape that produced the P2
+/// 81%-false-409 epidemic at semantic tier.
+fn noise_payload(bytes: usize, salt: u64) -> String {
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789 ";
+    let mut s = String::with_capacity(bytes);
+    let mut x = salt.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..bytes {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as usize % ALPHA.len();
+        s.push(ALPHA[idx] as char);
+    }
+    s
+}
+
+/// **The P2 false-409 reproduction.** Two UNRELATED documents whose
+/// embeddings the model happens to cluster above the 0.95 cosine
+/// threshold (the probe on the release MiniLM measured ~28% of noise
+/// PAIRS at >= 0.95, max 0.9722 — so at 1k rows essentially every
+/// write found such a "near-duplicate") must NOT be classified as a
+/// conflict: their contents share no vocabulary, so nothing is being
+/// "restated". Pre-#1579 this returned `Some(..)` — the 409 the
+/// loadtest measured on 81% of semantic-tier writes.
+#[test]
+fn a5_1579_false_409_noise_near_duplicate_is_not_a_conflict() {
+    let conn = fresh_conn();
+    let existing = make_mem("lt-p2sem-0-40", &noise_payload(256, 1), "loadns");
+    // Caller-supplied embeddings simulate the model clustering: the
+    // two noise documents get the SAME vector (cosine 1.0 >= 0.95).
+    let emb = vec![0.6_f32, 0.8, 0.0];
+    insert_with_embedding(&conn, &existing, &emb);
+
+    let mut incoming = make_mem("lt-p2sem-0-41", &noise_payload(256, 2), "loadns");
+    incoming.id = uuid::Uuid::new_v4().to_string();
+    assert_ne!(existing.content, incoming.content, "payloads are distinct");
+
+    let conflict = proactive_conflict_check(&conn, &incoming, &emb).expect("check ok");
+    assert!(
+        conflict.is_none(),
+        "#1579 A5 regression: cosine-clustered noise with disjoint content \
+         tokens must NOT 409 (was the 81% false-409 epidemic); got {conflict:?}"
+    );
+}
+
+/// Counter-pin: a GENUINE restatement (high cosine AND shared content
+/// vocabulary) still conflicts — the Jaccard floor must not over-filter.
+#[test]
+fn a5_1579_genuine_restatement_still_conflicts() {
+    let conn = fresh_conn();
+    let existing = make_mem(
+        "migration-deadline",
+        "the deadline for the migration project is june 15",
+        "global",
+    );
+    let emb = vec![1.0_f32, 0.0, 0.0];
+    insert_with_embedding(&conn, &existing, &emb);
+
+    let mut incoming = make_mem(
+        "migration-deadline-v2",
+        "the deadline for the migration project is june 22",
+        "global",
+    );
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    let conflict = proactive_conflict_check(&conn, &incoming, &emb)
+        .expect("check ok")
+        .expect("real restatement must still 409");
+    assert_eq!(conflict.existing_title, "migration-deadline");
+}
+
+/// The fallback scan is BOUNDED: a near-duplicate older than the
+/// `PROACTIVE_CONFLICT_SCAN_LIMIT` most-recently-updated rows is
+/// outside the scan horizon (documented advisory miss — the write is
+/// ALLOWED), while the HNSW-routed path still finds it.
+#[test]
+fn a5_1579_bounded_scan_horizon_and_indexed_path() {
+    let conn = fresh_conn();
+    let ns = "bounded-ns";
+
+    // Oldest row: the genuine near-duplicate (identical embedding,
+    // shared-vocabulary differing content).
+    let old_conflict = make_mem("seed-fact", "service listens on port 9077", ns);
+    let conflict_emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+    let conflict_id = insert_with_embedding(&conn, &old_conflict, &conflict_emb);
+
+    // Bury it under LIMIT+8 newer embedded rows that are near-
+    // orthogonal to the query (they pass the recency horizon but not
+    // the cosine gate). The fillers get slightly-varied vectors —
+    // 1000+ byte-identical points would make the ANN graph
+    // degenerate, which is not the production shape.
+    let mut entries: Vec<(String, Vec<f32>)> = vec![(conflict_id.clone(), conflict_emb.clone())];
+    for i in 0..(PROACTIVE_CONFLICT_SCAN_LIMIT + 8) {
+        #[allow(clippy::cast_precision_loss)]
+        let jitter = (i as f32).mul_add(0.000_1, 0.01);
+        let raw = [0.0_f32, 1.0, jitter, 0.0];
+        let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let filler_emb: Vec<f32> = raw.iter().map(|v| v / norm).collect();
+        let filler = make_mem(&format!("filler-{i}"), &format!("filler body {i}"), ns);
+        let fid = insert_with_embedding(&conn, &filler, &filler_emb);
+        entries.push((fid, filler_emb));
+    }
+
+    let mut incoming = make_mem("seed-fact-restated", "service listens on port 9099", ns);
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    // Bounded fallback: the conflict row fell off the recency horizon
+    // — the write is allowed (the documented safe-direction miss).
+    let scan_verdict = proactive_conflict_check(&conn, &incoming, &conflict_emb).expect("scan ok");
+    assert!(
+        scan_verdict.is_none(),
+        "bounded scan must not see beyond its recency horizon"
+    );
+
+    // HNSW-routed path: the ANN query surfaces the buried row.
+    let idx = VectorIndex::build(entries);
+    assert!(idx.is_fully_searchable());
+    let indexed_verdict =
+        proactive_conflict_check_with_index(&conn, &incoming, &conflict_emb, Some(&idx))
+            .expect("indexed ok")
+            .expect("indexed path must surface the buried near-duplicate");
+    assert_eq!(indexed_verdict.existing_id, conflict_id);
+}
+
+/// Namespace + liveness post-filters on the ANN candidate list: a
+/// cross-namespace or expired candidate id must not produce a verdict
+/// even when the index returned it.
+#[test]
+fn a5_1579_candidates_path_applies_namespace_and_liveness_filters() {
+    let conn = fresh_conn();
+    let emb = vec![1.0_f32, 0.0];
+
+    // Cross-namespace near-duplicate.
+    let foreign = make_mem("shared-fact", "the answer is 42", "ns-other");
+    let foreign_id = insert_with_embedding(&conn, &foreign, &emb);
+
+    // Expired in-namespace near-duplicate.
+    let mut expired = make_mem("shared-fact-x", "the answer is 41", "ns-mine");
+    expired.expires_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+    let expired_id = insert_with_embedding(&conn, &expired, &emb);
+
+    let mut incoming = make_mem("shared-fact-new", "the answer is 43", "ns-mine");
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    let verdict =
+        proactive_conflict_check_candidates(&conn, &incoming, &emb, &[foreign_id, expired_id])
+            .expect("candidates ok");
+    assert!(
+        verdict.is_none(),
+        "foreign-namespace + expired candidates must be filtered out"
+    );
+}
+
+/// Dispatch: an index that is NOT fully searchable (the async-boot
+/// warm window — entries seeded but no graph swapped in) must be
+/// bypassed in favour of the bounded scan, which still finds a recent
+/// in-namespace conflict.
+#[test]
+fn a5_1579_warm_window_falls_back_to_bounded_scan() {
+    let conn = fresh_conn();
+    let ns = "warm-ns";
+    let existing = make_mem("port-fact", "daemon binds port 9077 by default", ns);
+    let emb = vec![0.0_f32, 1.0, 0.0];
+    let existing_id = insert_with_embedding(&conn, &existing, &emb);
+
+    // Simulate the boot warm window: entries parked via seed_entries,
+    // no rebuild yet — search() cannot see them.
+    let idx = VectorIndex::empty();
+    idx.seed_entries(vec![(existing_id.clone(), emb.clone())]);
+    assert!(!idx.is_fully_searchable());
+
+    let mut incoming = make_mem("port-fact-2", "daemon binds port 9099 by default", ns);
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx))
+        .expect("ok")
+        .expect("warm-window fallback (bounded scan) must find the recent conflict");
+    assert_eq!(verdict.existing_id, existing_id);
+}
+
+/// #1579 QC — the async-boot LOAD phase, the sub-window BEFORE
+/// `seed_entries` lands: the daemon bound with `VectorIndex::empty()`
+/// while the boot loader is still reading the stored embeddings. An
+/// empty index is VACUOUSLY fully-searchable (`0 + 0 >= 0`), so
+/// gating on `is_fully_searchable` alone consulted the empty index,
+/// got zero candidates, and silently SKIPPED the conflict check —
+/// neither the indexed path nor the documented bounded-scan fallback.
+/// The dispatcher must treat empty as "no usable index" and route to
+/// the bounded scan, which still finds the recent in-DB conflict.
+#[test]
+fn a5_1579_empty_index_boot_load_phase_routes_to_bounded_scan() {
+    let conn = fresh_conn();
+    let ns = "load-phase-ns";
+    let existing = make_mem("cache-fact", "cache ttl is sixty seconds", ns);
+    let emb = vec![1.0_f32, 0.0, 0.0];
+    let existing_id = insert_with_embedding(&conn, &existing, &emb);
+
+    // Boot LOAD phase shape: empty index, nothing seeded yet. Pin the
+    // vacuous-truth premise so a future is_fully_searchable change
+    // that invalidates this scenario surfaces here.
+    let idx = VectorIndex::empty();
+    assert!(
+        idx.is_fully_searchable(),
+        "premise: an empty index reports vacuously fully-searchable"
+    );
+
+    let mut incoming = make_mem("cache-fact-2", "cache ttl is ninety seconds", ns);
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx))
+        .expect("ok")
+        .expect(
+            "empty-index dispatch must route to the bounded scan, not silently \
+             skip the conflict check (#1579 QC)",
+        );
+    assert_eq!(verdict.existing_id, existing_id);
+}

@@ -2171,3 +2171,115 @@ fn mcp_store_stale_created_at_is_rejected() {
         "stale-timestamp rejection should mention the freshness window, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1579 A1 — single-embed-per-store contract.
+//
+// Pre-#1579 every `memory_store` at semantic tier embedded the
+// identical `embedding_document(title, content)` text TWICE: once for
+// the proactive conflict check (#519) and once for the post-insert
+// source embed. At semantic/smart tiers the embed dominates per-store
+// latency (~150-400 ms inline MiniLM; one remote round-trip on Ollama
+// backends), so the duplicate call ~doubled store latency. These tests
+// pin the call count mechanically with a counting `Embed` fake.
+// ---------------------------------------------------------------------------
+
+/// Counting wrapper around [`MockEmbedder`] — every `embed` /
+/// `embed_batch` text is tallied so tests can assert exact call
+/// counts on the store path.
+struct CountingEmbedder {
+    inner: MockEmbedder,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingEmbedder {
+    fn new() -> Self {
+        Self {
+            inner: MockEmbedder::new_local().expect("mock"),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Embed for CountingEmbedder {
+    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Embed::embed(&self.inner, text)
+    }
+    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.calls
+            .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+        Embed::embed_batch(&self.inner, texts)
+    }
+}
+
+#[test]
+fn a1_1579_store_embeds_document_exactly_once() {
+    // Default path: conflict check runs (force absent), source embed
+    // reuses the conflict-check vector ⇒ exactly ONE embed call.
+    let conn = fresh_conn();
+    let ttl = ResolvedTtl::default();
+    let counting = CountingEmbedder::new();
+    let idx = VectorIndex::empty();
+    let resp = handle_store(
+        &conn,
+        &db_path(),
+        &base_params("a1-single-embed"),
+        Some(&counting as &dyn Embed),
+        None,
+        Some(&idx),
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("store ok");
+    let id = resp["id"].as_str().expect("id");
+    assert_eq!(
+        counting.count(),
+        1,
+        "#1579 A1: memory_store must embed the document text exactly once \
+         (conflict check + source embed share one vector)"
+    );
+    // The shared vector must still land in the embeddings column +
+    // the HNSW index (the reuse path is not allowed to drop either
+    // persistence side-effect).
+    let emb = db::get_embedding(&conn, id).expect("ok").expect("some");
+    assert_eq!(emb.len(), 384);
+    assert_eq!(idx.len(), 1, "HNSW insert still happens on the reuse path");
+}
+
+#[test]
+fn a1_1579_force_store_embeds_exactly_once() {
+    // force=true skips the conflict check entirely; the source embed
+    // is then the only embed call — still exactly one.
+    let conn = fresh_conn();
+    let ttl = ResolvedTtl::default();
+    let counting = CountingEmbedder::new();
+    let mut params = base_params("a1-force-embed");
+    params["force"] = json!(true);
+    let resp = handle_store(
+        &conn,
+        &db_path(),
+        &params,
+        Some(&counting as &dyn Embed),
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("store ok");
+    assert!(resp["id"].is_string());
+    assert_eq!(
+        counting.count(),
+        1,
+        "#1579 A1: force=true path must embed exactly once (source embed only)"
+    );
+}

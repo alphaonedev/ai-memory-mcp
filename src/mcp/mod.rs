@@ -2550,7 +2550,13 @@ pub fn run_embedding_backfill_with_batch_size(
         scanned += chunk.len();
         let ok_before = ok;
 
-        let texts: Vec<String> = chunk.iter().map(|(_, t, c)| format!("{t} {c}")).collect();
+        // #1579 — routed through the canonical `embedding_document`
+        // template (#1558 batch 5 SSOT) instead of an inline `format!`
+        // spelling of the same shape.
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|(_, t, c)| crate::embeddings::embedding_document(t, c))
+            .collect();
         let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
         match emb.embed_batch(&text_refs) {
@@ -2866,22 +2872,46 @@ pub fn run_mcp_server(
     };
 
     // --- Build HNSW vector index (semantic tier and above) ---
-    let vector_index = if embedder.is_some() {
-        match db::get_all_embeddings(&conn) {
-            Ok(entries) if !entries.is_empty() => {
-                eprintln!(
-                    "ai-memory: building HNSW index ({} vectors)...",
-                    entries.len()
-                );
-                let idx = VectorIndex::build(entries);
-                eprintln!("ai-memory: HNSW index ready ({} entries)", idx.len());
-                Some(idx)
-            }
-            _ => {
+    //
+    // #1579 B3 — async boot. Pre-#1579 this site ran
+    // `get_all_embeddings` + `VectorIndex::build` SYNCHRONOUSLY before
+    // the stdio loop started (P1 audit: 40 s to `initialize` at 10k
+    // vectors, >28 min at 100k). The server now answers immediately
+    // with an EMPTY index while a background thread loads the stored
+    // embeddings over its own connection and warms the graph through
+    // the #968 double-buffer rebuild (`VectorIndex::warm_boot`).
+    // Until the swap lands, semantic recall serves the keyword/FTS
+    // blend and the #519 proactive conflict check uses its
+    // bounded-scan fallback (`is_fully_searchable` gating). The
+    // `Arc` exists solely so the warm thread can share the index with
+    // the single-threaded stdio loop; handlers still receive
+    // `Option<&VectorIndex>` via `as_deref()`.
+    let vector_index: Option<std::sync::Arc<VectorIndex>> = if embedder.is_some() {
+        let idx = std::sync::Arc::new(VectorIndex::empty());
+        eprintln!(
+            "ai-memory: HNSW index warming in background; semantic recall \
+             serves keyword/FTS results until the swap lands (#1579 B3)"
+        );
+        let warm_idx = std::sync::Arc::clone(&idx);
+        let warm_db_path = db_path.to_path_buf();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let Some(entries) = crate::daemon_runtime::load_boot_index_entries(&warm_db_path)
+            else {
+                return;
+            };
+            if entries.is_empty() {
                 eprintln!("ai-memory: no embeddings for HNSW index, using linear scan");
-                Some(VectorIndex::empty())
+                return;
             }
-        }
+            let total = entries.len();
+            warm_idx.warm_boot(entries);
+            eprintln!(
+                "ai-memory: HNSW index ready ({total} entries, warmed in {:.1}s)",
+                started.elapsed().as_secs_f64()
+            );
+        });
+        Some(idx)
     } else {
         None
     };
@@ -3159,7 +3189,7 @@ pub fn run_mcp_server(
             reranker.as_ref(),
             &tier_config,
             &resolved_models,
-            vector_index.as_ref(),
+            vector_index.as_deref(),
             &resolved_ttl,
             &resolved_scoring,
             archive_on_gc,

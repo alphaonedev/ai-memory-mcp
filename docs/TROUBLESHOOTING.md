@@ -337,9 +337,18 @@ everything else on its own.
 
 1. **First semantic recall after startup** — model load is ~500 ms
    cold. Warm up with a throwaway recall call.
-2. **Large corpus + HNSW not yet built** — HNSW is built lazily on
-   first semantic query against a given DB. 100k memories takes
-   ~15 s to index once; subsequent queries are ms.
+2. **Async-boot HNSW warm window (#1579 B3)** — `serve` and `mcp`
+   become ready immediately and build the HNSW index in the
+   background; until the swap lands, semantic recall serves the
+   keyword/FTS blend (correct, but ranked without the vector phase)
+   and can look "worse" or slower on big corpora. Watch for the
+   readiness line: `serve` logs INFO `HNSW index warm (#1579 B3)`;
+   `mcp` prints `ai-memory: HNSW index ready (N entries, warmed in
+   X.Xs)` on stderr. One-shot `ai-memory recall` CLI invocations skip
+   the graph build entirely below 20k embedded rows
+   (`hnsw::CLI_HNSW_BUILD_MIN_ENTRIES`) and linear-scan instead —
+   that path is expected to answer in tens of ms, not to build an
+   index.
 3. **Disk I/O bottleneck** — `iostat 1` to confirm. Move DB to SSD.
 4. **SQLite contention under concurrent writes** — use `stats`
    output to see WAL size. If the daemon is doing a lot of writes,

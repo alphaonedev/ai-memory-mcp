@@ -101,23 +101,45 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // hoist + injection-class fix, no speculative surface.
     // 16_550 = 16_475 + 75 headroom.
     //
-    // 2026-06-10 (#1579 perf final-gate) — bumped 16_550 → 16_700 by
-    // the A2 sargable-list rewrite + B6 scale bundle: the
-    // `build_list_query` SQL builder (the OR-NULL filter arms became
-    // distinct prepared shapes the v56 composite indexes can serve),
-    // the chunked GC loop (`GC_CHUNK_ROWS` bounded transactions
-    // replacing the single whole-backlog BEGIN IMMEDIATE), and the
-    // bounded `get_unembedded_ids_batch` variant pushed the file to
-    // 16_691. Growth justified: measured hot-path fixes (P1 audit:
-    // list 141 ms → 0.06 ms at 100k rows) plus their doc comments, no
-    // speculative surface. 16_700 = 16_691 + 9 headroom.
-    ("src/storage/mod.rs", 16_700),
-    // 2026-06-10 (#1579 B6/F5.6) — bumped 14_000 → 14_050: the
-    // embed-backfill sweep converted from whole-backlog
-    // materialisation to a bounded drain loop over
-    // `get_unembedded_ids_batch` (+ the no-progress break), pushing
-    // the file to 14_010. 14_050 = 14_010 + 40 headroom.
-    ("src/mcp/mod.rs", 14_050),
+    // 2026-06-10 (#1579 perf final-gate, storage lane) — the A2
+    // sargable-list rewrite + B6 scale bundle: the `build_list_query`
+    // SQL builder (the OR-NULL filter arms became distinct prepared
+    // shapes the v56 composite indexes can serve), the chunked GC
+    // loop (`GC_CHUNK_ROWS` bounded transactions replacing the single
+    // whole-backlog BEGIN IMMEDIATE), and the bounded
+    // `get_unembedded_ids_batch` variant (~141 LOC). Measured
+    // hot-path fixes (P1 audit: list 141 ms → 0.06 ms at 100k rows),
+    // no speculative surface.
+    //
+    // 2026-06-10 (#1579, writepath lane, merged batch-2) — the A5
+    // remediation on the SAME module: the proactive-conflict check
+    // gained the HNSW-routed dispatcher
+    // (`proactive_conflict_check_with_index`), the ANN-candidate
+    // verifier (`proactive_conflict_check_candidates`), the shared
+    // `proactive_conflict_verdict` scoring tail, the bounded-scan
+    // LIMIT + Jaccard-floor consts with their P2-evidence doc blocks,
+    // and `count_embedded_memories` (the B3 CLI threshold probe) —
+    // ~225 LOC on the existing #519 write-path surface (the
+    // O(N)-scan-under-mutex / 81%-false-409 fix).
+    //
+    // The per-lane ceilings (16_700 / 16_800) each under-counted the
+    // union, so the merged ceiling is pinned from the measured
+    // post-merge file: actual LOC 16_943. 17_000 = 16_943 + 57
+    // headroom; far under the 1.5x aspirational cap.
+    ("src/storage/mod.rs", 17_000),
+    // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
+    // sweep converted from whole-backlog materialisation to a bounded
+    // drain loop over `get_unembedded_ids_batch` (+ the no-progress
+    // break).
+    //
+    // 2026-06-10 (#1579 B3, writepath lane, merged batch-2) — the
+    // async-boot HNSW change on the SAME module: the MCP stdio boot
+    // site swaps the synchronous get_all_embeddings +
+    // VectorIndex::build for the background warm thread (Arc +
+    // warm_boot + readiness stderr lines), and the backfill helper
+    // routes through the canonical `embedding_document` template.
+    // Merged actual LOC: 14_040. 14_100 = 14_040 + 60 headroom.
+    ("src/mcp/mod.rs", 14_100),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -284,7 +306,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #1548 — the curator `--store-url` SAL store-build path
     // (`build_curator_store` + the Curator dispatch arm) added ~34 LOC.
     // Bumped in lockstep.
-    ("src/daemon_runtime.rs", 7_950),
+    // 2026-06-10 — bumped 7_950 → 8_300 by the #1579 B3 async-boot
+    // HNSW loader: `load_boot_index_entries` +
+    // `spawn_vector_index_boot_load` (the seed → background-build →
+    // swap orchestration with its lock-discipline doc block) and the
+    // `b3_1579_boot_loader_warms_index_off_the_startup_path`
+    // readiness regression test — ~185 LOC on the serve boot path
+    // (the 40 s @10k / >28 min @100k sync-build fix), no speculative
+    // surface. Actual LOC at the bump: 8_135. 8_300 = 8_135 + 165
+    // headroom; far under the 1.5x cap.
+    ("src/daemon_runtime.rs", 8_300),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
