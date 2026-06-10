@@ -535,11 +535,13 @@ operation's measured p95 exceeds its target by more than 10%.
 | `--baseline <PATH>` | string | — | Compare against a saved `--json` baseline; flag regressions. |
 | `--regression-threshold <PCT>` | f64 | `bench::DEFAULT_REGRESSION_THRESHOLD_PCT` | Growth threshold for regression flagging (clamped `[0.0, 1000.0]`). |
 | `--history <PATH>` | path | — | Append the run as one JSONL row to a history file (rolling p95 trend). |
+| `--scale <ROWS>` | usize | — | #1579 B8: seed a scratch corpus of `<ROWS>` rows first and gate against the `PERFORMANCE.md` §"Corpus-scale budgets" table (clamped `[1, 1_000_000]`). |
 
 ```bash
 ai-memory bench
 ai-memory bench --json --history ./bench/history.jsonl
 ai-memory bench --baseline ./bench/baseline-v0.6.3.json
+ai-memory bench --scale 10000
 ```
 
 Operations covered by `src/bench.rs`: `memory_store` (no embedding),

@@ -123,6 +123,14 @@ pub async fn recall_memories_get(
         )
             .into_response();
     }
+    // #1579 B4 — negotiate the response format BEFORE doing any work.
+    // `json` (default) keeps the legacy envelope; `toon` /
+    // `toon_compact` reuse the MCP TOON encoder; anything else is a
+    // 400 with the SSOT message.
+    let format = match crate::toon::WireFormat::parse_http(req.format.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return crate::handlers::wire_format::invalid_format_response(&e),
+    };
     // v0.7.0 (issue #518) — splice `[agents.defaults.recall_scope]`
     // when `session_default=true` AND the caller omitted the
     // matching filter axis. Resolution: explicit args win.
@@ -157,6 +165,7 @@ pub async fn recall_memories_get(
         scope_tier.as_deref(),
         kinds.as_deref(),
         provenance_shape,
+        format,
     )
     .await
 }
@@ -188,6 +197,11 @@ pub async fn recall_memories_post(
         )
             .into_response();
     }
+    // #1579 B4 — same format negotiation as the GET path.
+    let format = match crate::toon::WireFormat::parse_http(req.format.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return crate::handlers::wire_format::invalid_format_response(&e),
+    };
     // v0.7.0 (issue #518) — see GET handler for the resolution rule.
     let scope_tier = splice_recall_scope_into(&mut req, &app);
     let kinds = body.resolved_kinds();
@@ -211,6 +225,7 @@ pub async fn recall_memories_post(
         scope_tier.as_deref(),
         kinds.as_deref(),
         provenance_shape,
+        format,
     )
     .await
 }
@@ -267,6 +282,9 @@ async fn recall_response(
     // intentional and documented at
     // `src/handlers/accept_provenance.rs`.
     provenance_shape: crate::handlers::accept_provenance::ProvenanceShape,
+    // #1579 B4 — negotiated response format (json default | toon |
+    // toon_compact), parsed + validated by the entry handlers.
+    format: crate::toon::WireFormat,
 ) -> axum::response::Response {
     let context = req.context.as_str();
     let namespace = req.namespace.as_deref();
@@ -466,7 +484,8 @@ async fn recall_response(
                 if let Some(b) = budget_tokens {
                     resp[field_names::BUDGET_TOKENS] = json!(b);
                 }
-                Json(resp).into_response()
+                // #1579 B4 — serialize per the negotiated format.
+                crate::handlers::wire_format::memories_response(format, resp)
             }
             Err(e) => store_err_to_response(e),
         };
@@ -711,7 +730,8 @@ async fn recall_response(
                     "budget_overflow": outcome.budget_overflow,
                 });
             }
-            Json(resp).into_response()
+            // #1579 B4 — serialize per the negotiated format.
+            crate::handlers::wire_format::memories_response(format, resp)
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }

@@ -68,7 +68,13 @@ tracing-appender = "0.2"
 # bindings via the `zstd` crate.
 zstd = { version = "0.13", default-features = false }
 uuid = { version = "1", features = ["v4", "v7"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+# #1579 B4 (operator-approved feature delta) — `compression-gzip`
+# adds the response CompressionLayer for the HTTP daemon (measured
+# 4.6× response-size win on recall payloads in the perf audit).
+# Gzip only — no brotli/zstd response coding, keeping the transitive
+# additions to the flate2/miniz_oxide family already vetted by
+# `cargo audit`.
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 gethostname = "0.5"
 
 # Native TLS for `serve` (Layer 1 — issue to be filed). axum-server

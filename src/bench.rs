@@ -83,6 +83,69 @@ pub const MAX_WARMUP: usize = 10_000;
 /// this are clamped; a 1000% allowance already means "no gate".
 pub const MAX_REGRESSION_THRESHOLD_PCT: f64 = 1000.0;
 
+/// #1579 B8 — canonical corpus scale (rows) for the scale-gate run
+/// (`ai-memory bench --scale 10000`). The P1 perf-audit proved the
+/// default workload (~500 rows after per-op seeding) cannot see
+/// corpus-scale budget blowouts (recall p95 361 ms vs the 50 ms budget
+/// at 100k rows was invisible to the built-in bench).
+pub const CI_SCALE_GATE_ROWS: usize = 10_000;
+
+/// #1579 B8 — hard ceiling on `--scale` rows. Bounds seeding wall-clock
+/// + RAM on a mistyped flag (1M rows ≈ the largest corpus the perf
+/// audit exercised).
+pub const MAX_SCALE: usize = 1_000_000;
+
+/// #1579 B8 — one row of the per-scale p95 budget table published in
+/// `PERFORMANCE.md` §"Corpus-scale budgets". Only the three
+/// corpus-sensitive operations carry scale-specific budgets; the KG
+/// operations run against fixed-size fixtures (50×4 fan-out, 50×5
+/// chains) whose cost is independent of the seeded corpus scale, so
+/// they keep their canonical budgets at every scale.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleBudgets {
+    /// Seeded corpus rows this row's budgets apply to (upper bound —
+    /// a requested scale selects the first table row whose `scale` is
+    /// `>=` the request).
+    pub scale: usize,
+    /// `memory_store` (no embedding) p95 budget, ms.
+    pub store_no_embedding_ms: f64,
+    /// `memory_search` (FTS5) p95 budget, ms.
+    pub search_fts_ms: f64,
+    /// `memory_recall` (hot, keyword) p95 budget, ms.
+    pub recall_hot_ms: f64,
+}
+
+/// #1579 B8 — the per-scale budget table (SSOT; `PERFORMANCE.md`
+/// §"Corpus-scale budgets" narrates these numbers and the
+/// `operation_scale_targets_match_performance_md` test pins them).
+///
+/// 10k-row budgets were pinned from a measured release-build run on
+/// this branch (`ai-memory bench --scale 10000`, Linux x86_64) with
+/// ≥50% headroom over the measurement, capped at the operator-approved
+/// conservative ceilings from the #1579 remediation plan (store ≤120,
+/// recall ≤80, search ≤60).
+pub const SCALE_BUDGETS: &[ScaleBudgets] = &[ScaleBudgets {
+    scale: CI_SCALE_GATE_ROWS,
+    store_no_embedding_ms: 120.0,
+    search_fts_ms: 60.0,
+    recall_hot_ms: 80.0,
+}];
+
+/// #1579 B8 — resolve the budget row for a requested scale: the first
+/// table row whose `scale >= requested`, else the largest pinned row
+/// (best-effort; pin a new table row before gating larger scales).
+#[must_use]
+pub fn scale_budgets_for(requested: usize) -> ScaleBudgets {
+    for row in SCALE_BUDGETS {
+        if row.scale >= requested {
+            return *row;
+        }
+    }
+    *SCALE_BUDGETS
+        .last()
+        .expect("SCALE_BUDGETS table must be non-empty")
+}
+
 /// Default tolerance applied when comparing a fresh run against a
 /// `--baseline` JSON file: a measured p95 may grow by this percentage
 /// before the run is flagged as a regression. Independent of
@@ -166,6 +229,37 @@ impl Operation {
     pub fn effective_target_p95_ms(self) -> f64 {
         self.target_p95_ms() * MACOS_BUDGET_MULT
     }
+
+    /// #1579 B8 — canonical p95 budget at a given corpus scale.
+    /// `None` (the default workload) keeps the legacy
+    /// [`Self::target_p95_ms`] budgets byte-for-byte. `Some(rows)`
+    /// swaps in the [`SCALE_BUDGETS`] row for the three
+    /// corpus-sensitive operations; the KG operations keep their
+    /// canonical budgets because their fixtures are scale-independent
+    /// (see [`ScaleBudgets`]).
+    #[must_use]
+    pub fn target_p95_ms_at_scale(self, scale: Option<usize>) -> f64 {
+        let Some(rows) = scale else {
+            return self.target_p95_ms();
+        };
+        let budgets = scale_budgets_for(rows);
+        match self {
+            Self::StoreNoEmbedding => budgets.store_no_embedding_ms,
+            Self::SearchFts => budgets.search_fts_ms,
+            Self::RecallHot => budgets.recall_hot_ms,
+            Self::KgQueryDepth1 | Self::KgQueryDepth3 | Self::KgQueryDepth5 | Self::KgTimeline => {
+                self.target_p95_ms()
+            }
+        }
+    }
+
+    /// #1579 B8 — runner-effective sibling of
+    /// [`Self::target_p95_ms_at_scale`] (applies the #1193 macOS
+    /// multiplier, same as [`Self::effective_target_p95_ms`]).
+    #[must_use]
+    pub fn effective_target_p95_ms_at_scale(self, scale: Option<usize>) -> f64 {
+        self.target_p95_ms_at_scale(scale) * MACOS_BUDGET_MULT
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +287,12 @@ pub struct BenchConfig {
     pub iterations: usize,
     pub warmup: usize,
     pub namespace: String,
+    /// #1579 B8 — corpus scale. `None` keeps the legacy default
+    /// workload (~500 rows after per-op seeding) and the legacy
+    /// budgets; `Some(rows)` seeds a scratch corpus of `rows` rows
+    /// into the bench namespace before the operations run and gates
+    /// the verdict against the [`SCALE_BUDGETS`] table instead.
+    pub scale: Option<usize>,
 }
 
 impl Default for BenchConfig {
@@ -201,6 +301,7 @@ impl Default for BenchConfig {
             iterations: DEFAULT_ITERATIONS,
             warmup: DEFAULT_WARMUP,
             namespace: BENCH_NAMESPACE.to_string(),
+            scale: None,
         }
     }
 }
@@ -216,6 +317,16 @@ impl Default for BenchConfig {
 /// Returns the underlying [`db`] error if any of the seeded inserts
 /// or queries fail.
 pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResult>> {
+    // #1579 B8 — seed the scratch corpus FIRST so every operation
+    // below (FTS5 search, hybrid-keyword recall, the store upsert
+    // probe) runs against a table of ~`scale` rows, not the ~500-row
+    // default that hid the 100k-corpus budget blowouts from the P1
+    // audit. The corpus shares the bench namespace and the
+    // `topic-N / category-M` vocabulary the search/recall queries use,
+    // so the queries genuinely scan it.
+    if let Some(rows) = config.scale {
+        seed_corpus(conn, &config.namespace, "scale", rows)?;
+    }
     let store = run_store_no_embedding(conn, config)?;
     let search = run_search_fts(conn, config)?;
     let recall = run_recall_hot(conn, config)?;
@@ -250,7 +361,11 @@ fn run_store_no_embedding(conn: &Connection, config: &BenchConfig) -> Result<Ope
             samples.push(elapsed);
         }
     }
-    Ok(percentile_summary(Operation::StoreNoEmbedding, &samples))
+    Ok(percentile_summary(
+        Operation::StoreNoEmbedding,
+        &samples,
+        config.scale,
+    ))
 }
 
 fn run_search_fts(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
@@ -279,7 +394,11 @@ fn run_search_fts(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             samples.push(elapsed);
         }
     }
-    Ok(percentile_summary(Operation::SearchFts, &samples))
+    Ok(percentile_summary(
+        Operation::SearchFts,
+        &samples,
+        config.scale,
+    ))
 }
 
 fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
@@ -323,7 +442,11 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
         )?;
         samples.push(start.elapsed());
     }
-    Ok(percentile_summary(Operation::RecallHot, &samples))
+    Ok(percentile_summary(
+        Operation::RecallHot,
+        &samples,
+        config.scale,
+    ))
 }
 
 /// Source memory IDs returned from [`seed_kg_fixture`]. Each source has
@@ -361,7 +484,11 @@ fn run_kg_query_depth1(
             samples.push(elapsed);
         }
     }
-    Ok(percentile_summary(Operation::KgQueryDepth1, &samples))
+    Ok(percentile_summary(
+        Operation::KgQueryDepth1,
+        &samples,
+        config.scale,
+    ))
 }
 
 fn run_kg_query_chain(
@@ -386,7 +513,7 @@ fn run_kg_query_chain(
             samples.push(elapsed);
         }
     }
-    Ok(percentile_summary(operation, &samples))
+    Ok(percentile_summary(operation, &samples, config.scale))
 }
 
 fn run_kg_timeline(
@@ -409,7 +536,11 @@ fn run_kg_timeline(
             samples.push(elapsed);
         }
     }
-    Ok(percentile_summary(Operation::KgTimeline, &samples))
+    Ok(percentile_summary(
+        Operation::KgTimeline,
+        &samples,
+        config.scale,
+    ))
 }
 
 /// Seed the in-process KG fixture: `KG_FIXTURE_SOURCES` source memories,
@@ -521,7 +652,12 @@ fn synth_memory(namespace: &str, i: usize, prefix: &str) -> Memory {
     }
 }
 
-fn percentile_summary(operation: Operation, samples: &[Duration]) -> OperationResult {
+fn percentile_summary(
+    operation: Operation,
+    samples: &[Duration],
+    // #1579 B8 — corpus scale of this run; selects the budget bucket.
+    scale: Option<usize>,
+) -> OperationResult {
     debug_assert!(
         !samples.is_empty(),
         "bench operation produced no samples; iterations must be > 0"
@@ -531,12 +667,15 @@ fn percentile_summary(operation: Operation, samples: &[Duration]) -> OperationRe
     let p50 = percentile(&sorted, 0.50);
     let p95 = percentile(&sorted, 0.95);
     let p99 = percentile(&sorted, 0.99);
-    let target = operation.target_p95_ms();
+    // #1579 B8 — both the reported target and the verdict budget come
+    // from the scale-aware resolver; `scale == None` keeps the legacy
+    // budgets byte-for-byte.
+    let target = operation.target_p95_ms_at_scale(scale);
     // Per issue #1193: the pass/fail verdict uses the runner-effective
     // budget so the macOS GHA pool's higher I/O variance doesn't blow
     // a clean run. The reported `target_p95_ms` keeps the canonical
     // PERFORMANCE.md value so dashboards / baselines stay stable.
-    let effective_target = operation.effective_target_p95_ms();
+    let effective_target = operation.effective_target_p95_ms_at_scale(scale);
     let status = if p95 <= effective_target * P95_TOLERANCE {
         Status::Pass
     } else {
@@ -730,6 +869,10 @@ pub fn append_history(
     captured_at: &str,
     iterations: usize,
     warmup: usize,
+    // #1579 B8 — corpus scale of the recorded run (`null` = default
+    // workload) so downstream regression tooling can stratify history
+    // entries per scale bucket.
+    scale: Option<usize>,
     results: &[OperationResult],
 ) -> Result<()> {
     use std::fs::OpenOptions;
@@ -746,6 +889,7 @@ pub fn append_history(
         "captured_at": captured_at,
         "iterations": iterations,
         "warmup": warmup,
+        "scale": scale,
         "results": results,
     });
 
@@ -771,6 +915,7 @@ mod tests {
             iterations: 30,
             warmup: 5,
             namespace: "bench-test".to_string(),
+            scale: None,
         }
     }
 
@@ -898,6 +1043,86 @@ mod tests {
         assert!((MACOS_BUDGET_MULT - 3.0).abs() < 1e-9);
         #[cfg(not(target_os = "macos"))]
         assert!((MACOS_BUDGET_MULT - 1.0).abs() < 1e-9);
+    }
+
+    /// #1579 B8 — pins the per-scale budget table to the values
+    /// published in `PERFORMANCE.md` §"Corpus-scale budgets". If you
+    /// change a scale budget, change both.
+    #[test]
+    fn operation_scale_targets_match_performance_md() {
+        let at_gate_scale = Some(CI_SCALE_GATE_ROWS);
+        assert!(
+            (Operation::StoreNoEmbedding.target_p95_ms_at_scale(at_gate_scale) - 120.0).abs()
+                < 1e-9
+        );
+        assert!((Operation::SearchFts.target_p95_ms_at_scale(at_gate_scale) - 60.0).abs() < 1e-9);
+        assert!((Operation::RecallHot.target_p95_ms_at_scale(at_gate_scale) - 80.0).abs() < 1e-9);
+        // KG fixtures are scale-independent → canonical budgets hold.
+        for op in [
+            Operation::KgQueryDepth1,
+            Operation::KgQueryDepth3,
+            Operation::KgQueryDepth5,
+            Operation::KgTimeline,
+        ] {
+            assert!(
+                (op.target_p95_ms_at_scale(at_gate_scale) - op.target_p95_ms()).abs() < 1e-9,
+                "{op:?} must keep its canonical budget at scale"
+            );
+        }
+        // `None` (default workload) keeps the legacy budgets.
+        assert!((Operation::RecallHot.target_p95_ms_at_scale(None) - 50.0).abs() < 1e-9);
+    }
+
+    /// #1579 B8 — bucket resolution: a request at or below a pinned
+    /// scale selects that row; a request beyond the largest pinned
+    /// scale falls back to the largest row (best-effort).
+    #[test]
+    fn issue_1579_b8_scale_budget_bucket_resolution() {
+        assert_eq!(scale_budgets_for(500).scale, CI_SCALE_GATE_ROWS);
+        assert_eq!(
+            scale_budgets_for(CI_SCALE_GATE_ROWS).scale,
+            CI_SCALE_GATE_ROWS
+        );
+        assert_eq!(scale_budgets_for(MAX_SCALE).scale, CI_SCALE_GATE_ROWS);
+    }
+
+    /// #1579 B8 — a `--scale` run actually seeds the scratch corpus
+    /// (the P1 failure mode was a bench that never grew the table) and
+    /// gates the three corpus-sensitive ops against the scale budgets.
+    #[test]
+    fn issue_1579_b8_scale_run_seeds_corpus_and_uses_scale_budgets() {
+        let conn = fresh_conn();
+        let ns = "bench-scale-test";
+        let config = BenchConfig {
+            iterations: 10,
+            warmup: 2,
+            namespace: ns.to_string(),
+            scale: Some(300),
+        };
+        let results = run(&conn, &config).unwrap();
+        assert_eq!(results.len(), 7);
+        let seeded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                [ns],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            seeded >= 300,
+            "scale run must seed the scratch corpus; found {seeded} rows"
+        );
+        // Scale budgets reported (300 resolves into the 10k bucket).
+        let store = &results[0];
+        assert_eq!(store.operation, Operation::StoreNoEmbedding);
+        assert!((store.target_p95_ms - 120.0).abs() < 1e-9);
+        let search = &results[1];
+        assert!((search.target_p95_ms - 60.0).abs() < 1e-9);
+        let recall = &results[2];
+        assert!((recall.target_p95_ms - 80.0).abs() < 1e-9);
+        // KG rows keep canonical budgets.
+        assert!((results[3].target_p95_ms - 100.0).abs() < 1e-9);
+        assert!((results[5].target_p95_ms - 250.0).abs() < 1e-9);
     }
 
     #[test]

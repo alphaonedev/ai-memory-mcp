@@ -333,12 +333,21 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // draining `MemoryStore::list_unembedded` through the daemon
     // embedder under the `embedding-backfill` sentinel principal;
     // ~46 LOC incl. the root-cause doc block) on the SAME module —
-    // closes the postgres fleet dead-semantic-recall gap. Measured
-    // post-merge LOC: 8_196. 8_300 (the writepath-lane ceiling)
-    // already covers the union — kept. NOTE: the wire lane (A3+B8)
-    // lands on this module in the same train; re-measure at that
-    // merge.
-    ("src/daemon_runtime.rs", 8_300),
+    // closes the postgres fleet dead-semantic-recall gap.
+    //
+    // 2026-06-10 (#1579 A3+B8, wire lane, merged batch-2) — A3 routed
+    // the store-URL boot/error sites through
+    // `crate::logging::redact_url_password` and added the
+    // `issue_1579_a3_boot_log_redacts_store_url_password` regression
+    // test (~75 LOC); B8 added the `--scale` corpus-scale flag to
+    // `BenchArgs` + `cmd_bench` (~25 LOC). Security fix on existing
+    // log/error sites + the scale knob on the existing bench
+    // dispatch.
+    //
+    // Three lanes landed on this module in one train; the ceiling is
+    // pinned from the measured post-merge union: actual LOC 8_293.
+    // 8_400 = 8_293 + 107 headroom; far under the 1.5x cap.
+    ("src/daemon_runtime.rs", 8_400),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

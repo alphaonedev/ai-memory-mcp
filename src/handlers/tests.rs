@@ -14684,3 +14684,372 @@ async fn http_capture_turn_rejects_agent_id_mismatch_1413() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// #1579 B4 — gzip response compression + TOON format negotiation
+// ---------------------------------------------------------------------------
+
+/// Seed `n` memories whose content matches the `b4 corpus` recall /
+/// search queries below.
+async fn seed_b4_corpus(state: &Db, n: usize) {
+    let lock = state.lock().await;
+    let now = Utc::now();
+    for i in 0..n {
+        let mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "b4-test".into(),
+            title: format!("b4 corpus row {i}"),
+            content: format!(
+                "gzip toon corpus row {i} with enough repeated filler text to make \
+                 compression worthwhile — filler filler filler filler filler filler"
+            ),
+            tags: vec!["b4".into()],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            // #910 — collective scope so the anonymous HTTP caller in
+            // these fixtures passes the visibility filter (same
+            // convention as `insert_test_memory`).
+            metadata: serde_json::json!({"scope": "collective", "agent_id": "b4-tester"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        db::insert(&lock.0, &mem).unwrap();
+    }
+}
+
+/// Full production router (every middleware layer, incl. the #1579 B4
+/// `CompressionLayer`) over the shared test fixtures.
+fn full_router(state: Db) -> axum::Router {
+    crate::build_router(
+        ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        },
+        test_app_state(state),
+    )
+}
+
+/// #1579 B4 — a recall response is gzip-coded when (and only when)
+/// the caller advertises `Accept-Encoding: gzip`, and the compressed
+/// body is materially smaller than the identity body.
+#[tokio::test]
+async fn issue_1579_b4_gzip_round_trip_honors_accept_encoding() {
+    let state = test_state();
+    seed_b4_corpus(&state, 20).await;
+    let app = full_router(state);
+
+    // Identity request — no Accept-Encoding → no content-encoding.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/recall?context=gzip%20toon%20corpus&namespace=b4-test&limit=20")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .is_none(),
+        "no Accept-Encoding → identity response"
+    );
+    let identity_body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&identity_body).unwrap();
+    assert!(v["count"].as_u64().unwrap() > 0, "fixture must recall rows");
+
+    // Gzip request — Accept-Encoding: gzip → content-encoding: gzip +
+    // gzip magic bytes + a materially smaller body.
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/recall?context=gzip%20toon%20corpus&namespace=b4-test&limit=20")
+                .method("GET")
+                .header(axum::http::header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "Accept-Encoding: gzip must produce a gzip-coded response"
+    );
+    let gzip_body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    assert!(
+        gzip_body.len() >= 2 && gzip_body[0] == 0x1f && gzip_body[1] == 0x8b,
+        "gzip body must start with the gzip magic bytes"
+    );
+    assert!(
+        gzip_body.len() < identity_body.len(),
+        "gzip body ({}) must be smaller than identity body ({})",
+        gzip_body.len(),
+        identity_body.len()
+    );
+    eprintln!(
+        "issue_1579_b4 measured recall response: identity={}B gzip={}B ({:.1}x)",
+        identity_body.len(),
+        gzip_body.len(),
+        identity_body.len() as f64 / gzip_body.len() as f64
+    );
+}
+
+/// #1579 B4 — the SSE `/api/v1/approvals/stream` surface must NOT be
+/// gzip-coded even when the caller advertises gzip: the
+/// CompressionLayer's default `NotForContentType` predicate exempts
+/// `text/event-stream` so events flush immediately instead of
+/// buffering inside a gzip stream.
+#[tokio::test]
+async fn issue_1579_b4_sse_stream_is_not_gzip_compressed() {
+    let state = test_state();
+    let app = full_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/approvals/stream")
+                .method("GET")
+                .header(axum::http::header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string()),
+        Some("text/event-stream".to_string()),
+        "fixture must actually hit the SSE surface"
+    );
+    assert!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .is_none(),
+        "SSE stream must never be gzip-coded"
+    );
+}
+
+/// #1579 B4 — `format=toon_compact` on HTTP recall returns the TOON
+/// envelope as `text/plain`, materially smaller than the JSON default.
+#[tokio::test]
+async fn issue_1579_b4_recall_format_toon_compact() {
+    let state = test_state();
+    seed_b4_corpus(&state, 10).await;
+    let app = Router::new()
+        .route("/api/v1/recall", axum_get(recall_memories_get))
+        .with_state(test_app_state(state));
+
+    let json_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/recall?context=gzip%20toon%20corpus&namespace=b4-test&limit=10")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_resp.status(), StatusCode::OK);
+    let json_body = axum::body::to_bytes(json_resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/recall?context=gzip%20toon%20corpus&namespace=b4-test&limit=10&format=toon_compact")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/plain"),
+        "TOON responses are text/plain"
+    );
+    let toon_body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let toon = String::from_utf8(toon_body.to_vec()).unwrap();
+    assert!(
+        toon.contains("memories["),
+        "TOON header line expected: {toon}"
+    );
+    assert!(toon.contains("b4 corpus row"), "TOON rows expected: {toon}");
+    assert!(
+        toon_body.len() < json_body.len(),
+        "toon_compact ({}) must be smaller than the JSON envelope ({})",
+        toon_body.len(),
+        json_body.len()
+    );
+    eprintln!(
+        "issue_1579_b4 measured recall response: json={}B toon_compact={}B ({:.0}% smaller)",
+        json_body.len(),
+        toon_body.len(),
+        (1.0 - toon_body.len() as f64 / json_body.len() as f64) * 100.0
+    );
+}
+
+/// #1579 B4 — `format=toon` (non-compact) works on recall, and an
+/// invalid `format` value is a 400 carrying the SSOT message.
+#[tokio::test]
+async fn issue_1579_b4_recall_format_toon_and_invalid() {
+    let state = test_state();
+    seed_b4_corpus(&state, 3).await;
+    let app = Router::new()
+        .route("/api/v1/recall", axum_get(recall_memories_get))
+        .with_state(test_app_state(state));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/recall?context=gzip%20toon%20corpus&namespace=b4-test&format=toon")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let toon = String::from_utf8(body.to_vec()).unwrap();
+    // Non-compact column set includes created_at.
+    assert!(
+        toon.contains("created_at"),
+        "non-compact TOON expected: {toon}"
+    );
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/recall?context=gzip%20toon%20corpus&namespace=b4-test&format=yaml")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["error"].as_str().unwrap(),
+        crate::toon::invalid_format_msg("yaml"),
+        "400 must carry the SSOT invalid-format message"
+    );
+}
+
+/// #1579 B4 — `format` negotiation on HTTP search: toon_compact +
+/// invalid value, plus json-by-default.
+#[tokio::test]
+async fn issue_1579_b4_search_format_negotiation() {
+    let state = test_state();
+    seed_b4_corpus(&state, 5).await;
+    let app = Router::new()
+        .route("/api/v1/search", axum_get(search_memories))
+        .with_state(test_app_state(state));
+
+    // Default stays JSON.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/search?q=gzip&namespace=b4-test")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["count"].as_u64().unwrap() > 0, "fixture must match rows");
+
+    // toon_compact returns the TOON text envelope.
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/search?q=gzip&namespace=b4-test&format=toon_compact")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let toon = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        toon.contains("memories["),
+        "search TOON normalizes results: {toon}"
+    );
+    assert!(toon.contains("b4 corpus row"));
+
+    // Invalid format → 400 + SSOT message.
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/search?q=gzip&namespace=b4-test&format=xml")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["error"].as_str().unwrap(),
+        crate::toon::invalid_format_msg("xml")
+    );
+}
