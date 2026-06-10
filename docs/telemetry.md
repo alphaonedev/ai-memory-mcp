@@ -47,7 +47,7 @@ If you build with default Cargo features, the only outbound network calls the bi
 
 ## 3. Sinks — where spans go
 
-Three sinks ship in v0.7.0; you choose any combination:
+Three surfaces ship in v0.7.0 (stderr, rolling file, Prometheus `/metrics`), plus a forward-looking OTLP commitment; you choose any combination:
 
 **stdout/stderr (default).** Spans render to stderr via `tracing-subscriber::fmt`. Suitable for systemd journals (`journalctl -u ai-memory`), Docker log drivers, and pipeline ingestion (`ai-memory serve 2>&1 | vector --config ...`).
 
@@ -68,13 +68,15 @@ The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolve
 
 **OpenTelemetry OTLP exporter (forward-looking).** The substrate's span shape is intentionally OTel-compatible. An OTLP exporter that reads `OTEL_EXPORTER_OTLP_ENDPOINT` (and the standard `OTEL_*` companion variables) is a v1.0 commitment — see ROADMAP §7.6. Until then, the file-sink path with `structured = true` produces JSON that any OTel-aware collector can ingest as a log-receiver input.
 
+**Prometheus `/metrics` (HTTP daemon, pull-based).** The `serve` daemon additionally exposes a Prometheus scrape surface at the bare `/metrics` path (alias `/api/v1/metrics`; `src/metrics.rs`). It is pull-only — nothing is pushed anywhere. The registered series at v0.7.0 include the core counters/gauges `ai_memory_store_total`, `ai_memory_recall_total`, `ai_memory_recall_latency_seconds`, `ai_memory_memories`, the HNSW gauges (`ai_memory_hnsw_size`, `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_last_eviction_at_nanos`), the webhook/subscription series (`ai_memory_webhook_dispatched_total`, `ai_memory_webhook_failed_total`, `ai_memory_subscriptions_active`, `ai_memory_subscription_dlq_overflow_total`), the curator series (`ai_memory_curator_cycles_total`, `ai_memory_curator_cycle_duration_seconds`, `ai_memory_curator_operations_total`), the autonomy/quality series (`ai_memory_autonomy_hook_total`, `ai_memory_contradiction_detected_total`, `ai_memory_corrupt_provenance_rows_total`, `ai_memory_auto_export_spawn_failed_total`), and the federation series (`ai_memory_federation_push_dlq_depth`, `ai_memory_federation_push_dlq_quarantined_total`, `ai_memory_federation_fanout_retry_total`, `ai_memory_federation_fanout_dropped_total`, `ai_memory_federation_partial_quorum_total`, `ai_memory_federation_cred_verify_total`, `ai_memory_federation_inbound_cred_total`, `ai_memory_federation_cred_max_age_seconds`, `ai_memory_federation_renewal_lag_seconds`). Metric values are operation counts and durations only — never memory content.
+
 ---
 
 ## 4. Privacy-preserving design
 
 Three substrate behaviors give operators a defensible privacy posture without changing the deployment topology:
 
-**`AI_MEMORY_ANONYMIZE=1`.** When set (or `[privacy] anonymize_default = true` in `config.toml`), the binary replaces the resolved `agent_id` in every emitted span with a stable anonymized hash. The original id is still recorded inside the database for the operator's own audit needs; only externally-visible spans carry the redacted form. Shipped via issue #198 closure.
+**`AI_MEMORY_ANONYMIZE=1`.** When set (or `[identity] anonymize_default = true` in `config.toml`), the binary replaces the resolved `agent_id` in every emitted span with a stable anonymized hash. The original id is still recorded inside the database for the operator's own audit needs; only externally-visible spans carry the redacted form. Shipped via issue #198 closure.
 
 **Memory content is never in spans.** This is structural, not policy: the `tracing::info!` call sites never receive `content`, `title`, or `metadata` payloads. Adding a span macro that violated this would fail code review against [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) §Hard Prohibitions. Operators can audit this themselves: `grep -rn "tracing::\(info\|warn\|error\)" src/` against the field set of `models::Memory`.
 
@@ -84,17 +86,28 @@ Three substrate behaviors give operators a defensible privacy posture without ch
 
 ## 5. The `doctor` command — local-only health
 
-`ai-memory doctor` returns a seven-section health dashboard:
+`ai-memory doctor` returns a nine-section health dashboard
+(pinned by `local_run_on_empty_db_produces_nine_sections` in
+`src/cli/doctor.rs`):
 
-1. Binary version + build provenance
-2. Database integrity (`PRAGMA integrity_check`, schema version, FTS5 consistency)
-3. Retention drift (rows past TTL, archive table sizing)
-4. Embedder availability (smart tier model on disk, vector index loaded)
-5. Hook pipeline status (per-event subscriber count, recent denials)
-6. Federation peer reachability (one row per allowlist entry; mTLS handshake status)
-7. Recent audit-trail summary (last hour's emissions by category)
+1. Storage (DB integrity, schema version, retention drift)
+2. Index (vector index / embedder state)
+3. Recall (pipeline health)
+4. Governance (rule corpus, pending actions)
+5. Sync (federation state)
+6. Webhook (subscription health)
+7. Capabilities (advertised surface)
+8. Reflection Health (L1-4)
+9. LLM Reachability (#1146)
 
-All seven sections are computed locally against the SQLite or PostgreSQL store. The doctor command never opens a network connection. It is safe to run from a paging-on-health-check loop or a Nagios-style monitoring probe.
+Eight of the nine sections are computed locally against the SQLite
+or PostgreSQL store with no network access. The exception is the
+**LLM Reachability** section (#1146), which probes the *resolved,
+operator-configured* LLM endpoint (`<base_url>/api/tags` for Ollama
+or `<base_url>/models` for OpenAI-compatible backends) — still only
+a destination you configured, never a third party. It is safe to run
+from a paging-on-health-check loop or a Nagios-style monitoring
+probe.
 
 ---
 

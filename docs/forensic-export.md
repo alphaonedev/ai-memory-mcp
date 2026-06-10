@@ -209,9 +209,10 @@ ignore it exactly (see the integration test fleet at
 
 ### Signature semantics
 
-When the daemon has an AlphaOne operator keypair on disk (default
-location: `~/.local/share/ai-memory/keypair.ed25519`), the bundle
-gets signed. The signature is over a **canonical concatenation** of
+When the daemon has an operator keypair on disk (under the key
+directory — `AI_MEMORY_KEY_DIR`, default platform config dir +
+`/ai-memory/keys`, layout `<key_dir>/<agent_id>.{pub,priv}`), the
+bundle gets signed. The signature is over a **canonical concatenation** of
 the per-file SHA-256 digests in manifest order. The signer agent id
 is written into `manifest.signer_agent_id`; the Ed25519 signature
 goes into `manifest.signature` as base64.
@@ -317,7 +318,7 @@ diff <(jq 'del(.generated_at)' a.json) <(jq 'del(.generated_at)' b.json)
 - **Integration tests:** [`tests/forensic.rs`](../tests/forensic.rs), [`tests/forensic/`](../tests/forensic/)
 - **Substrate cross-references:**
   - Reflection chain contract: [`RECURSIVE_LEARNING.md`](RECURSIVE_LEARNING.md)
-  - Skill bundle integration: [`agent-skills.md` §Federation behavior](agent-skills.md#federation-behavior)
+  - Skill bundle integration: [`agent-skills.md` §Cross-node interchange](agent-skills.md#cross-node-interchange-export-folder-round-trip)
   - Transcript replay union (L2-4): [`src/transcripts/`](../src/transcripts/)
 - **Issue tracker:** [#670](https://github.com/alphaonedev/ai-memory-mcp/issues/670)
 - **Commits:** L2-5 merge [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3); L2-4 transcript-union merge [`a50b34c`](https://github.com/alphaonedev/ai-memory-mcp/commit/a50b34c)

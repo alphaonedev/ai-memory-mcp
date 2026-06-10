@@ -9,7 +9,9 @@ mutates the database (touch, TTL extension, auto-promotion).
 
 1. **FTS5 keyword search** — fuzzy OR query over the bundled SQLite
    `memories_fts` virtual table; scored by
-   `fts.rank + priority*0.5 + access_count*0.1 + confidence*2.0 + tier_bonus + recency_factor`.
+   `(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor`
+   (the access-count term is capped at 50 so high-traffic rows can't
+   dominate; tier bonus is long=3.0 / mid=1.0 / short=0).
 2. **Semantic search** — cosine similarity via the in-memory HNSW index
    (or a linear scan fallback when no index is loaded). Cosine gate is
    `> 0.2`; relaxed from 0.3 in v0.6.2 Patch 2 after scenario-18 caught
@@ -25,10 +27,12 @@ mutates the database (touch, TTL extension, auto-promotion).
    (contains `/`), recall broadens to the ancestor chain and applies a
    small score bonus to memories nearer the queried leaf.
 6. **Token-budget greedy fill** (Phase P6 / R1) — see below.
-7. **Touch** — increment `access_count`, extend TTL, auto-promote
-   mid → long at 5 accesses, increment priority every 10. Touch runs
-   only on memories that survive every prior stage, including the
-   budget cut.
+7. **Touch** — increment `access_count`, reset the sliding TTL window
+   (`expires_at = now + 1h` short / `now + 1d` mid — a per-access
+   **replacement**, not a max-of-old-and-new extend; long-tier rows
+   are untouched), auto-promote mid → long at 5 accesses, increment
+   priority every 10. Touch runs only on memories that survive every
+   prior stage, including the budget cut.
 
 ---
 
@@ -161,5 +165,5 @@ HTTP:
 ```bash
 curl -sS -X POST http://localhost:9077/api/v1/recall \
   -H 'content-type: application/json' \
-  -d '{"context":"what's our refund policy","budget_tokens":4096}'
+  -d '{"context":"what is our refund policy","budget_tokens":4096}'
 ```

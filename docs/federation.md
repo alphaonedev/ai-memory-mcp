@@ -230,7 +230,7 @@ re-POSTs the originally captured payload via `post_once` and stamps
 **quarantined** — the take query excludes it
 ([#1578](https://github.com/alphaonedev/ai-memory-mcp/issues/1578))
 so it cannot wedge the queue or amplify against a dead peer, and the
-`ai_memory_federation_push_dlq_quarantined` counter plus the
+`ai_memory_federation_push_dlq_quarantined_total` counter plus the
 `ai_memory_federation_push_dlq_depth` gauge are the operator alert
 surface. Quarantined rows are never silently dropped; no CLI drain
 surface ships at v0.7.0 — the data-layer drain procedure lives in

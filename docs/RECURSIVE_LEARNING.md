@@ -133,14 +133,15 @@ walks leaf-first.
 
 ### Per-namespace override
 
-`GovernancePolicy.max_reflection_depth: Option<u32>` is a pure JSON
-metadata field on the standard-memory governance object. No schema
-bump — it rides alongside the existing `write`, `promote`, `delete`,
-`approver`, and `inherit` fields. The accessor is flat:
+`max_reflection_depth: Option<u32>` (a `CorePolicy` field, surfaced
+through `GovernancePolicy`) is a pure JSON metadata field on the
+standard-memory governance object. No schema bump — it rides
+alongside the existing `write`, `promote`, `delete`, `approver`, and
+`inherit` fields. The accessor is flat:
 
 ```rust
 pub fn effective_max_reflection_depth(&self) -> u32 {
-    self.max_reflection_depth.unwrap_or(3)
+    self.core.max_reflection_depth.unwrap_or(3)
 }
 ```
 
@@ -166,7 +167,7 @@ the entire primitive.
 |---|---|---|
 | `memories.reflection_depth INTEGER NOT NULL DEFAULT 0` | SQLite schema v29 (`src/storage/migrations.rs`; pre-#961 was `src/db.rs`); Postgres schema v31 ([`src/store/postgres_schema.sql`](../src/store/postgres_schema.sql), [`migrations/postgres/0013_v0700_reflection_depth.sql`](../migrations/postgres/0013_v0700_reflection_depth.sql)) | Caller-minted rows are 0; reflections are `max(source_depths) + 1`. UPSERT clauses take `MAX(old, new)` so federation merges preserve the higher-depth signal. |
 | `Memory::reflection_depth: i32` | [`src/models/memory.rs`](../src/models/memory.rs) | `#[serde(default)]` keeps wire-compat with pre-v0.7.0 federation peers. `impl Default for Memory` ships in the same commit so future struct-field adds stop fanning out to ~50 test fixtures. |
-| `GovernancePolicy::max_reflection_depth: Option<u32>` | [`src/models/namespace.rs`](../src/models/namespace.rs) | Per-namespace cap. `None` → compiled default 3. `Some(0)` → kill-switch. |
+| `CorePolicy::max_reflection_depth: Option<u32>` (read via `GovernancePolicy`) | [`src/models/namespace.rs`](../src/models/namespace.rs) | Per-namespace cap. `None` → compiled default 3. `Some(0)` → kill-switch. |
 | `GovernancePolicy::effective_max_reflection_depth(&self) -> u32` | [`src/models/namespace.rs`](../src/models/namespace.rs) | Flat accessor. Does NOT walk ancestors — call `resolve_governance_policy` first, then this accessor on the result. |
 | `reflects_on` relation | [`src/validate.rs`](../src/validate.rs) (`VALID_RELATIONS`); MCP relation handling in [`src/mcp/tools/link.rs`](../src/mcp/tools/link.rs) (post-#1066 split; was `src/mcp.rs` pre-split — there is no separate unlink tool/module); `claude_help` prompt pipe-list | No schema migration required. `memory_links.relation` has no `CHECK (relation IN ...)` clause on either adapter — adding a label is a pure validator + documentation change. |
 | `memory_reflect` MCP tool | [`src/mcp/tools/reflect.rs`](../src/mcp/tools/reflect.rs) (post-#1066 + #987 D1.6 split); substrate impl `reflect` in [`src/storage/reflect.rs`](../src/storage/reflect.rs) (post-#961 SAL boundary cleanup; `db::reflect` is the back-compat alias); postgres parity `PostgresStore::reflect` in [`src/store/postgres.rs`](../src/store/postgres.rs) | `Family::Power`. Tool count 51 → 52. Atomic insert + N `reflects_on` link writes inside a single `BEGIN IMMEDIATE` / `COMMIT` block (SQLite) or `sqlx::Transaction` (Postgres). |

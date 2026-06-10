@@ -24,11 +24,16 @@ Two failure modes for the AGE branch:
    probe itself fails because the role can't read the catalog —
    `kg_backend` resolves to `Cte` and the dispatchers route exclusively
    to the relational walk for the lifetime of that adapter. Operators
-   see this once at startup as an `info` line:
+   see this once at startup as an `info` line on the
+   `store::postgres` target:
 
    ```
-   INFO store::postgres connected — kg_backend=cte AGE extension not detected (proceeding with recursive CTE)
+   INFO store::postgres: Postgres KG backend: CTE  kg_backend=cte
    ```
+
+   (A probe *failure* — e.g. the role can't read `pg_extension` —
+   additionally logs a `debug`-level
+   `AGE detection probe failed; defaulting to CTE backend` line.)
 
 2. **Runtime AGE failure.** AGE was present at boot but a per-request
    cypher call fails: extension dropped between boot and now,

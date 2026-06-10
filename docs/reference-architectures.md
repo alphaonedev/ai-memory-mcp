@@ -138,9 +138,9 @@ agents collaborate. No cross-machine sync needed yet.
    │   │  sqlite.db   │   │  sqlite.db   │   │  sqlite.db   │           │
    │   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘           │
    │          │                  │                  │                   │
-   │          │ HTTPS + HMAC     │ HTTPS + HMAC     │ HTTPS + HMAC      │
+   │          │ HTTPS + Ed25519  │ HTTPS + Ed25519  │ HTTPS + Ed25519   │
    │          │ /sync/push       │ /sync/push       │ /sync/push        │
-   │          │ /sync/pull       │ /sync/pull       │ /sync/pull        │
+   │          │ /sync/since      │ /sync/since      │ /sync/since       │
    │          ▼                  ▼                  ▼                   │
    │   ┌───────────────────────────────────────────────────────┐       │
    │   │              top-of-rack switch                         │       │
@@ -547,8 +547,8 @@ billions of memories, multi-decade forensic retention.
                               (to regional / global hive
                                per topologies 5-8)
 
-   edge → hub push: HMAC-signed + nonce-checked /sync/push
-   hub → edge pull: edge polls /sync/pull on local-miss recall, opportunistically
+   edge → hub push: Ed25519-signed + nonce-checked /sync/push
+   hub → edge pull: edge polls /sync/since on local-miss recall, opportunistically
 ```
 
 This is the **edge-of-the-edge** view: how phones, IoT, drones,
@@ -559,7 +559,8 @@ critical design points:
   They do not accept inbound connections from other peers; they
   do not gossip; they are not in any peer allowlist.
 - **The hub is the trust boundary.** All edge writes pass through
-  HMAC + nonce verification at the hub's `/sync/push` (gated by
+  per-message Ed25519 signature (`X-Memory-Sig`) + nonce
+  (`X-Memory-Nonce`) verification at the hub's `/sync/push` (gated by
   `AI_MEMORY_FED_REQUIRE_SIG=1` + `AI_MEMORY_FED_REQUIRE_NONCE=1`,
   v0.7.0 secure defaults per issues #791 + #922).
 - **The wearable is a thin client of the phone.** A Pebble-class
@@ -652,7 +653,7 @@ them know why they are off the supported list:
   use one DB file per node, sync via the federation protocol or
   the SAL Postgres adapter.
 - **HTTP daemon exposed without TLS.** The federation protocol's
-  HMAC + nonce gates protect message integrity, not
+  signature + nonce gates protect message integrity, not
   confidentiality. Always front the daemon with TLS (the daemon
   speaks rustls natively via `--tls-cert` / `--tls-key`).
 - **Phones in the federation peer allowlist.** Inbound
@@ -665,13 +666,16 @@ them know why they are off the supported list:
   TCP socket via `socat` or `nc` works in dev but leaks
   resources under any kind of load. Use the HTTP API for
   cross-host calls.
-- **Postgres without AGE.** The kg / reflection / atomisation
-  paths assume the AGE graph extension is present when
-  `--store-url postgres://` is set. Operators who deploy
-  Postgres-without-AGE see `kg_query` and friends return
-  `UnsupportedCapability`; this is expected, but the resulting
-  feature gap is often surprising. Either deploy AGE alongside
-  Postgres, or stay on sqlite.
+- **Postgres without AGE (performance caveat, not a hard
+  failure).** Since fold-A2A1.3 (#700), the four KG endpoints
+  (`memory_kg_query` / `memory_kg_timeline` / `memory_kg_invalidate`
+  / `memory_find_paths`) fall back automatically to the
+  recursive-CTE walk over `memory_links` on vanilla Postgres — the
+  answers are equivalence-tested against AGE
+  (see [`docs/kg-backend-fallback.md`](kg-backend-fallback.md)).
+  What you lose without AGE is the cypher-path speedup, not the
+  feature. Deploy AGE alongside Postgres when KG traversal volume
+  is high.
 
 ---
 

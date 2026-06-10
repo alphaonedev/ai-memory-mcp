@@ -18,11 +18,18 @@ capabilities:
 2. **Network attacker** reaching the HTTP daemon. They should NOT be
    able to bypass API-key / mTLS, inject memories with a forged
    `agent_id`, or enumerate memories without authorization.
-3. **Compromised peer** holding valid mTLS cert. They CAN push
-   memories under any `agent_id` they claim in the request body.
-   Operators should treat the `agent_id` on synced memories as a
-   claimed identity, not an attested one, and keep the mTLS peer
-   allowlist tight accordingly. (Store-path agent attestation —
+3. **Compromised peer** holding valid mTLS cert. Under the v0.7.0
+   default posture they can author only **as themselves**: the
+   peer-attestation layer re-stamps inbound rows with the
+   authenticated peer identity, and a `body.sender_agent_id` claim
+   not on that peer's operator-configured allowlist is refused with
+   `sender_agent_id_mismatch` (see
+   [`docs/federation.md`](federation.md) Layer 3). The legacy
+   trust-the-body posture exists only behind the explicit
+   `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1` escape hatch. Operators
+   should still treat the `agent_id` on synced memories as a claimed
+   identity, not an attested one, and keep the mTLS peer allowlist
+   tight. (Store-path agent attestation —
    #626 Layer-3 — upgrades *directly authored* CLI/MCP/HTTP writes to
    `agent_attested` when a valid Ed25519 signature is presented, but the
    federation **receive** path here remains claimed-by-default; mTLS +
@@ -87,11 +94,17 @@ Or via config file:
 api_key = "long-random-string"
 ```
 
-Every HTTP endpoint except `/api/v1/health` enforces the key. Accepts
-either:
+Every HTTP endpoint except `/api/v1/health` enforces the key (when
+the mTLS allowlist is enforced, the `/api/v1/sync/*` federation
+endpoints additionally bypass the key check — they have already
+cleared a stronger transport gate; see #702 and
+[`docs/federation.md`](federation.md)). Accepts either:
 
-- Header: `X-API-Key: <key>`
-- Query parameter: `?api_key=<key>`
+- Header: `X-API-Key: <key>` — the supported channel.
+- Query parameter: `?api_key=<key>` — **DEPRECATED** at v0.7.0
+  (#1574; URL-embedded credentials leak into access logs, Referer
+  headers, and proxy logs — a once-per-process WARN is emitted on
+  use). Slated for removal; migrate callers to the header.
 
 Rotation: generate new key, update config, restart the daemon.
 Clients have a grace period determined by their connection
@@ -189,7 +202,9 @@ Every write path validates:
 - `tier` / `scope` — whitelisted values only.
 - `metadata` — JSON object, size capped.
 
-Body-size limit: 16 MB per request (`DefaultBodyLimit::max(16 * 1024 * 1024)`).
+Body-size limit: 2 MiB per request
+(`DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES)`,
+`HTTP_BODY_LIMIT_BYTES = 2 * MIB` in `src/lib.rs`).
 
 ## Network hardening
 
@@ -202,6 +217,19 @@ ai-memory serve --host 10.0.0.5    # specific interface
 ```
 
 Never bind `0.0.0.0` without TLS + API key + mTLS.
+
+Two related hardening knobs:
+
+- `AI_MEMORY_REQUIRE_API_KEY=1` (#1458) — hard-refuse daemon start
+  without an `api_key` on ANY bind host, including loopback. Use it
+  on reverse-proxy / `--network=host` / `socat` deployments where
+  the loopback host string does not reflect off-host reachability.
+- `AI_MEMORY_ADMIN_HEADER_TRUST` (#1570) — default **off**: when
+  admin ids are configured and the daemon has no request
+  authentication (no `api_key`), a bare self-asserted `X-Agent-Id`
+  naming an admin id is REFUSED admin-role resolution (boot emits a
+  WARN naming the flag). Set truthy only on isolated / mTLS-fronted
+  deployments to restore the legacy trust-the-header posture.
 
 ### Webhooks (SSRF-hardened)
 
@@ -218,24 +246,37 @@ review subscription inserts through governance if that's a concern.
 
 ### Sync peer push
 
-`POST /api/v1/sync/push` is gated by mTLS fingerprint allowlist.
-Without TLS + mTLS, it accepts any caller — the startup log warns
-about this. Never run the sync endpoint on a public network without
-mTLS.
+`POST /api/v1/sync/push` is gated by the mTLS fingerprint allowlist
+at the transport layer, and at v0.7.0 by **per-message Ed25519
+signatures by default**: `AI_MEMORY_FED_REQUIRE_SIG=1` (#791 secure
+default) rejects missing/invalid `X-Memory-Sig` headers with 401,
+and `AI_MEMORY_FED_REQUIRE_NONCE=1` (#922 secure default) refuses
+byte-for-byte replays via per-peer nonce freshness
+(`X-Memory-Nonce`; nonces persist across restarts in the
+`federation_nonce_cache` table, schema v51 / #1255). Peer
+attestation (`AI_MEMORY_FED_PEER_ATTESTATION`) further scopes what
+an authenticated peer may claim and pull. Never run the sync
+endpoint on a public network without mTLS.
 
 ## Governance
 
 Policies are set per-namespace via `memory_namespace_set_standard`
-(MCP) or directly in SQL. Supported policy levels:
+(MCP) or directly in SQL. The per-action levels
+(`crate::models::GovernanceLevel`) are:
 
-- `allow` — no approval needed.
-- `single:<agent-type>` — one registered agent of this type.
-- `consensus:N` — N distinct registered agents must approve.
+- `any` — ungated (the allow-on-silence default for `write` /
+  `promote`; see [`docs/governance.md`](governance.md)).
+- `registered` — any registered agent.
+- `owner` — only the row's authoring agent (the default for
+  `delete`).
+- `approve` — queue a pending action for the namespace's configured
+  approver (`human`, `{"agent": "<id>"}`, or `{"consensus": N}` —
+  `crate::models::ApproverType`).
 
-An action that hits a policy returns `202 Accepted` with a
+An action that hits an `approve` policy returns `202 Accepted` with a
 `pending_id`; approvers POST to `/api/v1/pending/{id}/approve`.
 
-**Critical**: `consensus:N` requires **pre-registered agents**
+**Critical**: `consensus: N` requires **pre-registered agents**
 (issue #216 / #234). Unregistered approvers cannot satisfy the
 quorum. See `ai-memory agents register`.
 
