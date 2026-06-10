@@ -1034,12 +1034,17 @@ pub async fn create_memory(
     // to 0.3-1.7 rps (P2 audit). `None` ⇒ force-bypass, no embedding,
     // or no fully-searchable index (keyword tier / async-boot warm
     // window) — the check below then uses the bounded-scan fallback.
+    // An EMPTY index also yields `None` (#1579 QC): emptiness makes
+    // `is_fully_searchable` vacuously true, but during the async-boot
+    // LOAD phase (before the boot loader's `seed_entries` lands) it
+    // says nothing about the DB — `Some(vec![])` here would silently
+    // SKIP the conflict check instead of routing to the bounded scan.
     let conflict_candidate_ids: Option<Vec<String>> = if body.force {
         None
     } else if let Some(ref qe) = embedding {
         let vi = app.vector_index.lock().await;
         vi.as_ref()
-            .filter(|idx| idx.is_fully_searchable())
+            .filter(|idx| idx.is_fully_searchable() && !idx.is_empty())
             .map(|idx| {
                 idx.search(qe, db::PROACTIVE_CONFLICT_INDEX_K)
                     .into_iter()

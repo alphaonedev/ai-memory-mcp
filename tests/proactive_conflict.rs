@@ -437,3 +437,41 @@ fn a5_1579_warm_window_falls_back_to_bounded_scan() {
         .expect("warm-window fallback (bounded scan) must find the recent conflict");
     assert_eq!(verdict.existing_id, existing_id);
 }
+
+/// #1579 QC — the async-boot LOAD phase, the sub-window BEFORE
+/// `seed_entries` lands: the daemon bound with `VectorIndex::empty()`
+/// while the boot loader is still reading the stored embeddings. An
+/// empty index is VACUOUSLY fully-searchable (`0 + 0 >= 0`), so
+/// gating on `is_fully_searchable` alone consulted the empty index,
+/// got zero candidates, and silently SKIPPED the conflict check —
+/// neither the indexed path nor the documented bounded-scan fallback.
+/// The dispatcher must treat empty as "no usable index" and route to
+/// the bounded scan, which still finds the recent in-DB conflict.
+#[test]
+fn a5_1579_empty_index_boot_load_phase_routes_to_bounded_scan() {
+    let conn = fresh_conn();
+    let ns = "load-phase-ns";
+    let existing = make_mem("cache-fact", "cache ttl is sixty seconds", ns);
+    let emb = vec![1.0_f32, 0.0, 0.0];
+    let existing_id = insert_with_embedding(&conn, &existing, &emb);
+
+    // Boot LOAD phase shape: empty index, nothing seeded yet. Pin the
+    // vacuous-truth premise so a future is_fully_searchable change
+    // that invalidates this scenario surfaces here.
+    let idx = VectorIndex::empty();
+    assert!(
+        idx.is_fully_searchable(),
+        "premise: an empty index reports vacuously fully-searchable"
+    );
+
+    let mut incoming = make_mem("cache-fact-2", "cache ttl is ninety seconds", ns);
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx))
+        .expect("ok")
+        .expect(
+            "empty-index dispatch must route to the bounded scan, not silently \
+             skip the conflict check (#1579 QC)",
+        );
+    assert_eq!(verdict.existing_id, existing_id);
+}

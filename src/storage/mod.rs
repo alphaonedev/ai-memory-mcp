@@ -4641,6 +4641,18 @@ pub fn canonical_content_hash(text: &str) -> [u8; 32] {
 /// fact, restated" bar; combined with the textual contradiction signal
 /// below, we surface only writes that proactively conflict with an
 /// established near-duplicate.
+///
+/// **Known miss class (pre-existing; deliberately unchanged by the
+/// #1579 A5 remediation):** genuine paraphrases can embed just BELOW
+/// this bar — the P2-audit probe pair ("deadline is june 15" vs
+/// "deadline is june 22" in otherwise-identical sentences) scored
+/// 0.945 cosine on the release MiniLM and is therefore not detected.
+/// Safe direction for an advisory gate (the write is ALLOWED; nothing
+/// is wrongly refused); lowering the bar instead would re-open the
+/// false-409 epidemic the
+/// [`PROACTIVE_CONFLICT_CONTENT_JACCARD_FLOOR`] corroboration exists
+/// to close. The deeper `detect_contradiction` tooling remains the
+/// surface for sub-threshold contradictions.
 pub const PROACTIVE_CONFLICT_SIM_THRESHOLD: f32 = 0.95;
 
 /// Top-K cap for the candidate pool inspected by
@@ -4827,7 +4839,15 @@ pub fn proactive_conflict_check(
 /// * Otherwise (no index at keyword tier, the async-boot warm window
 ///   before the first graph swap, CLI one-shots below the build
 ///   threshold) it falls back to the BOUNDED recency scan in
-///   [`proactive_conflict_check`].
+///   [`proactive_conflict_check`]. An EMPTY index also routes to the
+///   fallback (#1579 QC): emptiness makes `is_fully_searchable`
+///   vacuously true, but during the async-boot LOAD phase (daemon
+///   bound with `VectorIndex::empty()`, boot loader still reading the
+///   stored embeddings, `seed_entries` not yet landed) it says
+///   nothing about what the DB holds — consulting it would silently
+///   SKIP the check instead of degrading to the documented bounded
+///   scan. On a genuinely empty corpus the fallback scan matches zero
+///   rows, so the routing is behaviour-neutral outside that window.
 ///
 /// Known under-detection windows, both safe-direction (a missed
 /// conflict ALLOWS a write; the check never wrongly refuses):
@@ -4853,6 +4873,11 @@ pub fn proactive_conflict_check_with_index(
     }
     if let Some(idx) = vector_index
         && idx.is_fully_searchable()
+        // #1579 QC — an empty index is vacuously fully-searchable but
+        // proves nothing about the DB during the async-boot LOAD
+        // phase; see the doc comment above and
+        // `crate::hnsw::VectorIndex::is_empty`.
+        && !idx.is_empty()
     {
         let hits = idx.search(query_embedding, PROACTIVE_CONFLICT_INDEX_K);
         let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
@@ -4861,7 +4886,7 @@ pub fn proactive_conflict_check_with_index(
     tracing::trace!(
         target: "proactive_conflict",
         namespace = %mem.namespace,
-        "no fully-searchable vector index — bounded recency-scan fallback (#1579 A5)"
+        "no fully-searchable (or empty) vector index — bounded recency-scan fallback (#1579 A5)"
     );
     proactive_conflict_check(conn, mem, query_embedding)
 }
