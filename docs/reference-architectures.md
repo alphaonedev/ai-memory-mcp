@@ -148,7 +148,7 @@ agents collaborate. No cross-machine sync needed yet.
    │   └───────────────────────────────────────────────────────┘       │
    │                                                                     │
    │   federation mode: full mesh, Ed25519-attested peers                │
-   │   quorum: N-1 acks before commit confirms                           │
+   │   quorum: local commit first; W-1 peer acks gate success            │
    │                                                                     │
    └─────────────────────────────────────────────────────────────────────┘
 
@@ -157,8 +157,10 @@ agents collaborate. No cross-machine sync needed yet.
 
 Three (or more) ai-memory servers in a rack, full-mesh federated
 via the `federation/` module's quorum protocol. Each peer holds an
-independent copy of the substrate; writes propagate to N-1 peers
-before commit confirms. The Ed25519 `X-Memory-Sig` header
+independent copy of the substrate; a write commits locally first,
+then fans out to peers — the success response is gated on W−1 peer
+acks within the quorum deadline (W defaults to majority, counting
+the local commit). The Ed25519 `X-Memory-Sig` header
 (`AI_MEMORY_FED_REQUIRE_SIG=1`) + per-message nonce
 (`AI_MEMORY_FED_REQUIRE_NONCE=1`) gate replay and forgery.
 
@@ -210,21 +212,24 @@ failure. Cross-rack / cross-DC sync not yet needed.
    │   │   ToR switch (~0.2ms)  │     │           streaming repl            │     │
    │   ╰────────────────────────╯     ╰────────────────────────────────────╯     │
    │                                                                             │
-   │   per-rack quorum + cross-rack write-fanout via federation gossip           │
-   │   long-tier archive on Postgres+AGE in dedicated rack D                     │
+   │   per-rack quorum + cross-rack write-fanout via quorum broadcast            │
+   │   postgres+AGE-backed daemons (SAL backend) in dedicated rack D             │
    │                                                                             │
    └─────────────────────────────────────────────────────────────────────────────┘
 
    intra-rack recall p50: ~1.5 ms   cross-rack p50: ~5 ms   archive query p50: ~12 ms
 ```
 
-Multi-rack deployment with rack-local quorum cells, cross-rack
-gossip via the federation push DLQ (`federation_push_dlq` table,
-v48 migration). One rack holds the Postgres+AGE durable archive
-that the sqlite peers offload long-tier rows to via the SAL
-adapter (`--store-url postgres://`). Recall first hits the local
-peer's sqlite + HNSW; misses cascade to the archive over the
-spine.
+Multi-rack deployment with rack-local quorum cells and cross-rack
+write-fanout via the federation quorum broadcast; per-peer push
+failures land in the `federation_push_dlq` table (v48 migration)
+and are replayed by the DLQ worker. Rack D runs a Postgres+AGE
+pair for daemons that select the SAL postgres backend
+(`--store-url postgres://`). Note the backend choice is per-daemon
+at v0.7.0 — a daemon binds to sqlite OR postgres, so the "archive
+rack" pattern means dedicating postgres-backed daemons to the
+durable long-tier namespaces (peers reach them over the spine via
+the federation API), not a per-row cascade inside one daemon.
 
 **When to choose this.** A medium enterprise with rack-aware
 fault tolerance requirements, where any single rack can fail
@@ -275,9 +280,9 @@ the local peer cache misses.
    │   ╔══════════════ DC-3 (us-east-1c, witness) ════════════╗                 │
    │   ║                                                       ║                 │
    │   ║          ┌────────────────┐                           ║                 │
-   │   ║          │   witness +    │  no full archive, just    ║                 │
-   │   ║          │  quorum vote   │  quorum participant to    ║                 │
-   │   ║          └────────────────┘  break ties               ║                 │
+   │   ║          │   thin peer    │  no full archive, just    ║                 │
+   │   ║          │   (ack-only)   │  a quorum peer counted    ║                 │
+   │   ║          └────────────────┘  toward W-of-N acks       ║                 │
    │   ╚═══════════════════════════════════════════════════════╝                 │
    │                                                                            │
    │   3-DC quorum: any 2 DCs survive a third's loss without losing the         │
@@ -289,8 +294,9 @@ the local peer cache misses.
 ```
 
 Three datacenters in a single region: two with full peer fleets +
-Postgres+AGE archives, one with a thin witness for quorum
-tie-breaking. The Postgres replication is at the storage layer
+Postgres+AGE archives, one with a thin ack-only peer that widens
+the W-of-N write quorum (it hosts no agents; it simply counts
+toward the ack threshold so either full DC can fail). The Postgres replication is at the storage layer
 (streaming WAL), so the AGE graph stays consistent across DCs at
 the granularity of the replica's lag. The federation layer on the
 sqlite peers handles intra-region gossip; cross-DC sync goes
@@ -392,21 +398,22 @@ demands cross-region presence.
 
          every peer talks to every other peer (n*(n-1)/2 connections)
          no central coordinator, no single point of failure
-         gossip + anti-entropy reconciles divergence
+         push fanout + /sync/since catch-up reconciles divergence
 
 
    peer-to-peer hop: ~1-50 ms depending on geographic spread
-   gossip convergence: O(log n) rounds; for 100 peers, ~7-10 rounds
+   convergence: every peer pulls /sync/since on its sync cadence
 ```
 
 A full mesh: every peer talks to every other peer, no central
-coordinator. The federation gossip protocol pushes new memories
-to all peers; the anti-entropy sweep periodically reconciles
-divergence. The `version` BIGINT carries vector-clock-like
-semantics for last-write-wins conflict resolution; explicit
-contradiction memories get flagged via the
-`MemoryLinkRelation::Contradicts` link type for human / AI
-review.
+coordinator. The federation quorum broadcast pushes new memories
+to all peers; the periodic `/sync/since` catch-up loop reconciles
+divergence after partitions. Conflict resolution is
+last-write-wins at the sync layer (`insert_if_newer` on
+`updated_at`), with the `version` BIGINT (schema v45) guarding
+optimistic concurrency on direct updates; explicit contradiction
+memories get flagged via the `MemoryLinkRelation::Contradicts`
+link type for human / AI review.
 
 **When to choose this.** A federation of independent operators
 (community-run nodes, research institutions, multi-tenant SaaS
@@ -520,7 +527,7 @@ billions of memories, multi-decade forensic retention.
     ════════════════════════════════════════════════════════════════════════════
                               edge sync gateway
                               (rate-limit, batch,
-                               HMAC verify, nonce check)
+                               Ed25519 sig verify, nonce check)
     ════════════════════════════════════════════════════════════════════════════
                                        │
                                        │ ~5-20 ms LAN  /  ~50-200 ms cell

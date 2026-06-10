@@ -1122,7 +1122,7 @@ footer.site-foot a { color: var(--text-muted); }
         <text class="stage-text" x="280" y="105" text-anchor="middle">memory_recall</text>
         <text class="stage-label" x="280" y="125" text-anchor="middle">USED</text>
         <text x="280" y="160" fill="#999" font-size="11" text-anchor="middle">access_count++</text>
-        <text x="280" y="173" fill="#666" font-size="10" text-anchor="middle">extends TTL</text>
+        <text x="280" y="173" fill="#666" font-size="10" text-anchor="middle">resets TTL window</text>
       </g>
 
       <g>
@@ -1160,10 +1160,10 @@ footer.site-foot a { color: var(--text-muted); }
       <!-- Bottom path: contradictions -->
       <g>
         <rect class="stage-box" x="200" y="240" width="160" height="60" rx="8" stroke="#ff6b9d"/>
-        <text class="stage-text" x="280" y="265" text-anchor="middle" fill="#ff6b9d">on_contradiction</text>
+        <text class="stage-text" x="280" y="265" text-anchor="middle" fill="#ff6b9d">detect_contradiction</text>
         <text class="stage-label" x="280" y="285" text-anchor="middle">FLAGGED</text>
-        <text x="280" y="320" fill="#999" font-size="11" text-anchor="middle">webhook fires</text>
-        <text x="280" y="333" fill="#666" font-size="10" text-anchor="middle">human picks winner</text>
+        <text x="280" y="320" fill="#999" font-size="11" text-anchor="middle">potential_contradictions</text>
+        <text x="280" y="333" fill="#666" font-size="10" text-anchor="middle">caller picks winner</text>
       </g>
 
       <g>
@@ -1178,8 +1178,8 @@ footer.site-foot a { color: var(--text-muted); }
         <rect class="stage-box" x="580" y="240" width="160" height="60" rx="8"/>
         <text class="stage-text" x="660" y="265" text-anchor="middle">memory_forget</text>
         <text class="stage-label" x="660" y="285" text-anchor="middle">USER-DELETED</text>
-        <text x="660" y="320" fill="#999" font-size="11" text-anchor="middle">explicit op</text>
-        <text x="660" y="333" fill="#666" font-size="10" text-anchor="middle">requires approval</text>
+        <text x="660" y="320" fill="#999" font-size="11" text-anchor="middle">explicit op · archives first</text>
+        <text x="660" y="333" fill="#666" font-size="10" text-anchor="middle">governance-gated</text>
       </g>
 
       <!-- Arrows -->
@@ -1443,7 +1443,7 @@ footer.site-foot a { color: var(--text-muted); }
       <path class="ack-line" d="M 440 200 L 440 120"/>
 
       <!-- Quorum threshold indicator -->
-      <text x="440" y="340" fill="#999" font-family="monospace" font-size="13" text-anchor="middle">W=2 of N=3 reached → write committed</text>
+      <text x="440" y="340" fill="#999" font-family="monospace" font-size="13" text-anchor="middle">W=2 met (local commit + peer acks) → write committed</text>
       <text x="440" y="360" fill="#666" font-size="11" text-anchor="middle">node-4 catches up via /api/v1/sync/since when reachable</text>
 
       <defs>
@@ -1960,7 +1960,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p3" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ ENGINEERING DEEP DIVE</div>
           <div class="card-title">Data Flow</div>
-          <p class="card-body">Animated write path, read path with hybrid 70/30 fusion, federation W=2 of N=3 quorum diagram. Where every byte goes.</p>
+          <p class="card-body">Animated write path, read path with adaptive hybrid fusion + 70/30 context blend, federation W=2 quorum diagram. Where every byte goes.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">data-flow.html →</div>
         </div>
       </a>

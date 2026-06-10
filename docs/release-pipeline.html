@@ -290,7 +290,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The Pipeline</span>
     <h2>Tag a release. Watch the matrix go.</h2>
-    <p class="lede">Every tag matching <code>v*</code> triggers the full release matrix in <code>.github/workflows/ci.yml</code>. The <code>release</code> job depends on <code>check</code> passing first — so a tagged release that fails any platform's check (fmt, clippy, tests) never publishes.</p>
+    <p class="lede">Pushing a tag matching <code>v*</code> runs the full CI check matrix in <code>.github/workflows/ci.yml</code>. Publishing is a separate, operator-gated step at v0.7.0: <code>.github/workflows/release.yml</code> runs via <code>workflow_dispatch</code> against the already-pushed annotated tag, preflight-verifies it, and builds + publishes only from that verified SHA — so a release that fails checks never publishes.</p>
 
     <div class="pipeline">
       <svg viewBox="0 0 1200 480" xmlns="http://www.w3.org/2000/svg">

@@ -287,7 +287,7 @@ footer a{color:var(--text-muted)}
         <rect class="table-box" x="540" y="140" width="200" height="100" rx="8"/>
         <text class="table-name" x="640" y="170" text-anchor="middle">archived_memories</text>
         <text class="table-cols" x="640" y="190" text-anchor="middle">id (PK) · mirror shape</text>
-        <text class="table-cols" x="640" y="205" text-anchor="middle">archived_at · reason</text>
+        <text class="table-cols" x="640" y="205" text-anchor="middle">archived_at · archive_reason</text>
         <text class="table-cols" x="640" y="220" text-anchor="middle">+14 cols @ v49 (#1025)</text>
       </g>
 
@@ -295,8 +295,8 @@ footer a{color:var(--text-muted)}
       <g>
         <rect class="table-box" x="100" y="140" width="180" height="100" rx="8"/>
         <text class="table-name" x="190" y="170" text-anchor="middle">entity_aliases</text>
-        <text class="table-cols" x="190" y="190" text-anchor="middle">entity_id (FK)</text>
-        <text class="table-cols" x="190" y="205" text-anchor="middle">alias (PK + idx)</text>
+        <text class="table-cols" x="190" y="190" text-anchor="middle">PK (entity_id, alias)</text>
+        <text class="table-cols" x="190" y="205" text-anchor="middle">alias (idx)</text>
         <text class="table-cols" x="190" y="220" text-anchor="middle">created_at</text>
       </g>
 
@@ -305,10 +305,10 @@ footer a{color:var(--text-muted)}
         <rect class="table-box" x="960" y="140" width="180" height="120" rx="8"/>
         <text class="table-name" x="1050" y="170" text-anchor="middle">pending_actions</text>
         <text class="table-cols" x="1050" y="190" text-anchor="middle">id (PK)</text>
-        <text class="table-cols" x="1050" y="205" text-anchor="middle">action_type · ns</text>
+        <text class="table-cols" x="1050" y="205" text-anchor="middle">action_type · namespace</text>
         <text class="table-cols" x="1050" y="220" text-anchor="middle">requested_by</text>
         <text class="table-cols" x="1050" y="235" text-anchor="middle">approvals (JSON)</text>
-        <text class="table-cols" x="1050" y="250" text-anchor="middle">decision</text>
+        <text class="table-cols" x="1050" y="250" text-anchor="middle">status · decided_by</text>
       </g>
 
       <!-- namespace_meta -->
@@ -317,7 +317,7 @@ footer a{color:var(--text-muted)}
         <text class="table-name" x="1050" y="350" text-anchor="middle">namespace_meta</text>
         <text class="table-cols" x="1050" y="370" text-anchor="middle">namespace (PK)</text>
         <text class="table-cols" x="1050" y="385" text-anchor="middle">standard_id (FK)</text>
-        <text class="table-cols" x="1050" y="400" text-anchor="middle">parent · created_at</text>
+        <text class="table-cols" x="1050" y="400" text-anchor="middle">parent_namespace · updated_at</text>
       </g>
 
       <!-- subscriptions -->
@@ -336,14 +336,14 @@ footer a{color:var(--text-muted)}
         <text class="table-name" x="1050" y="650" text-anchor="middle">subscription_events</text>
         <text class="table-cols" x="1050" y="670" text-anchor="middle">id · subscription_id (FK)</text>
         <text class="table-cols" x="1050" y="685" text-anchor="middle">event_type · payload</text>
-        <text class="table-cols" x="1050" y="700" text-anchor="middle">delivered_at · retries</text>
+        <text class="table-cols" x="1050" y="700" text-anchor="middle">delivered_at · delivery_status</text>
       </g>
 
       <!-- sync_state -->
       <g>
         <rect class="table-box" x="540" y="540" width="200" height="100" rx="8"/>
         <text class="table-name" x="640" y="570" text-anchor="middle">sync_state</text>
-        <text class="table-cols" x="640" y="590" text-anchor="middle">agent_id · peer_url (PK)</text>
+        <text class="table-cols" x="640" y="590" text-anchor="middle">agent_id · peer_id (PK)</text>
         <text class="table-cols" x="640" y="605" text-anchor="middle">last_pulled_at</text>
         <text class="table-cols" x="640" y="620" text-anchor="middle">last_pushed_at</text>
       </g>
@@ -353,8 +353,8 @@ footer a{color:var(--text-muted)}
         <rect class="table-box" x="100" y="480" width="200" height="100" rx="8"/>
         <text class="table-name" x="200" y="510" text-anchor="middle">audit_log</text>
         <text class="table-cols" x="200" y="530" text-anchor="middle">id · event_type</text>
-        <text class="table-cols" x="200" y="545" text-anchor="middle">subject · agent_id</text>
-        <text class="table-cols" x="200" y="560" text-anchor="middle">ts · payload (JSON)</text>
+        <text class="table-cols" x="200" y="545" text-anchor="middle">agent_id · requested_family</text>
+        <text class="table-cols" x="200" y="560" text-anchor="middle">granted · attestation_tier · timestamp</text>
       </g>
 
       <!-- signed_events (V-4 cross-row hash chain, schema v34) -->
@@ -362,7 +362,7 @@ footer a{color:var(--text-muted)}
         <rect class="table-box" x="100" y="620" width="200" height="100" rx="8"/>
         <text class="table-name" x="200" y="650" text-anchor="middle">signed_events</text>
         <text class="table-cols" x="200" y="670" text-anchor="middle">id · sequence · prev_hash</text>
-        <text class="table-cols" x="200" y="685" text-anchor="middle">payload · sig (Ed25519)</text>
+        <text class="table-cols" x="200" y="685" text-anchor="middle">payload_hash · signature (Ed25519)</text>
         <text class="table-cols" x="200" y="700" text-anchor="middle">V-4 chain (v34)</text>
       </g>
 
@@ -371,8 +371,8 @@ footer a{color:var(--text-muted)}
         <rect class="table-box" x="320" y="620" width="200" height="100" rx="8"/>
         <text class="table-name" x="420" y="650" text-anchor="middle">signed_events_dlq</text>
         <text class="table-cols" x="420" y="670" text-anchor="middle">id · failure_reason</text>
-        <text class="table-cols" x="420" y="685" text-anchor="middle">retry_count · last_attempt</text>
-        <text class="table-cols" x="420" y="700" text-anchor="middle">drainer DLQ (K7)</text>
+        <text class="table-cols" x="420" y="685" text-anchor="middle">agent_id · failed_at</text>
+        <text class="table-cols" x="420" y="700" text-anchor="middle">signed-event drainer DLQ</text>
       </g>
 
       <!-- federation_push_dlq (Track D #933, schema v48) -->
@@ -404,8 +404,8 @@ footer a{color:var(--text-muted)}
       <path class="fk-line" d="M 640 320 L 640 240" marker-end="url(#farr)"/>
       <text class="fk-label" x="650" y="280">archive ← memories (mirror shape)</text>
 
-      <path class="fk-line" d="M 640 240 L 640 120" marker-end="url(#farr)"/>
-      <text class="fk-label" x="650" y="135">shadow observations → memories</text>
+      <path class="fk-line" d="M 640 120 L 640 240" marker-end="url(#farr)"/>
+      <text class="fk-label" x="650" y="135">shadow memory_id FK → memories.id</text>
 
       <path class="fk-line" d="M 280 190 L 540 380" marker-end="url(#farr)"/>
       <text class="fk-label" x="380" y="265">aliases → entity memory.id</text>
