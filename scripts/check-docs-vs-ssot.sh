@@ -251,8 +251,14 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
 check_env_var_census_rule() {
     local rule_name="ENV_VAR_CENSUS" var
     local code_vars
-    code_vars=$(grep -rhoE 'env::var(_os)?\("(AI_MEMORY_[A-Z0-9_]+)"' "$REPO_ROOT/src" \
-        --include='*.rs' 2>/dev/null \
+    # Two read shapes: direct env::var("AI_MEMORY_X") literals, and
+    # const-indirected reads where the spelling lives on an `ENV_*`
+    # const definition (e.g. `pub const ENV_ADMIN_HEADER_TRUST: &str =
+    # "AI_MEMORY_ADMIN_HEADER_TRUST";`) — the post-#1558 house style.
+    code_vars=$( { grep -rhoE 'env::var(_os)?\("(AI_MEMORY_[A-Z0-9_]+)"' "$REPO_ROOT/src" \
+        --include='*.rs' 2>/dev/null; \
+        grep -rhoE 'const ENV_[A-Z0-9_]+: *&str *= *"AI_MEMORY_[A-Z0-9_]+"' "$REPO_ROOT/src" \
+        --include='*.rs' 2>/dev/null; } \
         | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u)
     for var in $code_vars; do
         if ! grep -q "$var" "$REPO_ROOT/CLAUDE.md"; then
