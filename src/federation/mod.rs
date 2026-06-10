@@ -139,6 +139,66 @@ pub struct PeerEndpoint {
     pub sync_push_url: String,
 }
 
+/// #1566 / #1579 B1 — embed-once-replicate-vector. A source-side
+/// embedding shipped alongside its memory row in the federation
+/// `/sync/push` payload (wire key [`crate::models::field_names::EMBEDDINGS`]).
+///
+/// ## Wire contract
+///
+/// - The array rides INSIDE the JSON body that `sync::post_once`
+///   serialises once and signs (`X-Memory-Sig` over the exact body
+///   bytes, nonce-bound per #922), so the vector's integrity is
+///   covered by the same Ed25519 signature + replay protection as the
+///   memory rows themselves. A tampered vector invalidates the
+///   signature.
+/// - Decode is TOLERANT of absence: the receiver's `SyncPushBody`
+///   field defaults to an empty vec, so pushes from older peers (no
+///   `embeddings` key) and pushes to older peers (unknown fields are
+///   ignored — request structs are deliberately permissive per #1052)
+///   both interoperate. The fleet swaps as one, but the protocol must
+///   not hard-require the field.
+///
+/// ## Receive contract
+///
+/// The receiver stores `vector` directly ONLY when `dim` matches its
+/// own configured embedder dimensionality (the same dim-safety
+/// property recall's H7 `CosineComparison::DimensionMismatch` exists
+/// for). On mismatch — or when no vector was shipped — the row falls
+/// back to the deferred background-embed path; either way the
+/// receiver acks after commit WITHOUT a synchronous embed (~1s/row
+/// via ollama pre-#1566, which rode inside the sender's quorum-ack
+/// window and drove the `deadline_exceeded` → DLQ cascade).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShippedEmbedding {
+    /// Id of the memory row (in the same push) this vector belongs to.
+    pub memory_id: String,
+    /// Human-readable id of the model that produced the vector
+    /// (sender's `Embedder::model_description()`). Observability only —
+    /// the dim gate is the load-bearing safety check.
+    pub model: String,
+    /// Dimensionality the sender claims for `vector`. Receivers verify
+    /// `dim == vector.len()` AND `dim == local embedder dim` before
+    /// storing the vector directly.
+    pub dim: usize,
+    /// The embedding vector itself.
+    pub vector: Vec<f32>,
+}
+
+impl ShippedEmbedding {
+    /// Build a shipped embedding for `memory_id` from a freshly
+    /// computed vector; `dim` is derived from the vector length so the
+    /// two can never disagree on the sender side.
+    #[must_use]
+    pub fn new(memory_id: String, model: String, vector: Vec<f32>) -> Self {
+        Self {
+            memory_id,
+            model,
+            dim: vector.len(),
+            vector,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::receive::{catchup_once, urlencoding_encode};
