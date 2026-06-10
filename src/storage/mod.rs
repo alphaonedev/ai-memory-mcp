@@ -22,6 +22,14 @@ const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
 const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
 const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
+// ── #1579 A2 — sargable `list` SQL fragments ──────────────────────────────
+// The always-present expiry guard opens the WHERE clause; every other
+// filter is appended by `build_list_query` ONLY when the caller supplied
+// it, so the planner sees bare `col = ?` / `col >= ?` predicates it can
+// drive through `idx_memories_list_order` / `idx_memories_ns_list_order`
+// instead of the formerly non-sargable `(?N IS NULL OR col = ?N)` arms.
+const SQL_LIST_BASE: &str = "SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?)";
+const SQL_LIST_ORDER_LIMIT: &str = " ORDER BY priority DESC, updated_at DESC LIMIT ? OFFSET ?";
 
 /// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
 /// precision. Companion of the same-named helper in
@@ -376,6 +384,11 @@ pub(crate) mod reflect;
 // is re-published at `crate::storage::*` (and therefore `crate::db::*`
 // via the lib.rs shim) so callsites keep resolving without churn.
 pub use connection::open;
+// #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
+// seeding hook (`daemon_runtime::run`); the DEFAULT const is the
+// compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
+// out on (also consumed by the config-precedence tests).
+pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
 // v0.7.0 refactor PR-1 (#793) — schema-pins SSOT. Re-export the
 // test-facing helper so callers can use either
 // `ai_memory::storage::current_schema_version_for_tests()` or the
@@ -640,7 +653,11 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // `[entity:X]` title-marker fallback) on reflection rows. See
     // `extract_mentioned_entity_id` for the resolution order.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
-    let actual_id: String = conn.query_row(
+    // #1579 B6 — `insert` is the hottest write statement in the
+    // substrate (every store / upsert / capture-turn / federation push
+    // lands here). `prepare_cached` skips the re-parse of this ~60-line
+    // upsert on every call after the first.
+    let mut insert_stmt = conn.prepare_cached(
         "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
          ON CONFLICT(title, namespace) DO UPDATE SET
@@ -714,14 +731,34 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- extraction populate previously-NULL rows.
             mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
          RETURNING id",
+    )?;
+    let actual_id: String = insert_stmt.query_row(
         params![
-            mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
-            tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
-            metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
-            mem.entity_id, mem.persona_version,
-            citations_json, mem.source_uri, source_span_json,
-            mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
+            mem.id,
+            mem.tier.as_str(),
+            mem.namespace,
+            mem.title,
+            mem.content,
+            tags_json,
+            mem.priority,
+            mem.confidence,
+            mem.source,
+            mem.access_count,
+            mem.created_at,
+            mem.updated_at,
+            mem.last_accessed_at,
+            mem.effective_expires_at(),
+            metadata_json,
+            mem.reflection_depth,
+            mem.memory_kind.as_str(),
+            mem.entity_id,
+            mem.persona_version,
+            citations_json,
+            mem.source_uri,
+            source_span_json,
+            mem.confidence_source.as_str(),
+            confidence_signals_json,
+            mem.confidence_decayed_at,
             mentioned_entity_id,
         ],
         |r| r.get(0),
@@ -823,16 +860,22 @@ pub fn capture_turn_idempotent(
 ) -> std::result::Result<crate::models::CaptureTurnResult, String> {
     use rusqlite::OptionalExtension;
 
+    // #1579 B6 — the dedup probe fires on EVERY captured turn before
+    // any write; `prepare_cached` keeps the per-turn cost at bind+step.
     let existing: Option<String> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT memory_id FROM transcript_line_dedup \
              WHERE host_session_id IS NOT NULL \
                AND host_session_id = ?1 \
                AND host_turn_index = ?2",
-            params![&write.host_session_id, write.host_turn_index],
-            |row| row.get(0),
         )
-        .optional()
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![&write.host_session_id, write.host_turn_index],
+                |row| row.get(0),
+            )
+            .optional()
+        })
         .map_err(|e| format!("DEDUP_QUERY_FAILED: {e}"))?;
 
     if let Some(memory_id) = existing {
@@ -849,20 +892,22 @@ pub fn capture_turn_idempotent(
         let inserted_id =
             insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
 
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
              (sha256, memory_id, host_kind, transcript_path, \
               host_session_id, host_turn_index, recovered_at) \
              VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 write.sha256,
                 inserted_id,
                 write.host_kind,
                 write.host_session_id,
                 write.host_turn_index,
                 write.recovered_at_ms,
-            ],
-        )
+            ])
+        })
         .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
 
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
@@ -1021,7 +1066,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
 }
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Memory>> {
-    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     match rows.next() {
         Some(Ok(m)) => Ok(Some(m)),
@@ -1322,7 +1367,7 @@ pub fn update_with_expected_version(
     source_uri: Option<&str>,
     expected_version: Option<i64>,
 ) -> Result<(bool, bool)> {
-    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         return Ok((false, false));
@@ -1544,7 +1589,7 @@ pub fn update_with_archive_on_supersede(
     edit_source: crate::models::EditSource,
 ) -> Result<SupersedeResult> {
     // Read the existing row so we can compose the patched NEW row.
-    let mut stmt = conn.prepare(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
         // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
@@ -2001,6 +2046,82 @@ pub fn forget(
     Ok(deleted)
 }
 
+/// #1579 A2 — build the sargable `list` SQL + parameter vector.
+///
+/// The legacy single-shape query expressed every optional filter as a
+/// `(?N IS NULL OR col = ?N)` arm. SQLite cannot drive such an arm
+/// through an index (the predicate is not sargable), so the P1 perf
+/// audit measured the 100k-row list page at ~141 ms: the plan answered
+/// the expiry guard via `idx_memories_expires` and paid a USE TEMP
+/// B-TREE FOR ORDER BY over the whole table. Appending each filter
+/// ONLY when the caller supplied it gives the planner bare `col = ?` /
+/// `col >= ?` predicates, so it walks `idx_memories_list_order
+/// (priority DESC, updated_at DESC)` — or `idx_memories_ns_list_order
+/// (namespace, priority DESC, updated_at DESC)` for namespace-filtered
+/// shapes — in ORDER BY order with early-stop under the LIMIT
+/// (~0.06 ms on the same corpus). EXPLAIN QUERY PLAN proof is pinned
+/// by `tests/issue_1579_storage_perf.rs`.
+///
+/// The distinct shapes repeat across calls, so `list` prepares them
+/// via `prepare_cached` — at most 2^7 shapes exist and real traffic
+/// concentrates on a handful.
+///
+/// Public as the test-facing SSOT accessor for the EXPLAIN-pinning
+/// regression tests (the `current_schema_version_for_tests` precedent):
+/// the tests must plan the EXACT SQL production runs, not a restated
+/// copy that could drift.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_list_query(
+    namespace: Option<&str>,
+    tier: Option<&Tier>,
+    min_priority: Option<i32>,
+    now: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+    tags_filter: Option<&str>,
+    agent_id: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut sql = String::from(SQL_LIST_BASE);
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.to_string())];
+    if let Some(ns) = namespace {
+        sql.push_str(" AND namespace = ?");
+        params_vec.push(Box::new(ns.to_string()));
+    }
+    if let Some(t) = tier {
+        sql.push_str(" AND tier = ?");
+        params_vec.push(Box::new(t.as_str().to_string()));
+    }
+    if let Some(p) = min_priority {
+        sql.push_str(" AND priority >= ?");
+        params_vec.push(Box::new(p));
+    }
+    if let Some(s) = since {
+        sql.push_str(" AND created_at >= ?");
+        params_vec.push(Box::new(s.to_string()));
+    }
+    if let Some(u) = until {
+        sql.push_str(" AND created_at <= ?");
+        params_vec.push(Box::new(u.to_string()));
+    }
+    if let Some(tag) = tags_filter {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?)",
+        );
+        params_vec.push(Box::new(tag.to_string()));
+    }
+    if let Some(a) = agent_id {
+        sql.push_str(" AND agent_id_idx = ?");
+        params_vec.push(Box::new(a.to_string()));
+    }
+    sql.push_str(SQL_LIST_ORDER_LIMIT);
+    params_vec.push(Box::new(limit));
+    params_vec.push(Box::new(offset));
+    (sql, params_vec)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn list(
     conn: &Connection,
@@ -2015,35 +2136,22 @@ pub fn list(
     agent_id: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
-    let tier_str = tier.map(|t| t.as_str().to_string());
-    let mut stmt = conn.prepare(
-        "SELECT * FROM memories
-         WHERE (?1 IS NULL OR namespace = ?1)
-           AND (?2 IS NULL OR tier = ?2)
-           AND (?3 IS NULL OR priority >= ?3)
-           AND (expires_at IS NULL OR expires_at > ?4)
-           AND (?5 IS NULL OR created_at >= ?5)
-           AND (?6 IS NULL OR created_at <= ?6)
-           AND (?7 IS NULL OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE json_each.value = ?7))
-           AND (?10 IS NULL OR agent_id_idx = ?10)
-         ORDER BY priority DESC, updated_at DESC
-         LIMIT ?8 OFFSET ?9",
-    )?;
-    let rows = stmt.query_map(
-        params![
-            namespace,
-            tier_str,
-            min_priority,
-            now,
-            since,
-            until,
-            tags_filter,
-            limit,
-            offset,
-            agent_id,
-        ],
-        row_to_memory,
-    )?;
+    let (sql, params_vec) = build_list_query(
+        namespace,
+        tier,
+        min_priority,
+        &now,
+        since,
+        until,
+        tags_filter,
+        agent_id,
+        limit,
+        offset,
+    );
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), row_to_memory)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
 }
@@ -6176,56 +6284,103 @@ pub fn auto_purge_archive(conn: &Connection, max_days: Option<i64>) -> Result<us
     }
 }
 
+/// #1579 B6 (F5.7) — expired rows reaped per GC transaction.
+///
+/// The pre-fix `gc` ran ONE `BEGIN IMMEDIATE` covering an archive
+/// `INSERT … SELECT` + `DELETE` over the entire expired set, holding
+/// the sqlite write lock for the whole sweep (seconds on a 100k-row
+/// expiry backlog, during which every concurrent writer queues behind
+/// `busy_timeout`). Chunking bounds the lock-hold per transaction to
+/// this many rows; the loop in [`gc`] re-runs until the backlog drains.
+/// 500 keeps each archive-copy + delete transaction in the
+/// single-digit-millisecond band on the P1 audit corpus while still
+/// amortising the per-transaction fsync across a useful batch.
+const GC_CHUNK_ROWS: usize = 500;
+
+/// Subquery selecting one bounded chunk of expired row ids. Shared by
+/// the archive `INSERT … SELECT` and the `DELETE` inside the same
+/// `BEGIN IMMEDIATE` transaction; `ORDER BY rowid` makes the selection
+/// fully deterministic, so both statements — which run against the
+/// identical snapshot because the transaction holds the write lock —
+/// target the exact same rows and the archive-before-delete invariant
+/// is preserved chunk by chunk.
+const SQL_GC_EXPIRED_CHUNK_IDS: &str = "SELECT id FROM memories \
+     WHERE expires_at IS NOT NULL AND expires_at < ?1 \
+     ORDER BY rowid LIMIT ?2";
+
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
-    let result = (|| -> Result<usize> {
-        if archive {
-            // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
-            conn.execute(
-                "INSERT OR REPLACE INTO archived_memories
-                 (id, tier, namespace, title, content, tags, priority, confidence,
-                  source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at,
-                  reflection_depth, atomised_into, atom_of, memory_kind,
-                  entity_id, persona_version, citations, source_uri, source_span,
-                  confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?1, 'ttl_expired', metadata,
-                        embedding, embedding_dim, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version
-                 FROM memories
-                 WHERE expires_at IS NOT NULL AND expires_at < ?1",
-                params![now],
-            )?;
-        }
-        let deleted = conn.execute(
-            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
-            params![now],
-        )?;
-        Ok(deleted)
-    })();
-    match result {
-        Ok(n) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
-            // Clean up namespace_meta rows pointing to deleted memories
-            let _ = conn.execute(
-                "DELETE FROM namespace_meta WHERE standard_id NOT IN (SELECT id FROM memories)",
-                [],
-            );
-            Ok(n)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
-            Err(e)
+    // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
+    // iteration archives + deletes at most GC_CHUNK_ROWS expired rows
+    // inside its own BEGIN IMMEDIATE transaction, so concurrent
+    // writers interleave between chunks instead of stalling behind one
+    // giant sweep transaction. Archive semantics are preserved: within
+    // a chunk the archive INSERT and the DELETE address the same
+    // deterministic id set (see SQL_GC_EXPIRED_CHUNK_IDS), and a
+    // failure rolls back only the in-flight chunk (already-committed
+    // chunks remain reaped — same observable contract as repeated
+    // smaller gc calls).
+    let mut total = 0usize;
+    loop {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let result = (|| -> Result<usize> {
+            if archive {
+                // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on GC archive.
+                let mut archive_stmt = conn.prepare_cached(&format!(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?1, 'ttl_expired', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version
+                     FROM memories
+                     WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                ))?;
+                archive_stmt.execute(params![now, GC_CHUNK_ROWS])?;
+            }
+            let mut delete_stmt = conn.prepare_cached(&format!(
+                "DELETE FROM memories WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+            ))?;
+            let deleted = delete_stmt.execute(params![now, GC_CHUNK_ROWS])?;
+            Ok(deleted)
+        })();
+        match result {
+            Ok(n) => {
+                conn.execute_batch(connection::SQL_COMMIT)?;
+                total += n;
+                if n < GC_CHUNK_ROWS {
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+                return Err(e);
+            }
         }
     }
+    // Clean up namespace_meta rows pointing to deleted memories.
+    // #1579 B6 — correlated NOT EXISTS instead of the former
+    // `standard_id NOT IN (SELECT id FROM memories)`, which
+    // materialised the full id set on every sweep; the rewrite is one
+    // primary-key probe per namespace_meta row (a small table — one
+    // row per namespace standard).
+    let _ = conn.execute(
+        "DELETE FROM namespace_meta WHERE NOT EXISTS \
+         (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)",
+        [],
+    );
+    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -6773,7 +6928,10 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // so a stale peer cannot blank out a value the matcher's index
     // depends on.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
-    let actual_id: String = conn.query_row(
+    // #1579 B6 — federation catch-up replays this newer-wins upsert
+    // once per pulled row; `prepare_cached` amortises the parse of the
+    // largest SQL statement in the file across the whole batch.
+    let mut newer_wins_stmt = conn.prepare_cached(
         "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
          ON CONFLICT(title, namespace) DO UPDATE SET
@@ -6863,14 +7021,34 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                                        THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
                                        ELSE memories.mentioned_entity_id END
          RETURNING id",
+    )?;
+    let actual_id: String = newer_wins_stmt.query_row(
         params![
-            mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
-            tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-            mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
-            metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
-            mem.entity_id, mem.persona_version,
-            citations_json, mem.source_uri, source_span_json,
-            mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
+            mem.id,
+            mem.tier.as_str(),
+            mem.namespace,
+            mem.title,
+            mem.content,
+            tags_json,
+            mem.priority,
+            mem.confidence,
+            mem.source,
+            mem.access_count,
+            mem.created_at,
+            mem.updated_at,
+            mem.last_accessed_at,
+            mem.effective_expires_at(),
+            metadata_json,
+            mem.reflection_depth,
+            mem.memory_kind.as_str(),
+            mem.entity_id,
+            mem.persona_version,
+            citations_json,
+            mem.source_uri,
+            source_span_json,
+            mem.confidence_source.as_str(),
+            confidence_signals_json,
+            mem.confidence_decayed_at,
             mentioned_entity_id,
         ],
         |r| r.get(0),
@@ -7160,10 +7338,44 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
 }
 
 /// Get all memory IDs that are missing embeddings.
+///
+/// #1579 B6 (F5.6): unbounded — materialises every `(id, title,
+/// content)` triple in one `Vec`, which on a large backlog is the
+/// whole corpus in memory. Hot loops (the embed-backfill sweep) should
+/// use [`get_unembedded_ids_batch`] and drain in bounded passes; this
+/// variant remains for callers that need the full snapshot semantics.
 pub fn get_unembedded_ids(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut stmt =
         conn.prepare("SELECT id, title, content FROM memories WHERE embedding IS NULL")?;
     let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// #1579 B6 (F5.6) — bounded variant of [`get_unembedded_ids`].
+///
+/// Returns at most `limit` `(id, title, content)` triples so the
+/// caller's materialisation is bounded by its batch size (the
+/// `AI_MEMORY_EMBED_BACKFILL_BATCH` resolver semantics) instead of the
+/// whole unembedded backlog. There is deliberately NO OFFSET: rows
+/// that gain an embedding drop out of the `embedding IS NULL`
+/// predicate, so callers drain by re-fetching until the returned batch
+/// is empty (or stops shrinking — rows whose embedding persistently
+/// fails stay at the head of the scan).
+pub fn get_unembedded_ids_batch(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, title, content FROM memories WHERE embedding IS NULL LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -7474,7 +7686,10 @@ fn fts_keyword_phase(
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
         vis = visibility_clause(8, "m"),
     );
-    let mut fts_stmt = conn.prepare(&fts_sql)?;
+    // #1579 B6 — recall’s FTS branch is the hottest read statement;
+    // prepare_cached amortises re-parsing across recalls (shape cardinality
+    // is small: the optional fragments expand to a handful of variants).
+    let mut fts_stmt = conn.prepare_cached(&fts_sql)?;
     let fts_row_handler =
         |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>)> {
             let mem = row_to_memory(row)?;
@@ -7700,7 +7915,8 @@ fn semantic_phase(
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
         vis = visibility_clause(6, "memories"),
     );
-    let mut sem_stmt = conn.prepare(&sem_sql)?;
+    // #1579 B6 — same prepare_cached treatment as the FTS branch above.
+    let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
     let sem_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>)> {
         let mem = row_to_memory(row)?;
         // v0.7.x Form 6 — `memory_kind` was inserted between

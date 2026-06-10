@@ -1,0 +1,53 @@
+-- v0.7.0 #1579 A2 + B6d — composite list / archive ordering indexes
+-- (schema v56).
+--
+-- A2: `storage::list` orders every page with
+--
+--     ORDER BY priority DESC, updated_at DESC LIMIT ? OFFSET ?
+--
+-- The P1 perf audit measured the 100k-row list at ~141 ms local /
+-- ~156 ms HTTP because the planner answered the (formerly
+-- non-sargable) OR-NULL filter arms with `idx_memories_expires` plus a
+-- USE TEMP B-TREE FOR ORDER BY over the whole table. With the filter
+-- arms split into distinct prepared shapes (same change, see
+-- `storage::list`) the planner can instead walk a composite index in
+-- ORDER BY order and stop at the LIMIT (~0.06 ms local / ~1 ms HTTP on
+-- the same corpus):
+--
+--   * idx_memories_list_order (priority DESC, updated_at DESC) —
+--     serves the bare / tier-only / min_priority shapes: the index
+--     order IS the ORDER BY, and a `priority >= ?` floor becomes a
+--     range bound on the first key.
+--   * idx_memories_ns_list_order (namespace, priority DESC,
+--     updated_at DESC) — serves the namespace-filtered shapes:
+--     namespace equality on the prefix, then the same ordered walk.
+--     EXPLAIN QUERY PLAN proof for both shapes is pinned by
+--     `tests/issue_1579_storage_perf.rs`.
+--
+-- B6d: `storage::list_archived` orders with
+--
+--     WHERE namespace = ? ORDER BY archived_at DESC LIMIT ? OFFSET ?
+--
+-- which the separate single-column `idx_archived_namespace` +
+-- `idx_archived_at` indexes cannot serve sort-free.
+-- `idx_archived_ns_archived_at` gives the namespace-filtered shape an
+-- equality prefix + ordered walk; the bare shape keeps using
+-- `idx_archived_at`. The now-redundant single-column
+-- `idx_archived_namespace` is intentionally NOT dropped: append-only
+-- ladder discipline, and other namespace-equality probes still use it
+-- interchangeably.
+--
+-- Pure additive `CREATE INDEX IF NOT EXISTS` — fully idempotent and
+-- replay-safe. The two `memories` indexes are also carried inline in
+-- the bootstrap SCHEMA const (the `idx_memories_updated_at` v55
+-- precedent). The `archived_memories` sibling
+-- (`idx_archived_ns_archived_at ON archived_memories (namespace,
+-- archived_at DESC)`) is NOT in this file: that table is created by
+-- the v4 ladder arm rather than the bootstrap SCHEMA, so the v56 Rust
+-- arm (`src/storage/migrations.rs`) creates the index behind a
+-- table-existence probe (the v49/v50 defensive precedent for
+-- synthetic fixtures that stamp a version without replaying v4).
+CREATE INDEX IF NOT EXISTS idx_memories_list_order
+    ON memories (priority DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_ns_list_order
+    ON memories (namespace, priority DESC, updated_at DESC);

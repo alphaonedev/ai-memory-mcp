@@ -37,12 +37,57 @@ pub const SQL_BEGIN_IMMEDIATE: &str = "BEGIN IMMEDIATE";
 pub const SQL_COMMIT: &str = "COMMIT";
 pub const SQL_ROLLBACK: &str = "ROLLBACK";
 
+/// #1579 B7 — default `PRAGMA mmap_size` in bytes (256 MiB).
+///
+/// The P1 perf-audit PRAGMA A/B on the 100k-row corpus found
+/// `mmap_size=256MB` the only across-the-board winner (15-30% on
+/// large-corpus reads: list p50 137 ms → 101 ms, recall-FTS p50
+/// 658 ms → 569 ms; `temp_store=MEMORY` was a wash and
+/// `cache_size=64MB` a regression). Memory-mapped I/O lets SQLite read
+/// pages straight from the OS page cache instead of `read(2)` copies;
+/// the value is an address-space reservation cap, NOT an allocation,
+/// so idle databases pay nothing.
+///
+/// Operator override ladder (resolved by
+/// `AppConfig::resolve_storage()` at boot and seeded here via
+/// [`set_db_mmap_size`]): `AI_MEMORY_DB_MMAP_SIZE` env >
+/// `[storage].db_mmap_size_bytes` config > this compiled default.
+/// `0` disables memory-mapped I/O entirely (the stock SQLite
+/// semantics); negative / unparseable values fall through to the next
+/// ladder layer.
+pub const DEFAULT_DB_MMAP_SIZE_BYTES: i64 = 256 * 1024 * 1024;
+
+/// Process-wide resolved `PRAGMA mmap_size`, seeded once at boot from
+/// `AppConfig::resolve_storage()` (the `crate::quotas::QuotaDefaults`
+/// OnceLock precedent — `open` is called deep in paths where no
+/// `AppConfig` is in scope). Unseeded processes (unit tests, library
+/// embedders that bypass the CLI boot path) fall through to
+/// [`DEFAULT_DB_MMAP_SIZE_BYTES`].
+static DB_MMAP_SIZE_BYTES: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Seed the process-wide mmap size for every subsequent [`open`].
+/// Idempotent — first writer wins; later calls are no-ops (matches
+/// `crate::quotas::set_quota_defaults`).
+pub fn set_db_mmap_size(bytes: i64) {
+    let _ = DB_MMAP_SIZE_BYTES.set(bytes);
+}
+
+/// The effective `PRAGMA mmap_size` for this process.
+fn db_mmap_size() -> i64 {
+    *DB_MMAP_SIZE_BYTES
+        .get()
+        .unwrap_or(&DEFAULT_DB_MMAP_SIZE_BYTES)
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // #1579 B7 — memory-mapped I/O. See DEFAULT_DB_MMAP_SIZE_BYTES for
+    // the P1 A/B evidence + override ladder.
+    conn.pragma_update(None, "mmap_size", db_mmap_size())?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
@@ -235,6 +280,25 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .expect("journal_mode");
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn open_applies_default_mmap_size() {
+        // #1579 B7 — `open` must apply the compiled 256 MiB mmap
+        // default when the process never seeded `set_db_mmap_size`
+        // (the unit-test / library-embedder posture). The OnceLock is
+        // process-global, but nothing in the test binary seeds it —
+        // `daemon_runtime::run` is the only production writer — so the
+        // fallback branch is the one under test.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = open(tmp.path()).expect("open");
+        let mmap: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+            .expect("mmap_size");
+        assert_eq!(
+            mmap, DEFAULT_DB_MMAP_SIZE_BYTES,
+            "open() must apply the P1-proven 256 MiB mmap_size default"
+        );
     }
 
     #[test]

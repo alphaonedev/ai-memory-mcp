@@ -100,8 +100,24 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // pushed the file to 16_475. Growth justified: security-gate
     // hoist + injection-class fix, no speculative surface.
     // 16_550 = 16_475 + 75 headroom.
-    ("src/storage/mod.rs", 16_550),
-    ("src/mcp/mod.rs", 14_000),
+    //
+    // 2026-06-10 (#1579 perf final-gate) — bumped 16_550 → 16_700 by
+    // the A2 sargable-list rewrite + B6 scale bundle: the
+    // `build_list_query` SQL builder (the OR-NULL filter arms became
+    // distinct prepared shapes the v56 composite indexes can serve),
+    // the chunked GC loop (`GC_CHUNK_ROWS` bounded transactions
+    // replacing the single whole-backlog BEGIN IMMEDIATE), and the
+    // bounded `get_unembedded_ids_batch` variant pushed the file to
+    // 16_691. Growth justified: measured hot-path fixes (P1 audit:
+    // list 141 ms → 0.06 ms at 100k rows) plus their doc comments, no
+    // speculative surface. 16_700 = 16_691 + 9 headroom.
+    ("src/storage/mod.rs", 16_700),
+    // 2026-06-10 (#1579 B6/F5.6) — bumped 14_000 → 14_050: the
+    // embed-backfill sweep converted from whole-backlog
+    // materialisation to a bounded drain loop over
+    // `get_unembedded_ids_batch` (+ the no-progress break), pushing
+    // the file to 14_010. 14_050 = 14_010 + 40 headroom.
+    ("src/mcp/mod.rs", 14_050),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -205,7 +221,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // ungoverned-link-write security hole + decay parity, zero
     // speculative surface. 16_700 = 16_601 + 99 headroom.
     ("src/store/postgres.rs", 16_700),
-    ("src/config.rs", 9_000),
+    // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
+    // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
+    // StorageSection/ResolvedStorage fields + the resolve_storage env >
+    // config > default ladder arm) and its four precedence regression
+    // tests pushed the file to 9_091. Growth justified: one operator
+    // knob on the established resolver pattern plus its mandated
+    // precedence pins. 9_150 = 9_091 + 59 headroom.
+    ("src/config.rs", 9_150),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -277,7 +300,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // recover-from-backup safety primitive on the open/migrate path plus
     // its regression coverage, zero speculative surface. 3700 = 3625 + 75
     // headroom; far under the 1.5x cap.
-    ("src/storage/migrations.rs", 3_700),
+    // 2026-06-10 (#1579 A2 + B6d) — bumped 3_700 → 3_800: the v56
+    // ladder arm (composite list/archive ordering indexes + the
+    // archived_memories table probe), the SCHEMA-inline index pair,
+    // and the `latest_arm_creates_list_composite_indexes_and_is_
+    // idempotent` regression test pushed the file to 3_769. Growth
+    // justified: one schema bump + its replay/idempotency coverage.
+    // 3_800 = 3_769 + 31 headroom.
+    ("src/storage/migrations.rs", 3_800),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

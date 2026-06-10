@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 55).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 56).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -37,6 +37,11 @@ pub(crate) const SELECT_SCHEMA_VERSION_SQL: &str =
 /// migration arms (one spelling; pm-v3.1 hardcoded-literal gate,
 /// #1558 wave 4).
 const PRAGMA_TABLE_INFO_MEMORIES: &str = "PRAGMA table_info(memories)";
+
+/// Tracing target for the sqlite migration ladder (the
+/// `store::postgres` `TRACE_TARGET` precedent — one named const, no
+/// scattered target literals).
+const TRACE_TARGET: &str = "ai_memory::storage::migrations";
 
 pub(super) const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS memories (
@@ -156,6 +161,16 @@ CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
 -- migration v55 (file 0046) for upgrading DBs; carried inline here so a
 -- fresh bootstrap that applies SCHEMA has it even before the ladder runs.
 CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at);
+-- #1579 (A2) — composite list-ordering indexes for the sargable
+-- `storage::list` shapes (`ORDER BY priority DESC, updated_at DESC
+-- LIMIT ? OFFSET ?`, optionally namespace-filtered). Also added by
+-- migration v56 (file 0047) for upgrading DBs; carried inline here so
+-- a fresh bootstrap that applies SCHEMA has them even before the
+-- ladder runs. The archived_memories sibling index from the same
+-- migration is NOT inline because that table is created by the v4
+-- ladder arm, not this bootstrap.
+CREATE INDEX IF NOT EXISTS idx_memories_list_order ON memories(priority DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_ns_list_order ON memories(namespace, priority DESC, updated_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_title_ns ON memories(title, namespace);
 -- Partial indexes referencing v36+ columns (`atom_of`, `atomised_into`,
 -- `source_uri`, `confidence_source`, `mentioned_entity_id`) and the v41
@@ -568,6 +583,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       eliminated; `touch_many` for K=10 recalls drops 5-10x wall
 //       cost. Pure DDL — DROP TRIGGER + recreate with `AFTER UPDATE
 //       OF title, content, tags` column scope. Idempotent.
+//
+//   * v56 — #1579 (A2 + B6d), 2026-06-10 perf final-gate remediation.
+//       Composite list / archive ordering indexes:
+//       `idx_memories_list_order (priority DESC, updated_at DESC)`,
+//       `idx_memories_ns_list_order (namespace, priority DESC,
+//       updated_at DESC)`, and `idx_archived_ns_archived_at
+//       (namespace, archived_at DESC)`. Paired with the sargable
+//       rewrite of `storage::list` (the OR-NULL filter arms became
+//       distinct prepared shapes) so the planner walks an index in
+//       ORDER BY order with early-stop under LIMIT instead of
+//       `idx_memories_expires` + USE TEMP B-TREE FOR ORDER BY
+//       (P1-measured 141 ms -> 0.06 ms at 100k rows). Pure additive
+//       CREATE INDEX IF NOT EXISTS — fully idempotent.
 /// Current schema tip — the single source of truth for the sqlite
 /// schema version. The literal lives HERE and nowhere else on the
 /// sqlite side; every migration arm/gate/stamp/meta entry references
@@ -575,7 +603,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 55;
+const CURRENT_SCHEMA_VERSION: i64 = 56;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1044,6 +1072,15 @@ const MIGRATION_V53_SQLITE: &str =
 // — fully idempotent + replay-safe.
 const MIGRATION_V55_SQLITE: &str =
     include_str!("../../migrations/sqlite/0046_v55_idx_memories_updated_at.sql");
+// v0.7.0 #1579 (A2 + B6d) — composite list / archive ordering indexes.
+// `(priority DESC, updated_at DESC)` + `(namespace, priority DESC,
+// updated_at DESC)` let the sargable `storage::list` shapes walk an
+// index in ORDER BY order with early-stop under LIMIT (no temp B-tree
+// sort); `(namespace, archived_at DESC)` does the same for the
+// namespace-filtered `list_archived` page. Pure additive
+// `CREATE INDEX IF NOT EXISTS` — fully idempotent + replay-safe.
+const MIGRATION_V56_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0047_v56_list_composite_indexes.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2228,7 +2265,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 .collect::<rusqlite::Result<_>>()?;
             if existing.is_empty() {
                 tracing::debug!(
-                    target: "ai_memory::storage::migrations",
+                    target: TRACE_TARGET,
                     "v49: archived_memories table does not exist (test fixture or \
                      deployment-without-archive); skipping column extension"
                 );
@@ -2289,7 +2326,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 .collect::<rusqlite::Result<_>>()?;
             if cols.is_empty() {
                 tracing::debug!(
-                    target: "ai_memory::storage::migrations",
+                    target: TRACE_TARGET,
                     "v50: agent_quotas table does not exist (test fixture or \
                      deployment-without-quotas); skipping shadow-table swap"
                 );
@@ -2395,7 +2432,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 }
             }
         }
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 55 {
             // v0.7.0 #1476 — federation-catchup `updated_at` index.
             // `memories_updated_since` drives every W=2 peer catchup
             // with `WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT`.
@@ -2406,6 +2443,44 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // in index order, each with early-stop under the LIMIT.
             // `CREATE INDEX IF NOT EXISTS` so the migration is replay-safe.
             conn.execute_batch(MIGRATION_V55_SQLITE)?;
+        }
+        if version < CURRENT_SCHEMA_VERSION {
+            // v0.7.0 #1579 (A2 + B6d) — composite list / archive
+            // ordering indexes. The P1 perf audit measured the 100k-row
+            // `storage::list` page at ~141 ms because the plan used
+            // `idx_memories_expires` + USE TEMP B-TREE FOR ORDER BY;
+            // walking `(priority DESC, updated_at DESC)` (optionally
+            // prefixed by a `namespace` equality) in index order with
+            // early-stop under LIMIT drops the same page to ~0.06 ms.
+            // `CREATE INDEX IF NOT EXISTS` so the migration is
+            // replay-safe.
+            conn.execute_batch(MIGRATION_V56_SQLITE)?;
+            // B6d — the archived_memories sibling gives the
+            // namespace-filtered `list_archived` page the same
+            // sort-free shape. The table is created by the v4 arm (it
+            // is NOT in the bootstrap SCHEMA), so probe for it first —
+            // the v49/v50 defensive precedent for synthetic fixtures
+            // that stamp a schema_version without replaying v4. Real
+            // ladders (fresh v0 replay or any v4+ deployment) always
+            // have the table.
+            let has_archive_table: bool = conn
+                .prepare("PRAGMA table_info(archived_memories)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .next()
+                .is_some();
+            if has_archive_table {
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_archived_ns_archived_at \
+                     ON archived_memories (namespace, archived_at DESC)",
+                    [],
+                )?;
+            } else {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v56: archived_memories table does not exist (test fixture); \
+                     skipping idx_archived_ns_archived_at"
+                );
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -2824,17 +2899,18 @@ mod tests {
     }
 
     #[test]
-    fn latest_arm_creates_updated_at_index_and_is_idempotent() {
-        // #1476 — the latest ladder arm sources MIGRATION_V55_SQLITE
+    fn v55_arm_creates_updated_at_index_and_is_idempotent() {
+        // #1476 — the v55 arm sources MIGRATION_V55_SQLITE
         // (`CREATE INDEX IF NOT EXISTS idx_memories_updated_at`). Start a
-        // DB one version below current WITHOUT the index, run the ladder,
+        // DB one version below the arm WITHOUT the index, run the ladder,
         // and assert the index materialised; then rewind and re-run to
         // prove the `IF NOT EXISTS` form is replay-safe and the version
-        // stays put. No hardcoded version literal — the seed version is
-        // derived from CURRENT_SCHEMA_VERSION so the test tracks the
-        // constant across future schema bumps (same SSOT discipline as
-        // the v54 idempotency test above).
-        const PRIOR_VERSION: i64 = CURRENT_SCHEMA_VERSION - 1;
+        // stays put. Seeds the FIXED version 54 (one below the v55 arm's
+        // trigger), NOT `CURRENT_SCHEMA_VERSION - 1` — when the tip
+        // advanced to v56 the arm became version-pinned (`if version <
+        // 55`), so its trigger no longer tracks the constant (the same
+        // fixed-trigger discipline as the v54 idempotency test above).
+        const PRIOR_VERSION: i64 = 54;
         const UPDATED_AT_INDEX: &str = "idx_memories_updated_at";
 
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -2861,7 +2937,7 @@ mod tests {
         super::migrate(&conn).expect("first index-migration pass");
         assert!(
             index_exists(&conn, UPDATED_AT_INDEX),
-            "latest arm must create {UPDATED_AT_INDEX}"
+            "v55 arm must create {UPDATED_AT_INDEX}"
         );
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
 
@@ -2869,6 +2945,57 @@ mod tests {
         seed_prior_version(&conn);
         super::migrate(&conn).expect("second pass is replay-safe");
         assert!(index_exists(&conn, UPDATED_AT_INDEX));
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn latest_arm_creates_list_composite_indexes_and_is_idempotent() {
+        // #1579 (A2) — the latest ladder arm sources MIGRATION_V56_SQLITE
+        // (the two composite list-ordering indexes; the archived_memories
+        // sibling is created behind a table probe and exercised by the
+        // historical v1 replay test, since this fixture applies SCHEMA
+        // only and SCHEMA carries no archived_memories table). Start a DB
+        // one version below current WITHOUT the indexes, run the ladder,
+        // assert they materialised, then rewind + re-run to prove
+        // replay-safety. No hardcoded version literal — the seed version
+        // derives from CURRENT_SCHEMA_VERSION so the test tracks the
+        // constant across future schema bumps.
+        const PRIOR_VERSION: i64 = CURRENT_SCHEMA_VERSION - 1;
+        const LIST_INDEXES: [&str; 2] = ["idx_memories_list_order", "idx_memories_ns_list_order"];
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        for idx in LIST_INDEXES {
+            conn.execute(&format!("DROP INDEX IF EXISTS {idx}"), [])
+                .expect("drop index to simulate a pre-index DB");
+            assert!(
+                !index_exists(&conn, idx),
+                "precondition: {idx} removed to simulate a pre-index DB"
+            );
+        }
+
+        let seed_prior_version = |conn: &Connection| {
+            conn.execute("DELETE FROM schema_version", []).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![PRIOR_VERSION],
+            )
+            .unwrap();
+        };
+
+        seed_prior_version(&conn);
+        super::migrate(&conn).expect("first index-migration pass");
+        for idx in LIST_INDEXES {
+            assert!(index_exists(&conn, idx), "latest arm must create {idx}");
+        }
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // Rewind + replay: CREATE INDEX IF NOT EXISTS is a no-op.
+        seed_prior_version(&conn);
+        super::migrate(&conn).expect("second pass is replay-safe");
+        for idx in LIST_INDEXES {
+            assert!(index_exists(&conn, idx));
+        }
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
     }
 
@@ -3258,6 +3385,15 @@ mod tests {
         // legacy v1 schema has no such index, so its presence here proves
         // the v55 migration arm (MIGRATION_V55_SQLITE) actually ran.
         assert!(index_exists(&conn, "idx_memories_updated_at"));
+        // v56 (#1579 A2 + B6d) — composite list / archive ordering
+        // indexes. Same proof shape: the legacy v1 schema has none of
+        // them, so their presence proves the v56 arm
+        // (MIGRATION_V56_SQLITE) actually ran — including the
+        // archived_memories index, whose table itself is only created
+        // by the v4 arm earlier in the replay.
+        assert!(index_exists(&conn, "idx_memories_list_order"));
+        assert!(index_exists(&conn, "idx_memories_ns_list_order"));
+        assert!(index_exists(&conn, "idx_archived_ns_archived_at"));
     }
 
     #[test]
