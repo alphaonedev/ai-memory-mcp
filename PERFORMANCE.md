@@ -49,6 +49,46 @@ are advisory targets.
 > are loaded. Both surfaces are kept in agreement; this file is the
 > canonical aggregate contract that the `bench.yml` CI guard reads.
 
+## Boot Time-to-Ready — Async HNSW Warm-up (#1579 B3)
+
+Since #1579 (v0.7.0 performance final gate), the daemon (`serve`) and
+the MCP stdio server (`mcp`) **no longer build the HNSW vector index
+on the startup path**. Both surfaces become ready immediately with an
+empty index; a background loader reads the stored embeddings over its
+own connection, builds the graph on the #968 double-buffer rebuild
+thread, and atomically swaps it in. Operators see one line when the
+swap lands:
+
+- `serve`: INFO `HNSW index warm (#1579 B3): async boot build swapped
+  in; semantic recall is now index-backed` (with `entries` +
+  `elapsed_ms` fields).
+- `mcp`: stderr `ai-memory: HNSW index ready (N entries, warmed in
+  X.Xs)`.
+
+**Warm-window semantics** (between process start and the swap):
+
+- Semantic recall serves the keyword/FTS blend (the same degraded mode
+  used when no embedder is configured); results are correct but ranked
+  without the vector phase.
+- The #519 proactive conflict check routes to a bounded recency scan
+  (newest `PROACTIVE_CONFLICT_SCAN_LIMIT` rows) instead of the index.
+- Writes are unaffected — rows inserted during the window are
+  index-visible immediately (overflow path) and survive the swap.
+
+Pre-#1579 baseline (P1 audit, synchronous boot build): 35 ms keyword
+(any corpus), **40 s at 10k embedded rows, >28 min at 100k** from
+spawn to the first `initialize` answer. Post-#1579 the first answer is
+independent of corpus size; only time-to-*semantic-index-warm* scales
+with N (same build cost, now off the readiness path).
+
+**One-shot CLI** (`ai-memory recall`) never amortises a graph build,
+so it skips HNSW construction entirely below
+`hnsw::CLI_HNSW_BUILD_MIN_ENTRIES` (20 000 embedded rows — SSOT const)
+and uses the recall pipeline's linear-scan fallback, which answers in
+≤ 35 ms at that scale. Embedding backfill on the CLI path is batched
+(`embed_batch` + one multi-row UPDATE per chunk) per the #1146
+`[embeddings].backfill_batch` resolver.
+
 ## Autonomous-Tier Latency Tax — Batman-Active Write Path
 
 > **v0.7.0 Gap #4 (issue #805) attack plan.** Cross-refs #654 (distilled
