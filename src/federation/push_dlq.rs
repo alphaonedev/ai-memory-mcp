@@ -44,13 +44,14 @@
 //!
 //! - No reverse direction. The DLQ is leader → peer. Peer → leader is
 //!   covered by the existing catchup loop in `federation::receive`.
-//! - No retry budget. The replay worker keeps trying forever; the
-//!   `federation_push_dlq_depth` gauge is the operator alert surface.
-//!   A future enhancement may add an `attempt_count` watermark + DLQ-
-//!   parking lot, but for v0.7.0 GA the unbounded retry posture is
-//!   correct: silent data loss is a worse failure mode than
-//!   unbounded-DLQ growth (operators alert on the gauge well before
-//!   the column overflows).
+//! - No unbounded retry. Rows retry up to [`MAX_REPLAY_ATTEMPTS`]
+//!   (~50 min at the default tick), then quarantine: the take query
+//!   excludes them (#1578) and the
+//!   `federation_push_dlq_quarantined` counter +
+//!   `federation_push_dlq_depth` gauge are the operator alert
+//!   surface. Quarantined rows are never silently dropped — the
+//!   data-layer drain procedure lives in docs/TROUBLESHOOTING.md
+//!   §federation-push-DLQ.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,8 +90,9 @@ pub struct FederationPushDlqRow {
 ///
 /// The trait is intentionally small — three methods cover the full
 /// happy path (enqueue on failure, list pending for replay, mark
-/// success). Operator tooling (`ai-memory federation dlq list`,
-/// future) can layer on top via direct SQL.
+/// success). No CLI surface ships at v0.7.0 (#1578); operator
+/// inspection/drain is direct SQL per docs/TROUBLESHOOTING.md
+/// §federation-push-DLQ.
 #[async_trait::async_trait]
 pub trait FederationDlqSink: Send + Sync {
     /// Insert a new pending row OR bump `attempt_count` + refresh
@@ -187,11 +189,13 @@ pub const REPLAY_BATCH_SIZE: usize = 64;
 /// indefinitely while the worker kept re-issuing HTTP POSTs to the
 /// peer every tick (network amplification) AND the `pending_dlq_count`
 /// gauge would never settle. Once `attempt_count >= MAX_REPLAY_ATTEMPTS`
-/// the row is *quarantined*: the replay worker skips it on subsequent
-/// ticks, the `federation_push_dlq_quarantined` Prometheus counter
-/// increments, and the operator gets a tracing::warn line. Operators
-/// then drain quarantined rows manually via `ai-memory federation
-/// dlq drain --quarantined` (CLI surface tracked separately).
+/// the row is *quarantined*: the take query EXCLUDES it (#1578 — the
+/// pre-fix exclusion happened only in-loop, so once a full batch of
+/// oldest rows hit the ceiling they starved the take set and the
+/// queue wedged), the `federation_push_dlq_quarantined` Prometheus
+/// counter increments, and the operator gets a tracing::warn line.
+/// No CLI drain ships at v0.7.0; the data-layer drain procedure is
+/// documented in docs/TROUBLESHOOTING.md §federation-push-DLQ.
 ///
 /// 100 attempts at ~30-second tick cadence = ~50 minutes of retries
 /// before quarantine. That's generous for legitimate transient
@@ -245,7 +249,8 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                 memory_id = %row.memory_id,
                 attempt_count = row.attempt_count,
                 "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}); \
-                 drain manually via `ai-memory federation dlq drain --quarantined`",
+                 no CLI drain surface ships at v0.7.0 — see docs/TROUBLESHOOTING.md \
+                 §federation-push-DLQ for the data-layer drain procedure (#1578)",
                 row.id,
                 row.attempt_count,
             );
@@ -413,25 +418,28 @@ impl FederationDlqSink for SqliteDlqSink {
             .prepare(
                 "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
                  FROM federation_push_dlq \
-                 WHERE replayed_at IS NULL \
+                 WHERE replayed_at IS NULL AND attempt_count < ?2 \
                  ORDER BY failed_at ASC \
                  LIMIT ?1",
             )
             .map_err(|e| format!("sqlite take_pending_dlq_rows prepare: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                let payload_str: String = row.get(3)?;
-                let payload_json =
-                    serde_json::from_str(&payload_str).unwrap_or(serde_json::json!({}));
-                Ok(FederationPushDlqRow {
-                    id: row.get(0)?,
-                    memory_id: row.get(1)?,
-                    peer_id: row.get(2)?,
-                    payload_json,
-                    attempt_count: row.get(4)?,
-                    last_error: row.get(5)?,
-                })
-            })
+            .query_map(
+                rusqlite::params![limit as i64, MAX_REPLAY_ATTEMPTS],
+                |row| {
+                    let payload_str: String = row.get(3)?;
+                    let payload_json =
+                        serde_json::from_str(&payload_str).unwrap_or(serde_json::json!({}));
+                    Ok(FederationPushDlqRow {
+                        id: row.get(0)?,
+                        memory_id: row.get(1)?,
+                        peer_id: row.get(2)?,
+                        payload_json,
+                        attempt_count: row.get(4)?,
+                        last_error: row.get(5)?,
+                    })
+                },
+            )
             .map_err(|e| format!("sqlite take_pending_dlq_rows query: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("sqlite take_pending_dlq_rows collect: {e}"))?;
@@ -533,11 +541,12 @@ impl FederationDlqSink for PostgresDlqSink {
         let rows: Vec<(i64, String, String, serde_json::Value, i32, String)> = sqlx::query_as(
             "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
              FROM federation_push_dlq \
-             WHERE replayed_at IS NULL \
+             WHERE replayed_at IS NULL AND attempt_count < $2 \
              ORDER BY failed_at ASC \
              LIMIT $1",
         )
         .bind(limit_i64)
+        .bind(MAX_REPLAY_ATTEMPTS)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("postgres take_pending_dlq_rows: {e}"))?;

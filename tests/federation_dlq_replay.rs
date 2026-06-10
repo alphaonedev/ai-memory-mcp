@@ -346,3 +346,46 @@ async fn dlq_dedupes_repeated_failures_via_unique_index() {
         "the second failure must bump attempt_count instead of inserting"
     );
 }
+
+/// #1578 — quarantined rows must NOT starve the take batch.
+///
+/// Pre-fix, `take_pending_dlq_rows` had no `attempt_count` exclusion:
+/// once `batch`-many oldest rows hit `MAX_REPLAY_ATTEMPTS`, the worker
+/// fetched exactly those every tick, skipped them in-loop, and never
+/// reached the replayable tail — observed live on do-1461 with 64
+/// quarantined heads wedging 62k replayable rows. The take query now
+/// excludes at-ceiling rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantined_head_does_not_starve_take_batch_1578() {
+    use ai_memory::federation::push_dlq::MAX_REPLAY_ATTEMPTS;
+    let (_tmp, db) = fresh_dlq_db();
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+
+    // Oldest row: already at the quarantine ceiling.
+    sink.enqueue_push_failure("mem-quarantined", "peer-x", &serde_json::json!({}), "boom")
+        .await
+        .expect("enqueue head");
+    {
+        let lock = db.lock().await;
+        lock.0
+            .execute(
+                "UPDATE federation_push_dlq SET attempt_count = ?1 WHERE memory_id = 'mem-quarantined'",
+                rusqlite::params![MAX_REPLAY_ATTEMPTS],
+            )
+            .expect("age the head row to the ceiling");
+    }
+    // Newer, replayable row behind it.
+    sink.enqueue_push_failure("mem-replayable", "peer-x", &serde_json::json!({}), "boom")
+        .await
+        .expect("enqueue tail");
+
+    // A take batch of ONE must skip the quarantined head and return
+    // the replayable tail row — pre-fix this returned the quarantined
+    // head and the tail starved.
+    let took = sink.take_pending_dlq_rows(1).await.expect("take");
+    assert_eq!(took.len(), 1, "one replayable row expected");
+    assert_eq!(
+        took[0].memory_id, "mem-replayable",
+        "#1578: the at-ceiling head must be excluded from the take set"
+    );
+}
