@@ -6844,7 +6844,14 @@ fn serialize_err(field: &str, e: impl std::fmt::Display) -> String {
 fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     StoreError::BackendUnavailable {
         backend: "postgres".to_string(),
-        detail: format!("{what}: {e}"),
+        // #1585 (SEC) — the #1579 A3 redaction covered the parse-url
+        // site only; this shared helper wraps `pool.acquire` / `begin`
+        // / per-statement errors, and `sqlx::Error::Configuration`
+        // (and some connect-time variants) can interpolate the raw
+        // connection URL — credentials included — into its Display.
+        // Scrub any embedded URL's password before the detail leaves
+        // the adapter, mirroring the A3 parse-url site.
+        detail: crate::logging::redact_urls_in_message(&format!("{what}: {e}")),
     }
 }
 
@@ -8771,9 +8778,21 @@ impl MemoryStore for PostgresStore {
     /// until empty).
     async fn list_unembedded(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         limit: usize,
     ) -> StoreResult<Vec<(String, String, String)>> {
+        // #1586 (SEC) — this method returns id+title+content of EVERY
+        // unembedded row regardless of namespace/scope, so it is an
+        // admin-only sweep primitive. The sole production caller is the
+        // serve-boot backfill sweep under `CallerContext::for_admin`.
+        // Refuse a non-admin context (`bypass_visibility == false`) with
+        // an empty result so a future handler that wires this method
+        // without re-gating cannot leak cross-tenant private content —
+        // matching the scope-gate convention every sibling SAL read
+        // applies. The `ctx` is load-bearing, not decorative.
+        if !ctx.bypass_visibility {
+            return Ok(Vec::new());
+        }
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
         let rows = sqlx::query(
             "SELECT id, title, content FROM memories \
