@@ -155,3 +155,83 @@ async fn live_promote_clears_expiry_pg() {
     let _ = store.delete(&ctx, &id).await;
     let _ = store.delete(&ctx, &id_b).await;
 }
+
+/// #1630 (#1466 class) — pg consolidate must mint the tier-default
+/// expiry. Pre-fix the consolidate INSERT omitted `expires_at`, so a
+/// consolidated mid/short row landed NULL (immortal, never GC-reaped)
+/// while the sqlite twin (`storage::consolidate`) bound
+/// `candidate.effective_expires_at()`.
+#[tokio::test]
+async fn live_consolidate_backfills_expiry_pg_1630() {
+    let Some(store) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let unique = uuid::Uuid::new_v4();
+    let owner = format!("ai:fix3-1630-{unique}");
+    let ctx = CallerContext::for_agent(owner.clone());
+    let ns = format!("fix3-1630-{unique}");
+
+    // tier mid → consolidated row must carry the tier-default expiry.
+    let a = sample_memory(&format!("fix3-1630-a-{unique}"), &ns, Tier::Mid, &owner);
+    let b = sample_memory(&format!("fix3-1630-b-{unique}"), &ns, Tier::Mid, &owner);
+    let id_a = store.store(&ctx, &a).await.expect("store a");
+    let id_b = store.store(&ctx, &b).await.expect("store b");
+    let mid_id = store
+        .consolidate(
+            &ctx,
+            &[id_a, id_b],
+            &format!("fix3-1630-mid-{unique}"),
+            "consolidated summary (mid)",
+            &ns,
+            &Tier::Mid,
+            "test",
+            &owner,
+        )
+        .await
+        .expect("consolidate mid");
+    let mid_row = store
+        .get(&ctx, &mid_id)
+        .await
+        .expect("get consolidated mid");
+    assert_eq!(mid_row.tier, Tier::Mid);
+    assert!(
+        mid_row.expires_at.is_some(),
+        "#1630: consolidate tier=mid must mint a NOT NULL expires_at \
+         (tier-default backfill); got NULL"
+    );
+
+    // tier long → no TTL; expires_at stays NULL.
+    let c = sample_memory(&format!("fix3-1630-c-{unique}"), &ns, Tier::Mid, &owner);
+    let d = sample_memory(&format!("fix3-1630-d-{unique}"), &ns, Tier::Mid, &owner);
+    let id_c = store.store(&ctx, &c).await.expect("store c");
+    let id_d = store.store(&ctx, &d).await.expect("store d");
+    let long_id = store
+        .consolidate(
+            &ctx,
+            &[id_c, id_d],
+            &format!("fix3-1630-long-{unique}"),
+            "consolidated summary (long)",
+            &ns,
+            &Tier::Long,
+            "test",
+            &owner,
+        )
+        .await
+        .expect("consolidate long");
+    let long_row = store
+        .get(&ctx, &long_id)
+        .await
+        .expect("get consolidated long");
+    assert_eq!(long_row.tier, Tier::Long);
+    assert!(
+        long_row.expires_at.is_none(),
+        "#1630: consolidate tier=long must keep expires_at NULL (no TTL); \
+         got {:?}",
+        long_row.expires_at
+    );
+
+    // Cleanup (best-effort).
+    let _ = store.delete(&ctx, &mid_id).await;
+    let _ = store.delete(&ctx, &long_id).await;
+}

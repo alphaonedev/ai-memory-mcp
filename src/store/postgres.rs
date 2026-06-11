@@ -11040,11 +11040,20 @@ impl MemoryStore for PostgresStore {
         // other insert site in this adapter. `RETURNING id` yields the
         // existing id on update so the caller sees a single canonical
         // memory at that (title, namespace).
+        // #1630 (#1466 class) — consolidate mints a fresh memory via this
+        // raw INSERT, so it must carry the tier-default expiry too ($11 =
+        // `candidate.effective_expires_at()`); otherwise a consolidated
+        // mid/short row landed NULL `expires_at` on postgres (immortal,
+        // never GC-reaped) while the sqlite twin
+        // (`src/storage/mod.rs::consolidate`) backfilled it. Long-tier
+        // consolidations keep NULL (long has no TTL). The UPSERT branch
+        // intentionally has no `expires_at` SET clause (keep the existing
+        // row's expiry — same convention as `reflection_depth` below).
         let inserted_id: String = sqlx::query_scalar(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
-                source, access_count, created_at, updated_at, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11)
+                source, access_count, created_at, updated_at, expires_at, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
@@ -11083,6 +11092,12 @@ impl MemoryStore for PostgresStore {
         .bind(source)
         .bind(total_access)
         .bind(now)
+        // #1630 — tier-default expiry backfill (mid/short → created_at +
+        // tier TTL; long → NULL). `candidate.created_at == now` so the
+        // backfill anchors on the same instant as the $10 bind.
+        .bind(parse_rfc3339_opt(
+            candidate.effective_expires_at().as_deref(),
+        ))
         .bind(&merged_metadata_value)
         .fetch_one(&mut *tx)
         .await
