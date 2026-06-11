@@ -842,6 +842,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // quota seeding above.
     let resolved_storage = app_config.resolve_storage();
     crate::storage::set_db_mmap_size(resolved_storage.db_mmap_size_bytes);
+    // #1604 — seed the process-wide rerank input-sequence cap from the
+    // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
+    // `[reranker].max_seq_tokens` > compiled default). Every subsequent
+    // batched cross-encoder rerank forward on any subcommand path
+    // (serve / mcp / CLI) applies it. Idempotent — first writer wins,
+    // same as the mmap seeding above.
+    crate::reranker::set_rerank_max_seq(app_config.resolve_reranker().max_seq_tokens);
     // #1590 — seed the process-wide operator-configured default
     // namespace (Some ONLY when `[storage].default_namespace` — or the
     // legacy flat field — was explicitly set). Every write surface

@@ -295,8 +295,54 @@ const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
 /// Bare configured-model spelling for the default reranker — shared with
 /// the `ai-memory config migrate` template (#1558 batch 6).
 pub(crate) const DEFAULT_RERANKER_MODEL: &str = "ms-marco-MiniLM-L-6-v2";
-const CROSS_ENCODER_MAX_SEQ: usize = 512;
+/// Model-architecture ceiling on the cross-encoder input sequence.
+/// Per-consumer truncation (e.g. the #1604 rerank cap below) may go
+/// tighter, never looser — the resolver clamps against this value.
+pub const CROSS_ENCODER_MAX_SEQ: usize = 512;
 const CROSS_ENCODER_HIDDEN_DIM: usize = 384;
+
+/// #1604 — compiled default for the tokenized length of **rerank**
+/// inputs, applied in [`CrossEncoder::neural_score_pairs`] (the #1597
+/// batched-forward path) instead of the architecture-ceiling
+/// [`CROSS_ENCODER_MAX_SEQ`].
+///
+/// The #1588 dogfood RE-RUN measured the residual #1597 latency:
+/// warm autonomous-tier recall was ~4,013 ms on a real (long-content)
+/// corpus vs ~533 ms on short-content rows — the [batch=20, seq=512]
+/// candle CPU forward, not pool size or batching, was the cost. BERT
+/// attention is O(n²) in sequence length, so halving the cap to 256
+/// cuts the forward ~4× while keeping the title + lead content that
+/// carries the relevance signal for memory rows. Other cross-encoder
+/// consumers (the single-pair [`CrossEncoder::score`]) keep the full
+/// [`CROSS_ENCODER_MAX_SEQ`].
+///
+/// Operator override ladder (resolved by
+/// `AppConfig::resolve_reranker()` at boot and seeded here via
+/// [`set_rerank_max_seq`]): `AI_MEMORY_RERANK_MAX_SEQ` env >
+/// `[reranker].max_seq_tokens` config > this compiled default. Values
+/// that are zero, unparseable, or above [`CROSS_ENCODER_MAX_SEQ`]
+/// fall through to the next ladder layer.
+pub const RERANK_MAX_SEQ_DEFAULT: usize = 256;
+
+/// Process-wide resolved rerank sequence cap, seeded once at boot from
+/// `AppConfig::resolve_reranker()` (the `crate::storage::set_db_mmap_size`
+/// OnceLock precedent — the scoring paths run deep in the recall
+/// pipeline where no `AppConfig` is in scope). Unseeded processes
+/// (unit tests, library embedders that bypass the CLI boot path) fall
+/// through to [`RERANK_MAX_SEQ_DEFAULT`].
+static RERANK_MAX_SEQ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Seed the process-wide rerank sequence cap for every subsequent
+/// batched rerank forward. Idempotent — first writer wins; later calls
+/// are no-ops (matches `crate::storage::set_db_mmap_size`).
+pub fn set_rerank_max_seq(tokens: usize) {
+    let _ = RERANK_MAX_SEQ.set(tokens);
+}
+
+/// The effective rerank sequence cap for this process.
+fn rerank_max_seq() -> usize {
+    *RERANK_MAX_SEQ.get().unwrap_or(&RERANK_MAX_SEQ_DEFAULT)
+}
 
 /// v0.7.0 L2-8 — default multiplicative boost applied to `Reflection`-kind
 /// memories AFTER cross-encoder reranking. Reflections summarise multiple
@@ -984,6 +1030,19 @@ impl CrossEncoder {
             ..Default::default()
         };
         batch_tokenizer.with_padding(Some(padding));
+        // #1604 — rerank inputs truncate at the resolved rerank cap
+        // (default RERANK_MAX_SEQ_DEFAULT), tighter than the
+        // architecture-ceiling CROSS_ENCODER_MAX_SEQ the shared
+        // tokenizer carries: long-content rows otherwise pad the whole
+        // batch to 512 tokens and the candle CPU forward dominates
+        // recall latency (~3.2 s/recall measured on the #1588 re-run).
+        let truncation = tokenizers::TruncationParams {
+            max_length: rerank_max_seq(),
+            ..Default::default()
+        };
+        batch_tokenizer
+            .with_truncation(Some(truncation))
+            .map_err(|e| anyhow::anyhow!("failed to set rerank truncation: {e}"))?;
 
         let encodings = batch_tokenizer
             .encode_batch(
@@ -1735,6 +1794,20 @@ fn process_batch(
 mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
+
+    /// #1604 — process-wide rerank sequence-cap seeding: unseeded
+    /// reads fall through to the compiled default; the first
+    /// [`set_rerank_max_seq`] writer wins; later writes are no-ops.
+    /// Single test (not split) because the `OnceLock` is process-wide
+    /// state — ordering across tests would be nondeterministic.
+    #[test]
+    fn rerank_max_seq_1604_seed_once_semantics() {
+        assert_eq!(rerank_max_seq(), RERANK_MAX_SEQ_DEFAULT);
+        set_rerank_max_seq(192);
+        assert_eq!(rerank_max_seq(), 192);
+        set_rerank_max_seq(64);
+        assert_eq!(rerank_max_seq(), 192, "first writer must win");
+    }
 
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {

@@ -596,6 +596,60 @@ fn test_db_mmap_size_env_overrides_config_and_default() {
 }
 
 // ---------------------------------------------------------------------------
+// 8b. #1604 — AI_MEMORY_RERANK_MAX_SEQ env var overrides the
+//     [reranker].max_seq_tokens config field through
+//     AppConfig::resolve_reranker(); zero / garbage / above-model-ceiling
+//     values fall through layer by layer.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_rerank_max_seq_env_overrides_config_and_default() {
+    use ai_memory::config::RerankerSection;
+
+    let cfg = AppConfig {
+        reranker: Some(RerankerSection {
+            max_seq_tokens: Some(128),
+            ..RerankerSection::default()
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env unset → config wins over compiled default ----
+    let guard_a = MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_RERANK_MAX_SEQ, None)]);
+    assert_eq!(
+        cfg.resolve_reranker().max_seq_tokens,
+        128,
+        "[reranker].max_seq_tokens must beat the compiled default",
+    );
+    drop(guard_a);
+
+    // ---- Branch B: env beats config ----
+    let guard_b = MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_RERANK_MAX_SEQ, Some("192"))]);
+    assert_eq!(
+        cfg.resolve_reranker().max_seq_tokens,
+        192,
+        "AI_MEMORY_RERANK_MAX_SEQ env MUST beat [reranker] config",
+    );
+    drop(guard_b);
+
+    // ---- Branch C: garbage / zero / above-ceiling env falls through
+    //                to config; the compiled default backstops ----
+    for bad in ["garbage", "0", "100000"] {
+        let guard = MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_RERANK_MAX_SEQ, Some(bad))]);
+        assert_eq!(
+            cfg.resolve_reranker().max_seq_tokens,
+            128,
+            "inadmissible env value {bad:?} must fall through to the [reranker] section",
+        );
+        assert_eq!(
+            AppConfig::default().resolve_reranker().max_seq_tokens,
+            ai_memory::reranker::RERANK_MAX_SEQ_DEFAULT,
+            "no usable env/config layer must bottom out on the compiled default",
+        );
+        drop(guard);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 9. #1598 — AI_MEMORY_EMBED_{BACKEND,BASE_URL,MODEL,API_KEY} env vars
 //    override the [embeddings] config section through
 //    AppConfig::resolve_embeddings() (env-var table rows #72-75).

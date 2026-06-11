@@ -10293,9 +10293,14 @@ impl MemoryStore for PostgresStore {
         //
         //   * access_count = LEAST(access_count + 1, 1_000_000)
         //   * last_accessed_at = NOW()
-        //   * expires_at — sliding-window replacement per tier
-        //     (1h short / 1d mid, cleared when a mid→long promotion
-        //     fires this round), see memory 830 (pm-v33 fix)
+        //   * expires_at — extension FLOOR per tier (#1607, the
+        //     postgres twin of the sqlite #1596 fix):
+        //     GREATEST(expires_at, NOW() + window) with 1h short /
+        //     1d mid windows (cleared when a mid→long promotion
+        //     fires this round). An access can extend a row's life
+        //     but can never move its expiry EARLIER — the pre-#1607
+        //     replacement form pulled a fresh mid-tier row's +7d
+        //     create-time backstop in to now+1d on first recall.
         //   * tier — auto-promote mid → long once access_count + 1
         //     would land at or above PROMOTION_THRESHOLD (5)
         //   * updated_at — bumped only when the tier flip actually
@@ -10317,9 +10322,9 @@ impl MemoryStore for PostgresStore {
                     WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NULL
                     WHEN tier = 'long' THEN expires_at
                     WHEN tier = 'short' AND expires_at IS NOT NULL
-                        THEN NOW() + INTERVAL '1 hour'
+                        THEN GREATEST(expires_at, NOW() + INTERVAL '1 hour')
                     WHEN tier = 'mid' AND expires_at IS NOT NULL
-                        THEN NOW() + INTERVAL '1 day'
+                        THEN GREATEST(expires_at, NOW() + INTERVAL '1 day')
                     ELSE expires_at
                 END,
                 tier = CASE
@@ -16533,6 +16538,81 @@ mod tests {
             (got.confidence - 0.5).abs() < 0.02,
             "one half-life of age must collapse confidence to ~0.5, got {}",
             got.confidence
+        );
+    }
+
+    /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension
+    /// FLOOR. Pre-fix `touch_after_recall` REPLACED `expires_at` with
+    /// `NOW() + window`, so recalling a fresh mid-tier row pulled its
+    /// +7d create-time backstop in to now+1d. Pins: a mid-tier row
+    /// whose expiry is ~7 days out keeps that expiry across a touch
+    /// (`GREATEST` floor), while a row whose expiry is nearer than the
+    /// 1-day window is extended out to ~now+1d.
+    #[tokio::test]
+    async fn live_touch_after_recall_expiry_is_extension_floor_1607() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("floor-1607-{unique}");
+
+        let expiry_secs = |id: &str| {
+            let pool = store.pool.clone();
+            let id = id.to_string();
+            async move {
+                let row: (Option<f64>,) = sqlx::query_as(
+                    "SELECT EXTRACT(EPOCH FROM (expires_at - NOW()))::float8 \
+                     FROM memories WHERE id = $1",
+                )
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("read expiry");
+                row.0.expect("expires_at must be set")
+            }
+        };
+
+        // Far-expiry row: +7d backstop must SURVIVE the touch.
+        let mut far = sample_memory(&format!("floor-far-{unique}"), &ns, "floor-far", "body");
+        far.tier = crate::models::Tier::Mid;
+        let far_id = store.store(&ctx, &far).await.expect("store far");
+        sqlx::query("UPDATE memories SET expires_at = NOW() + INTERVAL '7 days' WHERE id = $1")
+            .bind(&far_id)
+            .execute(&store.pool)
+            .await
+            .expect("set far expiry");
+        store
+            .touch_after_recall(&[far_id.clone()])
+            .await
+            .expect("touch far");
+        let day_secs = f64::from(u32::try_from(crate::SECS_PER_DAY).expect("fits u32"));
+        let far_secs = expiry_secs(&far_id).await;
+        assert!(
+            far_secs > 6.0 * day_secs,
+            "touch must NOT pull a +7d expiry in (floor semantics, #1607); \
+             remaining secs = {far_secs}"
+        );
+
+        // Near-expiry row: +1h remaining must be EXTENDED to ~now+1d.
+        let mut near = sample_memory(&format!("floor-near-{unique}"), &ns, "floor-near", "body");
+        near.tier = crate::models::Tier::Mid;
+        let near_id = store.store(&ctx, &near).await.expect("store near");
+        sqlx::query("UPDATE memories SET expires_at = NOW() + INTERVAL '1 hour' WHERE id = $1")
+            .bind(&near_id)
+            .execute(&store.pool)
+            .await
+            .expect("set near expiry");
+        store
+            .touch_after_recall(&[near_id.clone()])
+            .await
+            .expect("touch near");
+        let near_secs = expiry_secs(&near_id).await;
+        assert!(
+            (near_secs - day_secs).abs() < 300.0,
+            "touch must extend a near expiry out to ~now+1d; remaining secs = {near_secs}"
         );
     }
 
