@@ -4,11 +4,14 @@
 # Edit deliberately — every entry should be a reviewed exception.
 # See CLAUDE.md §"Enforceable Orchestrator Safeguards" (C8).
 
-src/federation/receive.rs:federation-catchup
-src/handlers/admin.rs:daemon
-src/handlers/hook_subscribers.rs:ai:http-internal
-src/handlers/http.rs:ai:http-internal
-src/handlers/subscriptions.rs:subscription-dispatch
-src/migrate.rs:ai:migrate
-src/store/postgres.rs:export-internal
-src/store/postgres.rs:governance-internal
+src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
+src/curator/reflection_pass.rs:agent_id
+src/daemon_runtime.rs:EMBEDDING_BACKFILL
+src/federation/receive.rs:FEDERATION_CATCHUP
+src/handlers/admin.rs:DAEMON_PRINCIPAL
+src/handlers/hook_subscribers.rs:AI_HTTP_INTERNAL
+src/handlers/http.rs:AI_HTTP_INTERNAL
+src/handlers/subscriptions.rs:SUBSCRIPTION_DISPATCH
+src/migrate.rs:AI_MIGRATE
+src/store/postgres.rs:EXPORT_INTERNAL
+src/store/postgres.rs:GOVERNANCE_INTERNAL

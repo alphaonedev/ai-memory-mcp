@@ -50,6 +50,29 @@ if [[ "${1:-}" == "--update" ]]; then
     UPDATE=1
 fi
 
+# --self-test (#1651): prove the for_admin detector is load-bearing for
+# the SENTINEL-CONST call form (the #1558 refactor moved every
+# production site off string literals, which silently collapsed the
+# literal-only detector's coverage to zero). Injects a transient
+# production file containing a sentinel-form for_admin call, expects
+# the main check to HARD-BLOCK, then cleans up.
+if [[ "${1:-}" == "--self-test" ]]; then
+    PROBE="${ROOT}/src/c8_probe_1651.rs"
+    trap 'rm -f "${PROBE}"' EXIT
+    cat > "${PROBE}" <<'PROBE_EOF'
+// C8 --self-test probe (transient; created + removed by qc-codegraph-precheck.sh --self-test)
+pub fn probe() {
+    let _ = CallerContext::for_admin(sentinels::C8_SELF_TEST_PROBE);
+}
+PROBE_EOF
+    if "$0" >/dev/null 2>&1; then
+        echo "C8 SELF-TEST FAIL: sentinel-form for_admin injection was NOT detected" >&2
+        exit 1
+    fi
+    echo "C8 SELF-TEST PASS: sentinel-form for_admin injection HARD-BLOCKed as expected"
+    exit 0
+fi
+
 # Enumerate "production" sites: rg/grep through src/, then drop any
 # line that is inside a `#[cfg(test)] mod tests {` block. The
 # heuristic: per-file, the first occurrence of `#[cfg(test)]` (or
@@ -58,6 +81,7 @@ fi
 # entirely.
 collect_sites () {
     local pattern="$1"
+    local mode="${2:-literal}"
     local out=""
     # find src files, skip *test*.rs by name + tests/ subdirs of src
     while IFS= read -r -d '' f; do
@@ -67,12 +91,28 @@ collect_sites () {
         case "$bn" in
             *test*.rs|tests.rs) continue ;;
         esac
-        # Find the first `#[cfg(test)]` line.
-        local test_line
-        test_line=$(grep -n -m 1 '#\[cfg(test)\]\|#\[cfg(any(test' "$f" 2>/dev/null | head -1 | cut -d: -f1 || true)
-        if [[ -z "${test_line}" ]]; then
-            test_line=999999999
-        fi
+        # Find the test-region boundary: the first NON-COMMENT
+        # `#[cfg(test)]` attribute whose next line opens a `mod` block.
+        # #1651 — the old "first #[cfg(test)] anywhere" heuristic was
+        # defeated by (a) a comment mentioning the attribute
+        # (daemon_runtime.rs:2062 hid the EMBEDDING_BACKFILL site 2000
+        # lines later) and (b) `#[cfg(test)] use ...` import gates
+        # (curator/compaction.rs:52). Only a cfg(test) mod ends the
+        # production region.
+        local test_line=999999999
+        local tl nl
+        while IFS=: read -r tl _; do
+            [[ -z "${tl}" ]] && continue
+            # comment lines can't carry a live attribute
+            if sed -n "${tl}p" "$f" | grep -qE '^[[:space:]]*(//|\*)'; then
+                continue
+            fi
+            nl=$(sed -n "$((tl + 1))p" "$f")
+            if printf '%s\n' "$nl" | grep -qE '^[[:space:]]*(pub( |\() *)?mod '; then
+                test_line=$tl
+                break
+            fi
+        done <<< "$(grep -n '#\[cfg(test)\]\|#\[cfg(any(test' "$f" 2>/dev/null || true)"
         # Find matching lines and filter to lineno < test_line.
         # Pattern format: `for_agent("LIT")` or `for_admin("LIT")`.
         #
@@ -84,7 +124,15 @@ collect_sites () {
         # identical and runs the loop in the current shell so `out`
         # still accumulates.
         local matches
-        matches="$(grep -n "${pattern}(\"" "$f" 2>/dev/null || true)"
+        if [[ "${mode}" == "any-arg" ]]; then
+            # #1651 — for_admin is a privacy-bypass CONSTRUCTION; the
+            # bypass is the call itself, in ANY argument form. The
+            # pre-#1651 literal-only grep went blind when #1558 moved
+            # every site onto sentinel consts.
+            matches="$(grep -n "${pattern}(" "$f" 2>/dev/null || true)"
+        else
+            matches="$(grep -n "${pattern}(\"" "$f" 2>/dev/null || true)"
+        fi
         [[ -z "${matches}" ]] && continue
         while IFS=: read -r lineno content; do
             # Skip blank/no-match
@@ -92,9 +140,34 @@ collect_sites () {
             if (( lineno >= test_line )); then
                 continue
             fi
+            # Skip comment lines (//, ///, block-comment continuations) —
+            # prose mentioning the call is not a call site (#1651).
+            if printf '%s\n' "$content" | grep -qE '^[[:space:]]*(//|\*)'; then
+                continue
+            fi
             # Extract the literal between `${pattern}("` and `")`.
             local literal
             literal=$(printf '%s\n' "$content" | sed -nE "s/.*${pattern}\(\"([^\"]+)\"\).*/\1/p" | head -1)
+            if [[ -z "${literal}" && "${mode}" == "any-arg" ]]; then
+                # #1651 — non-literal argument: key on the argument
+                # expression (identifier / sentinel path / variable),
+                # normalized to its last `::` segment so the allowlist
+                # stays stable across import-style refactors.
+                literal=$(printf '%s\n' "$content" \
+                    | sed -nE "s/.*${pattern}\(([^\")(,]+)[,)].*/\1/p" \
+                    | head -1 | tr -d ' &')
+                if [[ -z "${literal}" ]] \
+                    && printf '%s\n' "$content" | grep -qE "${pattern}\($"; then
+                    # Call split across lines (rustfmt reflow): take
+                    # the first token of the next source line.
+                    local nextline
+                    nextline=$(sed -n "$((lineno + 1))p" "$f")
+                    literal=$(printf '%s\n' "$nextline" | sed -nE 's/^[[:space:]]*"([^"]+)".*/\1/p')
+                    [[ -z "${literal}" ]] && literal=$(printf '%s\n' "$nextline" \
+                        | sed -nE 's/^[[:space:]]*([A-Za-z0-9_:&]+).*/\1/p' | tr -d '&')
+                fi
+                literal="${literal##*::}"
+            fi
             if [[ -n "${literal}" ]]; then
                 # Strip the absolute prefix so the allowlist is
                 # repo-root-relative (and stable across checkouts).
@@ -108,7 +181,7 @@ collect_sites () {
 }
 
 CURRENT_FOR_AGENT="$(collect_sites 'CallerContext::for_agent')"
-CURRENT_FOR_ADMIN="$(collect_sites 'CallerContext::for_admin')"
+CURRENT_FOR_ADMIN="$(collect_sites 'CallerContext::for_admin' any-arg)"
 
 # Strip the line-number column from a "file:line:literal" stream so
 # the allowlist contract is `file:literal` only — line numbers drift
