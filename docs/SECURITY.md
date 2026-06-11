@@ -229,7 +229,13 @@ Two related hardening knobs:
   authentication (no `api_key`), a bare self-asserted `X-Agent-Id`
   naming an admin id is REFUSED admin-role resolution (boot emits a
   WARN naming the flag). Set truthy only on isolated / mTLS-fronted
-  deployments to restore the legacy trust-the-header posture.
+  deployments to restore the legacy trust-the-header posture. The same
+  gate covers BOTH the `require_admin` endpoints AND the read handlers
+  that OR an admin flag past the per-row `scope=private` visibility
+  filter (`/contradictions`, `/kg/query`, `/links/{id}`, `/archive`,
+  `/pending`, `/taxonomy`) via the authn-gated `is_admin_caller_trusted`
+  predicate (#1582), so a self-asserted admin header on a keyless
+  deployment cannot read other tenants' private rows.
 
 ### Webhooks (SSRF-hardened)
 

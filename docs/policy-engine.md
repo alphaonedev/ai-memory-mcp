@@ -216,7 +216,7 @@ bypass-prevention property — see §4.2.
 
 | Surface | Call site | AgentAction constructed | Refusal mapping |
 |---|---|---|---|
-| **Substrate write path** (HTTP `POST /api/v1/memories`, MCP `memory_store`, federation inbound, CLI `ai-memory mine`) | `src/storage/mod.rs::consult_governance_pre_write` (OnceLock-installed closure in `src/daemon_runtime.rs`, daemon `serve` only) | `AgentAction::Custom { custom_kind: "memory_write", payload: {namespace, tier, memory_kind, title} }` evaluated by `check_agent_action_no_audit` | HTTP `403 FORBIDDEN` + `GOVERNANCE_REFUSED` code; MCP `GOVERNANCE_REFUSED` error data; typed `MemoryError::RefusedByGovernance` |
+| **Substrate write path** (HTTP `POST /api/v1/memories`, MCP `memory_store`, federation inbound, CLI `ai-memory mine`) | `src/storage/mod.rs::consult_governance_pre_write` (OnceLock-installed closure in `src/daemon_runtime.rs::install_governance_pre_write_hook`, installed by both daemon `serve` AND `ai-memory mcp` since #1583; CLI one-shot ops do NOT install it by design) | `AgentAction::Custom { custom_kind: "memory_write", payload: {namespace, tier, memory_kind, title} }` evaluated by `check_agent_action_no_audit` | HTTP `403 FORBIDDEN` + `GOVERNANCE_REFUSED` code; MCP `GOVERNANCE_REFUSED` error data; typed `MemoryError::RefusedByGovernance` |
 | **MCP** `memory_check_agent_action` (Power family) | `src/mcp/tools/check_agent_action.rs::handle_check_agent_action` → `check_agent_action` (audited) | Caller-supplied — `{kind, ...}` per §2.3 | MCP tool returns `{"decision":"refuse", "rule_id": "...", "reason": "..."}`; harness PreToolUse hook of type `mcp_tool` reads this and blocks |
 | **CLI** `ai-memory rules check` | `src/cli/rules.rs::run` (`RulesAction::Check` variant) → `check_agent_action` (audited) | Caller-supplied via `--kind` + `--command`/`--path`/`--host`/`--binary` | Non-zero exit code on refuse; JSON output via `--json` |
 
@@ -304,7 +304,11 @@ File: `tests/governance_storage_insert_hook.rs`. Six tests:
 5. **`cli_one_shot_does_not_install_hook`** — `ai-memory store` /
    `mine` / `import` (one-shot CLI ops) leave the OnceLock empty by
    design — the operator's direct substrate ops stay unimpeded.
-   Only `ai-memory serve` installs the hook.
+   The long-lived write surfaces — `ai-memory serve` (HTTP daemon) AND
+   `ai-memory mcp` (stdio agent interface) — both install the hook via
+   the shared `install_governance_pre_write_hook` helper (#1583);
+   `mcp_store_is_refused_by_agent_action_rule_1583` pins the MCP path.
+   CLI one-shot stays intentionally outside it.
 6. **`refusal_maps_to_http_403`** — the daemon end-to-end: an HTTP
    `POST /api/v1/memories` against an enforced refuse-rule returns
    `403` with body `{"code":"GOVERNANCE_REFUSED","reason": "..."}`.
