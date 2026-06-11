@@ -10705,7 +10705,7 @@ impl MemoryStore for PostgresStore {
         .bind(&now)
         .execute(&self.pool)
         .await
-        .map_err(|e| to_store_err("bind_agent_pubkey", e))?;
+        .map_err(|e| to_store_err(crate::handlers::BIND_AGENT_PUBKEY_ACTION, e))?;
 
         Ok(())
     }

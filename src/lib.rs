@@ -289,12 +289,12 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // addition / removal of a route surface requires bumping this
 // constant in lockstep with the test failing.
 //
-// The 88th `.route(` at the bottom of `build_router_with_timeout` is
+// The 90th `.route(` at the bottom of `build_router_with_timeout` is
 // the `/slow` slowloris-test route gated by `#[cfg(test)]` — that is
 // counted by `EXPECTED_TEST_ROUTES_COUNT` below.
 // ---------------------------------------------------------------------------
 
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 88;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 89;
 pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
 
 /// Number of distinct URL paths (multi-line-aware) registered by the
@@ -305,7 +305,7 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
 /// cannot drift silently. v0.7.0 multi-agent literal-sweep (scanner
 /// A, finding F-A4.1) — previously the `73 unique URL paths` count
 /// was cited in 30+ doc sites with no const.
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 74;
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 75;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -896,6 +896,10 @@ pub fn build_router_with_timeout(
         )
         .route(handlers::routes::AGENTS, get(handlers::list_agents))
         .route(handlers::routes::AGENTS, post(handlers::register_agent))
+        .route(
+            handlers::routes::AGENTS_ID_PUBKEY,
+            axum::routing::put(handlers::bind_agent_pubkey),
+        )
         .route(handlers::routes::PENDING, get(handlers::list_pending))
         .route(
             handlers::routes::PENDING_ID_APPROVE,

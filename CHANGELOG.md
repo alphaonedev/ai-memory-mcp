@@ -105,6 +105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via the LLM-agnostic backend (§2.7) but does not *attest* it. Tracked
   under [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171).
 
+### v0.7.x GA push — #1539 agent-pubkey bind route + #1542/#1607/#1608 postgres durability/provenance fixes (2026-06-11)
+
+- **[#1539](https://github.com/alphaonedev/ai-memory-mcp/issues/1539)** — new admin-gated `PUT /api/v1/agents/{id}/pubkey` binds an Ed25519 attestation pubkey through the SAL `MemoryStore::bind_agent_pubkey` (both adapters); validated curve-point input, #911 audit entry, #1582 authn-trusted admin gate. Route counts move 88→89 registrations / 74→75 unique paths (SSOT consts + docs updated in lockstep). Pins: `tests/issue_1539_bind_pubkey_route.rs` (4 tests).
+- **[#1542](https://github.com/alphaonedev/ai-memory-mcp/issues/1542)** — `POST /api/v1/links` returned 201 while persisting NOTHING on AGE-enabled postgres daemons whose role can't `LOAD 'age'`: the in-tx LOAD refusal aborted the tx and the warn-and-continue COMMIT silently rolled back. LOAD + the whole projection now ride SAVEPOINTs at both link-write sites; federated link replays degrade to `warn_age_fallback` instead of failing forever. Pin: `live_link_persists_when_age_projection_refused_1542` (restricted-role, LOAD-refusal precondition asserted).
+- **[#1607](https://github.com/alphaonedev/ai-memory-mcp/issues/1607)/[#1608](https://github.com/alphaonedev/ai-memory-mcp/issues/1608)** — postgres write-path parity: `touch_after_recall` GREATEST extension floor; `store_with_embedding` full 27-column Form-4/5/QW-2 INSERT (was 19 — the anchor row contradicted its own wire response); `store()`/`store_batch()` gained `entity_id`/`persona_version`.
+- **[#1536](https://github.com/alphaonedev/ai-memory-mcp/issues/1536)** — do-1461 Form-7 activation was a silent no-op (clap-refused `--store-url` on rules verbs, swallowed; plus a cwd split-brain putting rules in a db the daemon never reads). Fixed with the `REMOTE_GOV_DB` SSOT + self-verifying activation (`governance check-action` must refuse a /tmp write) + the Form-2/6 standard now binds through the live HTTP surface.
+- Issue hygiene: #1543/#1545/#1537/#1538/#1540/#1560/#1566/#1578 verified fixed-in-code and closed with evidence; #1544 dispositioned to v0.8 with rationale.
+
 ### v0.7.x #1588 dogfood RE-RUN — capabilities-truthfulness pair #1605 + #1606 (2026-06-11)
 
 Two discoverability defects the RE-RUN hit live: following the capabilities surface verbatim produced refused calls.
