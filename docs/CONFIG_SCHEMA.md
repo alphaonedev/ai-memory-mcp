@@ -54,12 +54,37 @@ model   = "gemma3:4b"
 
 # ---------------------------------------------------------------------
 # [embeddings] — embedding-model configuration.
+#
+# #1598 — fully API-capable: `backend` accepts the same vendor-alias
+# vocabulary as [llm].backend — `ollama` (the default; native
+# /api/embed wire shape), any #1067 alias (`openrouter`, `openai`,
+# `gemini`, `xai`, `mistral`, …), or the generic `openai-compatible`
+# escape hatch for self-hosted OpenAI-compatible /v1/embeddings
+# endpoints (HuggingFace text-embeddings-inference, vLLM, llama.cpp
+# server). Per-field precedence:
+#   AI_MEMORY_EMBED_* env > [embeddings] section > legacy flat fields
+#   (embed_url / embedding_model / ollama_url) > compiled default.
 # ---------------------------------------------------------------------
 [embeddings]
 backend        = "ollama"
-url            = "http://localhost:11434"
-model          = "nomic-embed-text-v1.5"
-backfill_batch = 100            # env override: AI_MEMORY_EMBED_BACKFILL_BATCH
+url            = "http://localhost:11434"  # synonym of base_url; base_url
+                                           # wins when both are set
+# base_url     = "https://openrouter.ai/api/v1"  # API backends; vendor
+                                           # default when omitted for a
+                                           # named alias
+model          = "nomic-embed-text-v1.5"   # e.g. "google/gemini-embedding-2"
+                                           # (3072-dim) on openrouter
+
+# Exactly one of api_key_env / api_key_file for API backends (or
+# neither — falls back to the per-vendor env-var chain, highest
+# precedence AI_MEMORY_EMBED_API_KEY). Inline `api_key = "<literal>"`
+# is REJECTED at parse time, same as [llm].api_key.
+# api_key_env  = "OPENROUTER_API_KEY"
+# api_key_file = "/etc/ai-memory/keys/embed.key"  # mode 0400 enforced
+
+# dim          = 3072            # explicit vector-dim override for models
+                                 # not in config.rs::KNOWN_EMBEDDING_DIMS
+backfill_batch = 100             # env override: AI_MEMORY_EMBED_BACKFILL_BATCH
 
 # ---------------------------------------------------------------------
 # [reranker] — cross-encoder rerank configuration.
@@ -337,7 +362,14 @@ methods:
 
 - `AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url)`
 - `AppConfig::resolve_llm_auto_tag()`
-- `AppConfig::resolve_embeddings()`
+- `AppConfig::resolve_embeddings()` — #1598: full per-field ladder
+  (`AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat
+  `embed_url`/`embedding_model`/`ollama_url` > compiled default), embed
+  API key via `AI_MEMORY_EMBED_API_KEY` > per-vendor alias env >
+  `api_key_env` > `api_key_file` (0400), vector dim via
+  `[embeddings].dim` override > `KNOWN_EMBEDDING_DIMS` table. Consumed
+  by the MCP stdio init, daemon `build_embedder`, `ai-memory doctor`
+  ("Embeddings Reachability (#1598)" section), and `ai-memory reembed`.
 - `AppConfig::resolve_reranker()`
 - `AppConfig::resolve_storage()`
 - `AppConfig::resolve_limits()` — resource caps; produces `ResolvedLimits`
@@ -513,7 +545,14 @@ verify the chosen model exists on their account before relying on it.
 - [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) —
   the underlying provider-agnostic LLM substrate this schema configures.
 - [#1143](https://github.com/alphaonedev/ai-memory-mcp/issues/1143) —
-  the sibling-site cleanup this schema subsumed.
+  the sibling-site cleanup this schema subsumed (embed-client wire-shape
+  disambiguation; its boot-site behaviour is superseded by #1598's
+  API-capable `[embeddings]` resolver).
+- [#1598](https://github.com/alphaonedev/ai-memory-mcp/issues/1598) —
+  API-wired embeddings: `[embeddings]` backend/base_url/api_key/dim
+  fields, `AI_MEMORY_EMBED_*` env vars, fail-closed embedder boot
+  (#1593), truthful capabilities (#1594), resilient backfill (#1595),
+  `ai-memory reembed`, doctor "Embeddings Reachability" section.
 - [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055) —
   the `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` escape hatch
   reused by `api_key_file`.

@@ -2,7 +2,7 @@
 
 **Audience:** operators wiring ai-memory's `smart` / `autonomous` tiers to a specific LLM provider via an MCP-capable AI client (Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, Aider, Cody, Gemini CLI, OpenClaw, …).
 
-**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client. **15 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 17 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
+**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client; v0.7.x (#1598) extends the same vendor-alias vocabulary to the embedder via the `[embeddings]` section / `AI_MEMORY_EMBED_*` env vars. **15 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 17 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
 
 ## Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)
 
@@ -78,12 +78,11 @@ The fix: **the LLM env vars MUST live inside the MCP server config's `env:` bloc
 Restart your AI client. Inspect the ai-memory boot banner that prints on first MCP session-start (or run `ai-memory boot` directly with the same env vars). You should see:
 
 ```text
-ai-memory: LLM ready (backend=<vendor>, model=<name>)
-ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape);
-           building dedicated Ollama embed client at http://localhost:11434 (#1143)
+ai-memory: LLM ready (backend=<vendor>, model=<name>, source=<layer>, key_source=<layer>)
+ai-memory: embedder loaded (<embed-backend description>)
 ```
 
-The second line appears only when `backend` is non-Ollama and confirms the embed-client wire-shape disambiguation from #1143 is taking effect (semantic recall still uses Ollama-native embed at `localhost:11434` while chat goes to the cloud vendor). If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the path of the MCP config file your AI client actually reads.
+The second line confirms the embedder built against the **independently-resolved** embeddings configuration (#1598: `AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat > compiled default — historically #1143 disambiguated the embed-client wire shape by always building a dedicated localhost-Ollama embed client beside a non-Ollama chat client; #1598 superseded that boot site, and the embedder now speaks to any #1067 alias / `openai-compatible` endpoint of its own). If embedder construction fails you instead get a loud `embedder init failed … semantic recall DEGRADED to keyword (#1143, #1593, #1598)` line — the chat LLM client is never silently reused for embeddings. If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the path of the MCP config file your AI client actually reads.
 
 ## The canonical recipe shape
 

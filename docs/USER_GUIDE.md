@@ -762,6 +762,16 @@ v1/v2 remain negotiable via the `accept` param):**
 > [v0.7.x #1146 enterprise-config rollout](../docs/v0.7.0/release-notes.md#v070-enterprise-configuration-standard-1146-2026-05-23)
 > for the full precedence ladder.
 
+> **`features.embedder_loaded` reports the LIVE posture**
+> ([#1594](https://github.com/alphaonedev/ai-memory-mcp/issues/1594) /
+> [#1598](https://github.com/alphaonedev/ai-memory-mcp/issues/1598)):
+> a remote (API-backend) embedder whose endpoint is failing at request
+> time reports `false`, and `recall_mode_active` follows truthfully
+> (`"degraded"` instead of `"hybrid"`). Embedder construction failures
+> at boot fail closed to keyword recall
+> ([#1593](https://github.com/alphaonedev/ai-memory-mcp/issues/1593))
+> — the chat LLM client is never reused for embeddings.
+
 ---
 
 ### memory_expand_query
@@ -1421,7 +1431,7 @@ ai-memory supports 4 feature tiers, controlled by the `--tier` flag when startin
 | Tier | Recall Method | Extra Features | Requirements |
 |------|--------------|----------------|--------------|
 | **keyword** | FTS5 only | None | None (lightest) |
-| **semantic** (default) | Hybrid: semantic + keyword blending | Embedding-based recall | HuggingFace embedding model (~256 MB RAM) |
+| **semantic** (default) | Hybrid: semantic + keyword blending | Embedding-based recall | HuggingFace embedding model (~256 MB RAM), or zero local RAM with an API embedding backend (#1598 — `[embeddings].backend`) |
 | **smart** | Hybrid | Query expansion, auto-tagging, contradiction detection | An LLM backend (#1067 — local Ollama ~1 GB RAM, or any OpenAI-compatible cloud vendor via `AI_MEMORY_LLM_BACKEND` ~256 MB) |
 | **autonomous** | Hybrid | Full autonomous memory management + cross-encoder reranking | LLM backend + local cross-encoder (~4 GB local / ~3 GB with a remote LLM) |
 

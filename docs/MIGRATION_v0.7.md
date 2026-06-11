@@ -619,7 +619,7 @@ ai-memory identity generate
 # 8. Restart
 systemctl --user start ai-memory   # or relaunch your MCP host
 
-# 9. Verify — `ai-memory doctor` now reports 9 sections incl. the new
+# 9. Verify — `ai-memory doctor` now reports 10 sections incl. the new
 #    "LLM Reachability (#1146)" section that probes the resolved backend.
 ai-memory doctor
 ai-memory doctor --tokens

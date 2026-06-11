@@ -46,7 +46,7 @@ action required for the database itself.
 | **MCP tools at `--profile full`** | ~60 | **74** (73 callable + memory_capabilities bootstrap) |
 | **MCP tools at `--profile core`** | 5 | **7** (added memory_load_family + memory_smart_load) |
 | **CLI subcommands** | 40 | **79** in the default build, **81** with `--features sal` (adds `migrate` + `schema-init`) — added `config migrate`, `atomise`, `persona`, `skill <…>`, `verify-signed-events-chain`, `expand`, `recover-previous-session`, … |
-| **`ai-memory doctor`** | 7 sections | **9 sections** (+ Reflection Health + LLM Reachability) |
+| **`ai-memory doctor`** | 7 sections | **10 sections** (+ Reflection Health + LLM Reachability; #1598 added Embeddings Reachability) |
 | **Permissions mode default** | `advisory` | **`enforce`** (#K3 governance gate) — set `AI_MEMORY_PERMISSIONS_MODE=advisory` to preserve v0.6.x posture during rollout |
 | **Federation sig required** | Off | **On by default** (`AI_MEMORY_FED_REQUIRE_SIG=1`) — set `=0` during peer Ed25519-key enrolment |
 | **Federation nonce required** | Off | **On by default** (`AI_MEMORY_FED_REQUIRE_NONCE=1`) — set `=0` for legacy senders |

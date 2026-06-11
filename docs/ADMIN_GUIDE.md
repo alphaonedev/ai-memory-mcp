@@ -197,9 +197,13 @@ backend = "ollama"
 model   = "gemma3:4b"
 
 [embeddings]
-backend = "ollama"
-url     = "http://localhost:11434"
-model   = "nomic-embed-text-v1.5"
+backend = "ollama"                     # #1598: also any #1067 alias (openrouter,
+                                       # openai, gemini, ...) or "openai-compatible"
+                                       # (self-hosted TEI / vLLM / llama.cpp server)
+url     = "http://localhost:11434"     # synonym of base_url; base_url wins
+model   = "nomic-embed-text-v1.5"      # e.g. "google/gemini-embedding-2" (3072d)
+# api_key_env  = "OPENROUTER_API_KEY"  # API backends; XOR api_key_file (0400)
+# dim          = 3072                  # only for models outside KNOWN_EMBEDDING_DIMS
 
 [reranker]
 enabled = true
@@ -217,7 +221,7 @@ If all four return empty, the resolver returns `KeySource::None` (correct for `b
 
 **Secret-handling discipline.** `[llm].api_key = "<literal>"` is **rejected at parse time** with a clear stderr error — `config.toml` is typically world-readable, so literal keys would be a credential leak. `api_key_env` and `api_key_file` are mutually exclusive.
 
-**Precedence ladder (uniform across all four resolvers — LLM / embeddings / reranker / storage):**
+**Precedence ladder (uniform across all four resolvers — LLM / embeddings / reranker / storage; the embeddings env layer is `AI_MEMORY_EMBED_*` per #1598):**
 
 ```
 CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
@@ -225,7 +229,7 @@ CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  co
 
 **Migration tool — `ai-memory config migrate`.** Rewrites a legacy v0.6.x flat-field `config.toml` in place (with a timestamped `.bak`) to the v2 sectioned shape. Idempotent. `--dry-run` prints the diff; `--also-clean-claude-json` additionally strips redundant `mcpServers.<*>.env` blocks whose `command` resolves to `ai-memory` from `~/.claude.json`.
 
-**Reachability probe — `ai-memory doctor`.** A `LLM Reachability (#1146)` section resolves the canonical config and probes the endpoint with the resolved Bearer key (`/api/tags` for Ollama, `/models` for OpenAI-compatible). Reports PASS / WARN (401/403/429/5xx) / CRIT (4xx other, network, DNS, TLS) plus the resolved provenance facts (`backend`, `model`, `base_url`, `config_source`, `key_source`).
+**Reachability probe — `ai-memory doctor`.** A `LLM Reachability (#1146)` section resolves the canonical config and probes the endpoint with the resolved Bearer key (`/api/tags` for Ollama, `/models` for OpenAI-compatible). Reports PASS / WARN (401/403/429/5xx) / CRIT (4xx other, network, DNS, TLS) plus the resolved provenance facts (`backend`, `model`, `base_url`, `config_source`, `key_source`). #1598 added the sibling `Embeddings Reachability (#1598)` section: same severity mapping against the resolved *embeddings* endpoint (ollama `GET /api/tags`; API backends `POST /embeddings` with a 1-char input + resolved Bearer key), plus an operator GPU-policy WARN when `backend = ollama` resolves on a host with no detectable NVIDIA GPU (policy: local Ollama embeddings only on GPU-equipped nodes — see the [enterprise reference architectures](reference-architecture/enterprise-cpu-memory.md)).
 
 Canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
 
@@ -441,9 +445,17 @@ Below is a complete example showing every supported field with explanatory comme
 #   model   = "gemma3:4b"
 #
 #   [embeddings]
-#   backend        = "ollama"
-#   url            = "http://localhost:11434"
+#   backend        = "ollama"     # #1598: or any #1067 alias (openrouter,
+#                                 # openai, gemini, ...) or
+#                                 # "openai-compatible" (self-hosted
+#                                 # TEI / vLLM / llama.cpp server)
+#   url            = "http://localhost:11434"  # synonym of base_url;
+#                                 # base_url wins when both are set
 #   model          = "nomic-embed-text-v1.5"
+#   # api_key_env  = "OPENROUTER_API_KEY"   # API backends; XOR
+#   # api_key_file = "/etc/ai-memory/keys/embed.key"  # mode 0400 enforced
+#   # dim          = 3072         # override for models outside
+#                                 # KNOWN_EMBEDDING_DIMS
 #   backfill_batch = 100
 #
 #   [reranker]
@@ -461,8 +473,10 @@ Below is a complete example showing every supported field with explanatory comme
 #
 # Inline `[llm].api_key = "<literal>"` is REJECTED at parse time — use
 # api_key_env (process env var reference) or api_key_file (mode 0400
-# enforced) instead. Verify wiring with `ai-memory doctor` (the
-# "LLM Reachability (#1146)" section probes the resolved endpoint).
+# enforced) instead — the same rule applies to [embeddings].api_key
+# (#1598). Verify wiring with `ai-memory doctor` (the
+# "LLM Reachability (#1146)" and "Embeddings Reachability (#1598)"
+# sections probe the resolved endpoints).
 #
 # ---------------------------------------------------------------------------
 # LEGACY v0.6.x flat fields (deprecated, removed in v0.8.0)
@@ -477,10 +491,12 @@ Below is a complete example showing every supported field with explanatory comme
 # Default: "http://localhost:11434"
 # ollama_url = "http://localhost:11434"
 
-# LEGACY → v2: [embeddings].url
-# Falls back to ollama_url if unset. Embedder is Ollama-only at
-# v0.7.0 — there is no OpenAI-compatible embedder path yet (v0.7.x
-# follow-up).
+# LEGACY → v2: [embeddings].url / [embeddings].base_url
+# Falls back to ollama_url if unset. Post-#1598 the embedder is
+# provider-agnostic: [embeddings].backend accepts any #1067 vendor
+# alias or "openai-compatible" (self-hosted TEI / vLLM / llama.cpp
+# server) in addition to the default "ollama"; env overrides are
+# AI_MEMORY_EMBED_BACKEND / _BASE_URL / _MODEL / _API_KEY.
 # Default: same as ollama_url
 # embed_url = "http://localhost:11434"
 
