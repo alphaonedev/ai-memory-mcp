@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Feature Matrix — every tool, endpoint, command</title>
-<meta name="description" content="Complete surface-area atlas: 74 MCP tools at --profile full (7 at --profile core), 88 HTTP routes (74 unique paths) at /api/v1/, 79 CLI subcommands (default build) / 81 with --features sal; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
+<meta name="description" content="Complete surface-area atlas: 74 MCP tools at --profile full (7 at --profile core), 88 HTTP routes (74 unique paths) at /api/v1/, 80 CLI subcommands (default build) / 82 with --features sal; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/feature-matrix.html">
 <style>
@@ -226,6 +226,8 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
           <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -295,6 +297,8 @@ footer a{color:var(--text-muted)}
         <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
         <a href="architectures-t5.html">T5 — Global Hive</a>
         <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         <div class="mnav-group">Internals</div>
         <a href="schema.html">Schema</a>
         <a href="types.html">Types</a>
@@ -324,12 +328,12 @@ footer a{color:var(--text-muted)}
 <section class="hero">
   <h1>The complete surface area.</h1>
   <p class="tagline">
-    Every MCP tool, every HTTP route, every CLI subcommand — categorized, cross-referenced, signed off. <strong>74 + 88 + 79 = 241 operations</strong> exposed across three protocol fronts at v0.7.0. One implementation underneath, three ways to call it.
+    Every MCP tool, every HTTP route, every CLI subcommand — categorized, cross-referenced, signed off. <strong>74 + 88 + 80 = 242 operations</strong> exposed across three protocol fronts at v0.7.x (#1598 added <code>reembed</code>). One implementation underneath, three ways to call it.
   </p>
   <div class="pill-row">
     <span class="pill"><strong>74</strong>MCP tools (<code>--profile full</code>)</span>
     <span class="pill"><strong>88</strong>HTTP routes (74 unique paths)</span>
-    <span class="pill"><strong>79</strong>CLI subcommands (81 w/ <code>--features sal</code>)</span>
+    <span class="pill"><strong>80</strong>CLI subcommands (82 w/ <code>--features sal</code>)</span>
     <span class="pill"><strong>4</strong>operational modes</span>
   </div>
 </section>
@@ -723,7 +727,7 @@ footer a{color:var(--text-muted)}
 <!-- =============== CLI =============== -->
 <section id="cli-commands">
   <div class="container">
-    <span class="eyebrow">81 CLI Subcommands (sal/sal-postgres) · 79 default-build</span>
+    <span class="eyebrow">82 CLI Subcommands (sal/sal-postgres) · 80 default-build</span>
     <h2>For humans, scripts, and CI.</h2>
     <p class="lede">Direct subcommands of the <code>ai-memory</code> binary. No daemon required for read/write commands. Run against any database file via <code>--db &lt;path&gt;</code>.</p>
 

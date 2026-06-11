@@ -813,7 +813,7 @@ Forever. Including:
 - **Cross-modal memory** — image / audio / code-AST / sensor / biological-signal embeddings on the same index, different embedders (§2.4 evolution).
 - **Federated learning of recall weights** — agents adapt scoring locally, sync weights across the mesh (§2.4 + §2.5 evolution).
 - **Skill marketplace protocol** — registration / discovery / signing / invocation (§2.4 evolution; curated marketplace ops = commercial-service tier; the protocol is OSS).
-- **Custom embedder integrations** — OpenAI, Voyage, Cohere, Ollama, local Sentence Transformers, all behind a trait (§2.7 evolution).
+- **Custom embedder integrations** — OpenAI, Voyage, Cohere, Ollama, local Sentence Transformers, all behind a trait (§2.7 evolution). *Partially shipped at v0.7.x (#1598): `[embeddings].backend` already speaks to any OpenAI-compatible `/v1/embeddings` endpoint (cloud vendor aliases + self-hosted TEI/vLLM/llama.cpp server) and native Ollama; the remaining scope here is the in-process trait for non-HTTP embedders.*
 - **§5 family-attestation mechanism** — adjudicated by the heterogeneous panel; landed in whatever release the panel synthesis directs.
 - **AGI/ASI primitives** — substrate evolution to absorb whatever cognitive artifacts higher-capability entities produce, while preserving the seven properties.
 

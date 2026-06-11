@@ -292,7 +292,7 @@ separate failure domain. The `--keep 48` flag rotates oldest-first.
 
 ### 3.7 Observability
 
-`ai-memory doctor` runs locally (9-section health dashboard at v0.7.0). For T2
+`ai-memory doctor` runs locally (10-section health dashboard at v0.7.x — #1598 added Embeddings Reachability). For T2
 + a single operator this is enough — schedule as a daily cron and
 page on non-zero exit.
 
@@ -1525,7 +1525,7 @@ Drill on a scratch host:
 ai-memory restore --from /var/backups/ai-memory             # 1. uses newest snapshot
 ai-memory serve --db /var/lib/ai-memory/restored.db         # 2. boots; schema ladder re-applies idempotently
 ai-memory verify-signed-events-chain --format json | jq .chain_holds   # 3. expected: true
-ai-memory doctor --json                                     # 4. 9-section health pass
+ai-memory doctor --json                                     # 4. 10-section health pass
 ai-memory recall "$(date)"                              # 5. smoke-test recall
 ```
 

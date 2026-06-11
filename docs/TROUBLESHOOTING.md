@@ -46,6 +46,50 @@ Network or disk issues interrupt the download.
    `huggingface-cli download sentence-transformers/all-MiniLM-L6-v2`.
 4. If you don't need semantic recall, run with `--tier keyword` —
    FTS5-only, zero model load.
+5. Post-#1598, CPU-only / egress-restricted hosts can skip the local
+   model entirely: point `[embeddings]` at an API backend (any #1067
+   alias, or `openai-compatible` for a self-hosted TEI/vLLM/llama.cpp
+   `/v1/embeddings` endpoint). See the
+   [enterprise reference architectures](reference-architecture/enterprise-cpu-memory.md).
+
+### Semantic recall degraded to keyword — "embedder init failed" / "EMBEDDER LOAD FAILED" (#1593 / #1598)
+
+**Symptom**: stderr shows
+`embedder init failed (backend=…, model=…, url=…, source=…): … —
+semantic recall DEGRADED to keyword (#1143, #1593, #1598)` (MCP
+stdio) or the ERROR-level `EMBEDDER LOAD FAILED` marker (daemon).
+`memory_capabilities` reports `embedder_loaded: false` and
+`recall_mode_active: "degraded"`.
+
+**Cause**: embedder construction failed — for API backends usually a
+wrong `base_url`, a missing/rejected API key, or no network egress;
+for local backends a HuggingFace download or memory issue. This is
+the **fail-closed** posture (#1593): the substrate keeps serving
+keyword/FTS recall and NEVER silently routes embeddings through the
+chat LLM client. #1594 makes the degradation truthful at request
+time too — a remote embedder whose endpoint starts failing flips
+`embedder_loaded` to `false` in live `memory_capabilities` output.
+
+**Fix**:
+
+1. **Run `ai-memory doctor` and inspect the `Embeddings Reachability
+   (#1598)` section.** It probes the resolved endpoint (ollama
+   `GET /api/tags`; API backends `POST /embeddings` with the
+   resolved Bearer key) and reports
+   `backend`/`model`/`base_url`/`config_source`/`key_source` plus
+   HTTP status — auth (401/403), rate-limit (429), vendor outage
+   (5xx), wrong base_url (4xx-other), or network/DNS.
+2. If `config_source = compiled-default`, no operator embeddings
+   config exists anywhere — set `AI_MEMORY_EMBED_BACKEND` or write
+   an `[embeddings]` section
+   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)).
+3. If `key_source = error(...)`, fix the referenced env var or key
+   file perms (mode 0400 required for `api_key_file`).
+4. If the section carries a `gpu_policy` WARN, you resolved
+   `backend = ollama` on a host with no compatible GPU — operator
+   policy is API embeddings on CPU-only nodes; switch the backend or
+   move the workload to a GPU node.
+5. To silence the degradation deliberately, set `tier = "keyword"`.
 
 ### "port 9077 already in use"
 
