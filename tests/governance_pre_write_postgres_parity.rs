@@ -523,7 +523,11 @@ async fn postgres_reflect_fires_hook_and_refuses() {
         tags: vec![],
         priority: 5,
         confidence: 1.0,
-        source: "test".to_string(),
+        // #1653 — "test" is not in validate::VALID_SOURCES, so the pg
+        // reflect path refused with Validation BEFORE the governance
+        // hook could fire and the HookVeto assertion never ran. "nhi"
+        // is the substrate default for AI writes.
+        source: "nhi".to_string(),
         agent_id: "ai:fxc5-pg-reflect".to_string(),
         metadata: serde_json::json!({}),
     };
