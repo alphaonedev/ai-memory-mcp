@@ -146,7 +146,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // in tests/issue_{1596,1601,1602}_*.rs, not in-file, to keep the
     // module growth minimal. 17_500 = 17_432 + 68 headroom; far under
     // the 1.5x cap.
-    ("src/storage/mod.rs", 17_500),
+    //
+    // 2026-06-11 — bumped 17_500 → 17_650 by the GA audit fix train:
+    // #1638 (supersede atomicity — archive_memory_no_tx split + the
+    // one-tx wrapper), #1633 (consolidate provenance stamp), #1637
+    // (archive-listing full v49 projection), #1631 (insert_if_newer
+    // version column). Measured 17_521 + 129 headroom; every addition
+    // is a closed audit finding with its own regression test.
+    ("src/storage/mod.rs", 17_650),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -303,7 +310,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // lived-defect regression pins; zero speculative surface.
     // Measured post-fix LOC: 17_242. 17_350 = 17_242 + 108 headroom;
     // far under the 1.5x cap.
-    ("src/store/postgres.rs", 17_350),
+    //
+    // 2026-06-11 — bumped 17_350 → 17_820 by the GA audit fix train:
+    // #1626/#1628/#1641 (promote expiry + If-Match gate-CAS retry),
+    // #1629 (the seven sqlite ON CONFLICT arms ported to all four
+    // upserts), #1631 (apply_remote_memory parity arms), #1627 (full-
+    // column supersede INSERT), #1630/#1642 (consolidate expiry +
+    // delete namespace_meta), #1636 (COR-3 mapper observability),
+    // #1639/#1640 (AGE savepoint + shared tolerated-LOAD helper),
+    // #1637 (archive-listing v49 projection), #1633 (consolidate
+    // provenance). Measured 17_666 + 154 headroom; all closed audit
+    // findings with regression tests; the module-split follow-on is
+    // tracked under #650-class work for v0.8.
+    ("src/store/postgres.rs", 17_820),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
