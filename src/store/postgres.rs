@@ -8281,9 +8281,21 @@ impl MemoryStore for PostgresStore {
                     ELSE memories.tier
                 END,
                 tags = EXCLUDED.tags,
-                priority = EXCLUDED.priority,
-                confidence = EXCLUDED.confidence,
+                -- #1629 — sqlite `storage::insert` parity: priority +
+                -- confidence take the MAX across upsert so a re-store can
+                -- never downgrade either signal.
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                -- #1629 — sqlite parity: source follows the incoming row.
+                source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                -- #1629 — sqlite parity: long-tier rows pin expiry to NULL;
+                -- otherwise an incoming row that omits expiry keeps the
+                -- stored one rather than blanking it out.
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                END,
                 metadata = CASE
                     WHEN memories.metadata ? 'agent_id'
                         THEN jsonb_set(
@@ -8298,25 +8310,40 @@ impl MemoryStore for PostgresStore {
                 -- signal when re-stored at the same (title, namespace).
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky: once Reflection, always Reflection.
+                -- #1629 / QW-2 — Persona is also sticky (sqlite parity).
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
                                    ELSE EXCLUDED.memory_kind END,
-                -- v0.7.0 #900 — Form-4 / Form-5 provenance columns ride
-                -- the upsert so a re-store doesn't blank out the URI /
-                -- citation context.
-                citations = EXCLUDED.citations,
+                -- v0.7.0 #900 / #1629 — Form-4 fact-provenance follows the
+                -- sqlite CASE: a non-empty incoming citations array replaces
+                -- (caller re-asserted provenance); an empty one preserves the
+                -- stored evidence instead of silently wiping it.
+                citations = CASE WHEN EXCLUDED.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = EXCLUDED.confidence_source,
+                -- #1629 — Form-5 sqlite parity: an explicit non-default
+                -- provenance replaces; the caller_provided default keeps the
+                -- stored (auto-derived / calibrated) signal.
+                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
+                                         THEN EXCLUDED.confidence_source
+                                         ELSE memories.confidence_source END,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
-                -- #1608 — QW-2 persona-artifact columns (sqlite insert
-                -- parity; pre-#1608 the local store() dropped both).
-                entity_id = COALESCE(EXCLUDED.entity_id, memories.entity_id),
-                persona_version = COALESCE(EXCLUDED.persona_version, memories.persona_version),
+                -- #1608 / #1629 — QW-2 persona-artifact columns stay sticky:
+                -- the sqlite COALESCE order keeps the value the row was
+                -- minted with (old wins), so match it.
+                entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
+                persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 -- #1383 — preserve a previously-extracted attribution if
                 -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
                 -- at `src/storage/mod.rs:689`).
-                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- #1632 (pg twin) — upsert-merge IS a mutation, so the Gap-1
+                -- optimistic-concurrency counter bumps exactly like
+                -- db::update (sqlite landed in 27b45dc2).
+                version = memories.version + 1
             RETURNING id",
         )
         .bind(&memory.id)
@@ -8550,9 +8577,16 @@ impl MemoryStore for PostgresStore {
                     ELSE memories.tier
                 END,
                 tags = EXCLUDED.tags,
-                priority = EXCLUDED.priority,
-                confidence = EXCLUDED.confidence,
+                -- #1629 — sqlite parity: MAX-merge, source follows incoming,
+                -- expiry long→NULL + COALESCE (see `store()` for rationale).
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                END,
                 metadata = CASE
                     WHEN memories.metadata ? 'agent_id'
                         THEN jsonb_set(
@@ -8564,16 +8598,23 @@ impl MemoryStore for PostgresStore {
                 END,
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
                                    ELSE EXCLUDED.memory_kind END,
-                citations = EXCLUDED.citations,
+                citations = CASE WHEN EXCLUDED.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = EXCLUDED.confidence_source,
+                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
+                                         THEN EXCLUDED.confidence_source
+                                         ELSE memories.confidence_source END,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
-                entity_id = COALESCE(EXCLUDED.entity_id, memories.entity_id),
-                persona_version = COALESCE(EXCLUDED.persona_version, memories.persona_version),
-                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+                entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
+                persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
+                version = memories.version + 1
             RETURNING id, title, namespace",
         );
 
@@ -8755,9 +8796,16 @@ impl MemoryStore for PostgresStore {
                     ELSE memories.tier
                 END,
                 tags = EXCLUDED.tags,
-                priority = EXCLUDED.priority,
-                confidence = EXCLUDED.confidence,
+                -- #1629 — sqlite parity: MAX-merge, source follows incoming,
+                -- expiry long→NULL + COALESCE (see `store()` for rationale).
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                END,
                 metadata = CASE
                     WHEN memories.metadata ? 'agent_id'
                         THEN jsonb_set(
@@ -8769,14 +8817,21 @@ impl MemoryStore for PostgresStore {
                 END,
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
                                    ELSE EXCLUDED.memory_kind END,
-                citations = EXCLUDED.citations,
+                citations = CASE WHEN EXCLUDED.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = EXCLUDED.confidence_source,
+                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
+                                         THEN EXCLUDED.confidence_source
+                                         ELSE memories.confidence_source END,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
-                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
+                version = memories.version + 1
             RETURNING id",
         )
         .bind(&memory.id)
@@ -8960,9 +9015,16 @@ impl MemoryStore for PostgresStore {
                     ELSE memories.tier
                 END,
                 tags = EXCLUDED.tags,
-                priority = EXCLUDED.priority,
-                confidence = EXCLUDED.confidence,
+                -- #1629 — sqlite parity: MAX-merge, source follows incoming,
+                -- expiry long→NULL + COALESCE (see `store()` for rationale).
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                source = EXCLUDED.source,
                 updated_at = EXCLUDED.updated_at,
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                END,
                 metadata = CASE
                     WHEN memories.metadata ? 'agent_id'
                         THEN jsonb_set(
@@ -8974,23 +9036,30 @@ impl MemoryStore for PostgresStore {
                 END,
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
-                -- L1-1 — kind is sticky.
+                -- L1-1 — kind is sticky (reflection AND persona, #1629).
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
                                    ELSE EXCLUDED.memory_kind END,
-                -- #1608 — Form-4 / Form-5 / QW-2 arms mirror `store()`
-                -- (#900 shape): re-store doesn't blank out provenance.
-                citations = EXCLUDED.citations,
+                -- #1608 / #1629 — Form-4 / Form-5 / QW-2 arms mirror `store()`
+                -- (sqlite shape): re-store doesn't blank out provenance.
+                citations = CASE WHEN EXCLUDED.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE EXCLUDED.citations END,
                 source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
                 source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                confidence_source = EXCLUDED.confidence_source,
+                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
+                                         THEN EXCLUDED.confidence_source
+                                         ELSE memories.confidence_source END,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
-                entity_id = COALESCE(EXCLUDED.entity_id, memories.entity_id),
-                persona_version = COALESCE(EXCLUDED.persona_version, memories.persona_version),
+                entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
+                persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 embedding = COALESCE(EXCLUDED.embedding, memories.embedding),
                 -- #1383 — preserve a previously-extracted attribution
                 -- if EXCLUDED is NULL (sqlite parity).
-                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
+                version = memories.version + 1
             RETURNING id",
         )
         .bind(&memory.id)
