@@ -7368,6 +7368,17 @@ pub fn dim_violations(conn: &Connection) -> Result<u64> {
     Ok(u64::try_from(n).unwrap_or(0))
 }
 
+/// #1595/#1598 — the single embedding-UPDATE statement (headed blob +
+/// declared dim), shared by [`set_embedding`], [`set_embeddings_batch`]
+/// and [`set_embeddings_batch_reembed`] so the write shape cannot
+/// drift between the checked and replace-semantics writers.
+const SQL_UPDATE_EMBEDDING_WITH_DIM: &str =
+    "UPDATE memories SET embedding = ?1, embedding_dim = ?2 WHERE id = ?3";
+/// Degenerate empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]
+/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`).
+const SQL_UPDATE_EMBEDDING_NULL_DIM: &str =
+    "UPDATE memories SET embedding = ?1, embedding_dim = NULL WHERE id = ?2";
+
 /// Store an embedding vector for a memory.
 ///
 /// v0.6.3.1 P2 — writes are now headed with the magic byte (`encode_embedding_blob`)
@@ -7396,10 +7407,7 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
         // them; preserve that to avoid breaking legacy tests but skip the
         // dim check.
         let bytes = crate::embeddings::encode_embedding_blob(embedding);
-        conn.execute(
-            "UPDATE memories SET embedding = ?1, embedding_dim = NULL WHERE id = ?2",
-            params![bytes, id],
-        )?;
+        conn.execute(SQL_UPDATE_EMBEDDING_NULL_DIM, params![bytes, id])?;
         return Ok(());
     }
     if let Some(ref ns) = namespace
@@ -7415,10 +7423,7 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
     }
     let bytes = crate::embeddings::encode_embedding_blob(embedding);
     let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-    conn.execute(
-        "UPDATE memories SET embedding = ?1, embedding_dim = ?2 WHERE id = ?3",
-        params![bytes, dim_i64, id],
-    )?;
+    conn.execute(SQL_UPDATE_EMBEDDING_WITH_DIM, params![bytes, dim_i64, id])?;
     Ok(())
 }
 
@@ -7491,10 +7496,8 @@ pub fn set_embeddings_batch(
 
     let tx = conn.transaction()?;
     {
-        let mut update =
-            tx.prepare("UPDATE memories SET embedding = ?1, embedding_dim = ?2 WHERE id = ?3")?;
-        let mut update_empty =
-            tx.prepare("UPDATE memories SET embedding = ?1, embedding_dim = NULL WHERE id = ?2")?;
+        let mut update = tx.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
+        let mut update_empty = tx.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
 
         let mut rows_updated = 0usize;
         for (id, embedding) in entries {
@@ -7618,6 +7621,225 @@ pub fn get_unembedded_ids_batch(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// #1595 — keyset-paginated variant of [`get_unembedded_ids_batch`].
+///
+/// Returns at most `limit` `(id, title, content)` triples whose `id`
+/// sorts strictly AFTER `after_id` (or from the start when `None`),
+/// in `id` order. The resilient backfill sweep advances its cursor
+/// past every processed row — embedded OR skipped — so a poison row
+/// (over-context-length content, transient embedder fault) can no
+/// longer pin the scan head and starve the rest of the backlog (the
+/// pre-fix `LIMIT`-only fetch re-returned persistently-failing rows
+/// forever, and the no-progress guard then stopped the whole sweep
+/// with 0 rows backfilled).
+///
+/// Two distinct prepared shapes (with / without the cursor predicate)
+/// rather than the non-sargable `(?1 IS NULL OR id > ?1)` form, per
+/// the v55/v56 sargability discipline.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn get_unembedded_ids_batch_after(
+    conn: &Connection,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, String, String)>> {
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    };
+    let rows = if let Some(after) = after_id {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, title, content FROM memories \
+             WHERE embedding IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after, limit], map_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, title, content FROM memories \
+             WHERE embedding IS NULL ORDER BY id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], map_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
+}
+
+/// #1598 — keyset-paginated scan over ALL live memories (embedded or
+/// not), optionally namespace-filtered, for the `ai-memory reembed`
+/// full-corpus sweep. Same cursor semantics as
+/// [`get_unembedded_ids_batch_after`]: at most `limit` `(id, title,
+/// content)` triples with `id` strictly after `after_id`, in `id`
+/// order. Four distinct prepared shapes (namespace × cursor) keep the
+/// scan sargable (v55/v56 discipline).
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn get_memory_texts_batch(
+    conn: &Connection,
+    namespace: Option<&str>,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, String, String)>> {
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    };
+    let rows = match (namespace, after_id) {
+        (Some(ns), Some(after)) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, title, content FROM memories \
+                 WHERE namespace = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![ns, after, limit], map_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        (Some(ns), None) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, title, content FROM memories \
+                 WHERE namespace = ?1 ORDER BY id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![ns, limit], map_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        (None, Some(after)) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, title, content FROM memories \
+                 WHERE id > ?1 ORDER BY id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, limit], map_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        (None, None) => {
+            let mut stmt = conn
+                .prepare_cached("SELECT id, title, content FROM memories ORDER BY id LIMIT ?1")?;
+            let rows = stmt.query_map(params![limit], map_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+    };
+    Ok(rows)
+}
+
+/// #1598 — REPLACE-semantics sibling of [`set_embeddings_batch`] for
+/// the `ai-memory reembed` vector-space migration.
+///
+/// Identical single-transaction write shape, but it deliberately does
+/// NOT enforce the per-namespace established-dim invariant: re-embed
+/// is exactly the tool that migrates a namespace from one model/dim to
+/// another, so mid-run the namespace legitimately holds mixed dims
+/// (the H7 recall read-guards skip dim-mismatched vectors during the
+/// transition, and the sweep converges every row to the target dim).
+/// Every other caller MUST keep using [`set_embeddings_batch`] — the
+/// G4 invariant is what stops a misconfigured writer from silently
+/// zeroing cosine scores.
+///
+/// Returns the number of rows updated (unknown ids are skipped, same
+/// as the checked sibling).
+///
+/// # Errors
+///
+/// Returns the underlying SQLite transaction / statement error.
+pub fn set_embeddings_batch_reembed(
+    conn: &mut Connection,
+    entries: &[(String, Vec<f32>)],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let mut rows_updated = 0usize;
+    {
+        let mut update = tx.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
+        let mut update_empty = tx.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
+        for (id, embedding) in entries {
+            let bytes = crate::embeddings::encode_embedding_blob(embedding);
+            if embedding.is_empty() {
+                // Legacy degenerate-case parity with `set_embedding`.
+                rows_updated += update_empty.execute(params![bytes, id])?;
+            } else {
+                let dim_i64 = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
+                rows_updated += update.execute(params![bytes, dim_i64, id])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(rows_updated)
+}
+
+/// #1598 — `(total_rows, rows_with_embeddings)` for the reembed
+/// dry-run plan, optionally namespace-filtered. `COUNT(embedding)`
+/// counts non-NULL values, so the missing count is the difference.
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn embedding_coverage(conn: &Connection, namespace: Option<&str>) -> Result<(u64, u64)> {
+    let (total, embedded): (i64, i64) = if let Some(ns) = namespace {
+        conn.query_row(
+            "SELECT COUNT(*), COUNT(embedding) FROM memories WHERE namespace = ?1",
+            params![ns],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+    } else {
+        conn.query_row("SELECT COUNT(*), COUNT(embedding) FROM memories", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+    };
+    Ok((
+        u64::try_from(total).unwrap_or(0),
+        u64::try_from(embedded).unwrap_or(0),
+    ))
+}
+
+/// #1598 — distinct embedding dimensionalities currently stored,
+/// optionally namespace-filtered, for the reembed pre-flight banner
+/// (the loud "old dims vs target dim" disclosure before a vector-space
+/// migration). Prefers the declared `embedding_dim` column and falls
+/// back to deriving from the BLOB length for legacy rows — `4n+1`
+/// bytes is the v17 headed form (`(len-1)/4` floats), `4n` the
+/// legacy unheaded form (`len/4`), mirroring [`dim_violations`].
+///
+/// # Errors
+///
+/// Returns the underlying SQLite error.
+pub fn distinct_embedding_dims(conn: &Connection, namespace: Option<&str>) -> Result<Vec<usize>> {
+    const DIM_EXPR: &str = "COALESCE(embedding_dim, \
+         CASE WHEN length(embedding) % 4 = 1 THEN (length(embedding)-1)/4 \
+              ELSE length(embedding)/4 END)";
+    let collect = |stmt: &mut rusqlite::Statement<'_>,
+                   params: &[&dyn rusqlite::ToSql]|
+     -> Result<Vec<usize>> {
+        let rows = stmt.query_map(params, |r| r.get::<_, i64>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|d| usize::try_from(d).ok())
+            .collect())
+    };
+    if let Some(ns) = namespace {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {DIM_EXPR} AS dim FROM memories \
+             WHERE embedding IS NOT NULL AND namespace = ?1 ORDER BY dim"
+        ))?;
+        collect(&mut stmt, &[&ns])
+    } else {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {DIM_EXPR} AS dim FROM memories \
+             WHERE embedding IS NOT NULL ORDER BY dim"
+        ))?;
+        collect(&mut stmt, &[])
+    }
 }
 
 /// #1579 B3 — count of rows carrying a stored embedding. Cheap probe
@@ -12388,6 +12610,170 @@ mod tests {
         let got = get_embedding(&conn, &id).unwrap().unwrap();
         assert_eq!(got.len(), 4);
         assert!((got[0] - 0.1).abs() < 1e-6);
+    }
+
+    // -- #1595 / #1598 — resilient-backfill + reembed storage helpers --
+
+    /// #1595 — the keyset fetch pages strictly past the cursor in `id`
+    /// order, and rows that gain an embedding drop out of the scan.
+    #[test]
+    fn unembedded_batch_after_cursor_paginates_1595() {
+        let conn = test_db();
+        let mut ids: Vec<String> = (0..5)
+            .map(|i| {
+                insert(
+                    &conn,
+                    &make_memory(&format!("row-{i}"), "bf-1595", Tier::Long, 5),
+                )
+                .unwrap()
+            })
+            .collect();
+        ids.sort();
+
+        let first = get_unembedded_ids_batch_after(&conn, None, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].0, ids[0], "scan starts at the smallest id");
+        let cursor = first.last().unwrap().0.clone();
+
+        let rest = get_unembedded_ids_batch_after(&conn, Some(&cursor), 10).unwrap();
+        assert_eq!(rest.len(), 3);
+        assert!(
+            rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()),
+            "every row must sort strictly after the cursor"
+        );
+
+        // Embedded rows leave the unembedded predicate.
+        set_embedding(&conn, &ids[0], &[0.1, 0.2]).unwrap();
+        let after = get_unembedded_ids_batch_after(&conn, None, 10).unwrap();
+        assert_eq!(after.len(), 4);
+        assert!(after.iter().all(|(id, _, _)| id != &ids[0]));
+    }
+
+    /// #1598 — the reembed full-corpus scan returns embedded AND
+    /// unembedded rows, honors the namespace filter, and pages by
+    /// cursor.
+    #[test]
+    fn memory_texts_batch_namespace_and_cursor_1598() {
+        let conn = test_db();
+        let mut ns_a_ids: Vec<String> = (0..3)
+            .map(|i| {
+                insert(
+                    &conn,
+                    &make_memory(&format!("a-{i}"), "reembed-a", Tier::Long, 5),
+                )
+                .unwrap()
+            })
+            .collect();
+        ns_a_ids.sort();
+        for i in 0..2 {
+            insert(
+                &conn,
+                &make_memory(&format!("b-{i}"), "reembed-b", Tier::Long, 5),
+            )
+            .unwrap();
+        }
+        // An already-embedded row MUST still be scanned — reembed
+        // replaces existing vectors, it is not a backfill.
+        set_embedding(&conn, &ns_a_ids[0], &[0.5, 0.5]).unwrap();
+
+        let all = get_memory_texts_batch(&conn, None, None, 100).unwrap();
+        assert_eq!(all.len(), 5, "unfiltered scan sees every live row");
+
+        let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100).unwrap();
+        assert_eq!(ns_a.len(), 3);
+        assert_eq!(ns_a[0].0, ns_a_ids[0], "embedded row still scanned");
+
+        let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1).unwrap();
+        let cursor = first[0].0.clone();
+        let rest = get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()));
+    }
+
+    /// #1598 — the reembed writer REPLACES vectors across a dim change
+    /// that the checked writer (G4 invariant) refuses, and skips
+    /// unknown ids like its checked sibling.
+    #[test]
+    fn set_embeddings_batch_reembed_bypasses_dim_invariant_1598() {
+        let mut conn = test_db();
+        let id1 = insert(&conn, &make_memory("dim-est", "reembed-dim", Tier::Long, 5)).unwrap();
+        let id2 = insert(&conn, &make_memory("dim-mig", "reembed-dim", Tier::Long, 5)).unwrap();
+        // Establish a 4-dim namespace.
+        set_embedding(&conn, &id1, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        // The checked writer enforces the established dim…
+        let refused =
+            set_embeddings_batch(&mut conn, &[(id2.clone(), vec![0.1_f32; 8])]).unwrap_err();
+        assert!(
+            refused.downcast_ref::<EmbeddingDimMismatch>().is_some(),
+            "checked writer must refuse the dim change: {refused}"
+        );
+
+        // …the migration writer replaces every row to the new dim.
+        let entries = vec![
+            (id1.clone(), vec![0.9_f32; 8]),
+            (id2.clone(), vec![0.8_f32; 8]),
+        ];
+        let written = set_embeddings_batch_reembed(&mut conn, &entries).unwrap();
+        assert_eq!(written, 2);
+        assert_eq!(get_embedding(&conn, &id1).unwrap().unwrap().len(), 8);
+        assert_eq!(get_embedding(&conn, &id2).unwrap().unwrap().len(), 8);
+        assert_eq!(
+            namespace_embedding_dim(&conn, "reembed-dim").unwrap(),
+            Some(8),
+            "namespace converges to the target dim"
+        );
+
+        // Unknown ids are skipped; empty input is a no-op.
+        let n = set_embeddings_batch_reembed(
+            &mut conn,
+            &[("no-such-id".to_string(), vec![0.1_f32; 8])],
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(set_embeddings_batch_reembed(&mut conn, &[]).unwrap(), 0);
+    }
+
+    /// #1598 — dry-run coverage counts, with and without the namespace
+    /// filter.
+    #[test]
+    fn embedding_coverage_counts_1598() {
+        let conn = test_db();
+        let id_a = insert(&conn, &make_memory("c-a", "cov-a", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("c-b", "cov-a", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("c-c", "cov-b", Tier::Long, 5)).unwrap();
+        set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
+
+        assert_eq!(embedding_coverage(&conn, None).unwrap(), (3, 1));
+        assert_eq!(embedding_coverage(&conn, Some("cov-a")).unwrap(), (2, 1));
+        assert_eq!(embedding_coverage(&conn, Some("cov-b")).unwrap(), (1, 0));
+        assert_eq!(embedding_coverage(&conn, Some("cov-none")).unwrap(), (0, 0));
+    }
+
+    /// #1598 — the pre-flight dim survey lists every stored dim
+    /// (sorted) and honors the namespace filter.
+    #[test]
+    fn distinct_embedding_dims_lists_mixed_1598() {
+        let mut conn = test_db();
+        let id_a = insert(&conn, &make_memory("d-a", "dims-a", Tier::Long, 5)).unwrap();
+        let id_b = insert(&conn, &make_memory("d-b", "dims-b", Tier::Long, 5)).unwrap();
+        let id_c = insert(&conn, &make_memory("d-c", "dims-b", Tier::Long, 5)).unwrap();
+        set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
+        set_embedding(&conn, &id_b, &[0.1; 8]).unwrap();
+        // Mixed dims inside ONE namespace only arise mid-migration —
+        // land them via the reembed writer.
+        set_embeddings_batch_reembed(&mut conn, &[(id_c, vec![0.2_f32; 4])]).unwrap();
+
+        assert_eq!(distinct_embedding_dims(&conn, None).unwrap(), vec![2, 4, 8]);
+        assert_eq!(
+            distinct_embedding_dims(&conn, Some("dims-b")).unwrap(),
+            vec![4, 8]
+        );
+        assert!(
+            distinct_embedding_dims(&conn, Some("dims-none"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // -- Pillar 2 / Stream D — memory_check_duplicate -------------------

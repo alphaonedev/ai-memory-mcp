@@ -3331,30 +3331,65 @@ pub struct LlmAutoTagSection {
 /// Wire format:
 /// ```toml
 /// [embeddings]
-/// backend        = "ollama"                    # only backend at v0.7.0
-/// url            = "http://localhost:11434"
-/// model          = "nomic-embed-text-v1.5"
+/// backend        = "openrouter"                # ollama (default) or any
+///                                              # #1067 API alias /
+///                                              # openai-compatible (#1598)
+/// base_url       = "https://openrouter.ai/api/v1"
+/// model          = "google/gemini-embedding-2"
+/// api_key_env    = "OPENROUTER_API_KEY"        # mutually exclusive with
+/// # api_key_file = "/etc/ai-memory/keys/embed.key"   # mode 0400 enforced
+/// dim            = 3072                        # only needed for models
+///                                              # outside the known-dims table
 /// backfill_batch = 100                         # 1-10000 (env override:
 ///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingsSection {
-    /// Embedding backend. At v0.7.0 only `ollama` is supported (the
-    /// `nomic-embed-text-v1.5` and `all-MiniLM-L6-v2` models both
-    /// speak Ollama's `/api/embed` wire shape). Field is present for
-    /// forward compatibility with future OpenAI-compatible embedding
-    /// vendors.
+    /// Embedding backend. `ollama` (the default — local `/api/embed`
+    /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
+    /// (`openrouter`, `openai`, `gemini`, …) or the generic
+    /// `openai-compatible` escape hatch for self-hosted endpoints
+    /// (HF TEI, vLLM).
     pub backend: Option<String>,
 
     /// Embedding endpoint URL. Defaults to `http://localhost:11434`
-    /// when unset.
+    /// when unset (ollama backend) or to the backend alias's default
+    /// base URL (API backends, #1598). Synonym of [`Self::base_url`];
+    /// `base_url` wins when both are set.
     pub url: Option<String>,
+
+    /// #1598 — embedding endpoint base URL. Synonym of [`Self::url`]
+    /// (named to match `[llm].base_url`); when both are set,
+    /// `base_url` wins.
+    pub base_url: Option<String>,
 
     /// Embedding model identifier. Legacy values `nomic_embed_v15`
     /// (alias for `nomic-embed-text-v1.5`) and `mini_lm_l6_v2` (alias
     /// for `sentence-transformers/all-MiniLM-L6-v2`) are honored at
     /// parse time.
     pub model: Option<String>,
+
+    /// #1598 — inline API-key literal. ALWAYS REJECTED at config load
+    /// (mirrors `[llm].api_key`): config.toml is typically
+    /// world-readable, so inline secrets are a credential leak. The
+    /// field exists solely so the rejection is loud instead of a
+    /// silent unknown-key skip. Use [`Self::api_key_env`] or
+    /// [`Self::api_key_file`].
+    pub api_key: Option<String>,
+
+    /// #1598 — name of the process env var holding the embedding API
+    /// key. Mutually exclusive with [`Self::api_key_file`].
+    pub api_key_env: Option<String>,
+
+    /// #1598 — path of a file holding the embedding API key (mode
+    /// 0400 enforced, mirroring `[llm].api_key_file`). Mutually
+    /// exclusive with [`Self::api_key_env`].
+    pub api_key_file: Option<String>,
+
+    /// #1598 — explicit vector-dim override for embedding models not
+    /// in [`KNOWN_EMBEDDING_DIMS`]. Takes precedence over the table
+    /// lookup; non-positive values are ignored.
+    pub dim: Option<u32>,
 
     /// Backfill batch size. Bounded `1..=10000`; out-of-range values
     /// fall back to the compiled default (100) with a WARN. Env
@@ -3656,13 +3691,21 @@ impl std::fmt::Debug for ResolvedLlm {
 
 /// Canonical resolved-embedder configuration. Produced by
 /// [`AppConfig::resolve_embeddings`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Secret handling (#1598).** The `api_key` field is private;
+/// access via [`Self::api_key`]. The manual `Debug` impl redacts the
+/// value (`<redacted>`), mirroring [`ResolvedLlm`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedEmbeddings {
-    /// Embedding backend selector. At v0.7.0 only `"ollama"` is
-    /// produced (the substrate's nomic-embed + minilm models both
-    /// speak Ollama's `/api/embed` wire shape).
+    /// Embedding backend selector. `"ollama"` (local `/api/embed`
+    /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
+    /// / the generic `openai-compatible` escape hatch. Classify via
+    /// [`is_api_embed_backend`].
     pub backend: String,
-    /// Embedding endpoint URL.
+    /// Embedding endpoint base URL. The `[embeddings].base_url` /
+    /// `[embeddings].url` synonym merge happens in the resolver
+    /// (`base_url` wins); the field keeps the historical `url` name
+    /// to limit call-site churn (#1598).
     pub url: String,
     /// Embedding model identifier (canonicalised — legacy aliases
     /// `nomic_embed_v15` / `mini_lm_l6_v2` are mapped to the
@@ -3672,15 +3715,78 @@ pub struct ResolvedEmbeddings {
     /// fall back to 100 with a WARN.
     pub backfill_batch: u32,
     /// v0.7.x (issue #1169) — vector dim of the resolved model, when
-    /// known. Populated by [`canonical_embedding_dim`] against
-    /// [`KNOWN_EMBEDDING_DIMS`]. `None` when the operator chose a
-    /// model id that isn't in the table — in that case
-    /// [`build_capability_models`] falls back to the tier preset's
-    /// dim (preserving pre-#1169 behaviour for unrecognised ids and
-    /// avoiding the silent-wrong-dim trap for the recognised ones).
+    /// known. #1598: the explicit `[embeddings].dim` override wins
+    /// over the [`canonical_embedding_dim`] table lookup. `None` when
+    /// the operator chose a model id that isn't in the table and set
+    /// no override — in that case [`build_capability_models`] falls
+    /// back to the tier preset's dim (preserving pre-#1169 behaviour
+    /// for unrecognised ids and avoiding the silent-wrong-dim trap
+    /// for the recognised ones).
     pub embedding_dim: Option<u32>,
+    /// #1598 — resolved embedding API key. `None` for
+    /// `backend = "ollama"` (no auth) and for keyless self-hosted
+    /// OpenAI-compatible endpoints. Private — access via
+    /// [`Self::api_key`].
+    api_key: Option<String>,
+    /// #1598 — provenance of the resolved API key for boot-banner /
+    /// doctor-probe display.
+    pub key_source: KeySource,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
+}
+
+impl ResolvedEmbeddings {
+    /// Access the resolved embedding API key. Use this only when
+    /// constructing the embed client; do NOT log or `{:?}` the result.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// #1598 — construct from explicit parts. Prefer
+    /// [`AppConfig::resolve_embeddings`]; this exists for tests and
+    /// sibling surfaces (e.g. the reembed CLI) that synthesise a
+    /// resolved view without an `AppConfig`.
+    #[must_use]
+    pub fn from_parts(
+        backend: String,
+        url: String,
+        model: String,
+        embedding_dim: Option<u32>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            url,
+            model,
+            backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
+            embedding_dim,
+            api_key,
+            key_source: KeySource::None,
+            source: ConfigSource::CompiledDefault,
+        }
+    }
+}
+
+impl std::fmt::Debug for ResolvedEmbeddings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEmbeddings")
+            .field("backend", &self.backend)
+            .field("url", &self.url)
+            .field("model", &self.model)
+            .field("backfill_batch", &self.backfill_batch)
+            .field(
+                crate::models::field_names::EMBEDDING_DIM,
+                &self.embedding_dim,
+            )
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
+            .field("key_source", &self.key_source)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// Canonical resolved-reranker configuration. Produced by
@@ -3762,6 +3868,35 @@ pub const ENV_PG_POOL_MIN: &str = "AI_MEMORY_PG_POOL_MIN";
 /// (`postgres_acquire_timeout_secs`), in whole seconds.
 pub const ENV_PG_ACQUIRE_TIMEOUT_SECS: &str = "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS";
 
+/// #1067 — env carrying the LLM Bearer-auth secret; highest-precedence
+/// layer of the `[llm]` API-key resolution ladder ([`KeySource`]).
+pub const ENV_LLM_API_KEY: &str = "AI_MEMORY_LLM_API_KEY";
+
+/// #1598 — env override for the embedding backend selector
+/// (`[embeddings].backend`). Same accepted values as the section
+/// field: `ollama`, any #1067 alias, or `openai-compatible`.
+pub const ENV_EMBED_BACKEND: &str = "AI_MEMORY_EMBED_BACKEND";
+/// #1598 — env override for the embedding endpoint base URL
+/// (`[embeddings].base_url` / `[embeddings].url`).
+pub const ENV_EMBED_BASE_URL: &str = "AI_MEMORY_EMBED_BASE_URL";
+/// #1598 — env override for the embedding model id
+/// (`[embeddings].model`).
+pub const ENV_EMBED_MODEL: &str = "AI_MEMORY_EMBED_MODEL";
+/// #1598 — env carrying the embedding Bearer-auth secret;
+/// highest-precedence layer of the `[embeddings]` API-key resolution
+/// ladder (mirrors [`ENV_LLM_API_KEY`]).
+pub const ENV_EMBED_API_KEY: &str = "AI_MEMORY_EMBED_API_KEY";
+/// #38 — env override for the embedding backfill batch size
+/// (`[embeddings].backfill_batch`). Hoisted from a raw literal in the
+/// resolver per the no-hardcoded-literals discipline (#1598).
+pub const ENV_EMBED_BACKFILL_BATCH: &str = "AI_MEMORY_EMBED_BACKFILL_BATCH";
+
+/// Compiled-default embedding model id (the v0.7.0 autonomous-tier
+/// nomic default), shared by the resolver and its precedence tests.
+pub(crate) const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text-v1.5";
+/// Compiled-default embedding backfill batch size.
+pub(crate) const DEFAULT_EMBED_BACKFILL_BATCH: u32 = 100;
+
 /// v0.7.x (issue #1168) — bundle the three model-resolver outputs into
 /// a single triple consumed by the capabilities surface. Lets callers
 /// thread ONE struct through `handle_capabilities_with_conn` /
@@ -3802,8 +3937,10 @@ impl Default for ResolvedModels {
                 backend: "ollama".to_string(),
                 url: "http://localhost:11434".to_string(),
                 model: String::new(),
-                backfill_batch: 100,
+                backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
                 embedding_dim: None,
+                api_key: None,
+                key_source: KeySource::None,
                 source: ConfigSource::CompiledDefault,
             },
             reranker: ResolvedReranker {
@@ -3851,13 +3988,15 @@ impl ResolvedModels {
                     .embedding_model
                     .map(|m| m.hf_model_id().to_string())
                     .unwrap_or_default(),
-                backfill_batch: 100,
+                backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
                 // v0.7.x (#1169) — back-compat constructor: source the
                 // dim from the tier-preset enum directly so the
                 // ResolvedModels::from_tier_preset path matches the
                 // pre-#1169 capabilities byte-shape (the test invariant
                 // pinned by tests/issue_1168_*::from_tier_preset_*).
                 embedding_dim: tier.embedding_model.map(|m| m.dim() as u32),
+                api_key: None,
+                key_source: KeySource::None,
                 source: ConfigSource::CompiledDefault,
             },
             reranker: ResolvedReranker {
@@ -5219,6 +5358,11 @@ pub const KNOWN_EMBEDDING_DIMS: &[(&str, u32)] = &[
     // Google embedding
     ("embedding-001", 768),
     ("text-embedding-004", 768),
+    ("google/gemini-embedding-2", 3072),
+    ("gemini-embedding-2", 3072),
+    // IBM Granite (#1598 — common self-hosted TEI/vLLM pick)
+    ("ibm-granite/granite-embedding-125m-english", 768),
+    ("granite-embedding", 768),
     // Snowflake Arctic
     ("snowflake-arctic-embed", 1024),
     ("snowflake-arctic-embed:l", 1024),
@@ -5261,13 +5405,77 @@ pub fn canonical_embedding_dim(model: &str) -> Option<u32> {
 ///      "ollama"`; a misconfiguration for OpenAI-compatible vendors —
 ///      surfaced by the reachability probe).
 ///
-/// File reads do NOT enforce permission bits at this commit; the 0400
-/// enforcement lands in a follow-up commit and surfaces errors via
-/// `KeySource::Error(reason)` so the daemon can boot and report the
-/// problem through `ai-memory doctor` rather than failing at config load.
+/// #1598 — thin delegate over [`resolve_api_key_ladder`] (the same
+/// ladder serves the `[embeddings]` section via
+/// [`resolve_embed_api_key`]).
 fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, KeySource) {
+    resolve_api_key_ladder(
+        ENV_LLM_API_KEY,
+        backend,
+        llm.and_then(|l| l.api_key_env.as_deref()),
+        llm.and_then(|l| l.api_key_file.as_deref()),
+        "llm",
+    )
+}
+
+/// #1598 — resolve the EMBEDDING API key + provenance tag for the
+/// configured embedding backend. Mirrors [`resolve_api_key`] with the
+/// `[embeddings]`-section sources:
+///
+///   1. `AI_MEMORY_EMBED_API_KEY` process env → `KeySource::ProcessEnv`
+///   2. Per-vendor process env-var fallback (e.g. `OPENROUTER_API_KEY`)
+///      → `KeySource::AliasFallback(name)`
+///   3. `[embeddings].api_key_env` → `KeySource::ConfigEnvVar(name)`
+///   4. `[embeddings].api_key_file` (0400 enforced)
+///      → `KeySource::ConfigFile(path)`
+///   5. None resolved → `KeySource::None` (correct for `backend =
+///      "ollama"` and for keyless self-hosted OpenAI-compatible
+///      endpoints such as HF TEI / vLLM).
+fn resolve_embed_api_key(
+    backend: &str,
+    embeddings: Option<&EmbeddingsSection>,
+) -> (Option<String>, KeySource) {
+    resolve_api_key_ladder(
+        ENV_EMBED_API_KEY,
+        backend,
+        embeddings.and_then(|e| e.api_key_env.as_deref()),
+        embeddings.and_then(|e| e.api_key_file.as_deref()),
+        "embeddings",
+    )
+}
+
+/// #1598 — true when the embedding backend speaks an API wire shape
+/// (OpenAI-compatible `/embeddings` + Bearer auth) rather than the
+/// local Ollama-native `/api/embed` shape. `"ollama"` is the ONLY
+/// non-API backend; every #1067 alias and the generic
+/// `openai-compatible` escape hatch classify as API backends. Sits
+/// next to [`alias_api_key_env_vars_for_resolver`] /
+/// [`backend_default_base_url`] — the alias machinery it complements.
+#[must_use]
+pub fn is_api_embed_backend(backend: &str) -> bool {
+    !backend
+        .trim()
+        .eq_ignore_ascii_case(crate::llm::BACKEND_OLLAMA)
+}
+
+/// Shared API-key resolution ladder for the `[llm]` and `[embeddings]`
+/// sections (#1146 / #1598). `primary_env` is the section's dedicated
+/// `AI_MEMORY_*_API_KEY` env var; `section` is the bare section name
+/// (`"llm"` / `"embeddings"`) used in provenance / error strings.
+///
+/// File reads enforce mode 0400 (via [`enforce_api_key_file_perms`])
+/// and surface failures as `KeySource::Error(reason)` so the daemon
+/// can boot and report the problem through `ai-memory doctor` rather
+/// than failing at config load.
+fn resolve_api_key_ladder(
+    primary_env: &str,
+    backend: &str,
+    api_key_env: Option<&str>,
+    api_key_file: Option<&str>,
+    section: &str,
+) -> (Option<String>, KeySource) {
     // 1. Process env (highest).
-    if let Some(k) = std::env::var("AI_MEMORY_LLM_API_KEY")
+    if let Some(k) = std::env::var(primary_env)
         .ok()
         .filter(|s| !s.trim().is_empty())
     {
@@ -5282,37 +5490,32 @@ fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, 
     }
 
     // 3. config-pointed env var.
-    if let Some(name) = llm
-        .and_then(|l| l.api_key_env.as_ref())
-        .filter(|s| !s.trim().is_empty())
-    {
+    if let Some(name) = api_key_env.filter(|s| !s.trim().is_empty()) {
         return match std::env::var(name) {
-            Ok(v) if !v.trim().is_empty() => (Some(v), KeySource::ConfigEnvVar(name.clone())),
+            Ok(v) if !v.trim().is_empty() => (Some(v), KeySource::ConfigEnvVar(name.to_string())),
             Ok(_) => (
                 None,
                 KeySource::Error(format!(
-                    "[llm].api_key_env = {name:?} resolves to an empty env var"
+                    "[{section}].api_key_env = {name:?} resolves to an empty env var"
                 )),
             ),
             Err(_) => (
                 None,
                 KeySource::Error(format!(
-                    "[llm].api_key_env = {name:?} is not set in the process env"
+                    "[{section}].api_key_env = {name:?} is not set in the process env"
                 )),
             ),
         };
     }
 
     // 4. config-pointed file.
-    if let Some(raw_path) = llm
-        .and_then(|l| l.api_key_file.as_ref())
-        .filter(|s| !s.trim().is_empty())
-    {
+    if let Some(raw_path) = api_key_file.filter(|s| !s.trim().is_empty()) {
+        let field = format!("[{section}].api_key_file");
         let path = expand_tilde(raw_path);
         let path_display = path.display().to_string();
 
         // Mode 0400 enforcement (#1055-style escape hatch).
-        if let Err(reason) = enforce_api_key_file_perms(&path) {
+        if let Err(reason) = enforce_api_key_file_perms(&path, &field) {
             return (None, KeySource::Error(reason));
         }
 
@@ -5322,7 +5525,7 @@ fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, 
                 if key.is_empty() {
                     (
                         None,
-                        KeySource::Error(format!("[llm].api_key_file = {path_display:?} is empty")),
+                        KeySource::Error(format!("{field} = {path_display:?} is empty")),
                     )
                 } else {
                     (Some(key), KeySource::ConfigFile(path_display))
@@ -5330,9 +5533,7 @@ fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, 
             }
             Err(e) => (
                 None,
-                KeySource::Error(format!(
-                    "[llm].api_key_file = {path_display:?} could not be read: {e}"
-                )),
+                KeySource::Error(format!("{field} = {path_display:?} could not be read: {e}")),
             ),
         };
     }
@@ -5341,24 +5542,25 @@ fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, 
 }
 
 /// v0.7.x (#1146) — enforce mode 0400 (or stricter) on the file
-/// referenced by `[llm].api_key_file`. The check mirrors the existing
-/// `AI_MEMORY_DB_PASSPHRASE_FILE` enforcement (issue #1055): any bits
-/// set in `mode & 0o077` (group / world readable / executable) cause
-/// the daemon to refuse the file, unless the operator opts out via
+/// referenced by `[llm].api_key_file` / `[embeddings].api_key_file`
+/// (#1598; `field` names the rejecting config field in error text).
+/// The check mirrors the existing `AI_MEMORY_DB_PASSPHRASE_FILE`
+/// enforcement (issue #1055): any bits set in `mode & 0o077` (group /
+/// world readable / executable) cause the daemon to refuse the file,
+/// unless the operator opts out via
 /// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`.
 ///
 /// On non-Unix platforms (the `staticlib` mobile target, future
 /// Windows builds) the check is a no-op — the perm bits are not
 /// expressible on those platforms.
-fn enforce_api_key_file_perms(path: &Path) -> Result<(), String> {
+fn enforce_api_key_file_perms(path: &Path, field: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::metadata(path).map_err(|e| {
             format!(
-                "[llm].api_key_file = {:?} could not be stat'd for perms check: {}",
+                "{field} = {:?} could not be stat'd for perms check: {e}",
                 path.display(),
-                e
             )
         })?;
         let mode = metadata.permissions().mode();
@@ -5373,7 +5575,7 @@ fn enforce_api_key_file_perms(path: &Path) -> Result<(), String> {
                 });
             if !opt_in {
                 return Err(format!(
-                    "[llm].api_key_file = {:?} has lax permissions \
+                    "{field} = {:?} has lax permissions \
                      (mode = {:o}; expected 0400 or stricter). Run \
                      `chmod 0400 {}` to fix, or set \
                      `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` to \
@@ -5384,7 +5586,7 @@ fn enforce_api_key_file_perms(path: &Path) -> Result<(), String> {
                 ));
             }
             tracing::warn!(
-                "[llm].api_key_file = {:?} has lax permissions (mode = {:o}); \
+                "{field} = {:?} has lax permissions (mode = {:o}); \
                  accepted because AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1",
                 path.display(),
                 mode & 0o777
@@ -5394,7 +5596,7 @@ fn enforce_api_key_file_perms(path: &Path) -> Result<(), String> {
     #[cfg(not(unix))]
     {
         // Permission bits do not apply on non-Unix platforms.
-        let _ = path;
+        let _ = (path, field);
     }
     Ok(())
 }
@@ -5572,6 +5774,12 @@ impl AppConfig {
     /// 3. Both `api_key_env` and `api_key_file` set on
     ///    `[llm.auto_tag]`. Same mutex.
     ///
+    /// 4. (#1598) Inline `api_key = "<literal>"` in `[embeddings]` —
+    ///    same posture as rejection 1.
+    ///
+    /// 5. (#1598) Both `api_key_env` and `api_key_file` set on
+    ///    `[embeddings]`. Same mutex as rejection 2.
+    ///
     /// On any rejection, [`Self::load_from`] surfaces the message to
     /// stderr and falls back to [`Self::default`] so the daemon boots
     /// without the misconfigured secret rather than refusing to start
@@ -5602,6 +5810,30 @@ impl AppConfig {
                          [llm.auto_tag].api_key_file are mutually exclusive."
                         .to_string());
                 }
+            }
+        }
+        if let Some(embeddings) = &self.embeddings {
+            // #1598 Rejection 4 — inline [embeddings].api_key literal
+            // (mirrors the [llm] rejection above).
+            if embeddings.api_key.is_some() {
+                return Err(
+                    "inline `api_key = \"<literal>\"` in [embeddings] is forbidden — \
+                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
+                     process env var, or `api_key_file = \"/path/to/key\"` to \
+                     reference a file (mode 0400 enforced). Inline secrets in \
+                     config.toml (typically world-readable) are a credential \
+                     leak."
+                        .to_string(),
+                );
+            }
+            // #1598 Rejection 5 — [embeddings] env vs file mutex.
+            if embeddings.api_key_env.is_some() && embeddings.api_key_file.is_some() {
+                return Err(
+                    "[embeddings].api_key_env and [embeddings].api_key_file are \
+                     mutually exclusive — set exactly one (or neither, to fall \
+                     back to the per-vendor env-var chain)."
+                        .to_string(),
+                );
             }
         }
         Ok(())
@@ -6108,6 +6340,23 @@ impl AppConfig {
 
     /// v0.7.x (#1146) — resolve the canonical embedder configuration.
     ///
+    /// #1598 — extended per-field precedence ladder:
+    ///
+    /// - `backend`: `AI_MEMORY_EMBED_BACKEND` env > `[embeddings].backend`
+    ///   > compiled default (`ollama`).
+    /// - `url`: `AI_MEMORY_EMBED_BASE_URL` env > `[embeddings].base_url`
+    ///   > `[embeddings].url` > legacy `embed_url` > legacy `ollama_url`
+    ///   > the backend alias's default base URL (API backends) > the
+    ///   localhost Ollama default.
+    /// - `model`: `AI_MEMORY_EMBED_MODEL` env > `[embeddings].model`
+    ///   > legacy `embedding_model` > compiled default
+    ///   (`nomic-embed-text-v1.5`); legacy aliases canonicalised.
+    /// - `api_key`: [`resolve_embed_api_key`] ladder
+    ///   (`AI_MEMORY_EMBED_API_KEY` > per-vendor alias env >
+    ///   `[embeddings].api_key_env` > `[embeddings].api_key_file`).
+    /// - `embedding_dim`: `[embeddings].dim` override >
+    ///   [`canonical_embedding_dim`] table > `None`.
+    ///
     /// DOC-6: reads the legacy `embed_url`/`embedding_model`/
     /// `ollama_url` fields as the lowest-precedence fallback layer.
     #[must_use]
@@ -6115,40 +6364,72 @@ impl AppConfig {
     pub fn resolve_embeddings(&self) -> ResolvedEmbeddings {
         let cfg = self.embeddings.as_ref();
 
-        let backend = cfg
-            .and_then(|e| e.backend.clone())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "ollama".to_string());
+        let env_backend = std::env::var(ENV_EMBED_BACKEND)
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let backend = env_backend
+            .clone()
+            .or_else(|| {
+                cfg.and_then(|e| e.backend.as_ref())
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| crate::llm::BACKEND_OLLAMA.to_string());
 
-        let url = cfg
-            .and_then(|e| e.url.clone())
+        let url = std::env::var(ENV_EMBED_BASE_URL)
+            .ok()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|e| e.base_url.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                cfg.and_then(|e| e.url.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .or_else(|| self.embed_url.clone().filter(|s| !s.trim().is_empty()))
             .or_else(|| self.ollama_url.clone().filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+            .or_else(|| {
+                // #1598 — API backends default to the vendor's base URL
+                // (declared once in llm.rs); `openai-compatible` has no
+                // sane default and falls through.
+                if is_api_embed_backend(&backend) {
+                    crate::llm::default_base_url_for_alias(&backend).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| crate::llm::DEFAULT_OLLAMA_URL.to_string());
 
-        let model = cfg
-            .and_then(|e| e.model.clone())
+        let model = std::env::var(ENV_EMBED_MODEL)
+            .ok()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|e| e.model.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .or_else(|| {
                 self.embedding_model
                     .clone()
                     .filter(|s| !s.trim().is_empty())
             })
             .map(canonicalise_embedding_model)
-            .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
 
-        let backfill_batch_env = std::env::var("AI_MEMORY_EMBED_BACKFILL_BATCH")
+        let backfill_batch_env = std::env::var(ENV_EMBED_BACKFILL_BATCH)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         let backfill_batch_cfg = cfg.and_then(|e| e.backfill_batch);
         let backfill_batch_raw = backfill_batch_env.or(backfill_batch_cfg);
         let backfill_batch = match backfill_batch_raw {
             Some(n) if (1..=10000).contains(&n) => n,
-            Some(_) | None => 100,
+            Some(_) | None => DEFAULT_EMBED_BACKFILL_BATCH,
         };
 
-        let source = if cfg.is_some() {
+        let source = if env_backend.is_some() {
+            ConfigSource::Env
+        } else if cfg.is_some() {
             ConfigSource::Config
         } else if self.embed_url.is_some()
             || self.embedding_model.is_some()
@@ -6160,10 +6441,20 @@ impl AppConfig {
         };
 
         // v0.7.x (#1169) — derive the dim from the resolved model id
-        // via the canonical lookup table. None when the operator picked
-        // a model not in [`KNOWN_EMBEDDING_DIMS`]; callers (capabilities
-        // surface) fall back to the tier preset's compiled dim.
-        let embedding_dim = canonical_embedding_dim(&model);
+        // via the canonical lookup table. #1598 — the explicit
+        // `[embeddings].dim` override wins (escape hatch for models
+        // not in [`KNOWN_EMBEDDING_DIMS`]); non-positive overrides are
+        // ignored. None when neither layer knows the dim; callers
+        // (capabilities surface) fall back to the tier preset's
+        // compiled dim.
+        let embedding_dim = cfg
+            .and_then(|e| e.dim)
+            .filter(|d| *d > 0)
+            .or_else(|| canonical_embedding_dim(&model));
+
+        // #1598 — embedding API key (None for ollama / keyless
+        // self-hosted endpoints).
+        let (api_key, key_source) = resolve_embed_api_key(&backend, cfg);
 
         ResolvedEmbeddings {
             backend,
@@ -6171,6 +6462,8 @@ impl AppConfig {
             model,
             backfill_batch,
             embedding_dim,
+            api_key,
+            key_source,
             source,
         }
     }
@@ -8368,6 +8661,27 @@ legacy_scoring = false
         }
     }
 
+    /// #1598 — scrub the embeddings-resolver env surface (and the
+    /// alias-fallback vendor key vars the precedence tests exercise)
+    /// so `resolve_embeddings` tests are hermetic. Callers hold
+    /// `env_var_lock()`.
+    fn scrub_embed_env() {
+        for k in [
+            ENV_EMBED_BACKEND,
+            ENV_EMBED_BASE_URL,
+            ENV_EMBED_MODEL,
+            ENV_EMBED_API_KEY,
+            ENV_EMBED_BACKFILL_BATCH,
+            "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
     fn scrub_limits_env() {
         for k in [
             ENV_MAX_MEMORIES_PER_DAY,
@@ -8923,6 +9237,325 @@ max_page_size = 1000000
         let resolved = cfg.resolve_embeddings();
         assert_eq!(resolved.backfill_batch, 500, "env must beat config");
         scrub_llm_env();
+    }
+
+    // ── #1598 — API-wired embeddings resolver ladder ──────────────────
+
+    #[test]
+    fn resolve_embeddings_1598_compiled_defaults() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backend, crate::llm::BACKEND_OLLAMA);
+        assert_eq!(resolved.url, crate::llm::DEFAULT_OLLAMA_URL);
+        assert_eq!(resolved.model, DEFAULT_EMBED_MODEL);
+        assert_eq!(resolved.source, ConfigSource::CompiledDefault);
+        assert_eq!(resolved.api_key(), None);
+        assert_eq!(resolved.key_source, KeySource::None);
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_env_beats_section() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_BACKEND, "openai-compatible");
+            std::env::set_var(ENV_EMBED_BASE_URL, "http://tei.internal:8080/v1");
+            std::env::set_var(
+                ENV_EMBED_MODEL,
+                "ibm-granite/granite-embedding-125m-english",
+            );
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("ollama".into()),
+            url: Some("http://section-url:11434".into()),
+            model: Some("nomic-embed-text-v1.5".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backend, "openai-compatible");
+        assert_eq!(resolved.url, "http://tei.internal:8080/v1");
+        assert_eq!(resolved.model, "ibm-granite/granite-embedding-125m-english");
+        assert_eq!(resolved.source, ConfigSource::Env);
+        assert_eq!(
+            resolved.embedding_dim,
+            Some(768),
+            "granite dim comes from the known-dims table"
+        );
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_section_beats_legacy() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embed_url = Some("http://legacy-embed:11434".into());
+        cfg.embedding_model = Some("mini_lm_l6_v2".into());
+        cfg.embeddings = Some(EmbeddingsSection {
+            url: Some("http://section:11434".into()),
+            model: Some("nomic-embed-text-v1.5".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.url, "http://section:11434");
+        assert_eq!(resolved.model, "nomic-embed-text-v1.5");
+        assert_eq!(resolved.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_base_url_wins_over_url_synonym() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            base_url: Some("http://base-url-wins:8080/v1".into()),
+            url: Some("http://url-loses:11434".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.url, "http://base-url-wins:8080/v1");
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_api_alias_default_base_url() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            model: Some("google/gemini-embedding-2".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.url, "https://openrouter.ai/api/v1",
+            "API alias with no URL configured must fall back to the \
+             vendor default from llm.rs"
+        );
+        assert_eq!(resolved.embedding_dim, Some(3072), "gemini-embedding-2 dim");
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_dim_override_beats_table() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".into()),
+            dim: Some(512),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.embedding_dim,
+            Some(512),
+            "[embeddings].dim override must beat the known-dims table"
+        );
+        // Non-positive override is ignored — table wins again.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".into()),
+            dim: Some(0),
+            ..EmbeddingsSection::default()
+        });
+        assert_eq!(cfg.resolve_embeddings().embedding_dim, Some(768));
+    }
+
+    #[test]
+    fn resolve_embed_api_key_1598_process_env_wins() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_API_KEY, "embed-process-env-key");
+            std::env::set_var("OPENROUTER_API_KEY", "alias-key-loses");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), Some("embed-process-env-key"));
+        assert_eq!(resolved.key_source, KeySource::ProcessEnv);
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn resolve_embed_api_key_1598_alias_fallback() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "alias-fallback-embed-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), Some("alias-fallback-embed-key"));
+        match &resolved.key_source {
+            KeySource::AliasFallback(name) => assert_eq!(name, "OPENROUTER_API_KEY"),
+            other => panic!("expected AliasFallback(OPENROUTER_API_KEY), got {other:?}"),
+        }
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn resolve_embed_api_key_1598_config_env_var() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var("MY_CUSTOM_EMBED_KEY", "via-embed-config-env-var");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openai-compatible".into()),
+            api_key_env: Some("MY_CUSTOM_EMBED_KEY".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), Some("via-embed-config-env-var"));
+        match &resolved.key_source {
+            KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_EMBED_KEY"),
+            other => panic!("expected ConfigEnvVar(MY_CUSTOM_EMBED_KEY), got {other:?}"),
+        }
+        unsafe {
+            std::env::remove_var("MY_CUSTOM_EMBED_KEY");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_embed_api_key_1598_api_key_file_rejects_lax_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1598-perms-lax-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("embed.key");
+        std::fs::write(&key_path, "leaky-embed-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openai-compatible".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), None, "lax-perm file must be refused");
+        match &resolved.key_source {
+            KeySource::Error(reason) => {
+                assert!(
+                    reason.contains("[embeddings].api_key_file") && reason.contains("lax"),
+                    "error must attribute the embeddings field: {reason}"
+                );
+            }
+            other => panic!("expected KeySource::Error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn resolved_embeddings_1598_debug_redacts_api_key() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_API_KEY, "super-secret-embed-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        let debugged = format!("{resolved:?}");
+        assert!(
+            !debugged.contains("super-secret-embed-key"),
+            "Debug must never leak the key: {debugged}"
+        );
+        assert!(
+            debugged.contains(crate::REDACTED_PLACEHOLDER),
+            "Debug must show the redaction placeholder: {debugged}"
+        );
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn validate_secret_handling_1598_rejects_inline_embeddings_api_key() {
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            api_key: Some("embed-INLINE-SECRET".into()),
+            ..EmbeddingsSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("inline [embeddings].api_key must be rejected");
+        assert!(
+            err.contains("api_key") && err.contains("forbidden") && err.contains("[embeddings]"),
+            "error must name the field, section, and policy: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_secret_handling_1598_rejects_embeddings_env_and_file_both_set() {
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            api_key_env: Some("EMBED_KEY".into()),
+            api_key_file: Some("/etc/embed.key".into()),
+            ..EmbeddingsSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("[embeddings] env+file mutex must be enforced");
+        assert!(
+            err.contains("[embeddings].api_key_env") && err.contains("[embeddings].api_key_file"),
+            "error must call out the mutex: {err}"
+        );
+    }
+
+    #[test]
+    fn is_api_embed_backend_1598_classification() {
+        // "ollama" is the ONLY non-API backend (case/space tolerant).
+        assert!(!is_api_embed_backend(crate::llm::BACKEND_OLLAMA));
+        assert!(!is_api_embed_backend(" Ollama "));
+        // Every #1067 alias + the generic escape hatch is an API backend.
+        for api in ["openrouter", "openai", "gemini", "openai-compatible"] {
+            assert!(is_api_embed_backend(api), "{api} must classify as API");
+        }
+    }
+
+    #[test]
+    fn known_embedding_dims_1598_gemini_and_granite_entries() {
+        assert_eq!(
+            canonical_embedding_dim("google/gemini-embedding-2"),
+            Some(3072)
+        );
+        assert_eq!(canonical_embedding_dim("gemini-embedding-2"), Some(3072));
+        assert_eq!(
+            canonical_embedding_dim("ibm-granite/granite-embedding-125m-english"),
+            Some(768)
+        );
+        assert_eq!(canonical_embedding_dim("granite-embedding"), Some(768));
     }
 
     // ── #1579 B7 — `[storage].db_mmap_size_bytes` / AI_MEMORY_DB_MMAP_SIZE ──

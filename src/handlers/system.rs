@@ -60,7 +60,14 @@ pub async fn get_capabilities(
     // HTTP doesn't yet thread one (it would come from a future
     // session-bound auth header); for now pass None and the field is
     // omitted from the wire per the A4 contract.
-    let embedder_loaded = app.embedder.as_ref().is_some();
+    // #1594 / #1598 — report the LIVE posture: a remote embedder whose
+    // most recent call failed (dead endpoint, auth rejection) is
+    // degraded and reports `false` so `recall_mode_active` follows.
+    let embedder_loaded = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .is_some_and(|e| !e.is_degraded());
     let lock = app.db.lock().await;
     let conn = &lock.0;
     let result = match accept {

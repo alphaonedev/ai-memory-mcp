@@ -108,6 +108,9 @@ pub const ELAPSED_MS: &str = "elapsed_ms";
 /// inside the Ed25519-signed body bytes; decode is tolerant of the
 /// field's absence so older peers interoperate.
 pub const EMBEDDINGS: &str = "embeddings";
+/// `embedding_dim` — wire/row field name (#1169 dim reporting; #1598
+/// `ResolvedEmbeddings` Debug field).
+pub const EMBEDDING_DIM: &str = "embedding_dim";
 /// `event_types` — wire/row field name.
 pub const EVENT_TYPES: &str = "event_types";
 /// `excluded_for_scope` — wire/row field name.

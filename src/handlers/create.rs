@@ -555,7 +555,7 @@ async fn fanout_and_assemble_create_response(
     let shipped = match (&embedding, app.embedder.as_ref().as_ref()) {
         (Some(vec), Some(emb)) => Some(crate::federation::ShippedEmbedding::new(
             actual_id.to_string(),
-            emb.model_description().to_string(),
+            emb.model_description(),
             vec.clone(),
         )),
         _ => None,
@@ -899,7 +899,7 @@ async fn create_memory_postgres(
             let shipped = match (&embedding, app.embedder.as_ref().as_ref()) {
                 (Some(vec), Some(emb)) => Some(crate::federation::ShippedEmbedding::new(
                     mem.id.clone(),
-                    emb.model_description().to_string(),
+                    emb.model_description(),
                     vec.clone(),
                 )),
                 _ => None,

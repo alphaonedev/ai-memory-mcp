@@ -463,6 +463,16 @@ pub enum Command {
     /// stored embeddings. CLI parity for `memory_check_duplicate`.
     /// Requires the embedder (semantic tier or above).
     CheckDuplicate(crate::cli::commands::check_duplicate::CheckDuplicateArgs),
+    /// v0.7.0 #1598 — `ai-memory reembed` subcommand. Full-corpus
+    /// vector-space migration: re-embeds every live memory (optionally
+    /// `--namespace`-filtered) with the resolved embedding
+    /// backend/model and REPLACES the stored vectors (unlike the boot
+    /// backfill, which only fills missing ones). `--dry-run` prints
+    /// the plan; per-row #1595 failure isolation (skip-with-WARN)
+    /// keeps one poison row from stopping the sweep. Resolves the
+    /// embedder via the same `AppConfig::resolve_embeddings()` +
+    /// `Embedder::from_resolved` path as daemon/MCP boot.
+    Reembed(crate::cli::commands::reembed::ReembedArgs),
     /// v0.7.0 ARCH-3 / FX-12 — `ai-memory replay` subcommand.
     /// Reconstruct the conversation transcript chain that produced a
     /// memory. CLI parity for `memory_replay`.
@@ -1657,6 +1667,20 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 code => std::process::exit(code),
             }
         }
+        Command::Reembed(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 #1598 — full-corpus vector-space migration.
+            // Non-zero exit codes map configuration outcomes
+            // (no-embedder / init-failed) like `ai-memory expand`.
+            match cli::commands::reembed::cmd_reembed(&db_path, &a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         Command::Replay(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -2057,7 +2081,7 @@ pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -
 /// keyword-only. Pure: no network I/O, so the precedence is unit-testable
 /// without an HF-Hub fetch (`build_embedder` does the construction).
 #[allow(deprecated)]
-fn resolve_embedder_model(
+pub(crate) fn resolve_embedder_model(
     tier_config: &crate::config::TierConfig,
     app_config: &AppConfig,
 ) -> Option<crate::config::EmbeddingModel> {
@@ -2117,39 +2141,37 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
     let tier_config = feature_tier.config();
     // #1521: consume the canonical embeddings resolver so the sectioned
     // `[embeddings]` block (#1146) drives the daemon embedder, not just
-    // the deprecated flat fields. The model is resolved by the pure
-    // `resolve_embedder_model` helper (precedence: `[embeddings].model`
-    // section > legacy flat `embedding_model` > tier preset); the URL is
-    // taken from the resolver, which layers `[embeddings].url` > legacy
-    // `embed_url`/`ollama_url` > default.
+    // the deprecated flat fields.
+    //
+    // #1598 — construction is delegated to the single shared boot
+    // entry `Embedder::from_resolved` (also used by the MCP stdio
+    // init). For the local/ollama backend the model is resolved by
+    // the pure `resolve_embedder_model` helper (precedence:
+    // `[embeddings].model` section > legacy flat `embedding_model` >
+    // tier preset); for API backends the operator's `model` id is
+    // wired verbatim by the resolver and the tier preset only gates
+    // whether embeddings are enabled at all (Some vs None).
     let resolved_embeddings = app_config.resolve_embeddings();
-    let Some(emb_model) = resolve_embedder_model(&tier_config, app_config) else {
+    let tier_model = if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
+        tier_config.embedding_model
+    } else {
+        resolve_embedder_model(&tier_config, app_config)
+    };
+    let Some(emb_model) = tier_model else {
         tracing::info!(
             "embedder disabled — tier={} keyword-only (FTS5); semantic recall not wired",
             feature_tier.as_str()
         );
         return None;
     };
-    let embed_url = resolved_embeddings.url.clone();
-    // #1143: the daemon embed client is always Ollama-wire-shape (it
-    // talks to a local Ollama OR a compatible nomic-embed-text host).
-    // Using `new_with_url` here is correct regardless of
-    // `AI_MEMORY_LLM_BACKEND` — that env controls the CHAT client, not
-    // the embed client. The MCP path now likewise builds a dedicated
-    // Ollama embed client when the LLM is OpenAI-compatible (see
-    // `src/mcp/mod.rs` post-#1143 embed-client init).
-    //
     // The HF-Hub sync API and candle model-load are blocking CPU work that
     // internally spin their own tokio runtime. Running them directly in this
     // async context panics with "Cannot drop a runtime in a context where
     // blocking is not allowed." Move the whole construction onto the blocking
     // pool so the inner runtime is owned by a dedicated thread.
+    let resolved_for_build = resolved_embeddings.clone();
     let build = match tokio::task::spawn_blocking(move || {
-        let embed_client =
-            llm::OllamaClient::new_with_url(&embed_url, crate::embeddings::NOMIC_OLLAMA_MODEL)
-                .ok()
-                .map(Arc::new);
-        embeddings::Embedder::for_model(emb_model, embed_client)
+        embeddings::Embedder::from_resolved(&resolved_for_build, Some(emb_model))
     })
     .await
     {
@@ -2160,7 +2182,7 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
         }
     };
     match build {
-        Ok(emb) => {
+        Ok(Some(emb)) => {
             tracing::info!(
                 "embedder loaded ({}) — tier={} semantic recall enabled",
                 emb.model_description(),
@@ -2168,6 +2190,10 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
             );
             Some(emb)
         }
+        // Unreachable with `Some(emb_model)` threaded above; kept
+        // explicit so the keyword-tier contract of `from_resolved`
+        // stays loud here (#1598).
+        Ok(None) => None,
         Err(e) => {
             // v0.6.2 (#327): make embedder load failures loud. The
             // prior WARN level was easy to miss in DO droplet logs,
@@ -2178,11 +2204,15 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
             // or tail -f /var/log/ai-memory-serve.log.
             tracing::error!(
                 "EMBEDDER LOAD FAILED — tier={} requested semantic features, \
-                 but embedder init errored: {e}. Daemon falls back to keyword-only. \
-                 Semantic recall, sync_push embedding refresh (#322), and HNSW index \
-                 will be NO-OPS. Check network egress to HuggingFace Hub + available \
-                 memory for model weights. To force keyword-only explicitly (silences \
-                 this error), set `tier = \"keyword\"` in config.toml.",
+                 but embedder init errored: {e:#}. Semantic recall DEGRADED to \
+                 keyword (#1593/#1598 fail-closed; the chat LLM client is NEVER \
+                 reused for embeddings). Semantic recall, sync_push embedding \
+                 refresh (#322), and HNSW index will be NO-OPS. For local \
+                 backends check network egress to HuggingFace Hub + available \
+                 memory for model weights; for API backends check the resolved \
+                 base URL / API key (`ai-memory doctor`). To force keyword-only \
+                 explicitly (silences this error), set `tier = \"keyword\"` in \
+                 config.toml.",
                 feature_tier.as_str()
             );
             None
