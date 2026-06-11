@@ -15,15 +15,15 @@
 #
 #   2. Form-7 governance activation (peers only): via the golden ai-memory binary
 #      over SSH — `rules keygen` (operator key), `rules sign-seed`, then enable
-#      R001..R004 with `--sign` (the seed rules), then bind the Form2/6 namespace
-#      Batman policy on the campaign namespace (`namespace batman-policy --json`
-#      piped to `namespace set-standard`). Mirrors the command recipe in repo-
-#      root scripts/install-batman-active.sh (steps 1-3 + 7); that script is NOT
-#      invoked verbatim because it targets a sqlite operator host (~/.claude.json,
-#      macOS launchd) — our peers are postgres-backed daemons, so we drive the
-#      same CLI verbs against each peer's own --store-url (read from its 0400 env
-#      file on the node, so the secret never reaches our command line). The
-#      curator daemon is started under systemd on every peer.
+#      R001..R004 with `--sign` (the seed rules) against the daemon's LOCAL
+#      sqlite at $REMOTE_GOV_DB (#1536 — the rules engine is sqlite-substrate-
+#      scoped on every backend; the runtime checks read the daemon's local db,
+#      NOT the postgres store), verified in-place via
+#      `governance check-action` (a /tmp write must refuse). The Form-2/6
+#      namespace Batman policy is then bound through the daemon's HTTP surface
+#      (attested store + POST /namespaces/{ns}/standard) so it lands in the
+#      peer's LIVE postgres store. The curator daemon is started under systemd
+#      on every peer.
 #
 # DELIBERATELY NOT SET: AI_MEMORY_ENCRYPT_AT_REST (see lib.sh BATMAN_ENV block):
 # it is a sqlite/sqlcipher data-at-rest feature and a NO-OP on these postgres-
@@ -78,8 +78,9 @@ append_batman_env() {
 }
 
 # --- Form-7 governance activation on a peer over SSH (idempotent) --------------
-# Drives the golden binary against the peer's OWN postgres --store-url, read from
-# the 0400 env file on the node (never on our command line). Mirrors
+# Drives the golden binary against the daemon's LOCAL sqlite ($REMOTE_GOV_DB) —
+# the substrate the runtime rule checks consult on every backend (#1536) — and
+# binds the Form-2/6 namespace standard through the live HTTP surface. Mirrors
 # scripts/install-batman-active.sh steps 1-3 + 7.
 activate_form7_on_peer() {
   local ip="$1" host="$2"
@@ -89,38 +90,85 @@ activate_form7_on_peer() {
   local rules_csv="" r
   for r in "${BATMAN_SEED_RULES[@]}"; do rules_csv="${rules_csv:+$rules_csv }$r"; done
 
-  # Remote recipe. The store URL is sourced from the 0400 env file INSIDE the
-  # remote shell so the secret never appears in our local argv / `ps`. AGENT_ID
-  # for the governance writes is the peer's stable id (matches 50_federation).
-  # All verbs are idempotent: keygen skips if the key exists, enable/sign-seed
-  # are no-ops when already applied.
+  # Remote recipe. All verbs are idempotent: keygen skips if the key exists,
+  # enable/sign-seed are no-ops when already applied.
+  #
+  # #1536 — the rules verbs run against the peer's LOCAL sqlite --db ON
+  # PURPOSE: the Form-7 rules engine is sqlite-substrate-scoped by design
+  # (the runtime checks — MCP memory_check_agent_action and the HTTP
+  # /api/v1/governance surface — read the daemon's local sqlite
+  # governance_rules table on EVERY backend, including postgres-backed
+  # peers). The pre-#1536 wrapper appended --store-url to every verb;
+  # `rules` / `store` / `namespace` don't accept that flag (only
+  # `serve` / `curator` do), so every call was a clap parse error
+  # swallowed by `>/dev/null 2>&1 || true` — Form-7 activation was a
+  # SILENT NO-OP on every postgres peer. Errors are now surfaced.
   ssh_node "$ip" "
     set -u
     export HOME=/root
     export AI_MEMORY_KEY_DIR='$REMOTE_KEY_DIR'
     mkdir -p '$REMOTE_KEY_DIR'; chmod 700 '$REMOTE_KEY_DIR'
-    # Pull only the store URL out of the 0400 env file (root-readable) and export
-    # it for the rules verbs; never echoed.
-    STORE_URL=\$(grep -E '^AI_MEMORY_STORE_URL=' '$REMOTE_ENVFILE' 2>/dev/null | head -1 | cut -d= -f2-)
-    AM() { '$BIN' \${STORE_URL:+--store-url \"\$STORE_URL\"} \"\$@\"; }
+    AM() { '$BIN' --db '$REMOTE_GOV_DB' \"\$@\"; }
     # 1. operator key (idempotent)
-    if [ ! -f '$REMOTE_KEY_DIR/operator.key' ]; then AM rules keygen >/dev/null 2>&1 || true; fi
-    # 2. sign the seed rules (idempotent no-op if already signed)
-    AM rules sign-seed >/dev/null 2>&1 || true
-    # 3. enable + sign R001..R004 (idempotent)
-    for r in $rules_csv; do AM rules enable --id \"\$r\" --sign >/dev/null 2>&1 || true; done
-    # 7. bind the Form2/6 Batman namespace policy on the campaign namespace.
-    POLICY_JSON=\$(AM namespace batman-policy --json 2>/dev/null | grep -vE '^ai-memory: loaded config')
-    if [ -n \"\$POLICY_JSON\" ]; then
-      STD_ID=\$(AM store --namespace '$DEFAULT_NAMESPACE' --tier long --priority 10 \
-        --title 'batman-active standard for $DEFAULT_NAMESPACE' \
-        --content 'Form 2 synchronous atomise-before-embed + Form 6 auto-classify (regex_then_llm) namespace standard. Set by provision/46_batman.sh on peer $host.' \
-        --json 2>/dev/null | grep -vE '^ai-memory: loaded config' | tr -d '\n' | sed -n 's/.*\"id\"[^\"]*\"\([^\"]*\)\".*/\1/p')
-      if [ -n \"\$STD_ID\" ]; then
-        AM namespace set-standard --namespace '$DEFAULT_NAMESPACE' --id \"\$STD_ID\" --governance \"\$POLICY_JSON\" >/dev/null 2>&1 || true
-      fi
+    if [ ! -f '$REMOTE_KEY_DIR/operator.key' ]; then
+      AM rules keygen >/dev/null || echo \"WARN: rules keygen failed on $host\" >&2
     fi
-  " || log "[$host] WARN: Form-7 activation returned non-zero (verbs are best-effort idempotent — 50_federation restart + test/run.sh nsa_gaps re-assert live state)"
+    # 2. sign the seed rules (idempotent no-op if already signed)
+    AM rules sign-seed >/dev/null || echo \"WARN: rules sign-seed failed on $host\" >&2
+    # 3. enable + sign R001..R004 (idempotent)
+    for r in $rules_csv; do
+      AM rules enable --id \"\$r\" --sign >/dev/null || echo \"WARN: rules enable \$r failed on $host\" >&2
+    done
+    # 4. verify: the runtime check the harness PreToolUse hook calls
+    # must REFUSE a /tmp write. Fails loudly when activation didn't
+    # take (the pre-#1536 silent no-op class).
+    VERDICT=\$(AM governance check-action --kind filesystem_write --path /tmp/probe-1536 --json 2>/dev/null | grep -o '\"decision\":\"[a-z]*\"' | head -1)
+    case \"\$VERDICT\" in
+      *refuse*) : ;;
+      *) echo \"WARN: Form-7 verify on $host expected refuse for /tmp write, got '\$VERDICT'\" >&2; exit 64 ;;
+    esac
+  " || log "[$host] WARN: Form-7 activation/verification FAILED (see stderr above — rules engine may be inactive on this peer)"
+
+  # 7. bind the Form2/6 Batman namespace policy on the campaign
+  # namespace — via the daemon's HTTP surface so it lands in the
+  # peer's LIVE store (postgres on do-1461 peers). The pre-#1536 form
+  # wrote it to the peer's local sqlite via CLI one-shots, which a
+  # postgres-backed daemon never reads (and the calls were the same
+  # silent clap-error no-ops as above). Uses the validate-harness
+  # client pattern: on-node loopback curl, mTLS client cert + the
+  # x-api-key from the run-dir secret; the standard row is written by
+  # the enrolled harness agent (attested store — the fleet runs
+  # REQUIRE_AGENT_ATTESTATION=1).
+  local api_key policy_json std_id std_title
+  api_key="$(cat "$RUN_DIR/secrets/api.pw" 2>/dev/null || true)"
+  if [ -z "$api_key" ]; then
+    log "[$host] WARN: api.pw missing — skipping Form-2/6 namespace-standard bind"
+    return 0
+  fi
+  policy_json="$(ssh_node "$ip" "'$BIN' namespace batman-policy --json 2>/dev/null" | grep -vE '^ai-memory: loaded config' || true)"
+  if [ -z "$policy_json" ]; then
+    log "[$host] WARN: batman-policy emitted nothing — skipping namespace-standard bind"
+    return 0
+  fi
+  harness_keypair_ensure >/dev/null
+  harness_enroll_peer "$ip" >/dev/null 2>&1 || true
+  std_title="batman-active standard for $DEFAULT_NAMESPACE"
+  local std_body curl_base
+  std_body="$(attested_body "$DEFAULT_NAMESPACE" "$std_title" observation collective \
+    "Form 2 synchronous atomise-before-embed + Form 6 auto-classify (regex_then_llm) namespace standard. Set by provision/46_batman.sh on peer $host.")"
+  curl_base="--max-time 8 --resolve $host:$FEDERATION_PORT:127.0.0.1 --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key"
+  std_id="$(ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_body' https://$host:$FEDERATION_PORT/api/v1/memories" 2>/dev/null | sed -n 's/.*"id"[^"]*"\([^"]*\)".*/\1/p')"
+  if [ -z "$std_id" ]; then
+    log "[$host] WARN: namespace-standard store refused — Form-2/6 bind skipped"
+    return 0
+  fi
+  local std_payload
+  std_payload="$(printf '{"id":"%s","governance":%s}' "$std_id" "$policy_json")"
+  if ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_payload' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" >/dev/null 2>&1; then
+    log "[$host] Form-2/6 namespace standard bound on $DEFAULT_NAMESPACE (id=$std_id, live store)"
+  else
+    log "[$host] WARN: namespace set-standard HTTP call failed — Form-2/6 bind incomplete"
+  fi
 }
 
 # --- start the curator daemon (Form-1/5/6 upkeep) on a peer (idempotent) -------
