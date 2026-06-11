@@ -102,7 +102,7 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # finite+L2-norm validation), #1585 (to_store_err redaction), #1586
 # (list_unembedded ctx guard). Supersedes the 21bd6899 / 4bb54c4d pre-train
 # golden. Default suite 7842/0 + sal-postgres 9050/0 at the pin commit.
-GOLDEN_SHA256="${GOLDEN_SHA256:-c861e00fb5918e7f8ad6ddd99d3e81235781f72165dd6f4934c9a79296df4fb9}"
+GOLDEN_SHA256="${GOLDEN_SHA256:-fc78a9e643f8baf7851a385a8373dab44cfde0974d7d14de27660001bfc4df9a}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
@@ -256,6 +256,16 @@ EMBED_OLLAMA_URL="${EMBED_OLLAMA_URL:-http://127.0.0.1:11434}"
 PEER_LLM_BACKEND="${PEER_LLM_BACKEND:-openrouter}"
 PEER_LLM_API_KEY_ENV="${PEER_LLM_API_KEY_ENV:-OPENROUTER_API_KEY}"
 PEER_LLM_MODEL="${PEER_LLM_MODEL:-google/gemma-4-26b-a4b-it}"  # chat id for $PEER_LLM_BACKEND
+
+# #1598 API embeddings (operator decisions 2026-06-11: USA models, paid tier,
+# Ollama only on GPU nodes — do-1461 peers are CPU-only). The embed secret
+# rides the SAME EnvironmentFile env var as [llm] (OpenRouter key). dim=768 is
+# the fleet-wide Matryoshka pin: gemini-embedding-2 truncates server-side so
+# the PG regions' vector(768) schemas + ANN indexes (pgvector 2000-dim cap)
+# stay untouched. Override the trio in lockstep for forks.
+PEER_EMBED_BACKEND="${PEER_EMBED_BACKEND:-openrouter}"
+PEER_EMBED_MODEL="${PEER_EMBED_MODEL:-google/gemini-embedding-2}"
+PEER_EMBED_DIM="${PEER_EMBED_DIM:-768}"
 AGENT_LLM_MODEL="${AGENT_LLM_MODEL:-grok-4.3}"                 # xAI chat id (agent NHI)
 DEFAULT_NAMESPACE="${DEFAULT_NAMESPACE:-do-1461}"
 

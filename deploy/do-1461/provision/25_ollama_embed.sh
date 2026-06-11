@@ -22,6 +22,16 @@
 # container model shipped, minus the container.
 source "$(dirname "$0")/lib.sh"
 
+# #1598 (operator GPU policy, 2026-06-11): the Ollama sidecar is provisioned
+# ONLY when the fleet's embedding backend is ollama. API-backed fleets
+# (PEER_EMBED_BACKEND=openrouter/openai-compatible/...) skip this step
+# entirely — CPU-only peers run zero local inference for embeddings; the v2
+# [embeddings] section in 30_config.sh carries the API wiring instead.
+if [ "${PEER_EMBED_BACKEND:-ollama}" != "ollama" ]; then
+  log "25_ollama_embed: SKIP — PEER_EMBED_BACKEND=$PEER_EMBED_BACKEND (API embeddings, #1598); no Ollama sidecar on CPU-only peers"
+  exit 0
+fi
+
 # Render the localhost-bound systemd unit locally; scp into place (no secret, so
 # a plain heredoc render is fine — this is NOT a credential file).
 render_ollama_unit() {
