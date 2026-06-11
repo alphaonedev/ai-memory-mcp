@@ -273,6 +273,10 @@ pub fn run_pending(
                         )?;
                     }
                 }
+                // #1620 — typed not-found (was a Rejected string).
+                ApproveOutcome::NotFound => {
+                    anyhow::bail!(crate::errors::msg::pending_action_not_found(&id));
+                }
                 ApproveOutcome::Rejected(reason) => {
                     writeln!(
                         out.stderr,

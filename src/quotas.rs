@@ -14,6 +14,15 @@
 //! naming the limit that was hit, which the MCP layer maps to a
 //! `QUOTA_EXCEEDED` diagnostic.
 //!
+//! Enforcement scope (#1621): quotas gate the daemon-facing write
+//! surfaces — MCP `memory_store` / `memory_link` and HTTP
+//! `POST /api/v1/memories` / `POST /api/v1/links`. CLI one-shot
+//! writes are operator-as-actor and deliberately uncharged (the same
+//! exemption principle as the L1-6 governance pre-write hook, which
+//! the CLI binaries do not install); CLI writes likewise fire no
+//! webhook dispatch. K8 limits target NHI agents reaching the
+//! substrate through a daemon, not the operator at the shell.
+//!
 //! Daily counters reset at UTC midnight via [`reset_daily`], driven by
 //! the K8 sweep loop wired into `daemon_runtime::bootstrap_serve` —
 //! same lifecycle shape as the K2 pending-actions sweeper and the I3

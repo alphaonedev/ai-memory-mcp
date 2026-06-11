@@ -107,7 +107,16 @@ pub fn run(
                     "--metadata must be a JSON object (got {v})"
                 ));
             }
-            Some(v)
+            // #1635 — preserve existing metadata.agent_id: provenance
+            // is immutable across update (CLAUDE.md Agent Identity
+            // contract). Mirrors the MCP memory_update caller layer
+            // (src/mcp/tools/update.rs); without this a bare
+            // `--metadata '{...}'` rewrote/stripped the author of any
+            // memory because the sqlite UPDATE replaces metadata
+            // wholesale.
+            let existing =
+                db::get(&conn, &resolved_id)?.map_or_else(|| serde_json::json!({}), |m| m.metadata);
+            Some(crate::identity::preserve_agent_id(&existing, &v))
         }
     };
     if let Some(ref s) = args.source_uri {
@@ -489,6 +498,36 @@ mod tests {
             run(&db, &args, false, &mut out).unwrap();
         }
         assert!(env.stdout_str().contains("updated:"));
+    }
+
+    #[test]
+    fn test_update_metadata_preserves_agent_id_1635() {
+        // #1635 — a bare `--metadata '{...}'` used to replace metadata
+        // wholesale, stripping/rewriting metadata.agent_id (immutable
+        // provenance per the CLAUDE.md Agent Identity contract; the
+        // MCP caller layer already preserved it).
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc"); // agent_id = "test-agent"
+        let mut args = empty_args(&id);
+        args.metadata = Some(r#"{"note":"x","agent_id":"ai:attacker"}"#.to_string());
+        {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap();
+        }
+        let conn = crate::db::open(&db).unwrap();
+        let mem = crate::db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            mem.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("test-agent"),
+            "#1635: agent_id must survive a CLI metadata update; got {:?}",
+            mem.metadata
+        );
+        assert_eq!(
+            mem.metadata.get("note").and_then(|v| v.as_str()),
+            Some("x"),
+            "the rest of the patch must apply"
+        );
     }
 
     #[test]

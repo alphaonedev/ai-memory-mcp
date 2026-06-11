@@ -35,8 +35,17 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::transport::{AppState, constant_time_eq};
+#[cfg(feature = "sal")]
+use super::{StorageBackend, store_err_to_response};
 use crate::db;
 use crate::validate;
+
+/// Wire message for the approve-succeeded-but-execute-failed 500 path.
+/// Shared by the sqlite + postgres branches of [`approval_decide`] and
+/// the legacy governance `approve_pending` handler (#1618) so the
+/// surfaces stay byte-identical without scattering the literal
+/// (pm-v3.1 no-hardcoded-literals discipline).
+pub(crate) const APPROVED_BUT_EXECUTION_FAILED: &str = "approved but execution failed";
 
 /// Body of `POST /api/v1/approvals/{pending_id}`.
 #[derive(Debug, Deserialize)]
@@ -274,6 +283,22 @@ pub async fn approval_decide(
         json!({ (field_names::PENDING_ID): &id }),
     );
 
+    // #1618 — postgres-backed daemons dispatch through the SAL trait.
+    // Pre-#1618 this handler unconditionally locked `app.db`, which on
+    // a postgres daemon is the empty in-memory scratch sqlite that
+    // `bootstrap_serve` opens — every HMAC-valid approval was refused
+    // as "not found" and never touched the real store, even though the
+    // endpoint is allow-listed in `postgres_endpoint_supported`
+    // (postgres_gate.rs `approvals_decide_path`). Mirrors the
+    // governance `approve_pending` postgres branch
+    // (src/handlers/governance.rs): approve routes through
+    // `governance_approve_with_consensus` + `execute_pending_action`;
+    // deny routes through `pending_decide(false)`.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return approval_decide_postgres(&app, &id, &agent_id, &body).await;
+    }
+
     let lock = app.db.lock().await;
     // Snapshot the pending row before deciding so we can synthesise a
     // permission rule even after the row transitions.
@@ -296,7 +321,7 @@ pub async fn approval_decide(
                             tracing::error!("execute pending error: {e}");
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({"error": "approved but execution failed"})),
+                                Json(json!({"error": APPROVED_BUT_EXECUTION_FAILED})),
                             )
                                 .into_response();
                         }
@@ -310,6 +335,17 @@ pub async fn approval_decide(
                     "quorum": quorum,
                     "remember": format!("{:?}", body.remember).to_lowercase(),
                 }),
+                // #1620 — missing pending id is 404 (was 403 via the
+                // collapsed Rejected arm; postgres already 404'd).
+                Ok(crate::db::ApproveOutcome::NotFound) => {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "error": crate::errors::msg::pending_action_not_found(&id),
+                        })),
+                    )
+                        .into_response();
+                }
                 Ok(crate::db::ApproveOutcome::Rejected(reason)) => {
                     return (
                         StatusCode::FORBIDDEN,
@@ -345,13 +381,125 @@ pub async fn approval_decide(
     };
     drop(lock);
 
-    // Fan out the decision on the broadcast bus and (for forever)
-    // record the synthetic rule.
-    let decision_label = match body.decision {
+    publish_decision_event(
+        &id,
+        &agent_id,
+        body.decision,
+        body.remember,
+        pending_snapshot,
+    );
+    Json(outcome).into_response()
+}
+
+/// #1618 — postgres branch of [`approval_decide`]. Routes the K10
+/// decision through the SAL trait so it lands on the real postgres
+/// store instead of the scratch sqlite. Mirrors the governance
+/// `approve_pending` postgres branch (src/handlers/governance.rs):
+/// approve = `governance_approve_with_consensus` +
+/// `execute_pending_action`; deny = `pending_decide(false)`.
+///
+/// Response shapes are byte-identical to the sqlite K10 path (same
+/// fields, same status codes) — the storage backend is an
+/// implementation detail the K10 wire contract does not expose.
+#[cfg(feature = "sal")]
+async fn approval_decide_postgres(
+    app: &AppState,
+    id: &str,
+    agent_id: &str,
+    body: &ApprovalRequestBody,
+) -> axum::response::Response {
+    let ctx = crate::store::CallerContext::for_agent(agent_id.to_string());
+    // Snapshot the pending row before deciding so we can synthesise a
+    // permission rule even after the row transitions (same rationale
+    // as the sqlite branch).
+    let pending_snapshot = app.store.get_pending(&ctx, id).await.ok().flatten();
+    let remember_label = format!("{:?}", body.remember).to_lowercase();
+    let outcome = match body.decision {
+        crate::approvals::Decision::Approve => {
+            match app
+                .store
+                .governance_approve_with_consensus(&ctx, id, agent_id)
+                .await
+            {
+                Ok(crate::store::ApproveOutcome::Approved) => {
+                    match app.store.execute_pending_action(&ctx, id).await {
+                        Ok(memory_id) => json!({
+                            "approved": true,
+                            "id": id,
+                            (field_names::DECIDED_BY): agent_id,
+                            "executed": true,
+                            "memory_id": memory_id,
+                            "remember": remember_label,
+                        }),
+                        Err(e) => {
+                            tracing::error!("approval_decide(postgres): execute pending: {e}");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": APPROVED_BUT_EXECUTION_FAILED})),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                Ok(crate::store::ApproveOutcome::Pending { votes, quorum }) => json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": id,
+                    "votes": votes,
+                    "quorum": quorum,
+                    "remember": remember_label,
+                }),
+                Ok(crate::store::ApproveOutcome::Rejected(reason)) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
+                    )
+                        .into_response();
+                }
+                Err(e) => return store_err_to_response(e),
+            }
+        }
+        crate::approvals::Decision::Deny => {
+            match app.store.pending_decide(&ctx, id, false, agent_id).await {
+                Ok(true) => json!({
+                    "rejected": true,
+                    "id": id,
+                    (field_names::DECIDED_BY): agent_id,
+                    "remember": remember_label,
+                }),
+                Ok(false) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(
+                            json!({"error": crate::errors::msg::PENDING_ACTION_NOT_FOUND_OR_DECIDED}),
+                        ),
+                    )
+                        .into_response();
+                }
+                Err(e) => return store_err_to_response(e),
+            }
+        }
+    };
+    publish_decision_event(id, agent_id, body.decision, body.remember, pending_snapshot);
+    Json(outcome).into_response()
+}
+
+/// Shared post-decision fan-out for both storage-backend branches of
+/// [`approval_decide`]: publish the `ApprovalDecided` event on the
+/// process-wide broadcast bus and (for `remember=session|forever`)
+/// record the synthetic permission rule.
+fn publish_decision_event(
+    id: &str,
+    agent_id: &str,
+    decision: crate::approvals::Decision,
+    remember: crate::approvals::Remember,
+    pending_snapshot: Option<crate::models::PendingAction>,
+) {
+    let decision_label = match decision {
         crate::approvals::Decision::Approve => "approve",
         crate::approvals::Decision::Deny => "deny",
     };
-    let remember_label = match body.remember {
+    let remember_label = match remember {
         crate::approvals::Remember::Once => "once",
         crate::approvals::Remember::Session => "session",
         crate::approvals::Remember::Forever => "forever",
@@ -374,15 +522,15 @@ pub async fn approval_decide(
         .map(|p| p.requested_by.clone())
         .unwrap_or_default();
     crate::approvals::publish(crate::approvals::ApprovalEvent::ApprovalDecided {
-        pending_id: id.clone(),
+        pending_id: id.to_string(),
         decision: decision_label.to_string(),
-        decided_by: agent_id.clone(),
+        decided_by: agent_id.to_string(),
         remember: remember_label.to_string(),
         namespace: evt_namespace,
         requested_by: evt_requested_by,
     });
     if matches!(
-        body.remember,
+        remember,
         crate::approvals::Remember::Forever | crate::approvals::Remember::Session
     ) && let Some(snap) = pending_snapshot
     {
@@ -394,7 +542,6 @@ pub async fn approval_decide(
             recorded_at: Utc::now().to_rfc3339(),
         });
     }
-    Json(outcome).into_response()
 }
 
 /// Predicate: should the SSE subscriber identified by

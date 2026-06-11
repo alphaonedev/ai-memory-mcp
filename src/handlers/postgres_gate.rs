@@ -210,6 +210,10 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // gate permits them to reach the handler's postgres branch.
         ("POST", super::routes::MEMORY_REFLECT) => true,
         ("POST", super::routes::MEMORY_REFLECTION_ORIGIN) => true,
+        // #1619 — the #1416 L4 turn-capture route is fully SAL-routed
+        // (`app.store.capture_turn_idempotent`) but was missing from
+        // BOTH gate tables, working on postgres only by double-miss.
+        ("POST", super::routes::CAPTURE_TURN) => true,
         ("POST", super::routes::MEMORY_RECALL_OBSERVATIONS) => true,
         _ => false,
     }
@@ -356,6 +360,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         // L6 autonomous-tier.
         ("POST", super::routes::AUTO_TAG) => true,
         ("POST", super::routes::EXPAND_QUERY) => true,
+        // #1619 — L4 turn-capture registered route (the #1416 omission).
+        ("POST", super::routes::CAPTURE_TURN) => true,
         // L9 / L10 — tools/list + load_family.
         ("GET", super::routes::TOOLS_LIST) => true,
         ("POST", super::routes::MEMORY_LOAD_FAMILY) => true,
@@ -1258,6 +1264,17 @@ mod transport_postgres_gate_tests {
             &Method::GET,
             crate::handlers::routes::HEALTH
         ));
+        // #1619 — the L4 turn-capture route (#1416) was missing from
+        // BOTH gate tables; these pins keep the cells from drifting
+        // out again.
+        assert!(path_is_registered_route(
+            &Method::POST,
+            crate::handlers::routes::CAPTURE_TURN
+        ));
+        assert!(
+            postgres_endpoint_supported(&Method::POST, crate::handlers::routes::CAPTURE_TURN),
+            "#1619: capture_turn is fully SAL-routed and must be postgres-supported"
+        );
         assert!(path_is_registered_route(
             &Method::GET,
             crate::handlers::routes::METRICS_BARE

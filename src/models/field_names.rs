@@ -52,6 +52,12 @@ pub const ARCHIVE_REASON: &str = "archive_reason";
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.
 pub const ATOM_COUNT: &str = "atom_count";
+/// `atomised_into` — wire/row field name (#1637 archive projection).
+pub const ATOMISED_INTO: &str = "atomised_into";
+/// `atom_of` — wire/row field name (#1637 archive projection).
+pub const ATOM_OF: &str = "atom_of";
+/// `mentioned_entity_id` — wire/row field name (#1637 archive projection).
+pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
 /// `budget_tokens` — wire/row field name.

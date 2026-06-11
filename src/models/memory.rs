@@ -570,11 +570,14 @@ pub struct Memory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_decayed_at: Option<String>,
     /// v0.7.0 Provenance Gap 1 (issue #884, schema v45 sqlite) —
-    /// optimistic-concurrency counter. Bumped on every mutation by
-    /// `storage::update`. Two callers writing against the same
-    /// `expected_version` race exactly one winner; the loser receives
-    /// a typed `CONFLICT` envelope naming the current stored
-    /// version. Legacy rows land at `version = 1` via the SQL DEFAULT
+    /// optimistic-concurrency counter. Bumped on every mutation:
+    /// `storage::update` AND the `(title, namespace)` upsert-merge arm
+    /// of `storage::insert` (#1632). Two callers writing against the
+    /// same `expected_version` race exactly one winner; the loser
+    /// receives a typed `CONFLICT` envelope naming the current stored
+    /// version. The confidence-decay sweep is the only documented
+    /// non-bumping mutator (tests/non_version_bumping_sites_1036.rs).
+    /// Legacy rows land at `version = 1` via the SQL DEFAULT
     /// clause. `#[serde(default = "default_memory_version")]` keeps
     /// pre-v45 federation peers / JSON payloads deserialising cleanly.
     #[serde(default = "default_memory_version")]
@@ -1209,6 +1212,11 @@ pub struct RecallQuery {
     /// this budget.
     #[serde(default)]
     pub budget_tokens: Option<usize>,
+    /// #1622 — salience tokens biasing the recall query embedding,
+    /// comma-separated (`context_tokens=alpha,beta`), mirroring the
+    /// `kinds` CSV convention for GET query params.
+    #[serde(default)]
+    pub context_tokens: Option<String>,
     /// v0.7.0 (issue #518) — when `true`, splice defaults from
     /// `[agents.defaults.recall_scope]` in `config.toml` for any
     /// filter field not explicitly set on this request. Resolution:
@@ -1294,6 +1302,12 @@ pub struct RecallBody {
     /// Task 1.11 — context-budget-aware recall.
     #[serde(default)]
     pub budget_tokens: Option<usize>,
+    /// #1622 — salience tokens biasing the recall query embedding
+    /// (70/30 blend). Pre-#1622 this field was unreachable from HTTP
+    /// (hard-coded `None` in `from_http_body`) while MCP + CLI honored
+    /// it — the same class #1098 fixed for four other fields.
+    #[serde(default)]
+    pub context_tokens: Option<Vec<String>>,
     /// v0.7.0 (issue #518) — when `true`, splice defaults from
     /// `[agents.defaults.recall_scope]` in `config.toml` for any
     /// filter field not explicitly set on this request body.

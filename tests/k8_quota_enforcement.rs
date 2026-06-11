@@ -343,3 +343,164 @@ fn k8_record_op_after_check_increments_counters() {
     assert_eq!(status.current_storage_bytes, 30);
     assert_eq!(status.current_links_today, 2);
 }
+
+// ---------------------------------------------------------------------------
+// #1621 — K8 link-quota parity on the HTTP surface. Pre-#1621 only the
+// MCP `memory_link` path charged `QuotaOp::Link`; `POST /api/v1/links`
+// bypassed the quota entirely, so a throttled agent with HTTP access
+// sidestepped K8 limits.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sal")]
+#[tokio::test]
+#[allow(clippy::items_after_statements, clippy::too_many_lines)]
+async fn k8_http_link_at_links_per_day_limit_returns_429_1621() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt as _;
+
+    const AID: &str = "ai:k8-http-1621";
+
+    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let _ = ai_memory::db::open(&db_path).expect("db::open");
+    let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
+    let db: ai_memory::handlers::Db = Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.clone(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )));
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("SqliteStore"));
+    let app_state = ai_memory::handlers::AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(tokio::sync::Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(ai_memory::config::FeatureTier::Keyword.config()),
+        scoring: Arc::new(ai_memory::config::ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+        store,
+        llm: Arc::new(None),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(Vec::new()),
+        rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+    };
+    let router = ai_memory::build_router(
+        ai_memory::handlers::ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        },
+        app_state,
+    );
+
+    let post = |uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("x-agent-id", AID)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let store_mem = |title: &str| {
+        serde_json::json!({
+            "title": title,
+            "content": "body long enough to be a real memory for the 1621 quota test",
+            "namespace": "k8-1621",
+            "agent_id": AID,
+        })
+    };
+
+    // Two owned memories to link.
+    let r1 = router
+        .clone()
+        .oneshot(post("/api/v1/memories", store_mem("k8-1621-a")))
+        .await
+        .unwrap();
+    assert!(r1.status().is_success(), "store a: {:?}", r1.status());
+    let b1 = axum::body::to_bytes(r1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let id_a = serde_json::from_slice::<serde_json::Value>(&b1).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r2 = router
+        .clone()
+        .oneshot(post("/api/v1/memories", store_mem("k8-1621-b")))
+        .await
+        .unwrap();
+    assert!(r2.status().is_success(), "store b: {:?}", r2.status());
+    let b2 = axum::body::to_bytes(r2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let id_b = serde_json::from_slice::<serde_json::Value>(&b2).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Zero the link allowance on every accounting row for this agent.
+    {
+        // The two memory stores above already charged QuotaOp::Memory,
+        // so the (agent, namespace) accounting row exists.
+        let conn = Connection::open(&db_path).expect("open for cap tighten");
+        conn.execute(
+            "UPDATE agent_quotas SET max_links_per_day = 0 WHERE agent_id = ?1",
+            params![AID],
+        )
+        .expect("tighten link cap");
+    }
+
+    // The link write must now 429 with the canonical envelope.
+    let r3 = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/links",
+            serde_json::json!({"source_id": id_a, "target_id": id_b, "relation": "related_to"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r3.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "#1621: HTTP link at zero allowance must 429"
+    );
+    let b3 = axum::body::to_bytes(r3.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&b3).unwrap();
+    assert_eq!(v["code"].as_str(), Some("QUOTA_EXCEEDED"), "envelope: {v}");
+    assert_eq!(v["limit"].as_str(), Some("links_per_day"), "envelope: {v}");
+
+    // No row landed.
+    {
+        let conn = Connection::open(&db_path).expect("open for assert");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1",
+                params![id_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "#1621: refused link must not persist");
+    }
+}

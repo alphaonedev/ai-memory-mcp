@@ -161,3 +161,35 @@ fn user_update_bumps_version_pinning_the_contrast_1036() {
         after.version
     );
 }
+
+#[test]
+fn upsert_merge_bumps_version_1632() {
+    // #1632 — a (title, namespace) collision re-store IS a mutation
+    // (content/tags/priority can change), so it bumps the Gap-1
+    // counter exactly like db::update. Pre-#1632 a re-store rewrote
+    // content while `version` stood still, so a concurrent caller's
+    // stale `If-Match` could overwrite the merge invisibly.
+    let conn = fresh_db_conn();
+    let mut mem = seed_memory_with_confidence(&conn, "m-1632", 0.9);
+    let v1: i64 = conn
+        .query_row(
+            "SELECT version FROM memories WHERE id = 'm-1632'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read v1");
+    assert_eq!(v1, 1, "fresh insert lands at version=1");
+
+    // Same (title, namespace) → ON CONFLICT merge path.
+    mem.id = "m-1632-second".to_string();
+    mem.content = "updated body for the upsert-merge version bump pin".to_string();
+    db::insert(&conn, &mem).expect("upsert merge");
+    let v2: i64 = conn
+        .query_row(
+            "SELECT version FROM memories WHERE id = 'm-1632'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read v2");
+    assert_eq!(v2, 2, "#1632: upsert-merge must bump version");
+}
