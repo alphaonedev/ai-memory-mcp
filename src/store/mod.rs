@@ -343,6 +343,31 @@ impl BoxBackendError {
 /// Convenience alias — every trait method returns this.
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// #1624 — shared integrity finding-checks for [`MemoryStore::verify`]
+/// so both adapters report IDENTICAL findings for identical rows.
+/// Union of the two pre-#1624 checkers (sqlite: title/content/agent_id;
+/// postgres: content + a HARD error on unparseable `created_at`).
+/// A malformed `created_at` is now a FINDING on both backends rather
+/// than a postgres-only `IntegrityFailed` error — verify is a report
+/// surface, not a gate.
+#[must_use]
+pub fn integrity_findings(mem: &Memory) -> Vec<String> {
+    let mut findings: Vec<String> = Vec::new();
+    if mem.title.trim().is_empty() {
+        findings.push("title is empty".to_string());
+    }
+    if mem.content.trim().is_empty() {
+        findings.push("content is empty".to_string());
+    }
+    if mem.metadata.get("agent_id").is_none() {
+        findings.push("metadata.agent_id missing".to_string());
+    }
+    if chrono::DateTime::parse_from_rfc3339(&mem.created_at).is_err() {
+        findings.push(format!("created_at is not RFC3339: '{}'", mem.created_at));
+    }
+    findings
+}
+
 /// Identity + visibility + governance context threaded through every
 /// mutating operation. Reuses the NHI-hardened `agent_id` from the
 /// existing `crate::identity` resolution chain.
@@ -3794,5 +3819,55 @@ mod tests {
         assert!(report.integrity_ok);
         let err = rt.block_on(store.get(&ctx, "missing")).unwrap_err();
         assert!(matches!(err, StoreError::NotFound { id } if id == "missing"));
+    }
+    #[test]
+    fn integrity_findings_union_checks_1624() {
+        // #1624 — one checker for both adapters: the union of the two
+        // pre-fix sets, with malformed created_at as a FINDING (the
+        // postgres adapter used to hard-error; sqlite silently passed).
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut mem = Memory {
+            id: "v-1624".to_string(),
+            tier: Tier::Mid,
+            namespace: "ns".to_string(),
+            title: "  ".to_string(),
+            content: String::new(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: "not-a-timestamp".to_string(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            ..Memory::default()
+        };
+        let findings = integrity_findings(&mem);
+        assert!(
+            findings.iter().any(|f| f == "title is empty"),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f == "content is empty"),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f == "metadata.agent_id missing"),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.starts_with("created_at is not RFC3339")),
+            "{findings:?}"
+        );
+        // A clean row yields zero findings.
+        mem.title = "t".to_string();
+        mem.content = "c".to_string();
+        mem.metadata = serde_json::json!({"agent_id": "alice"});
+        mem.created_at = chrono::Utc::now().to_rfc3339();
+        assert!(integrity_findings(&mem).is_empty());
     }
 }
