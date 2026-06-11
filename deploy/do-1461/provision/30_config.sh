@@ -58,13 +58,19 @@ tier = "autonomous"
 # (test clients supply it in P3). config.toml is chmod 0600 on the remote.
 api_key = "$API_KEY"
 
-# Embedder: autonomous-tier nomic-embed-text (768-dim) via the local CPU Ollama
-# sidecar (25_ollama_embed.sh). build_embedder() reads these LEGACY FLAT fields,
-# NOT the v2 [embeddings] section (src/config.rs::effective_embed_url).
-ollama_url = "$EMBED_OLLAMA_URL"
-embed_url = "$EMBED_OLLAMA_URL"
-embedding_model = "nomic_embed_v15"
+# Embedder (#1598): API embeddings — no Ollama sidecar on CPU-only peers
+# (operator decisions 2026-06-11: USA models, paid tier, Ollama only on GPU
+# nodes). build_embedder() consumes the v2 [embeddings] section post-#1598.
+# dim is the fleet-wide Matryoshka pin (gemini truncates server-side) keeping
+# the PG regions' vector(768) schemas + pgvector ANN indexes (2000-dim cap)
+# untouched. The embed key rides the same EnvironmentFile env var as [llm].
 cross_encoder = true
+
+[embeddings]
+backend = "$PEER_EMBED_BACKEND"
+model = "$PEER_EMBED_MODEL"
+dim = $PEER_EMBED_DIM
+api_key_env = "$PEER_LLM_API_KEY_ENV"
 
 # Chat LLM: cloud OpenAI-compatible (no GPU on peers). The secret is supplied by
 # the EnvironmentFile via api_key_env; inline api_key is rejected at parse.
