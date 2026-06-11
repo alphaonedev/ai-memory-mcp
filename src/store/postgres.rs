@@ -13771,7 +13771,11 @@ impl PostgresStore {
         let rows = sqlx::query(
             "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
              source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata \
+             expires_at, archived_at, archive_reason, metadata, \
+             reflection_depth, memory_kind, entity_id, persona_version, \
+             citations, source_uri, source_span, confidence_source, \
+             confidence_signals, confidence_decayed_at, version, \
+             atomised_into, atom_of, mentioned_entity_id \
              FROM archived_memories \
              WHERE ($1::text IS NULL OR namespace = $1) \
              ORDER BY archived_at DESC \
@@ -13856,6 +13860,52 @@ impl PostgresStore {
             let archive_reason: String = row
                 .try_get(field_names::ARCHIVE_REASON)
                 .map_err(|e| to_store_err("list_archived archive_reason decode", e))?;
+            // #1637 — the v49 columns (in the table since #1025; restore
+            // was lossless but the LISTING projection hid them). All
+            // nullable per the v49 additive migration; decode failures
+            // hard-propagate per the #1080 posture.
+            let reflection_depth: Option<i32> = row
+                .try_get("reflection_depth")
+                .map_err(|e| to_store_err("list_archived reflection_depth decode", e))?;
+            let memory_kind: Option<String> = row
+                .try_get("memory_kind")
+                .map_err(|e| to_store_err("list_archived memory_kind decode", e))?;
+            let entity_id: Option<String> = row
+                .try_get("entity_id")
+                .map_err(|e| to_store_err("list_archived entity_id decode", e))?;
+            let persona_version: Option<i32> = row
+                .try_get("persona_version")
+                .map_err(|e| to_store_err("list_archived persona_version decode", e))?;
+            let citations: Option<String> = row
+                .try_get("citations")
+                .map_err(|e| to_store_err("list_archived citations decode", e))?;
+            let source_uri: Option<String> = row
+                .try_get("source_uri")
+                .map_err(|e| to_store_err("list_archived source_uri decode", e))?;
+            let source_span: Option<String> = row
+                .try_get("source_span")
+                .map_err(|e| to_store_err("list_archived source_span decode", e))?;
+            let confidence_source: Option<String> = row
+                .try_get("confidence_source")
+                .map_err(|e| to_store_err("list_archived confidence_source decode", e))?;
+            let confidence_signals: Option<String> = row
+                .try_get("confidence_signals")
+                .map_err(|e| to_store_err("list_archived confidence_signals decode", e))?;
+            let confidence_decayed_at: Option<String> = row
+                .try_get("confidence_decayed_at")
+                .map_err(|e| to_store_err("list_archived confidence_decayed_at decode", e))?;
+            let version: Option<i64> = row
+                .try_get("version")
+                .map_err(|e| to_store_err("list_archived version decode", e))?;
+            let atomised_into: Option<i32> = row
+                .try_get(field_names::ATOMISED_INTO)
+                .map_err(|e| to_store_err("list_archived atomised_into decode", e))?;
+            let atom_of: Option<String> = row
+                .try_get(field_names::ATOM_OF)
+                .map_err(|e| to_store_err("list_archived atom_of decode", e))?;
+            let mentioned_entity_id: Option<String> = row
+                .try_get(field_names::MENTIONED_ENTITY_ID)
+                .map_err(|e| to_store_err("list_archived mentioned_entity_id decode", e))?;
             out.push(serde_json::json!({
                 "id": id,
                 "tier": tier,
@@ -13874,6 +13924,24 @@ impl PostgresStore {
                 (field_names::ARCHIVED_AT): archived_at.to_rfc3339(),
                 (field_names::ARCHIVE_REASON): archive_reason,
                 "metadata": metadata,
+                "reflection_depth": reflection_depth.unwrap_or(0),
+                "memory_kind": memory_kind,
+                "entity_id": entity_id,
+                "persona_version": persona_version,
+                "citations": citations
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .unwrap_or_else(|| serde_json::json!([])),
+                "source_uri": source_uri,
+                "source_span": source_span
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
+                "confidence_source": confidence_source,
+                "confidence_signals": confidence_signals
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
+                "confidence_decayed_at": confidence_decayed_at,
+                "version": version.unwrap_or(1),
+                (field_names::ATOMISED_INTO): atomised_into,
+                (field_names::ATOM_OF): atom_of,
+                (field_names::MENTIONED_ENTITY_ID): mentioned_entity_id,
             }));
         }
         Ok(out)

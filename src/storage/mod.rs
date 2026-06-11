@@ -6842,7 +6842,7 @@ pub fn list_archived(
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
             "confidence_decayed_at": row.get::<_, Option<String>>(26)?,
             "version": row.get::<_, Option<i64>>(27)?.unwrap_or(1),
-            (field_names::ATOMISED_INTO): row.get::<_, Option<String>>(28)?,
+            (field_names::ATOMISED_INTO): row.get::<_, Option<i64>>(28)?,
             (field_names::ATOM_OF): row.get::<_, Option<String>>(29)?,
             (field_names::MENTIONED_ENTITY_ID): row.get::<_, Option<String>>(30)?,
         }))
