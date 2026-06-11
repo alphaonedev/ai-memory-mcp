@@ -402,7 +402,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // backend dispatch arms across ~15 vendor aliases). Refactor-split
     // into `src/llm/{client,backends,auto_tag,expansion}.rs` is
     // tracked as a separate v0.7.x post-ship ARCH cleanup.
-    ("src/llm.rs", 5_200),
+    // 2026-06-11 — bumped 5_200 → 5_350 by #1603 (batched remote
+    // embeds: `embed_texts`/`embed_texts_async` + the one-request
+    // helper + `parse_openai_embeddings_batch` + 2 parse-pin tests
+    // grew the file to 5_317; lockstep bump = 5_317 + 33 headroom).
+    ("src/llm.rs", 5_350),
 ];
 
 #[test]
