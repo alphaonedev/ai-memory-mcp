@@ -121,6 +121,25 @@ pub(crate) fn key_dir_env_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Env var that relocates the key storage directory (see
+/// [`default_key_dir`]). One declaration site so every consumer —
+/// the default-dir resolver and the `rules keygen` override detection
+/// (#1610) — reads the same name.
+pub const KEY_DIR_ENV: &str = "AI_MEMORY_KEY_DIR";
+
+/// Returns the explicit `AI_MEMORY_KEY_DIR` env override when set and
+/// non-empty, else `None`. Split out of [`default_key_dir`] so callers
+/// that must distinguish "operator explicitly relocated the key store"
+/// from "platform default" (the #1610 `rules keygen` write-path fix)
+/// share the same set-and-non-empty semantics.
+#[must_use]
+pub fn key_dir_env_override() -> Option<PathBuf> {
+    match std::env::var(KEY_DIR_ENV) {
+        Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => None,
+    }
+}
+
 /// Returns the default key storage directory:
 /// `dirs::config_dir().join("ai-memory/keys/")`.
 ///
@@ -135,10 +154,8 @@ pub(crate) fn key_dir_env_lock() -> &'static std::sync::Mutex<()> {
 /// the operator's real `~/.config/ai-memory/keys/`. Operators who want
 /// to relocate the key store in production can use the same override.
 pub fn default_key_dir() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var("AI_MEMORY_KEY_DIR")
-        && !v.is_empty()
-    {
-        return Ok(PathBuf::from(v));
+    if let Some(p) = key_dir_env_override() {
+        return Ok(p);
     }
     // COVERAGE: ok_or_else closure (line 131) reachable only on hosts
     //           where dirs::config_dir() returns None — i.e. exotic

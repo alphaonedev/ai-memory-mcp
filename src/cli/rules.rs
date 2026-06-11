@@ -390,7 +390,17 @@ pub fn run(
             out: out_path,
             force,
         } => {
-            let resolved = resolve_operator_key_path(out_path.as_deref())?;
+            // #1610 — keygen must write where the signing verbs read.
+            // When the operator relocated the key store (`--key-dir`
+            // flag or `AI_MEMORY_KEY_DIR`), the default write path is
+            // `<key_dir>/operator.key` — the exact Layout-2 path
+            // `load_operator_signing_key_from_dir` and the L1-6
+            // verify ladder consult. Only with NO override in force
+            // does the legacy singleton `<config>/ai-memory/operator.key`
+            // location apply (the Layout-3 parent fallback covers it).
+            let key_dir_overridden = args.key_dir.is_some() || kp::key_dir_env_override().is_some();
+            let resolved =
+                resolve_keygen_out_path(out_path.as_deref(), &key_dir, key_dir_overridden)?;
             let fingerprint = keygen_operator(&resolved, force, out)?;
             let payload = serde_json::json!({
                 "path": resolved.display().to_string(),
@@ -450,6 +460,34 @@ pub fn run(
 // ---------------------------------------------------------------------------
 // L1-6 — operator keypair generation + loading
 // ---------------------------------------------------------------------------
+
+/// Resolve where `rules keygen` writes (#1610). Precedence:
+///
+/// 1. explicit `--out <PATH>` — always wins;
+/// 2. `<key_dir>/operator.key` when a key-dir override is in force
+///    (`--key-dir` flag or `AI_MEMORY_KEY_DIR`) — keeps the write
+///    path and the `--sign` verbs' read path
+///    ([`load_operator_signing_key_from_dir`] Layout 2) on the SAME
+///    directory, closing the split-brain where keygen wrote
+///    `~/.config/ai-memory/operator.key` while `enable --sign` read
+///    an empty `/etc/ai-memory/keys` and R001–R004 never enabled;
+/// 3. the legacy singleton `<config>/ai-memory/operator.key`
+///    ([`resolve_operator_key_path`]) when nothing is overridden —
+///    the Layout-3 parent fallback makes `keygen → enable` work
+///    there without any mirroring.
+fn resolve_keygen_out_path(
+    explicit_out: Option<&Path>,
+    key_dir: &Path,
+    key_dir_overridden: bool,
+) -> Result<PathBuf> {
+    if let Some(p) = explicit_out {
+        return Ok(p.to_path_buf());
+    }
+    if key_dir_overridden {
+        return Ok(key_dir.join(OPERATOR_KEY_FILENAME));
+    }
+    resolve_operator_key_path(None)
+}
 
 /// Resolve the operator key path: explicit `--out` override → default
 /// `~/.config/ai-memory/operator.key`. The default lives next to the
@@ -2290,6 +2328,35 @@ mod tests {
             "default path missing ai-memory: {s}"
         );
         assert!(s.ends_with("operator.key"), "got: {s}");
+    }
+
+    #[test]
+    fn resolve_keygen_out_path_explicit_out_wins_1610() {
+        let out = std::path::PathBuf::from("/custom/operator.key");
+        let kd = std::path::PathBuf::from("/etc/ai-memory/keys");
+        let r = resolve_keygen_out_path(Some(&out), &kd, true).unwrap();
+        assert_eq!(r, out, "--out must win over a key-dir override");
+    }
+
+    #[test]
+    fn resolve_keygen_out_path_overridden_key_dir_wins_1610() {
+        // The F1 split-brain: keygen must write into the SAME dir the
+        // --sign verbs read when the operator relocated the key store.
+        let kd = std::path::PathBuf::from("/etc/ai-memory/keys");
+        let r = resolve_keygen_out_path(None, &kd, true).unwrap();
+        assert_eq!(r, kd.join(OPERATOR_KEY_FILENAME));
+    }
+
+    #[test]
+    fn resolve_keygen_out_path_no_override_falls_back_to_legacy_singleton_1610() {
+        let kd = std::path::PathBuf::from("/ignored/keys");
+        let r = resolve_keygen_out_path(None, &kd, false).unwrap();
+        let s = r.display().to_string();
+        assert!(s.contains("ai-memory"), "legacy singleton path: {s}");
+        assert!(
+            !s.starts_with("/ignored"),
+            "must NOT use key_dir when no override is in force: {s}"
+        );
     }
 
     #[test]
