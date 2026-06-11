@@ -68,6 +68,12 @@ async fn mtls_config_pinning_fixture_cert() -> axum_server::tls_rustls::RustlsCo
 /// Client config presenting the allowlisted fixture cert — the same
 /// production builder the sync-daemon uses for outbound mTLS.
 async fn allowlisted_client_config() -> rustls::ClientConfig {
+    // Same explicit provider pin as the sibling builders below: under
+    // feature graphs where BOTH `ring` and `aws-lc-rs` are present
+    // (e.g. the coverage run's `--features sal,sal-postgres`), rustls
+    // cannot auto-select a process-level CryptoProvider and panics.
+    // Idempotent — `AlreadyInstalled` is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tls::build_rustls_client_config(&fixture("valid_cert.pem"), &fixture("valid_key_pkcs8.pem"))
         .await
         .expect("client config with allowlisted fixture cert")
