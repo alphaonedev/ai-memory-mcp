@@ -205,7 +205,7 @@
 
 3. **Restart your AI client.**
 
-   > **Verify the LLM backend wired through (smart/autonomous tier only).** After restart, check the ai-memory boot banner that prints on first MCP session-start (or the AI client's MCP server stderr log). You should see `LLM ready (backend=<vendor>, model=<name>)` matching what you put in the `env:` block, plus an `(#1143)` embed-client banner line when using a non-Ollama backend. If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the MCP config path you edited matches the AI client's actual scope. Full troubleshooting: [`TROUBLESHOOTING.md` § LLM backend silently fell back](TROUBLESHOOTING.md#llm-backend-silently-fell-back-to-ollama).
+   > **Verify the LLM backend wired through (smart/autonomous tier only).** After restart, check the ai-memory boot banner that prints on first MCP session-start (or the AI client's MCP server stderr log). You should see `LLM ready (backend=<vendor>, model=<name>, …)` matching what you put in the `env:` block, plus an `embedder loaded (…)` line reflecting the independently-resolved `[embeddings]` configuration (#1598 — the embedder can be local Ollama or any API backend; the historical `(#1143)` dedicated-Ollama embed-client banner was superseded at this boot site). If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the MCP config path you edited matches the AI client's actual scope. Full troubleshooting: [`TROUBLESHOOTING.md` § LLM backend silently fell back](TROUBLESHOOTING.md#llm-backend-silently-fell-back-to-ollama).
 
 4. **Verify** — at the default `--profile core` (v0.7.0) you should see **7 new tools** registered plus the always-on `memory_capabilities` bootstrap (8 total): `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`. To eagerly load the full v0.7.0 surface (74 advertised entries — 73 callable memory tools + the always-on `memory_capabilities` bootstrap), launch with `ai-memory mcp --profile full`. The full-profile surface includes (highlights): `memory_update`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, the 4 archive tools, `memory_check_duplicate`, the 2 entity tools, the 3 KG tools (`memory_kg_query`/`memory_kg_timeline`/`memory_kg_invalidate`), `memory_get_taxonomy`, the 3 namespace-standard tools, the 3 pending-action tools, the 2 agent tools, `memory_notify`/`memory_inbox`, the 3 subscription tools, `memory_session_start`, `memory_gc`, and the v0.7 additions: `memory_reflect`, `memory_atomise`, `memory_ingest_multistep`, `memory_persona`, `memory_persona_generate`, `memory_offload`, `memory_deref`, `memory_calibrate_confidence`, the 7 L1-5 Agent Skills tools, `memory_check_agent_action`, `memory_rule_list`, `memory_export_reflection`, `memory_reflection_origin`, `memory_dependents_of_invalidated`, `memory_find_paths`, `memory_verify`, `memory_quota_status`, the archive-list metadata helpers (#860), and more. Full per-tool reference: [API_REFERENCE.md](API_REFERENCE.md). Run `memory_capabilities` from the agent loop to get the live family list.
 
@@ -807,7 +807,8 @@ ai-memory --help
 
 # v0.7.x — comprehensive health check (Storage / Index / Recall /
 # Governance / Sync / Webhook / Capabilities / Reflection Health /
-# LLM Reachability (#1146)). 9-section operator-visible dashboard.
+# LLM Reachability (#1146) + Embeddings Reachability (#1598)).
+# 10-section operator-visible dashboard.
 ai-memory doctor
 
 # If running as MCP server, test manually:
@@ -1010,7 +1011,7 @@ ollama run gemma3:4b "Hello, world"
 }
 ```
 
-> ai-memory connects to Ollama at `http://localhost:11434` automatically. No additional configuration needed. If Ollama is not running, ai-memory gracefully falls back to the semantic tier.
+> ai-memory connects to Ollama at `http://localhost:11434` automatically. No additional configuration needed. If Ollama is not running, LLM-backed features degrade gracefully (the semantic-tier embedder + keyword recall keep working). Post-#1598 the embedder itself can also be pointed at an API backend instead of Ollama — see `[embeddings]` in [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
 
 > **Note:** The `semantic` tier (default) downloads a HuggingFace embedding model (~100 MB) on first startup. No account or API key is required. The model is cached in `~/.cache/huggingface/`.
 

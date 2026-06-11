@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+pub(crate) const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
 /// PERF-9 (v0.7.0 FX-C1, 2026-05-26) — bridge sync API to the new async
 /// `reqwest::Client` without double-blocking or panicking.
@@ -192,7 +192,12 @@ pub const BACKEND_OLLAMA: &str = "ollama";
 /// Per-vendor default base URLs for the OpenAI-compatible alias
 /// backends. Operator-provided `AI_MEMORY_LLM_BASE_URL` overrides
 /// these. Verified against vendor documentation as of 2026-Q2.
-fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
+///
+/// `pub(crate)` since #1598: the embeddings resolver
+/// (`AppConfig::resolve_embeddings`) reuses the same alias → default
+/// base-URL table for API-wired embedding backends, so the vendor
+/// URLs stay declared once, in `llm.rs`.
+pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
     match alias {
         "openai" => Some("https://api.openai.com/v1"),
         "xai" => Some("https://api.x.ai/v1"),
@@ -210,6 +215,14 @@ fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         "lmstudio" => Some("http://localhost:1234/v1"),
         _ => None,
     }
+}
+
+/// Canonical Ollama model-listing endpoint (`<base>/api/tags`) for a
+/// given base URL. One definition for the wire path shared by the
+/// health probe, the model-pull listings, and the `ai-memory doctor`
+/// reachability probes (#1598 literal-dedup).
+pub(crate) fn ollama_tags_url(base_url: &str) -> String {
+    format!("{base_url}/api/tags")
 }
 
 /// Per-alias environment-variable fallback for the API key. Lets
@@ -952,7 +965,7 @@ impl OllamaClient {
     /// Same semantics; no thread blocked.
     pub async fn is_available_async(&self) -> bool {
         let (url, bearer) = match &self.provider {
-            LlmProvider::Ollama => (format!("{}/api/tags", self.base_url), None),
+            LlmProvider::Ollama => (ollama_tags_url(&self.base_url), None),
             LlmProvider::OpenAiCompatible { api_key } => {
                 (format!("{}/models", self.base_url), Some(api_key.as_str()))
             }
@@ -991,7 +1004,7 @@ impl OllamaClient {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
         }
-        let url = format!("{}/api/tags", self.base_url);
+        let url = ollama_tags_url(&self.base_url);
         let resp = self
             .client
             .get(&url)
@@ -1548,9 +1561,17 @@ impl OllamaClient {
         self.check_outbound()?;
 
         let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+            // #1595 — `"truncate": true` makes Ollama clip an
+            // over-context-length input to the model's window instead
+            // of failing the call with `{"error":"the input length
+            // exceeds the context length"}` (a 4xx that poisoned whole
+            // backfill chunks pre-fix). A truncated-tail embedding of a
+            // long document is strictly better than no embedding at
+            // all; the client-side `EMBED_MAX_BYTES` guard still caps
+            // pathological inputs before they are sent.
             LlmProvider::Ollama => (
                 format!("{}/api/embed", self.base_url),
-                json!({"model": embed_model, "input": text}),
+                json!({"model": embed_model, "input": text, "truncate": true}),
                 None,
             ),
             LlmProvider::OpenAiCompatible { api_key } => (
@@ -1644,7 +1665,7 @@ impl OllamaClient {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
         }
-        let url = format!("{}/api/tags", self.base_url);
+        let url = ollama_tags_url(&self.base_url);
         let resp = self
             .client
             .get(&url)
@@ -2980,6 +3001,79 @@ mod wiremock_tests {
         assert!((v[0] - 0.1_f32).abs() < 1e-5);
         assert!((v[1] - 0.2_f32).abs() < 1e-5);
         assert!((v[2] - 0.3_f32).abs() < 1e-5);
+    }
+
+    /// #1595 — the Ollama-native embed payload must carry
+    /// `"truncate": true` so an over-context-length input is clipped by
+    /// the server instead of failing the whole call (the live-DB
+    /// failure mode: one long row 400'd its entire backfill chunk).
+    /// The mock matches on the key, so a regression that drops it makes
+    /// the POST miss the mount and the call error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_embed_payload_sets_truncate_1595() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(body_partial_json(json!({
+                "model": "nomic-embed-text",
+                "input": "hello",
+                "truncate": true,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "embeddings": [[0.5_f32, 0.25_f32]],
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let vec = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.embed_text("hello", "nomic-embed-text")
+        })
+        .await
+        .unwrap();
+        assert_eq!(vec.unwrap().len(), 2);
+    }
+
+    /// #1595 companion — `truncate` is an Ollama-native knob; the
+    /// OpenAI-compatible `/embeddings` wire shape must NOT grow the
+    /// non-standard key (strict servers reject unknown fields).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_embed_payload_omits_truncate_1595() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"embedding": [0.5_f32, 0.25_f32]}],
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let vec = tokio::task::spawn_blocking(move || {
+            let client =
+                OllamaClient::new_openai_compatible(&uri, "test-model", "fake-key").unwrap();
+            client.embed_text("hello", "test-model")
+        })
+        .await
+        .unwrap();
+        assert_eq!(vec.unwrap().len(), 2);
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let embed_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/embeddings")
+            .expect("embed request recorded");
+        let body: serde_json::Value = serde_json::from_slice(&embed_req.body).expect("json body");
+        assert!(
+            body.get("truncate").is_none(),
+            "OpenAI-compatible embed payload must not carry the \
+             Ollama-native truncate key, got: {body}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

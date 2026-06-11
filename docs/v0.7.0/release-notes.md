@@ -237,6 +237,86 @@ explicitly so operators don't have to reverse-engineer it from source.
   snapshot → start. Procedure in `docs/ADMIN_GUIDE.md`
   §Migration → Rollback.
 
+## Substrate-native API embeddings ([#1598](https://github.com/alphaonedev/ai-memory-mcp/issues/1598), 2026-06-11)
+
+The #1067 provider-agnostic substrate now extends to the **embedder**.
+Pre-#1598, semantic recall embeddings were local-only (Ollama-native
+`/api/embed` or the in-process MiniLM/nomic path); the `[embeddings]`
+section accepted only `backend = "ollama"` shapes. Post-#1598 the
+`[embeddings]` section is fully API-capable and CPU-only nodes can run
+the full semantic/autonomous tiers against a cloud or self-hosted
+embedding API.
+
+**New configuration surface.**
+
+- `[embeddings].backend` — `ollama` (default), any #1067 vendor alias
+  (`openrouter`, `openai`, `gemini`, …), or `openai-compatible` for
+  self-hosted `/v1/embeddings` endpoints (HuggingFace
+  text-embeddings-inference, vLLM, llama.cpp server).
+- `[embeddings].base_url` — synonym of the existing `url` field
+  (named to match `[llm].base_url`); `base_url` wins when both set.
+- `[embeddings].api_key_env` XOR `[embeddings].api_key_file` (mode
+  0400 enforced) — inline `api_key = "<literal>"` is REJECTED at
+  parse time, mirroring `[llm].api_key`.
+- `[embeddings].dim` — explicit vector-dim override for models not in
+  `config.rs::KNOWN_EMBEDDING_DIMS` (the table gained
+  `google/gemini-embedding-2` (3072) and the IBM Granite entries).
+- New env vars (precedence per field: env > `[embeddings]` section >
+  legacy flat > compiled default): `AI_MEMORY_EMBED_BACKEND`,
+  `AI_MEMORY_EMBED_BASE_URL`, `AI_MEMORY_EMBED_MODEL`,
+  `AI_MEMORY_EMBED_API_KEY` (**secret**).
+
+**Behaviour changes.**
+
+- **Fail-closed embedder boot (closes
+  [#1593](https://github.com/alphaonedev/ai-memory-mcp/issues/1593)).**
+  When embedder construction fails, semantic recall degrades to
+  keyword mode with a loud ERROR on stderr — the chat LLM client is
+  **never** silently reused for embeddings.
+- **Truthful capabilities (closes
+  [#1594](https://github.com/alphaonedev/ai-memory-mcp/issues/1594)).**
+  `memory_capabilities` reports the LIVE posture: a remote embedder
+  whose endpoint is failing at request time reports
+  `embedder_loaded = false` and `recall_mode_active` follows
+  (`degraded` instead of `hybrid`).
+- **Resilient backfill (closes
+  [#1595](https://github.com/alphaonedev/ai-memory-mcp/issues/1595)).**
+  The embedding backfill survives poison rows: failed batches retry
+  per-row, rows that still fail are skipped with a WARN naming the
+  row, and Ollama requests send `truncate: true` so over-length inputs
+  no longer abort a batch.
+
+**New operator tooling.**
+
+- **`ai-memory reembed [--namespace <ns>] [--dry-run] [--batch <n>]
+  [--json]`** — the vector-space migration tool. Re-embeds the corpus
+  under the currently-resolved backend/model; `--dry-run` prints
+  `{total_rows, rows_missing_embeddings, target_model, target_dim,
+  backend}`; a live run replaces all vectors with per-row fallback +
+  skip-with-WARN on poison rows and a summary JSON. CLI subcommand
+  count: 79 → **80** default build, 81 → **82** under
+  `--features sal`.
+- **`ai-memory doctor` section "Embeddings Reachability (#1598)"** —
+  probes the resolved endpoint (ollama `GET /api/tags`; API backends
+  `POST /embeddings` with the resolved Bearer key), reports
+  PASS/WARN/CRIT plus full provenance facts, and fires a GPU-policy
+  WARN when `backend = ollama` resolves on a host with no compatible
+  GPU (operator policy: local Ollama embeddings only on GPU-equipped
+  nodes).
+
+**Reference shapes.** The operator-selected reference cloud model is
+`openrouter` + `google/gemini-embedding-2` (3072-dim, 8192-token
+context, ~$0.20/M tokens, Google AI Studio provider, USA; paid-tier
+only — no `:free` routes). For airgapped/self-hosted deployments the
+Apache-2.0 USA model set is `nomic-embed-text-v1.5` (768d — zero
+re-embed for existing corpora), Snowflake `arctic-embed` l/m/s
+(1024/768/384) and IBM `granite-embedding` (768/384), served via TEI,
+vLLM, or llama.cpp server. See the two new enterprise reference
+architectures:
+[CPU + Memory federated nodes](../reference-architecture/enterprise-cpu-memory.md)
+and
+[CPU + Memory + GPU federated nodes](../reference-architecture/enterprise-cpu-memory-gpu.md).
+
 ## v0.7.0 provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067), 2026-05-21)
 
 The historical Ollama-only LLM client is now a **provider-agnostic LLM

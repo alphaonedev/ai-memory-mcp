@@ -1446,12 +1446,17 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
         ctx.embedder.is_some(),
         ctx.reranker.is_some(),
     );
+    // #1594 / #1598 — `embedder_loaded` reports the LIVE posture: a
+    // remote embedder whose most recent call failed (dead endpoint,
+    // auth rejection) is degraded and must report `false` so
+    // `recall_mode_active` follows truthfully.
+    let embedder_live = ctx.embedder.is_some_and(|e| !e.is_degraded());
     let result = match accept {
         CapabilitiesAccept::V3 => handle_capabilities_with_conn_v3(
             ctx.tier_config,
             ctx.resolved_models,
             ctx.reranker,
-            ctx.embedder.is_some(),
+            embedder_live,
             Some(ctx.conn),
             ctx.profile,
             ctx.mcp_config,
@@ -1462,7 +1467,7 @@ fn dispatch_memory_capabilities(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
             ctx.tier_config,
             ctx.resolved_models,
             ctx.reranker,
-            ctx.embedder.is_some(),
+            embedder_live,
             Some(ctx.conn),
             accept,
         ),
@@ -2431,10 +2436,12 @@ pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 /// Replaces the original per-row `emb.embed()` + `db::set_embedding()`
 /// loop that issued one autocommit `UPDATE` per memory. The new path:
 ///
-/// 1. Fetches unembedded rows in bounded passes of `batch_size`
-///    (#1579 B6 / F5.6 — [`db::get_unembedded_ids_batch`]; the
-///    pre-fix path materialised the WHOLE backlog in one Vec via
-///    [`db::get_unembedded_ids`]) and re-fetches until drained.
+/// 1. Fetches unembedded rows in bounded keyset passes of
+///    `batch_size` (#1579 B6 / F5.6 + #1595 —
+///    [`db::get_unembedded_ids_batch_after`]; the pre-fix path
+///    materialised the WHOLE backlog in one Vec via
+///    [`db::get_unembedded_ids`]) and re-fetches past the cursor
+///    until drained.
 /// 2. Each pass embeds one `batch_size` chunk. Callers
 ///    typically resolve this via
 ///    [`crate::config::AppConfig::resolve_embeddings`] which
@@ -2457,18 +2464,25 @@ pub const DEFAULT_EMBED_BACKFILL_BATCH_SIZE: usize = 64;
 /// `Ok(0)` without further work — re-running the backfill on a
 /// fully-embedded DB is a true no-op.
 ///
-/// **Failure isolation:** an embedder/writer fault for one pass is
-/// logged and the sweep stops at the no-progress check (re-fetching
-/// would return the same head rows); the next sweep invocation
-/// retries. The aggregate `ok` counter is the number of rows
-/// successfully written across all passes.
+/// **Failure isolation (#1595):** a chunk-level `embed_batch` fault
+/// falls back to per-row [`Embed::embed`]; rows that still fail (or
+/// whose `title + content` exceeds the client-side
+/// [`crate::embeddings::EMBED_MAX_BYTES`] cap) are SKIPPED with a
+/// per-row WARN naming the id + reason, and the sweep CONTINUES past
+/// them via a keyset cursor ([`db::get_unembedded_ids_batch_after`]).
+/// The pre-#1595 loop stopped the whole sweep on the first failing
+/// chunk — one over-context-length row meant 0 rows ever backfilled.
+/// Skipped rows stay unembedded and are re-attempted on the next sweep
+/// invocation. The final stderr summary reports both totals:
+/// `backfilled {ok}/{scanned} (skipped {skipped})`.
 ///
 /// # Errors
 ///
-/// Only propagates errors from [`db::get_unembedded_ids_batch`] (the
-/// bounded scans). Per-chunk embedder + writer faults are logged and
-/// counted (NOT propagated), matching the original loop's semantics so
-/// a transient embedder fault doesn't block MCP readiness.
+/// Only propagates errors from [`db::get_unembedded_ids_batch_after`]
+/// (the bounded scans). Per-chunk embedder + writer faults are logged
+/// and counted (NOT propagated), matching the original loop's
+/// semantics so a transient embedder fault doesn't block MCP
+/// readiness.
 pub fn run_embedding_backfill(
     conn: &mut rusqlite::Connection,
     emb: &dyn Embed,
@@ -2482,7 +2496,7 @@ pub fn run_embedding_backfill(
     // `AppConfig::resolve_embeddings().backfill_batch` so
     // `[embeddings].backfill_batch` in `config.toml` is honoured
     // even when the env var is unset (issue #1260).
-    let batch_size = std::env::var("AI_MEMORY_EMBED_BACKFILL_BATCH")
+    let batch_size = std::env::var(crate::config::ENV_EMBED_BACKFILL_BATCH)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -2521,22 +2535,22 @@ pub fn run_embedding_backfill_with_batch_size(
         batch_size
     };
 
-    // #1579 B6 (F5.6) — bounded drain loop. The pre-fix path
-    // materialised EVERY unembedded `(id, title, content)` triple in
-    // one Vec before chunking, which on a cold 100k-row corpus is the
-    // whole table in memory. Each pass now fetches at most
-    // `batch_size` rows (`db::get_unembedded_ids_batch`); rows that
-    // gain an embedding drop out of the `embedding IS NULL` predicate,
-    // so re-fetching until the batch comes back empty drains the
-    // backlog with bounded materialisation. A pass that makes ZERO
-    // progress (embedder fault, write fault, or rows that persistently
-    // fail) breaks out instead of spinning on the same head rows —
-    // the next backfill sweep retries them.
+    // #1579 B6 (F5.6) + #1595 — bounded keyset drain loop. Each pass
+    // fetches at most `batch_size` rows strictly after the cursor
+    // (`db::get_unembedded_ids_batch_after`), so materialisation stays
+    // bounded AND the cursor advances past skipped (persistently
+    // failing / oversize) rows instead of re-fetching the same head
+    // forever. The pre-#1595 head-scan + no-progress break meant one
+    // poison row stopped the whole sweep with 0 rows backfilled.
+    // Termination is structural: every non-empty fetch strictly
+    // advances the cursor.
     let mut ok = 0usize;
+    let mut skipped = 0usize;
     let mut scanned = 0usize;
     let mut announced = false;
+    let mut cursor: Option<String> = None;
     loop {
-        let chunk = db::get_unembedded_ids_batch(conn, batch_size)?;
+        let chunk = db::get_unembedded_ids_batch_after(conn, cursor.as_deref(), batch_size)?;
         if chunk.is_empty() {
             // Idempotence: zero rows scanned ⇒ zero work; on the
             // first pass no log line is emitted so re-runs on a
@@ -2548,74 +2562,135 @@ pub fn run_embedding_backfill_with_batch_size(
             announced = true;
         }
         scanned += chunk.len();
-        let ok_before = ok;
+        cursor = chunk.last().map(|(id, _, _)| id.clone());
 
-        // #1579 — routed through the canonical `embedding_document`
-        // template (#1558 batch 5 SSOT) instead of an inline `format!`
-        // spelling of the same shape.
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|(_, t, c)| crate::embeddings::embedding_document(t, c))
-            .collect();
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-
-        match emb.embed_batch(&text_refs) {
-            Err(e) => {
-                eprintln!(
-                    "ai-memory: embed_batch failed for chunk of {} rows: {e} (stopping this sweep)",
-                    chunk.len()
-                );
-            }
-            // Defensive: a well-behaved embedder must return one vector
-            // per input. If a future custom impl violates the contract,
-            // fall back to the per-row path for safety rather than
-            // misaligning ids with vectors.
-            Ok(embeddings) if embeddings.len() != chunk.len() => {
-                eprintln!(
-                    "ai-memory: embed_batch returned {} vectors for {} inputs — falling back to per-row path for this chunk",
-                    embeddings.len(),
-                    chunk.len()
-                );
-                for (id, title, content) in &chunk {
-                    let text = crate::embeddings::embedding_document(title, content);
-                    if let Ok(v) = emb.embed(&text)
-                        && db::set_embedding(conn, id, &v).is_ok()
-                    {
-                        ok += 1;
-                    }
-                }
-            }
-            Ok(embeddings) => {
-                let entries: Vec<(String, Vec<f32>)> = chunk
-                    .iter()
-                    .zip(embeddings.into_iter())
-                    .map(|((id, _, _), v)| (id.clone(), v))
-                    .collect();
-
-                match db::set_embeddings_batch(conn, &entries) {
-                    Ok(n) => ok += n,
-                    Err(e) => {
-                        eprintln!(
-                            "ai-memory: set_embeddings_batch failed for chunk of {} rows: {e} (stopping this sweep)",
-                            chunk.len()
-                        );
-                    }
-                }
-            }
+        let embedded = embed_rows_with_fallback(emb, &chunk);
+        for (id, reason) in &embedded.skipped {
+            eprintln!("ai-memory: backfill skipped row {id}: {reason} (#1595)");
+        }
+        skipped += embedded.skipped.len();
+        if embedded.entries.is_empty() {
+            continue;
         }
 
-        if ok == ok_before {
-            // No progress this pass — the same rows would come back on
-            // the next fetch. Break so a persistently-failing row (or a
-            // down embedder) cannot wedge the sweep in a hot loop.
-            break;
+        match db::set_embeddings_batch(conn, &embedded.entries) {
+            Ok(n) => ok += n,
+            Err(e) => {
+                // #1595 — a chunk-level write fault (e.g. one row
+                // tripping the G4 namespace-dim invariant) falls back
+                // to per-row writes so the rest of the chunk still
+                // lands; rows that still fail are skipped with a WARN.
+                eprintln!(
+                    "ai-memory: set_embeddings_batch failed for chunk of {} rows: {e} \
+                     — falling back to per-row writes (#1595)",
+                    embedded.entries.len()
+                );
+                for (id, v) in &embedded.entries {
+                    match db::set_embedding(conn, id, v) {
+                        Ok(()) => ok += 1,
+                        Err(e) => {
+                            eprintln!("ai-memory: backfill skipped row {id}: {e} (#1595)");
+                            skipped += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
     if scanned > 0 {
-        eprintln!("ai-memory: backfilled {ok}/{scanned}");
+        eprintln!("ai-memory: backfilled {ok}/{scanned} (skipped {skipped})");
     }
     Ok(ok)
+}
+
+/// #1595 — vectors-plus-skips outcome of embedding one fetched chunk.
+/// Shared by the boot backfill sweep and the `ai-memory reembed` CLI
+/// so their resilience semantics cannot drift.
+pub(crate) struct EmbeddedRows {
+    /// `(id, vector)` pairs ready for a batched write.
+    pub(crate) entries: Vec<(String, Vec<f32>)>,
+    /// `(id, reason)` pairs for rows that could not be embedded this
+    /// pass (oversize input or per-row embedder failure).
+    pub(crate) skipped: Vec<(String, String)>,
+}
+
+/// #1595 — embed a chunk of `(id, title, content)` rows with per-row
+/// failure isolation:
+///
+/// 1. Rows whose canonical document text
+///    ([`crate::embeddings::embedding_document`]) exceeds
+///    [`crate::embeddings::EMBED_MAX_BYTES`] are skipped CLIENT-SIDE
+///    (same guard + reason text as `embed_with_status` on the store
+///    path) — they are never sent to the backend at all.
+/// 2. The remaining rows go through one [`Embed::embed_batch`] call.
+/// 3. On a chunk-level fault (error OR a vector-count misalignment),
+///    fall back to per-row [`Embed::embed`]; rows that still fail are
+///    reported in `skipped` with the embedder's error as the reason.
+///
+/// Pure with respect to the DB — callers own the write (checked
+/// `set_embeddings_batch` for backfill, replace-semantics
+/// `set_embeddings_batch_reembed` for the #1598 migration sweep) and
+/// the WARN emission, so the helper stays unit-testable without I/O.
+pub(crate) fn embed_rows_with_fallback(
+    emb: &dyn Embed,
+    rows: &[(String, String, String)],
+) -> EmbeddedRows {
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    // (id, document text) pairs that pass the client-side size guard.
+    let mut candidates: Vec<(&str, String)> = Vec::with_capacity(rows.len());
+    for (id, title, content) in rows {
+        let text = crate::embeddings::embedding_document(title, content);
+        if let Some(reason) = crate::embeddings::oversize_embed_reason(text.len()) {
+            skipped.push((id.clone(), reason));
+        } else {
+            candidates.push((id.as_str(), text));
+        }
+    }
+
+    let text_refs: Vec<&str> = candidates.iter().map(|(_, t)| t.as_str()).collect();
+    let mut entries: Vec<(String, Vec<f32>)> = Vec::with_capacity(candidates.len());
+    let batch = if text_refs.is_empty() {
+        Ok(Vec::new())
+    } else {
+        emb.embed_batch(&text_refs)
+    };
+    match batch {
+        // The happy path requires the embedder contract (one vector
+        // per input) to hold; a misaligned result would pair ids with
+        // the wrong vectors and silently corrupt semantic recall.
+        Ok(vectors) if vectors.len() == candidates.len() => {
+            entries.extend(
+                candidates
+                    .iter()
+                    .zip(vectors)
+                    .map(|((id, _), v)| ((*id).to_string(), v)),
+            );
+        }
+        batch_fault => {
+            match &batch_fault {
+                Ok(vectors) => eprintln!(
+                    "ai-memory: embed_batch returned {} vectors for {} inputs — \
+                     falling back to per-row embeds for this chunk (#1595)",
+                    vectors.len(),
+                    candidates.len()
+                ),
+                Err(e) => eprintln!(
+                    "ai-memory: embed_batch failed for chunk of {} rows: {e} — \
+                     falling back to per-row embeds (#1595)",
+                    candidates.len()
+                ),
+            }
+            for (id, text) in &candidates {
+                match emb.embed(text) {
+                    Ok(v) => entries.push(((*id).to_string(), v)),
+                    Err(e) => skipped.push(((*id).to_string(), format!("{e:#}"))),
+                }
+            }
+        }
+    }
+
+    EmbeddedRows { entries, skipped }
 }
 
 /// Run the MCP server over stdio. Blocks until stdin closes.
@@ -2832,79 +2907,59 @@ pub fn run_mcp_server(
 
     // --- Initialize embedder (semantic tier and above) ---
     //
-    // #1143: clone-the-LLM-client-for-embeddings only when the LLM
-    // client speaks the Ollama wire shape. Pre-#1143 the embed client
-    // unconditionally cloned `llm` when `embed_url == ollama_url`,
-    // which silently routed embedding requests through an
-    // OpenAI-compatible (xAI / OpenAI / Anthropic / …) client whose
-    // `/v1/embeddings` endpoint either doesn't exist (xAI Grok,
-    // Anthropic Messages) or uses a different model namespace.
-    // Result: operators who set `AI_MEMORY_LLM_BACKEND=xai` lost
-    // semantic recall silently. Post-#1143 we keep the clone only for
-    // Ollama-native clients; for OpenAI-compatible LLM clients we
-    // always build a dedicated local-Ollama embed client against the
-    // configured embed URL.
-    let embed_client: Option<Arc<OllamaClient>> = {
-        let embed_url = app_config.effective_embed_url();
-        let ollama_url = app_config.effective_ollama_url();
-        let llm_is_ollama = llm.as_ref().is_some_and(|c| c.is_ollama_native());
-        if embed_url == ollama_url && llm_is_ollama {
-            llm.clone()
-        } else {
-            if embed_url != ollama_url {
-                eprintln!("ai-memory: using separate embed URL: {embed_url}");
-            } else if !llm_is_ollama {
-                eprintln!(
-                    "ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape); \
-                     building dedicated Ollama embed client at {embed_url} (#1143)"
-                );
+    // #1598 — single shared boot entry: `Embedder::from_resolved`
+    // consumes the canonical `AppConfig::resolve_embeddings()` ladder
+    // (AI_MEMORY_EMBED_* env > [embeddings] section > legacy flat >
+    // compiled default) and builds either an OpenAI-compatible remote
+    // embed client (API backends: OpenRouter, HF TEI, vLLM, …) or the
+    // historical dedicated-Ollama embed client. This supersedes the
+    // #1143 clone-the-LLM-client heuristic at this site: the embed
+    // client is ALWAYS its own client now, never a clone of the chat
+    // LLM client.
+    //
+    // #1593 FAIL-CLOSED: when embedder construction fails, the daemon
+    // degrades to keyword recall (embedder = None) with a loud stderr
+    // breadcrumb — it NEVER routes embedding requests through the
+    // chat LLM client (the pre-#1143 silent-wrong-wire-shape trap).
+    let resolved_embeddings = app_config.resolve_embeddings();
+    let embedder = match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model)
+    {
+        Ok(Some(emb)) => {
+            eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
+            // Backfill embeddings for memories that don't have them.
+            // v0.7.0 Wave-2 A5 (issue #853): scan all unembedded rows
+            // in a single query, then chunk into fixed-size batches
+            // and call `embed_batch` + `set_embeddings_batch` per
+            // chunk. This collapses N per-row UPDATE round-trips into
+            // ceil(N/B) transaction commits and creates the surface
+            // for a vectorised embedder backend to land later.
+            //
+            // v0.7.0 issue #1260 — batch size from the canonical #1146
+            // precedence ladder (AI_MEMORY_EMBED_BACKFILL_BATCH env >
+            // [embeddings].backfill_batch config > compiled default
+            // 100), via the same resolver output the embedder was
+            // built from.
+            let embed_batch_size = resolved_embeddings.backfill_batch as usize;
+            if let Err(e) =
+                run_embedding_backfill_with_batch_size(&mut conn, &emb, embed_batch_size)
+            {
+                eprintln!("ai-memory: backfill failed: {e}");
             }
-            match OllamaClient::new_with_url(embed_url, crate::embeddings::NOMIC_OLLAMA_MODEL) {
-                Ok(client) => Some(Arc::new(client)),
-                Err(e) => {
-                    eprintln!(
-                        "ai-memory: embed client failed: {e}, falling back to LLM client \
-                         (semantic recall will be a no-op if LLM is non-Ollama)"
-                    );
-                    llm.clone()
-                }
-            }
+            Some(emb)
         }
-    };
-    let embedder = if let Some(ref emb_model) = tier_config.embedding_model {
-        match Embedder::for_model(*emb_model, embed_client) {
-            Ok(emb) => {
-                eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
-                // Backfill embeddings for memories that don't have them.
-                // v0.7.0 Wave-2 A5 (issue #853): scan all unembedded rows
-                // in a single query, then chunk into fixed-size batches
-                // and call `embed_batch` + `set_embeddings_batch` per
-                // chunk. This collapses N per-row UPDATE round-trips into
-                // ceil(N/B) transaction commits and creates the surface
-                // for a vectorised embedder backend to land later.
-                //
-                // v0.7.0 issue #1260 — resolve batch size via
-                // `AppConfig::resolve_embeddings` (canonical #1146
-                // precedence ladder: CLI > AI_MEMORY_EMBED_BACKFILL_BATCH
-                // env > [embeddings].backfill_batch config > compiled
-                // default 100). Pre-fix the function read the env var
-                // directly, so the operator's config-file value was
-                // silently ignored when the env var was unset.
-                let embed_batch_size = app_config.resolve_embeddings().backfill_batch as usize;
-                if let Err(e) =
-                    run_embedding_backfill_with_batch_size(&mut conn, &emb, embed_batch_size)
-                {
-                    eprintln!("ai-memory: backfill failed: {e}");
-                }
-                Some(emb)
-            }
-            Err(e) => {
-                eprintln!("ai-memory: embedder failed: {e}");
-                None
-            }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!(
+                "ai-memory: embedder init failed (backend={}, model={}, url={}, \
+                 source={}): {e:#} — semantic recall DEGRADED to keyword \
+                 (#1143, #1593, #1598)",
+                resolved_embeddings.backend,
+                resolved_embeddings.model,
+                resolved_embeddings.url,
+                resolved_embeddings.source.as_str(),
+            );
+            None
         }
-    } else {
-        None
     };
 
     // --- Build HNSW vector index (semantic tier and above) ---
@@ -14072,5 +14127,253 @@ mod tests {
             .expect("read_until OK");
         assert_eq!(m, "second line\n".len());
         assert_eq!(buf.last(), Some(&b'\n'));
+    }
+}
+
+/// #1595 — regression pins for the resilient embedding-backfill sweep:
+/// one poison row (over-context-length / persistently-failing) must no
+/// longer stop the sweep with 0 rows backfilled. See
+/// `run_embedding_backfill_with_batch_size` + `embed_rows_with_fallback`.
+#[cfg(test)]
+mod backfill_resilience_1595_tests {
+    use super::*;
+    use crate::models::{Memory, Tier};
+
+    /// Marker that makes [`PoisonEmbedder`] reject a row, simulating
+    /// the live-DB failure mode (Ollama: `{"error":"the input length
+    /// exceeds the context length"}`).
+    const POISON_MARKER: &str = "poison-row-marker-1595";
+
+    fn seed(conn: &rusqlite::Connection, title: &str, content: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "bf-1595".to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        db::insert(conn, &mem).unwrap()
+    }
+
+    /// Errors on any text carrying [`POISON_MARKER`]; embeds everything
+    /// else as a fixed 4-dim vector. `embed_batch` uses the trait
+    /// default (per-text loop, first error propagates), so a poison row
+    /// fails its whole chunk — exactly the #1595 defect shape.
+    struct PoisonEmbedder;
+    impl Embed for PoisonEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            if text.contains(POISON_MARKER) {
+                anyhow::bail!("test: the input length exceeds the context length");
+            }
+            Ok(vec![0.5_f32; 4])
+        }
+    }
+
+    /// Records the byte length of every text it is asked to embed, so
+    /// the client-side oversize guard can be proven (the oversize text
+    /// must never reach the backend).
+    struct RecordingEmbedder {
+        seen_lens: std::sync::Mutex<Vec<usize>>,
+    }
+    impl Embed for RecordingEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.seen_lens.lock().unwrap().push(text.len());
+            Ok(vec![0.5_f32; 4])
+        }
+    }
+
+    /// A corpus with one poison row backfills every other row and
+    /// reports the poison row as skipped (it stays unembedded for the
+    /// next sweep); the sweep CONTINUES past the failing chunk instead
+    /// of stopping (pre-fix: 0 rows ever backfilled).
+    #[test]
+    fn backfill_skips_poison_row_and_continues_1595() {
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        for i in 0..2 {
+            seed(&conn, &format!("ok-head-{i}"), "plain healthy content");
+        }
+        seed(&conn, "poison", POISON_MARKER);
+        for i in 0..2 {
+            seed(&conn, &format!("ok-tail-{i}"), "plain healthy content");
+        }
+
+        let ok = run_embedding_backfill_with_batch_size(&mut conn, &PoisonEmbedder, 2)
+            .expect("sweep must not error");
+        assert_eq!(ok, 4, "all healthy rows backfilled");
+
+        let remaining = db::get_unembedded_ids(&conn).unwrap();
+        assert_eq!(remaining.len(), 1, "exactly skipped=1 (the poison row)");
+        assert!(
+            remaining[0].2.contains(POISON_MARKER),
+            "the surviving unembedded row is the poison row"
+        );
+    }
+
+    /// Rows whose `title + content` exceeds `EMBED_MAX_BYTES` are
+    /// skipped CLIENT-SIDE — the embedder never sees them (consistent
+    /// with `embed_with_status` store-path semantics).
+    #[test]
+    fn backfill_oversize_row_skipped_client_side_1595() {
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "small-a", "fits fine");
+        seed(
+            &conn,
+            "huge",
+            &"a".repeat(crate::embeddings::EMBED_MAX_BYTES + 1),
+        );
+        seed(&conn, "small-b", "also fits");
+
+        let emb = RecordingEmbedder {
+            seen_lens: std::sync::Mutex::new(Vec::new()),
+        };
+        let ok = run_embedding_backfill_with_batch_size(&mut conn, &emb, 10)
+            .expect("sweep must not error");
+        assert_eq!(ok, 2, "both small rows backfilled");
+
+        let remaining = db::get_unembedded_ids(&conn).unwrap();
+        assert_eq!(remaining.len(), 1, "oversize row skipped, not embedded");
+        assert_eq!(remaining[0].1, "huge");
+
+        let lens = emb.seen_lens.lock().unwrap();
+        assert!(
+            lens.iter()
+                .all(|&l| l <= crate::embeddings::EMBED_MAX_BYTES),
+            "oversize text must never be sent to the embedder, seen lens: {lens:?}"
+        );
+    }
+
+    /// Chunk-level `embed_batch` fault → per-row fallback recovers
+    /// every row (no skips) when individual embeds succeed.
+    #[test]
+    fn embed_rows_with_fallback_batch_fault_recovers_per_row_1595() {
+        struct BatchFailsRowsWork;
+        impl Embed for BatchFailsRowsWork {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.25_f32; 3])
+            }
+            fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                anyhow::bail!("test: synthetic chunk-level failure")
+            }
+        }
+        let rows: Vec<(String, String, String)> = (0..3)
+            .map(|i| (format!("id-{i}"), format!("t-{i}"), format!("c-{i}")))
+            .collect();
+        let out = embed_rows_with_fallback(&BatchFailsRowsWork, &rows);
+        assert_eq!(out.entries.len(), 3);
+        assert!(out.skipped.is_empty());
+        assert_eq!(out.entries[0].0, "id-0");
+    }
+
+    /// A misaligned `embed_batch` (wrong vector count) must NOT pair
+    /// ids with the wrong vectors — it falls back to per-row embeds.
+    #[test]
+    fn embed_rows_with_fallback_misaligned_batch_recovers_per_row_1595() {
+        struct MisalignedEmbedder;
+        impl Embed for MisalignedEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.75_f32; 3])
+            }
+            fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![0.1_f32; 3]])
+            }
+        }
+        let rows: Vec<(String, String, String)> = (0..2)
+            .map(|i| (format!("id-{i}"), format!("t-{i}"), format!("c-{i}")))
+            .collect();
+        let out = embed_rows_with_fallback(&MisalignedEmbedder, &rows);
+        assert_eq!(out.entries.len(), 2, "per-row fallback recovers both");
+        assert!(out.skipped.is_empty());
+        assert!(
+            out.entries.iter().all(|(_, v)| v.len() == 3),
+            "vectors come from the per-row path, not the misaligned batch"
+        );
+    }
+
+    /// Per-row fallback skips ONLY the failing rows; the rest of the
+    /// chunk still embeds (the heart of the #1595 fix).
+    #[test]
+    fn embed_rows_with_fallback_reports_per_row_skips_1595() {
+        let rows = vec![
+            ("id-ok".to_string(), "t".to_string(), "fine".to_string()),
+            (
+                "id-bad".to_string(),
+                "t".to_string(),
+                POISON_MARKER.to_string(),
+            ),
+        ];
+        let out = embed_rows_with_fallback(&PoisonEmbedder, &rows);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].0, "id-ok");
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].0, "id-bad");
+        assert!(
+            out.skipped[0].1.contains("context length"),
+            "skip reason carries the embedder error: {}",
+            out.skipped[0].1
+        );
+    }
+
+    /// Empty input chunk is a structural no-op (no embedder calls).
+    #[test]
+    fn embed_rows_with_fallback_empty_rows_is_noop_1595() {
+        struct PanickingEmbedder;
+        impl Embed for PanickingEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                unreachable!("must not be called for an empty chunk")
+            }
+        }
+        let out = embed_rows_with_fallback(&PanickingEmbedder, &[]);
+        assert!(out.entries.is_empty());
+        assert!(out.skipped.is_empty());
+    }
+
+    /// Chunk-level WRITE fault (G4 namespace-dim invariant) falls back
+    /// to per-row writes; rows that still fail are skipped and the
+    /// sweep terminates cleanly with Ok.
+    #[test]
+    fn backfill_write_fault_falls_back_per_row_1595() {
+        struct EightDimEmbedder;
+        impl Embed for EightDimEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.5_f32; 8])
+            }
+        }
+        let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // Establish a 4-dim namespace so the 8-dim writes are refused.
+        let est = seed(&conn, "established", "already embedded");
+        db::set_embedding(&conn, &est, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        seed(&conn, "new-a", "needs embedding");
+        seed(&conn, "new-b", "needs embedding");
+
+        let ok = run_embedding_backfill_with_batch_size(&mut conn, &EightDimEmbedder, 10)
+            .expect("write faults must not propagate");
+        assert_eq!(ok, 0, "dim-mismatched rows cannot land");
+        assert_eq!(
+            db::get_unembedded_ids(&conn).unwrap().len(),
+            2,
+            "both rows skipped (left for the next sweep), sweep terminated"
+        );
     }
 }

@@ -74,6 +74,22 @@
 //!    compiled 256 MiB default` through `AppConfig::resolve_storage()`;
 //!    explicit `0` (mmap disabled) is honoured, garbage falls through.
 //!
+//! 9. **`test_embed_env_overrides_config_1598`** (#1598) — the four
+//!    embedding knobs (`AI_MEMORY_EMBED_BACKEND` / `_BASE_URL` /
+//!    `_MODEL` / `_API_KEY`, env-var table rows #72-75) resolve `env >
+//!    [embeddings] section` through `AppConfig::resolve_embeddings()`.
+//!    Both ladder halves run against one fixture (config wins when env
+//!    is scrubbed; env wins when set), including the dim re-derivation
+//!    from the env-selected model and the `ConfigSource` provenance
+//!    flip.
+//!
+//! 10. **`test_embed_secret_not_in_capabilities_1598`** (#1598) —
+//!     `AI_MEMORY_EMBED_API_KEY` is classified `secret` (table row
+//!     #75); neither its value nor its name may appear in the
+//!     serialized `memory_capabilities` response (v2 AND v3 envelopes).
+//!     Mirrors `test_secret_not_in_capabilities` for the embeddings
+//!     sibling of the LLM key.
+//!
 //! All tests serialize env mutation through the shared `ENV_LOCK`: the
 //! single-key tests via [`EnvVarGuard`], and the multi-key `[limits]`
 //! tests via [`MultiEnvVarGuard`] (which acquires the non-reentrant
@@ -576,5 +592,197 @@ fn test_db_mmap_size_env_overrides_config_and_default() {
     assert_eq!(
         r_zero.db_mmap_size_bytes, 0,
         "explicit 0 disables mmap and must NOT fall through",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. #1598 — AI_MEMORY_EMBED_{BACKEND,BASE_URL,MODEL,API_KEY} env vars
+//    override the [embeddings] config section through
+//    AppConfig::resolve_embeddings() (env-var table rows #72-75).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_embed_env_overrides_config_1598() {
+    use ai_memory::config::{
+        ConfigSource, ENV_EMBED_API_KEY, ENV_EMBED_BACKEND, ENV_EMBED_BACKFILL_BATCH,
+        ENV_EMBED_BASE_URL, ENV_EMBED_MODEL, EmbeddingsSection,
+    };
+
+    // [embeddings] section sets every knob the env vars compete with.
+    // `api_key_env` names a section-pointed env var so the key ladder's
+    // config layer is live in the same fixture.
+    let cfg = AppConfig {
+        embeddings: Some(EmbeddingsSection {
+            backend: Some("openrouter".to_string()),
+            base_url: Some("https://config.example/v1".to_string()),
+            model: Some("bge-large-en".to_string()),
+            api_key_env: Some("CONFIG_POINTED_EMBED_KEY_1598".to_string()),
+            backfill_batch: Some(42),
+            ..EmbeddingsSection::default()
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env scrubbed → the [embeddings] section wins ----
+    // The vendor-alias fallback vars (OPENROUTER_API_KEY for the
+    // config-selected backend) are scrubbed too so an operator shell
+    // can't satisfy the key ladder out-of-band.
+    let guard_a = MultiEnvVarGuard::apply(&[
+        (ENV_EMBED_BACKEND, None),
+        (ENV_EMBED_BASE_URL, None),
+        (ENV_EMBED_MODEL, None),
+        (ENV_EMBED_API_KEY, None),
+        (ENV_EMBED_BACKFILL_BATCH, None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("CONFIG_POINTED_EMBED_KEY_1598", Some("config-ladder-key")),
+    ]);
+    let r_cfg = cfg.resolve_embeddings();
+    assert_eq!(
+        r_cfg.backend, "openrouter",
+        "[embeddings].backend must win when env is unset"
+    );
+    assert_eq!(
+        r_cfg.url, "https://config.example/v1",
+        "[embeddings].base_url must win when env is unset",
+    );
+    assert_eq!(
+        r_cfg.model, "bge-large-en",
+        "[embeddings].model must win when env is unset"
+    );
+    assert_eq!(
+        r_cfg.backfill_batch, 42,
+        "[embeddings].backfill_batch must win"
+    );
+    assert_eq!(
+        r_cfg.embedding_dim,
+        Some(1024),
+        "dim must derive from the config-selected model via KNOWN_EMBEDDING_DIMS",
+    );
+    assert_eq!(
+        r_cfg.api_key(),
+        Some("config-ladder-key"),
+        "[embeddings].api_key_env must resolve the section-pointed env var",
+    );
+    assert_eq!(
+        r_cfg.source,
+        ConfigSource::Config,
+        "provenance must report Config"
+    );
+    drop(guard_a);
+
+    // ---- Branch B: all four #1598 env vars beat the section ----
+    let _guard_b = MultiEnvVarGuard::apply(&[
+        (ENV_EMBED_BACKEND, Some("openai-compatible")),
+        (ENV_EMBED_BASE_URL, Some("http://env.example:8080/v1")),
+        (ENV_EMBED_MODEL, Some("text-embedding-3-large")),
+        (ENV_EMBED_API_KEY, Some("env-wins-key-1598")),
+        (ENV_EMBED_BACKFILL_BATCH, Some("7")),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("CONFIG_POINTED_EMBED_KEY_1598", Some("config-ladder-key")),
+    ]);
+    let r_env = cfg.resolve_embeddings();
+    assert_eq!(
+        r_env.backend, "openai-compatible",
+        "AI_MEMORY_EMBED_BACKEND env MUST beat [embeddings].backend",
+    );
+    assert_eq!(
+        r_env.url, "http://env.example:8080/v1",
+        "AI_MEMORY_EMBED_BASE_URL env MUST beat [embeddings].base_url",
+    );
+    assert_eq!(
+        r_env.model, "text-embedding-3-large",
+        "AI_MEMORY_EMBED_MODEL env MUST beat [embeddings].model",
+    );
+    assert_eq!(
+        r_env.backfill_batch, 7,
+        "AI_MEMORY_EMBED_BACKFILL_BATCH env MUST beat config"
+    );
+    assert_eq!(
+        r_env.embedding_dim,
+        Some(3072),
+        "dim must re-derive from the ENV-selected model, not the config one",
+    );
+    assert_eq!(
+        r_env.api_key(),
+        Some("env-wins-key-1598"),
+        "AI_MEMORY_EMBED_API_KEY env MUST beat [embeddings].api_key_env",
+    );
+    assert_eq!(
+        r_env.source,
+        ConfigSource::Env,
+        "provenance must report Env"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. #1598 — the AI_MEMORY_EMBED_API_KEY secret value MUST NOT appear
+//     in the memory_capabilities JSON response (v2 + v3 envelopes).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_embed_secret_not_in_capabilities_1598() {
+    // Recognizable plaintext a stray serializer would echo verbatim;
+    // distinct from every production constant and from the LLM-key
+    // canary in test_secret_not_in_capabilities.
+    const SECRET: &str = "embed-secret-precedence-canary-1598-c4d7";
+
+    let _guard = EnvVarGuard::set(ai_memory::config::ENV_EMBED_API_KEY, SECRET.to_string());
+
+    // Sanity: the env var IS set, so the no-leak assertions below are
+    // exercising a live secret rather than tautologically passing.
+    assert_eq!(
+        std::env::var(ai_memory::config::ENV_EMBED_API_KEY).as_deref(),
+        Ok(SECRET),
+        "EnvVarGuard must actually set AI_MEMORY_EMBED_API_KEY before probing capabilities",
+    );
+
+    let tier_config = semantic_tier();
+    let response = handle_capabilities_with_conn(
+        &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
+        None,
+        false,
+        None,
+        CapabilitiesAccept::V2,
+    )
+    .expect("v2 capabilities serialize");
+    let response_str =
+        serde_json::to_string(&response).expect("capabilities response JSON-serializes");
+    assert!(
+        !response_str.contains(SECRET),
+        "memory_capabilities response MUST NOT contain AI_MEMORY_EMBED_API_KEY; \
+         secret leaked into JSON: {response_str}",
+    );
+    assert!(
+        !response_str.contains("AI_MEMORY_EMBED_API_KEY"),
+        "memory_capabilities response MUST NOT mention the secret env-var name \
+         either (information disclosure); got: {response_str}",
+    );
+
+    // V3 envelope carries additional overlays — pin the same no-leak
+    // property there (mirrors the #1259 extension for the passphrase).
+    let response_v3 = handle_capabilities_with_conn_v3(
+        &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
+        None,
+        false,
+        None,
+        &Profile::full(),
+        None,
+        None,
+        None,
+    )
+    .expect("v3 capabilities serialize");
+    let response_v3_str =
+        serde_json::to_string(&response_v3).expect("v3 capabilities response JSON-serializes");
+    assert!(
+        !response_v3_str.contains(SECRET),
+        "v3 memory_capabilities response MUST NOT contain AI_MEMORY_EMBED_API_KEY; \
+         secret leaked into JSON: {response_v3_str}",
+    );
+    assert!(
+        !response_v3_str.contains("AI_MEMORY_EMBED_API_KEY"),
+        "v3 memory_capabilities response MUST NOT mention the secret env-var name \
+         either; got: {response_v3_str}",
     );
 }
