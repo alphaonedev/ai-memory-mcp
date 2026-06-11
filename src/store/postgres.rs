@@ -74,6 +74,12 @@ use crate::quotas::{QuotaStatus, quota_defaults};
 // Duplicated literals in this adapter hoisted to named consts per the
 // pm-v3.1 hardcoded-literal lint-gate (scripts/check-hardcoded-literals.sh).
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
+/// #1642 — postgres twin of `storage::SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID`
+/// (`src/storage/mod.rs`): deleting a memory that serves as a namespace
+/// standard must also remove the `namespace_meta` row that points at it,
+/// or the namespace keeps enforcing a standard whose backing memory is gone.
+const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
+    "DELETE FROM namespace_meta WHERE standard_id = $1";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
@@ -9193,6 +9199,19 @@ impl MemoryStore for PostgresStore {
                 Some(Some(_)) => {} // owner matches; proceed
             }
         }
+
+        // #1642 — parity with sqlite `storage::delete`
+        // (`src/storage/mod.rs:1747-1751`): if this memory is registered
+        // as a namespace standard, drop the `namespace_meta` row(s)
+        // pointing at it BEFORE deleting the memory, mirroring the
+        // sqlite ordering. Pre-fix the postgres delete left a dangling
+        // `namespace_meta.standard_id` so governance kept resolving a
+        // standard whose backing memory no longer existed.
+        sqlx::query(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("delete: namespace_meta cleanup", e))?;
 
         let rows_affected = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
             .bind(id)
