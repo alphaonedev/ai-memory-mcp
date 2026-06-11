@@ -4618,10 +4618,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
 
-        sqlx::query(SQL_LOAD_AGE)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("LOAD age", e))?;
+        // #1640 — tolerated LOAD (see load_age_tolerated): a role-level
+        // LOAD refusal must not fail the query on fleets where
+        // shared_preload_libraries provides the library.
+        load_age_tolerated(&mut tx).await?;
         // #925 (2026-05-20): use `SET LOCAL` so the search_path
         // mutation is transaction-scoped and auto-reverts at
         // COMMIT/ROLLBACK. Pre-fix the bare `SET search_path`
@@ -4923,10 +4923,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
 
-        sqlx::query(SQL_LOAD_AGE)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("LOAD age", e))?;
+        // #1640 — tolerated LOAD (see load_age_tolerated): a role-level
+        // LOAD refusal must not fail the query on fleets where
+        // shared_preload_libraries provides the library.
+        load_age_tolerated(&mut tx).await?;
         sqlx::query(SQL_SET_AGE_SEARCH_PATH)
             .execute(&mut *tx)
             .await
@@ -5298,10 +5298,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
 
-        sqlx::query(SQL_LOAD_AGE)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("LOAD age", e))?;
+        // #1640 — tolerated LOAD (see load_age_tolerated): a role-level
+        // LOAD refusal must not fail the query on fleets where
+        // shared_preload_libraries provides the library.
+        load_age_tolerated(&mut tx).await?;
         sqlx::query(SQL_SET_AGE_SEARCH_PATH)
             .execute(&mut *tx)
             .await
@@ -5666,10 +5666,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
 
-        sqlx::query(SQL_LOAD_AGE)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("LOAD age", e))?;
+        // #1640 — tolerated LOAD (see load_age_tolerated): a role-level
+        // LOAD refusal must not fail the query on fleets where
+        // shared_preload_libraries provides the library.
+        load_age_tolerated(&mut tx).await?;
         sqlx::query(SQL_SET_AGE_SEARCH_PATH)
             .execute(&mut *tx)
             .await
@@ -6214,6 +6214,10 @@ impl PostgresStore {
             detail: format!("invalid tier value: {tier_str}"),
         })?;
 
+        // #1636 — pre-read the id so corrupt-provenance warns can name
+        // the row (parity with the sqlite mapper's COR-3 hardening).
+        let row_id: String = row.try_get("id").map_err(|e| to_store_err("read id", e))?;
+
         let tags_json: serde_json::Value = row
             .try_get("tags")
             .map_err(|e| to_store_err("read tags", e))?;
@@ -6236,7 +6240,7 @@ impl PostgresStore {
             .unwrap_or_default();
 
         Ok(Memory {
-            id: row.try_get("id").map_err(|e| to_store_err("read id", e))?,
+            id: row_id.clone(),
             tier,
             namespace: row
                 .try_get("namespace")
@@ -6280,18 +6284,33 @@ impl PostgresStore {
             // SQL DEFAULT '[]' on `citations` keeps legacy rows visible
             // as the empty vec; pre-v37 backups missing the column hit
             // the `.unwrap_or_default()` fallthrough below.
-            citations: row
-                .try_get::<String, _>("citations")
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default(),
+            citations: match row.try_get::<String, _>("citations") {
+                // Pre-v37 backup: column absent — silent empty is correct.
+                Err(_) => Vec::new(),
+                Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                    // #1636 — corrupt CONTENT is observable (COR-3
+                    // parity with the sqlite mapper), not silently
+                    // defaulted.
+                    tracing::warn!(memory_id = %row_id, "corrupt citations JSON in postgres row: {e}");
+                    crate::metrics::record_corrupt_provenance("citations");
+                    Vec::new()
+                }),
+            },
             source_uri: row
                 .try_get::<Option<String>, _>(field_names::SOURCE_URI)
                 .unwrap_or(None),
             source_span: row
                 .try_get::<Option<String>, _>(COL_SOURCE_SPAN)
                 .unwrap_or(None)
-                .and_then(|s| serde_json::from_str(&s).ok()),
+                .and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        // #1636 — COR-3 observability parity.
+                        tracing::warn!(memory_id = %row_id, "corrupt source_span JSON in postgres row: {e}");
+                        crate::metrics::record_corrupt_provenance(field_names::SOURCE_SPAN);
+                        None
+                    }
+                }),
             // v0.7.0 Form 5 — Postgres v38 confidence-provenance columns.
             // Pre-v38 backups missing the column hit the `.ok()`
             // fallthrough; legacy rows resolve to `CallerProvided`
@@ -6304,7 +6323,15 @@ impl PostgresStore {
             confidence_signals: row
                 .try_get::<Option<String>, _>(COL_CONFIDENCE_SIGNALS)
                 .unwrap_or(None)
-                .and_then(|s| serde_json::from_str(&s).ok()),
+                .and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        // #1636 — COR-3 observability parity.
+                        tracing::warn!(memory_id = %row_id, "corrupt confidence_signals JSON in postgres row: {e}");
+                        crate::metrics::record_corrupt_provenance(COL_CONFIDENCE_SIGNALS);
+                        None
+                    }
+                }),
             confidence_decayed_at: row
                 .try_get::<Option<String>, _>(field_names::CONFIDENCE_DECAYED_AT)
                 .unwrap_or(None),
@@ -7651,18 +7678,39 @@ async fn ensure_memory_graph(pool: &PgPool) -> StoreResult<()> {
         .begin()
         .await
         .map_err(|e| to_store_err("begin ensure_memory_graph tx", e))?;
-    sqlx::query(SQL_LOAD_AGE)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("LOAD age (ensure_memory_graph)", e))?;
+    // #1640 — tolerated LOAD (shared helper).
+    load_age_tolerated(&mut tx).await?;
     sqlx::query(SQL_SET_AGE_SEARCH_PATH)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("set search_path (ensure_memory_graph)", e))?;
-    if let Err(e) = sqlx::query(SQL_CREATE_AGE_GRAPH).execute(&mut *tx).await {
-        let msg = e.to_string();
-        if !msg.contains(PG_ERR_ALREADY_EXISTS) {
-            return Err(to_store_err("create_graph memory_graph", e));
+    // #1639 — the tolerated create_graph failure rides a SAVEPOINT
+    // (the #1542 gated pattern, same as project_link_into_age): a
+    // tolerated statement error inside an open tx otherwise puts
+    // postgres in the aborted-tx state, where the COMMIT below is
+    // silently a ROLLBACK that still reports Ok. Benign today only
+    // because nothing durable is queued in this tx; any future
+    // durable statement would vanish on every steady-state connect.
+    sqlx::query("SAVEPOINT create_age_graph")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("savepoint create_age_graph", e))?;
+    match sqlx::query(SQL_CREATE_AGE_GRAPH).execute(&mut *tx).await {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT create_age_graph")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("release create_age_graph", e))?;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains(PG_ERR_ALREADY_EXISTS) {
+                return Err(to_store_err("create_graph memory_graph", e));
+            }
+            sqlx::query("ROLLBACK TO SAVEPOINT create_age_graph")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("rollback create_age_graph savepoint", e))?;
         }
     }
     tx.commit()
@@ -7700,6 +7748,45 @@ async fn ensure_memory_graph(pool: &PgPool) -> StoreResult<()> {
 /// transactions so the SQL row + the AGE projection commit together
 /// — a half-projection with the SQL row but no AGE node would surface
 /// as a stale gap on `find_paths` queries.
+/// #1640 — tolerated `LOAD 'age'` inside an open transaction: the
+/// #1542 gated-SAVEPOINT pattern, hoisted so EVERY age consumer (link
+/// projection, the four cypher fns, ensure_memory_graph) shares it.
+/// PostgreSQL refuses `LOAD` for non-superuser roles even when
+/// `shared_preload_libraries='age'` provides the library (the do-1461
+/// fleet posture); pre-#1640 the four cypher read/invalidate fns
+/// treated that refusal as FATAL, permanently degrading KG queries to
+/// the CTE fallback (write-amplified AGE projections that were never
+/// read, and `kg_invalidate`'s AGE-side `SET r.valid_until` never
+/// executing). If `age` is genuinely absent, the next cypher
+/// statement still fails loudly and the caller's fallback handles it.
+async fn load_age_tolerated(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> StoreResult<()> {
+    sqlx::query("SAVEPOINT load_age_lib")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("savepoint load_age_lib", e))?;
+    match sqlx::query(SQL_LOAD_AGE).execute(&mut **tx).await {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT load_age_lib")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint load_age_lib", e))?;
+        }
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT load_age_lib")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("rollback savepoint load_age_lib", e2))?;
+            tracing::debug!(
+                target: TRACE_TARGET_KG,
+                err = %e,
+                "LOAD 'age' refused for this role — proceeding on the \
+                 assumption shared_preload_libraries provides it (#1542/#1640)"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn project_link_into_age(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     source_id: &str,
@@ -7723,43 +7810,9 @@ async fn project_link_into_age(
         });
     }
 
-    // #1542 — `LOAD 'age'` rides its own SAVEPOINT and its failure is
-    // TOLERATED. PostgreSQL refuses `LOAD` for non-superuser roles
-    // ("access to library \"age\" is not allowed") even when the
-    // library is already provided by `shared_preload_libraries='age'`
-    // (the do-1461 fleet posture). Pre-#1542 that refusal aborted the
-    // OUTER link transaction; the caller's warn-and-continue arm then
-    // issued COMMIT on an aborted tx, which PostgreSQL silently turns
-    // into ROLLBACK — `POST /api/v1/links` returned 201 while
-    // `memory_links` persisted NOTHING (the lived fleet finding: 201 +
-    // `linked:true` + zero rows, statement log showed the INSERT
-    // arriving and vanishing). If `age` is genuinely absent, the
-    // MERGE below still fails loudly and the caller's savepoint
-    // handles it.
-    sqlx::query("SAVEPOINT load_age_lib")
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| to_store_err("savepoint load_age_lib", e))?;
-    match sqlx::query(SQL_LOAD_AGE).execute(&mut **tx).await {
-        Ok(_) => {
-            sqlx::query("RELEASE SAVEPOINT load_age_lib")
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| to_store_err("release savepoint load_age_lib", e))?;
-        }
-        Err(e) => {
-            sqlx::query("ROLLBACK TO SAVEPOINT load_age_lib")
-                .execute(&mut **tx)
-                .await
-                .map_err(|e2| to_store_err("rollback savepoint load_age_lib", e2))?;
-            tracing::debug!(
-                target: TRACE_TARGET_KG,
-                err = %e,
-                "LOAD 'age' refused for this role — proceeding on the \
-                 assumption shared_preload_libraries provides it (#1542)"
-            );
-        }
-    }
+    // #1542/#1640 — shared tolerated-LOAD helper.
+    load_age_tolerated(tx).await?;
+
     // `SET LOCAL` confines the search path to the open transaction
     // (`link_internal` / `apply_remote_link`'s tx) so post-commit
     // checkouts of the same pooled connection don't inherit the
@@ -9558,13 +9611,10 @@ impl MemoryStore for PostgresStore {
         // timestamps parse. Integrity signatures land with the
         // provenance work on the Postgres track next sprint.
         let mem = self.get(_ctx, id).await?;
-        let mut findings = Vec::new();
-        if mem.content.is_empty() {
-            findings.push("empty content".to_string());
-        }
-        parse_rfc3339_required(&mem.created_at).map_err(|_| StoreError::IntegrityFailed {
-            detail: format!("invalid created_at on {id}"),
-        })?;
+        // #1624 — shared finding-checks (`store::integrity_findings`);
+        // a malformed created_at is now a FINDING (parity with sqlite)
+        // instead of a postgres-only IntegrityFailed hard error.
+        let findings = super::integrity_findings(&mem);
         Ok(VerifyReport {
             memory_id: id.to_string(),
             integrity_ok: findings.is_empty(),

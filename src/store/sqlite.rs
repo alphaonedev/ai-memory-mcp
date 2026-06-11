@@ -20,7 +20,7 @@ use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 
 use super::{
     BoxBackendError, CallerContext, Capabilities, CaptureTurnResult, CaptureTurnWrite, Filter,
-    MemoryStore, StoreError, StoreResult, Transaction, UpdatePatch, VerifyFilter, VerifyLinkReport,
+    MemoryStore, StoreError, StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport,
     VerifyReport, is_visible_to_caller,
 };
 use crate::quotas::{self, QuotaStatus};
@@ -293,20 +293,10 @@ impl MemoryStore for SqliteStore {
         let Some(mem) = db::get(&conn, id).map_err(box_err)? else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
-        // v0.6.0.0 preview: minimal integrity check. Confirms that
-        // the memory has a non-empty title + content and its
-        // `metadata.agent_id` round-trips as a string. Real
-        // signature verification lands alongside Task 1.4.
-        let mut findings: Vec<String> = Vec::new();
-        if mem.title.trim().is_empty() {
-            findings.push("title is empty".to_string());
-        }
-        if mem.content.trim().is_empty() {
-            findings.push("content is empty".to_string());
-        }
-        if mem.metadata.get("agent_id").is_none() {
-            findings.push("metadata.agent_id missing".to_string());
-        }
+        // #1624 — shared finding-checks (see `store::integrity_findings`)
+        // so sqlite and postgres report identical findings for
+        // identical rows. Real signature verification lands with #302.
+        let findings = super::integrity_findings(&mem);
         Ok(VerifyReport {
             memory_id: id.to_string(),
             integrity_ok: findings.is_empty(),
