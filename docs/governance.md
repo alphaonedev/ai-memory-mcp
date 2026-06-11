@@ -72,6 +72,31 @@ substrates, not for shared or federated deployments. Child
 namespaces inherit the parent's policy by default (`inherit: true`),
 so one standard at `org/` governs the subtree until a child opts out.
 
+### Enforcement scope ([#1617](https://github.com/alphaonedev/ai-memory-mcp/issues/1617))
+
+The namespace-standard `CorePolicy` gates the **direct write
+surfaces** (MCP tools, HTTP `POST/PUT` routes, CLI under a daemon
+context). It is **not** evaluated on the federation receive path:
+`/sync/push` applies the signed L1-6 rule engine (on both backends)
+but not the receiving node's namespace `CorePolicy`, because the
+peer is mTLS-trusted + signature-verified and `CorePolicy` is an
+authorship-time control. Operators configuring `write: owner` /
+`approve` should understand the gate binds where memories are
+*authored*, not where they replicate to. Receive-path hardening is
+in scope for the
+[#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464)
+v0.8 work.
+
+### Governance reach: memories writes only ([#1652](https://github.com/alphaonedev/ai-memory-mcp/issues/1652))
+
+The L1-6 pre-write rule engine and the namespace `CorePolicy` govern
+**memory and link writes**. Skill rows live in dedicated
+`skills` / `skill_resources` tables that the `memory_write` gate does
+not cover — skill registration/promotion/export are operator-surface
+artifacts outside namespace-rule reach at v0.7.0. A `skill_write`
+action kind for the rule engine is a v0.8 candidate; until then,
+treat skill registration as an operator-trust surface.
+
 ## Commands
 
 ```bash

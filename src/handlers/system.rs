@@ -105,7 +105,7 @@ pub async fn get_capabilities(
     // surfaces as a logged warning + a `0` fallback rather than a
     // 500 over the whole capabilities endpoint. Operators reading
     // this field consult it as a live progress indicator versus the
-    // binary's expected `CURRENT_SCHEMA_VERSION` (55 at v0.7.0); a
+    // binary's expected `CURRENT_SCHEMA_VERSION` (57 at v0.7.0; #1650); a
     // mismatch is meaningful, but a transient SAL hiccup must not
     // hide every other capability bit.
     #[cfg(feature = "sal")]

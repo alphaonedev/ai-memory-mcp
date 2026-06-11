@@ -6558,7 +6558,16 @@ impl AppConfig {
         let backfill_batch_raw = backfill_batch_env.or(backfill_batch_cfg);
         let backfill_batch = match backfill_batch_raw {
             Some(n) if (1..=10000).contains(&n) => n,
-            Some(_) | None => DEFAULT_EMBED_BACKFILL_BATCH,
+            // #1649 — out-of-range values were silently swallowed while
+            // the env-var table promised a warn-log (the sibling knob
+            // AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY already warns).
+            Some(n) => {
+                tracing::warn!(
+                    "{ENV_EMBED_BACKFILL_BATCH}={n} outside 1..=10000 — falling back to default {DEFAULT_EMBED_BACKFILL_BATCH}"
+                );
+                DEFAULT_EMBED_BACKFILL_BATCH
+            }
+            None => DEFAULT_EMBED_BACKFILL_BATCH,
         };
 
         let source = if env_backend.is_some() {
