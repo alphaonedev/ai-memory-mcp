@@ -388,3 +388,96 @@ async fn gemini_style_model_input_is_not_prefixed_1598() {
     .await
     .expect("blocking embed task must not panic");
 }
+
+// ---------------------------------------------------------------------------
+// 5. #1598 fleet follow-up — requested output dimensionality
+//    (`[embeddings].dim` → wire `dimensions` param for
+//    Matryoshka-capable API models).
+// ---------------------------------------------------------------------------
+
+/// When `requested_dim` is set on the resolved view, the
+/// OpenAI-compatible embed payload MUST carry `"dimensions": <dim>`
+/// — the mock only answers a body containing it, so a dropped param
+/// fails structurally.
+#[tokio::test(flavor = "multi_thread")]
+async fn requested_dim_sends_wire_dimensions_param_1598() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(body_partial_json(json!({
+            "model": "google/gemini-embedding-2",
+            "dimensions": 768
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(openai_embedding_response(&[0.5; 768])),
+        )
+        .mount(&server)
+        .await;
+
+    let resolved = ResolvedEmbeddings::from_parts(
+        "openrouter".to_string(),
+        server.uri(),
+        "google/gemini-embedding-2".to_string(),
+        Some(768),
+        Some("sk-or-dims-1598".to_string()),
+    )
+    .with_requested_dim(Some(768));
+    tokio::task::spawn_blocking(move || {
+        let embedder = Embedder::from_resolved(&resolved, Some(EmbeddingModel::NomicEmbedV15))
+            .expect("from_resolved with requested_dim must not error")
+            .expect("from_resolved with requested_dim must yield Some(embedder)");
+        let v = embedder
+            .embed("matryoshka requested-dim embed")
+            .expect("embed must succeed when the wire carries dimensions");
+        assert_eq!(v.len(), 768, "vector must come back at the requested dim");
+    })
+    .await
+    .expect("blocking embed task must not panic");
+}
+
+/// Without `requested_dim`, the payload MUST NOT carry a `dimensions`
+/// key — a table-derived dim describes the model's native output and
+/// must never be re-requested on the wire. The mock 422s any body
+/// containing the key.
+#[tokio::test(flavor = "multi_thread")]
+async fn table_dim_does_not_send_wire_dimensions_param_1598() {
+    let server = MockServer::start().await;
+    // Reject any request that carries "dimensions".
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(body_partial_json(json!({ "dimensions": 8 })))
+        .respond_with(ResponseTemplate::new(422))
+        .mount(&server)
+        .await;
+    // Accept the plain shape.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(openai_embedding_response(&[0.25; 8])),
+        )
+        .mount(&server)
+        .await;
+
+    let resolved = ResolvedEmbeddings::from_parts(
+        "openrouter".to_string(),
+        server.uri(),
+        "google/gemini-embedding-2".to_string(),
+        Some(8), // dim known (as if table-derived) but NOT requested
+        Some("sk-or-nodims-1598".to_string()),
+    );
+    assert_eq!(
+        resolved.requested_dim, None,
+        "from_parts must not populate requested_dim implicitly",
+    );
+    tokio::task::spawn_blocking(move || {
+        let embedder = Embedder::from_resolved(&resolved, Some(EmbeddingModel::NomicEmbedV15))
+            .expect("from_resolved without requested_dim must not error")
+            .expect("from_resolved without requested_dim must yield Some(embedder)");
+        let v = embedder
+            .embed("native-dim embed")
+            .expect("embed without a dimensions param must succeed");
+        assert_eq!(v.len(), 8);
+    })
+    .await
+    .expect("blocking embed task must not panic");
+}

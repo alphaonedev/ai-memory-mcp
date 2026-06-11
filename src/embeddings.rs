@@ -461,7 +461,11 @@ impl Embedder {
                 &resolved.model,
                 api_key,
             )
-            .context("failed to build OpenAI-compatible embed client (#1598)")?;
+            .context("failed to build OpenAI-compatible embed client (#1598)")?
+            // #1598 (fleet follow-up) — explicit `[embeddings].dim`
+            // doubles as the requested Matryoshka output dim on the
+            // OpenAI-compatible wire (see ResolvedEmbeddings::requested_dim).
+            .with_embed_dimensions(resolved.requested_dim);
             return Ok(Some(Self::new_remote(
                 Arc::new(client),
                 resolved.model.clone(),
