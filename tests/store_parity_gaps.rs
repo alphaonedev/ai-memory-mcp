@@ -626,15 +626,21 @@ mod postgres_side {
             title: Some("v2".to_string()),
             ..ai_memory::store::UpdatePatch::default()
         };
+        // #1628 — the inherent helper now takes a CallerContext and
+        // applies the caller-owns gate. The fixture row carries no
+        // `metadata.agent_id` stamp, so exercise the version gate via
+        // the admin/bypass context (the owner gate + handler routing
+        // are pinned by `tests/pg_fix3_parity_tests.rs`).
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test");
         let new_v = pg
-            .update_with_expected_version(&mem.id, patch.clone(), Some(1))
+            .update_with_expected_version(&admin_ctx, &mem.id, patch.clone(), Some(1))
             .await
             .expect("first update succeeds");
         assert_eq!(new_v, 2);
 
         // Stale expected_version must fail with the typed envelope.
         let err = pg
-            .update_with_expected_version(&mem.id, patch, Some(1))
+            .update_with_expected_version(&admin_ctx, &mem.id, patch, Some(1))
             .await
             .expect_err("stale expected_version must conflict");
         let msg = format!("{err}");
