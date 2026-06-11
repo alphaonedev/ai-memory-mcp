@@ -7,6 +7,29 @@ use crate::db;
 use crate::models::Tier;
 use serde_json::{Value, json};
 use std::path::Path;
+
+/// #1602 — cap on the per-response forget listing (`rows` on dry-run,
+/// `deleted_ids` on a live run). Bounds the response payload on huge
+/// match sets; `truncated: true` signals the listing was cut here
+/// while the `would_delete` / `deleted` counts stay exact.
+pub(crate) const DRY_RUN_PREVIEW_CAP: usize = 50;
+
+/// #1602 — fetch the matched rows for a forget preview / audit
+/// listing: up to [`DRY_RUN_PREVIEW_CAP`] rows plus the `truncated`
+/// flag (computed by over-fetching one row past the cap).
+fn forget_preview(
+    conn: &rusqlite::Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+) -> Result<(Vec<db::ForgetMatch>, bool), String> {
+    let mut rows = db::forget_matches(conn, namespace, pattern, tier, DRY_RUN_PREVIEW_CAP + 1)
+        .map_err(|e| e.to_string())?;
+    let truncated = rows.len() > DRY_RUN_PREVIEW_CAP;
+    rows.truncate(DRY_RUN_PREVIEW_CAP);
+    Ok((rows, truncated))
+}
+
 pub(super) fn handle_forget(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -20,12 +43,35 @@ pub(super) fn handle_forget(
     if dry_run {
         let count =
             db::forget_count(conn, namespace, pattern, tier.as_ref()).map_err(|e| e.to_string())?;
-        return Ok(json!({"would_delete": count, "dry_run": true}));
+        // #1602 — sighted preview: the matched rows (id/title/
+        // namespace/tier) ride along with the count so callers can see
+        // WHAT a destructive pattern is about to remove. The
+        // `would_delete` count stays byte-compatible (exact, uncapped).
+        let (rows, truncated) = forget_preview(conn, namespace, pattern, tier.as_ref())?;
+        let rows_json = serde_json::to_value(rows).map_err(|e| e.to_string())?;
+        return Ok(json!({
+            "would_delete": count,
+            "dry_run": true,
+            "rows": rows_json,
+            "truncated": truncated,
+        }));
     }
 
+    // #1602 — capture the matched ids BEFORE deletion so the live-run
+    // response can carry `deleted_ids`; rows are archived on forget,
+    // so recovery via memory_archive_restore becomes one call instead
+    // of an archive-list expedition. Same connection, synchronous
+    // dispatch — the set cannot drift between the SELECT and DELETE.
+    let (matched, truncated) = forget_preview(conn, namespace, pattern, tier.as_ref())?;
+    let deleted_ids: Vec<String> = matched.into_iter().map(|m| m.id).collect();
     let deleted =
         db::forget(conn, namespace, pattern, tier.as_ref(), archive).map_err(|e| e.to_string())?;
-    Ok(json!({"deleted": deleted, "archived": archive}))
+    Ok(json!({
+        "deleted": deleted,
+        "archived": archive,
+        "deleted_ids": deleted_ids,
+        "truncated": truncated,
+    }))
 }
 
 pub(super) fn handle_stats(conn: &rusqlite::Connection, db_path: &Path) -> Result<Value, String> {
@@ -51,6 +97,8 @@ pub struct ForgetRequest {
     #[serde(default)]
     pub namespace: Option<String>,
 
+    /// Full-text pattern; every whitespace-separated token must match
+    /// (AND semantics — #1601).
     #[serde(default)]
     pub pattern: Option<String>,
 
@@ -74,7 +122,13 @@ impl McpTool for ForgetTool {
         "Bulk delete memories matching a pattern, namespace, or tier (archives first)."
     }
     fn docs() -> &'static str {
-        "Bulk delete by pattern/namespace/tier. Archives first (recover via memory_archive_restore). dry_run previews."
+        // #1601 — pattern matching is conservative AND, not fuzzy OR.
+        // #1602 — dry_run lists the matched rows; live runs list ids.
+        "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every \
+         whitespace-separated token must match (#1601). Archives first (recover via \
+         memory_archive_restore). dry_run previews the matched rows \
+         (id/title/namespace/tier, capped + truncated flag); live runs return \
+         deleted_ids (same cap)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ForgetRequest>()
@@ -298,5 +352,72 @@ mod tests {
         let _ = insert_one(&conn, "stats-ns", "a", Tier::Short);
         let resp = handle_stats(&conn, Path::new(":memory:")).expect("ok");
         assert!(resp.is_object(), "stats must be an object");
+    }
+
+    // #1602 — dry-run is a sighted preview: the matched rows'
+    // id/title/namespace/tier ride along with the count.
+    #[test]
+    fn forget_dry_run_lists_matched_rows_1602() {
+        let conn = fresh_conn();
+        let id_a = insert_one(&conn, "preview-ns", "alpha row", Tier::Short);
+        let id_b = insert_one(&conn, "preview-ns", "beta row", Tier::Short);
+        let resp = handle_forget(
+            &conn,
+            &json!({"namespace": "preview-ns", "dry_run": true}),
+            false,
+        )
+        .expect("ok");
+        assert_eq!(resp["would_delete"].as_u64(), Some(2));
+        assert_eq!(resp["truncated"], false);
+        let rows = resp["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 2);
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&id_a.as_str()) && ids.contains(&id_b.as_str()));
+        let titles: Vec<&str> = rows.iter().filter_map(|r| r["title"].as_str()).collect();
+        assert!(titles.contains(&"alpha row") && titles.contains(&"beta row"));
+        assert!(rows.iter().all(|r| r["namespace"] == "preview-ns"));
+        assert!(rows.iter().all(|r| r["tier"] == Tier::Short.as_str()));
+    }
+
+    // #1602 — a corpus larger than the preview cap sets truncated=true,
+    // caps the listing, and keeps the count exact.
+    #[test]
+    fn forget_dry_run_truncates_past_preview_cap_1602() {
+        let conn = fresh_conn();
+        let total = DRY_RUN_PREVIEW_CAP + 5;
+        for i in 0..total {
+            let _ = insert_one(&conn, "cap-ns", &format!("row {i}"), Tier::Short);
+        }
+        let resp = handle_forget(
+            &conn,
+            &json!({"namespace": "cap-ns", "dry_run": true}),
+            false,
+        )
+        .expect("ok");
+        assert_eq!(resp["would_delete"].as_u64(), Some(total as u64));
+        assert_eq!(resp["truncated"], true);
+        assert_eq!(
+            resp["rows"].as_array().map(Vec::len),
+            Some(DRY_RUN_PREVIEW_CAP)
+        );
+    }
+
+    // #1602 — live run returns the deleted ids so archive recovery is
+    // one memory_archive_restore call.
+    #[test]
+    fn forget_live_run_returns_deleted_ids_1602() {
+        let conn = fresh_conn();
+        let id_a = insert_one(&conn, "live-ns", "a", Tier::Mid);
+        let id_b = insert_one(&conn, "live-ns", "b", Tier::Mid);
+        let resp = handle_forget(&conn, &json!({"namespace": "live-ns"}), true).expect("ok");
+        assert_eq!(resp["deleted"].as_u64(), Some(2));
+        assert_eq!(resp["truncated"], false);
+        let ids: Vec<&str> = resp["deleted_ids"]
+            .as_array()
+            .expect("deleted_ids array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(ids.contains(&id_a.as_str()) && ids.contains(&id_b.as_str()));
     }
 }

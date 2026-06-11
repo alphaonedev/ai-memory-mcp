@@ -3,16 +3,21 @@
 
 #![allow(clippy::needless_update)]
 
-//! Issue #830 — regression test pinning the sliding-window-REPLACE
-//! semantics of the short-tier TTL touch operation.
+//! Issue #830 → superseded by issue #1596 — short-tier TTL touch
+//! semantics.
 //!
-//! The short-tier TTL touch is a sliding-window **REPLACEMENT** —
-//! `expires_at = now + SHORT_TTL_EXTEND_SECS` on every access, NOT
-//! `max(old_expires_at, now + extend)`. A short-tier memory created
-//! with `expires_at = create + 6h` will have `expires_at = access + 1h`
-//! after one touch. The pre-fix `CLAUDE.md` text ("extend TTL") implied
-//! max-of-old-and-new, which was wrong: a single recall right after
-//! creation actually SHORTENS the TTL from 6h to 1h.
+//! HISTORY: #830 originally pinned the sliding-window **REPLACEMENT**
+//! contract (`expires_at = now + SHORT_TTL_EXTEND_SECS` on every
+//! access). #1596 found that contract harmful in lived use: a fresh
+//! row carrying its create-time backstop (+6h short / +7d mid) had its
+//! expiry pulled IN on the very first recall — recalling a memory made
+//! it die SOONER (lived evidence: mid row 4c7e7cc1 went 2026-06-18 →
+//! 2026-06-12 on first recall). The contract is now an extension
+//! FLOOR: `expires_at = MAX(existing, now + per-tier window)` — the
+//! per-access window only ever extends, never shortens. This file is
+//! updated (per #1596) to pin the NEW contract on the short tier; the
+//! mid-tier + batched `touch_many` pins live in
+//! `tests/issue_1596_touch_ttl_extension_floor.rs`.
 
 use ai_memory::db;
 use ai_memory::models::{
@@ -54,46 +59,23 @@ fn make_short_memory(expires_at: Option<String>) -> Memory {
     }
 }
 
-/// **Issue #830** — pin the sliding-window-REPLACE semantics of the
-/// short-tier TTL touch operation.
+/// **Issue #1596** (supersedes the #830 REPLACE pin) — the short-tier
+/// touch TTL is an extension floor.
 ///
-/// Scenario: create a short-tier memory with `expires_at = create + 6h`
-/// (the documented backstop), then perform one access (the touch path),
-/// and assert the new `expires_at` is ~now + 1h — NOT the original
-/// 6h-from-create value, and NOT a max-of-old-and-new value.
-///
-/// The pre-fix CLAUDE.md wording said "extend TTL (1h short / 1d mid)"
-/// which implied additive or max semantics. The actual code does:
-///
-/// ```ignore
-/// expires_at = now + SHORT_TTL_EXTEND_SECS  // unconditional REPLACE
-/// ```
-///
-/// so a memory just created with a 6h backstop has its expiry pulled
-/// IN to 1h on the very first recall. That is the contract, and that is
-/// what this test pins.
+/// Scenario A: a short-tier row created with `expires_at = create + 6h`
+/// (the documented backstop) is touched once. Pre-#1596 the expiry was
+/// REPLACED with `now + 1h` — recalling the row shortened its life by
+/// ~5h. Post-#1596 `MAX(existing, now + window)` keeps the later
+/// backstop: the expiry must be unchanged (>= the original).
 #[test]
-fn lifecycle_short_tier_ttl_is_sliding_window_replace() {
+fn lifecycle_short_tier_touch_never_shortens_backstop_1596() {
     let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
 
-    // Create-time expiry = create + 6h (the documented backstop for
-    // short-tier memories).
     let create_time = Utc::now();
     let backstop_expires_at = (create_time + Duration::hours(6)).to_rfc3339();
     let mem = make_short_memory(Some(backstop_expires_at.clone()));
     let id = db::insert(&conn, &mem).expect("insert short-tier memory");
 
-    // Sanity: the row went in with the 6h backstop.
-    let pre_touch = db::get(&conn, &id).unwrap().unwrap();
-    assert_eq!(
-        pre_touch.expires_at.as_deref(),
-        Some(backstop_expires_at.as_str()),
-        "pre-touch expires_at should equal the 6h backstop"
-    );
-
-    // Perform one touch (the same path that memory_recall + memory_get
-    // hit when they mutate access_count).
-    let touch_at = Utc::now();
     db::touch(&conn, &id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS).expect("touch");
 
     let post_touch = db::get(&conn, &id).unwrap().unwrap();
@@ -101,34 +83,48 @@ fn lifecycle_short_tier_ttl_is_sliding_window_replace() {
         .expires_at
         .as_deref()
         .expect("expires_at must still be set on short-tier post-touch");
-    let new_expires = chrono::DateTime::parse_from_rfc3339(new_expires_str)
-        .expect("expires_at must parse as RFC3339");
+    // #1596 extension-floor contract: the 6h backstop is LATER than
+    // now + 1h, so MAX keeps it byte-identical. Strictly-earlier (the
+    // old #830 REPLACE assertion) is the regression this test pins out.
+    assert_eq!(
+        new_expires_str, backstop_expires_at,
+        "touch must not pull a later backstop expiry IN (#1596); \
+         the per-access window is a floor, not a replacement"
+    );
+}
 
-    // Expected: new_expires ≈ touch_at + 1h. The actual implementation
-    // computes `now + extend` *inside* `touch()`, so we allow a generous
-    // ±5s window to absorb scheduling jitter between our `touch_at`
-    // sample and the `Utc::now()` call inside the function.
+/// **Issue #1596** — the per-access window still EXTENDS a
+/// nearly-expired short-tier row (the half of the old sliding-window
+/// behaviour worth keeping).
+#[test]
+fn lifecycle_short_tier_touch_extends_imminent_expiry_1596() {
+    let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+
+    // Row with only 5 minutes left — well inside the 1h touch window.
+    let imminent_expires_at = (Utc::now() + Duration::minutes(5)).to_rfc3339();
+    let mem = make_short_memory(Some(imminent_expires_at.clone()));
+    let id = db::insert(&conn, &mem).expect("insert short-tier memory");
+
+    let touch_at = Utc::now();
+    db::touch(&conn, &id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS).expect("touch");
+
+    let post_touch = db::get(&conn, &id).unwrap().unwrap();
+    let new_expires = chrono::DateTime::parse_from_rfc3339(
+        post_touch
+            .expires_at
+            .as_deref()
+            .expect("expires_at must still be set"),
+    )
+    .expect("expires_at must parse as RFC3339");
+
+    // Expected: ~touch_at + 1h (generous ±5s window for jitter between
+    // our `touch_at` sample and the `Utc::now()` inside `touch`).
     let expected = touch_at + Duration::seconds(SHORT_TTL_EXTEND_SECS);
     let drift = (new_expires.with_timezone(&Utc) - expected)
         .num_milliseconds()
         .abs();
     assert!(
         drift < 5_000,
-        "post-touch expires_at ({new_expires_str}) should be within 5s of \
-         touch_at + 1h ({expected:?}); drift_ms={drift}"
-    );
-
-    // And critically: NOT max-of-old-and-new. The pre-touch backstop
-    // was 6h-out from creation, so a max() semantics would have kept
-    // it. We assert the post-touch value is STRICTLY LESS than the
-    // pre-touch backstop, proving the implementation replaces (and in
-    // fact shortens, when the access happens before the backstop
-    // window has aged into the per-touch window).
-    let backstop_parsed = chrono::DateTime::parse_from_rfc3339(&backstop_expires_at).unwrap();
-    assert!(
-        new_expires < backstop_parsed,
-        "sliding-window REPLACE contract violated: post-touch expires_at \
-         ({new_expires:?}) should be STRICTLY EARLIER than the 6h backstop \
-         ({backstop_parsed:?}) — max-of-old-and-new is NOT the contract"
+        "post-touch expires_at should be within 5s of touch_at + 1h; drift_ms={drift}"
     );
 }
