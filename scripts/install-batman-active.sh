@@ -58,7 +58,13 @@ step()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 info()  { printf '    %s\n' "$*"; }
 ok()    { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 warn()  { printf '    \033[33m⚠\033[0m %s\n' "$*"; }
-err()   { printf '    \033[31m✗\033[0m %s\n' "$*"; }
+# #1612 — every err is a real activation failure. The script runs
+# without `set -e` (deliberate: later steps should still attempt), so
+# err() raises a failure flag that the summary turns into a non-zero
+# exit. Early-precondition sites that `exit 2` immediately are
+# unaffected.
+FAILED=0
+err()   { FAILED=1; printf '    \033[31m✗\033[0m %s\n' "$*"; }
 run()   {
     if [[ $DRY_RUN -eq 1 ]]; then
         printf '    [dry-run] %s\n' "$*"
@@ -387,6 +393,11 @@ fi
 # ----------------------------------------------------------- summary ----
 
 step "Done"
+if [[ $FAILED -ne 0 ]]; then
+    err "Batman Mode installation FAILED — one or more steps above reported ✗ (#1612)."
+    info "Fix the failing step and re-run (the script is idempotent)."
+    exit 1
+fi
 ok "Batman Mode installation complete."
 info ""
 info "Verify with:"

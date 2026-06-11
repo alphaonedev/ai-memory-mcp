@@ -77,7 +77,14 @@ r = subprocess.run(
     capture_output=True, text=True,
 )
 elapsed_ms = (time.monotonic() - start) * 1000
-print(f"{elapsed_ms:.1f}")
+# #1616 — a failed or governance-REFUSED store is NOT write-path
+# latency; emit a sentinel the caller counts separately instead of
+# polluting the percentiles with refusal-path numbers.
+combined = (r.stdout or "") + (r.stderr or "")
+if r.returncode != 0 or '"refuse"' in combined or '"refused"' in combined:
+    print("FAILED")
+else:
+    print(f"{elapsed_ms:.1f}")
 PY
 }
 
@@ -114,11 +121,24 @@ for label in tiny medium large huge; do
     step "size=$label (~$chars chars / $((chars / 4)) cl100k tokens)"
     content=$(body $chars)
     runs=""
+    failed=0
     for i in $(seq 1 $SAMPLES); do
         t=$(time_one "bench-$label-$i-$(date +%s%3N 2>/dev/null || date +%s)000" "$content")
-        runs="$runs $t"
+        # #1616 — failed/refused stores are excluded from the latency
+        # profile and counted separately.
+        if [[ "$t" == "FAILED" ]]; then
+            failed=$((failed + 1))
+        else
+            runs="$runs $t"
+        fi
     done
+    if [[ -z "${runs// /}" ]]; then
+        RESULTS[$label]="ALL $SAMPLES stores FAILED/refused — no latency data"
+        ok "${RESULTS[$label]}"
+        continue
+    fi
     summary=$(percentiles "$runs")
+    [[ $failed -gt 0 ]] && summary="$summary (excluded: $failed failed/refused)"
     RESULTS[$label]="$summary"
     ok "$summary"
 done
