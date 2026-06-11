@@ -1166,14 +1166,22 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
     let result = (|| -> Result<()> {
+        // #1596 — the per-access TTL window is an extension FLOOR, not a
+        // replacement. `MAX(expires_at, ?N)` keeps whichever expiry is
+        // later, so a fresh mid-tier row carrying its create-time +7d
+        // backstop is no longer pulled IN to now+1d on first recall
+        // (lived evidence: row 4c7e7cc1 went 2026-06-18 → 2026-06-12).
+        // Both operands are UTC RFC3339 strings, so SQLite's scalar
+        // MAX() lexicographic comparison is chronological. Long-tier
+        // (NULL expiry) rows stay NULL via the first CASE arm.
         conn.execute(
             "UPDATE memories SET
                 access_count = MIN(access_count + 1, 1000000),
                 last_accessed_at = ?1,
                 expires_at = CASE
                     WHEN tier = 'long' THEN expires_at
-                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN ?2
-                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN ?3
+                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN MAX(expires_at, ?2)
+                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN MAX(expires_at, ?3)
                     ELSE expires_at
                 END
              WHERE id = ?4",
@@ -1247,14 +1255,18 @@ pub fn touch_many(
         // Cache the three prepared statements once for the whole
         // batch; each `execute` reuses the cached query plan instead
         // of re-parsing per row.
+        // #1596 — extension-floor semantics, mirroring [`touch`]: the
+        // per-access window only ever EXTENDS expiry (MAX over the
+        // existing column), never shortens it. One batched UPDATE per
+        // row is preserved.
         let mut bump_stmt = conn.prepare_cached(
             "UPDATE memories SET
                 access_count = MIN(access_count + 1, 1000000),
                 last_accessed_at = ?1,
                 expires_at = CASE
                     WHEN tier = 'long' THEN expires_at
-                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN ?2
-                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN ?3
+                    WHEN tier = 'short' AND expires_at IS NOT NULL THEN MAX(expires_at, ?2)
+                    WHEN tier = 'mid' AND expires_at IS NOT NULL THEN MAX(expires_at, ?3)
                     ELSE expires_at
                 END
              WHERE id = ?4",
@@ -1896,6 +1908,24 @@ pub fn archive_memory_for_caller(
     }
 }
 
+/// #1601 — build the FTS5 query for the DESTRUCTIVE forget paths.
+///
+/// `forget` / `forget_count` historically routed the caller's pattern
+/// through `sanitize_fts_query(pat, /* use_or = */ true)` — the fuzzy
+/// OR join the recall path uses for high RANKED retrieval. For a bulk
+/// DELETE that over-matches catastrophically: pattern "D6 scratch"
+/// matched (and would delete) every row containing EITHER token, and
+/// "D6 nonexistentzzzword" still matched rows containing just "D6".
+/// Destructive matching must be conservative: every
+/// whitespace-separated token must match (FTS5 implicit AND — the
+/// sanitized phrase-quoted tokens are space-joined). All three forget
+/// sites (`forget_count`, the `forget` delete arm, and the
+/// archive-before-delete arm) route through this single builder so
+/// their match sets can never drift apart.
+fn forget_fts_query(pat: &str) -> String {
+    sanitize_fts_query(pat, false)
+}
+
 /// Count memories that would be deleted by forget (for `dry_run`).
 pub fn forget_count(
     conn: &Connection,
@@ -1910,7 +1940,7 @@ pub fn forget_count(
         }));
     }
     if let Some(pat) = pattern {
-        let fts_query = sanitize_fts_query(pat, true);
+        let fts_query = forget_fts_query(pat);
         let tier_str = tier.map(|t| t.as_str().to_string());
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE rowid IN (
@@ -1954,7 +1984,7 @@ pub fn forget(
         // Archive matching memories before deletion
         let now = Utc::now().to_rfc3339();
         if let Some(pat) = pattern {
-            let fts_query = sanitize_fts_query(pat, true);
+            let fts_query = forget_fts_query(pat);
             let tier_str = tier.map(|t| t.as_str().to_string());
             // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on forget-archive.
             // v0.7.0 issue #861 — also project `metadata` into the
@@ -2023,7 +2053,7 @@ pub fn forget(
 
     // If pattern provided, use FTS to find matching IDs
     if let Some(pat) = pattern {
-        let fts_query = sanitize_fts_query(pat, true);
+        let fts_query = forget_fts_query(pat);
         let tier_str = tier.map(|t| t.as_str().to_string());
         let deleted = conn.execute(
             "DELETE FROM memories WHERE rowid IN (
@@ -2044,6 +2074,82 @@ pub fn forget(
         params![namespace, tier_str],
     )?;
     Ok(deleted)
+}
+
+/// #1602 — one row of a forget preview / deletion audit listing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForgetMatch {
+    pub id: String,
+    pub title: String,
+    pub namespace: String,
+    pub tier: String,
+}
+
+/// #1602 — list the rows the forget filters currently match, capped
+/// at `limit`.
+///
+/// `memory_forget {dry_run:true}` previously returned only a blind
+/// `{would_delete: N}` count, so callers had no way to see WHAT a
+/// destructive pattern was about to remove; the live run likewise
+/// returned only a count, leaving recovery (archive restore) a
+/// guessing game. This helper shares filter semantics with [`forget`]
+/// / [`forget_count`] — including the #1601 AND pattern matching via
+/// [`forget_fts_query`] — so the preview is exactly the set `forget`
+/// would delete. Rows come back in stable `rowid` order; callers pass
+/// `cap + 1` to detect truncation without a second COUNT query.
+pub fn forget_matches(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    limit: usize,
+) -> Result<Vec<ForgetMatch>> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — same refusal as `forget` / `forget_count`.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let row_to_match = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ForgetMatch> {
+        Ok(ForgetMatch {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            namespace: row.get(2)?,
+            tier: row.get(3)?,
+        })
+    };
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.title, m.namespace, m.tier
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.namespace = ?2)
+               AND (?3 IS NULL OR m.tier = ?3)
+             ORDER BY m.rowid
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![fts_query, namespace, tier_str, limit_i64],
+                row_to_match,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, title, namespace, tier FROM memories
+         WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+         ORDER BY rowid
+         LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![namespace, tier_str, limit_i64], row_to_match)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// #1579 A2 — build the sargable `list` SQL + parameter vector.
