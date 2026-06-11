@@ -107,14 +107,22 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
   # --- systemd unit (no secret in the unit; store URL via ${VAR} expansion) ----
   outdir="$RENDER_DIR/$host"; mkdir -p "$outdir"
   unit="$outdir/ai-memory.service"
+  # #1598 — the ollama.service ordering/pull-in applies ONLY when the fleet's
+  # embedding backend is the local Ollama sidecar (25_ollama_embed.sh). On an
+  # API-embeddings fleet (PEER_EMBED_BACKEND != ollama) the sidecar is
+  # decommissioned, and a Wants= on the disabled unit would pull it back up on
+  # every daemon restart — so the dependency is rendered conditionally.
+  unit_embed_deps=""
+  [ "${PEER_EMBED_BACKEND:-ollama}" = "ollama" ] && unit_embed_deps=" ollama.service"
   cat > "$unit" <<UNIT
 [Unit]
 Description=ai-memory federated daemon ($CAMPAIGN peer $host)
-# The autonomous tier loads its embedder from the co-located native Ollama
-# (25_ollama_embed.sh) on localhost:11434 — order after it so the embedder API
-# is up before the daemon's first embed call (no Docker anywhere on the fleet).
-After=network-online.target ollama.service
-Wants=network-online.target ollama.service
+# The embedder dependency below is conditional: with the local Ollama sidecar
+# (PEER_EMBED_BACKEND=ollama) the daemon orders after it so the embedder API is
+# up before the first embed call; with API embeddings (#1598) no local unit is
+# referenced.
+After=network-online.target$unit_embed_deps
+Wants=network-online.target$unit_embed_deps
 
 [Service]
 Type=simple
