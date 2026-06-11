@@ -102,7 +102,14 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # finite+L2-norm validation), #1585 (to_store_err redaction), #1586
 # (list_unembedded ctx guard). Supersedes the 21bd6899 / 4bb54c4d pre-train
 # golden. Default suite 7842/0 + sal-postgres 9050/0 at the pin commit.
-GOLDEN_SHA256="${GOLDEN_SHA256:-fc78a9e643f8baf7851a385a8373dab44cfde0974d7d14de27660001bfc4df9a}"
+# Re-pinned 2026-06-11 (#1598 Phase-2 fleet rewire): the prior fc78a9e6 pin was
+# minted from a DEFAULT-features `cargo build --release` — it lacks the
+# sal-gated `serve --store-url` (80 subcommands, not 82) and crash-loops every
+# postgres-backed peer with `error: unexpected argument '--store-url' found`
+# (observed live on do-1461-peer-fra1-01, restart counter 38). This pin is the
+# same release/v0.7.0 @ 5b064f38 source rebuilt WITH the required
+# `--features sal,sal-postgres,sqlite-bundled`.
+GOLDEN_SHA256="${GOLDEN_SHA256:-471cfec63a62a32f46545f6476405efb410af82d469066b466a6695465a25642}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 

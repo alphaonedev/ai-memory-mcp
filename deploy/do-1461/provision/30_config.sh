@@ -64,7 +64,10 @@ api_key = "$API_KEY"
 # dim is the fleet-wide Matryoshka pin (gemini truncates server-side) keeping
 # the PG regions' vector(768) schemas + pgvector ANN indexes (2000-dim cap)
 # untouched. The embed key rides the same EnvironmentFile env var as [llm].
-cross_encoder = true
+# NOTE: the cross-encoder is enabled via the v2 [reranker] section below — the
+# legacy flat `cross_encoder` field is IGNORED under schema_version=2 and its
+# presence fires the legacy-fields WARN on every daemon boot (#1146 migration
+# warning), so it is deliberately NOT rendered here.
 
 [embeddings]
 backend = "$PEER_EMBED_BACKEND"
