@@ -724,6 +724,13 @@ mod postgres_side {
 
     /// Gap 5 (#888) — postgres twin of
     /// `verify_gap_5_edit_source_sqlite`.
+    ///
+    /// #1627 — extended to pin the FULL-column carry on the supersede
+    /// INSERT: pre-#1627 the NEW row persisted only 15 of the table's
+    /// columns, silently resetting `memory_kind`, `reflection_depth`,
+    /// `citations`, `confidence_source`, `entity_id`, and `expires_at`
+    /// to their SQL DEFAULTs (the sqlite twin routes through
+    /// `storage::insert` and carries everything).
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
     async fn pg_parity_gap_5_edit_source() {
@@ -732,7 +739,22 @@ mod postgres_side {
         };
         verify_gap_5_edit_source_sqlite();
         let ctx = ai_memory::store::CallerContext::for_agent("parity-test");
-        let mem = sample_memory("pg-g5");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mut mem = sample_memory(&format!("pg-g5-{run}"));
+        // #1627 — seed the provenance columns the supersede must carry.
+        mem.tier = ai_memory::models::Tier::Mid;
+        mem.expires_at = Some((chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339());
+        mem.metadata = serde_json::json!({ "agent_id": "parity-test" });
+        mem.memory_kind = ai_memory::models::MemoryKind::Reflection;
+        mem.reflection_depth = 2;
+        mem.citations = vec![ai_memory::models::Citation {
+            uri: "https://example.com/g5-evidence".to_string(),
+            accessed_at: chrono::Utc::now().to_rfc3339(),
+            hash: None,
+            span: None,
+        }];
+        mem.confidence_source = ai_memory::models::ConfidenceSource::AutoDerived;
+        mem.entity_id = Some("ent-g5".to_string());
         let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
 
         let patch = ai_memory::store::UpdatePatch {
@@ -750,6 +772,40 @@ mod postgres_side {
             .expect("supersede");
         assert_eq!(archived_id, mem.id);
         assert_ne!(new_id, mem.id);
+
+        // #1627 — the NEW row must carry the full provenance shape.
+        let new_row = ai_memory::store::MemoryStore::get(&pg, &ctx, &new_id)
+            .await
+            .expect("get superseding row");
+        assert_eq!(new_row.content, "new content");
+        assert_eq!(
+            new_row.memory_kind,
+            ai_memory::models::MemoryKind::Reflection,
+            "#1627: memory_kind must survive the supersede"
+        );
+        assert_eq!(
+            new_row.reflection_depth, 2,
+            "#1627: reflection_depth must survive the supersede"
+        );
+        assert_eq!(
+            new_row.citations.first().map(|c| c.uri.as_str()),
+            Some("https://example.com/g5-evidence"),
+            "#1627: citations must survive the supersede"
+        );
+        assert_eq!(
+            new_row.confidence_source,
+            ai_memory::models::ConfidenceSource::AutoDerived,
+            "#1627: confidence_source must survive the supersede"
+        );
+        assert_eq!(
+            new_row.entity_id.as_deref(),
+            Some("ent-g5"),
+            "#1627: entity_id must survive the supersede"
+        );
+        assert!(
+            new_row.expires_at.is_some(),
+            "#1627: expires_at must carry per the sqlite new_expires logic"
+        );
     }
 
     /// Gap 6 (#889) — postgres twin of

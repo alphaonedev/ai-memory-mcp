@@ -2927,6 +2927,16 @@ impl PostgresStore {
             .source_uri
             .clone()
             .or_else(|| existing.source_uri.clone());
+        // #1627 — expires_at carry, mirroring the sqlite twin's
+        // `new_expires` composition (src/storage/mod.rs:1656-1659): an
+        // explicit empty/"null" patch clears it, an explicit value
+        // rewrites it, and an absent patch inherits the OLD row's
+        // expiry instead of silently dropping it.
+        let new_expires = match patch.expires_at.as_deref() {
+            Some("" | "null") => None,
+            Some(v) => Some(v.to_string()),
+            None => existing.expires_at.clone(),
+        };
         // Stamp edit_source + superseded_id into the new row's metadata.
         let mut new_metadata = patch
             .metadata
@@ -2971,7 +2981,8 @@ impl PostgresStore {
             created_at: now_rfc.clone(),
             updated_at: now_rfc,
             last_accessed_at: None,
-            expires_at: None,
+            // #1627 — patch-or-inherit expiry (sqlite twin parity).
+            expires_at: new_expires.clone(),
             metadata: new_metadata.clone(),
             reflection_depth: existing.reflection_depth,
             memory_kind: existing.memory_kind.clone(),
@@ -3035,13 +3046,55 @@ impl PostgresStore {
 
         // Step 3: insert the NEW row carrying the patched content.
         // version starts at 1 (fresh row, not a continuation).
-        // v0.7.0 Provenance Gap 2 (#906) — source_uri ($11) is carried
+        // v0.7.0 Provenance Gap 2 (#906) — source_uri is carried
         // onto the new row via patch-or-inherit composition above.
+        // #1627 — persist the FULL candidate shape (the sqlite twin
+        // routes through `storage::insert`, which writes every
+        // Memory-struct column). Pre-#1627 this INSERT listed only 15
+        // columns, so memory_kind / reflection_depth / citations /
+        // confidence provenance / entity_id / persona_version /
+        // expires_at / mentioned_entity_id were silently reset to
+        // their SQL DEFAULTs on every supersede.
+        let citations_json = serde_json::to_string(&candidate.citations).map_err(|e| {
+            StoreError::IntegrityFailed {
+                detail: serialize_err("citations", e),
+            }
+        })?;
+        let source_span_json = match candidate.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &candidate.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+                })?,
+            ),
+            None => None,
+        };
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(&candidate);
+        // Tier-default expiry backfill (#1466 parity with the sqlite
+        // `storage::insert` chokepoint the twin routes through).
+        let new_expires_dt = parse_rfc3339_opt(candidate.effective_expires_at().as_deref());
         sqlx::query(
             "INSERT INTO memories
                 (id, tier, namespace, title, content, tags, priority, confidence,
-                 source, access_count, created_at, updated_at, metadata, version, source_uri)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), $10, 1, $11)",
+                 source, access_count, created_at, updated_at, last_accessed_at,
+                 expires_at, metadata, reflection_depth, memory_kind,
+                 entity_id, persona_version, citations, source_uri, source_span,
+                 confidence_source, confidence_signals, confidence_decayed_at,
+                 mentioned_entity_id, version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), NULL,
+                     $10, $11, $12, $13,
+                     $14, $15, $16, $17, $18,
+                     $19, $20, $21,
+                     $22, 1)",
         )
         .bind(&new_id)
         .bind(new_tier.as_str())
@@ -3056,8 +3109,19 @@ impl PostgresStore {
         .bind(new_priority)
         .bind(new_confidence)
         .bind(&existing.source)
+        .bind(new_expires_dt)
         .bind(&new_metadata)
+        .bind(candidate.reflection_depth)
+        .bind(candidate.memory_kind.as_str())
+        .bind(candidate.entity_id.as_deref())
+        .bind(candidate.persona_version)
+        .bind(&citations_json)
         .bind(&new_source_uri)
+        .bind(source_span_json.as_deref())
+        .bind(candidate.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(candidate.confidence_decayed_at.as_deref())
+        .bind(mentioned_entity_id.as_deref())
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert new on supersede", e))?;
