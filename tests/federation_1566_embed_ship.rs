@@ -35,6 +35,9 @@
 // `..Memory::default()` in the fixture keeps compiling when Memory
 // gains fields (the same posture as tests/federation_inbound_verify.rs).
 #![allow(clippy::needless_update)]
+// #1584 — the unit-norm test fills compute `1.0 / (dim as f32).sqrt()`;
+// `dim` is the embedder dimension (768), well within f32 mantissa range.
+#![allow(clippy::cast_precision_loss)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
