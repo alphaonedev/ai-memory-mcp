@@ -82,8 +82,16 @@ model          = "nomic-embed-text-v1.5"   # e.g. "google/gemini-embedding-2"
 # api_key_env  = "OPENROUTER_API_KEY"
 # api_key_file = "/etc/ai-memory/keys/embed.key"  # mode 0400 enforced
 
-# dim          = 3072            # explicit vector-dim override for models
-                                 # not in config.rs::KNOWN_EMBEDDING_DIMS
+# dim          = 768             # explicit vector-dim override for models
+#                                 # not in KNOWN_EMBEDDING_DIMS. #1598 fleet
+#                                 # follow-up: for OpenAI-compatible backends an
+#                                 # EXPLICIT dim is also sent as the wire
+#                                 # `dimensions` request param — Matryoshka-capable
+#                                 # models (gemini-embedding-2, text-embedding-3-*)
+#                                 # truncate server-side. Use dim = 768 on
+#                                 # pgvector-backed federated fleets: pgvector ANN
+#                                 # indexes cap at 2000 dims and the fleet schemas
+#                                 # template vector(768).
 backfill_batch = 100             # env override: AI_MEMORY_EMBED_BACKFILL_BATCH
 
 # ---------------------------------------------------------------------

@@ -483,6 +483,14 @@ pub struct OllamaClient {
     /// requests against an unreachable endpoint. Reset on the first
     /// success after a cooldown.
     breaker: Mutex<BreakerState>,
+    /// #1598 (fleet follow-up) — requested embedding output
+    /// dimensionality. When `Some`, the OpenAI-compatible embed
+    /// payload carries the wire `dimensions` param so
+    /// Matryoshka-capable models (gemini-embedding-2,
+    /// text-embedding-3-*) return truncated vectors at the declared
+    /// dim. Ignored by the Ollama-native wire shape. Set via
+    /// [`Self::with_embed_dimensions`]; `None` = model-native dim.
+    embed_dimensions: Option<u32>,
 }
 
 impl OllamaClient {
@@ -524,6 +532,7 @@ impl OllamaClient {
                 .build()
                 .expect("test reqwest client builds"),
             breaker: Mutex::new(BreakerState::new()),
+            embed_dimensions: None,
         }
     }
 
@@ -838,7 +847,17 @@ impl OllamaClient {
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
+            embed_dimensions: None,
         })
+    }
+
+    /// #1598 (fleet follow-up) — builder for the requested embedding
+    /// output dimensionality (see the `embed_dimensions` field doc).
+    /// `None` clears the request (model-native dim).
+    #[must_use]
+    pub fn with_embed_dimensions(mut self, dims: Option<u32>) -> Self {
+        self.embed_dimensions = dims;
+        self
     }
 
     /// Creates a new `OllamaClient` with a custom base URL.
@@ -913,6 +932,7 @@ impl OllamaClient {
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
+            embed_dimensions: None,
         })
     }
 
@@ -1574,9 +1594,20 @@ impl OllamaClient {
                 json!({"model": embed_model, "input": text, "truncate": true}),
                 None,
             ),
+            // #1598 (fleet follow-up) — when the operator declared an
+            // explicit `[embeddings].dim`, request it on the wire:
+            // Matryoshka-capable models (gemini-embedding-2,
+            // text-embedding-3-*) truncate server-side, which keeps
+            // pgvector `vector(768)` fleet schemas + ANN indexes
+            // (<=2000-dim limit) usable with high-dim API models.
             LlmProvider::OpenAiCompatible { api_key } => (
                 format!("{}/embeddings", self.base_url),
-                json!({"model": embed_model, "input": text}),
+                match self.embed_dimensions {
+                    Some(dims) => {
+                        json!({"model": embed_model, "input": text, "dimensions": dims})
+                    }
+                    None => json!({"model": embed_model, "input": text}),
+                },
                 Some(api_key.as_str()),
             ),
         };

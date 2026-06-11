@@ -3723,6 +3723,15 @@ pub struct ResolvedEmbeddings {
     /// for unrecognised ids and avoiding the silent-wrong-dim trap
     /// for the recognised ones).
     pub embedding_dim: Option<u32>,
+    /// #1598 (fleet follow-up) — the EXPLICIT `[embeddings].dim`
+    /// override only (never table-derived). For OpenAI-compatible
+    /// backends this is also sent as the wire `dimensions` request
+    /// param, so Matryoshka-capable API models (gemini-embedding-2,
+    /// text-embedding-3-*) return truncated vectors at the operator's
+    /// declared dim — the mechanism that keeps pgvector `vector(768)`
+    /// fleet schemas + ANN indexes (≤2000-dim limit) usable with
+    /// high-dim API models. `None` = model-native dim.
+    pub requested_dim: Option<u32>,
     /// #1598 — resolved embedding API key. `None` for
     /// `backend = "ollama"` (no auth) and for keyless self-hosted
     /// OpenAI-compatible endpoints. Private — access via
@@ -3761,10 +3770,19 @@ impl ResolvedEmbeddings {
             model,
             backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
             embedding_dim,
+            requested_dim: None,
             api_key,
             key_source: KeySource::None,
             source: ConfigSource::CompiledDefault,
         }
+    }
+
+    /// #1598 (fleet follow-up) — builder for the explicit requested
+    /// output dimensionality (see [`Self::requested_dim`]).
+    #[must_use]
+    pub fn with_requested_dim(mut self, dim: Option<u32>) -> Self {
+        self.requested_dim = dim;
+        self
     }
 }
 
@@ -3779,6 +3797,7 @@ impl std::fmt::Debug for ResolvedEmbeddings {
                 crate::models::field_names::EMBEDDING_DIM,
                 &self.embedding_dim,
             )
+            .field("requested_dim", &self.requested_dim)
             .field(
                 "api_key",
                 &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
@@ -3939,6 +3958,7 @@ impl Default for ResolvedModels {
                 model: String::new(),
                 backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
                 embedding_dim: None,
+                requested_dim: None,
                 api_key: None,
                 key_source: KeySource::None,
                 source: ConfigSource::CompiledDefault,
@@ -3995,6 +4015,7 @@ impl ResolvedModels {
                 // pre-#1169 capabilities byte-shape (the test invariant
                 // pinned by tests/issue_1168_*::from_tier_preset_*).
                 embedding_dim: tier.embedding_model.map(|m| m.dim() as u32),
+                requested_dim: None,
                 api_key: None,
                 key_source: KeySource::None,
                 source: ConfigSource::CompiledDefault,
@@ -6452,6 +6473,14 @@ impl AppConfig {
             .filter(|d| *d > 0)
             .or_else(|| canonical_embedding_dim(&model));
 
+        // #1598 (fleet follow-up) — the EXPLICIT override alone also
+        // becomes the wire `dimensions` request for OpenAI-compatible
+        // backends (Matryoshka truncation; see
+        // [`ResolvedEmbeddings::requested_dim`]). Deliberately NOT
+        // populated from the table lookup — a table dim describes the
+        // model's native output and must not be re-requested.
+        let requested_dim = cfg.and_then(|e| e.dim).filter(|d| *d > 0);
+
         // #1598 — embedding API key (None for ollama / keyless
         // self-hosted endpoints).
         let (api_key, key_source) = resolve_embed_api_key(&backend, cfg);
@@ -6462,6 +6491,7 @@ impl AppConfig {
             model,
             backfill_batch,
             embedding_dim,
+            requested_dim,
             api_key,
             key_source,
             source,
@@ -9367,6 +9397,47 @@ max_page_size = 1000000
             ..EmbeddingsSection::default()
         });
         assert_eq!(cfg.resolve_embeddings().embedding_dim, Some(768));
+    }
+
+    /// #1598 fleet follow-up — `requested_dim` carries ONLY the
+    /// explicit `[embeddings].dim` (the wire `dimensions` request for
+    /// Matryoshka-capable API models); a table-derived dim must never
+    /// populate it, and non-positive overrides are ignored.
+    #[test]
+    fn resolve_embeddings_1598_requested_dim_explicit_only() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        // Table-known model, no explicit dim → requested_dim None.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.embedding_dim, Some(768), "table dim resolves");
+        assert_eq!(
+            resolved.requested_dim, None,
+            "table-derived dim must not become a wire dimensions request"
+        );
+        // Explicit dim → both embedding_dim and requested_dim.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("google/gemini-embedding-2".into()),
+            dim: Some(768),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.embedding_dim, Some(768));
+        assert_eq!(resolved.requested_dim, Some(768));
+        // Non-positive explicit dim is ignored on both fields.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("google/gemini-embedding-2".into()),
+            dim: Some(0),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.embedding_dim, Some(3072), "table dim again");
+        assert_eq!(resolved.requested_dim, None);
     }
 
     #[test]
