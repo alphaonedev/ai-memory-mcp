@@ -20,6 +20,16 @@ Topology index:
 8. [Hive — high-fanout hierarchical with mobile-edge layer](#topology-8)
 9. [Mobile-edge tier — fleet of phones / IoT reporting to a regional hub](#topology-9)
 
+Enterprise embedding-architecture companions (#1598 — which embedder
+shape a federated fleet runs; orthogonal to the topologies above):
+
+- [Enterprise Reference Architecture: CPU + Memory Federated Nodes](reference-architecture/enterprise-cpu-memory.md)
+  — API embeddings (OpenRouter `google/gemini-embedding-2` cloud shape
+  or self-hosted TEI/vLLM airgapped shape); no Ollama anywhere.
+- [Enterprise Reference Architecture: CPU + Memory + GPU Federated Nodes](reference-architecture/enterprise-cpu-memory-gpu.md)
+  — local Ollama embeddings on GPU-equipped nodes (operator GPU
+  policy), with the when-to-choose-which comparison table.
+
 Each topology lists approximate latency at each hop so capacity
 planners can budget end-to-end recall latency without going to the
 benchmark numbers. The numbers are p50 on cold-cache / warm-tail

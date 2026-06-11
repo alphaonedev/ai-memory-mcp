@@ -99,15 +99,18 @@ Three substrate behaviors give operators a defensible privacy posture without ch
 7. Capabilities (advertised surface)
 8. Reflection Health (L1-4)
 9. LLM Reachability (#1146)
+10. Embeddings Reachability (#1598)
 
-Eight of the nine sections are computed locally against the SQLite
-or PostgreSQL store with no network access. The exception is the
+Eight of the ten sections are computed locally against the SQLite
+or PostgreSQL store with no network access. The exceptions are the
 **LLM Reachability** section (#1146), which probes the *resolved,
 operator-configured* LLM endpoint (`<base_url>/api/tags` for Ollama
-or `<base_url>/models` for OpenAI-compatible backends) — still only
-a destination you configured, never a third party. It is safe to run
-from a paging-on-health-check loop or a Nagios-style monitoring
-probe.
+or `<base_url>/models` for OpenAI-compatible backends), and the
+**Embeddings Reachability** section (#1598), which probes the
+resolved embedding endpoint (`<url>/api/tags` for ollama or a 1-char
+`POST <url>/embeddings` for API backends) — still only destinations
+you configured, never a third party. It is safe to run from a
+paging-on-health-check loop or a Nagios-style monitoring probe.
 
 ---
 

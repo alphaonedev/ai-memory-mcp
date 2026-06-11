@@ -162,6 +162,8 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
           <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -231,6 +233,8 @@ footer a{color:var(--text-muted)}
         <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
         <a href="architectures-t5.html">T5 — Global Hive</a>
         <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         <div class="mnav-group">Internals</div>
         <a href="schema.html">Schema</a>
         <a href="types.html">Types</a>
@@ -469,7 +473,7 @@ model   = <span class="val">"gemma4:e4b"</span>     <span class="cm"># the model
 base_url = <span class="val">"http://localhost:11434"</span>
 
 [embeddings]
-backend = <span class="val">"ollama"</span>
+backend = <span class="val">"ollama"</span>          <span class="cm"># #1598: or any API vendor alias / "openai-compatible"</span>
 url     = <span class="val">"http://localhost:11434"</span>
 model   = <span class="val">"nomic-embed-text-v1.5"</span>
 

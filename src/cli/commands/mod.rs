@@ -38,6 +38,10 @@ pub mod expand;
 pub mod find_paths;
 pub mod kg_query;
 pub mod recall_observations;
+// v0.7.0 #1598 — `ai-memory reembed`: full-corpus vector-space
+// migration (REPLACES every stored embedding with the resolved
+// backend/model's vectors; per-row #1595 failure isolation).
+pub mod reembed;
 pub mod replay;
 // v0.7.0 ARCH-3 / FX-C3 (batch2) — closing the 16 remaining
 // applicable deferrals from the FX-12 audit. Each module wires a

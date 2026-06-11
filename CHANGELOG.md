@@ -425,6 +425,20 @@ Closes [#1168](https://github.com/alphaonedev/ai-memory-mcp/issues/1168). Pre-fi
 
 ### Added
 
+### feat(embeddings, #1598) — substrate-native API embeddings + `ai-memory reembed` (2026-06-11)
+
+Closes [#1598](https://github.com/alphaonedev/ai-memory-mcp/issues/1598) (and with it [#1593](https://github.com/alphaonedev/ai-memory-mcp/issues/1593), [#1594](https://github.com/alphaonedev/ai-memory-mcp/issues/1594), [#1595](https://github.com/alphaonedev/ai-memory-mcp/issues/1595)). The #1067 provider-agnostic substrate now extends to the embedder.
+
+- **`[embeddings]` fully API-capable** — `backend` accepts any #1067 vendor alias (`openrouter`, `openai`, `gemini`, …), `openai-compatible` (self-hosted HF TEI / vLLM / llama.cpp-server `/v1/embeddings`), or `ollama` (default). New fields: `base_url` (synonym of `url`; wins when both set), `api_key_env` XOR `api_key_file` (mode 0400 enforced; inline `api_key` rejected at parse time, mirroring `[llm]`), `dim` (override for models outside `KNOWN_EMBEDDING_DIMS`).
+- **New env vars** (per-field precedence env > `[embeddings]` > legacy flat > compiled default): `AI_MEMORY_EMBED_BACKEND`, `AI_MEMORY_EMBED_BASE_URL`, `AI_MEMORY_EMBED_MODEL`, `AI_MEMORY_EMBED_API_KEY` (secret). Source consts `crate::config::ENV_EMBED_*`.
+- **Fail-closed embedder boot (#1593)** — construction failure degrades semantic recall to keyword mode with a loud stderr ERROR; the chat LLM client is NEVER reused for embeddings (supersedes the #1143 boot-site heuristic).
+- **Truthful capabilities (#1594)** — `memory_capabilities` reports the LIVE posture: `embedder_loaded = false` (and `recall_mode_active = "degraded"`) when the remote embedder is failing at request time.
+- **Resilient backfill (#1595)** — per-row fallback on batch failure, skip-with-WARN on poison rows, Ollama `truncate: true`.
+- **`ai-memory reembed [--namespace <ns>] [--dry-run] [--batch <n>] [--json]`** — vector-space migration tool; re-embeds the corpus under the currently-resolved backend/model. CLI subcommand counts: 79 → 80 default build, 81 → 82 under `--features sal` (`EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}`).
+- **`ai-memory doctor` "Embeddings Reachability (#1598)" section** — probes ollama `/api/tags` or OpenAI-compatible `/embeddings` with the resolved Bearer key; PASS/WARN/CRIT + provenance facts; GPU-policy WARN when `backend = ollama` resolves on a host with no compatible GPU.
+- **`KNOWN_EMBEDDING_DIMS`** gained `google/gemini-embedding-2` (3072) + IBM Granite entries.
+- **Docs** — two new enterprise reference architectures (`docs/reference-architecture/enterprise-cpu-memory{,-gpu}.md`: CPU+Memory API-embeddings shape, CPU+Memory+GPU local-Ollama shape) registered in the Pages nav, plus a full-spectrum drift sweep across CLAUDE.md / docs/ / README / Pages.
+
 - feat(quotas, #1156): per-namespace K8 quota dimension extension (schema v50). Extends `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)` so per-namespace quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel namespace, preserving pre-v50 row accounting verbatim. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Both adapters now at `CURRENT_SCHEMA_VERSION = 50` (`src/storage/migrations.rs` sqlite ladder + `src/store/postgres.rs::migrate_v50()` postgres mirror with `ALTER TABLE ... ADD COLUMN namespace TEXT NOT NULL DEFAULT '_global'` + PK swap + index). New migration file `migrations/sqlite/0042_v50_per_namespace_quota.sql`; 14 integration tests in `tests/per_namespace_quota.rs`.
 
 ### feat(mcp, #1154) — daemon serverInfo Ed25519 signing at MCP initialize handshake (2026-05-23)

@@ -150,7 +150,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (88 route registrations / 74 unique URL paths on localhost at v0.7.0) and the **CLI** (81 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 79 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (88 route registrations / 74 unique URL paths on localhost at v0.7.0) and the **CLI** (82 subcommands at v0.7.x under `--features sal` OR `--features sal-postgres`; 80 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -652,7 +652,7 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, ai-memory also exposes a full HTTP REST API (88 route registrations / 74 unique URL paths on port 9077 at v0.7.0) and a complete CLI (81 subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`; 79 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) for direct interaction, scripting, and integration with any AI platform or tool.
+Beyond MCP, ai-memory also exposes a full HTTP REST API (88 route registrations / 74 unique URL paths on port 9077 at v0.7.0) and a complete CLI (82 subcommands at v0.7.x under `--features sal` OR `--features sal-postgres`; 80 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 
@@ -684,7 +684,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (88 route registrations 
 
 ### Interfaces
 - **88 HTTP routes (74 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
-- **81 CLI subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres`** (79 in the default build) -- complete CLI with identical capabilities
+- **82 CLI subcommands at v0.7.x under `--features sal` OR `--features sal-postgres`** (80 in the default build) -- complete CLI with identical capabilities
 - **74 MCP tools** at full profile (7 default at v0.7.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
@@ -850,6 +850,7 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | Autonomous memory reflection | -- | -- | -- | Yes |
 | **Models** | | | | |
 | Embedding model | -- | MiniLM-L6-v2 (384d) | nomic-embed-text (768d) | nomic-embed-text (768d) |
+| Embedding backend override ([#1598](https://github.com/alphaonedev/ai-memory-mcp/issues/1598)) | -- | any: local Ollama, API vendor alias, or self-hosted OpenAI-compatible (`[embeddings].backend` / `AI_MEMORY_EMBED_*`) | same | same |
 | LLM | -- | -- | operator-selected (#1067) — default `gemma3:4b` local; remote endpoints carry no local footprint | operator-selected (#1067) — default `gemma3:4b` local; remote endpoints carry no local footprint |
 | **Resources** | | | | |
 | RAM | 0 MB | ~256 MB | ~1 GB | ~4 GB |
@@ -980,7 +981,7 @@ These 74 tools (full profile at v0.7.0; canonical count via `Profile::full().exp
 
 ## CLI Commands
 
-81 top-level subcommands at v0.7.0 under `--features sal` OR `--features sal-postgres` (79 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+82 top-level subcommands at v0.7.x under `--features sal` OR `--features sal-postgres` (80 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`; was 40 at v0.6.4; #1598 added `Reembed`). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|

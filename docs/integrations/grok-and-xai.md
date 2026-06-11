@@ -109,10 +109,14 @@ If you DO use the `env:` block, verify by restarting your AI client
 and checking the boot banner:
 
 ```text
-ai-memory: LLM ready (backend=xai, model=grok-4.3)
-ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape);
-           building dedicated Ollama embed client at http://localhost:11434 (#1143)
+ai-memory: LLM ready (backend=xai, model=grok-4.3, source=env, key_source=env)
+ai-memory: embedder loaded (<embed-backend description>)
 ```
+
+(The embedder line reflects the independently-resolved `[embeddings]`
+configuration — post-#1598 it can be local Ollama OR any API backend;
+the historical #1143 "building dedicated Ollama embed client" banner
+was superseded at this boot site by #1598.)
 
 If you see `llm=gemma3:4b` (the legacy Ollama default), neither the
 config file nor the env block landed — re-check the paths your AI

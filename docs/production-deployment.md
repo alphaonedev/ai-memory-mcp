@@ -123,7 +123,7 @@ Out-of-the-box observability lands in three places:
 
 - **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug` for deep traces. Note (post-#1562, 2026-06-09): the postgres SAL adapter emits under the literal targets `store::postgres` / `store::postgres::kg`, which an `ai_memory=...` filter does not match — postgres-backed deployments wanting those events must add e.g. `store::postgres=debug` to the filter.
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
-- **`ai-memory doctor`.** A 9-section health dashboard run locally at v0.7.0: Storage / Index / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146). Nothing leaves the host except the opt-in LLM reachability probe against your configured backend.
+- **`ai-memory doctor`.** A 10-section health dashboard run locally at v0.7.x: Storage / Index / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146) / Embeddings Reachability (#1598). Nothing leaves the host except the opt-in reachability probes against your configured LLM / embedding backends.
 
 Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc. — 25 lifecycle events, see [`hook-pipeline.md`](hook-pipeline.md)) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.md).
 
