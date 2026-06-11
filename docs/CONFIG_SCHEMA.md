@@ -100,6 +100,13 @@ backfill_batch = 100             # env override: AI_MEMORY_EMBED_BACKFILL_BATCH
 [reranker]
 enabled = true
 model   = "ms-marco-MiniLM-L-6-v2"
+max_seq_tokens = 256             # rerank input-sequence cap (#1604).
+                                 # Compiled default 256; admissible
+                                 # range 1..=512 (the model ceiling) —
+                                 # zero / out-of-range values fall
+                                 # through. Env override:
+                                 # AI_MEMORY_RERANK_MAX_SEQ (env > this
+                                 # field > compiled default).
 
 # ---------------------------------------------------------------------
 # [storage] — storage configuration.

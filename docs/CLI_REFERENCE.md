@@ -87,10 +87,12 @@ ai-memory store --title "Prod incident postmortem" \
 ### `recall`
 
 Semantic + keyword hybrid recall. **Mutates the database**: increments
-`access_count`, REPLACES `expires_at` with `now + per-tier-extend_secs`
-(sliding-window REPLACEMENT, NOT max-of-old-and-new extend — issue
-[#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)),
-auto-promotes mid→long at 5 accesses.
+`access_count`, raises `expires_at` to
+`MAX(current expires_at, now + per-tier-extend_secs)` (extension FLOOR —
+an access can never move an expiry earlier; issue
+[#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596),
+superseding the [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)
+replacement contract), auto-promotes mid→long at 5 accesses.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|

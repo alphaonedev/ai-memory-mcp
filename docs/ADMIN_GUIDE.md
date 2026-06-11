@@ -208,6 +208,8 @@ model   = "nomic-embed-text-v1.5"      # e.g. "google/gemini-embedding-2" (3072d
 [reranker]
 enabled = true
 model   = "ms-marco-MiniLM-L-6-v2"
+max_seq_tokens = 256                   # rerank input-sequence cap (#1604);
+                                       # 1..=512, env: AI_MEMORY_RERANK_MAX_SEQ
 ```
 
 **API-key resolution chain.** For non-Ollama backends, the resolver consults (in order):
@@ -373,8 +375,8 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
 | `ttl.mid_ttl_secs` | Integer | `604800` (7 days) | `0` = never expires, or positive integer | TTL for mid-tier memories in seconds |
 | `ttl.long_ttl_secs` | Integer | `0` (never expires) | `0` = never expires, or positive integer | TTL for long-tier memories in seconds |
-| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | Per-access TTL window for short-tier memories. **Sliding-window REPLACEMENT semantic** (not max-of-old-and-new extend): on every access, `expires_at = now + short_extend_secs`. The create-time `short_ttl_secs` (6h default) is only a backstop until first access. |
-| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | Per-access TTL window for mid-tier memories. **Sliding-window REPLACEMENT semantic** (not extend): on every access, `expires_at = now + mid_extend_secs`. The create-time `mid_ttl_secs` (7d default) is only a backstop until first access. |
+| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | Per-access TTL window for short-tier memories. **Extension-FLOOR semantic ([#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596))**: on every access, `expires_at = MAX(current expires_at, now + short_extend_secs)` — an access can extend a memory's life but can never move its expiry EARLIER. The create-time `short_ttl_secs` (6h default) is preserved when it is later than the per-access window. |
+| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | Per-access TTL window for mid-tier memories. **Extension-FLOOR semantic ([#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596))**: on every access, `expires_at = MAX(current expires_at, now + mid_extend_secs)`. The create-time `mid_ttl_secs` (7d default) is preserved when it is later than the per-access window. |
 | `[limits]` | Section | -- | -- | **[#1156 follow-up, v0.7.x]** Operator-tunable resource caps. Per-field precedence: `AI_MEMORY_MAX_* env > [limits] > compiled default`; non-positive / unparseable values fall through. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). |
 | `limits.max_memories_per_day` | Integer (>0) | `1000` | Any positive integer | Per-agent daily memory-write quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_MEMORIES_PER_DAY`. |
 | `limits.max_storage_bytes` | Integer (>0) | `104857600` (100 MiB) | Any positive integer | Per-agent storage-byte quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_STORAGE_BYTES`. |
@@ -383,7 +385,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 
 > **Note:** Set any TTL to `0` to disable expiry for that tier. Values are clamped to a 10-year maximum (315,360,000 seconds). Negative extension values are clamped to 0.
 
-> **Sliding-window REPLACEMENT (CLAUDE.md prime-directive contract, issue [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)):** the `*_extend_secs` fields are misnamed historically — the implementation does NOT take `max(old_expires_at, now + extend_secs)`. Each access REPLACES `expires_at` outright with `now + per-tier-extend_secs`. A short memory accessed every 30 minutes never expires, even though it started with a 6h backstop. The field-name "extend" is preserved for backward-compat with v0.6.x callers and config files.
+> **Extension FLOOR, not replacement ([#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596), supersedes the [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830) replacement contract):** the touch path takes `MAX(current expires_at, now + per-tier-extend_secs)` (`src/storage/mod.rs::touch`). An access can only extend a memory's life, never shorten it — the pre-#1596 behavior, where recalling a mid-tier row with a week of remaining life REPLACED its expiry with `now + 1 day`, was a lived dogfood defect (a recall moved an expiry from 06-18 to 06-12). A short memory accessed every 30 minutes still never expires (each access keeps pushing the floor forward); what changed is that an access can no longer move an expiry EARLIER than it already was.
 
 > **Note:** Archive-restored memories re-apply the archived row's `original_tier` / `original_expires_at` where present; legacy archive rows (pre-v49) restore as `long` with no expiry.
 
@@ -461,6 +463,9 @@ Below is a complete example showing every supported field with explanatory comme
 #   [reranker]
 #   enabled = true
 #   model   = "ms-marco-MiniLM-L-6-v2"
+#   max_seq_tokens = 256        # rerank input-sequence cap (#1604);
+#                               # 1..=512 (model ceiling), default 256.
+#                               # Env override: AI_MEMORY_RERANK_MAX_SEQ.
 #
 #   [storage]
 #   default_namespace = "global"

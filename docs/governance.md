@@ -107,11 +107,21 @@ ai-memory install claude-code --hook pretool --apply
   the subscription system (K4).
 - `rule_summary` is now populated with a real ordered list of active
   governance rules (K5).
-- The 7th-form agent-EXTERNAL Layer-4 surface (Bash /
-  FilesystemWrite / NetworkRequest / ProcessSpawn) is **Option-B
-  foundation** at v0.7.0 (substrate-INTERNAL writes gated; agent
-  contracts surface `callable_now=false`). Full cover lands in
-  v0.8.0 per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697).
+- The 7th-form agent-EXTERNAL Layer-4 surface (`AgentAction::Bash` /
+  `FilesystemWrite` / `NetworkRequest` / `ProcessSpawn`; wire kinds
+  `bash` / `filesystem_write` / `network_request` / `process_spawn`)
+  is **live at v0.7.0**: PE-1 wired `GOVERNANCE_PRE_ACTION` at four
+  daemon-side boundaries (skill-manifest emission, federation peer
+  POST, hooks subprocess spawn, LLM HTTP), PE-2 ships the Claude Code
+  PreToolUse hook installer, and `memory_check_agent_action` is the
+  harness-consulted read surface — see
+  [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point
+  audit. Residual v0.8.0 scope (subprocess chains, mandatory-hook
+  attestation, `AgentAction::Read`) is tracked under
+  [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697).
+  Capabilities advertises the four wire kinds verbatim under
+  `governance.enforced_actions`
+  ([#1605](https://github.com/alphaonedev/ai-memory-mcp/issues/1605)).
 
 See [`docs/internal/v070-feature-inventory.md` §"K1/G1
 namespace-inheritance"](internal/v070-feature-inventory.md) for the

@@ -210,9 +210,13 @@ What v0.7.0 ships:
 - Substrate `storage::insert` pre-write hook surfaces structured refusal via the `MemoryError::RefusedByGovernance` error variant.
 - `ai-memory install claude-code --hook pretool --apply` wires the policy hook at install time (routes Bash / Edit / Write tool calls through `memory_check_agent_action`).
 
-What v0.7.0 does NOT ship (v0.8.0 cover):
+What v0.7.0 ALSO ships (post-PE-1/PE-2/PE-3 fold — supersedes the earlier "v0.8.0 cover" framing):
 
-- Agent-EXTERNAL Bash / FilesystemWrite / NetworkRequest / ProcessSpawn enforcement is `callable_now=false` at the substrate boundary — the rule corpus is consulted on the substrate write path only.
+- Agent-EXTERNAL enforcement (wire kinds `bash` / `filesystem_write` / `network_request` / `process_spawn`) is live at four daemon-side `GOVERNANCE_PRE_ACTION` boundaries (skill-manifest emission, federation peer POST, hooks subprocess spawn, LLM HTTP) plus the harness PreToolUse hook (`ai-memory install claude-code --hook pretool --apply`). See [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point audit.
+
+What v0.7.0 does NOT ship (v0.8.0 cover, [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)):
+
+- Subprocess-chain visibility (bash spawn → fork → exec), mandatory-hook attestation, and engine-level read gating (`AgentAction::Read`).
 
 Audit-honest framing: see [`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](RECURSIVE_LEARNING.md#substrate-authority-claim--v070-option-b-foundation). Operator doc: [`docs/policy-engine.md`](policy-engine.md) + [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.md).
 

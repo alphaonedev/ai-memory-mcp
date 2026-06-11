@@ -318,7 +318,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The TTL ladder</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">From hours to days to forever — three slopes.</h2>
-    <p class="lede">Each tier has its own decay slope. Short bleeds out in hours. Mid in days. Long holds. Access resets the expiry to <code>now +</code> a tier-specific extend interval (a sliding window), so memories that matter get used and earn more time.</p>
+    <p class="lede">Each tier has its own decay slope. Short bleeds out in hours. Mid in days. Long holds. Access raises the expiry to <code>MAX(current expiry, now + extend interval)</code> — an extension floor (#1596) — so memories that matter get used and earn more time, and an access never shortens a memory's remaining life.</p>
     <svg class="ladder-svg" viewBox="0 0 1180 360" xmlns="http://www.w3.org/2000/svg">
       <style>
         .axis{stroke:#3d3d3d;stroke-width:1.2}

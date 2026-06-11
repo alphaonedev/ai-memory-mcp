@@ -305,7 +305,7 @@ mid_extend_secs   = <span class="num">86400</span>  <span class="cm"># access re
 
     <div class="dial config">
       <div class="dial-head"><span class="dial-name">extend_secs (access-driven)</span><span class="dial-where">on read · per-tier</span></div>
-      <div class="dial-desc">When a memory is accessed (<code>memory_get</code>, recall hit, search hit), its <code>expires_at</code> is <strong>reset to <code>now + extend_secs</code></strong> for the tier — a sliding-window <em>replacement</em>, not a max-of-old-and-new additive extend (the create-time 6h/7d backstop applies only until first access). Memories that get used keep earning more time. Defaults: Short 1h, Mid 1d (<code>SHORT_TTL_EXTEND_SECS</code> / <code>MID_TTL_EXTEND_SECS</code>). Long has no extend (no TTL to extend).</div>
+      <div class="dial-desc">When a memory is accessed (<code>memory_get</code>, recall hit, search hit), its <code>expires_at</code> is <strong>raised to <code>MAX(current expires_at, now + extend_secs)</code></strong> for the tier — an extension <em>floor</em> (#1596): an access can extend a memory's life but can never move its expiry earlier, so the create-time 6h/7d backstop is preserved when it is later than the per-access window. Memories that get used keep earning more time. Defaults: Short 1h, Mid 1d (<code>SHORT_TTL_EXTEND_SECS</code> / <code>MID_TTL_EXTEND_SECS</code>). Long has no extend (no TTL to extend).</div>
     </div>
 
     <div class="dial policy">
