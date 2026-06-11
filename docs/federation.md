@@ -209,10 +209,16 @@ Receive-side embedding is **no longer part of that window**
 ([#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566),
 fixed under #1579 B1): the push payload ships the sender's embedding
 vector inside the signed body (`embeddings` array — optional on the
-wire, so older peers interoperate), a dim-matching receiver stores it
-directly, and any row without a usable shipped vector is embedded by
-a background task **after** the ack (the pre-fix behaviour embedded
-synchronously at ~1 s/row while holding the receiver's DB lock).
+wire, so older peers interoperate), a dim-matching receiver
+validates + stores it directly, and any row without a usable shipped
+vector is embedded by a background task **after** the ack (the pre-fix
+behaviour embedded synchronously at ~1 s/row while holding the
+receiver's DB lock). The signature attests the SENDER + transit
+integrity, not that the vector is well-formed, so the receiver enforces
+the value domain (#1584): a shipped vector with a non-finite component
+is rejected (→ local re-embed) and a non-unit-norm vector is
+L2-normalized before storage, so an enrolled peer cannot poison the
+receiver's cosine ranking with a NaN or high-magnitude vector.
 A too-tight deadline shows up as push `deadline_exceeded` → DLQ
 ([#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)).
 Raising it is cheap: the write commits **locally first**, so a longer
