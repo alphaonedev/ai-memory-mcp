@@ -1795,18 +1795,33 @@ mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
 
-    /// #1604 — process-wide rerank sequence-cap seeding: unseeded
-    /// reads fall through to the compiled default; the first
-    /// [`set_rerank_max_seq`] writer wins; later writes are no-ops.
-    /// Single test (not split) because the `OnceLock` is process-wide
-    /// state — ordering across tests would be nondeterministic.
+    /// #1604 — process-wide rerank sequence-cap seeding: the first
+    /// [`set_rerank_max_seq`] writer wins and later writes are no-ops.
+    ///
+    /// Order-independent by construction: other tests in this binary
+    /// may legitimately seed the process-wide `OnceLock` first (any
+    /// test that walks the `daemon_runtime` boot ladder does), so this
+    /// test asserts only the post-seed immutability contract — it
+    /// seeds (or observes the earlier seed), then proves a second
+    /// write cannot change the value. The unseeded-default fallback
+    /// is pinned by `resolve_reranker_1604_max_seq_ladder` (resolver
+    /// layer, no OnceLock) instead. The pre-fix form asserted the
+    /// unseeded default first and was order-dependent — green locally,
+    /// red under CI's impact-aware test ordering.
     #[test]
     fn rerank_max_seq_1604_seed_once_semantics() {
-        assert_eq!(rerank_max_seq(), RERANK_MAX_SEQ_DEFAULT);
         set_rerank_max_seq(192);
-        assert_eq!(rerank_max_seq(), 192);
+        let settled = rerank_max_seq();
+        assert!(
+            settled > 0,
+            "settled value must be a real cap (ours or an earlier boot seed), got {settled}"
+        );
         set_rerank_max_seq(64);
-        assert_eq!(rerank_max_seq(), 192, "first writer must win");
+        assert_eq!(
+            rerank_max_seq(),
+            settled,
+            "first writer must win — a later set_rerank_max_seq call must be a no-op"
+        );
     }
 
     fn make_memory(title: &str, content: &str) -> Memory {
