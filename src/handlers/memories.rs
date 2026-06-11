@@ -946,6 +946,7 @@ pub async fn promote_memory(
     State(app): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {
@@ -955,6 +956,46 @@ pub async fn promote_memory(
         )
             .into_response();
     }
+    // #1623 — optional JSON body `{"target_tier": "mid"|"long"}`,
+    // closing the MCP/HTTP parity gap (#831 added the param on MCP;
+    // the HTTP route read no body and silently jumped to long even
+    // when a caller supplied one). Empty body preserves the
+    // historical highest-reachable-tier default. Validation mirrors
+    // the MCP handler's wording.
+    let target_tier = if body.is_empty() {
+        Tier::Long
+    } else {
+        let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid promote body JSON: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        match parsed.get("target_tier").and_then(|v| v.as_str()) {
+            None => Tier::Long,
+            Some("short") => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "target_tier 'short' is not a valid promote target (would be a downgrade)"})),
+                )
+                    .into_response();
+            }
+            Some(other) => match Tier::from_str(other) {
+                Some(t) => t,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("target_tier must be one of 'mid' or 'long' (got '{other}')")})),
+                    )
+                        .into_response();
+                }
+            },
+        }
+    };
 
     // v0.7.0 Wave-3 Continuation 5 (state-flake / S16+S49) — postgres-
     // backed daemons resolve the memory through the SAL trait so a
@@ -1052,7 +1093,7 @@ pub async fn promote_memory(
         }
 
         let patch = crate::store::UpdatePatch {
-            tier: Some(Tier::Long),
+            tier: Some(target_tier),
             ..Default::default()
         };
         return match app.store.update(&ctx, &target.id, patch).await {
@@ -1267,7 +1308,7 @@ pub async fn promote_memory(
         &resolved_id,
         None,
         None,
-        Some(&Tier::Long),
+        Some(&target_tier),
         None,
         None,
         None,
@@ -1276,16 +1317,21 @@ pub async fn promote_memory(
         None,
     ) {
         Ok((true, _)) => {
-            if let Err(e) = lock.0.execute(
-                "UPDATE memories SET expires_at = NULL WHERE id = ?1",
-                rusqlite::params![resolved_id],
-            ) {
-                tracing::error!("promote clear expiry failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-                )
-                    .into_response();
+            // #1623 — only a LONG landing clears expiry (long is
+            // permanent); a mid landing keeps the row's live 7-day
+            // TTL, matching the MCP handler's semantics.
+            if matches!(target_tier, Tier::Long) {
+                if let Err(e) = lock.0.execute(
+                    "UPDATE memories SET expires_at = NULL WHERE id = ?1",
+                    rusqlite::params![resolved_id],
+                ) {
+                    tracing::error!("promote clear expiry failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                    )
+                        .into_response();
+                }
             }
             // v0.6.0.1: fan out the promoted memory so peers pick up the
             // new tier + cleared expiry via insert_if_newer's newer-wins merge.
@@ -1300,7 +1346,7 @@ pub async fn promote_memory(
                 .map(str::to_string);
             let details = serde_json::to_value(crate::subscriptions::PromoteEventDetails {
                 mode: "tier".to_string(),
-                tier: Some(Tier::Long.as_str().to_string()),
+                tier: Some(target_tier.as_str().to_string()),
                 to_namespace: None,
                 clone_id: None,
             })

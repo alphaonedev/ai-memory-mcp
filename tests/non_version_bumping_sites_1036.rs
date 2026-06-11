@@ -193,3 +193,68 @@ fn upsert_merge_bumps_version_1632() {
         .expect("read v2");
     assert_eq!(v2, 2, "#1632: upsert-merge must bump version");
 }
+
+#[test]
+fn archive_no_tx_joins_outer_transaction_1638() {
+    // #1638 — the supersede path wraps archive + insert in ONE
+    // BEGIN IMMEDIATE via db::archive_memory (tx wrapper) /
+    // the pub(crate) no-tx core. Prove the load-bearing property from
+    // the OUTSIDE: an archive_memory inside a rolled-back outer
+    // transaction leaves the live row intact (pre-#1638 the archive
+    // committed its own tx, so a later failure could not undo it and
+    // the live row was gone with an error returned).
+    let conn = fresh_db_conn();
+    let _mem = seed_memory_with_confidence(&conn, "m-1638", 0.8);
+
+    // db::archive_memory is the tx wrapper; the no-tx core is
+    // pub(crate). Exercise the same property through the public
+    // supersede API instead: a supersede whose insert step fails must
+    // leave the OLD row live. Force the insert failure with a
+    // CHECK-violating tier smuggled through the patch — the validated
+    // surfaces reject it earlier, so emulate the mid-tx fault by
+    // dropping the FTS table the insert trigger needs.
+    conn.execute_batch("DROP TABLE memories_fts;").unwrap();
+    let err = db::update_with_archive_on_supersede(
+        &conn,
+        "m-1638",
+        None,
+        Some("patched content for the 1638 atomicity probe"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ai_memory::models::EditSource::Llm,
+    )
+    .expect_err("insert step must fail once the FTS table is gone");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("memories_fts") || msg.contains("no such table"),
+        "unexpected failure shape: {msg}"
+    );
+    // The OLD row must still be LIVE (pre-#1638 it had vanished into
+    // archived_memories).
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = 'm-1638'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        live, 1,
+        "#1638: failed supersede must leave the old row live"
+    );
+    let archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = 'm-1638'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived, 0, "#1638: the archive step must roll back too");
+}

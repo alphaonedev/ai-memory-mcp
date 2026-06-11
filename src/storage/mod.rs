@@ -1682,12 +1682,14 @@ pub fn update_with_archive_on_supersede(
         );
     }
 
-    // Note: do NOT open an outer transaction here — `archive_memory`
-    // opens its own BEGIN IMMEDIATE and SQLite refuses nested
-    // transactions. The two writes (archive + insert) are not
-    // strictly atomic, but the live row is removed before the new
-    // row is inserted so a mid-failure leaves the live table empty
-    // for this (title, namespace) slot rather than dual-populated.
+    // #1638 — archive + insert run inside ONE BEGIN IMMEDIATE (below),
+    // honoring the documented atomicity contract: a failure mid-way
+    // (SQLITE_BUSY from a concurrent CLI-process writer, ENOSPC, FTS
+    // trigger I/O error on the insert) rolls back the archive too, so
+    // the OLD row stays live instead of vanishing into the archive
+    // with an error returned. Uses `archive_memory_no_tx` (the
+    // `append_signed_event_no_tx` idiom) because SQLite refuses
+    // nested transactions.
     let archived_id = existing.id.clone();
 
     // FX-C5 — compose the NEW row up front so the substrate
@@ -1726,18 +1728,30 @@ pub fn update_with_archive_on_supersede(
     // returns cleanly with no state change.
     consult_governance_pre_write(&new_mem)?;
 
-    // Step 1: archive the OLD row with reason='superseded'.
-    let moved = archive_memory(conn, &archived_id, Some("superseded"))?;
-    if !moved {
-        // #962 typed envelope — substrate-internal fault (DB row vanished
-        // between read and write or row count drifted). Maps to 500.
-        return Err(anyhow::Error::new(StorageError::ArchiveSupersedeFailed {
-            archived_id: archived_id.clone(),
-        }));
+    // Steps 1+2 (#1638): one transaction around archive + insert.
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let tx_result = (|| -> Result<()> {
+        // Step 1: archive the OLD row with reason='superseded'.
+        let moved = archive_memory_no_tx(conn, &archived_id, Some("superseded"))?;
+        if !moved {
+            // #962 typed envelope — substrate-internal fault (DB row
+            // vanished between read and write or row count drifted).
+            // Maps to 500.
+            return Err(anyhow::Error::new(StorageError::ArchiveSupersedeFailed {
+                archived_id: archived_id.clone(),
+            }));
+        }
+        // Step 2: insert the NEW row carrying the patched content.
+        insert(conn, &new_mem)?;
+        Ok(())
+    })();
+    match tx_result {
+        Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            return Err(e);
+        }
     }
-
-    // Step 2: insert the NEW row carrying the patched content.
-    insert(conn, &new_mem)?;
 
     // Step 3: the supersede edge from new→archived id is preserved
     // in the new row's `metadata.superseded_id` (see above). A
@@ -1775,9 +1789,32 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
 ///
 /// Returns an error if the INSERT-SELECT or DELETE fails.
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let result = archive_memory_no_tx(conn, id, reason);
+    match result {
+        Ok(moved) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(moved)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
+/// #1638 — transaction-free core of [`archive_memory`], for callers
+/// that already hold an open transaction (the supersede path wraps
+/// archive + insert in ONE `BEGIN IMMEDIATE` so a mid-failure leaves
+/// the OLD row live, per the function's documented atomicity
+/// contract). Same idiom as `append_signed_event_no_tx`.
+pub(crate) fn archive_memory_no_tx(
+    conn: &Connection,
+    id: &str,
+    reason: Option<&str>,
+) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let reason = reason.unwrap_or("archive");
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -1815,16 +1852,7 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
         let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
-    match result {
-        Ok(moved) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
-            Ok(moved)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
-            Err(e)
-        }
-    }
+    result
 }
 
 /// #940 (security-high, 2026-05-20) — caller-scoped archive variant.
@@ -4218,7 +4246,12 @@ pub fn consolidate(
             citations: Vec::new(),
             source_uri: None,
             source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            // #1633 — the engine pins confidence=1.0, so the honest
+            // provenance is CuratorDerived (the #1242 audit-honesty
+            // invariant: engine-derived values must be discoverable to
+            // the calibration sweep; 'caller_provided' rows are
+            // excluded by idx_memories_confidence_source).
+            confidence_source: crate::models::ConfidenceSource::CuratorDerived,
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
@@ -4231,9 +4264,9 @@ pub fn consolidate(
         // never reaped by GC. `candidate.created_at == now` so the backfill
         // here matches the `?10` bound below.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12)",
-            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json],
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
+            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str()],
         )?;
 
         // Delete source memories first. Note: we intentionally do NOT create

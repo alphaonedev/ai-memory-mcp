@@ -4004,6 +4004,68 @@ fn test_import_trust_source_preserves_agent_id() {
 /// merged metadata). Fix: consolidator's `agent_id` becomes authoritative;
 /// original authors preserved in `metadata.consolidated_from_agents`.
 #[test]
+fn test_consolidate_stamps_curator_derived_provenance_1633() {
+    // #1633 — the engine pins confidence=1.0 on consolidated rows, so
+    // the honest provenance is curator_derived (the #1242 audit-
+    // honesty invariant: 'caller_provided' rows are invisible to the
+    // calibration sweep's derived-row index).
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let mut ids = Vec::new();
+    for title in ["pv-1", "pv-2"] {
+        let out = cmd(binary)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                "alice",
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-n",
+                "pv1633",
+                "-c",
+                "body",
+            ])
+            .output()
+            .unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ids.push(j["id"].as_str().unwrap().to_string());
+    }
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "curator",
+            "consolidate",
+            "--title",
+            "pv-merged",
+            "--summary",
+            "merged body",
+            "--namespace",
+            "pv1633",
+            &ids.join(","),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let cs: String = conn
+        .query_row(
+            "SELECT confidence_source FROM memories WHERE title = 'pv-merged'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cs, "curator_derived",
+        "#1633: consolidated rows must carry honest engine provenance"
+    );
+}
+
+#[test]
 fn test_consolidate_attributes_to_consolidator() {
     let db_path = fresh_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");

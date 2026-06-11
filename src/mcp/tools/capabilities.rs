@@ -359,7 +359,17 @@ fn build_capabilities_overlay(
             caps.models.cross_encoder = "lexical-fallback (neural download failed)".to_string();
             RerankerMode::LexicalFallback
         }
-        None => RerankerMode::Off,
+        None => {
+            // #1647 — no reranker handle on THIS surface (the HTTP
+            // daemon never wires one; its recall path performs no
+            // cross-encoder pass), so the flag must not advertise the
+            // tier preset. Same live-truth posture as the #93
+            // LexicalFallback flip above: the envelope was previously
+            // self-contradictory (cross_encoder_reranking=true beside
+            // reranker_active="off") on autonomous-tier HTTP daemons.
+            caps.features.cross_encoder_reranking = false;
+            RerankerMode::Off
+        }
     };
 
     // --- Reflection-aware boost live state (v0.7.0 L2-8) ---
@@ -1466,6 +1476,27 @@ mod d1_2_983_tests {
                 .symmetric_difference(&derived_keys)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn no_reranker_handle_flips_cross_encoder_flag_1647() {
+        // #1647 — a surface with no live reranker handle (the HTTP
+        // daemon) must not advertise the tier preset's
+        // cross_encoder_reranking; pre-fix the envelope was
+        // self-contradictory (flag true beside reranker_active "off").
+        let tier_config = crate::config::FeatureTier::Autonomous.config();
+        let caps = build_capabilities_overlay(
+            &tier_config,
+            &crate::config::ResolvedModels::default(),
+            None,
+            false,
+            None,
+        );
+        assert!(
+            !caps.features.cross_encoder_reranking,
+            "#1647: no handle ⇒ flag false"
+        );
+        assert_eq!(caps.features.reranker_active, RerankerMode::Off);
     }
 
     #[test]
