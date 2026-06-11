@@ -154,13 +154,34 @@ async fn a4_backfill_sweep_embeds_null_embedding_rows() {
             .await
             .expect("connect postgres adapter"),
     );
-    let ctx = CallerContext::for_agent("ai:perf-1579-test");
+    // #1586 (SEC) — `list_unembedded` is an admin-only sweep primitive
+    // (it returns id+title+content of EVERY unembedded row regardless of
+    // namespace/scope). The production sweep
+    // (`run_embedding_backfill_on_store`) drives it with
+    // `CallerContext::for_admin(EMBEDDING_BACKFILL)`, so the test uses
+    // the same admin posture.
+    let ctx = CallerContext::for_admin("ai:perf-1579-test");
     let ns = format!("perf-1579-a4-{}", uuid::Uuid::new_v4());
 
     for i in 0..7 {
         let mem = fixture_memory(i, &ns);
         store.store(&ctx, &mem).await.expect("seed store");
     }
+
+    // #1586 (SEC) — a NON-admin context (bypass_visibility == false)
+    // must get an EMPTY scan even though 7 unembedded rows exist, so a
+    // future handler wiring this method without re-gating cannot leak
+    // cross-tenant private title+content.
+    let non_admin = CallerContext::for_agent("ai:perf-1579-non-admin");
+    let leaked = store
+        .list_unembedded(&non_admin, 100)
+        .await
+        .expect("non-admin scan");
+    assert!(
+        leaked.is_empty(),
+        "#1586: list_unembedded under a non-admin context must be empty, got {} rows",
+        leaked.len()
+    );
 
     // Pre-sweep: every seeded row reports unembedded; the LIMIT is
     // honoured (bounded batches, F5.6 semantics).
