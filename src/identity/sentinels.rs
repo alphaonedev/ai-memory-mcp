@@ -84,6 +84,14 @@ pub const AI_CURATOR: &str = "ai:curator";
 /// helper every fallback path must route through; #1560).
 pub const ANONYMOUS_REQ_PREFIX: &str = "anonymous:req-";
 
+/// Prefix marking an NHI (AI) agent identity (`ai:<client>@<host>:…`,
+/// `ai:claude-code@…`, the operator-set `AI_MEMORY_AGENT_ID=ai:…`
+/// forms). The id-shape ladder in [`crate::identity::resolve_agent_id`]
+/// synthesizes ids under this prefix from `initialize.clientInfo.name`;
+/// #1600 derives the default `memory_update` `edit_source` from it
+/// ([`crate::models::EditSource::default_for_agent_id`]).
+pub const AI_AGENT_ID_PREFIX: &str = "ai:";
+
 #[cfg(test)]
 mod tests {
     use super::*;

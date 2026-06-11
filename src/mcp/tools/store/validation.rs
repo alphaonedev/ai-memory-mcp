@@ -112,10 +112,19 @@ pub(super) fn parse_and_build_memory(
     let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
     let tier =
         Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
-    let namespace = params["namespace"]
-        .as_str()
-        .unwrap_or(crate::DEFAULT_NAMESPACE)
-        .to_string();
+    // #1590 — namespace default ladder: explicit caller param >
+    // operator-configured `[storage].default_namespace` (seeded
+    // process-wide at boot; `None` for unconfigured deployments) >
+    // compiled `DEFAULT_NAMESPACE`. Pre-#1590 the resolved
+    // `default_namespace` was consumed by NO write path — the MCP
+    // store always hardcoded the compiled "global" fallback.
+    let namespace = params["namespace"].as_str().map_or_else(
+        || {
+            crate::config::configured_default_namespace()
+                .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
+        },
+        str::to_string,
+    );
     // v0.7.x (issue #1175): vendor-neutral substrate default. The
     // pre-#1175 hardcode of `"claude"` was a heterogeneous-NHI monoculture
     // defect — `memory_store` from a non-Anthropic NHI silently stamped
@@ -137,7 +146,12 @@ pub(super) fn parse_and_build_memory(
     // the stdio MCP server pre-fix. `validate_priority` below enforces the
     // semantic 1-10 range, so the clamp is purely a panic guard.
     let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(i32::MAX);
-    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
+    // #1591 — keep "did the caller actually send confidence?" visible
+    // so the row's `confidence_source` is truthful: an omitted value
+    // stamps the compiled DEFAULT_CONFIDENCE with source="default"
+    // instead of falsely claiming "caller_provided".
+    let caller_confidence = params[param_names::CONFIDENCE].as_f64();
+    let confidence = caller_confidence.unwrap_or(crate::models::DEFAULT_CONFIDENCE);
     let tags: Vec<String> = params["tags"]
         .as_array()
         .map(|a| {
@@ -296,7 +310,14 @@ pub(super) fn parse_and_build_memory(
         citations,
         source_uri,
         source_span,
-        confidence_source: ConfidenceSource::CallerProvided,
+        // #1591 — truthful confidence provenance: only an explicit
+        // caller value is `caller_provided`; the compiled fallback is
+        // `default`.
+        confidence_source: if caller_confidence.is_some() {
+            ConfidenceSource::CallerProvided
+        } else {
+            ConfidenceSource::Default
+        },
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
@@ -405,5 +426,103 @@ mod tests {
             mem.source, "system",
             "caller-supplied source wins over the default"
         );
+    }
+
+    /// v0.7.x issue #1591 regression — `memory_store` with NO
+    /// `confidence` argument must stamp the compiled default value
+    /// with TRUTHFUL provenance `confidence_source = "default"`.
+    /// Pre-#1591 the omitted case stamped `confidence = 1.0` +
+    /// `confidence_source = "caller_provided"` — a false provenance
+    /// claim indistinguishable from a deliberate caller assertion.
+    #[test]
+    fn issue_1591_omitted_confidence_stamps_source_default() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1591-omitted",
+            "content": "memory body",
+            "namespace": "issue-1591",
+            // No confidence field.
+        });
+        let (mem, _, _, _) = parse_and_build_memory(&params, None, &ttl, &conn).expect("ok");
+        assert!((mem.confidence - crate::models::DEFAULT_CONFIDENCE).abs() < f64::EPSILON);
+        assert_eq!(
+            mem.confidence_source,
+            crate::models::ConfidenceSource::Default,
+            "#1591: omitted confidence must stamp source=default"
+        );
+        assert_eq!(mem.confidence_source.as_str(), "default");
+    }
+
+    /// v0.7.x issue #1591 regression — an EXPLICIT `confidence=0.8`
+    /// keeps the historical `caller_provided` provenance.
+    #[test]
+    fn issue_1591_explicit_confidence_stays_caller_provided() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1591-explicit",
+            "content": "memory body",
+            "namespace": "issue-1591",
+            "confidence": 0.8,
+        });
+        let (mem, _, _, _) = parse_and_build_memory(&params, None, &ttl, &conn).expect("ok");
+        assert!((mem.confidence - 0.8).abs() < f64::EPSILON);
+        assert_eq!(
+            mem.confidence_source,
+            crate::models::ConfidenceSource::CallerProvided,
+        );
+    }
+
+    /// v0.7.x issue #1590 regression — the MCP store namespace default
+    /// ladder: explicit param > operator-configured
+    /// `[storage].default_namespace` (process-wide seed) > compiled
+    /// `"global"`. Pre-#1590 the configured value was resolved but
+    /// consumed by NO write path.
+    #[test]
+    fn issue_1590_store_namespace_default_ladder() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let _gate = crate::config::lock_configured_default_namespace_for_test();
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let omitted_ns = json!({
+            "title": "issue-1590-store",
+            "content": "memory body",
+        });
+
+        // Unconfigured deployment: historical compiled default.
+        crate::config::set_configured_default_namespace(None);
+        let (mem, _, _, _) = parse_and_build_memory(&omitted_ns, None, &ttl, &conn).expect("ok");
+        assert_eq!(mem.namespace, crate::DEFAULT_NAMESPACE);
+
+        // Operator explicitly configured [storage].default_namespace.
+        crate::config::set_configured_default_namespace(Some("alphaone".to_string()));
+        let (mem, _, _, _) = parse_and_build_memory(&omitted_ns, None, &ttl, &conn).expect("ok");
+        assert_eq!(
+            mem.namespace, "alphaone",
+            "#1590: configured default_namespace must win over compiled global"
+        );
+
+        // Explicit caller namespace still beats the configured default.
+        let explicit_ns = json!({
+            "title": "issue-1590-store-explicit",
+            "content": "memory body",
+            "namespace": "caller-ns",
+        });
+        let (mem, _, _, _) = parse_and_build_memory(&explicit_ns, None, &ttl, &conn).expect("ok");
+        assert_eq!(mem.namespace, "caller-ns", "explicit param wins");
+
+        crate::config::set_configured_default_namespace(None);
     }
 }

@@ -593,7 +593,12 @@ pub async fn bulk_create(
                 content: body.content,
                 tags: body.tags,
                 priority: body.priority.clamp(1, 10),
-                confidence: body.confidence.clamp(0.0, 1.0),
+                // #1591 — omitted confidence resolves to the compiled
+                // default with truthful provenance (see below).
+                confidence: body
+                    .confidence
+                    .unwrap_or(crate::models::DEFAULT_CONFIDENCE)
+                    .clamp(0.0, 1.0),
                 source: body.source,
                 access_count: 0,
                 created_at: now.to_rfc3339(),
@@ -608,7 +613,11 @@ pub async fn bulk_create(
                 citations,
                 source_uri,
                 source_span,
-                confidence_source: ConfidenceSource::CallerProvided,
+                confidence_source: if body.confidence.is_some() {
+                    ConfidenceSource::CallerProvided
+                } else {
+                    ConfidenceSource::Default
+                },
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
@@ -747,7 +756,12 @@ pub async fn bulk_create(
                 content: body.content,
                 tags: body.tags,
                 priority: body.priority.clamp(1, 10),
-                confidence: body.confidence.clamp(0.0, 1.0),
+                // #1591 — omitted confidence resolves to the compiled
+                // default with truthful provenance (see below).
+                confidence: body
+                    .confidence
+                    .unwrap_or(crate::models::DEFAULT_CONFIDENCE)
+                    .clamp(0.0, 1.0),
                 source: body.source,
                 access_count: 0,
                 created_at: now.to_rfc3339(),
@@ -762,7 +776,11 @@ pub async fn bulk_create(
                 citations,
                 source_uri,
                 source_span,
-                confidence_source: ConfidenceSource::CallerProvided,
+                confidence_source: if body.confidence.is_some() {
+                    ConfidenceSource::CallerProvided
+                } else {
+                    ConfidenceSource::Default
+                },
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,

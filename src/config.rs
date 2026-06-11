@@ -3837,8 +3837,86 @@ pub struct ResolvedStorage {
     /// > compiled 256 MiB default). `0` disables memory-mapped I/O.
     /// Seeded into `crate::storage::set_db_mmap_size` at boot.
     pub db_mmap_size_bytes: i64,
+    /// #1590 — per-field provenance of `default_namespace`:
+    /// [`ConfigSource::Config`] when `[storage].default_namespace` is
+    /// explicitly set, [`ConfigSource::Legacy`] when only the
+    /// deprecated flat `default_namespace` field is set, else
+    /// [`ConfigSource::CompiledDefault`]. The section-level `source`
+    /// tag below cannot express this — it reports `Config` whenever a
+    /// `[storage]` section EXISTS even if `default_namespace` itself
+    /// was never configured, and the write-path defaulting must only
+    /// be overridden by an explicit operator choice (unconfigured
+    /// deployments keep the historical per-surface ladders).
+    pub default_namespace_source: ConfigSource,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
+}
+
+impl ResolvedStorage {
+    /// #1590 — the operator-EXPLICITLY-configured default namespace,
+    /// or `None` when `default_namespace` merely bottomed out at the
+    /// compiled `"global"` default. Write-path consumers (MCP
+    /// `memory_store`, HTTP `POST /api/v1/memories`, the CLI
+    /// namespace ladder) only override their historical defaults when
+    /// this returns `Some`.
+    #[must_use]
+    pub fn explicit_default_namespace(&self) -> Option<&str> {
+        if self.default_namespace_source == ConfigSource::CompiledDefault {
+            None
+        } else {
+            Some(self.default_namespace.as_str())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1590 — process-wide operator-configured default namespace
+// ---------------------------------------------------------------------------
+
+/// #1590 — process-wide operator-configured default namespace, seeded
+/// once at boot by `crate::daemon_runtime::run` from
+/// [`ResolvedStorage::explicit_default_namespace`]. `None` (the
+/// unseeded / unconfigured state) preserves every surface's historical
+/// default: MCP + HTTP store fall back to [`crate::DEFAULT_NAMESPACE`]
+/// and the CLI falls back to its git-remote → cwd-basename → global
+/// inference ladder. Mirrors the `crate::quotas::QuotaDefaults` /
+/// `crate::storage::set_db_mmap_size` boot-seeding pattern for knobs
+/// consumed where no `AppConfig` is in scope (serde default fns, MCP
+/// param parsing, CLI helpers).
+static CONFIGURED_DEFAULT_NAMESPACE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// #1590 — seed (or clear) the process-wide operator-configured
+/// default namespace. Called once at boot; pass `None` for
+/// deployments without an explicit `[storage].default_namespace`.
+pub fn set_configured_default_namespace(namespace: Option<String>) {
+    let mut slot = CONFIGURED_DEFAULT_NAMESPACE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = namespace.filter(|s| !s.trim().is_empty());
+}
+
+/// #1590 — the operator-configured default namespace, or `None` when
+/// the operator never explicitly configured one (callers then apply
+/// their historical per-surface default).
+#[must_use]
+pub fn configured_default_namespace() -> Option<String> {
+    CONFIGURED_DEFAULT_NAMESPACE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Test-only gate serialising mutations of the process-wide
+/// [`CONFIGURED_DEFAULT_NAMESPACE`] slot (same pattern as
+/// [`lock_permissions_mode_for_test`]). Every test that seeds the slot
+/// — or asserts the unseeded default — takes this guard first so
+/// parallel tests cannot observe each other's transient state.
+pub fn lock_configured_default_namespace_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Canonical resolved operator-tunable capacity limits. Produced by
@@ -6569,14 +6647,26 @@ impl AppConfig {
     pub fn resolve_storage(&self) -> ResolvedStorage {
         let cfg = self.storage.as_ref();
 
-        let default_namespace = cfg
+        // #1590 — track WHICH layer supplied `default_namespace` so
+        // write-path consumers can distinguish an explicit operator
+        // choice from the compiled fallback (only the former overrides
+        // the historical per-surface defaults).
+        let section_ns = cfg
             .and_then(|s| s.default_namespace.clone())
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                self.default_namespace
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-            })
+            .filter(|s| !s.trim().is_empty());
+        let legacy_ns = self
+            .default_namespace
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let default_namespace_source = if section_ns.is_some() {
+            ConfigSource::Config
+        } else if legacy_ns.is_some() {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+        let default_namespace = section_ns
+            .or(legacy_ns)
             .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
         let archive_on_gc = cfg
@@ -6619,6 +6709,7 @@ impl AppConfig {
             archive_max_days,
             max_memory_mb,
             db_mmap_size_bytes,
+            default_namespace_source,
             source,
         }
     }
@@ -9705,6 +9796,94 @@ max_page_size = 1000000
         unsafe {
             std::env::remove_var(ENV_DB_MMAP_SIZE);
         }
+    }
+
+    // ── #1590 — `[storage].default_namespace` explicit-vs-compiled provenance ──
+
+    /// #1590 regression — `resolve_storage` distinguishes an EXPLICIT
+    /// operator `default_namespace` (section or legacy flat field)
+    /// from the compiled `"global"` fallback, and
+    /// `explicit_default_namespace()` only reports the former.
+    #[test]
+    fn resolve_storage_default_namespace_provenance_1590() {
+        let _g = env_var_lock();
+        // Unconfigured: compiled default, NOT explicit.
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.default_namespace, crate::DEFAULT_NAMESPACE);
+        assert_eq!(
+            resolved.default_namespace_source,
+            ConfigSource::CompiledDefault
+        );
+        assert_eq!(resolved.explicit_default_namespace(), None);
+
+        // A [storage] section WITHOUT default_namespace is still NOT
+        // explicit (the section-level `source` tag says Config, which
+        // is exactly why the per-field tag exists).
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            archive_on_gc: Some(true),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.explicit_default_namespace(), None);
+        assert_eq!(
+            resolved.default_namespace_source,
+            ConfigSource::CompiledDefault
+        );
+
+        // Explicit [storage].default_namespace → Config provenance.
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            default_namespace: Some("alphaone".to_string()),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.default_namespace, "alphaone");
+        assert_eq!(resolved.default_namespace_source, ConfigSource::Config);
+        assert_eq!(resolved.explicit_default_namespace(), Some("alphaone"));
+
+        // Legacy flat field → Legacy provenance, still explicit.
+        #[allow(deprecated)]
+        let resolved = {
+            let mut cfg = empty_app_config();
+            cfg.default_namespace = Some("legacy-ns".to_string());
+            cfg.resolve_storage()
+        };
+        assert_eq!(resolved.default_namespace, "legacy-ns");
+        assert_eq!(resolved.default_namespace_source, ConfigSource::Legacy);
+        assert_eq!(resolved.explicit_default_namespace(), Some("legacy-ns"));
+
+        // Whitespace-only is treated as unset (not explicit).
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            default_namespace: Some("   ".to_string()),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.explicit_default_namespace(), None);
+    }
+
+    /// #1590 regression — the process-wide seeded slot round-trips,
+    /// filters blank values, and clears back to the unconfigured state.
+    #[test]
+    fn configured_default_namespace_seed_and_clear_1590() {
+        let _gate = lock_configured_default_namespace_for_test();
+        set_configured_default_namespace(Some("alphaone".to_string()));
+        assert_eq!(
+            configured_default_namespace().as_deref(),
+            Some("alphaone"),
+            "seeded value must be readable process-wide"
+        );
+        set_configured_default_namespace(Some("  ".to_string()));
+        assert_eq!(
+            configured_default_namespace(),
+            None,
+            "blank seeds are filtered to the unconfigured state"
+        );
+        set_configured_default_namespace(Some("ns2".to_string()));
+        set_configured_default_namespace(None);
+        assert_eq!(configured_default_namespace(), None, "clear resets");
     }
 
     #[test]

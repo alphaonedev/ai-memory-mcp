@@ -840,7 +840,19 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // Every subsequent `db::open` on any subcommand path (serve / mcp /
     // CLI) applies it. Idempotent — first writer wins, same as the
     // quota seeding above.
-    crate::storage::set_db_mmap_size(app_config.resolve_storage().db_mmap_size_bytes);
+    let resolved_storage = app_config.resolve_storage();
+    crate::storage::set_db_mmap_size(resolved_storage.db_mmap_size_bytes);
+    // #1590 — seed the process-wide operator-configured default
+    // namespace (Some ONLY when `[storage].default_namespace` — or the
+    // legacy flat field — was explicitly set). Every write surface
+    // (MCP `memory_store`, HTTP `POST /api/v1/memories`, the CLI
+    // namespace ladder) consults this; unconfigured deployments keep
+    // their historical per-surface defaults.
+    crate::config::set_configured_default_namespace(
+        resolved_storage
+            .explicit_default_namespace()
+            .map(str::to_string),
+    );
     let j = cli.json;
     let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)
