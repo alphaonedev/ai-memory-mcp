@@ -109,7 +109,7 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # (observed live on do-1461-peer-fra1-01, restart counter 38). This pin is the
 # same release/v0.7.0 @ 5b064f38 source rebuilt WITH the required
 # `--features sal,sal-postgres,sqlite-bundled`.
-GOLDEN_SHA256="${GOLDEN_SHA256:-471cfec63a62a32f46545f6476405efb410af82d469066b466a6695465a25642}"
+GOLDEN_SHA256="${GOLDEN_SHA256:-4a107b72ba1bfa600a9fbb8d59e232ded4c2b8e70e2fafdad80750f0495e8a31}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
