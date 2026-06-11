@@ -6857,23 +6857,23 @@ pub fn list_archived(
             // legacy columns, so archived v0.7.0 fields were invisible
             // to memory_archive_list). Additive keys; JSON-ish columns
             // parse to structured like tags/metadata above.
-            "reflection_depth": row.get::<_, Option<i64>>(17)?.unwrap_or(0),
-            "memory_kind": row.get::<_, Option<String>>(18)?,
+            (field_names::REFLECTION_DEPTH): row.get::<_, Option<i64>>(17)?.unwrap_or(0),
+            (field_names::MEMORY_KIND): row.get::<_, Option<String>>(18)?,
             "entity_id": row.get::<_, Option<String>>(19)?,
-            "persona_version": row.get::<_, Option<i64>>(20)?,
+            (field_names::PERSONA_VERSION): row.get::<_, Option<i64>>(20)?,
             "citations": row
                 .get::<_, Option<String>>(21)?
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
                 .unwrap_or_else(|| serde_json::json!([])),
-            "source_uri": row.get::<_, Option<String>>(22)?,
-            "source_span": row
+            (field_names::SOURCE_URI): row.get::<_, Option<String>>(22)?,
+            (field_names::SOURCE_SPAN): row
                 .get::<_, Option<String>>(23)?
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
-            "confidence_source": row.get::<_, Option<String>>(24)?,
-            "confidence_signals": row
+            (field_names::CONFIDENCE_SOURCE): row.get::<_, Option<String>>(24)?,
+            (field_names::CONFIDENCE_SIGNALS): row
                 .get::<_, Option<String>>(25)?
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
-            "confidence_decayed_at": row.get::<_, Option<String>>(26)?,
+            (field_names::CONFIDENCE_DECAYED_AT): row.get::<_, Option<String>>(26)?,
             "version": row.get::<_, Option<i64>>(27)?.unwrap_or(1),
             (field_names::ATOMISED_INTO): row.get::<_, Option<i64>>(28)?,
             (field_names::ATOM_OF): row.get::<_, Option<String>>(29)?,

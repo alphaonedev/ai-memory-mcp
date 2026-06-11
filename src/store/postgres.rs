@@ -14127,34 +14127,34 @@ impl PostgresStore {
             // nullable per the v49 additive migration; decode failures
             // hard-propagate per the #1080 posture.
             let reflection_depth: Option<i32> = row
-                .try_get("reflection_depth")
+                .try_get(field_names::REFLECTION_DEPTH)
                 .map_err(|e| to_store_err("list_archived reflection_depth decode", e))?;
             let memory_kind: Option<String> = row
-                .try_get("memory_kind")
+                .try_get(field_names::MEMORY_KIND)
                 .map_err(|e| to_store_err("list_archived memory_kind decode", e))?;
             let entity_id: Option<String> = row
                 .try_get("entity_id")
                 .map_err(|e| to_store_err("list_archived entity_id decode", e))?;
             let persona_version: Option<i32> = row
-                .try_get("persona_version")
+                .try_get(field_names::PERSONA_VERSION)
                 .map_err(|e| to_store_err("list_archived persona_version decode", e))?;
             let citations: Option<String> = row
                 .try_get("citations")
                 .map_err(|e| to_store_err("list_archived citations decode", e))?;
             let source_uri: Option<String> = row
-                .try_get("source_uri")
+                .try_get(field_names::SOURCE_URI)
                 .map_err(|e| to_store_err("list_archived source_uri decode", e))?;
             let source_span: Option<String> = row
-                .try_get("source_span")
+                .try_get(field_names::SOURCE_SPAN)
                 .map_err(|e| to_store_err("list_archived source_span decode", e))?;
             let confidence_source: Option<String> = row
-                .try_get("confidence_source")
+                .try_get(field_names::CONFIDENCE_SOURCE)
                 .map_err(|e| to_store_err("list_archived confidence_source decode", e))?;
-            let confidence_signals: Option<String> = row
-                .try_get("confidence_signals")
-                .map_err(|e| to_store_err("list_archived confidence_signals decode", e))?;
+            let confidence_signals: Option<String> =
+                row.try_get(field_names::CONFIDENCE_SIGNALS)
+                    .map_err(|e| to_store_err("list_archived confidence_signals decode", e))?;
             let confidence_decayed_at: Option<String> = row
-                .try_get("confidence_decayed_at")
+                .try_get(field_names::CONFIDENCE_DECAYED_AT)
                 .map_err(|e| to_store_err("list_archived confidence_decayed_at decode", e))?;
             let version: Option<i64> = row
                 .try_get("version")
@@ -14186,20 +14186,20 @@ impl PostgresStore {
                 (field_names::ARCHIVED_AT): archived_at.to_rfc3339(),
                 (field_names::ARCHIVE_REASON): archive_reason,
                 "metadata": metadata,
-                "reflection_depth": reflection_depth.unwrap_or(0),
-                "memory_kind": memory_kind,
+                (field_names::REFLECTION_DEPTH): reflection_depth.unwrap_or(0),
+                (field_names::MEMORY_KIND): memory_kind,
                 "entity_id": entity_id,
-                "persona_version": persona_version,
+                (field_names::PERSONA_VERSION): persona_version,
                 "citations": citations
                     .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
                     .unwrap_or_else(|| serde_json::json!([])),
-                "source_uri": source_uri,
-                "source_span": source_span
+                (field_names::SOURCE_URI): source_uri,
+                (field_names::SOURCE_SPAN): source_span
                     .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
-                "confidence_source": confidence_source,
-                "confidence_signals": confidence_signals
+                (field_names::CONFIDENCE_SOURCE): confidence_source,
+                (field_names::CONFIDENCE_SIGNALS): confidence_signals
                     .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
-                "confidence_decayed_at": confidence_decayed_at,
+                (field_names::CONFIDENCE_DECAYED_AT): confidence_decayed_at,
                 "version": version.unwrap_or(1),
                 (field_names::ATOMISED_INTO): atomised_into,
                 (field_names::ATOM_OF): atom_of,
