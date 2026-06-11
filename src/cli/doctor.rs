@@ -984,8 +984,8 @@ fn section_llm_reachability_1146() -> ReportSection {
                     Severity::Warning,
                     Some(format!(
                         "auth failed (status {}); URL is reachable but the \
-                         resolved API key was rejected — check api_key_env / \
-                         api_key_file / process env",
+                         resolved API key was rejected — check [llm].api_key_env / \
+                         [llm].api_key_file / process env",
                         status.as_u16()
                     )),
                 )
@@ -1189,7 +1189,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
                     Some(format!(
                         "auth failed (status {}); URL is reachable but the \
                          resolved embedding API key was rejected — check \
-                         [embeddings].api_key_env / api_key_file / process env",
+                         [embeddings].api_key_env / [embeddings].api_key_file / process env",
                         status.as_u16()
                     )),
                 )
