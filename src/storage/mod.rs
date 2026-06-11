@@ -7347,8 +7347,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = CASE WHEN excluded.updated_at > memories.updated_at
                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
@@ -7434,7 +7434,13 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
                                             OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                                        THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
-                                       ELSE memories.mentioned_entity_id END
+                                       ELSE memories.mentioned_entity_id END,
+            -- #1631 (decide-once, #1029 contract) — `version` IS
+            -- replicated state on the federation merge path: merge via
+            -- MAX(local, remote) so an out-of-order peer push can't
+            -- roll the Gap-1 optimistic-concurrency counter backwards.
+            -- Matches the pg `apply_remote_memory` GREATEST arm.
+            version = MAX(memories.version, excluded.version)
          RETURNING id",
     )?;
     let actual_id: String = newer_wins_stmt.query_row(
@@ -7465,6 +7471,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             confidence_signals_json,
             mem.confidence_decayed_at,
             mentioned_entity_id,
+            mem.version,
         ],
         |r| r.get(0),
     )?;

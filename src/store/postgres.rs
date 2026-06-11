@@ -10023,39 +10023,58 @@ impl MemoryStore for PostgresStore {
                 $27
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
+                -- #1631 — every newer-wins arm carries the sqlite
+                -- `insert_if_newer` equal-timestamp id tiebreak
+                -- (src/storage/mod.rs:7320-7321) so two peers that wrote
+                -- in the same millisecond converge on ONE deterministic
+                -- winner (total order: updated_at, then id) instead of
+                -- diverging per receive order.
                 content = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.content
                     ELSE memories.content
                 END,
-                tier = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         AND tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
-                        THEN EXCLUDED.tier
-                    ELSE memories.tier
-                END,
+                -- #1631 — tier upgrades are monotone REGARDLESS of the
+                -- timestamp (sqlite parity): a stale peer that promoted
+                -- a row to long must not lose the promotion.
+                tier = CASE WHEN EXCLUDED.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN EXCLUDED.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
                 tags = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.tags
                     ELSE memories.tags
                 END,
-                priority = CASE
+                -- #1631 — sqlite parity: priority + confidence MAX-merge.
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                -- #1631 — sqlite parity: source rides the winning row.
+                source = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.priority
-                    ELSE memories.priority
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
+                        THEN EXCLUDED.source
+                    ELSE memories.source
                 END,
-                confidence = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.confidence
-                    ELSE memories.confidence
-                END,
-                updated_at = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.updated_at
-                    ELSE memories.updated_at
+                updated_at = GREATEST(memories.updated_at, EXCLUDED.updated_at),
+                -- #1631 — sqlite parity: access_count converges on MAX.
+                access_count = GREATEST(memories.access_count, EXCLUDED.access_count),
+                -- #1631 — sqlite parity: long-tier pins expiry to NULL;
+                -- otherwise a peer push that omits expiry keeps the local
+                -- one rather than blanking it out.
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
                 metadata = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at THEN
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id) THEN
                         CASE
                             WHEN memories.metadata ? 'agent_id'
                                 THEN jsonb_set(
@@ -10071,54 +10090,54 @@ impl MemoryStore for PostgresStore {
                 -- signal isn't lost on newer-wins federation merges.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky across federation merges.
+                -- #1631 / QW-2 — Persona is also sticky (sqlite parity).
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
                                    ELSE EXCLUDED.memory_kind END,
-                -- #1029 (2026-05-21) — Form-4 provenance, Form-5 calibration,
-                -- QW-2 persona, Gap-1 version: all newer-wins (matches the
-                -- existing content/tags/priority/confidence merge shape).
+                -- #1029 / #1631 — Form-4 provenance + Form-5 calibration:
+                -- newer-wins WITH the id tiebreak; source_uri / source_span
+                -- follow COALESCE so a merge lacking provenance does not
+                -- blank out a value the local row already had (sqlite
+                -- parity, src/storage/mod.rs:7376-7395).
                 citations = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.citations
                     ELSE memories.citations
                 END,
-                source_uri = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.source_uri
-                    ELSE memories.source_uri
-                END,
-                source_span = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.source_span
-                    ELSE memories.source_span
-                END,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
                 confidence_source = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.confidence_source
                     ELSE memories.confidence_source
                 END,
                 confidence_signals = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.confidence_signals
                     ELSE memories.confidence_signals
                 END,
                 confidence_decayed_at = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.confidence_decayed_at
                     ELSE memories.confidence_decayed_at
                 END,
-                entity_id = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.entity_id
-                    ELSE memories.entity_id
-                END,
-                persona_version = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                        THEN EXCLUDED.persona_version
-                    ELSE memories.persona_version
-                END,
-                -- version is newer-wins; advance to MAX so an out-of-order
-                -- federation push doesn't roll a peer back to a stale
-                -- version.
+                -- #1631 / QW-2 — entity_id + persona_version are immutable
+                -- once set (sqlite COALESCE order: old wins) so a federation
+                -- merge can't drop the persona discriminator off a
+                -- `memory_kind = 'persona'` row.
+                entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
+                persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
+                -- version IS replicated state (#1029 contract, decide-once):
+                -- advance to MAX so an out-of-order federation push doesn't
+                -- roll a peer back to a stale version.
                 version = GREATEST(memories.version, EXCLUDED.version),
                 -- #1383 — newer-wins for the denormalised attribution
                 -- column. Matches the metadata / citations / etc.
@@ -10127,6 +10146,8 @@ impl MemoryStore for PostgresStore {
                 -- a newer remote write that ADDS one replaces it).
                 mentioned_entity_id = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
                         THEN COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
                     ELSE memories.mentioned_entity_id
                 END
