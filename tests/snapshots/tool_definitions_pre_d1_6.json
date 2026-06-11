@@ -1356,7 +1356,7 @@
         "properties": {
           "accept": {
             "default": "v2",
-            "description": "Schema version. v2 default; v1 legacy.",
+            "description": "Schema version. v3 default (A5); v2/v1 legacy.",
             "enum": [
               "v1",
               "v2"
