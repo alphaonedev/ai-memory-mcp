@@ -2580,15 +2580,56 @@ impl PostgresStore {
     /// # Errors
     ///
     /// * [`crate::storage::VersionConflict`] — when `expected_version`
-    ///   is `Some` and the stored value has drifted.
+    ///   is `Some` and the stored value has drifted (surfaced as
+    ///   `StoreError::IntegrityFailed` whose detail starts with
+    ///   `VersionConflict:`).
     /// * `StoreError::NotFound` — when no live memory matches `id`.
+    /// * `StoreError::PermissionDenied` — when `ctx` does not own the
+    ///   row (#1628; same gate as [`MemoryStore::update`]).
     /// * `StoreError::BackendUnavailable` — on SQL failure.
     pub async fn update_with_expected_version(
         &self,
+        ctx: &CallerContext,
         id: &str,
         patch: UpdatePatch,
         expected_version: Option<i64>,
     ) -> StoreResult<i64> {
+        // #1628 — caller-owns write gate, mirroring the trait `update`
+        // (#1412). This method gained its first production caller (the
+        // HTTP `PUT /memories/{id}` If-Match branch), so it must apply
+        // the SAME tenant-isolation gate; admin paths skip via
+        // `ctx.bypass_visibility`.
+        if !ctx.bypass_visibility {
+            let owner: Option<Option<String>> =
+                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("update: pre-fetch owner", e))?;
+            match owner {
+                None => return Err(StoreError::NotFound { id: id.to_string() }),
+                Some(None) => {
+                    return Err(StoreError::PermissionDenied {
+                        action: "update".to_string(),
+                        target: id.to_string(),
+                        reason:
+                            "memory has no agent_id stamp; tenant writes refused (use admin path)"
+                                .to_string(),
+                    });
+                }
+                Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
+                    return Err(StoreError::PermissionDenied {
+                        action: "update".to_string(),
+                        target: id.to_string(),
+                        reason: format!(
+                            "caller {:?} does not own memory (owner: {existing_owner:?})",
+                            ctx.effective_principal()
+                        ),
+                    });
+                }
+                Some(Some(_)) => {} // owner matches; proceed
+            }
+        }
         // Pre-read the current version so a CONFLICT carries the
         // observed-current value in the typed error. The UPDATE
         // re-asserts the gate atomically below.
@@ -2668,6 +2709,17 @@ impl PostgresStore {
                     ELSE $9::JSONB
                 END,
                 source_uri = COALESCE($10, source_uri),
+                -- #1628/#1626 — If-Match PUTs route through this method
+                -- on postgres, so it must mirror the trait `update`'s
+                -- expires_at semantics including the #1626 tier→long
+                -- coupling: when the patch tier IS long the clear wins
+                -- over an explicitly-supplied $12; when the patch tier
+                -- is NOT long an explicit $12 wins and an absent $12
+                -- leaves the stored value untouched.
+                expires_at = CASE
+                    WHEN $4::TEXT = 'long' THEN NULL
+                    ELSE COALESCE($12, expires_at)
+                END,
                 updated_at = NOW(),
                 version = version + 1
              WHERE id = $1
@@ -2692,6 +2744,9 @@ impl PostgresStore {
         .bind(patch.metadata)
         .bind(patch.source_uri)
         .bind(expected_version)
+        // #1628 — expires_at COALESCE slot ($12); see the SET-clause
+        // comment above for the #1626 tier→long interplay.
+        .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
@@ -9077,12 +9132,16 @@ impl MemoryStore for PostgresStore {
         // #1024 (CRITICAL, 2026-05-21): bump `version` on every trait
         // `update`. Pre-#1024 the SET list omitted `version = version + 1`,
         // so postgres-backed daemons answering `PUT /api/v1/memories/:id`
-        // without `If-Match` (which routes through this trait method, NOT
-        // through the inherent `update_with_expected_version` helper)
+        // without `If-Match` (which routes through this trait method)
         // left `version` permanently at 1 — concurrent optimistic-
         // concurrency detection was silently broken on postgres while
         // the surface looked identical to sqlite. SQLite bumps version
         // in `src/storage/mod.rs`.
+        // #1628 (2026-06-11): PUTs WITH a parseable `If-Match` no longer
+        // reach this method — the handler routes them through the
+        // version-gated inherent `update_with_expected_version` helper,
+        // which applies the same owner gate + SET semantics and refuses
+        // stale versions with the typed VersionConflict envelope.
         let rows_affected = sqlx::query(
             "UPDATE memories SET
                 title = COALESCE($2, title),

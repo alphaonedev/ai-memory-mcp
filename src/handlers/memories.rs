@@ -181,6 +181,23 @@ pub async fn get_memory(
     }
 }
 
+/// #1628 — extract the stored `version` from the postgres
+/// `update_with_expected_version` conflict detail (shape:
+/// `"VersionConflict: memory <id> expected_version=<e> but stored version=<c>"`,
+/// minted in `src/store/postgres.rs`). Returns `None` for any other
+/// `IntegrityFailed` detail so non-conflict failures keep their
+/// generic `store_err_to_response` mapping.
+#[cfg(feature = "sal")]
+fn parse_pg_conflict_stored_version(detail: &str) -> Option<i64> {
+    detail
+        .strip_prefix("VersionConflict: memory ")?
+        .rsplit("stored version=")
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn update_memory(
     State(app): State<AppState>,
@@ -253,7 +270,36 @@ pub async fn update_memory(
         // memory's owner. Pre-fix this hardcoded "ai:http" which made
         // every update appear as if from the legacy daemon principal.
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        return match app.store.update(&ctx, &id, patch).await {
+        // #1628 — honor `If-Match` on the postgres branch. Pre-fix the
+        // parsed `if_match_version` was silently dropped here (the
+        // trait `update` is last-write-wins), so stale writers clobbered
+        // newer rows on postgres while sqlite refused them with 409.
+        // Route through the version-gated inherent
+        // `PostgresStore::update_with_expected_version` when a parseable
+        // If-Match is present; absent/unparseable headers preserve the
+        // legacy last-write-wins trait path, mirroring sqlite.
+        let update_result: Result<(), crate::store::StoreError> = {
+            #[cfg(feature = "sal-postgres")]
+            {
+                match (
+                    if_match_version,
+                    app.store
+                        .as_any()
+                        .downcast_ref::<crate::store::postgres::PostgresStore>(),
+                ) {
+                    (Some(expected), Some(pg)) => pg
+                        .update_with_expected_version(&ctx, &id, patch, Some(expected))
+                        .await
+                        .map(|_new_version| ()),
+                    _ => app.store.update(&ctx, &id, patch).await,
+                }
+            }
+            #[cfg(not(feature = "sal-postgres"))]
+            {
+                app.store.update(&ctx, &id, patch).await
+            }
+        };
+        return match update_result {
             Ok(()) => {
                 // Re-fetch through the trait so the response payload
                 // mirrors the legacy SQLite path's "return the updated
@@ -298,7 +344,40 @@ pub async fn update_memory(
                 };
                 response_body
             }
-            Err(e) => store_err_to_response(e),
+            Err(e) => {
+                // #1628 — map the version-gated conflict to the SAME
+                // 409 CONFLICT envelope the sqlite branch returns (see
+                // the `VersionConflict` downcast arm below): byte-equal
+                // wire shape so callers retry identically on either
+                // backend. The inherent pg helper surfaces the conflict
+                // as `IntegrityFailed` whose detail carries the typed
+                // message; reconstruct the typed `VersionConflict` so
+                // the `error` string is produced by the same `Display`
+                // impl the sqlite arm serialises.
+                if let Some(expected) = if_match_version
+                    && let crate::store::StoreError::IntegrityFailed { ref detail } = e
+                    && let Some(current) = parse_pg_conflict_stored_version(detail)
+                {
+                    let vc = crate::storage::VersionConflict {
+                        id: id.clone(),
+                        expected,
+                        current,
+                    };
+                    let error_text = vc.to_string();
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "conflict",
+                            "id": vc.id,
+                            "expected_version": vc.expected,
+                            "current_version": vc.current,
+                            "error": error_text,
+                        })),
+                    )
+                        .into_response();
+                }
+                store_err_to_response(e)
+            }
         };
     }
 
