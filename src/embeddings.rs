@@ -724,10 +724,36 @@ impl Embedder {
                 tokenizer,
                 device,
             } => Self::embed_local_batch(model, tokenizer, device, texts),
-            // Ollama arm: keep the sequential per-text loop until
-            // the LlmClient migration lands the batched-embed wire
-            // contract.
-            Self::Ollama { .. } => texts.iter().map(|t| self.embed(t)).collect(),
+            // Remote arm (#1603): delegate to the client's batched
+            // embed — OpenAI-compatible providers get ONE `/embeddings`
+            // POST per sub-batch (`input: [...]` wire shape) instead of
+            // the pre-#1603 per-text loop that drained an API-backed
+            // backfill at ~20 rows/min; Ollama-native keeps its
+            // per-text loop inside `embed_texts` until its batched wire
+            // contract is pinned. Documents get the nomic task prefix
+            // exactly as the single-text path applies it (#1520), gated
+            // on the model id.
+            Self::Ollama {
+                client,
+                model_name,
+                degraded,
+                ..
+            } => {
+                let result = if Self::model_requires_nomic_prefix(model_name) {
+                    let prefixed: Vec<String> = texts
+                        .iter()
+                        .map(|t| format!("{}{}", EmbedRole::Document.nomic_prefix(), t))
+                        .collect();
+                    let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+                    client.embed_texts(&refs, model_name)
+                } else {
+                    client.embed_texts(texts, model_name)
+                };
+                // #1598/#1594 — latch the live remote-endpoint posture,
+                // same as the single-text path.
+                degraded.store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
+                result
+            }
         }
     }
 
