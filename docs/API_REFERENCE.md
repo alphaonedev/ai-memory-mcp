@@ -394,9 +394,12 @@ v0.7.0 #1579 B4, same semantics as recall above).
 > (#1579 B4) the HTTP recall + search endpoints expose `format` too
 > (HTTP defaults to `json` for backwards compat; MCP defaults to
 > `toon_compact`). HTTP `memory_list` does not yet accept `format`.
-> The MCP `memory_recall` tool also accepts a `context_tokens` array
-> (v0.6.0.0 contextual recall — recent conversation tokens biasing the
-> query embedding at 70/30) that the HTTP body does not surface.
+> The MCP `memory_recall` tool requires the `context` parameter — the
+> `query` / `q` alias ladder is HTTP-only (#1606); an MCP call passing
+> `query` is refused with "context is required". MCP additionally
+> accepts a `context_tokens` array (v0.6.0.0 contextual recall — recent
+> conversation tokens biasing the query embedding at 70/30) that the
+> HTTP body does not surface.
 
 ## Lifecycle
 
