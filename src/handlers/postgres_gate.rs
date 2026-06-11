@@ -289,6 +289,7 @@ fn links_id_path(p: &str) -> bool {
 }
 
 /// #1539 — `PUT /api/v1/agents/{id}/pubkey` (attestation pubkey bind).
+#[cfg(feature = "sal")]
 fn agents_pubkey_path(p: &str) -> bool {
     let Some(rest) = p.strip_prefix("/api/v1/agents/") else {
         return false;
