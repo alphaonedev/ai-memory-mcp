@@ -131,6 +131,7 @@ Type=simple
 Environment=HOME=/root
 EnvironmentFile=$REMOTE_ENVFILE
 ExecStart=$BIN serve \\
+  --db $REMOTE_GOV_DB \\
   --host 0.0.0.0 \\
   --port $FEDERATION_PORT \\
   --store-url \${AI_MEMORY_STORE_URL} \\

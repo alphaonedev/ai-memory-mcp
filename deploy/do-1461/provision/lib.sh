@@ -416,6 +416,15 @@ REMOTE_TLS="${REMOTE_TLS:-/etc/ai-memory/tls}"
 # Batman env battery). SSOT here so every provision/test script uses the SAME
 # named constant — no duplicated literal path, no unbound-variable footguns.
 REMOTE_ENVFILE="${REMOTE_ENVFILE:-/etc/ai-memory/ai-memory.env}"
+# #1536 — the daemon's LOCAL sqlite path (governance_rules + every other
+# local-sqlite surface on a postgres-backed peer). The systemd unit has no
+# WorkingDirectory, so the compiled relative default `ai-memory.db` has
+# always resolved to `/ai-memory.db`; this const makes that lived path
+# EXPLICIT and shared between the serve unit (50_federation.sh `--db`)
+# and the Form-7 activation verbs (46_batman.sh) — pre-#1536 the ssh'd
+# CLI verbs resolved `/root/ai-memory.db` instead (cwd split-brain) so
+# the rules they wrote were never the ones the daemon consulted.
+REMOTE_GOV_DB="${REMOTE_GOV_DB:-/ai-memory.db}"
 # The harness write identity. Kept == the test/validate harness's AID_H
 # (`ai:test-harness@<campaign>`) so the SAME enrolled+bound agent both
 # authenticates (X-Agent-Id) AND owns the attested signature — one identity to
