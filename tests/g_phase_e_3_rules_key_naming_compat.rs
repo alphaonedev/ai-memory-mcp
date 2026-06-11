@@ -274,6 +274,62 @@ fn keygen_then_enable_roundtrip_works() {
 }
 
 #[test]
+fn keygen_honors_key_dir_override_then_enable_sign_succeeds_1610() {
+    // #1610 (deep-audit F1) — operator-key path split-brain. With the
+    // key store relocated (`--key-dir` flag; same code path as the
+    // `AI_MEMORY_KEY_DIR` env on the do-1461 fleet), `rules keygen`
+    // with NO `--out` used to write `~/.config/ai-memory/operator.key`
+    // while `rules enable --sign` read the relocated dir — so
+    // R001-R004 never enabled on a fresh peer. Post-fix, keygen's
+    // default write path IS `<key_dir>/operator.key`.
+    let tdir = tempfile::tempdir().unwrap();
+    let db_path = tdir.path().join("rules.db");
+    init_governance_db(&db_path);
+    let key_dir = tdir.path().join("relocated-keys");
+    fs::create_dir_all(&key_dir).unwrap();
+
+    // 1. keygen with the key-dir override and no --out.
+    {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        cli_rules::run(
+            &db_path,
+            cli_rules::RulesArgs {
+                key_dir: Some(key_dir.clone()),
+                action: cli_rules::RulesAction::Keygen {
+                    out: None,
+                    force: false,
+                },
+            },
+            false,
+            &mut out,
+        )
+        .expect("keygen under key-dir override");
+    }
+    assert!(
+        key_dir.join("operator.key").exists(),
+        "keygen must write operator.key INTO the overridden key dir (#1610)"
+    );
+    assert!(
+        key_dir.join("operator.key.pub").exists(),
+        "keygen must write operator.key.pub INTO the overridden key dir (#1610)"
+    );
+
+    // 2. enable --sign against the same key dir — the exact fleet
+    // recipe (46_batman.sh keygen → sign-seed → enable R00N --sign).
+    run_enable(&db_path, &key_dir, "R-PHASE-E-3")
+        .expect("keygen→enable roundtrip under key-dir override must succeed post-#1610");
+    let rule = read_rule(&db_path, "R-PHASE-E-3");
+    assert!(rule.enabled, "rule must be enabled");
+    assert_eq!(rule.attest_level, "operator_signed");
+    assert!(rule.signature.is_some());
+}
+
+#[test]
 fn enable_rejects_mismatched_key_keypub_pair() {
     // Defence-in-depth: if the public sidecar was tampered (e.g. swapped
     // with a different keypair's verifier), the load must refuse rather
