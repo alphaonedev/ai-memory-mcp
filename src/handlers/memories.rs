@@ -982,7 +982,10 @@ pub async fn promote_memory(
                 // fanout on the postgres branch. Mirrors the sqlite
                 // path at lines ~2406-2417: after a successful local
                 // tier-update, re-fetch the row to capture the new
-                // tier + cleared expiry and broadcast via
+                // tier + cleared expiry (#1626 — the trait update's
+                // tier→long arm now clears `expires_at` in SQL, so
+                // this re-fetch genuinely observes the clear) and
+                // broadcast via
                 // `broadcast_store_quorum` so peers' projections of
                 // the same memory inherit the tier ladder. Without
                 // this, a `notify` recipient on peer-B still sees the
