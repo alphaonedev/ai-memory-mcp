@@ -304,11 +304,23 @@ if ! git rev-parse "$BASE" >/dev/null 2>&1; then
     exit 0
 fi
 
-# Compute changed file list (portable read-loop — bash 3 lacks mapfile)
+# Compute changed file list. #1611 — capture git's exit status
+# separately: a git FAILURE (corrupt object, shallow-clone miss, bad
+# ref) must fall back to the FULL suite, not masquerade as an empty
+# diff and silently __SKIP__ the integration suite.
+if ! DIFF_OUT="$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null)"; then
+    note "git diff $BASE..$HEAD FAILED — running FULL suite"
+    emit "test_impact" "__ALL__"
+    emit "test_impact_count" "ALL"
+    emit "test_impact_total" "ALL"
+    emit "test_impact_reason" "git-diff-failed"
+    exit 0
+fi
+# (portable read-loop — bash 3 lacks mapfile)
 CHANGED=()
 while IFS= read -r _line; do
     [[ -n "$_line" ]] && CHANGED+=("$_line")
-done < <(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || true)
+done <<< "$DIFF_OUT"
 
 if [[ ${#CHANGED[@]} -eq 0 ]]; then
     note "no diff vs base — treating as docs-only no-op"

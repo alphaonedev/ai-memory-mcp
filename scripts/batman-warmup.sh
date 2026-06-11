@@ -123,9 +123,17 @@ done
 # ----------------------------------------------------------- recall ---
 
 step "Recalling to trigger Form 5 freshness-decay touches"
-RECALL_OUT=$(ai-memory --db "$DB" recall "batman warmup write-time-investment substrate" \
-    --namespace "$NAMESPACE" --limit "$COUNT" 2>&1 | grep -vE '^ai-memory: loaded config' | head -20)
-ok "recall fired"
+# #1615 — check the recall actually succeeded: an errored recall means
+# the Form-5 touches never fired (shadow/decay tables stay empty), so
+# a green "recall fired" line here was a lie.
+if RECALL_OUT=$(ai-memory --db "$DB" recall "batman warmup write-time-investment substrate" \
+    --namespace "$NAMESPACE" --limit "$COUNT" 2>&1 | grep -vE '^ai-memory: loaded config' | head -20) \
+   && [[ -n "$RECALL_OUT" ]]; then
+    ok "recall fired ($(echo "$RECALL_OUT" | wc -l | tr -d ' ') result line(s))"
+else
+    info "recall FAILED — Form 5 freshness-decay touches did NOT fire: $(echo "$RECALL_OUT" | head -1)"
+    exit 1
+fi
 
 # ----------------------------------------------------------- curator pass ---
 

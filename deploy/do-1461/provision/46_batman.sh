@@ -109,15 +109,35 @@ activate_form7_on_peer() {
     export AI_MEMORY_KEY_DIR='$REMOTE_KEY_DIR'
     mkdir -p '$REMOTE_KEY_DIR'; chmod 700 '$REMOTE_KEY_DIR'
     AM() { '$BIN' --db '$REMOTE_GOV_DB' \"\$@\"; }
-    # 1. operator key (idempotent)
+    # 1. operator key (idempotent). #1610 (deep-audit F1): pass --out
+    # EXPLICITLY so the key lands in \$AI_MEMORY_KEY_DIR regardless of
+    # binary vintage — pre-#1610 binaries default keygen to
+    # ~/.config/ai-memory/operator.key while enable --sign reads
+    # \$AI_MEMORY_KEY_DIR, so R001-R004 never enabled on a fresh peer
+    # (sign-seed's own fallback ladder masked it). Failures are fatal:
+    # an unsigned rules engine means Form-7 is inactive on this peer.
     if [ ! -f '$REMOTE_KEY_DIR/operator.key' ]; then
-      AM rules keygen >/dev/null || echo \"WARN: rules keygen failed on $host\" >&2
+      AM rules keygen --out '$REMOTE_KEY_DIR/operator.key' >/dev/null \
+        || { echo \"FATAL: rules keygen failed on $host\" >&2; exit 64; }
     fi
+    # 1b. mirror the PUBLIC half to the daemon-visible singleton
+    # location: the serve unit exports no AI_MEMORY_KEY_DIR (only
+    # HOME=/root), so the daemon's rule-signature verify resolves
+    # /root/.config/ai-memory/operator.key.pub — without the mirror it
+    # stays in the SEC-2 FAIL-OPEN posture (enabled rules enforce but
+    # signatures are unverified). Public key only; the private seed
+    # never leaves \$AI_MEMORY_KEY_DIR. Idempotent (cp -f).
+    [ -f '$REMOTE_KEY_DIR/operator.key.pub' ] \
+      || { echo \"FATAL: operator.key.pub missing after keygen on $host\" >&2; exit 64; }
+    mkdir -p /root/.config/ai-memory
+    cp -f '$REMOTE_KEY_DIR/operator.key.pub' /root/.config/ai-memory/operator.key.pub
     # 2. sign the seed rules (idempotent no-op if already signed)
-    AM rules sign-seed >/dev/null || echo \"WARN: rules sign-seed failed on $host\" >&2
+    AM rules sign-seed >/dev/null \
+      || { echo \"FATAL: rules sign-seed failed on $host\" >&2; exit 64; }
     # 3. enable + sign R001..R004 (idempotent)
     for r in $rules_csv; do
-      AM rules enable --id \"\$r\" --sign >/dev/null || echo \"WARN: rules enable \$r failed on $host\" >&2
+      AM rules enable --id \"\$r\" --sign >/dev/null \
+        || { echo \"FATAL: rules enable \$r failed on $host\" >&2; exit 64; }
     done
     # 4. verify: the runtime check the harness PreToolUse hook calls
     # must REFUSE a /tmp write. Fails loudly when activation didn't
@@ -127,7 +147,7 @@ activate_form7_on_peer() {
       *refuse*) : ;;
       *) echo \"WARN: Form-7 verify on $host expected refuse for /tmp write, got '\$VERDICT'\" >&2; exit 64 ;;
     esac
-  " || log "[$host] WARN: Form-7 activation/verification FAILED (see stderr above — rules engine may be inactive on this peer)"
+  " || die "[$host] Form-7 activation/verification FAILED (see stderr above — an inactive rules engine on a fleet peer is fatal to the #1535 reference architecture; #1610/#1614)"
 
   # 7. bind the Form2/6 Batman namespace policy on the campaign
   # namespace — via the daemon's HTTP surface so it lands in the
@@ -139,36 +159,37 @@ activate_form7_on_peer() {
   # x-api-key from the run-dir secret; the standard row is written by
   # the enrolled harness agent (attested store — the fleet runs
   # REQUIRE_AGENT_ATTESTATION=1).
+  # #1614 — every failure below is fatal (die), not WARN + return 0:
+  # a missing api.pw / empty policy / refused store / failed POST left
+  # Forms 2/6 silently dormant fleet-wide while provision reported
+  # green. A GET-standard probe at the end proves the bind round-trips.
   local api_key policy_json std_id std_title
   api_key="$(cat "$RUN_DIR/secrets/api.pw" 2>/dev/null || true)"
-  if [ -z "$api_key" ]; then
-    log "[$host] WARN: api.pw missing — skipping Form-2/6 namespace-standard bind"
-    return 0
-  fi
+  [ -n "$api_key" ] \
+    || die "[$host] api.pw missing — cannot bind the Form-2/6 namespace standard (#1614)"
   policy_json="$(ssh_node "$ip" "'$BIN' namespace batman-policy --json 2>/dev/null" | grep -vE '^ai-memory: loaded config' || true)"
-  if [ -z "$policy_json" ]; then
-    log "[$host] WARN: batman-policy emitted nothing — skipping namespace-standard bind"
-    return 0
-  fi
+  [ -n "$policy_json" ] \
+    || die "[$host] namespace batman-policy emitted nothing — cannot bind the Form-2/6 standard (#1614)"
   harness_keypair_ensure >/dev/null
-  harness_enroll_peer "$ip" >/dev/null 2>&1 || true
+  harness_enroll_peer "$ip" \
+    || die "[$host] harness enroll failed — attested namespace-standard store cannot succeed (#1614)"
   std_title="batman-active standard for $DEFAULT_NAMESPACE"
   local std_body curl_base
   std_body="$(attested_body "$DEFAULT_NAMESPACE" "$std_title" observation collective \
     "Form 2 synchronous atomise-before-embed + Form 6 auto-classify (regex_then_llm) namespace standard. Set by provision/46_batman.sh on peer $host.")"
   curl_base="--max-time 8 --resolve $host:$FEDERATION_PORT:127.0.0.1 --cacert $REMOTE_TLS/ca.pem --cert $REMOTE_TLS/client.pem --key $REMOTE_TLS/client.key"
   std_id="$(ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_body' https://$host:$FEDERATION_PORT/api/v1/memories" 2>/dev/null | sed -n 's/.*"id"[^"]*"\([^"]*\)".*/\1/p')"
-  if [ -z "$std_id" ]; then
-    log "[$host] WARN: namespace-standard store refused — Form-2/6 bind skipped"
-    return 0
-  fi
+  [ -n "$std_id" ] \
+    || die "[$host] namespace-standard store refused — Form-2/6 bind failed (#1614)"
   local std_payload
   std_payload="$(printf '{"id":"%s","governance":%s}' "$std_id" "$policy_json")"
-  if ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_payload' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" >/dev/null 2>&1; then
-    log "[$host] Form-2/6 namespace standard bound on $DEFAULT_NAMESPACE (id=$std_id, live store)"
-  else
-    log "[$host] WARN: namespace set-standard HTTP call failed — Form-2/6 bind incomplete"
-  fi
+  ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_payload' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" >/dev/null 2>&1 \
+    || die "[$host] namespace set-standard HTTP call failed — Form-2/6 bind incomplete (#1614)"
+  # Belt-and-braces: prove the standard round-trips from the live store.
+  ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" 2>/dev/null \
+      | grep -q "$std_id" \
+    || die "[$host] GET-standard probe did not return id=$std_id — Form-2/6 bind did not persist (#1614)"
+  log "[$host] Form-2/6 namespace standard bound on $DEFAULT_NAMESPACE (id=$std_id, live store, GET-probe verified)"
 }
 
 # --- start the curator daemon (Form-1/5/6 upkeep) on a peer (idempotent) -------

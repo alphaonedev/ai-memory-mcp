@@ -698,15 +698,24 @@ agent_enroll_peer() {
     || log "[$host] register $aid returned non-2xx (may already be registered) — continuing to bind"
 
   # 2) bind the pubkey into the peer's _agents row (psql on the regional pg node).
+  # #1613 — RETURNING 1 proves the UPDATE matched a row: psql exits 0 on
+  # `UPDATE 0`, so without it a missing _agents row (e.g. the register
+  # step above was refused and its non-2xx swallowed) logged
+  # "enrolled + pubkey bound" while the attestation gate had no key and
+  # every attested write 403'd with misleading provision evidence.
   [ -n "$pg_pub" ] || die "agent_enroll_peer: no pg node for region $region"
-  ssh_node "$pg_pub" "sudo -u postgres psql -d $PG_DB -v ON_ERROR_STOP=1 <<SQL
+  local bind_rows
+  bind_rows="$(ssh_node "$pg_pub" "sudo -u postgres psql -d $PG_DB -tA -v ON_ERROR_STOP=1 <<SQL
 SET search_path = $schema, ag_catalog, public;
 UPDATE memories
    SET metadata = jsonb_set(jsonb_set(metadata, '{agent_pubkey}', to_jsonb('$pub_b64'::text), true), '{pubkey_bound_at}', to_jsonb(now()::text), true),
        content  = (jsonb_set(jsonb_set(metadata, '{agent_pubkey}', to_jsonb('$pub_b64'::text), true), '{pubkey_bound_at}', to_jsonb(now()::text), true))::text,
        updated_at = now()
- WHERE namespace='_agents' AND title='agent:$aid';
-SQL" >/dev/null 2>&1 || die "[$host] pubkey bind failed for $aid (schema=$schema on $region pg)"
+ WHERE namespace='_agents' AND title='agent:$aid'
+ RETURNING 1;
+SQL" 2>/dev/null)" || die "[$host] pubkey bind failed for $aid (schema=$schema on $region pg)"
+  printf '%s' "$bind_rows" | grep -q 1 \
+    || die "[$host] pubkey bind matched 0 rows for $aid (no _agents row in schema=$schema — register step failed?)"
   log "[$host] agent $aid enrolled + pubkey bound (schema=$schema, region=$region)"
 }
 
