@@ -3076,6 +3076,23 @@ mod tests {
         )
     }
 
+    /// Builds an in-memory `HookConfig` row for the render tests (the
+    /// G3 doctor block renders config shape + zeroed metric
+    /// placeholders, so any valid event/mode pair exercises the row
+    /// renderer).
+    fn mk_hook(command: &str) -> crate::hooks::config::HookConfig {
+        crate::hooks::config::HookConfig {
+            event: crate::hooks::HookEvent::PostStore,
+            command: std::path::PathBuf::from(command),
+            priority: 10,
+            timeout_ms: 1_000,
+            mode: crate::hooks::config::HookMode::Exec,
+            enabled: true,
+            namespace: "*".to_string(),
+            fail_mode: crate::hooks::config::FailMode::Open,
+        }
+    }
+
     #[test]
     fn run_hooks_human_default_no_config_lists_zero() {
         // Default path: HookConfig::default_path() may or may not exist
@@ -3199,5 +3216,90 @@ enabled = true
         // No `Config path` line because path is None.
         assert!(!s.contains("Config path:"));
         assert!(s.contains("Hooks loaded: 1"));
+
+        /// A connection with no schema at all: `db::stats` fails, the
+        /// Storage section must downgrade to WARN with a `stats_error`
+        /// fact, and `dim_violations` renders the pre-P2 `not_observed`
+        /// line (prepare on the missing table fails → `Ok(None)`).
+        #[test]
+        fn storage_section_warns_with_stats_error_on_missing_schema() {
+            let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+            let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
+            assert_eq!(section.severity, Severity::Warning);
+            assert!(
+                section.facts.iter().any(|(k, _)| k == "stats_error"),
+                "facts: {:?}",
+                section.facts
+            );
+            assert!(
+                section
+                    .facts
+                    .iter()
+                    .any(|(k, v)| k == "dim_violations" && v.contains("not_observed")),
+                "facts: {:?}",
+                section.facts
+            );
+        }
+
+        /// Index section near-capacity arm: ≥95k embedded rows must WARN
+        /// with the MAX_ENTRIES note. The section only counts
+        /// `embedding IS NOT NULL`, so a minimal single-column table keeps
+        /// the fixture cheap (one recursive-CTE insert, no full schema).
+        #[test]
+        fn index_section_warns_when_hnsw_within_5pct_of_cap() {
+            let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+            conn.execute_batch(
+                "CREATE TABLE memories(embedding BLOB);
+             INSERT INTO memories(embedding)
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 95000)
+             SELECT x FROM c;",
+            )
+            .expect("seed 95k embedded rows");
+            let section = section_index(&conn);
+            assert_eq!(section.severity, Severity::Warning);
+            let note = section.note.as_deref().expect("note must explain the cap");
+            assert!(note.contains("within 5%"), "note: {note}");
+            assert!(
+                section
+                    .facts
+                    .iter()
+                    .any(|(k, v)| k == "hnsw_size_estimate" && v == "95000"),
+                "facts: {:?}",
+                section.facts
+            );
+        }
+
+        /// Sync section `Ok(None)` skew arm: a registered peer whose
+        /// `last_pulled_at` is NULL yields peer_count ≥ 1 but no measurable
+        /// skew — the section must render `not_observed` at INFO rather
+        /// than N/A (the no-peers early return) or CRIT.
+        #[test]
+        fn sync_section_not_observed_when_peer_has_no_pull_timestamp() {
+            let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+            conn.execute_batch(
+                "CREATE TABLE sync_state(last_seen_at TEXT, last_pulled_at TEXT);
+             INSERT INTO sync_state(last_seen_at, last_pulled_at)
+             VALUES ('2026-01-01T00:00:00Z', NULL);",
+            )
+            .expect("seed peer row");
+            let section = section_sync(&conn);
+            assert_eq!(section.severity, Severity::Info);
+            assert!(
+                section
+                    .facts
+                    .iter()
+                    .any(|(k, v)| k == "max_skew_secs" && v == "not_observed"),
+                "facts: {:?}",
+                section.facts
+            );
+            assert!(
+                section
+                    .facts
+                    .iter()
+                    .any(|(k, v)| k == "peer_count" && v == "1"),
+                "facts: {:?}",
+                section.facts
+            );
+        }
     }
 }
