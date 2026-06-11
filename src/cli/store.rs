@@ -844,24 +844,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_store_require_attestation_rejects_unsigned() {
-        let _lock = locked_env();
-        let _req = EnvVarGuard::set(
-            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
-            std::ffi::OsStr::new("1"),
-        );
-
-        let mut env = TestEnv::fresh();
-        let db = env.db_path.clone();
-        let cfg = config::AppConfig::default();
-        // Unsigned write (sign=false) under the strict posture: the gate
-        // is invoked with no signature + require=true → AttestationRequired.
-        let args = default_args();
-        let mut out = env.output();
-        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
-        assert!(err.to_string().contains("attestation"), "got: {err}");
-    }
+    // #1609 — the strict-require rejection case (`test_store_require_
+    // attestation_rejects_unsigned`) used to live here, SETTING the
+    // process-global `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` under
+    // `locked_env()`. The lock covers fellow MUTATORS, but the gate's
+    // READERS (`require_agent_attestation_enabled` callers in
+    // `mcp::tools::store` / `handlers::create` tests) run lock-free in
+    // the same parallel lib-test process, so the set-window leaked into
+    // any sibling store test scheduled concurrently (narrow-filter
+    // repro: `cargo test --lib 'store::tests'`). The case now drives
+    // the compiled binary with child-process env in
+    // `tests/agent_attestation_integrity.rs::
+    // cli_require_attestation_rejects_unsigned_store` — same coverage,
+    // zero process-global mutation. Per the design rule documented in
+    // `src/mcp/tools/store/tests.rs` (#626 section header): the
+    // parallel lib-test binary must NEVER set the require flag.
 
     // EnvVarGuard Drop with a pre-existing value → Some-arm restore (set_var)
     // rather than the None-arm remove. Pins the RAII restore contract.

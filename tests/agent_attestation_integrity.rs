@@ -347,6 +347,47 @@ fn mcp_require_attestation_rejects_unsigned_store() {
     assert_eq!(count, 0, "rejected unsigned write must not persist a row");
 }
 
+/// #626 Layer-3 / #1609 — the CLI strict-require gate
+/// (`src/cli/store.rs` `run()` → `attest_write` under
+/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`). Moved here from the
+/// `cli::store` in-lib test module: the lib-test binary runs its
+/// modules in parallel, and a process-global require flag set there
+/// (even lock-guarded) races every sibling that READS the flag without
+/// the lock — the #1609 narrow-filter flake. Driving the compiled
+/// binary gives the strict posture a process of its own: the env is
+/// scoped to the child, so no in-process reader anywhere can observe
+/// it. No `ENV_LOCK` needed for the same reason.
+#[test]
+fn cli_require_attestation_rejects_unsigned_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("cli-attest.db");
+    let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
+    let assert = cmd
+        .env_clear()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1")
+        .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1609")
+        .args([
+            "--db",
+            db.to_str().expect("utf8 path"),
+            "store",
+            "--title",
+            "cli-unsigned",
+            "--content",
+            "Body of the unsigned CLI write, long enough to read as real prose.",
+            "--namespace",
+            "attest-cli",
+        ])
+        .assert()
+        .failure();
+    let out = assert.get_output();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("attestation"),
+        "rejection must name the attestation gate; got stderr: {stderr}"
+    );
+}
+
 /// #626 Layer-3 — the *signed* arm of the same MCP `handle_store` gate. A
 /// caller presents a valid detached signature over the canonical envelope
 /// plus the matching `created_at`; the gate adopts the timestamp, re-derives
