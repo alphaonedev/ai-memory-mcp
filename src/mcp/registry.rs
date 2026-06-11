@@ -985,11 +985,15 @@ pub fn handle_capabilities_family(
 /// `inputSchema.properties` are also stripped from each tool by
 /// default (see [`trim_optional_params`]) so the `tools/list` payload
 /// fits the v0.7 token budget. Callers that need the full schema
-/// (every optional, every default) should call
-/// [`tool_definitions_for_profile_verbose`] or, on the wire, pass
-/// `verbose=true` to `memory_capabilities`. The C2 (description/docs)
-/// trim and the C4 (optional-params) trim are orthogonal — both run
-/// on the default path; both are skipped on the verbose path.
+/// SHAPE (every optional property, every default) should call
+/// [`tool_definitions_for_profile_verbose`] — noting it still strips
+/// the C2 prose (`docs` + per-property `description`s; #1648) — or,
+/// on the wire, pass `verbose=true` to `memory_capabilities`, whose
+/// family drilldown skips both trims and so carries the prose too.
+/// The C2 (description/docs) trim and the C4 (optional-params) trim
+/// are orthogonal — both run on this default path; only the C4 trim
+/// is skipped by [`tool_definitions_for_profile_verbose`] (its C2
+/// strip runs via [`strip_docs_from_tools`]).
 pub fn tool_definitions_for_profile(profile: &crate::profile::Profile) -> Value {
     // v0.7.0 #1077 — memoize per-Profile so repeat `tools/list` calls
     // are a single `Value::clone()` of the cached payload instead of
@@ -1108,19 +1112,25 @@ fn tools_verbose_env_enabled() -> bool {
     })
 }
 
-/// v0.7 C4 — full-schema (verbose) variant of
-/// [`tool_definitions_for_profile`]. Returns every optional param,
-/// every default, every per-property description. Used by the
-/// `memory_capabilities { verbose=true }` opt-in path so power users /
-/// NHI agents can still set the long-tail knobs (`confidence`,
-/// `priority`, `tier`, `metadata`, `agent_id`, …) without restarting
-/// the MCP server with a different profile.
+/// v0.7 C4 — full-SCHEMA-SHAPE (verbose) variant of
+/// [`tool_definitions_for_profile`]. Returns every optional param and
+/// every default (`type`, `enum`, `default`, `minimum`, `maximum`,
+/// `required`, `items`) — but NOT the natural-language prose: the
+/// body calls [`strip_docs_from_tools`], so the top-level `docs`
+/// field AND every per-property `description` string under
+/// `inputSchema.properties.*` are stripped here too (#1648 doc
+/// truth-fix; the pre-#1648 claim of "every per-property description"
+/// was false). Used by the `memory_capabilities { verbose=true }`
+/// opt-in path so power users / NHI agents can still set the
+/// long-tail knobs (`confidence`, `priority`, `tier`, `metadata`,
+/// `agent_id`, …) without restarting the MCP server with a different
+/// profile.
 ///
-/// v0.7 C2 — note that `docs` (long-form prose) is still stripped on
-/// the verbose path; the verbose flag controls whether
-/// `inputSchema.properties` is trimmed (C4), not the top-level `docs`
-/// field (C2). To recover the long-form docs, call
-/// [`tool_definitions`] directly.
+/// v0.7 C2 — the verbose flag controls only whether
+/// `inputSchema.properties` is trimmed (C4); the C2 strip
+/// ([`strip_docs_from_tools`]: top-level `docs` + nested per-property
+/// `description`s) runs on the verbose path as well. To recover the
+/// full prose surface, call [`tool_definitions`] directly.
 pub fn tool_definitions_for_profile_verbose(profile: &crate::profile::Profile) -> Value {
     let mut defs = tool_definitions();
     if let Some(arr) = defs.get_mut("tools").and_then(|t| t.as_array_mut()) {

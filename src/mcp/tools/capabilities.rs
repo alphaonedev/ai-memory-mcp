@@ -31,7 +31,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)] // D1.1 PoC: struct is the schemars source; handler still parses Value directly until D1.3.
 pub struct CapabilitiesRequest {
-    /// Schema version. v2 default; v1 legacy.
+    /// Schema version. v3 default (A5); v2/v1 legacy.
     #[serde(default)]
     pub accept: Option<String>,
 
@@ -223,9 +223,10 @@ impl CapabilitiesAccept {
 /// errors are non-fatal — the report falls back to zero-state so a
 /// transient blip cannot 500 the capabilities endpoint.
 ///
-/// **Schema selection.** `accept` controls the wire shape. `V2` is the
-/// default and recommended; `V1` projects the v2 report down to the
-/// legacy shape for backward compat (see [`Capabilities::to_v1`]).
+/// **Schema selection.** `accept` controls the wire shape. As of
+/// v0.7.0 A5 the default is `V3` (#1645); `V2` and `V1` remain
+/// negotiable for pinned clients (`V1` projects the v2 report down to
+/// the legacy shape — see [`Capabilities::to_v1`]).
 pub fn handle_capabilities_with_conn(
     tier_config: &TierConfig,
     resolved_models: &ResolvedModels,
@@ -725,8 +726,11 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
     };
     match name {
         tn::MEMORY_STORE => vec![ex(
+            // #1644 — the success envelope is {id, tier, title,
+            // namespace, agent_id} (store/mod.rs success echo), NOT
+            // the previously-claimed {id, status}.
             json!({"title": "design", "content": "wt-1 atomisation", "tier": Tier::Long.as_str(), "namespace": "ai-memory"}),
-            "Persists a long-tier memory; returns {id, status}.",
+            "Persists a long-tier memory; returns {id, tier, title, namespace, agent_id}.",
         )],
         tn::MEMORY_RECALL => vec![ex(
             // #1606 — the MCP wire param is `context` (the `query` alias
@@ -741,8 +745,11 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             "FTS5 keyword search across namespaces.",
         )],
         tn::MEMORY_LINK => vec![ex(
-            json!({"from_id": "<uuid-a>", "to_id": "<uuid-b>", "relation": "derives_from"}),
-            "Signed directional edge; returns {link_id, attest_level}.",
+            // #1644 — parser fields are `source_id`/`target_id`
+            // (`handle_link`), NOT `from_id`/`to_id`; the success
+            // envelope carries no `link_id`.
+            json!({"source_id": "<uuid-a>", "target_id": "<uuid-b>", "relation": "derives_from"}),
+            "Signed directional edge; returns {linked, source_id, target_id, relation, invalidation_notified, attest_level}.",
         )],
         tn::MEMORY_REFLECT => vec![ex(
             // v0.7.0 #1325 — example payload is byte-equal to a valid call.
@@ -770,19 +777,28 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             ),
         ],
         tn::MEMORY_CONSOLIDATE => vec![ex(
-            json!({"namespace": "raw/notes", "into_namespace": "team/alpha", "limit": 20}),
-            "Curator distils notes into one consolidated memory.",
+            // #1644 — the parser contract is `ids[]` + `title`
+            // (`handle_consolidate`); there is no namespace-sweep
+            // form and no `into_namespace`/`limit` params.
+            json!({"ids": ["<uuid-a>", "<uuid-b>"], "title": "Distilled summary", "namespace": "team/alpha"}),
+            "Curator distils the listed memories into one consolidated memory.",
         )],
         tn::MEMORY_ATOMISE => vec![ex(
             json!({"memory_id": "<long-uuid>", "max_atom_tokens": 200}),
             "WT-1 decomposition; archives parent.",
         )],
         tn::MEMORY_FIND_PATHS => vec![ex(
-            json!({"from_id": "<uuid-a>", "to_id": "<uuid-b>", "max_depth": 4}),
+            // #1644 — parser fields are `source_id`/`target_id`
+            // (`handle_find_paths`), NOT `from_id`/`to_id`.
+            json!({"source_id": "<uuid-a>", "target_id": "<uuid-b>", "max_depth": 4}),
             "BFS over KG; returns path arrays of memory ids.",
         )],
         tn::MEMORY_KG_QUERY => vec![ex(
-            json!({"start_id": "<uuid>", "relation": "derives_from", "direction": "out", "depth": 2}),
+            // #1644 — the parser requires `source_id` and reads
+            // `max_depth` (`handle_kg_query`); the previously-shipped
+            // `start_id`/`relation`/`direction`/`depth` params are
+            // never read by the handler.
+            json!({"source_id": "<uuid>", "max_depth": 2}),
             "Typed KG walk; returns nodes+edges.",
         )],
         tn::MEMORY_EXPORT_REFLECTION => vec![ex(
@@ -790,24 +806,46 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             "QW-1 export; returns {content, suggested_filename}.",
         )],
         tn::MEMORY_SMART_LOAD => vec![ex(
-            json!({"intent": "inspect the knowledge graph", "include_schema": true}),
+            // #1644 sweep — the handler reads `intent`/`namespace`/`k`
+            // only; the previously-shipped `include_schema` was inert.
+            json!({"intent": "inspect the knowledge graph", "k": 10}),
             "B2 intent routing.",
         )],
         tn::MEMORY_LOAD_FAMILY => vec![ex(
-            json!({"family": "graph", "include_schema": true}),
+            // #1644 sweep — the handler reads `family`/`namespace`/`k`
+            // only; the previously-shipped `include_schema` was inert.
+            json!({"family": "graph", "k": 10}),
             "B1 explicit family load.",
         )],
         tn::MEMORY_SESSION_START => vec![ex(
-            json!({"topic": "v0.7.0 ship"}),
+            // #1644 — the handler reads only `namespace` + `limit`
+            // (`handle_session_start`); the previously-shipped `topic`
+            // param was inert.
+            json!({"namespace": "ai-memory", "limit": 10}),
             "SessionStart bootstrap; returns memories+persona+rules.",
         )],
-        tn::MEMORY_VERIFY => vec![ex(
-            json!({"memory_id": "<uuid>"}),
-            "H4 signature replay; returns {verified, attest_level}.",
-        )],
+        tn::MEMORY_VERIFY => vec![
+            // #1644 — memory_verify re-verifies LINK signatures, not
+            // memory rows: `handle_verify` accepts either a composite
+            // `link_id` or the explicit `source_id`+`target_id`
+            // triple; `memory_id` is never read. The truthful return
+            // key is `signature_verified` (not `verified`).
+            ex(
+                json!({"source_id": "<uuid-a>", "target_id": "<uuid-b>", "relation": "derives_from"}),
+                "H4 on-demand link-signature re-verify; returns {signature_verified, attest_level, signed_by, signed_at}.",
+            ),
+            ex(
+                json!({"link_id": "<uuid-a>--derives_from--><uuid-b>"}),
+                "Composite link_id form of the same re-verify call.",
+            ),
+        ],
         tn::MEMORY_NOTIFY => vec![ex(
-            json!({"event_type": "deploy.completed", "payload": {"env": "prod"}, "ttl_seconds": crate::SECS_PER_HOUR}),
-            "Fan-out to active subscribers.",
+            // #1644 — `handle_notify` requires `target_agent_id` +
+            // `title`, and `payload` is a STRING (the message body);
+            // the previously-shipped `event_type`/`ttl_seconds`
+            // params (and the JSON-object payload) are never read.
+            json!({"target_agent_id": "ai:claude@host-a", "title": "deploy completed", "payload": "prod deploy finished green"}),
+            "Write a message to the target agent's inbox; read via memory_inbox.",
         )],
         // v0.7.0 #1327 — canonical example for `memory_skill_register`.
         // Parameter name is `folder_path` (NOT `skill_folder`); the
@@ -1088,6 +1126,250 @@ mod example_validity_1606_tests {
                 )
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod example_validity_1644_tests {
+    //! #1644 — class-closing generalization of
+    //! `recall_example_payload_parses_1606` (above) and
+    //! `tests/issue_1327_skill_register_docstring_example.rs`: EVERY
+    //! payload in the `tool_examples()` worked-example catalog must
+    //! round-trip through its tool's actual parser / param-extraction
+    //! layer (the #1325 byte-valid discipline).
+    //!
+    //! **Parse-level validation suffices here (documented per #1644):**
+    //! most handlers need a live DB / LLM / embedder to execute
+    //! end-to-end, but the failure class this closes — wrong param
+    //! names (`from_id` vs `source_id`), wrong param types (object
+    //! `payload` vs string), and inert params the handler never reads
+    //! (`topic`, `ttl_seconds`) — is fully visible at the serde +
+    //! schema layer. Each example deserializes through the SAME
+    //! request struct whose schemars derive is the tool's wire
+    //! `inputSchema`, and (because #1052 keeps the structs permissive
+    //! to unknown fields) every example key is additionally checked
+    //! against the declared `inputSchema.properties` set so an inert
+    //! param cannot hide behind serde leniency.
+
+    use serde_json::Value;
+
+    /// Every tool name in the FULL catalog (all registered tools +
+    /// the always-on bootstraps) that carries at least one worked
+    /// example. Enumerated from the catalog — not hand-listed — so a
+    /// future example added for ANY tool cannot dodge this test.
+    fn example_bearing_tools() -> Vec<String> {
+        let defs = crate::mcp::tool_definitions();
+        let mut names: Vec<String> = defs["tools"]
+            .as_array()
+            .expect("tool_definitions must emit `tools` array")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        for name in crate::profile::ALWAYS_ON_TOOLS {
+            if !names.iter().any(|n| n == name) {
+                names.push((*name).to_string());
+            }
+        }
+        names.retain(|n| !super::tool_examples(n).is_empty());
+        assert!(
+            !names.is_empty(),
+            "the #803 worked-example catalog must not be empty"
+        );
+        names
+    }
+
+    /// Deserialize `call` through `T` — the same request struct whose
+    /// schemars derive is the tool's wire `inputSchema` — panicking
+    /// with the tool name on refusal.
+    fn parses_as<T: serde::de::DeserializeOwned>(name: &str, call: &Value) {
+        if let Err(e) = serde_json::from_value::<T>(call.clone()) {
+            panic!(
+                "{name} capabilities example must be byte-equal to a valid \
+                 MCP call (#1644/#1325); parser said: {e}"
+            );
+        }
+    }
+
+    /// Round-trip every worked example through its tool's canonical
+    /// parser. The fallthrough arm panics, so a tool that GAINS a
+    /// worked example without a parser pin here fails this test —
+    /// that is the class guard.
+    #[test]
+    fn issue_1644_every_example_round_trips_through_its_parser() {
+        use crate::mcp::registry::tool_names as tn;
+        for name in example_bearing_tools() {
+            for example in &super::tool_examples(&name) {
+                let call = &example.call;
+                match name.as_str() {
+                    x if x == tn::MEMORY_STORE => {
+                        parses_as::<crate::mcp::store::StoreRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_RECALL => {
+                        // The one real no-DB parser entry point — same
+                        // contract as `recall_example_payload_parses_1606`.
+                        crate::models::RecallRequest::from_mcp_params(call).unwrap_or_else(|e| {
+                            panic!("memory_recall example must parse (#1644): {e}")
+                        });
+                    }
+                    x if x == tn::MEMORY_SEARCH => {
+                        parses_as::<crate::mcp::search::SearchRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_LINK => {
+                        parses_as::<crate::mcp::link::LinkRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_REFLECT => {
+                        parses_as::<crate::mcp::reflect::ReflectRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_PERSONA_GENERATE => {
+                        parses_as::<crate::mcp::persona::PersonaGenerateRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_CONSOLIDATE => {
+                        parses_as::<crate::mcp::consolidate::ConsolidateRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_ATOMISE => {
+                        parses_as::<crate::mcp::atomise::AtomiseRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_FIND_PATHS => {
+                        parses_as::<crate::mcp::find_paths::FindPathsRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_KG_QUERY => {
+                        parses_as::<crate::mcp::kg_query::KgQueryRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_EXPORT_REFLECTION => {
+                        parses_as::<crate::mcp::export_reflection::ExportReflectionRequest>(
+                            &name, call,
+                        );
+                    }
+                    x if x == tn::MEMORY_SMART_LOAD => {
+                        parses_as::<crate::mcp::load_family::SmartLoadRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_LOAD_FAMILY => {
+                        parses_as::<crate::mcp::load_family::LoadFamilyRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_SESSION_START => {
+                        parses_as::<crate::mcp::session_start::SessionStartRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_VERIFY => {
+                        parses_as::<crate::mcp::verify::VerifyRequest>(&name, call);
+                        // Mirror `handle_verify`'s param extraction:
+                        // link_id OR source_id+target_id is required,
+                        // and a composite link_id must satisfy
+                        // `parse_link_id`.
+                        let obj = call.as_object().expect("verify example is an object");
+                        if let Some(lid) = obj.get("link_id").and_then(Value::as_str) {
+                            assert!(
+                                crate::mcp::link::parse_link_id(lid).is_some(),
+                                "memory_verify link_id example must satisfy parse_link_id (#1644): {lid}"
+                            );
+                        } else {
+                            assert!(
+                                obj.contains_key("source_id") && obj.contains_key("target_id"),
+                                "memory_verify example must carry link_id or source_id+target_id (#1644)"
+                            );
+                        }
+                    }
+                    x if x == tn::MEMORY_NOTIFY => {
+                        parses_as::<crate::mcp::notify::NotifyRequest>(&name, call);
+                    }
+                    x if x == tn::MEMORY_SKILL_REGISTER => {
+                        parses_as::<crate::mcp::skill_register::SkillRegisterRequest>(&name, call);
+                    }
+                    other => panic!(
+                        "tool `{other}` carries worked examples but has no parser \
+                         round-trip arm in this test — add one so the example \
+                         stays byte-valid (#1644 class guard)"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Every key on every example must be a declared
+    /// `inputSchema.properties` entry, and every schema-`required`
+    /// property must be present on the example. This is the
+    /// inert-param guard: #1052 keeps request structs permissive to
+    /// unknown fields, so serde alone cannot catch a `topic`-class
+    /// param the handler never reads.
+    #[test]
+    fn issue_1644_example_keys_match_declared_schema() {
+        let defs = crate::mcp::tool_definitions();
+        let tools = defs["tools"]
+            .as_array()
+            .expect("tool_definitions must emit `tools` array");
+        for name in example_bearing_tools() {
+            let tool = tools
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name.as_str()))
+                .unwrap_or_else(|| panic!("`{name}` must be in the tool catalog"));
+            let props: std::collections::BTreeSet<&str> = tool
+                .pointer("/inputSchema/properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("`{name}` must carry inputSchema.properties"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let required: Vec<&str> = tool
+                .pointer("/inputSchema/required")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            for (idx, example) in super::tool_examples(&name).iter().enumerate() {
+                let obj = example
+                    .call
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{name} example {idx} call must be an object"));
+                for key in obj.keys() {
+                    assert!(
+                        props.contains(key.as_str()),
+                        "{name} example {idx}: key `{key}` is not a declared \
+                         inputSchema property — the handler never reads it \
+                         (#1644 inert-param class); declared: {props:?}"
+                    );
+                }
+                // memory_verify's either/or gate is checked in the
+                // round-trip test; its schema declares no `required`.
+                for req in &required {
+                    assert!(
+                        obj.contains_key(*req),
+                        "{name} example {idx}: missing required property `{req}` (#1644)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pin the two #1644 return-shape corrections so the false claims
+    /// cannot regress.
+    #[test]
+    fn issue_1644_return_shape_claims_are_truthful() {
+        use crate::mcp::registry::tool_names as tn;
+        let store = super::tool_examples(tn::MEMORY_STORE);
+        assert!(
+            store[0]
+                .description
+                .contains("{id, tier, title, namespace, agent_id}"),
+            "memory_store example must claim the real success envelope (#1644)"
+        );
+        assert!(
+            !store[0].description.contains("{id, status}"),
+            "memory_store example must not claim the fictitious {{id, status}} shape (#1644)"
+        );
+        let link = super::tool_examples(tn::MEMORY_LINK);
+        assert!(
+            !link[0].description.contains("link_id"),
+            "memory_link's success envelope carries no link_id (#1644)"
+        );
+        assert!(
+            link[0].description.contains("invalidation_notified")
+                && link[0].description.contains("attest_level"),
+            "memory_link example must claim the real success envelope (#1644)"
+        );
+        let verify = super::tool_examples(tn::MEMORY_VERIFY);
+        assert!(
+            verify[0].description.contains("signature_verified"),
+            "memory_verify's truthful return key is signature_verified (#1644)"
+        );
     }
 }
 
