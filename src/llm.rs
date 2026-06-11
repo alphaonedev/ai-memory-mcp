@@ -331,6 +331,18 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 /// the breaker. Single transient failure does not flip the switch.
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
+/// #1603 — max texts per batched OpenAI-compatible `/embeddings`
+/// request ([`OllamaClient::embed_texts_async`]). 100 matches the A4
+/// backfill chunk default ([`crate::config`]
+/// `DEFAULT_EMBED_BACKFILL_BATCH`) so a stock backfill chunk is ONE
+/// request; vendors commonly cap embed batches well above this.
+const EMBED_BATCH_MAX_INPUTS: usize = 100;
+/// #1603 — max total input bytes per batched `/embeddings` request.
+/// Keeps a batch of near-[`crate::embeddings::EMBED_MAX_BYTES`] rows
+/// from composing a multi-megabyte payload a vendor gateway rejects;
+/// overflow rolls into the next sub-batch.
+const EMBED_BATCH_MAX_BYTES: usize = 256 * 1024;
+
 /// #1459 (SEC, LOW) — hard cap on the number of bytes buffered from an
 /// LLM/embedder HTTP response before it is parsed. A hostile or
 /// misbehaving endpoint (or a compromised proxy in front of one) could
@@ -394,6 +406,58 @@ async fn read_capped_text(resp: reqwest::Response) -> String {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => format!("<error body unavailable: {e}>"),
     }
+}
+
+/// #1603 — parse a batched OpenAI-compatible `/embeddings` response
+/// (`{"data": [{"index": i, "embedding": [...]}, ...]}`) into one
+/// vector per input, in INPUT order. The spec allows providers to
+/// reorder `data`, so each element's `index` field places its vector;
+/// elements without an `index` fall back to positional order. Errors on
+/// a missing/short `data` array, a missing `embedding`, an
+/// out-of-range/duplicate `index`, an empty vector, or a final count
+/// that does not match `expected_len` — a misaligned batch must fail
+/// loudly rather than pair texts with the wrong vectors.
+fn parse_openai_embeddings_batch(body: &Value, expected_len: usize) -> Result<Vec<Vec<f32>>> {
+    let data = body["data"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Missing 'data' array in OpenAI-compatible embed response"))?;
+    if data.len() != expected_len {
+        return Err(anyhow!(
+            "Embed response carried {} vector(s) for {expected_len} input(s)",
+            data.len()
+        ));
+    }
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; expected_len];
+    for (pos, item) in data.iter().enumerate() {
+        let idx = match item["index"].as_u64() {
+            Some(i) => usize::try_from(i)
+                .map_err(|_| anyhow!("Embed response 'index' {i} does not fit usize"))?,
+            None => pos,
+        };
+        if idx >= expected_len {
+            return Err(anyhow!(
+                "Embed response 'index' {idx} out of range for {expected_len} input(s)"
+            ));
+        }
+        if out[idx].is_some() {
+            return Err(anyhow!("Embed response carried duplicate 'index' {idx}"));
+        }
+        let arr = item["embedding"].as_array().ok_or_else(|| {
+            anyhow!("Missing 'data[{pos}].embedding' in OpenAI-compatible embed response")
+        })?;
+        #[allow(clippy::cast_possible_truncation)]
+        let floats: Vec<f32> = arr
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect();
+        if floats.is_empty() {
+            return Err(anyhow!("Empty embedding at index {idx} in embed response"));
+        }
+        out[idx] = Some(floats);
+    }
+    // Every slot is provably Some: data.len() == expected_len and each
+    // element landed in a distinct in-range slot.
+    Ok(out.into_iter().flatten().collect())
 }
 
 const QUERY_EXPANSION_PROMPT: &str = r"You are a search query expander. Given a search query, generate 5-8 additional search terms that are semantically related. Return ONLY the terms, one per line, no numbering or explanation.
@@ -1676,6 +1740,173 @@ impl OllamaClient {
         Ok(floats)
     }
 
+    /// #1603 — generate embeddings for MANY texts, batching the wire
+    /// where the provider supports it. Sync wrapper over
+    /// [`Self::embed_texts_async`] (same `block_on_local` discipline as
+    /// [`Self::embed_text`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-request error (see
+    /// [`Self::embed_texts_async`]).
+    pub fn embed_texts(&self, texts: &[&str], embed_model: &str) -> Result<Vec<Vec<f32>>> {
+        block_on_local(|| self.embed_texts_async(texts, embed_model))
+    }
+
+    /// #1603 — async batched embed. Provider behaviour:
+    ///
+    /// * **OpenAI-compatible** — the `/embeddings` wire shape natively
+    ///   accepts `"input": [array of strings]`, so the inputs are sent
+    ///   in sub-batches of at most [`EMBED_BATCH_MAX_INPUTS`] texts /
+    ///   [`EMBED_BATCH_MAX_BYTES`] total bytes per request (one POST
+    ///   per sub-batch instead of one POST per text — the pre-#1603
+    ///   per-row loop drained an API-backed backfill at ~20 rows/min).
+    ///   On a batch-level error the sub-batch falls back to per-text
+    ///   requests so one rejected input (e.g. an over-context row the
+    ///   vendor 4xxes) cannot poison its whole sub-batch — the same
+    ///   isolation posture as the #1595 backfill fallback.
+    /// * **Ollama (native)** — per-text loop preserved verbatim: the
+    ///   batched `/api/embed` wire shape differs across the pinned
+    ///   Ollama versions (the PERF-5 deferral), so batching is staged
+    ///   behind the OpenAI-compatible arm only.
+    ///
+    /// Output order matches input order. The OpenAI-compatible parse
+    /// honours the response `data[*].index` field when present
+    /// (providers may reorder) and falls back to positional order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the circuit breaker is open, the
+    /// governance gate refuses the outbound, a request fails after the
+    /// per-text fallback, the response shape is missing
+    /// `data[*].embedding`, or the vector count does not match the
+    /// input count.
+    pub async fn embed_texts_async(
+        &self,
+        texts: &[&str],
+        embed_model: &str,
+    ) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if matches!(self.provider, LlmProvider::Ollama) {
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                out.push(self.embed_text_async(t, embed_model).await?);
+            }
+            return Ok(out);
+        }
+
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut start = 0usize;
+        while start < texts.len() {
+            // Greedy sub-batch: cap by input count AND total bytes so a
+            // batch of EMBED_MAX_BYTES-sized rows cannot compose a
+            // multi-megabyte request the vendor rejects outright.
+            let mut end = start;
+            let mut bytes = 0usize;
+            while end < texts.len()
+                && (end - start) < EMBED_BATCH_MAX_INPUTS
+                && (end == start || bytes + texts[end].len() <= EMBED_BATCH_MAX_BYTES)
+            {
+                bytes += texts[end].len();
+                end += 1;
+            }
+            let chunk = &texts[start..end];
+            match self.embed_texts_one_request(chunk, embed_model).await {
+                Ok(vecs) => out.extend(vecs),
+                Err(batch_err) => {
+                    // Per-text fallback isolates a poison input; if a
+                    // text still fails individually, propagate THAT
+                    // error (more precise than the batch-level one).
+                    tracing::warn!(
+                        "batched embed of {} text(s) failed ({batch_err}); \
+                         falling back to per-text requests",
+                        chunk.len()
+                    );
+                    for t in chunk {
+                        out.push(self.embed_text_async(t, embed_model).await?);
+                    }
+                }
+            }
+            start = end;
+        }
+        Ok(out)
+    }
+
+    /// One OpenAI-compatible `/embeddings` POST carrying every text in
+    /// `chunk` as the `input` array. Internal helper for
+    /// [`Self::embed_texts_async`] — callers must have provider
+    /// `OpenAiCompatible`.
+    async fn embed_texts_one_request(
+        &self,
+        chunk: &[&str],
+        embed_model: &str,
+    ) -> Result<Vec<Vec<f32>>> {
+        if self.breaker_is_open() {
+            return Err(anyhow!(
+                "Failed to send embed request: circuit breaker open \
+                 (last failure within {}s); LLM at {} is not responding",
+                CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+                self.base_url,
+            ));
+        }
+        self.check_outbound()?;
+
+        let LlmProvider::OpenAiCompatible { api_key } = &self.provider else {
+            return Err(anyhow!(
+                "embed_texts_one_request requires an OpenAI-compatible provider"
+            ));
+        };
+
+        // Same Matryoshka `dimensions` pass-through as the single-text
+        // path (#1598): an explicit `[embeddings].dim` rides every
+        // batched request too, keeping vector(768) fleet schemas valid.
+        let payload = match self.embed_dimensions {
+            Some(dims) => {
+                json!({"model": embed_model, "input": chunk, "dimensions": dims})
+            }
+            None => json!({"model": embed_model, "input": chunk}),
+        };
+
+        let resp = match self
+            .client
+            .post(format!("{}/embeddings", self.base_url))
+            .timeout(GENERATE_TIMEOUT)
+            .json(&payload)
+            .bearer_auth(api_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_failure();
+                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if status.is_server_error() {
+                self.note_failure();
+            }
+            let text = read_capped_text(resp).await;
+            return Err(anyhow!("Embed failed ({status}): {text}"));
+        }
+
+        let body: Value = match read_capped_json(resp).await {
+            Ok(b) => b,
+            Err(e) => {
+                self.note_failure();
+                return Err(e.context("Failed to parse embed response"));
+            }
+        };
+
+        let parsed = parse_openai_embeddings_batch(&body, chunk.len())?;
+        self.note_success();
+        Ok(parsed)
+    }
+
     /// Ensure an embedding model is available.
     ///
     /// - Ollama: lists `/api/tags`, pulls via `/api/pull` if missing.
@@ -1785,6 +2016,73 @@ mod tests {
     #[test]
     fn test_default_url() {
         assert_eq!(DEFAULT_OLLAMA_URL, "http://localhost:11434");
+    }
+
+    /// #1603 — batched `/embeddings` parse: in-order, out-of-order via
+    /// `index`, and positional fallback when `index` is absent.
+    #[test]
+    fn parse_openai_embeddings_batch_orders_by_index_1603() {
+        let body = serde_json::json!({"data": [
+            {"index": 1, "embedding": [2.0, 2.0]},
+            {"index": 0, "embedding": [1.0, 1.0]},
+        ]});
+        let out = parse_openai_embeddings_batch(&body, 2).expect("parse");
+        assert_eq!(out, vec![vec![1.0, 1.0], vec![2.0, 2.0]]);
+
+        let no_index = serde_json::json!({"data": [
+            {"embedding": [1.0]},
+            {"embedding": [2.0]},
+        ]});
+        let out = parse_openai_embeddings_batch(&no_index, 2).expect("positional parse");
+        assert_eq!(out, vec![vec![1.0], vec![2.0]]);
+    }
+
+    /// #1603 — misaligned/malformed batched responses must fail loudly
+    /// (count mismatch, duplicate index, out-of-range index, missing
+    /// embedding, empty vector) rather than mis-pair texts and vectors.
+    #[test]
+    fn parse_openai_embeddings_batch_rejects_malformed_1603() {
+        let short = serde_json::json!({"data": [{"index": 0, "embedding": [1.0]}]});
+        assert!(
+            parse_openai_embeddings_batch(&short, 2).is_err(),
+            "count mismatch"
+        );
+
+        let dup = serde_json::json!({"data": [
+            {"index": 0, "embedding": [1.0]},
+            {"index": 0, "embedding": [2.0]},
+        ]});
+        assert!(
+            parse_openai_embeddings_batch(&dup, 2).is_err(),
+            "duplicate index"
+        );
+
+        let oob = serde_json::json!({"data": [
+            {"index": 0, "embedding": [1.0]},
+            {"index": 9, "embedding": [2.0]},
+        ]});
+        assert!(
+            parse_openai_embeddings_batch(&oob, 2).is_err(),
+            "out-of-range index"
+        );
+
+        let missing = serde_json::json!({"data": [{"index": 0}]});
+        assert!(
+            parse_openai_embeddings_batch(&missing, 1).is_err(),
+            "missing embedding"
+        );
+
+        let empty = serde_json::json!({"data": [{"index": 0, "embedding": []}]});
+        assert!(
+            parse_openai_embeddings_batch(&empty, 1).is_err(),
+            "empty vector"
+        );
+
+        let no_data = serde_json::json!({"object": "list"});
+        assert!(
+            parse_openai_embeddings_batch(&no_data, 1).is_err(),
+            "missing data"
+        );
     }
 
     /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
