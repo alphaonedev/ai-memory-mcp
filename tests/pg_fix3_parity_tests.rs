@@ -235,3 +235,50 @@ async fn live_consolidate_backfills_expiry_pg_1630() {
     let _ = store.delete(&ctx, &mid_id).await;
     let _ = store.delete(&ctx, &long_id).await;
 }
+
+/// #1642 — pg delete must clean `namespace_meta` rows whose
+/// `standard_id` points at the deleted memory, mirroring sqlite
+/// `storage::delete` (`src/storage/mod.rs:1747-1751`). Pre-fix the
+/// namespace kept resolving a standard whose backing memory was gone.
+#[tokio::test]
+async fn live_delete_cleans_namespace_meta_pg_1642() {
+    let Some(store) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let unique = uuid::Uuid::new_v4();
+    let owner = format!("ai:fix3-1642-{unique}");
+    let ctx = CallerContext::for_agent(owner.clone());
+    let ns = format!("fix3-1642-{unique}");
+
+    let std_mem = sample_memory(&format!("fix3-1642-{unique}"), &ns, Tier::Long, &owner);
+    let std_id = store.store(&ctx, &std_mem).await.expect("store standard");
+    store
+        .set_namespace_standard(&ctx, &ns, &std_id, None)
+        .await
+        .expect("set namespace standard");
+    let got = store
+        .get_namespace_standard(&ctx, &ns)
+        .await
+        .expect("get standard pre-delete");
+    assert_eq!(
+        got.as_ref().map(|(sid, _)| sid.as_str()),
+        Some(std_id.as_str()),
+        "standard must resolve before the delete"
+    );
+
+    store
+        .delete(&ctx, &std_id)
+        .await
+        .expect("delete standard memory");
+
+    let after = store
+        .get_namespace_standard(&ctx, &ns)
+        .await
+        .expect("get standard post-delete");
+    assert!(
+        after.is_none(),
+        "#1642: deleting the standard memory must remove the \
+         namespace_meta row; got {after:?}"
+    );
+}
