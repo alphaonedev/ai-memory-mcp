@@ -3216,90 +3216,110 @@ enabled = true
         // No `Config path` line because path is None.
         assert!(!s.contains("Config path:"));
         assert!(s.contains("Hooks loaded: 1"));
+    }
 
-        /// A connection with no schema at all: `db::stats` fails, the
-        /// Storage section must downgrade to WARN with a `stats_error`
-        /// fact, and `dim_violations` renders the pre-P2 `not_observed`
-        /// line (prepare on the missing table fails → `Ok(None)`).
-        #[test]
-        fn storage_section_warns_with_stats_error_on_missing_schema() {
-            let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
-            let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
-            assert_eq!(section.severity, Severity::Warning);
-            assert!(
-                section.facts.iter().any(|(k, _)| k == "stats_error"),
-                "facts: {:?}",
-                section.facts
-            );
-            assert!(
-                section
-                    .facts
-                    .iter()
-                    .any(|(k, v)| k == "dim_violations" && v.contains("not_observed")),
-                "facts: {:?}",
-                section.facts
-            );
+    /// The happy-path complement of the `/`-fallback test above: a
+    /// hook whose command HAS a `file_name()` renders by basename.
+    /// (Also the call site that keeps `mk_hook` honest — the three
+    /// section tests below were nested inside the previous test fn by
+    /// the ee00d8bb coverage lift, so rustc flagged them unnameable
+    /// and `mk_hook` dead; this test + the un-nesting restore them.)
+    #[test]
+    fn render_hooks_human_with_rows_renders_each_hook() {
+        let hooks = vec![mk_hook("/usr/local/bin/notify-hook.sh")];
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            render_hooks_human_with(&mut out, None, &hooks).unwrap();
         }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("Hooks loaded: 1"), "got: {s}");
+        assert!(s.contains("notify-hook.sh"), "got: {s}");
+    }
 
-        /// Index section near-capacity arm: ≥95k embedded rows must WARN
-        /// with the MAX_ENTRIES note. The section only counts
-        /// `embedding IS NOT NULL`, so a minimal single-column table keeps
-        /// the fixture cheap (one recursive-CTE insert, no full schema).
-        #[test]
-        fn index_section_warns_when_hnsw_within_5pct_of_cap() {
-            let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
-            conn.execute_batch(
-                "CREATE TABLE memories(embedding BLOB);
+    /// A connection with no schema at all: `db::stats` fails, the
+    /// Storage section must downgrade to WARN with a `stats_error`
+    /// fact, and `dim_violations` renders the pre-P2 `not_observed`
+    /// line (prepare on the missing table fails → `Ok(None)`).
+    #[test]
+    fn storage_section_warns_with_stats_error_on_missing_schema() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
+        assert_eq!(section.severity, Severity::Warning);
+        assert!(
+            section.facts.iter().any(|(k, _)| k == "stats_error"),
+            "facts: {:?}",
+            section.facts
+        );
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "dim_violations" && v.contains("not_observed")),
+            "facts: {:?}",
+            section.facts
+        );
+    }
+
+    /// Index section near-capacity arm: ≥95k embedded rows must WARN
+    /// with the MAX_ENTRIES note. The section only counts
+    /// `embedding IS NOT NULL`, so a minimal single-column table keeps
+    /// the fixture cheap (one recursive-CTE insert, no full schema).
+    #[test]
+    fn index_section_warns_when_hnsw_within_5pct_of_cap() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(
+            "CREATE TABLE memories(embedding BLOB);
              INSERT INTO memories(embedding)
              WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 95000)
              SELECT x FROM c;",
-            )
-            .expect("seed 95k embedded rows");
-            let section = section_index(&conn);
-            assert_eq!(section.severity, Severity::Warning);
-            let note = section.note.as_deref().expect("note must explain the cap");
-            assert!(note.contains("within 5%"), "note: {note}");
-            assert!(
-                section
-                    .facts
-                    .iter()
-                    .any(|(k, v)| k == "hnsw_size_estimate" && v == "95000"),
-                "facts: {:?}",
-                section.facts
-            );
-        }
+        )
+        .expect("seed 95k embedded rows");
+        let section = section_index(&conn);
+        assert_eq!(section.severity, Severity::Warning);
+        let note = section.note.as_deref().expect("note must explain the cap");
+        assert!(note.contains("within 5%"), "note: {note}");
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "hnsw_size_estimate" && v == "95000"),
+            "facts: {:?}",
+            section.facts
+        );
+    }
 
-        /// Sync section `Ok(None)` skew arm: a registered peer whose
-        /// `last_pulled_at` is NULL yields peer_count ≥ 1 but no measurable
-        /// skew — the section must render `not_observed` at INFO rather
-        /// than N/A (the no-peers early return) or CRIT.
-        #[test]
-        fn sync_section_not_observed_when_peer_has_no_pull_timestamp() {
-            let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
-            conn.execute_batch(
-                "CREATE TABLE sync_state(last_seen_at TEXT, last_pulled_at TEXT);
+    /// Sync section `Ok(None)` skew arm: a registered peer whose
+    /// `last_pulled_at` is NULL yields peer_count ≥ 1 but no measurable
+    /// skew — the section must render `not_observed` at INFO rather
+    /// than N/A (the no-peers early return) or CRIT.
+    #[test]
+    fn sync_section_not_observed_when_peer_has_no_pull_timestamp() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(
+            "CREATE TABLE sync_state(last_seen_at TEXT, last_pulled_at TEXT);
              INSERT INTO sync_state(last_seen_at, last_pulled_at)
              VALUES ('2026-01-01T00:00:00Z', NULL);",
-            )
-            .expect("seed peer row");
-            let section = section_sync(&conn);
-            assert_eq!(section.severity, Severity::Info);
-            assert!(
-                section
-                    .facts
-                    .iter()
-                    .any(|(k, v)| k == "max_skew_secs" && v == "not_observed"),
-                "facts: {:?}",
-                section.facts
-            );
-            assert!(
-                section
-                    .facts
-                    .iter()
-                    .any(|(k, v)| k == "peer_count" && v == "1"),
-                "facts: {:?}",
-                section.facts
-            );
-        }
+        )
+        .expect("seed peer row");
+        let section = section_sync(&conn);
+        assert_eq!(section.severity, Severity::Info);
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "max_skew_secs" && v == "not_observed"),
+            "facts: {:?}",
+            section.facts
+        );
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "peer_count" && v == "1"),
+            "facts: {:?}",
+            section.facts
+        );
     }
 }
