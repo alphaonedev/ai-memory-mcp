@@ -151,6 +151,15 @@ UNIT
   scp_to "$unit" "$pub" "$REMOTE_UNIT"
   ssh_node "$pub" "chmod 0644 '$REMOTE_UNIT'; systemctl daemon-reload; systemctl enable ai-memory.service >/dev/null 2>&1 || true; systemctl restart ai-memory.service"
 
+  # #1587 — AI_MEMORY_STORE_URL is written into the EnvironmentFile above (this
+  # step owns it). The curator unit (installed by 46_batman) depends on it but
+  # runs BEFORE this step, so 46 deferred its first start to avoid an
+  # empty-store-url crash-loop. Now that the env carries the URL, (re)start the
+  # curator here — but only on peers where the unit exists + the var is set, and
+  # `reset-failed` first so any historical backoff counter from a prior race
+  # doesn't keep the unit in failed state.
+  ssh_node "$pub" "if [ -f /etc/systemd/system/ai-memory-curator.service ] && grep -qE '^AI_MEMORY_STORE_URL=.+' '$REMOTE_ENVFILE' 2>/dev/null; then systemctl reset-failed ai-memory-curator.service 2>/dev/null || true; systemctl restart ai-memory-curator.service 2>/dev/null || true; fi"
+
   # --- health gate over the FULL TLS+mTLS path -------------------------------
   # Verify from the node itself: connect to 127.0.0.1 but SNI/verify against the
   # DNS:<host> SAN (15_tls.sh puts both IP:<pub> and DNS:<host> on the server

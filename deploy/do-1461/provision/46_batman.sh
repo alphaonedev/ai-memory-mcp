@@ -152,8 +152,9 @@ Nice=5
 [Install]
 WantedBy=multi-user.target
 UNIT
-  chmod 0644 '$unit'; systemctl daemon-reload; systemctl enable ai-memory-curator.service >/dev/null 2>&1 || true; systemctl restart ai-memory-curator.service 2>/dev/null || true" \
-    && log "[$host] curator daemon unit installed + started (interval=${BATMAN_CURATOR_INTERVAL_SECS}s, max-ops=$BATMAN_CURATOR_MAX_OPS)" \
+  chmod 0644 '$unit'; systemctl daemon-reload; systemctl enable ai-memory-curator.service >/dev/null 2>&1 || true; \
+  if grep -qE '^AI_MEMORY_STORE_URL=.+' '$REMOTE_ENVFILE' 2>/dev/null; then systemctl restart ai-memory-curator.service 2>/dev/null || true; fi" \
+    && log "[$host] curator daemon unit installed + enabled (interval=${BATMAN_CURATOR_INTERVAL_SECS}s, max-ops=$BATMAN_CURATOR_MAX_OPS; #1587: first start deferred to 50_federation when AI_MEMORY_STORE_URL not yet written)" \
     || log "[$host] WARN: curator unit install returned non-zero (50_federation brings the daemon up first; re-run is idempotent)"
 }
 
