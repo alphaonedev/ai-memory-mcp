@@ -253,6 +253,44 @@ fn finite_or_floor(score: f64) -> f64 {
     if score.is_finite() { score } else { f64::MIN }
 }
 
+/// #1597 — split a candidate pool into `(head, tail)` at
+/// [`RERANK_POOL_MAX`].
+///
+/// Pools at or under the cap come back whole (`tail` empty, input order
+/// preserved — the degenerate full-rerank case). Larger pools are
+/// sorted by the incoming blended score descending (total order via
+/// [`f64::total_cmp`] so a NaN-poisoned score cannot destabilise the
+/// sort; NaN sorts into the head, is cross-encoded, and then sinks via
+/// [`finite_or_floor`] exactly as pre-#1597) and split after the cap,
+/// so both halves come back internally sorted descending.
+fn split_rerank_pool(
+    mut candidates: Vec<(Memory, f64)>,
+) -> (Vec<(Memory, f64)>, Vec<(Memory, f64)>) {
+    let tail = if candidates.len() > RERANK_POOL_MAX {
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.split_off(RERANK_POOL_MAX)
+    } else {
+        Vec::new()
+    };
+    (candidates, tail)
+}
+
+/// #1597 — hard cap on how many candidates receive a cross-encoder
+/// score per rerank call.
+///
+/// The Phase-3 dogfood run measured autonomous-tier recall at
+/// 2823-7737 ms/call on CPU vs 14-32 ms at the semantic tier: the
+/// pre-#1597 [`CrossEncoder::rerank`] ran one full BERT forward pass
+/// per (query, candidate) pair, sequentially, over the entire
+/// post-blend candidate pool (up to 50 rows from the recall SQL cap).
+/// Only the strongest `RERANK_POOL_MAX` candidates by incoming blended
+/// score are cross-encoded (in ONE batched forward pass); the
+/// remainder keep their blended scores and sort below the reranked
+/// head. 20 keeps the cross-encoder's precision win where it matters
+/// (the head the caller actually reads) while bounding the worst-case
+/// forward-pass cost at ~40% of the pre-fix pool.
+pub const RERANK_POOL_MAX: usize = 20;
+
 const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
 /// Bare configured-model spelling for the default reranker — shared with
 /// the `ai-memory config migrate` template (#1558 batch 6).
@@ -621,7 +659,13 @@ impl CrossEncoder {
     ///
     /// **Blend formula:** `final = 0.6 * original + 0.4 * cross_encoder`
     ///
-    /// Results are returned sorted by `final_score` descending.
+    /// **#1597 pool cap:** only the strongest [`RERANK_POOL_MAX`]
+    /// candidates by incoming blended score are cross-encoded; the
+    /// remainder keep their blended scores and rank below the reranked
+    /// head (head sorted by `final_score` descending, tail sorted by
+    /// blended score descending — no candidate is dropped). A pool at
+    /// or under the cap is fully reranked and returned sorted by
+    /// `final_score` descending, as before.
     ///
     /// **v0.7.0 L2-8 contract:** the bare `rerank` is the *pre-L2-8*
     /// behavior — no reflection boost is applied. Daemons that want
@@ -633,19 +677,13 @@ impl CrossEncoder {
     /// recall test for `boost = 1.0` uses
     /// `rerank_with_reflection_boost(.., &ReflectionBoostConfig::disabled())`
     /// and asserts byte-identical output to `rerank(..)`.
-    pub fn rerank(&self, query: &str, mut candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
-        let mut scored: Vec<(Memory, f64)> = candidates
-            .drain(..)
-            .map(|(mem, original_score)| {
-                let ce_score = f64::from(self.score(query, &mem.title, &mem.content));
-                let final_score =
-                    ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * ce_score;
-                (mem, finite_or_floor(final_score))
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored
+    pub fn rerank(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        // #1597 — delegate so the pool cap + batched forward pass live in
+        // exactly one place. `ReflectionBoostConfig::disabled()` yields a
+        // multiplier of exactly 1.0 for every candidate, so the output is
+        // byte-identical to the historical boost-free blend (the L2-8
+        // regression pin below asserts this equivalence directly).
+        self.rerank_with_reflection_boost(query, candidates, &ReflectionBoostConfig::disabled())
     }
 
     /// v0.7.0 L2-8 — rerank with a post-step reflection-aware boost.
@@ -664,24 +702,92 @@ impl CrossEncoder {
     /// `boost` factor) so a mediocre reflection cannot leapfrog a
     /// well-matched observation — the boost is a thumb-on-the-scale,
     /// not a free pass.
+    /// **#1597 pool cap + batched forward pass.** Only the strongest
+    /// [`RERANK_POOL_MAX`] candidates by incoming blended score receive a
+    /// cross-encoder score (in one batched forward pass on the Neural
+    /// variant); the remainder keep their blended scores, internally
+    /// sorted descending, appended after the reranked head. No candidate
+    /// is ever dropped. A pool at or under the cap degenerates to the
+    /// historical full rerank.
     pub fn rerank_with_reflection_boost(
         &self,
         query: &str,
-        mut candidates: Vec<(Memory, f64)>,
+        candidates: Vec<(Memory, f64)>,
         boost_config: &ReflectionBoostConfig,
     ) -> Vec<(Memory, f64)> {
-        let mut scored: Vec<(Memory, f64)> = candidates
-            .drain(..)
-            .map(|(mem, original_score)| {
-                let ce_score = f64::from(self.score(query, &mem.title, &mem.content));
-                let blended = ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * ce_score;
+        let (head, tail) = split_rerank_pool(candidates);
+
+        let ce_scores = self.pair_scores(query, &head);
+        let mut scored: Vec<(Memory, f64)> = head
+            .into_iter()
+            .zip(ce_scores)
+            .map(|((mem, original_score), ce_score)| {
+                let blended =
+                    ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * f64::from(ce_score);
                 let factor = boost_config.factor_for(&mem);
                 (mem, finite_or_floor(blended * factor))
             })
             .collect();
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // #1597 — uncapped remainder: blended scores untouched, already
+        // sorted descending by `split_rerank_pool`, ranked below the
+        // cross-encoded head.
+        scored.extend(tail);
         scored
+    }
+
+    /// #1597 — cross-encoder scores for an (already capped) candidate
+    /// slice, one score per candidate in input order.
+    ///
+    /// Neural variant: ONE batched tokenize + forward pass via
+    /// [`Self::neural_score_pairs`] (the same machinery the G9
+    /// [`Self::rerank_batch`] path uses) instead of a sequential
+    /// per-pair forward — the second half of the #1597 fix. Falls back
+    /// to per-pair lexical scoring if the batched forward fails.
+    fn pair_scores(&self, query: &str, candidates: &[(Memory, f64)]) -> Vec<f32> {
+        let lexical_fallback = |candidates: &[(Memory, f64)]| -> Vec<f32> {
+            candidates
+                .iter()
+                .map(|(mem, _)| lexical_score(query, &mem.title, &mem.content))
+                .collect()
+        };
+        match self {
+            Self::Lexical { .. } => lexical_fallback(candidates),
+            Self::Neural {
+                model,
+                tokenizer,
+                classifier_weight,
+                classifier_bias,
+                device,
+            } => {
+                let pairs: Vec<(&str, String)> = candidates
+                    .iter()
+                    .map(|(mem, _)| {
+                        (
+                            query,
+                            crate::embeddings::embedding_document(&mem.title, &mem.content),
+                        )
+                    })
+                    .collect();
+                match Self::neural_score_pairs(
+                    model,
+                    tokenizer,
+                    classifier_weight,
+                    classifier_bias,
+                    device,
+                    pairs,
+                ) {
+                    Ok(scores) => scores,
+                    Err(e) => {
+                        tracing::warn!(
+                            "neural cross-encoder batch score failed: {e}, using lexical fallback"
+                        );
+                        lexical_fallback(candidates)
+                    }
+                }
+            }
+        }
     }
 
     /// v0.7 G9 — batched rerank for concurrent recall.
@@ -737,6 +843,19 @@ impl CrossEncoder {
                 classifier_bias,
                 device,
             } => {
+                // #1597 — apply the per-query pool cap BEFORE the batched
+                // forward pass so a coalesced flush pays for at most
+                // `RERANK_POOL_MAX` forwards per job; each tail is
+                // reattached below its reranked head afterwards.
+                let mut tails: Vec<Vec<(Memory, f64)>> = Vec::with_capacity(queries.len());
+                let queries: Vec<(String, Vec<(Memory, f64)>)> = queries
+                    .into_iter()
+                    .map(|(q, cands)| {
+                        let (head, tail) = split_rerank_pool(cands);
+                        tails.push(tail);
+                        (q, head)
+                    })
+                    .collect();
                 // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
                 // shared across threads; `BertModel::forward(&self, ...)`
                 // is inference-only and safe to call concurrently. The
@@ -758,7 +877,7 @@ impl CrossEncoder {
                         // queries.iter().flat_map(|(_, cs)| cs).
                         let mut out = Vec::with_capacity(queries.len());
                         let mut cursor = 0usize;
-                        for (_query, cands) in queries {
+                        for ((_query, cands), tail) in queries.into_iter().zip(tails) {
                             let n = cands.len();
                             let mut scored: Vec<(Memory, f64)> = cands
                                 .into_iter()
@@ -775,6 +894,9 @@ impl CrossEncoder {
                             scored.sort_by(|a, b| {
                                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                             });
+                            // #1597 — uncapped remainder ranks below the
+                            // cross-encoded head, blended scores untouched.
+                            scored.extend(tail);
                             out.push(scored);
                         }
                         out
@@ -785,12 +907,16 @@ impl CrossEncoder {
                         );
                         queries
                             .into_iter()
-                            .map(|(q, cands)| {
+                            .zip(tails)
+                            .map(|((q, cands), tail)| {
                                 // Runtime degrade (forward-pass failure) —
                                 // mark the variant degraded so the recall
                                 // response can surface `degraded_lexical`.
                                 let lex = Self::Lexical { degraded: true };
-                                lex.rerank_with_reflection_boost(&q, cands, boost_config)
+                                let mut scored =
+                                    lex.rerank_with_reflection_boost(&q, cands, boost_config);
+                                scored.extend(tail);
+                                scored
                             })
                             .collect()
                     }
@@ -818,6 +944,29 @@ impl CrossEncoder {
                 pairs.push((q.as_str(), document));
             }
         }
+        Self::neural_score_pairs(
+            model,
+            tokenizer,
+            classifier_weight,
+            classifier_bias,
+            device,
+            pairs,
+        )
+    }
+
+    /// One tokenize + one forward pass over a flat list of
+    /// (query, document) pairs — the shared batched-inference chokepoint
+    /// (#1597) used by BOTH the G9 multi-query [`Self::neural_rerank_batch`]
+    /// path and the per-call [`Self::pair_scores`] path. Returns one
+    /// sigmoided logit per pair, in input order.
+    fn neural_score_pairs(
+        model: &BertModel,
+        tokenizer: &Tokenizer,
+        classifier_weight: &Tensor,
+        classifier_bias: &Tensor,
+        device: &Device,
+        pairs: Vec<(&str, String)>,
+    ) -> Result<Vec<f32>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -2813,4 +2962,247 @@ fn bigram_score_with_single_token_query() {
     // Query with only one token — bigrams should be empty, no crash
     let s = lexical_score("query", "Single Token Title", "single token content");
     assert!((0.0..=1.0).contains(&s));
+}
+
+#[cfg(test)]
+mod issue_1597_tests {
+    //! #1597 — rerank pool cap + batched cross-encoder forward pass.
+    //!
+    //! The counting-mock route is unavailable: `MockCrossEncoder` is a
+    //! standalone test struct, not a pluggable `CrossEncoder` variant,
+    //! so call counts cannot be observed through the production enum.
+    //! Instead the cap is pinned via score mutation: with a query that
+    //! shares zero tokens with every candidate, the lexical
+    //! cross-encoder scores every scored pair `0.0`, so a cross-encoded
+    //! candidate's final score becomes EXACTLY `ORIGINAL_WEIGHT * orig`
+    //! while an uncapped candidate keeps `orig` bit-for-bit — making
+    //! "exactly RERANK_POOL_MAX candidates were cross-encoded"
+    //! observable from the output alone.
+
+    use super::*;
+    use crate::models::Memory;
+
+    /// Query with zero token overlap against [`pool_memory`] docs —
+    /// lexical cross-encoder score is exactly 0.0 for every pair.
+    const NO_OVERLAP_QUERY: &str = "zzz qqq www";
+
+    fn pool_memory(i: i32) -> Memory {
+        Memory {
+            id: format!("cand-{i}"),
+            title: format!("alpha {i}"),
+            content: format!("beta gamma {i}"),
+            ..Memory::default()
+        }
+    }
+
+    /// `n` candidates with distinct ascending original scores
+    /// `0.01 * (i + 1)`, supplied in ASCENDING order so the cap's
+    /// pre-sort is load-bearing (not a pass-through of input order).
+    fn pool(n: i32) -> Vec<(Memory, f64)> {
+        (0..n)
+            .map(|i| (pool_memory(i), f64::from(i + 1) * 0.01))
+            .collect()
+    }
+
+    fn orig_score(i: i32) -> f64 {
+        f64::from(i + 1) * 0.01
+    }
+
+    /// Pool of 50 → exactly [`RERANK_POOL_MAX`] candidates get
+    /// cross-encoder scores (their final scores move to
+    /// `ORIGINAL_WEIGHT * orig`); the other 30 keep their blended
+    /// scores bit-for-bit and sort below the reranked head. No
+    /// candidate is lost.
+    #[test]
+    fn rerank_pool_cap_honored_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let n = 50;
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(n));
+
+        assert_eq!(out.len(), 50, "no candidate may be lost");
+        let ids: std::collections::HashSet<&str> = out.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 50, "no duplicate / dropped ids");
+
+        // Head: the top RERANK_POOL_MAX by original score (i = 30..49,
+        // descending), each cross-encoded → ORIGINAL_WEIGHT * orig.
+        for (rank, (mem, score)) in out.iter().take(RERANK_POOL_MAX).enumerate() {
+            let i = 49 - i32::try_from(rank).expect("rank fits i32");
+            assert_eq!(mem.id, format!("cand-{i}"), "head rank {rank}");
+            assert!(
+                (score - ORIGINAL_WEIGHT * orig_score(i)).abs() < f64::EPSILON,
+                "head rank {rank} must carry the cross-encoded blend"
+            );
+        }
+
+        // Tail: the remaining 30 (i = 29..0, descending), blended
+        // scores untouched (bit-for-bit the input score).
+        for (off, (mem, score)) in out.iter().skip(RERANK_POOL_MAX).enumerate() {
+            let i = 29 - i32::try_from(off).expect("offset fits i32");
+            assert_eq!(mem.id, format!("cand-{i}"), "tail offset {off}");
+            assert_eq!(
+                *score,
+                orig_score(i),
+                "tail offset {off} must keep its blended score untouched"
+            );
+        }
+    }
+
+    /// Order correctness: reranked head internally sorted descending,
+    /// tail internally sorted descending, tail strictly after the head.
+    #[test]
+    fn rerank_pool_cap_order_correctness_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(50));
+        let head = &out[..RERANK_POOL_MAX];
+        let tail = &out[RERANK_POOL_MAX..];
+        assert!(
+            head.windows(2).all(|w| w[0].1 >= w[1].1),
+            "reranked head must be sorted descending"
+        );
+        assert!(
+            tail.windows(2).all(|w| w[0].1 >= w[1].1),
+            "uncapped tail must be sorted descending"
+        );
+        // Every tail member's ORIGINAL score is below every head
+        // member's original score (the cap kept the strongest pool).
+        let min_head_orig = orig_score(30);
+        assert!(
+            tail.iter().all(|(_, s)| *s < min_head_orig),
+            "tail must hold only candidates the cap excluded"
+        );
+    }
+
+    /// Pool exactly at the cap → full rerank (tail empty): every
+    /// candidate is cross-encoded.
+    #[test]
+    fn rerank_pool_at_cap_fully_cross_encoded_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let n = i32::try_from(RERANK_POOL_MAX).expect("cap fits i32");
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(n));
+        assert_eq!(out.len(), RERANK_POOL_MAX);
+        for (rank, (_, score)) in out.iter().enumerate() {
+            let i = n - 1 - i32::try_from(rank).expect("rank fits i32");
+            assert!(
+                (score - ORIGINAL_WEIGHT * orig_score(i)).abs() < f64::EPSILON,
+                "at-cap pool: rank {rank} must be cross-encoded"
+            );
+        }
+    }
+
+    /// Cap > pool size degenerates to the historical full rerank.
+    #[test]
+    fn rerank_cap_gt_pool_degenerates_to_full_rerank_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(5));
+        assert_eq!(out.len(), 5);
+        for (rank, (_, score)) in out.iter().enumerate() {
+            let i = 4 - i32::try_from(rank).expect("rank fits i32");
+            assert!(
+                (score - ORIGINAL_WEIGHT * orig_score(i)).abs() < f64::EPSILON,
+                "small pool: rank {rank} must be cross-encoded (no tail)"
+            );
+        }
+    }
+
+    /// The G9 multi-query batch path applies the cap per query job.
+    #[test]
+    fn rerank_batch_applies_pool_cap_per_query_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let jobs = vec![
+            (NO_OVERLAP_QUERY.to_string(), pool(50)),
+            (NO_OVERLAP_QUERY.to_string(), pool(50)),
+        ];
+        let outs = ce.rerank_batch(jobs);
+        assert_eq!(outs.len(), 2);
+        for out in &outs {
+            assert_eq!(out.len(), 50, "per-job candidate count preserved");
+            for (off, (_, score)) in out.iter().skip(RERANK_POOL_MAX).enumerate() {
+                let i = 29 - i32::try_from(off).expect("offset fits i32");
+                assert_eq!(
+                    *score,
+                    orig_score(i),
+                    "per-job tail must keep blended scores untouched"
+                );
+            }
+        }
+    }
+
+    /// The `BatchedReranker` production wrapper inherits the cap via
+    /// the direct encoder path (lexical traffic never reaches the
+    /// coalescing worker per #1579 B10).
+    #[test]
+    fn batched_reranker_inherits_pool_cap_1597() {
+        let br = BatchedReranker::with_reflection_boost(
+            CrossEncoder::Lexical { degraded: false },
+            ReflectionBoostConfig::disabled(),
+        );
+        let out = br.rerank(NO_OVERLAP_QUERY, pool(50));
+        assert_eq!(out.len(), 50);
+        for (off, (_, score)) in out.iter().skip(RERANK_POOL_MAX).enumerate() {
+            let i = 29 - i32::try_from(off).expect("offset fits i32");
+            assert_eq!(*score, orig_score(i), "wrapper tail untouched");
+        }
+    }
+
+    /// #1597 bench evidence — manual run against the REAL neural
+    /// cross-encoder (resolves from the local HF cache; downloads
+    /// ~80 MB on a cold host):
+    ///
+    /// ```bash
+    /// AI_MEMORY_NO_CONFIG=1 cargo test --release --lib \
+    ///     issue_1597_neural_rerank_timing_evidence -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints BEFORE (sequential per-pair forward over the full
+    /// 50-candidate pool — the pre-#1597 `rerank` shape) vs AFTER
+    /// (capped pool + one batched forward — the shipped path).
+    #[test]
+    #[ignore = "#1597 manual bench evidence: loads the real neural cross-encoder"]
+    fn issue_1597_neural_rerank_timing_evidence() {
+        let ce = CrossEncoder::new_neural();
+        assert!(
+            ce.is_neural(),
+            "neural encoder failed to load; timing evidence invalid"
+        );
+        let bench_pool: Vec<(Memory, f64)> = (0..50)
+            .map(|i| {
+                let m = Memory {
+                    id: format!("bench-{i}"),
+                    title: format!("benchmark candidate number {i} recall pipeline"),
+                    content: format!(
+                        "long-form benchmark document body number {i} with enough \
+                         material to exercise the cross-encoder, covering recall \
+                         pipeline reranking, cross encoder scoring, candidate \
+                         blending and ordering semantics for run {i}"
+                    ),
+                    ..Memory::default()
+                };
+                (m, f64::from(i) * 0.01)
+            })
+            .collect();
+        let query = "how does the recall pipeline rerank candidates";
+
+        // Warm-up (first forward pays one-time allocation cost).
+        let _ = ce.score(query, "warmup", "warmup body");
+
+        // BEFORE shape: one full forward per (query, candidate) pair,
+        // sequentially, over the entire 50-candidate pool.
+        let t0 = Instant::now();
+        for (m, _) in &bench_pool {
+            let _ = ce.score(query, &m.title, &m.content);
+        }
+        let before = t0.elapsed();
+
+        // AFTER: shipped path — cap at RERANK_POOL_MAX + single
+        // batched forward.
+        let t1 = Instant::now();
+        let out = ce.rerank(query, bench_pool.clone());
+        let after = t1.elapsed();
+
+        assert_eq!(out.len(), 50, "no candidate lost on the neural path");
+        eprintln!(
+            "#1597 timing (50-candidate pool, CPU): BEFORE sequential-full = {before:?}; \
+             AFTER capped+batched = {after:?}"
+        );
+    }
 }

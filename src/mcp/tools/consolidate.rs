@@ -242,7 +242,12 @@ impl McpTool for ConsolidateTool {
         "Consolidate multiple memories into one long-term summary."
     }
     fn docs() -> &'static str {
-        "Merge 2-100 sources into one long-tier memory; deletes sources, adds derived_from links. LLM auto-generates summary if omitted (smart/autonomous tier)."
+        // #1599 — provenance is metadata-only by design: sources are
+        // deleted, so MemoryLink rows would dangle (ON DELETE CASCADE
+        // would reap them immediately). Do NOT claim link rows here.
+        "Merge 2-100 sources into one long-tier memory; deletes sources; provenance recorded in \
+         metadata.derived_from + metadata.consolidated_from_agents (NOT KG-traversable link rows). \
+         LLM auto-generates summary if omitted (smart/autonomous tier)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ConsolidateRequest>()
@@ -631,5 +636,76 @@ mod tests {
         )
         .expect("ok");
         assert!(resp.get("warning").is_none());
+    }
+
+    // #1599 — the honest provenance contract the docstring now documents:
+    // consolidate records provenance ONLY in metadata
+    // (`metadata.derived_from` carries every source id;
+    // `metadata.consolidated_from_agents` carries the source authors) and
+    // creates ZERO MemoryLink rows — the sources are deleted, so link rows
+    // would dangle (ON DELETE CASCADE would reap them immediately).
+    // `memory_get_links` on the result must therefore return 0 rows.
+    #[test]
+    fn provenance_is_metadata_only_zero_link_rows_1599() {
+        let (conn, tmp) = fresh_db();
+        let a = seed_observation(&conn, "cn-prov", "a");
+        let b = seed_observation(&conn, "cn-prov", "b");
+        let c = seed_observation(&conn, "cn-prov", "c");
+        let resp = handle_consolidate(
+            &conn,
+            tmp.path(),
+            &json!({
+                "ids": [a, b, c],
+                "title": "provenance-contract",
+                "summary": "merged",
+                "namespace": "cn-prov",
+            }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        let new_id = resp["id"].as_str().expect("new id");
+
+        // metadata.derived_from carries ALL source ids.
+        let mem = db::get(&conn, new_id).expect("get").expect("row exists");
+        let derived_key = crate::models::MemoryLinkRelation::DerivedFrom.as_str();
+        let derived: Vec<&str> = mem.metadata[derived_key]
+            .as_array()
+            .expect("metadata.derived_from must be an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(derived.len(), 3, "derived_from must carry every source");
+        for src in [&a, &b, &c] {
+            assert!(
+                derived.contains(&src.as_str()),
+                "derived_from missing source {src}"
+            );
+        }
+        // metadata.consolidated_from_agents preserves the source authors.
+        let agents = mem.metadata["consolidated_from_agents"]
+            .as_array()
+            .expect("metadata.consolidated_from_agents must be an array");
+        assert!(
+            agents.iter().any(|v| v.as_str() == Some("ai:test")),
+            "source author must be preserved, got: {agents:?}"
+        );
+
+        // memory_get_links returns 0 rows — provenance is NOT
+        // KG-traversable (the docstring's exact claim).
+        let links_resp = super::super::link::handle_get_links(&conn, &json!({"id": new_id}), None)
+            .expect("get_links ok");
+        assert_eq!(
+            links_resp["count"].as_u64(),
+            Some(0),
+            "consolidate must not mint MemoryLink rows, got: {links_resp}"
+        );
+        assert_eq!(
+            links_resp["links"].as_array().map(Vec::len),
+            Some(0),
+            "links array must be empty"
+        );
     }
 }

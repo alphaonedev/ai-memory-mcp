@@ -383,7 +383,7 @@
     },
     {
       "description": "Load top-k recent + high-priority memories from a Family.",
-      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 \u2014 `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
+      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 \u2014 `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc).",
       "inputSchema": {
         "properties": {
           "family": {
@@ -421,7 +421,7 @@
     },
     {
       "description": "Intent-routed loader: free-text intent picks the best Family.",
-      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 \u2014 `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc).",
+      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 \u2014 `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc).",
       "inputSchema": {
         "properties": {
           "intent": {
@@ -771,7 +771,7 @@
     },
     {
       "description": "Bulk delete memories matching a pattern, namespace, or tier (archives first).",
-      "docs": "Bulk delete by pattern/namespace/tier. Archives first (recover via memory_archive_restore). dry_run previews.",
+      "docs": "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every whitespace-separated token must match (#1601). Archives first (recover via memory_archive_restore). dry_run previews the matched rows (id/title/namespace/tier, capped + truncated flag); live runs return deleted_ids (same cap).",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1201,7 +1201,7 @@
     },
     {
       "description": "Consolidate multiple memories into one long-term summary.",
-      "docs": "Merge 2-100 sources into one long-tier memory; deletes sources, adds derived_from links. LLM auto-generates summary if omitted (smart/autonomous tier).",
+      "docs": "Merge 2-100 sources into one long-tier memory; deletes sources; provenance recorded in metadata.derived_from + metadata.consolidated_from_agents (NOT KG-traversable link rows). LLM auto-generates summary if omitted (smart/autonomous tier).",
       "inputSchema": {
         "properties": {
           "agent_id": {

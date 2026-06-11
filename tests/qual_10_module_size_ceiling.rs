@@ -134,7 +134,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // file at 17_329. Growth justified: the vector-space migration
     // primitives live beside the embedding storage they mutate.
     // 17_400 = 17_329 + 71 headroom.
-    ("src/storage/mod.rs", 17_400),
+    //
+    // 2026-06-11 (Phase-3 dogfood fix train, FIX-A) — bumped 17_400 →
+    // 17_500: the #1596 extension-floor doc blocks on the touch /
+    // touch_many SQL, the #1601 `forget_fts_query` AND builder (the
+    // shared chokepoint for all three destructive forget sites), and
+    // the #1602 `ForgetMatch` + `forget_matches` preview helper landed
+    // the file at 17_432 (measured). Growth justified: two correctness
+    // fixes on existing destructive/lifecycle paths plus the sighted
+    // dry-run primitive their MCP surface needs; regression tests live
+    // in tests/issue_{1596,1601,1602}_*.rs, not in-file, to keep the
+    // module growth minimal. 17_500 = 17_432 + 68 headroom; far under
+    // the 1.5x cap.
+    ("src/storage/mod.rs", 17_500),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -287,7 +299,20 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // justified: the resolver pattern requires its fields, ladder,
     // and tests to live with the section they resolve.
     // 9_800 = 9_724 + 76 headroom.
-    ("src/config.rs", 9_800),
+    //
+    // 2026-06-11 (#1590 dead default_namespace) — bumped 9_800 →
+    // 10_050: the process-wide configured-default-namespace seed
+    // (`set_configured_default_namespace` /
+    // `configured_default_namespace` + the test gate), the per-field
+    // `default_namespace_source` provenance on `ResolvedStorage`
+    // (`explicit_default_namespace()`), and the two mandated #1590
+    // regression pins landed the file at 9_974. Growth justified:
+    // the resolver must distinguish operator-explicit config from the
+    // compiled default so unconfigured deployments keep their
+    // historical write-path ladders, and the boot-seeded slot is the
+    // single choke point all three surfaces (MCP/HTTP/CLI) consult.
+    // 10_050 = 9_974 + 76 headroom.
+    ("src/config.rs", 10_050),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
