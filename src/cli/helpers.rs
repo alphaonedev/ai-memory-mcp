@@ -36,6 +36,23 @@ pub fn id_short(id: &str) -> &str {
     &id[..end]
 }
 
+/// #1590 — the full CLI namespace ladder:
+/// 1. Explicit `--namespace` flag (caller passes it as `explicit`)
+/// 2. Operator-configured `[storage].default_namespace` (seeded
+///    process-wide at boot by `daemon_runtime::run` ONLY when the
+///    config explicitly sets it — see
+///    [`crate::config::configured_default_namespace`])
+/// 3. [`auto_namespace`] inference: git remote → cwd basename → "global"
+///
+/// Pre-#1590 the configured `default_namespace` was resolved but
+/// consumed by NO CLI path; every command fell straight through to
+/// the git/cwd inference.
+pub fn resolve_namespace(explicit: Option<String>) -> String {
+    explicit
+        .or_else(crate::config::configured_default_namespace)
+        .unwrap_or_else(auto_namespace)
+}
+
 /// Best-effort namespace resolver:
 /// 1. `git remote get-url origin` — repo name (strip trailing `.git`)
 /// 2. `current_dir`'s file_name component
@@ -176,6 +193,41 @@ mod tests {
         let out = human_age(&future);
         // Just need to not panic and return non-empty.
         assert!(!out.is_empty());
+    }
+
+    // ---- resolve_namespace (#1590) -------------------------------------
+
+    /// #1590 regression — the CLI ladder: explicit `--namespace` flag >
+    /// operator-configured `[storage].default_namespace` > git/cwd
+    /// inference. With a configured default seeded, inference (git
+    /// remote / cwd basename) must NOT win; with an explicit flag, the
+    /// flag must beat the configured default.
+    #[test]
+    fn issue_1590_cli_namespace_ladder_config_beats_inference_flag_beats_config() {
+        let _gate = crate::config::lock_configured_default_namespace_for_test();
+
+        // Configured layer beats git/cwd inference (this worktree HAS a
+        // git origin, so auto_namespace() would yield the repo name).
+        crate::config::set_configured_default_namespace(Some("alphaone".to_string()));
+        assert_eq!(
+            resolve_namespace(None),
+            "alphaone",
+            "#1590: configured default_namespace must beat git inference"
+        );
+
+        // Explicit flag beats the configured layer.
+        assert_eq!(
+            resolve_namespace(Some("flag-ns".to_string())),
+            "flag-ns",
+            "#1590: explicit --namespace must beat the configured default"
+        );
+
+        // Unconfigured: falls through to the historical inference
+        // ladder (non-empty, environment-dependent).
+        crate::config::set_configured_default_namespace(None);
+        let inferred = resolve_namespace(None);
+        assert!(!inferred.is_empty(), "inference ladder stays total");
+        assert_ne!(inferred, "alphaone", "cleared config must not leak");
     }
 
     // ---- auto_namespace ----------------------------------------------

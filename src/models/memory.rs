@@ -259,6 +259,17 @@ pub enum ConfidenceSource {
     /// derived-row enumeration and violating the audit-honesty
     /// invariant.
     CuratorDerived,
+    /// v0.7.x issue #1591 — the caller OMITTED `confidence` and the
+    /// store surface stamped the compiled [`DEFAULT_CONFIDENCE`]
+    /// fallback. Pre-#1591 these rows mis-labelled
+    /// `confidence_source = 'caller_provided'` — a false provenance
+    /// claim that made an unexamined 1.0 indistinguishable from a
+    /// caller's deliberate full-confidence assertion. The Form-5
+    /// calibration / decay engines treat this bucket exactly like
+    /// `caller_provided` (the value is not engine-derived), but
+    /// auditors and recall ranking can now discount the compiled
+    /// fallback honestly.
+    Default,
 }
 
 impl ConfidenceSource {
@@ -272,6 +283,7 @@ impl ConfidenceSource {
             Self::Calibrated => "calibrated",
             Self::Decayed => "decayed",
             Self::CuratorDerived => "curator_derived",
+            Self::Default => "default",
         }
     }
 
@@ -287,6 +299,7 @@ impl ConfidenceSource {
             "calibrated" => Some(Self::Calibrated),
             "decayed" => Some(Self::Decayed),
             "curator_derived" => Some(Self::CuratorDerived),
+            "default" => Some(Self::Default),
             _ => None,
         }
     }
@@ -650,9 +663,23 @@ pub enum EditSource {
     /// Append-and-archive: same shape as [`EditSource::Llm`] but
     /// records that a substrate hook triggered the rewrite.
     Hook,
+    /// v0.7.x issue #1600 — direct in-place mutation performed by an
+    /// AI/NHI agent. Mutation semantics are IDENTICAL to
+    /// [`EditSource::Human`] (does NOT route through
+    /// append-and-archive); the variant exists so the audit trail can
+    /// distinguish a human-typed correction from an agent-initiated
+    /// in-place edit. When `edit_source` is omitted on `memory_update`
+    /// the default is derived from the resolved caller id via
+    /// [`EditSource::default_for_agent_id`].
+    Agent,
 }
 
 impl EditSource {
+    /// #1600 — the closed wire vocabulary, in declaration order. The
+    /// `memory_update` validation error names the valid set from this
+    /// const so the message can never drift from the parser below.
+    pub const ALL: [Self; 4] = [Self::Human, Self::Llm, Self::Hook, Self::Agent];
+
     /// Column-wire string used in audit log entries + the archive
     /// row's `archive_reason`-adjacent metadata.
     #[must_use]
@@ -661,18 +688,37 @@ impl EditSource {
             Self::Human => "human",
             Self::Llm => "llm",
             Self::Hook => "hook",
+            Self::Agent => "agent",
         }
     }
 
     /// Parse the column-wire string. Returns `None` on unrecognised
-    /// values so callers can fall back to [`EditSource::Human`].
+    /// values; per #1600 the MCP `memory_update` surface now surfaces
+    /// `None` as a validation ERROR naming [`EditSource::ALL`] instead
+    /// of silently defaulting to [`EditSource::Human`].
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "human" => Some(Self::Human),
             "llm" => Some(Self::Llm),
             "hook" => Some(Self::Hook),
+            "agent" => Some(Self::Agent),
             _ => None,
+        }
+    }
+
+    /// #1600 — default edit-source for an UPDATE whose caller omitted
+    /// `edit_source`, derived from the resolved caller agent id: ids
+    /// under [`crate::identity::sentinels::AI_AGENT_ID_PREFIX`]
+    /// (`ai:…`) default to [`EditSource::Agent`]; every other shape
+    /// (`host:…`, `anonymous:…`, bare operator ids) keeps the
+    /// historical [`EditSource::Human`] default.
+    #[must_use]
+    pub fn default_for_agent_id(agent_id: &str) -> Self {
+        if agent_id.starts_with(crate::identity::sentinels::AI_AGENT_ID_PREFIX) {
+            Self::Agent
+        } else {
+            Self::Human
         }
     }
 
@@ -843,7 +889,7 @@ impl Default for Memory {
             content: String::new(),
             tags: Vec::new(),
             priority: 5,
-            confidence: 1.0,
+            confidence: DEFAULT_CONFIDENCE,
             source: "api".to_string(),
             access_count: 0,
             created_at: String::new(),
@@ -878,8 +924,13 @@ pub struct CreateMemory {
     pub tags: Vec<String>,
     #[serde(default = "default_priority")]
     pub priority: i32,
-    #[serde(default = "default_confidence")]
-    pub confidence: f64,
+    /// Confidence 0.0–1.0. `None` (caller omitted the field) resolves
+    /// to [`DEFAULT_CONFIDENCE`] with truthful
+    /// `confidence_source = "default"` provenance (#1591) via
+    /// [`CreateMemory::resolved_confidence`] /
+    /// [`CreateMemory::resolved_confidence_source`].
+    #[serde(default)]
+    pub confidence: Option<f64>,
     #[serde(default = "default_source")]
     pub source: String,
     #[serde(default)]
@@ -978,17 +1029,49 @@ pub struct CreateMemory {
     pub created_at: Option<String>,
 }
 
+/// Compiled default `confidence` stamped when a store surface (MCP
+/// `memory_store`, HTTP `POST /api/v1/memories`, CLI `ai-memory store`)
+/// receives no explicit caller value. #1591 — rows minted from this
+/// fallback carry `confidence_source = `[`ConfidenceSource::Default`]
+/// instead of falsely claiming `caller_provided`.
+pub const DEFAULT_CONFIDENCE: f64 = 1.0;
+
+impl CreateMemory {
+    /// #1591 — effective confidence for this request: the caller's
+    /// explicit value, else the compiled [`DEFAULT_CONFIDENCE`].
+    #[must_use]
+    pub fn resolved_confidence(&self) -> f64 {
+        self.confidence.unwrap_or(DEFAULT_CONFIDENCE)
+    }
+
+    /// #1591 — truthful confidence provenance for this request:
+    /// [`ConfidenceSource::CallerProvided`] only when the caller
+    /// actually sent a `confidence` value;
+    /// [`ConfidenceSource::Default`] when the compiled fallback was
+    /// stamped.
+    #[must_use]
+    pub fn resolved_confidence_source(&self) -> ConfidenceSource {
+        if self.confidence.is_some() {
+            ConfidenceSource::CallerProvided
+        } else {
+            ConfidenceSource::Default
+        }
+    }
+}
+
 fn default_tier() -> Tier {
     Tier::Mid
 }
 fn default_namespace() -> String {
-    crate::DEFAULT_NAMESPACE.to_string()
+    // #1590 — honour the operator-configured `[storage].default_namespace`
+    // (seeded process-wide at boot from `AppConfig::resolve_storage`) on
+    // the HTTP store surface; unconfigured deployments keep the
+    // historical compiled default.
+    crate::config::configured_default_namespace()
+        .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
 }
 fn default_priority() -> i32 {
     5
-}
-fn default_confidence() -> f64 {
-    1.0
 }
 fn default_source() -> String {
     "api".to_string()
@@ -1667,9 +1750,32 @@ mod tests {
 
     #[test]
     fn create_memory_defaults_namespace_to_global() {
-        // Lines 178-180.
+        // #1590 — the serde default now consults the process-wide
+        // operator-configured default namespace; hold the test gate so
+        // a concurrently-running #1590 seeding test can't bleed into
+        // this unconfigured-deployment assertion.
+        let _gate = crate::config::lock_configured_default_namespace_for_test();
+        crate::config::set_configured_default_namespace(None);
         let cm: CreateMemory = serde_json::from_value(cm_minimal()).unwrap();
         assert_eq!(cm.namespace, "global");
+    }
+
+    /// #1590 regression — with an operator-configured
+    /// `[storage].default_namespace` seeded at boot, an HTTP
+    /// `CreateMemory` body that omits `namespace` lands in the
+    /// configured namespace instead of the compiled `"global"`.
+    /// An explicit body `namespace` still wins.
+    #[test]
+    fn create_memory_namespace_default_honours_configured_1590() {
+        let _gate = crate::config::lock_configured_default_namespace_for_test();
+        crate::config::set_configured_default_namespace(Some("alphaone".to_string()));
+        let cm: CreateMemory = serde_json::from_value(cm_minimal()).unwrap();
+        assert_eq!(cm.namespace, "alphaone", "#1590: configured default wins");
+        let mut v = cm_minimal();
+        v["namespace"] = serde_json::json!("explicit-ns");
+        let cm: CreateMemory = serde_json::from_value(v).unwrap();
+        assert_eq!(cm.namespace, "explicit-ns", "explicit body value wins");
+        crate::config::set_configured_default_namespace(None);
     }
 
     #[test]
@@ -1681,9 +1787,33 @@ mod tests {
 
     #[test]
     fn create_memory_defaults_confidence_to_one() {
-        // Lines 184-186.
+        // #1591 — the field is now `Option<f64>` so omission is
+        // observable; the RESOLVED value still defaults to the
+        // compiled DEFAULT_CONFIDENCE (1.0) with truthful
+        // `confidence_source = "default"` provenance.
         let cm: CreateMemory = serde_json::from_value(cm_minimal()).unwrap();
-        assert!((cm.confidence - 1.0).abs() < f64::EPSILON);
+        assert_eq!(cm.confidence, None, "omitted confidence must be None");
+        assert!((cm.resolved_confidence() - DEFAULT_CONFIDENCE).abs() < f64::EPSILON);
+        assert_eq!(
+            cm.resolved_confidence_source(),
+            ConfidenceSource::Default,
+            "#1591: omitted confidence must stamp source=default"
+        );
+    }
+
+    /// #1591 regression — an EXPLICIT caller `confidence` keeps the
+    /// historical `caller_provided` provenance.
+    #[test]
+    fn create_memory_explicit_confidence_is_caller_provided_1591() {
+        let mut v = cm_minimal();
+        v["confidence"] = serde_json::json!(0.8);
+        let cm: CreateMemory = serde_json::from_value(v).unwrap();
+        assert_eq!(cm.confidence, Some(0.8));
+        assert!((cm.resolved_confidence() - 0.8).abs() < f64::EPSILON);
+        assert_eq!(
+            cm.resolved_confidence_source(),
+            ConfidenceSource::CallerProvided
+        );
     }
 
     #[test]
@@ -1857,11 +1987,63 @@ mod tests {
             // `auto_derived` (which is the Form 5 engine's
             // signal-based derivation).
             ("curator_derived", ConfidenceSource::CuratorDerived),
+            // v0.7.x issue #1591 — caller omitted `confidence`; the
+            // compiled DEFAULT_CONFIDENCE fallback was stamped.
+            ("default", ConfidenceSource::Default),
         ] {
             assert_eq!(ConfidenceSource::from_str(s), Some(v));
             assert_eq!(v.as_str(), s);
             assert_eq!(format!("{v}"), s);
         }
+    }
+
+    /// #1600 regression — `EditSource` wire vocabulary round-trips
+    /// every variant (incl. the new `agent`), `ALL` covers the closed
+    /// set, and `agent` keeps Human's in-place mutation semantics
+    /// (does NOT route append-and-archive).
+    #[test]
+    fn edit_source_agent_variant_wire_and_semantics_1600() {
+        for v in EditSource::ALL {
+            assert_eq!(
+                EditSource::from_str(v.as_str()),
+                Some(v),
+                "EditSource wire string must round-trip"
+            );
+        }
+        assert_eq!(EditSource::from_str("agent"), Some(EditSource::Agent));
+        assert_eq!(EditSource::Agent.as_str(), "agent");
+        assert!(
+            !EditSource::Agent.appends_and_archives(),
+            "#1600: Agent mutates in place exactly like Human"
+        );
+        assert!(EditSource::Llm.appends_and_archives());
+        assert!(EditSource::Hook.appends_and_archives());
+        // serde wire compat: snake_case rename matches as_str.
+        assert_eq!(
+            serde_json::to_value(EditSource::Agent).unwrap(),
+            serde_json::Value::String("agent".to_string())
+        );
+        assert_eq!(EditSource::from_str("robot"), None, "unknown stays None");
+    }
+
+    /// #1600 regression — omitted `edit_source` derives from the
+    /// resolved caller id: `ai:`-prefixed NHI ids default to `Agent`,
+    /// every other shape keeps the historical `Human` default.
+    #[test]
+    fn edit_source_default_for_agent_id_matrix_1600() {
+        assert_eq!(
+            EditSource::default_for_agent_id("ai:claude-code@host:pid-1"),
+            EditSource::Agent
+        );
+        assert_eq!(
+            EditSource::default_for_agent_id("host:box:pid-2-abcd1234"),
+            EditSource::Human
+        );
+        assert_eq!(
+            EditSource::default_for_agent_id("anonymous:pid-3-ffff0000"),
+            EditSource::Human
+        );
+        assert_eq!(EditSource::default_for_agent_id("alice"), EditSource::Human);
     }
 
     #[test]

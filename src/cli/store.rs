@@ -6,7 +6,6 @@
 
 use crate::cli::CliOutput;
 use crate::cli::governance::{GovernanceOutcome, enforce as enforce_governance};
-use crate::cli::helpers::auto_namespace;
 use crate::models::ConfidenceSource;
 use crate::{config, db, identity, models, validate};
 use anyhow::Result;
@@ -37,9 +36,11 @@ pub struct StoreArgs {
     pub tags: String,
     #[arg(long, short, default_value_t = 5)]
     pub priority: i32,
-    /// Confidence 0.0-1.0
-    #[arg(long, default_value_t = 1.0)]
-    pub confidence: f64,
+    /// Confidence 0.0-1.0. When omitted (#1591) the compiled default is
+    /// stamped with truthful `confidence_source = "default"` provenance
+    /// instead of falsely claiming `caller_provided`.
+    #[arg(long)]
+    pub confidence: Option<f64>,
     /// Source: user, claude, hook, api
     #[arg(long, short = 'S', default_value = "cli")]
     pub source: String,
@@ -132,7 +133,11 @@ pub fn run(
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = Tier::from_str(&args.tier)
         .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
-    let namespace = args.namespace.unwrap_or_else(auto_namespace);
+    // #1590 — explicit --namespace > configured [storage].default_namespace
+    // > git remote > cwd basename > "global" (see `cli::helpers`).
+    let namespace = crate::cli::helpers::resolve_namespace(args.namespace);
+    // #1591 — keep caller-omission observable for truthful provenance.
+    let confidence = args.confidence.unwrap_or(models::DEFAULT_CONFIDENCE);
     let content = resolve_content(&args.content, read_stdin_to_string)?;
     let tags: Vec<String> = args
         .tags
@@ -148,7 +153,7 @@ pub fn run(
     validate::validate_source(&args.source)?;
     validate::validate_tags(&tags)?;
     validate::validate_priority(args.priority)?;
-    validate::validate_confidence(args.confidence)?;
+    validate::validate_confidence(confidence)?;
     validate::validate_expires_at(args.expires_at.as_deref())?;
     validate::validate_ttl_secs(args.ttl_secs)?;
 
@@ -225,7 +230,7 @@ pub fn run(
         content,
         tags,
         priority: args.priority.clamp(1, 10),
-        confidence: args.confidence.clamp(0.0, 1.0),
+        confidence: confidence.clamp(0.0, 1.0),
         source: args.source,
         access_count: 0,
         created_at: now.to_rfc3339(),
@@ -240,7 +245,13 @@ pub fn run(
         citations,
         source_uri,
         source_span,
-        confidence_source: ConfidenceSource::CallerProvided,
+        // #1591 — truthful provenance: only an explicit --confidence
+        // is `caller_provided`; the compiled fallback is `default`.
+        confidence_source: if args.confidence.is_some() {
+            ConfidenceSource::CallerProvided
+        } else {
+            ConfidenceSource::Default
+        },
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
@@ -361,7 +372,7 @@ mod tests {
             content: "test content".to_string(),
             tags: String::new(),
             priority: 5,
-            confidence: 1.0,
+            confidence: None,
             source: "cli".to_string(),
             expires_at: None,
             ttl_secs: None,

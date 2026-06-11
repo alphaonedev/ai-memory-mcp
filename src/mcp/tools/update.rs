@@ -61,7 +61,9 @@ pub struct UpdateRequest {
     #[serde(default)]
     pub expected_version: Option<i64>,
 
-    #[schemars(description = "#888 'human'=in-place; 'llm'/'hook'=archive+supersede.")]
+    #[schemars(
+        description = "#888/#1600 'human'/'agent'=in-place; 'llm'/'hook'=archive+supersede; omitted derives from caller id (ai:* => agent)."
+    )]
     #[serde(default)]
     pub edit_source: Option<String>,
 
@@ -158,15 +160,31 @@ pub(super) fn handle_update(
     // mutation with a typed VersionConflict envelope if the stored
     // row's `version` no longer matches.
     let expected_version = params["expected_version"].as_i64();
+    // #1600 — resolve the caller agent id ONCE, up front: it feeds
+    // both the omitted-`edit_source` default below and the K9 /
+    // governance write gate further down.
+    let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+        .map_err(|e| e.to_string())?;
     // v0.7.0 Provenance Gap 5 (#888) — typed `edit_source`
-    // discriminator. Default `Human` preserves the in-place v0.6.x
-    // mutation contract; `Llm` and `Hook` route through the
+    // discriminator. `Llm` and `Hook` route through the
     // append-and-archive path so the pre-edit content is preserved
-    // in `archived_memories` for rewind via `memory_archive_list`.
-    let edit_source = params["edit_source"]
-        .as_str()
-        .and_then(EditSource::from_str)
-        .unwrap_or_default();
+    // in `archived_memories` for rewind via `memory_archive_list`;
+    // `Human` and `Agent` (#1600) mutate in place.
+    //
+    // #1600 — (b) an UNKNOWN explicit value is now a validation ERROR
+    // naming the valid set (pre-fix it silently defaulted to Human,
+    // mis-attributing programmatic edits in the audit trail); (c) an
+    // OMITTED value derives its default from the resolved caller id
+    // (`ai:`-prefixed NHI callers → Agent, else Human).
+    let edit_source = match params[param_names::EDIT_SOURCE].as_str() {
+        Some(s) => EditSource::from_str(s).ok_or_else(|| {
+            format!(
+                "invalid edit_source '{s}' (expected {})",
+                EditSource::ALL.map(|v| v.as_str()).join("|")
+            )
+        })?,
+        None => EditSource::default_for_agent_id(&agent_id),
+    };
 
     if let Some(t) = title {
         validate::validate_title(t).map_err(|e| e.to_string())?;
@@ -225,8 +243,8 @@ pub(super) fn handle_update(
             .map_err(|e| e.to_string())?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
         let effective_namespace = namespace.unwrap_or(existing.namespace.as_str()).to_string();
-        let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+        // #1600 — `agent_id` was hoisted above (it also drives the
+        // omitted-`edit_source` default).
         let mem_owner = existing
             .metadata
             .get(param_names::AGENT_ID)
@@ -930,6 +948,112 @@ mod tests {
             "non-owner update must be gated; got: {err}"
         );
         crate::config::clear_permissions_mode_override_for_test();
+    }
+
+    /// v0.7.x issue #1600 regression — explicit `edit_source: "agent"`
+    /// is honoured: in-place mutation (NO append-and-archive — same id,
+    /// no superseded_id/new_id in the response) and the response echoes
+    /// `edit_source = "agent"`.
+    #[test]
+    fn issue_1600_explicit_agent_edit_source_mutates_in_place() {
+        let conn = fresh_conn();
+        let mem = make_mem("agent-inplace");
+        let id = db::insert(&conn, &mem).expect("ins");
+        let out = handle_update(
+            &conn,
+            &json!({
+                "id": &id,
+                "content": "agent-edited content body",
+                "edit_source": "agent",
+            }),
+            None,
+            None,
+            None,
+        )
+        .expect("agent edit ok");
+        assert_eq!(out["updated"].as_bool(), Some(true));
+        assert_eq!(out["edit_source"].as_str(), Some("agent"));
+        assert!(
+            out.get("superseded_id").is_none() && out.get("new_id").is_none(),
+            "#1600: agent edits must NOT route append-and-archive"
+        );
+        assert_eq!(out["memory"]["id"].as_str(), Some(id.as_str()));
+        assert_eq!(
+            out["memory"]["content"].as_str(),
+            Some("agent-edited content body")
+        );
+    }
+
+    /// v0.7.x issue #1600 regression — an UNKNOWN `edit_source` value
+    /// is a validation ERROR naming the valid set (pre-fix it silently
+    /// defaulted to Human and mutated in place).
+    #[test]
+    fn issue_1600_unknown_edit_source_errors_listing_valid_values() {
+        let conn = fresh_conn();
+        let mem = make_mem("robot-reject");
+        let id = db::insert(&conn, &mem).expect("ins");
+        let err = handle_update(
+            &conn,
+            &json!({"id": &id, "title": "should not land", "edit_source": "robot"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("invalid edit_source 'robot'"),
+            "must name the rejected value; got: {err}"
+        );
+        for valid in EditSource::ALL {
+            assert!(
+                err.contains(valid.as_str()),
+                "error must list '{}' in the valid set; got: {err}",
+                valid.as_str()
+            );
+        }
+        // The silently-defaulting pre-fix behaviour mutated the row.
+        let row = db::get(&conn, &id).expect("get").expect("row");
+        assert_eq!(row.title, "robot-reject", "row must be untouched");
+    }
+
+    /// v0.7.x issue #1600 regression — OMITTED `edit_source` derives
+    /// from the resolved caller agent id: an `ai:`-prefixed NHI caller
+    /// defaults to `agent` (in-place), every other shape keeps the
+    /// historical `human` default.
+    #[test]
+    fn issue_1600_omitted_edit_source_derives_from_caller_id() {
+        let conn = fresh_conn();
+        let mem = make_mem("derive-default");
+        let id = db::insert(&conn, &mem).expect("ins");
+        // ai:-prefixed caller → agent.
+        let out = handle_update(
+            &conn,
+            &json!({"id": &id, "priority": 7, "agent_id": "ai:grok-4@dogfood:pid-9"}),
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(
+            out["edit_source"].as_str(),
+            Some("agent"),
+            "#1600: omitted edit_source + ai:-prefixed caller must default to agent"
+        );
+        assert!(out.get("new_id").is_none(), "agent default stays in-place");
+        // Non-NHI caller shape → human (the historical default).
+        let out = handle_update(
+            &conn,
+            &json!({"id": &id, "priority": 8, "agent_id": "host:box-1"}),
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(
+            out["edit_source"].as_str(),
+            Some("human"),
+            "non-ai callers keep the historical human default"
+        );
     }
 
     #[test]

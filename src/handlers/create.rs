@@ -10,7 +10,6 @@
 
 #![allow(clippy::too_many_lines)]
 
-use crate::models::ConfidenceSource;
 use crate::models::field_names;
 use axum::{
     Json,
@@ -710,7 +709,9 @@ async fn create_memory_postgres(
         content: body.content.clone(),
         tags: final_tags,
         priority: body.priority,
-        confidence: body.confidence,
+        // #1591 — omitted confidence resolves to the compiled default
+        // with truthful `confidence_source = "default"` provenance.
+        confidence: body.resolved_confidence(),
         source: body.source.clone(),
         access_count: 0,
         created_at: now.to_rfc3339(),
@@ -746,7 +747,7 @@ async fn create_memory_postgres(
         citations: body.citations.clone(),
         source_uri: body.source_uri.clone(),
         source_span: body.source_span.clone(),
-        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_source: body.resolved_confidence_source(),
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
@@ -1139,7 +1140,8 @@ pub async fn create_memory(
         content: body.content.clone(),
         tags: merged_tags,
         priority: body.priority.clamp(1, 10),
-        confidence: body.confidence.clamp(0.0, 1.0),
+        // #1591 — see the postgres branch above.
+        confidence: body.resolved_confidence().clamp(0.0, 1.0),
         source: body.source.clone(),
         access_count: 0,
         created_at: now.to_rfc3339(),
@@ -1168,7 +1170,7 @@ pub async fn create_memory(
         citations: body.citations.clone(),
         source_uri: body.source_uri.clone(),
         source_span: body.source_span.clone(),
-        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_source: body.resolved_confidence_source(),
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
@@ -1354,7 +1356,7 @@ mod tests {
             content: "content body — long enough to satisfy validators".to_string(),
             tags: Vec::new(),
             priority: 5,
-            confidence: 0.8,
+            confidence: Some(0.8),
             source: "test".to_string(),
             expires_at: None,
             ttl_secs: None,

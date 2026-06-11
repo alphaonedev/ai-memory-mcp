@@ -37,7 +37,7 @@
 //! - `namespace`   — resolved namespace + how many memories matched
 
 use crate::cli::CliOutput;
-use crate::cli::helpers::{auto_namespace, human_age, id_short};
+use crate::cli::helpers::{human_age, id_short};
 use crate::config::AppConfig;
 use crate::models::field_names;
 use crate::{db, models, toon};
@@ -193,7 +193,9 @@ fn resolve_namespace(args: &BootArgs) -> String {
     if let Some(ref cwd) = args.cwd {
         let _ = std::env::set_current_dir(cwd);
     }
-    auto_namespace()
+    // #1590 — configured [storage].default_namespace beats the git/cwd
+    // inference; unconfigured deployments keep the historical ladder.
+    crate::cli::helpers::resolve_namespace(None)
 }
 
 /// Pull the boot set from the DB. Two-stage:

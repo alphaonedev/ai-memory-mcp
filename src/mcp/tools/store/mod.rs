@@ -620,11 +620,22 @@ pub(crate) fn handle_store(
             .get(param_names::AGENT_ID)
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // #1592 — echo the POST-WRITE row's tier/namespace, not the
+        // REQUESTED ones. The storage layer enforces tier monotonicity
+        // on the update (downgrades keep the existing max), so a
+        // `tier=short` upsert over a `long` row stays `long` — pre-fix
+        // the response reported "short" while the row stayed "long".
+        // Echo-read failures must not turn the already-committed write
+        // into an error; fall back to the request values.
+        let (echo_tier, echo_namespace) = db::get(conn, &dup.id).ok().flatten().map_or_else(
+            || (mem.tier.clone(), mem.namespace.clone()),
+            |post| (post.tier, post.namespace),
+        );
         return Ok(json!({
             "id": dup.id,
-            "tier": mem.tier,
+            "tier": echo_tier,
             "title": mem.title,
-            "namespace": mem.namespace,
+            "namespace": echo_namespace,
             "agent_id": echoed_agent_id,
             "duplicate": true,
             "action": "updated existing memory"
@@ -902,9 +913,19 @@ pub(crate) fn handle_store(
     }
 
     // #196: echo the resolved agent_id
+    //
+    // #1592 — `db::insert`'s ON CONFLICT (title, namespace) arm can
+    // upsert into an EXISTING row whose tier is monotonic (keeps max),
+    // so echo the post-write row's tier rather than the requested one.
+    // Fallback to the request values when the row is no longer
+    // readable (e.g. the synchronous atomise pass archived it above).
+    let echo_tier = db::get(conn, &actual_id)
+        .ok()
+        .flatten()
+        .map_or_else(|| mem.tier.clone(), |post| post.tier);
     let mut response = json!({
         "id": actual_id,
-        "tier": mem.tier,
+        "tier": echo_tier,
         "title": mem.title,
         "namespace": mem.namespace,
         "agent_id": agent_id,

@@ -321,6 +321,55 @@ fn on_conflict_merge_dedup_branch() {
     assert_eq!(r2["duplicate"].as_bool(), Some(true));
 }
 
+/// v0.7.x issue #1592 regression — a downgrade-attempt upsert
+/// (`tier=short` over an existing `long` row, merge mode) must echo
+/// the POST-WRITE tier. Storage correctly enforces monotonicity
+/// (keeps max); pre-#1592 the response echoed the REQUESTED tier
+/// ("short") while the row stayed "long" — a wire-truthfulness lie.
+#[test]
+fn issue_1592_upsert_response_echoes_stored_tier_not_requested() {
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+
+    // Seed a LONG-tier row.
+    let mut first = base_params("tier-echo-1592");
+    first["tier"] = json!(Tier::Long.as_str());
+    first["on_conflict"] = json!("merge");
+    let r1 = handle_store(
+        &conn, &db_path, &first, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("seed long row");
+    assert_eq!(r1["tier"].as_str(), Some(Tier::Long.as_str()));
+
+    // Downgrade-attempt upsert: request SHORT over the LONG row.
+    let mut second = base_params("tier-echo-1592");
+    second["tier"] = json!(Tier::Short.as_str());
+    second["on_conflict"] = json!("merge");
+    let r2 = handle_store(
+        &conn, &db_path, &second, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("downgrade-attempt upsert");
+    assert_eq!(r2["duplicate"].as_bool(), Some(true));
+    assert_eq!(r2["action"].as_str(), Some("updated existing memory"));
+
+    // The stored row kept its LONG tier (monotonicity)...
+    let row_id = r2["id"].as_str().expect("id");
+    let stored = db::get(&conn, row_id).expect("get").expect("row exists");
+    assert_eq!(stored.tier, Tier::Long, "storage keeps max tier");
+    // ...and the response now reports the SAME (post-write) tier.
+    assert_eq!(
+        r2["tier"].as_str(),
+        Some(Tier::Long.as_str()),
+        "#1592: response.tier must equal the stored tier, not the requested one"
+    );
+    assert_eq!(
+        r2["namespace"].as_str(),
+        Some(stored.namespace.as_str()),
+        "namespace echo comes from the post-write row too"
+    );
+}
+
 // Merge dedup with embedder — content_changed triggers re-embed
 #[test]
 fn merge_dedup_reembeds_on_content_change() {

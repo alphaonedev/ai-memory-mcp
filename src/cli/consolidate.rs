@@ -5,7 +5,6 @@
 //! `cli::store` for the design pattern.
 
 use crate::cli::CliOutput;
-use crate::cli::helpers::auto_namespace;
 use crate::models::field_names;
 use crate::{db, identity, models, validate};
 use anyhow::Result;
@@ -55,7 +54,9 @@ pub fn run(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let namespace = args.namespace.unwrap_or_else(auto_namespace);
+    // #1590 — explicit --namespace > configured [storage].default_namespace
+    // > git remote > cwd basename > "global" (see `cli::helpers`).
+    let namespace = crate::cli::helpers::resolve_namespace(args.namespace);
     validate::validate_consolidate(&ids, &args.title, &args.summary, &namespace)?;
     let conn = db::open(db_path)?;
     let consolidator_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
@@ -527,8 +528,9 @@ mod tests {
 
     #[test]
     fn test_consolidate_default_namespace_when_none() {
-        // Drives `args.namespace.unwrap_or_else(auto_namespace)` —
-        // the namespace defaults to whatever `auto_namespace()` yields.
+        // Drives `helpers::resolve_namespace(args.namespace)` (#1590)
+        // — with no flag and no configured default the namespace
+        // bottoms out at whatever `auto_namespace()` yields.
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         // Auto-namespace lookup — accept whatever it returns; the

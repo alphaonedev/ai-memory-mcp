@@ -909,7 +909,12 @@ pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     validate_source(&mem.source)?;
     validate_tags(&mem.tags)?;
     validate_priority(mem.priority)?;
-    validate_confidence(mem.confidence)?;
+    // #1591 — `confidence` is optional on the wire (omission resolves
+    // to the compiled default with `confidence_source = "default"`);
+    // only an explicit value needs range validation.
+    if let Some(confidence) = mem.confidence {
+        validate_confidence(confidence)?;
+    }
     validate_expires_at(mem.expires_at.as_deref())?;
     validate_ttl_secs(mem.ttl_secs)?;
     validate_metadata(&mem.metadata)?;
@@ -2369,8 +2374,12 @@ mod tests {
     #[test]
     fn validate_create_propagates_confidence_error() {
         let mut m = cm_valid();
-        m.confidence = 1.5;
+        m.confidence = Some(1.5);
         assert!(validate_create(&m).is_err());
+        // #1591 — omission is valid (resolves to the compiled default
+        // with `confidence_source = "default"`).
+        m.confidence = None;
+        assert!(validate_create(&m).is_ok());
     }
 
     #[test]
@@ -2891,7 +2900,7 @@ mod tests {
     fn request_validator_validate_create_rejects_oob_confidence() {
         // Cross-field range gate: confidence=2.0 (out of 0..=1).
         let mut req = happy_create();
-        req.confidence = 2.0;
+        req.confidence = Some(2.0);
         let err = RequestValidator::validate_create(&req)
             .expect_err("oob confidence must fail validation");
         assert!(
