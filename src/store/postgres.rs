@@ -2665,6 +2665,65 @@ impl PostgresStore {
         patch: UpdatePatch,
         expected_version: Option<i64>,
     ) -> StoreResult<i64> {
+        // #1641 — bounded gate-CAS retry. The governance pre-write
+        // gate evaluates a pre-read snapshot; the UPDATE re-asserts
+        // the snapshot's version atomically (see the $11 bind). For
+        // last-write-wins callers (expected_version=None) a lost race
+        // re-reads + RE-GATES instead of erroring, preserving their
+        // semantics while guaranteeing the gate evaluated the row
+        // that was actually replaced. Explicit If-Match callers keep
+        // exactly-one-winner semantics (no retry).
+        const MAX_GATE_RETRIES: usize = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .update_with_expected_version_once(ctx, id, patch.clone(), expected_version)
+                .await?
+            {
+                Some(new_version) => return Ok(new_version),
+                None => {
+                    // 0 rows: row vanished or version drifted.
+                    let observed: Option<(i64,)> =
+                        sqlx::query_as("SELECT version FROM memories WHERE id = $1")
+                            .bind(id)
+                            .fetch_optional(&self.pool)
+                            .await
+                            .map_err(|e| to_store_err("re-read version on conflict", e))?;
+                    let Some((cur,)) = observed else {
+                        return Err(StoreError::NotFound { id: id.to_string() });
+                    };
+                    if let Some(exp) = expected_version {
+                        return Err(StoreError::IntegrityFailed {
+                            detail: format!(
+                                "VersionConflict: memory {id} expected_version={exp} but stored version={cur}"
+                            ),
+                        });
+                    }
+                    if attempt >= MAX_GATE_RETRIES {
+                        return Err(StoreError::IntegrityFailed {
+                            detail: format!(
+                                "VersionConflict: memory {id} mutated concurrently on every                                  gate-CAS attempt ({MAX_GATE_RETRIES}); last stored version={cur}"
+                            ),
+                        });
+                    }
+                    // loop: re-read + re-gate on the fresh row.
+                }
+            }
+        }
+    }
+
+    /// #1641 — single gate-CAS attempt. Returns `Ok(Some(new_version))`
+    /// on success, `Ok(None)` when the guarded UPDATE matched 0 rows
+    /// (version drifted / row vanished — the caller decides retry vs
+    /// typed conflict).
+    async fn update_with_expected_version_once(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        patch: UpdatePatch,
+        expected_version: Option<i64>,
+    ) -> StoreResult<Option<i64>> {
         // #1628 — caller-owns write gate, mirroring the trait `update`
         // (#1412). This method gained its first production caller (the
         // HTTP `PUT /memories/{id}` If-Match branch), so it must apply
@@ -2785,7 +2844,14 @@ impl PostgresStore {
         .bind(patch.confidence)
         .bind(patch.metadata)
         .bind(patch.source_uri)
-        .bind(expected_version)
+        // #1641 — $11 ALWAYS carries a version guard: the caller's
+        // expected_version when supplied, else the pre-read `current`.
+        // The governance gate above evaluated the pre-read row; an
+        // unguarded UPDATE could land on a row that mutated in the
+        // SELECT→UPDATE window (gate evaluated stale state). With
+        // #1632 every mutation bumps `version`, so version-CAS is a
+        // complete change detector for governance-relevant fields.
+        .bind(expected_version.unwrap_or(current))
         // #1628 — expires_at COALESCE slot ($12); see the SET-clause
         // comment above for the #1626 tier→long interplay.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
@@ -2795,25 +2861,11 @@ impl PostgresStore {
         .rows_affected();
 
         if rows_affected == 0 {
-            // Either the row vanished or the version drifted between
-            // SELECT and UPDATE. Re-read to populate the typed error.
-            let observed: Option<(i64,)> =
-                sqlx::query_as("SELECT version FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| to_store_err("re-read version on conflict", e))?;
-            if let Some((cur,)) = observed {
-                let exp = expected_version.unwrap_or(current);
-                return Err(StoreError::IntegrityFailed {
-                    detail: format!(
-                        "VersionConflict: memory {id} expected_version={exp} but stored version={cur}"
-                    ),
-                });
-            }
-            return Err(StoreError::NotFound { id: id.to_string() });
+            // #1641 — the caller (the retry wrapper) owns the
+            // drift-vs-vanished disposition.
+            return Ok(None);
         }
-        Ok(new_version)
+        Ok(Some(new_version))
     }
 
     /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive write
