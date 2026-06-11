@@ -126,7 +126,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // union, so the merged ceiling is pinned from the measured
     // post-merge file: actual LOC 16_943. 17_000 = 16_943 + 57
     // headroom; far under the 1.5x aspirational cap.
-    ("src/storage/mod.rs", 17_000),
+    //
+    // 2026-06-11 (#1598 API embeddings) — bumped 17_000 → 17_400: the
+    // reembed sweep helpers (`embedding_coverage`,
+    // `distinct_embedding_dims`, `get_memory_texts_batch`,
+    // `set_embeddings_batch_reembed`) + their unit pins landed the
+    // file at 17_329. Growth justified: the vector-space migration
+    // primitives live beside the embedding storage they mutate.
+    // 17_400 = 17_329 + 71 headroom.
+    ("src/storage/mod.rs", 17_400),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -139,7 +147,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // warm_boot + readiness stderr lines), and the backfill helper
     // routes through the canonical `embedding_document` template.
     // Merged actual LOC: 14_040. 14_100 = 14_040 + 60 headroom.
-    ("src/mcp/mod.rs", 14_100),
+    //
+    // 2026-06-11 (#1598 API embeddings) — bumped 14_100 → 14_450: the
+    // fail-closed `Embedder::from_resolved` boot wiring (#1593), the
+    // degraded-aware capabilities posture (#1594), and the
+    // chunk-fault → per-row backfill fallback (#1595) landed the file
+    // at 14_379. 14_450 = 14_379 + 71 headroom.
+    ("src/mcp/mod.rs", 14_450),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -264,7 +278,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // tests pushed the file to 9_091. Growth justified: one operator
     // knob on the established resolver pattern plus its mandated
     // precedence pins. 9_150 = 9_091 + 59 headroom.
-    ("src/config.rs", 9_150),
+    //
+    // 2026-06-11 (#1598 API embeddings) — bumped 9_150 → 9_800: the
+    // `[embeddings]` API surface (ENV_EMBED_* consts,
+    // `resolve_embed_api_key` ladder, `is_api_embed_backend`,
+    // inline-key rejection, redacting Debug, dim override) + the
+    // mandated precedence pins landed the file at 9_724. Growth
+    // justified: the resolver pattern requires its fields, ladder,
+    // and tests to live with the section they resolve.
+    // 9_800 = 9_724 + 76 headroom.
+    ("src/config.rs", 9_800),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

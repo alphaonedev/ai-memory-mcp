@@ -227,6 +227,11 @@ pub fn run(
     // Delegate to the embedder-injected helper so test code can reach
     // every branch downstream without owning a real candle Embedder.
     let embedder_ref: Option<&dyn Embed> = embedder.as_ref().map(|e| e as &dyn Embed);
+    // #1598 — model_description now returns an owned String (the
+    // remote variant reports its live model id + dim).
+    let embedder_model_description = embedder
+        .as_ref()
+        .map(crate::embeddings::Embedder::model_description);
     run_with_embedder(
         &mut conn,
         args,
@@ -234,9 +239,7 @@ pub fn run(
         app_config,
         feature_tier,
         embedder_ref,
-        embedder
-            .as_ref()
-            .map(crate::embeddings::Embedder::model_description),
+        embedder_model_description.as_deref(),
         out,
     )
 }

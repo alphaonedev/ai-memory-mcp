@@ -60,7 +60,11 @@ const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
 const SECTION_LLM_REACHABILITY: &str = "LLM Reachability (#1146)";
+const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
 const MSG_RAW_SQL_DB_MODE: &str = "raw SQL section — only available in --db mode";
+/// #1598 literal-dedup — shared probe-client failure fact prefix for
+/// the LLM + Embeddings reachability sections.
+const MSG_HTTP_CLIENT_BUILD_FAILED: &str = "http client build failed";
 
 /// #1558 batch 5 wave 3 — placeholder fact value rendered when the
 /// probed capabilities payload does not carry the requested feature
@@ -546,6 +550,7 @@ fn run_local(db_path: &Path) -> Report {
     sections.push(section_capabilities_local());
     sections.push(section_reflection_health(&conn));
     sections.push(section_llm_reachability_1146());
+    sections.push(section_embeddings_reachability_1598());
 
     Report {
         mode: "local".into(),
@@ -930,7 +935,7 @@ fn section_llm_reachability_1146() -> ReportSection {
 
     // Build the probe URL.
     let (probe_url, bearer) = if resolved.is_ollama_native() {
-        (format!("{}/api/tags", resolved.base_url), None)
+        (crate::llm::ollama_tags_url(&resolved.base_url), None)
     } else {
         (
             format!("{}/models", resolved.base_url),
@@ -947,7 +952,10 @@ fn section_llm_reachability_1146() -> ReportSection {
     {
         Ok(c) => c,
         Err(e) => {
-            facts.push(("error".into(), format!("http client build failed: {e}")));
+            facts.push((
+                "error".into(),
+                format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
+            ));
             return ReportSection {
                 name: SECTION_LLM_REACHABILITY.into(),
                 severity: Severity::Critical,
@@ -1028,6 +1036,222 @@ fn section_llm_reachability_1146() -> ReportSection {
 
     ReportSection {
         name: SECTION_LLM_REACHABILITY.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// #1598 — should the operator GPU-policy WARN fire? Pure predicate
+/// (unit-testable without probing the host): the warn applies when the
+/// resolved embedding backend is the local Ollama wire shape on a host
+/// with no compatible GPU — operator policy prefers API embeddings on
+/// CPU-only nodes.
+fn gpu_policy_warn_applicable(backend: &str, gpu_detected: bool) -> bool {
+    !crate::config::is_api_embed_backend(backend) && !gpu_detected
+}
+
+/// #1598 — best-effort NVIDIA GPU detection: `nvidia-smi -L` on PATH
+/// returning success. Any failure (binary missing, driver absent,
+/// non-zero exit) is treated as no-GPU. Deliberately simple — the
+/// GPU-policy WARN is advisory, not load-bearing.
+fn nvidia_gpu_detected() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// #1598 — Embeddings Reachability section. Mirrors
+/// [`section_llm_reachability_1146`] for the embedding endpoint:
+///
+/// Resolves the canonical embeddings configuration via
+/// [`crate::config::AppConfig::resolve_embeddings`] (the same ladder
+/// the MCP stdio init + daemon `build_embedder` consume per #1598)
+/// and fires a lightweight probe at the resolved URL:
+///
+/// - `ollama` backend → `GET <url>/api/tags` (no auth)
+/// - API backends → `POST <url>/embeddings` with a 1-char input +
+///   the resolved Bearer key
+///
+/// Severity mapping matches the LLM section: INFO on 2xx; WARN on
+/// 401/403/429/5xx (reachable but degraded/auth issue); CRIT on
+/// other 4xx / network / DNS errors. The section facts carry the
+/// resolver's full provenance (backend / model / base_url /
+/// config_source / key_source — NEVER the key itself).
+///
+/// Additionally emits the operator GPU-policy WARN
+/// ([`gpu_policy_warn_applicable`]) when the resolved backend is
+/// `ollama` on a host with no detectable NVIDIA GPU.
+fn section_embeddings_reachability_1598() -> ReportSection {
+    use crate::config::{AppConfig, ConfigSource, KeySource};
+
+    let app_config = AppConfig::load();
+    let resolved = app_config.resolve_embeddings();
+
+    let mut facts = vec![
+        ("backend".into(), resolved.backend.clone()),
+        ("model".into(), resolved.model.clone()),
+        ("base_url".into(), resolved.url.clone()),
+        ("config_source".into(), resolved.source.as_str().to_string()),
+        (
+            field_names::KEY_SOURCE.into(),
+            resolved.key_source.as_str().to_string(),
+        ),
+    ];
+
+    // If the key resolution surfaced an error during resolve (file
+    // perms / missing env / etc.), call it out — but still try the
+    // probe so the operator sees if the URL is at least reachable.
+    if let KeySource::Error(reason) = &resolved.key_source {
+        facts.push(("key_error".into(), reason.clone()));
+    }
+
+    // Compiled-default — operator has no embeddings configuration
+    // anywhere (a fresh install; the tier preset governs). Legitimate
+    // state, not a misconfiguration: emit INFO without probing so the
+    // "fresh-DB doctor report = all INFO" invariant holds (mirrors
+    // the LLM section's early return).
+    if matches!(resolved.source, ConfigSource::CompiledDefault) {
+        return ReportSection {
+            name: SECTION_EMBEDDINGS_REACHABILITY.into(),
+            severity: Severity::Info,
+            facts,
+            note: Some(
+                "no operator embeddings configuration found (env / [embeddings] \
+                 section / legacy flat fields all absent); the tier preset \
+                 governs the embedder. To wire an API embedding backend, set \
+                 AI_MEMORY_EMBED_BACKEND or write an [embeddings] section in \
+                 config.toml (#1598)."
+                    .into(),
+            ),
+        };
+    }
+
+    let is_api = crate::config::is_api_embed_backend(&resolved.backend);
+
+    let started = std::time::Instant::now();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push((
+                "error".into(),
+                format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
+            ));
+            return ReportSection {
+                name: SECTION_EMBEDDINGS_REACHABILITY.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("could not build HTTP client for probe".into()),
+            };
+        }
+    };
+
+    // Build the probe request: a no-auth model listing for the
+    // Ollama wire shape, a minimal 1-char embed for API backends.
+    let (probe_url, req) = if is_api {
+        let url = format!("{}/embeddings", resolved.url);
+        let mut req = client
+            .post(&url)
+            .json(&serde_json::json!({ "model": resolved.model, "input": "a" }));
+        if let Some(key) = resolved.api_key() {
+            req = req.bearer_auth(key);
+        }
+        (url, req)
+    } else {
+        let url = crate::llm::ollama_tags_url(&resolved.url);
+        let req = client.get(&url);
+        (url, req)
+    };
+    facts.push(("probe_url".into(), probe_url.clone()));
+
+    let (mut severity, mut note) = match req.send() {
+        Ok(resp) => {
+            let status = resp.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push(("http_status".into(), status.as_u16().to_string()));
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
+
+            if status.is_success() {
+                (Severity::Info, None)
+            } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "auth failed (status {}); URL is reachable but the \
+                         resolved embedding API key was rejected — check \
+                         [embeddings].api_key_env / api_key_file / process env",
+                        status.as_u16()
+                    )),
+                )
+            } else if status.as_u16() == 429 {
+                (
+                    Severity::Warning,
+                    Some("rate-limited (status 429); vendor reachable but throttling".into()),
+                )
+            } else if status.is_server_error() {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "vendor 5xx (status {}); reachable but currently degraded",
+                        status.as_u16()
+                    )),
+                )
+            } else {
+                (
+                    Severity::Critical,
+                    Some(format!(
+                        "unexpected status {} from {} — verify base_url + endpoint shape",
+                        status.as_u16(),
+                        probe_url
+                    )),
+                )
+            }
+        }
+        Err(e) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
+            facts.push(("error".into(), e.to_string()));
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
+            (
+                Severity::Critical,
+                Some(format!(
+                    "network/{kind} error contacting {probe_url} — verify \
+                     base_url and connectivity"
+                )),
+            )
+        }
+    };
+
+    // Operator GPU-policy WARN (#1598): local-Ollama embeddings on a
+    // CPU-only host — operator policy prefers API embeddings there.
+    if gpu_policy_warn_applicable(&resolved.backend, nvidia_gpu_detected()) {
+        severity = severity_max(severity, Severity::Warning);
+        let gpu_note = format!(
+            "embeddings backend '{}' on a host with no compatible GPU — \
+             operator policy prefers API embeddings on CPU-only nodes (#1598)",
+            resolved.backend
+        );
+        facts.push(("gpu_policy".into(), gpu_note.clone()));
+        note = Some(match note {
+            Some(existing) => format!("{existing}; {gpu_note}"),
+            None => gpu_note,
+        });
+    }
+
+    ReportSection {
+        name: SECTION_EMBEDDINGS_REACHABILITY.into(),
         severity,
         facts,
         note,
@@ -1551,13 +1775,14 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_nine_sections() {
+    fn local_run_on_empty_db_produces_ten_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
         // L1-4 added "Reflection Health"; #1146 added
-        // "LLM Reachability (#1146)" — total is now 9.
-        assert_eq!(report.sections.len(), 9);
+        // "LLM Reachability (#1146)"; #1598 added
+        // "Embeddings Reachability (#1598)" — total is now 10.
+        assert_eq!(report.sections.len(), 10);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1571,8 +1796,55 @@ mod tests {
                 "Capabilities",
                 "Reflection Health",
                 "LLM Reachability (#1146)",
+                "Embeddings Reachability (#1598)",
             ]
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #1598 — Embeddings Reachability section
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn gpu_policy_warn_applies_only_to_local_backend_without_gpu_1598() {
+        // ollama + no GPU → warn fires.
+        assert!(gpu_policy_warn_applicable(
+            crate::llm::BACKEND_OLLAMA,
+            false
+        ));
+        // ollama + GPU present → no warn.
+        assert!(!gpu_policy_warn_applicable(
+            crate::llm::BACKEND_OLLAMA,
+            true
+        ));
+        // API backends never trigger the warn, GPU or not.
+        assert!(!gpu_policy_warn_applicable("openrouter", false));
+        assert!(!gpu_policy_warn_applicable("openai-compatible", false));
+        assert!(!gpu_policy_warn_applicable("openrouter", true));
+    }
+
+    #[test]
+    fn embeddings_reachability_section_present_with_provenance_facts_1598() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        let emb = find(&report, SECTION_EMBEDDINGS_REACHABILITY);
+        // Provenance facts are always present, regardless of whether
+        // the probe ran (compiled-default short-circuits pre-probe).
+        for key in [
+            "backend",
+            "model",
+            "base_url",
+            "config_source",
+            "key_source",
+        ] {
+            assert!(
+                emb.facts.iter().any(|(k, _)| k == key),
+                "missing fact {key} in {:?}",
+                emb.facts
+            );
+        }
+        // The resolved key value itself must NEVER appear as a fact key.
+        assert!(emb.facts.iter().all(|(k, _)| k != "api_key"));
     }
 
     #[test]

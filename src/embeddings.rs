@@ -50,6 +50,11 @@ const FALLBACK_MODEL_SUBDIR: &str =
 
 /// Nomic model ID and Ollama tag
 pub(crate) const NOMIC_OLLAMA_MODEL: &str = "nomic-embed-text";
+/// #1598 — case-insensitive substring identifying the nomic-embed
+/// model family across its id spellings (`nomic-embed-text`,
+/// `nomic-embed-text:v1.5`, `nomic-ai/nomic-embed-text-v1.5`). Drives
+/// [`Embedder::model_requires_nomic_prefix`].
+const NOMIC_MODEL_FAMILY_NEEDLE: &str = "nomic-embed";
 /// HF model-artifact file names — shared with the reranker loader
 /// (#1558 batch 6).
 pub(crate) const HF_CONFIG_FILE: &str = "config.json";
@@ -173,6 +178,18 @@ impl std::fmt::Display for EmbedStatus {
 /// constant alongside the F10 HTTP threshold.
 pub const EMBED_MAX_BYTES: usize = 64 * 1024;
 
+/// #1595 — single source of the [`EMBED_MAX_BYTES`] oversize check +
+/// its human-readable skip reason. `Some(reason)` when `byte_len`
+/// exceeds the cap, `None` otherwise. Shared by
+/// [`Embedder::embed_with_status`] (store path) and the backfill /
+/// reembed sweeps so the client-side guard and its WARN text can never
+/// drift between the write-time and batch paths.
+#[must_use]
+pub fn oversize_embed_reason(byte_len: usize) -> Option<String> {
+    (byte_len > EMBED_MAX_BYTES)
+        .then(|| format!("content {byte_len} bytes exceeds embed cap {EMBED_MAX_BYTES} bytes"))
+}
+
 /// v0.7.0 L0.7 — minimal dyn-compatible trait that abstracts "produces
 /// embedding vectors" away from the concrete [`Embedder`] enum.
 ///
@@ -227,6 +244,15 @@ pub trait Embed: Send + Sync {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
+
+    /// #1598 / #1594 — true when the embedder's most recent remote
+    /// call failed (live-degraded posture). Default `false` (correct
+    /// for local / mock embedders); the production [`Embedder`]
+    /// overrides it for the remote variant so the capabilities surface
+    /// reports a dead endpoint truthfully.
+    fn is_degraded(&self) -> bool {
+        false
+    }
 }
 
 /// Semantic embedding engine supporting multiple backends.
@@ -250,10 +276,20 @@ pub enum Embedder {
         tokenizer: Arc<Tokenizer>,
         device: Device,
     },
-    /// Ollama-based embedding (nomic-embed-text-v1.5, 768-dim)
+    /// Remote embed client — Ollama-native OR OpenAI-compatible wire
+    /// shape (#1598). The historical variant name is preserved to
+    /// avoid call-site churn; the carried [`crate::llm::OllamaClient`]
+    /// routes `/api/embed` (Ollama) or `/embeddings` + Bearer
+    /// (OpenAI-compatible) per its provider. `dim` is the model's
+    /// vector dimensionality (768 for the historical nomic default);
+    /// `degraded` latches the outcome of the most recent embed call so
+    /// the capabilities surface can report a dead remote endpoint
+    /// truthfully (#1594).
     Ollama {
         client: Arc<crate::llm::OllamaClient>,
         model_name: String,
+        dim: usize,
+        degraded: Arc<std::sync::atomic::AtomicBool>,
     },
 }
 
@@ -350,9 +386,98 @@ impl Embedder {
     ///
     /// Requires the Ollama client to already be connected and the model pulled.
     pub fn new_ollama(client: Arc<crate::llm::OllamaClient>) -> Self {
+        Self::new_remote(client, NOMIC_OLLAMA_MODEL.to_string(), NOMIC_DIM)
+    }
+
+    /// #1598 — create a remote embedder for an arbitrary model + dim.
+    /// `client` may speak either wire shape: Ollama-native
+    /// (`OllamaClient::new_with_url`) or OpenAI-compatible
+    /// (`OllamaClient::new_openai_compatible` — OpenRouter, HF TEI,
+    /// vLLM, …). The `degraded` flag starts `false` and tracks the
+    /// most recent embed outcome.
+    #[must_use]
+    pub fn new_remote(
+        client: Arc<crate::llm::OllamaClient>,
+        model_name: String,
+        dim: usize,
+    ) -> Self {
         Self::Ollama {
             client,
-            model_name: NOMIC_OLLAMA_MODEL.to_string(),
+            model_name,
+            dim,
+            degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// #1598 — single shared boot entry for both wiring sites (MCP
+    /// stdio init + `daemon_runtime::build_embedder`). Consumes the
+    /// canonical [`crate::config::AppConfig::resolve_embeddings`]
+    /// output and the tier's embedding-model gate:
+    ///
+    /// - `tier_model = None` (keyword tier) → `Ok(None)`.
+    /// - API backend ([`crate::config::is_api_embed_backend`]) →
+    ///   OpenAI-compatible remote client against `resolved.url` with
+    ///   the resolved Bearer key. Keyless self-hosted endpoints
+    ///   (HF TEI / vLLM) are legitimate: a missing key sends an empty
+    ///   Bearer value, which such servers ignore. Requires a known
+    ///   dim (`[embeddings].dim` override or the known-dims table) —
+    ///   bails otherwise so mismatched vectors never land silently.
+    /// - Ollama backend → the historical [`Self::for_model`] path
+    ///   (MiniLM = local candle regardless; nomic = Ollama client at
+    ///   `resolved.url`). Client construction failure returns `Err` —
+    ///   callers fail closed to keyword recall (#1593), NEVER to the
+    ///   chat LLM client.
+    ///
+    /// # Errors
+    ///
+    /// Remote-client construction failure, an unknown vector dim for
+    /// an API-backend model, or local model-load failure.
+    pub fn from_resolved(
+        resolved: &crate::config::ResolvedEmbeddings,
+        tier_model: Option<crate::config::EmbeddingModel>,
+    ) -> Result<Option<Self>> {
+        let Some(tier_model) = tier_model else {
+            // Keyword tier — embeddings disabled by the tier preset.
+            return Ok(None);
+        };
+        if crate::config::is_api_embed_backend(&resolved.backend) {
+            let Some(dim) = resolved.embedding_dim else {
+                anyhow::bail!(
+                    "embedding model {:?} (backend {:?}) has no known vector dim — \
+                     pick a model from the known-dims table (override with the \
+                     {} env var) or set the `[embeddings].dim` escape hatch in \
+                     config.toml (#1598)",
+                    resolved.model,
+                    resolved.backend,
+                    crate::config::ENV_EMBED_MODEL,
+                );
+            };
+            // Keyless on-prem endpoints get an empty Bearer value (the
+            // server ignores the header); keyed vendors get the
+            // resolved secret.
+            let api_key = resolved.api_key().unwrap_or_default();
+            let client = crate::llm::OllamaClient::new_openai_compatible(
+                &resolved.url,
+                &resolved.model,
+                api_key,
+            )
+            .context("failed to build OpenAI-compatible embed client (#1598)")?;
+            return Ok(Some(Self::new_remote(
+                Arc::new(client),
+                resolved.model.clone(),
+                dim as usize,
+            )));
+        }
+        match tier_model {
+            crate::config::EmbeddingModel::MiniLmL6V2 => {
+                Self::for_model(tier_model, None).map(Some)
+            }
+            crate::config::EmbeddingModel::NomicEmbedV15 => {
+                let client =
+                    crate::llm::OllamaClient::new_with_url(&resolved.url, NOMIC_OLLAMA_MODEL)
+                        .context("failed to build Ollama embed client")?;
+                Self::for_model(tier_model, Some(Arc::new(client))).map(Some)
+            }
         }
     }
 
@@ -384,15 +509,35 @@ impl Embedder {
     pub fn dim(&self) -> usize {
         match self {
             Self::Local { .. } => MINILM_DIM,
-            Self::Ollama { .. } => NOMIC_DIM,
+            Self::Ollama { dim, .. } => *dim,
         }
     }
 
     /// Human-readable description of the active embedding model.
-    pub fn model_description(&self) -> &str {
+    /// #1598 — returns `String` (the remote variant reports its live
+    /// model + dim, which may be any operator-picked API model id,
+    /// not just the historical nomic default).
+    #[must_use]
+    pub fn model_description(&self) -> String {
         match self {
-            Self::Local { .. } => "all-MiniLM-L6-v2 (384-dim, local)",
-            Self::Ollama { .. } => "nomic-embed-text-v1.5 (768-dim, Ollama)",
+            Self::Local { .. } => "all-MiniLM-L6-v2 (384-dim, local)".to_string(),
+            Self::Ollama {
+                model_name, dim, ..
+            } => format!("{model_name} ({dim}-dim, remote)"),
+        }
+    }
+
+    /// #1598 / #1594 — true when the most recent remote embed call
+    /// failed (dead endpoint, auth rejection, …). The local candle
+    /// embedder never degrades at runtime (weights are mmap'd at
+    /// construction). Consumed by the capabilities surface so
+    /// `features.embedder_loaded` / `recall_mode_active` report the
+    /// LIVE posture rather than the boot-time one.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        match self {
+            Self::Local { .. } => false,
+            Self::Ollama { degraded, .. } => degraded.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -433,23 +578,40 @@ impl Embedder {
                 // role carries no prefix here.
                 Self::embed_local(model, tokenizer, device, text)
             }
-            Self::Ollama { client, model_name } => {
-                if Self::ollama_requires_nomic_prefix(model_name) {
+            Self::Ollama {
+                client,
+                model_name,
+                degraded,
+                ..
+            } => {
+                let result = if Self::model_requires_nomic_prefix(model_name) {
                     let prefixed = format!("{}{}", role.nomic_prefix(), text);
                     client.embed_text(&prefixed, model_name)
                 } else {
                     client.embed_text(text, model_name)
-                }
+                };
+                // #1598 — latch the live remote-endpoint posture for
+                // the capabilities surface (#1594): a failed embed
+                // marks the embedder degraded; the next success clears
+                // the flag.
+                degraded.store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
+                result
             }
         }
     }
 
-    /// Whether the configured Ollama embed model uses nomic-style
+    /// Whether the configured remote embed model uses nomic-style
     /// asymmetric task prefixes. Gated on the model id so a different
-    /// (symmetric) Ollama embed model is never corrupted by an injected
-    /// `search_document:` / `search_query:` prefix (#1520).
-    fn ollama_requires_nomic_prefix(model_name: &str) -> bool {
-        model_name.starts_with(NOMIC_OLLAMA_MODEL)
+    /// (symmetric) embed model is never corrupted by an injected
+    /// `search_document:` / `search_query:` prefix (#1520). #1598 —
+    /// case-insensitive CONTAINS match on
+    /// [`NOMIC_MODEL_FAMILY_NEEDLE`] so the HF-id spelling
+    /// (`nomic-ai/nomic-embed-text-v1.5`) used by API backends gates
+    /// the same as the Ollama tag forms.
+    fn model_requires_nomic_prefix(model_name: &str) -> bool {
+        model_name
+            .to_ascii_lowercase()
+            .contains(NOMIC_MODEL_FAMILY_NEEDLE)
     }
 
     /// v0.7.0 F6 — generate an embedding and report the outcome.
@@ -470,12 +632,7 @@ impl Embedder {
         if text.is_empty() {
             return (None, EmbedStatus::Skipped("empty content".to_string()));
         }
-        if text.len() > EMBED_MAX_BYTES {
-            let reason = format!(
-                "content {} bytes exceeds embed cap {} bytes",
-                text.len(),
-                EMBED_MAX_BYTES
-            );
+        if let Some(reason) = oversize_embed_reason(text.len()) {
             return (None, EmbedStatus::Skipped(reason));
         }
         match self.embed(text) {
@@ -844,6 +1001,10 @@ impl Embed for Embedder {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         Self::embed_batch(self, texts)
     }
+
+    fn is_degraded(&self) -> bool {
+        Self::is_degraded(self)
+    }
 }
 
 /// Constant for backward compatibility — dimension of the default (`MiniLM`) embedding.
@@ -1014,20 +1175,173 @@ mod tests {
 
     #[test]
     fn nomic_prefix_gating_is_model_scoped() {
-        // The prefix is applied only when the Ollama embed model is
-        // nomic; a different (symmetric) Ollama model must NOT be
-        // corrupted by an injected task prefix (#1520).
+        // The prefix is applied only when the remote embed model is
+        // nomic; a different (symmetric) model must NOT be corrupted
+        // by an injected task prefix (#1520).
         // The nomic model id (bare and tag-qualified) requires prefixing.
-        assert!(Embedder::ollama_requires_nomic_prefix(NOMIC_OLLAMA_MODEL));
-        assert!(Embedder::ollama_requires_nomic_prefix(&format!(
+        assert!(Embedder::model_requires_nomic_prefix(NOMIC_OLLAMA_MODEL));
+        assert!(Embedder::model_requires_nomic_prefix(&format!(
             "{NOMIC_OLLAMA_MODEL}:v1.5"
         )));
-        // Representative non-nomic (symmetric) Ollama embed models must
-        // NOT be prefixed, or their cosine geometry would be corrupted.
+        // Representative non-nomic (symmetric) embed models must NOT
+        // be prefixed, or their cosine geometry would be corrupted.
         let other_embed_models = ["mxbai-embed-large", "all-minilm"];
         for model in other_embed_models {
-            assert!(!Embedder::ollama_requires_nomic_prefix(model));
+            assert!(!Embedder::model_requires_nomic_prefix(model));
         }
+    }
+
+    // --- #1598 — remote-variant generalisation + from_resolved ---
+
+    /// Build a no-network OpenAI-compatible client for constructor
+    /// tests (`new_openai_compatible` performs no health probe).
+    fn offline_openai_compatible_client() -> Arc<crate::llm::OllamaClient> {
+        Arc::new(
+            crate::llm::OllamaClient::new_openai_compatible(
+                "http://127.0.0.1:1",
+                "test-embed-model",
+                "",
+            )
+            .expect("client builds without network"),
+        )
+    }
+
+    #[test]
+    fn new_remote_carries_dynamic_dim_and_truthful_description_1598() {
+        let embedder = Embedder::new_remote(
+            offline_openai_compatible_client(),
+            "google/gemini-embedding-2".to_string(),
+            3072,
+        );
+        assert_eq!(embedder.dim(), 3072);
+        assert_eq!(
+            embedder.model_description(),
+            "google/gemini-embedding-2 (3072-dim, remote)"
+        );
+        assert!(!embedder.is_degraded());
+    }
+
+    #[test]
+    fn new_ollama_preserves_nomic_defaults_1598() {
+        let embedder = Embedder::new_ollama(offline_openai_compatible_client());
+        assert_eq!(embedder.dim(), NOMIC_DIM);
+        let desc = embedder.model_description();
+        assert!(desc.contains(NOMIC_OLLAMA_MODEL), "desc: {desc}");
+        assert!(desc.contains("768"), "desc: {desc}");
+        assert!(!embedder.is_degraded());
+    }
+
+    #[test]
+    fn remote_embed_failure_latches_degraded_flag_1598() {
+        // Port 1 on loopback refuses instantly — the embed call errors
+        // and the degraded flag must latch true (#1594 truthfulness).
+        let embedder = Embedder::new_remote(
+            offline_openai_compatible_client(),
+            "test-embed-model".to_string(),
+            8,
+        );
+        assert!(!embedder.is_degraded());
+        let err = embedder.embed("hello");
+        assert!(err.is_err(), "embed against a closed port must error");
+        assert!(embedder.is_degraded());
+    }
+
+    #[test]
+    fn local_embedder_is_never_degraded_via_trait_default_1598() {
+        // The `Embed` trait default reports false for embedders with
+        // no remote-degradation concept (mock / local).
+        let mock = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let as_trait: &dyn Embed = &mock;
+        assert!(!as_trait.is_degraded());
+    }
+
+    #[test]
+    fn from_resolved_keyword_tier_yields_none_1598() {
+        let resolved = crate::config::ResolvedEmbeddings::from_parts(
+            "openrouter".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            "google/gemini-embedding-2".to_string(),
+            Some(3072),
+            None,
+        );
+        let built = Embedder::from_resolved(&resolved, None).expect("keyword tier is Ok(None)");
+        assert!(built.is_none());
+    }
+
+    #[test]
+    fn from_resolved_api_backend_unknown_dim_bails_with_escape_hatch_1598() {
+        let resolved = crate::config::ResolvedEmbeddings::from_parts(
+            "openrouter".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            "some/unknown-embed-model".to_string(),
+            None,
+            None,
+        );
+        let result = Embedder::from_resolved(
+            &resolved,
+            Some(crate::config::EmbeddingModel::NomicEmbedV15),
+        );
+        let Err(err) = result else {
+            panic!("unknown dim on an API backend must fail closed");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dim"), "error must name the dim gap: {msg}");
+        assert!(
+            msg.contains("[embeddings].dim"),
+            "error must name the config escape hatch: {msg}"
+        );
+        assert!(
+            msg.contains(crate::config::ENV_EMBED_MODEL),
+            "error must name the model env var: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_resolved_api_backend_builds_remote_embedder_1598() {
+        // `new_openai_compatible` performs no construction-time network
+        // probe, so this is hermetic. Keyless (None) exercises the
+        // empty-Bearer on-prem contract (HF TEI / vLLM).
+        let resolved = crate::config::ResolvedEmbeddings::from_parts(
+            "openrouter".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            "google/gemini-embedding-2".to_string(),
+            Some(3072),
+            None,
+        );
+        let built = Embedder::from_resolved(
+            &resolved,
+            Some(crate::config::EmbeddingModel::NomicEmbedV15),
+        )
+        .expect("API-backend construction succeeds")
+        .expect("tier gates embeddings on");
+        assert!(matches!(built, Embedder::Ollama { .. }));
+        assert_eq!(built.dim(), 3072);
+        assert_eq!(
+            built.model_description(),
+            "google/gemini-embedding-2 (3072-dim, remote)"
+        );
+    }
+
+    #[test]
+    fn nomic_prefix_gating_covers_hf_id_and_case_forms_1598() {
+        // #1598 — the CONTAINS-needle predicate must gate the HF-id
+        // spelling used by API embed backends and be case-insensitive.
+        assert!(Embedder::model_requires_nomic_prefix(
+            "nomic-ai/nomic-embed-text-v1.5"
+        ));
+        assert!(Embedder::model_requires_nomic_prefix(
+            "nomic-embed-text-v1.5"
+        ));
+        assert!(Embedder::model_requires_nomic_prefix(
+            "Nomic-AI/Nomic-Embed-Text-v1.5"
+        ));
+        // Non-nomic API model ids never get the prefix.
+        assert!(!Embedder::model_requires_nomic_prefix(
+            "google/gemini-embedding-2"
+        ));
+        assert!(!Embedder::model_requires_nomic_prefix(
+            "ibm-granite/granite-embedding-125m-english"
+        ));
     }
 
     #[test]
@@ -1257,6 +1571,24 @@ mod tests {
         assert_eq!(
             EmbedStatus::Failed("ollama down".to_string()).as_str(),
             "failed"
+        );
+    }
+
+    /// #1595 — the shared oversize guard fires strictly above the cap
+    /// and names both the offending size and the cap in its reason.
+    #[test]
+    fn oversize_embed_reason_boundary_1595() {
+        assert_eq!(oversize_embed_reason(0), None);
+        assert_eq!(
+            oversize_embed_reason(EMBED_MAX_BYTES),
+            None,
+            "cap itself is allowed"
+        );
+        let reason = oversize_embed_reason(EMBED_MAX_BYTES + 1).expect("over-cap must skip");
+        assert!(
+            reason.contains(&(EMBED_MAX_BYTES + 1).to_string())
+                && reason.contains(&EMBED_MAX_BYTES.to_string()),
+            "reason must name size + cap, got: {reason}"
         );
     }
 
