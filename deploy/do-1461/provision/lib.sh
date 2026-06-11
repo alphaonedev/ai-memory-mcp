@@ -118,7 +118,15 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # parity fix; pre-fix every recall on a postgres-backed peer pulled a
 # mid-tier row's +7d backstop in to now+1d). Schema stays v57 (no new
 # migrations). Supersedes the e0ad8c34 Phase-3 golden.
-GOLDEN_SHA256="${GOLDEN_SHA256:-e87836895f2ff322fd449181c40a1e387946b0a5a05e0e230caae6c9a3ed60d3}"
+# Re-pinned 2026-06-11 (GA push): release/v0.7.0 @ ee00d8bb. Carries the
+# full GA fix train on top of e8783689: #1608 (27-column
+# store_with_embedding + store/store_batch QW-2 parity), #1542
+# (AGE-projection SAVEPOINT isolation — links no longer silently
+# rolled back on LOAD-refused roles), #1539 (PUT /agents/{id}/pubkey,
+# routes 89/75), #1536 tooling fixes ride the repo not the binary,
+# plus the coverage-lift tests (no production codegen change). Schema
+# stays v57. Supersedes the e8783689 RE-RUN golden.
+GOLDEN_SHA256="${GOLDEN_SHA256:-19281891a196c8a93f33e6f6729f2fdbf4f9353862269d850e8b64cfde073818}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
