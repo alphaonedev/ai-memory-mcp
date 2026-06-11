@@ -109,7 +109,16 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # (observed live on do-1461-peer-fra1-01, restart counter 38). This pin is the
 # same release/v0.7.0 @ 5b064f38 source rebuilt WITH the required
 # `--features sal,sal-postgres,sqlite-bundled`.
-GOLDEN_SHA256="${GOLDEN_SHA256:-e0ad8c34f85f1d7f0f2a0d5a4381bb936bb1c07da519529359a3223560170223}"
+# Re-pinned 2026-06-11 (#1588 dogfood RE-RUN fix train): release/v0.7.0 @
+# c8d0ef5f rebuilt with the same SAL feature set. Carries #1604 (rerank
+# input-sequence cap — warm autonomous recall 4013ms → 1206ms on the f2
+# corpus), #1605 (capabilities enforced_actions = snake_case wire kinds),
+# #1606 (memory_recall example uses `context`), and #1607 (postgres
+# touch_after_recall GREATEST extension floor — the fleet-relevant #1596
+# parity fix; pre-fix every recall on a postgres-backed peer pulled a
+# mid-tier row's +7d backstop in to now+1d). Schema stays v57 (no new
+# migrations). Supersedes the e0ad8c34 Phase-3 golden.
+GOLDEN_SHA256="${GOLDEN_SHA256:-e87836895f2ff322fd449181c40a1e387946b0a5a05e0e230caae6c9a3ed60d3}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
