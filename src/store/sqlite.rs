@@ -143,7 +143,11 @@ impl MemoryStore for SqliteStore {
             patch.tags.as_ref(),
             patch.priority,
             patch.confidence,
-            None,
+            // #1634 — thread the patch's expires_at; the pg trait
+            // update honored it (#1423) while this adapter passed a
+            // literal None, silently dropping the field for any future
+            // sqlite-backed trait caller.
+            patch.expires_at.as_deref(),
             patch.metadata.as_ref(),
             patch.source_uri.as_deref(),
             None,
@@ -1490,24 +1494,14 @@ impl MemoryStore for SqliteStore {
     }
 }
 
-/// Transaction handle that no-ops commit (`SQLite` txn support is
-/// available via `rusqlite::Connection::unchecked_transaction` but
-/// wrapping through the mutex gets awkward — for the preview, callers
-/// that need real atomicity should still reach through `crate::db`
-/// directly).
-#[allow(dead_code)]
-pub struct SqliteTransaction;
-
-#[async_trait::async_trait]
-impl Transaction for SqliteTransaction {
-    async fn commit(self: Box<Self>) -> StoreResult<()> {
-        Ok(())
-    }
-
-    async fn rollback(self: Box<Self>) -> StoreResult<()> {
-        Ok(())
-    }
-}
+// #1643 — the `SqliteTransaction` placeholder (a `Transaction` impl
+// whose commit AND rollback silently no-op'd) is deleted. It was
+// unreachable in production (`begin_transaction` keeps its
+// `UnsupportedCapability` trait default), but a future override would
+// have handed callers a transaction that doesn't transact — the
+// classic loaded-footgun. When real SAL transactions land, implement
+// them honestly (rusqlite `unchecked_transaction` through the mutex)
+// rather than resurrecting the no-op.
 
 #[cfg(test)]
 mod tests {
@@ -1578,6 +1572,30 @@ mod tests {
             "#1625: both prefix matches must surface despite 260 noise rows sorting first"
         );
         assert!(got.iter().all(|m| m.namespace.starts_with("pfx")));
+    }
+
+    #[tokio::test]
+    async fn trait_update_threads_expires_at_1634() {
+        // #1634 — the sqlite adapter passed a literal None into the
+        // expires_at slot (the pg twin honored it per #1423), so any
+        // trait caller setting it had the field silently dropped.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let ctx = CallerContext::for_agent("alice");
+        let m = test_memory("exp-1634", "expiry-thread fixture body");
+        store.store(&ctx, &m).await.expect("store");
+        let want = "2027-01-01T00:00:00+00:00";
+        let patch = UpdatePatch {
+            expires_at: Some(want.to_string()),
+            ..Default::default()
+        };
+        store.update(&ctx, &m.id, patch).await.expect("update");
+        let got = store.get(&ctx, &m.id).await.expect("get");
+        assert_eq!(
+            got.expires_at.as_deref(),
+            Some(want),
+            "#1634: patch.expires_at must reach the row"
+        );
     }
 
     #[tokio::test]
@@ -2502,13 +2520,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_transaction_commit_and_rollback_are_no_op() {
-        // The SqliteTransaction placeholder no-ops both commit and
-        // rollback (per the doc comment). Pin the contract.
-        let txn1 = Box::new(SqliteTransaction);
-        txn1.commit().await.expect("commit no-op");
-        let txn2 = Box::new(SqliteTransaction);
-        txn2.rollback().await.expect("rollback no-op");
+    async fn begin_transaction_stays_unsupported_1643() {
+        // #1643 — the no-op SqliteTransaction placeholder is deleted;
+        // pin that begin_transaction fails LOUDLY (Unsupported) until
+        // a real implementation lands, so no caller can ever hold a
+        // transaction handle that doesn't transact.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let ctx = CallerContext::for_agent("alice");
+        let err = match store.begin_transaction(&ctx).await {
+            Ok(_) => panic!("begin_transaction must be unsupported"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StoreError::UnsupportedCapability { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]

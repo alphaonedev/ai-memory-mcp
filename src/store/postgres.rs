@@ -11084,7 +11084,10 @@ impl MemoryStore for PostgresStore {
             citations: Vec::new(),
             source_uri: None,
             source_span: None,
-            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            // #1633 — engine-pinned confidence=1.0 ⇒ honest provenance
+            // is CuratorDerived (the #1242 audit-honesty invariant);
+            // sqlite twin stamped the same in storage::consolidate.
+            confidence_source: crate::models::ConfidenceSource::CuratorDerived,
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
@@ -11115,8 +11118,9 @@ impl MemoryStore for PostgresStore {
         let inserted_id: String = sqlx::query_scalar(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
-                source, access_count, created_at, updated_at, expires_at, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12)
+                source, access_count, created_at, updated_at, expires_at, metadata,
+                confidence_source
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12, $13)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
@@ -11162,6 +11166,8 @@ impl MemoryStore for PostgresStore {
             candidate.effective_expires_at().as_deref(),
         ))
         .bind(&merged_metadata_value)
+        // #1633 — $13: honest engine provenance for the pinned 1.0.
+        .bind(candidate.confidence_source.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("consolidate upsert", e))?;

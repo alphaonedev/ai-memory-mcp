@@ -11417,6 +11417,86 @@ async fn http_promote_memory_unknown_id_returns_404() {
 }
 
 #[tokio::test]
+async fn http_promote_target_tier_mid_stops_at_mid_keeps_expiry_1623() {
+    // #1623 — HTTP parity with the MCP target_tier param (#831): a
+    // JSON body {"target_tier":"mid"} stops the bump at mid and
+    // PRESERVES the live TTL; pre-fix the route read no body and
+    // silently jumped to long.
+    let state = test_state();
+    let id = {
+        let lock = state.lock().await;
+        let now = Utc::now();
+        let mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Short,
+            namespace: "ns-promote-1623".into(),
+            title: "to-promote-1623".into(),
+            content: "content".into(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: Some((now + Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339()),
+            metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        db::insert(&lock.0, &mem).unwrap()
+    };
+    let app = Router::new()
+        .route("/api/v1/memories/{id}/promote", axum_post(promote_memory))
+        .with_state(test_app_state(state.clone()));
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{id}/promote"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_tier":"mid"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    {
+        let lock = state.lock().await;
+        let got = db::get(&lock.0, &id).unwrap().unwrap();
+        assert_eq!(got.tier, Tier::Mid, "#1623: must stop at mid");
+        assert!(
+            got.expires_at.is_some(),
+            "#1623: mid landing must keep the live TTL"
+        );
+    }
+    // And the downgrade refusal arm:
+    let resp2 = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{id}/promote"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_tier":"short"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn http_promote_memory_happy_path_clears_expires_at() {
     let state = test_state();
     // Insert a short-tier memory with expires_at set.

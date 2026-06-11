@@ -28,6 +28,12 @@ pub struct PromoteArgs {
     /// separate axis from tier promotion.
     #[arg(long)]
     pub to_namespace: Option<String>,
+    /// #1623 (#831 parity): stop the tier bump at an intermediate tier
+    /// ('mid' or 'long'). Omitting preserves the historical jump to
+    /// long. 'short' is rejected (would be a downgrade). Mid landings
+    /// keep the row's live TTL; long landings clear it.
+    #[arg(long)]
+    pub target_tier: Option<String>,
 }
 
 /// `promote` handler.
@@ -113,17 +119,34 @@ pub fn cmd_promote(
         return Ok(());
     }
 
+    // #1623 — resolve the landing tier (mirrors the MCP handler's
+    // validation wording; 'short' refused as a downgrade).
+    let landing = match args.target_tier.as_deref() {
+        None => Tier::Long,
+        Some("short") => anyhow::bail!(
+            "target_tier 'short' is not a valid promote target (would be a downgrade)"
+        ),
+        Some(other) => Tier::from_str(other).ok_or_else(|| {
+            anyhow::anyhow!("target_tier must be one of 'mid' or 'long' (got '{other}')")
+        })?,
+    };
+    // Long is permanent → clear expiry (Some("")); mid keeps the live
+    // TTL (None preserves), matching MCP semantics.
+    let expires_arg: Option<&str> = match landing {
+        Tier::Long => Some(""),
+        Tier::Mid | Tier::Short => None,
+    };
     let (found, _) = db::update(
         &conn,
         &resolved_id,
         None,
         None,
-        Some(&Tier::Long),
+        Some(&landing),
         None,
         None,
         None,
         None,
-        Some(""),
+        expires_arg,
         None,
     )?;
     if !found {
@@ -134,10 +157,14 @@ pub fn cmd_promote(
         writeln!(
             out.stdout,
             "{}",
-            serde_json::json!({"promoted": true, "id": resolved_id, "tier": Tier::Long.as_str()})
+            serde_json::json!({"promoted": true, "id": resolved_id, "tier": landing.as_str()})
         )?;
     } else {
-        writeln!(out.stdout, "promoted to long-term: {resolved_id}")?;
+        writeln!(
+            out.stdout,
+            "promoted to {}: {resolved_id}",
+            landing.as_str()
+        )?;
     }
     Ok(())
 }
@@ -164,6 +191,7 @@ mod tests {
         PromoteArgs {
             id: id.to_string(),
             to_namespace: None,
+            target_tier: None,
         }
     }
 
@@ -408,5 +436,53 @@ mod tests {
         let mut out = env.output();
         let res = cmd_promote(&db, &args, false, Some("x"), &mut out);
         assert!(res.is_err());
+    }
+    #[test]
+    fn promote_target_tier_mid_stops_at_mid_and_keeps_expiry_1623() {
+        // #1623 — CLI parity with the MCP target_tier param (#831):
+        // a mid landing stops at mid and PRESERVES the live TTL.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt-1623", "cc");
+        // seed_memory rows are tier=mid; downgrade to short first so the
+        // mid landing is a genuine promotion.
+        {
+            let conn = crate::db::open(&db).unwrap();
+            conn.execute(
+                "UPDATE memories SET tier='short', expires_at='2099-01-01T00:00:00+00:00' WHERE id=?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let mut args = promote_args(&id);
+        args.target_tier = Some("mid".to_string());
+        {
+            let mut out = env.output();
+            cmd_promote(&db, &args, true, Some("test-agent"), &mut out).unwrap();
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("\"tier\":\"mid\""), "got: {stdout}");
+        let conn = crate::db::open(&db).unwrap();
+        let (tier, exp): (String, Option<String>) = conn
+            .query_row(
+                "SELECT tier, expires_at FROM memories WHERE id=?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tier, "mid", "#1623: must stop at mid");
+        assert!(exp.is_some(), "#1623: mid landing must keep the live TTL");
+    }
+
+    #[test]
+    fn promote_target_tier_short_rejected_1623() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt-1623b", "cc");
+        let mut args = promote_args(&id);
+        args.target_tier = Some("short".to_string());
+        let mut out = env.output();
+        let err = cmd_promote(&db, &args, false, Some("test-agent"), &mut out).unwrap_err();
+        assert!(err.to_string().contains("downgrade"), "got: {err}");
     }
 }
