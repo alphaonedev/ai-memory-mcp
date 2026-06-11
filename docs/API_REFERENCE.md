@@ -65,7 +65,13 @@ Validation pattern: `^[A-Za-z0-9_\-:@./]{1,128}$`.
 Corpus-scale endpoints require an **admin** caller: `GET /stats`,
 `POST /gc`, `GET /export`, `POST /import`, `GET /agents`,
 `POST /forget`, `GET /namespaces` (list form), `GET /taxonomy`,
-`GET /archive`, `GET /archive/stats`, and the seven `/skill/*` routes.
+`GET /archive`, `GET /archive/stats`, the seven `/skill/*` routes, and
+`PUT /agents/{id}/pubkey` (#1539 — bind an agent's Ed25519 attestation
+public key: body `{"pubkey_b64": "<base64 32-byte key>"}`, response
+`{"bound": true, "agent_id": "..."}`; the pubkey is validated as a real
+curve point and the agent must already be registered. Gives attesting
+clients under `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` a first-party
+enrollment surface instead of an out-of-band DB write).
 The admin allowlist is `[admin] agent_ids = [...]` in `config.toml`
 (plus `AI_MEMORY_ADMIN_AGENT_IDS`); when empty (the default) these
 endpoints return **403** to every caller. Per
@@ -916,7 +922,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (74 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> Total HTTP surface at v0.7.0: **74 unique URL paths** / 88 production
+> Total HTTP surface at v0.7.0: **75 unique URL paths** / 89 production
 > route registrations on the sqlite-backed daemon (and the
 > postgres-backed daemon under `--features sal-postgres`).
 > Authoritative count:

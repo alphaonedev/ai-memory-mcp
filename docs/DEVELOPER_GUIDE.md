@@ -6,7 +6,7 @@
 
 1. **MCP tool server** -- stdio JSON-RPC server exposing 74 advertised entries at `--profile full` (73 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 88 route registrations / 74 unique URL paths at v0.7.0 (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 88 route registrations / 75 unique URL paths at v0.7.0 (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
@@ -69,7 +69,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 - `ListArgs` includes `--offset` flag for pagination
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
-- `serve()` -- starts the Axum server with all routes (**88 production `.route(...)` registrations / 74 unique URL paths at v0.7.0** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
+- `serve()` -- starts the Axum server with all routes (**89 production `.route(...)` registrations / 75 unique URL paths at v0.7.0** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
 - `cmd_*()` functions -- one per CLI command, each opens the DB directly
 
 ### `src/models/`
@@ -164,7 +164,7 @@ Structured error types for the HTTP API:
 
 ### `src/handlers/`
 
-All HTTP handlers for the **88 production `.route(...)` registrations / 74 unique URL paths** at v0.7.0 (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
+All HTTP handlers for the **89 production `.route(...)` registrations / 75 unique URL paths** at v0.7.0 (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
 
 Key handlers:
 - `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
@@ -546,7 +546,7 @@ Base URL: `http://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 
-The HTTP API exposes **88 production `.route(...)` registrations / 74 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The HTTP API exposes **89 production `.route(...)` registrations / 75 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Health Check
 
@@ -833,7 +833,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (88 route registrations / 74 unique URL paths at v0.7.0).
+Start the HTTP daemon (88 route registrations / 75 unique URL paths at v0.7.0).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077

@@ -213,6 +213,97 @@ pub async fn register_agent(
     }
 }
 
+/// #1539 — `PUT /api/v1/agents/{id}/pubkey`. Binds an Ed25519
+/// attestation public key to a registered agent so attesting HTTP
+/// clients no longer need an out-of-band DB write (the do-1461
+/// provisioning previously bound via ssh+psql on the region pg node
+/// under `REQUIRE_AGENT_ATTESTATION=1`). Admin-gated via
+/// [`require_admin`] (the #1582 authn-trusted predicate); the bind
+/// routes through the SAL `MemoryStore::bind_agent_pubkey`, which both
+/// adapters implement, so sqlite- and postgres-backed daemons get the
+/// same callable surface. The pubkey is validated as a real 32-byte
+/// Ed25519 curve point BEFORE any store call
+/// ([`validate::validate_agent_pubkey_b64`]).
+/// #1539 — canonical action/endpoint label for the pubkey-bind
+/// surface: the `require_admin` endpoint tag, the #911 audit action,
+/// and the postgres adapter's error label all share this spelling.
+pub const BIND_AGENT_PUBKEY_ACTION: &str = "bind_agent_pubkey";
+
+pub async fn bind_agent_pubkey(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(body): Json<crate::models::BindAgentPubkeyBody>,
+) -> impl IntoResponse {
+    let caller = match require_admin(&app, &headers, BIND_AGENT_PUBKEY_ACTION) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = validate::validate_agent_id(&agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate::validate_agent_pubkey_b64(&body.pubkey_b64) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    // Admin action audit (the #911 discipline): emitted BEFORE the
+    // store call so the forensic chain pins the attempt even when the
+    // bind later fails. The pubkey itself is public material; logging
+    // it aids enrollment forensics rather than leaking a secret.
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        BIND_AGENT_PUBKEY_ACTION,
+        "",
+        json!({
+            "agent_id": agent_id,
+            "pubkey_b64": body.pubkey_b64,
+        }),
+    );
+    #[cfg(feature = "sal")]
+    {
+        let ctx =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
+        match app
+            .store
+            .bind_agent_pubkey(&ctx, &agent_id, body.pubkey_b64.trim())
+            .await
+        {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({
+                    "bound": true,
+                    "agent_id": agent_id,
+                })),
+            )
+                .into_response(),
+            Err(e) => store_err_to_response(e),
+        }
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        let lock = app.db.lock().await;
+        match db::bind_agent_pubkey(&lock.0, &agent_id, body.pubkey_b64.trim()) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({
+                    "bound": true,
+                    "agent_id": agent_id,
+                })),
+            )
+                .into_response(),
+            Err(e) => crate::handlers::errors::handler_error_500(&e),
+        }
+    }
+}
+
 pub async fn list_agents(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,

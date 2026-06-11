@@ -12,6 +12,8 @@
 //! Param segments use the axum `{param}` capture syntax.
 
 pub const AGENTS: &str = "/api/v1/agents";
+/// #1539 — admin-gated attestation pubkey bind for a registered agent.
+pub const AGENTS_ID_PUBKEY: &str = "/api/v1/agents/{id}/pubkey";
 pub const APPROVALS_STREAM: &str = "/api/v1/approvals/stream";
 pub const APPROVALS_PENDING_ID: &str = "/api/v1/approvals/{pending_id}";
 pub const ARCHIVE: &str = "/api/v1/archive";

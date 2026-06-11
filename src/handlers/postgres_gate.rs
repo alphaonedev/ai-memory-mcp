@@ -122,6 +122,9 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("GET", super::routes::PENDING) => true,
         // Wave-3 continuation — list_agents (read-only).
         ("GET", super::routes::AGENTS) => true,
+        // #1539 — attestation pubkey bind routes through the SAL
+        // `MemoryStore::bind_agent_pubkey`, implemented on postgres.
+        ("PUT", p) if agents_pubkey_path(p) => true,
         // Wave-3 continuation — list_namespaces (read-only).
         ("GET", super::routes::NAMESPACES) => {
             // GET /api/v1/namespaces with no query string lists namespaces.
@@ -285,6 +288,15 @@ fn links_id_path(p: &str) -> bool {
     !rest.is_empty() && !rest.contains('/')
 }
 
+/// #1539 — `PUT /api/v1/agents/{id}/pubkey` (attestation pubkey bind).
+fn agents_pubkey_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/agents/") else {
+        return false;
+    };
+    rest.strip_suffix("/pubkey")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// v0.7.0 #1410 — registered-route table.
 ///
 /// Returns `true` if the given (method, path) tuple has a
@@ -383,6 +395,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         // Agents.
         ("GET", super::routes::AGENTS) => true,
         ("POST", super::routes::AGENTS) => true,
+        // #1539 — attestation pubkey bind.
+        ("PUT", p) if agents_pubkey_path(p) => true,
         // Pending governance.
         ("GET", super::routes::PENDING) => true,
         // Approvals SSE stream (path form not parameterised).

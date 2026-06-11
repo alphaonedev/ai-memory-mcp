@@ -1142,6 +1142,13 @@ pub fn agent_registration_title(agent_id: &str) -> String {
     format!("agent:{agent_id}")
 }
 
+/// #1539 — body for `PUT /api/v1/agents/{id}/pubkey`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BindAgentPubkeyBody {
+    /// Base64 (URL-safe, no-pad accepted) 32-byte Ed25519 public key.
+    pub pubkey_b64: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterAgentBody {
     pub agent_id: String,
