@@ -282,7 +282,28 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // DEAD at 0.46% embedded) + a 20-37x measured FTS-rank win, zero
     // speculative surface. Measured post-merge LOC: 16_811.
     // 16_900 = 16_811 + 89 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 16_900),
+    //
+    // 2026-06-11 (#1607 + #1608, the #1588 RE-RUN fix train) — bumped
+    // 16_900 → 17_200: the touch_after_recall GREATEST extension-floor
+    // arms + comment (#1607), the store_with_embedding full 27-column
+    // Form-4/5/QW-2 parity INSERT + conflict arms, the store()/
+    // store_batch() entity_id+persona_version parity columns (#1608),
+    // and their gated regression tests
+    // (live_touch_after_recall_expiry_is_extension_floor_1607,
+    // live_store_with_embedding_persists_full_provenance_1608), PLUS
+    // the #1542 AGE-projection SAVEPOINT isolation (LOAD 'age' rides
+    // its own savepoint in project_link_into_age; both link-write
+    // call sites — link_internal + apply_remote_link — wrap the whole
+    // projection so a refused LOAD can no longer abort the outer tx
+    // and silently ROLLBACK the canonical memory_links INSERT at
+    // COMMIT) and its restricted-role regression pin
+    // (live_link_persists_when_age_projection_refused_1542).
+    // Growth justified: provenance-honesty + durability correctness
+    // fixes (201-with-zero-rows lived on the do-1461 fleet) +
+    // lived-defect regression pins; zero speculative surface.
+    // Measured post-fix LOC: 17_242. 17_350 = 17_242 + 108 headroom;
+    // far under the 1.5x cap.
+    ("src/store/postgres.rs", 17_350),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -312,7 +333,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // historical write-path ladders, and the boot-seeded slot is the
     // single choke point all three surfaces (MCP/HTTP/CLI) consult.
     // 10_050 = 9_974 + 76 headroom.
-    ("src/config.rs", 10_050),
+    //
+    // 2026-06-11 (#1604, the #1588 RE-RUN fix train) — bumped
+    // 10_050 → 10_180: the rerank input-sequence-cap ladder
+    // (ENV_RERANK_MAX_SEQ const + RerankerSection.max_seq_tokens +
+    // ResolvedReranker.max_seq_tokens + the resolve_reranker env >
+    // config > default arm) and the resolve_reranker_1604_max_seq_ladder
+    // precedence pin, plus the #1605 ENFORCED_AGENT_ACTIONS SSOT
+    // rebuild + doc block. Growth justified: the cap closed a measured
+    // 4,013 ms → 1,206 ms recall regression and the knob follows the
+    // mandated uniform resolver ladder; zero speculative surface.
+    // Measured post-fix LOC: 10_081. 10_180 = 10_081 + 99 headroom.
+    ("src/config.rs", 10_180),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

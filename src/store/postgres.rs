@@ -6036,7 +6036,19 @@ impl PostgresStore {
             // and continue to commit. Operators monitoring the
             // tracing stream see exactly which link skipped its
             // AGE projection.
-            if let Err(e) = project_link_into_age(
+            // #1542 — the WHOLE projection rides a SAVEPOINT. The
+            // pre-#1542 warn-and-continue arm left the outer tx in the
+            // ABORTED state after a projection error, so the commit
+            // below silently became a ROLLBACK and the canonical
+            // `memory_links` INSERT was lost while the handler
+            // returned 201. Rolling back to the savepoint keeps the
+            // outer tx healthy so the relational row truly commits —
+            // making the warning below honest.
+            sqlx::query("SAVEPOINT age_link_projection")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
+            match project_link_into_age(
                 &mut tx,
                 &link.source_id,
                 &link.target_id,
@@ -6044,7 +6056,17 @@ impl PostgresStore {
             )
             .await
             {
-                if is_age_runtime_failure(&e) {
+                Ok(()) => {
+                    sqlx::query("RELEASE SAVEPOINT age_link_projection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("release savepoint age_link_projection", e))?;
+                }
+                Err(e) if is_age_runtime_failure(&e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
                     tracing::warn!(
                         target: TRACE_TARGET_KG,
                         source_id = %link.source_id,
@@ -6056,9 +6078,8 @@ impl PostgresStore {
                          find_paths_cypher will degrade to CTE fallback for \
                          queries that traverse this edge."
                     );
-                } else {
-                    return Err(e);
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -7599,10 +7620,43 @@ async fn project_link_into_age(
         });
     }
 
-    sqlx::query(SQL_LOAD_AGE)
+    // #1542 — `LOAD 'age'` rides its own SAVEPOINT and its failure is
+    // TOLERATED. PostgreSQL refuses `LOAD` for non-superuser roles
+    // ("access to library \"age\" is not allowed") even when the
+    // library is already provided by `shared_preload_libraries='age'`
+    // (the do-1461 fleet posture). Pre-#1542 that refusal aborted the
+    // OUTER link transaction; the caller's warn-and-continue arm then
+    // issued COMMIT on an aborted tx, which PostgreSQL silently turns
+    // into ROLLBACK — `POST /api/v1/links` returned 201 while
+    // `memory_links` persisted NOTHING (the lived fleet finding: 201 +
+    // `linked:true` + zero rows, statement log showed the INSERT
+    // arriving and vanishing). If `age` is genuinely absent, the
+    // MERGE below still fails loudly and the caller's savepoint
+    // handles it.
+    sqlx::query("SAVEPOINT load_age_lib")
         .execute(&mut **tx)
         .await
-        .map_err(|e| to_store_err("LOAD age (project_link)", e))?;
+        .map_err(|e| to_store_err("savepoint load_age_lib", e))?;
+    match sqlx::query(SQL_LOAD_AGE).execute(&mut **tx).await {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT load_age_lib")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint load_age_lib", e))?;
+        }
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT load_age_lib")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("rollback savepoint load_age_lib", e2))?;
+            tracing::debug!(
+                target: TRACE_TARGET_KG,
+                err = %e,
+                "LOAD 'age' refused for this role — proceeding on the \
+                 assumption shared_preload_libraries provides it (#1542)"
+            );
+        }
+    }
     // `SET LOCAL` confines the search path to the open transaction
     // (`link_internal` / `apply_remote_link`'s tx) so post-commit
     // checkouts of the same pooled connection don't inherit the
@@ -8056,11 +8110,13 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
+                entity_id, persona_version,
                 mentioned_entity_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24)
+                      $24, $25,
+                      $26)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -8097,6 +8153,10 @@ impl MemoryStore for PostgresStore {
                 confidence_source = EXCLUDED.confidence_source,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                -- #1608 — QW-2 persona-artifact columns (sqlite insert
+                -- parity; pre-#1608 the local store() dropped both).
+                entity_id = COALESCE(EXCLUDED.entity_id, memories.entity_id),
+                persona_version = COALESCE(EXCLUDED.persona_version, memories.persona_version),
                 -- #1383 — preserve a previously-extracted attribution if
                 -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
                 -- at `src/storage/mod.rs:689`).
@@ -8126,6 +8186,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.confidence_source.as_str())
         .bind(confidence_signals_json.as_deref())
         .bind(memory.confidence_decayed_at.as_deref())
+        .bind(memory.entity_id.as_deref())
+        .bind(memory.persona_version)
         .bind(mentioned_entity_id.as_deref())
         .fetch_one(&mut *tx)
         .await
@@ -8218,6 +8280,7 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
+                entity_id, persona_version,
                 mentioned_entity_id
             ) ",
         );
@@ -8313,6 +8376,9 @@ impl MemoryStore for PostgresStore {
                 .push_bind(memory.confidence_source.as_str().to_string())
                 .push_bind(confidence_signals_json)
                 .push_bind(memory.confidence_decayed_at.clone())
+                // #1608 — QW-2 persona-artifact parity with `store()`.
+                .push_bind(memory.entity_id.clone())
+                .push_bind(memory.persona_version)
                 .push_bind(mentioned_entity_id);
         });
         if let Some(e) = push_err {
@@ -8349,6 +8415,8 @@ impl MemoryStore for PostgresStore {
                 confidence_source = EXCLUDED.confidence_source,
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                entity_id = COALESCE(EXCLUDED.entity_id, memories.entity_id),
+                persona_version = COALESCE(EXCLUDED.persona_version, memories.persona_version),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
             RETURNING id, title, namespace",
         );
@@ -8665,6 +8733,40 @@ impl MemoryStore for PostgresStore {
                 detail: serialize_err("tags", e),
             })?;
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
+        // #1608 — Form-4 / Form-5 / QW-2 column parity with `store()`
+        // and `apply_remote_memory`. Pre-#1608 this INSERT listed only
+        // 19 columns, so the embed-before-store hot path (the HTTP
+        // create anchor on postgres daemons) silently dropped
+        // citations / source_uri / source_span / confidence_source /
+        // confidence_signals / confidence_decayed_at / entity_id /
+        // persona_version — every attested HTTP create landed with the
+        // schema-default `confidence_source = 'caller_provided'` while
+        // the wire response and the federation SHIP envelope carried
+        // the truthful handler-stamped value (the #1588 DO-leg lived
+        // contradiction: anchor row lied, receiver rows were correct).
+        // Same defect class as #1029 on `apply_remote_memory`.
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("citations", e),
+            })?;
+        let source_span_json = match &memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+                })?,
+            ),
+            None => None,
+        };
 
         // v0.7.0.1 G1 — wrap INSERT + quota record in a single tx (see
         // store() above for context).
@@ -8684,9 +8786,16 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind, embedding,
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                entity_id, persona_version, embedding,
                 mentioned_entity_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                      $18, $19, $20,
+                      $21, $22, $23,
+                      $24, $25, $26,
+                      $27)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -8712,6 +8821,16 @@ impl MemoryStore for PostgresStore {
                 -- L1-1 — kind is sticky.
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    ELSE EXCLUDED.memory_kind END,
+                -- #1608 — Form-4 / Form-5 / QW-2 arms mirror `store()`
+                -- (#900 shape): re-store doesn't blank out provenance.
+                citations = EXCLUDED.citations,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = EXCLUDED.confidence_source,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                entity_id = COALESCE(EXCLUDED.entity_id, memories.entity_id),
+                persona_version = COALESCE(EXCLUDED.persona_version, memories.persona_version),
                 embedding = COALESCE(EXCLUDED.embedding, memories.embedding),
                 -- #1383 — preserve a previously-extracted attribution
                 -- if EXCLUDED is NULL (sqlite parity).
@@ -8735,6 +8854,14 @@ impl MemoryStore for PostgresStore {
         .bind(&memory.metadata)
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_deref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(memory.confidence_decayed_at.as_deref())
+        .bind(memory.entity_id.as_deref())
+        .bind(memory.persona_version)
         .bind(emb_pgvec)
         .bind(mentioned_entity_id.as_deref())
         .fetch_one(&mut *tx)
@@ -9887,13 +10014,42 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("apply_remote_link", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            project_link_into_age(
+            // #1542 — same SAVEPOINT isolation + warn-on-runtime-failure
+            // semantics as `link_internal`. Pre-#1542 this site
+            // propagated the projection error with `?` AFTER the
+            // relational INSERT had been queued in the tx, so a
+            // fleet-wide `LOAD 'age'` refusal made every federated
+            // link replay fail forever (DLQ churn) even though the
+            // canonical row could have landed. The relational
+            // `memory_links` row is the source of truth; the AGE
+            // mirror degrades to the CTE fallback.
+            sqlx::query("SAVEPOINT age_link_projection")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
+            match project_link_into_age(
                 &mut tx,
                 &link.source_id,
                 &link.target_id,
                 link.relation.as_str(),
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {
+                    sqlx::query("RELEASE SAVEPOINT age_link_projection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("release savepoint age_link_projection", e))?;
+                }
+                Err(e) if is_age_runtime_failure(&e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
+                    warn_age_fallback("apply_remote_link", &link.source_id, &e);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         tx.commit()
@@ -16541,6 +16697,70 @@ mod tests {
         );
     }
 
+    /// #1608 — `store_with_embedding` (the postgres HTTP-create anchor
+    /// hot path) must persist the FULL Form-4 / Form-5 / QW-2 column
+    /// set. Pre-fix its INSERT listed 19 columns, so citations /
+    /// source_uri / source_span / confidence_source /
+    /// confidence_signals / confidence_decayed_at / entity_id /
+    /// persona_version were silently dropped and the schema default
+    /// `confidence_source = 'caller_provided'` contradicted the wire
+    /// response (the #1588 DO-leg lived finding: anchor row lied while
+    /// the federation receivers — fed via the #1029-fixed
+    /// `apply_remote_memory` — were correct).
+    #[tokio::test]
+    async fn live_store_with_embedding_persists_full_provenance_1608() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("prov-1608-{unique}");
+
+        let mut mem = sample_memory(&format!("prov-{unique}"), &ns, "prov-1608", "body");
+        mem.confidence_source = ConfidenceSource::Default;
+        mem.citations = vec![crate::models::Citation {
+            uri: "doc:rerun-evidence".to_string(),
+            accessed_at: "2026-06-11T00:00:00Z".to_string(),
+            hash: None,
+            span: None,
+        }];
+        mem.source_uri = Some("doc:1608-source".to_string());
+        mem.entity_id = Some("entity-1608".to_string());
+        mem.persona_version = Some(3);
+
+        // Dim matches the test schema's `vector(384)` column (the
+        // MiniLM default the AGE test harness provisions).
+        let embedding = vec![0.5_f32; 384];
+        let id = store
+            .store_with_embedding(&ctx, &mem, Some(&embedding))
+            .await
+            .expect("store_with_embedding");
+
+        let got = store.get(&ctx, &id).await.expect("get back");
+        assert_eq!(
+            got.confidence_source,
+            ConfidenceSource::Default,
+            "persisted confidence_source must match the handler-stamped value, \
+             not the schema default (#1608)"
+        );
+        assert_eq!(got.citations.len(), 1, "citation must round-trip");
+        assert_eq!(got.citations[0].uri, "doc:rerun-evidence");
+        assert_eq!(got.source_uri.as_deref(), Some("doc:1608-source"));
+        assert_eq!(got.entity_id.as_deref(), Some("entity-1608"));
+        assert_eq!(got.persona_version, Some(3));
+
+        // store() parity for the two QW-2 columns it previously dropped.
+        let mut mem2 = sample_memory(&format!("prov2-{unique}"), &ns, "prov-1608-b", "body");
+        mem2.entity_id = Some("entity-1608-b".to_string());
+        mem2.persona_version = Some(7);
+        let id2 = store.store(&ctx, &mem2).await.expect("plain store");
+        let got2 = store.get(&ctx, &id2).await.expect("get back 2");
+        assert_eq!(got2.entity_id.as_deref(), Some("entity-1608-b"));
+        assert_eq!(got2.persona_version, Some(7));
+    }
+
     /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension
     /// FLOOR. Pre-fix `touch_after_recall` REPLACED `expires_at` with
     /// `NOW() + window`, so recalling a fresh mid-tier row pulled its
@@ -16613,6 +16833,114 @@ mod tests {
         assert!(
             (near_secs - day_secs).abs() < 300.0,
             "touch must extend a near expiry out to ~now+1d; remaining secs = {near_secs}"
+        );
+    }
+
+    /// #1542 — a failing AGE projection must NOT poison the link
+    /// transaction. Reproduces the fleet posture: a NON-superuser role
+    /// (PostgreSQL refuses `LOAD 'age'` for it, and it has no
+    /// `ag_catalog` USAGE so the MERGE fails too) writes a link via
+    /// `link_signed`. Pre-#1542 the aborted tx made the final COMMIT a
+    /// silent ROLLBACK: the handler returned 201 while `memory_links`
+    /// persisted nothing (lived on do-1461: 201 + linked:true + zero
+    /// rows). Post-fix the projection rides a SAVEPOINT and the
+    /// canonical relational row must be readable afterwards.
+    #[tokio::test]
+    async fn live_link_persists_when_age_projection_refused_1542() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let admin = PostgresStore::connect(&url).await.expect("connect admin");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let ns = format!("link-1542-{unique}");
+
+        // Two anchor rows, written as the privileged test role.
+        let a = sample_memory(&format!("l42a-{unique}"), &ns, "l42-a", "src");
+        let b = sample_memory(&format!("l42b-{unique}"), &ns, "l42-b", "dst");
+        let a_id = admin.store(&ctx, &a).await.expect("store a");
+        let b_id = admin.store(&ctx, &b).await.expect("store b");
+
+        // Provision a LOAD-refused role mirroring the fleet daemon
+        // posture: full DML on the public schema, NO superuser, NO
+        // ag_catalog access. Idempotent across runs.
+        let role = format!("age_refused_1542_{unique}");
+        let pw = uuid::Uuid::new_v4().simple().to_string();
+        // Membership in the admin role confers object OWNERSHIP rights
+        // (so `connect()`'s idempotent schema-init passes) WITHOUT the
+        // SUPERUSER attribute — `LOAD` checks the current role's own
+        // attribute, which is exactly the fleet daemon posture.
+        let admin_role: String = sqlx::query_scalar("SELECT current_user")
+            .fetch_one(&admin.pool)
+            .await
+            .expect("resolve admin role");
+        for stmt in [
+            format!("CREATE ROLE {role} LOGIN PASSWORD '{pw}'"),
+            format!("GRANT {admin_role} TO {role}"),
+        ] {
+            // CONNECT grant references whatever db the URL names; the
+            // ai_memory literal arm is best-effort for shared harness
+            // DBs — failures here only matter if the final connect
+            // fails, which the assert below surfaces.
+            let _ = sqlx::query(&stmt).execute(&admin.pool).await;
+        }
+        let restricted_url = {
+            // Splice the restricted credentials into the test URL.
+            let rest = url
+                .split_once('@')
+                .map(|(_, tail)| tail.to_string())
+                .expect("test URL must carry credentials");
+            format!("postgres://{role}:{pw}@{rest}")
+        };
+        let restricted = match PostgresStore::connect(&restricted_url).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Local pg_hba may forbid password auth for ad-hoc
+                // roles; that environment cannot exercise this pin.
+                eprintln!("skip: restricted-role connect failed ({e})");
+                return;
+            }
+        };
+
+        // Precondition pin: LOAD 'age' must actually be REFUSED for
+        // this role — otherwise the test silently stops exercising the
+        // #1542 poisoned-tx path.
+        let load_err = sqlx::query("LOAD 'age'").execute(&restricted.pool).await;
+        assert!(
+            load_err.is_err(),
+            "test precondition: LOAD 'age' must be refused for the              non-superuser role (got Ok — role attributes drifted)"
+        );
+
+        let link = MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: String::new(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+        };
+        restricted
+            .link_signed(&ctx, &link, None)
+            .await
+            .expect("link_signed must succeed for the restricted role");
+
+        // THE pin: the canonical relational row must actually exist.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM memory_links WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&a_id)
+        .bind(&b_id)
+        .fetch_one(&admin.pool)
+        .await
+        .expect("count link rows");
+        assert_eq!(
+            n, 1,
+            "the relational memory_links row must persist even when the \
+             AGE projection is refused for the writing role (#1542)"
         );
     }
 
