@@ -1155,7 +1155,11 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     // Build the probe request: a no-auth model listing for the
     // Ollama wire shape, a minimal 1-char embed for API backends.
     let (probe_url, req) = if is_api {
-        let url = format!("{}/embeddings", resolved.url);
+        let url = format!(
+            "{}{}",
+            resolved.url,
+            crate::llm::OPENAI_COMPAT_EMBEDDINGS_PATH
+        );
         let mut req = client
             .post(&url)
             .json(&serde_json::json!({ "model": resolved.model, "input": "a" }));

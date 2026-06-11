@@ -48,7 +48,7 @@ impl McpTool for LoadFamilyTool {
         "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. \
          Issue #864 — `family` here is the MCP tool family (8 groups: \
          core/lifecycle/graph/governance/power/meta/archive/other), \
-         NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
+         NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<LoadFamilyRequest>()
@@ -89,7 +89,7 @@ impl McpTool for SmartLoadTool {
         "B2: pick best Family from free-text intent, then forward to memory_load_family. \
          Issue #864 — `Family` here is the MCP tool family (8 groups: \
          core/lifecycle/graph/governance/power/meta/archive/other), \
-         NOT the memory_kind taxonomy (Observation/Reflection/Plan/Decision/etc)."
+         NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SmartLoadRequest>()
@@ -192,6 +192,60 @@ mod d1_3_984_tests {
         assert_eq!(LoadFamilyTool::family(), "core");
         assert_eq!(SmartLoadTool::name(), "memory_smart_load");
         assert_eq!(SmartLoadTool::family(), "core");
+    }
+}
+
+#[cfg(test)]
+mod issue_1589_tests {
+    //! #1589 — the loader docstrings cite memory_kind taxonomy examples
+    //! ("NOT the memory_kind taxonomy (Observation/Reflection/...)").
+    //! The pre-fix text named "Plan", which is not in the 10-kind
+    //! Form-6 vocabulary (docs/memory-kind-vocab.md). Pin that every
+    //! kind example cited inside the taxonomy parenthetical parses as
+    //! a real `MemoryKind` so the phantom kind cannot reappear.
+    use super::*;
+    use crate::models::MemoryKind;
+
+    /// The docstring fragment that opens the taxonomy-example
+    /// parenthetical in both loader docs.
+    const TAXONOMY_PARENTHETICAL_OPEN: &str = "memory_kind taxonomy (";
+
+    fn assert_taxonomy_examples_valid(docs: &str) {
+        let start = docs
+            .find(TAXONOMY_PARENTHETICAL_OPEN)
+            .expect("loader docs must carry the memory_kind taxonomy disambiguation");
+        let after = &docs[start + TAXONOMY_PARENTHETICAL_OPEN.len()..];
+        let inner = &after[..after.find(')').expect("parenthetical must close")];
+        let examples: Vec<&str> = inner
+            .split('/')
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && *t != "etc")
+            .collect();
+        assert!(
+            !examples.is_empty(),
+            "taxonomy parenthetical must cite at least one kind example"
+        );
+        for ex in examples {
+            assert!(
+                MemoryKind::from_str(&ex.to_ascii_lowercase()).is_some(),
+                "docstring cites {ex:?}, which is not a valid MemoryKind; \
+                 valid kinds = {:?}",
+                MemoryKind::all()
+                    .iter()
+                    .map(MemoryKind::as_str)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn load_family_docs_taxonomy_examples_are_valid_kinds_1589() {
+        assert_taxonomy_examples_valid(LoadFamilyTool::docs());
+    }
+
+    #[test]
+    fn smart_load_docs_taxonomy_examples_are_valid_kinds_1589() {
+        assert_taxonomy_examples_valid(SmartLoadTool::docs());
     }
 }
 /// v0.7 B1 — `memory_load_family(family, namespace?, k?)`.

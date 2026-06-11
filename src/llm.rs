@@ -189,6 +189,12 @@ where
 /// the codebase.
 pub const BACKEND_OLLAMA: &str = "ollama";
 
+/// #1598 — OpenAI-compatible embeddings endpoint path suffix, appended
+/// to the resolved base URL (e.g. `https://openrouter.ai/api/v1`).
+/// Single source for the embed wire path across the client's two embed
+/// call sites and the doctor reachability probe.
+pub const OPENAI_COMPAT_EMBEDDINGS_PATH: &str = "/embeddings";
+
 /// Per-vendor default base URLs for the OpenAI-compatible alias
 /// backends. Operator-provided `AI_MEMORY_LLM_BASE_URL` overrides
 /// these. Verified against vendor documentation as of 2026-Q2.
@@ -1665,7 +1671,7 @@ impl OllamaClient {
             // pgvector `vector(768)` fleet schemas + ANN indexes
             // (<=2000-dim limit) usable with high-dim API models.
             LlmProvider::OpenAiCompatible { api_key } => (
-                format!("{}/embeddings", self.base_url),
+                format!("{}{}", self.base_url, OPENAI_COMPAT_EMBEDDINGS_PATH),
                 match self.embed_dimensions {
                     Some(dims) => {
                         json!({"model": embed_model, "input": text, "dimensions": dims})
@@ -1871,7 +1877,10 @@ impl OllamaClient {
 
         let resp = match self
             .client
-            .post(format!("{}/embeddings", self.base_url))
+            .post(format!(
+                "{}{}",
+                self.base_url, OPENAI_COMPAT_EMBEDDINGS_PATH
+            ))
             .timeout(GENERATE_TIMEOUT)
             .json(&payload)
             .bearer_auth(api_key)
