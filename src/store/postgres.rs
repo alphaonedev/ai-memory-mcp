@@ -9100,7 +9100,21 @@ impl MemoryStore for PostgresStore {
                     ELSE $9::JSONB
                 END,
                 source_uri = COALESCE($10, source_uri),
-                expires_at = COALESCE($11, expires_at),
+                -- #1626 — tier→long ⇒ expires_at = NULL. A patch that
+                -- promotes to 'long' always wins the tier ladder above,
+                -- so the row must shed its expiry or GC reaps the
+                -- promoted row at the stale mid/short deadline. Rule:
+                -- when the patch tier IS long the clear wins over any
+                -- explicitly-supplied $11 (matching the sqlite upsert
+                -- semantics: expiry is only cleared when the new tier
+                -- is long, and the sqlite promote handler's explicit
+                -- `UPDATE memories SET expires_at = NULL`); when the
+                -- patch tier is NOT long an explicit $11 wins and an
+                -- absent $11 leaves the stored value untouched.
+                expires_at = CASE
+                    WHEN $4::TEXT = 'long' THEN NULL
+                    ELSE COALESCE($11, expires_at)
+                END,
                 version = version + 1,
                 updated_at = NOW()
              WHERE id = $1",
@@ -9126,7 +9140,9 @@ impl MemoryStore for PostgresStore {
         // v0.7.0 #1423 — bind expires_at COALESCE slot ($11). The
         // postgres column is `TIMESTAMPTZ`; parse the RFC3339 string
         // into a DateTime so sqlx binds the right type. None → NULL
-        // → COALESCE leaves stored value untouched.
+        // → COALESCE leaves stored value untouched. #1626: when the
+        // patch tier is 'long' the SET clause above ignores $11 and
+        // clears the expiry unconditionally.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
         .execute(&self.pool)
         .await
