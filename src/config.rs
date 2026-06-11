@@ -1422,6 +1422,14 @@ pub struct CapabilityGovernance {
 /// variant set in [`crate::governance::agent_action::AgentAction`]
 /// (minus the open-ended `Custom` extension point).
 ///
+/// #1605 — the values are the snake_case **wire tags** from
+/// [`crate::governance::agent_action::action_kinds`] (the #1558 SSOT
+/// the `memory_check_agent_action` MCP parser, the CLI `rules test`
+/// parser, and the `governance_rules.kind` column all share), NOT the
+/// Rust variant names. The pre-#1605 list advertised `"Bash"` /
+/// `"FilesystemWrite"` / … — tokens the kind parser refuses — so a
+/// caller following capabilities verbatim got `unknown kind`.
+///
 /// MemoryWrite is intentionally NOT in this list — substrate-internal
 /// memory writes are gated by the K9 `Op` pipeline
 /// ([`crate::governance::Op`]) which is a separate, substrate-
@@ -1429,8 +1437,12 @@ pub struct CapabilityGovernance {
 /// semantics; honest reporting keeps them on separate fields rather
 /// than conflating them under one label. The L3-5 audit comment in
 /// `tests/capabilities_v3_l3_5.rs` documents the carry-forward.
-pub const ENFORCED_AGENT_ACTIONS: &[&str] =
-    &["Bash", "FilesystemWrite", "NetworkRequest", "ProcessSpawn"];
+pub const ENFORCED_AGENT_ACTIONS: &[&str] = &[
+    crate::governance::agent_action::action_kinds::BASH,
+    crate::governance::agent_action::action_kinds::FILESYSTEM_WRITE,
+    crate::governance::agent_action::action_kinds::NETWORK_REQUEST,
+    crate::governance::agent_action::action_kinds::PROCESS_SPAWN,
+];
 
 /// v0.7.0 L1-6 — number of bypass-impossibility tests pinning the
 /// rules-engine activation posture. Tracks the `#[test]` count in
@@ -3425,6 +3437,14 @@ pub struct RerankerSection {
     /// model bake-offs (e.g., `bge-reranker-v2-m3`,
     /// `mxbai-rerank-large-v2`).
     pub model: Option<String>,
+
+    /// #1604 — tokenized length cap for rerank inputs (the batched
+    /// cross-encoder forward). Defaults to
+    /// `crate::reranker::RERANK_MAX_SEQ_DEFAULT` when unset; values
+    /// that are zero or above the model ceiling
+    /// (`crate::reranker::CROSS_ENCODER_MAX_SEQ`) fall through.
+    /// Overridable via `AI_MEMORY_RERANK_MAX_SEQ`.
+    pub max_seq_tokens: Option<usize>,
 }
 
 /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
@@ -3816,6 +3836,11 @@ pub struct ResolvedReranker {
     pub enabled: bool,
     /// Cross-encoder model identifier.
     pub model: String,
+    /// #1604 — tokenized length cap for rerank inputs, resolved via
+    /// `AI_MEMORY_RERANK_MAX_SEQ` env > `[reranker].max_seq_tokens` >
+    /// `crate::reranker::RERANK_MAX_SEQ_DEFAULT`. Seeded into
+    /// `crate::reranker::set_rerank_max_seq` at boot.
+    pub max_seq_tokens: usize,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -3953,6 +3978,14 @@ pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
 /// (`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`).
 pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
 
+/// #1604 — env override for the tokenized length of rerank inputs
+/// (`[reranker].max_seq_tokens`), in tokens. Values that are zero,
+/// unparseable, or above the model ceiling
+/// (`crate::reranker::CROSS_ENCODER_MAX_SEQ`) fall through to the
+/// `[reranker]` section, then to the compiled default
+/// (`crate::reranker::RERANK_MAX_SEQ_DEFAULT`).
+pub const ENV_RERANK_MAX_SEQ: &str = "AI_MEMORY_RERANK_MAX_SEQ";
+
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
 /// in `docs/enterprise-deployment.md §5.6`.
@@ -4044,6 +4077,7 @@ impl Default for ResolvedModels {
             reranker: ResolvedReranker {
                 enabled: false,
                 model: "ms-marco-MiniLM-L-6-v2".to_string(),
+                max_seq_tokens: crate::reranker::RERANK_MAX_SEQ_DEFAULT,
                 source: ConfigSource::CompiledDefault,
             },
         }
@@ -4105,6 +4139,7 @@ impl ResolvedModels {
                 // the tier-preset enabled the cross-encoder. Preserve
                 // that here so legacy assertions stay byte-equal.
                 model: "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
+                max_seq_tokens: crate::reranker::RERANK_MAX_SEQ_DEFAULT,
                 source: ConfigSource::CompiledDefault,
             },
         }
@@ -6600,6 +6635,17 @@ impl AppConfig {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "ms-marco-MiniLM-L-6-v2".to_string());
 
+        // #1604 — rerank input sequence cap, uniform ladder:
+        // env > [reranker] section > compiled default. Zero,
+        // unparseable, or above-model-ceiling values fall through.
+        let admissible = |n: &usize| *n > 0 && *n <= crate::reranker::CROSS_ENCODER_MAX_SEQ;
+        let max_seq_tokens = std::env::var(ENV_RERANK_MAX_SEQ)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(admissible)
+            .or_else(|| cfg.and_then(|r| r.max_seq_tokens).filter(admissible))
+            .unwrap_or(crate::reranker::RERANK_MAX_SEQ_DEFAULT);
+
         let source = if cfg.is_some() {
             ConfigSource::Config
         } else if self.cross_encoder.is_some() {
@@ -6611,6 +6657,7 @@ impl AppConfig {
         ResolvedReranker {
             enabled,
             model,
+            max_seq_tokens,
             source,
         }
     }
@@ -9895,6 +9942,66 @@ max_page_size = 1000000
         assert!(resolved.enabled);
         assert_eq!(resolved.model, "ms-marco-MiniLM-L-6-v2");
         assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    /// #1604 — rerank sequence-cap ladder: env >
+    /// `[reranker].max_seq_tokens` > compiled default, with zero /
+    /// unparseable / above-model-ceiling values falling through.
+    #[test]
+    fn resolve_reranker_1604_max_seq_ladder() {
+        let _g = env_var_lock();
+        unsafe { std::env::remove_var(ENV_RERANK_MAX_SEQ) };
+
+        // Compiled default when nothing is configured.
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.resolve_reranker().max_seq_tokens,
+            crate::reranker::RERANK_MAX_SEQ_DEFAULT
+        );
+
+        // Config layer wins over the compiled default.
+        let mut cfg = AppConfig::default();
+        cfg.reranker = Some(RerankerSection {
+            max_seq_tokens: Some(128),
+            ..RerankerSection::default()
+        });
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Env wins over config.
+        unsafe { std::env::set_var(ENV_RERANK_MAX_SEQ, "192") };
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 192);
+
+        // Garbage env falls through to config.
+        unsafe { std::env::set_var(ENV_RERANK_MAX_SEQ, "not-a-number") };
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Zero env falls through to config.
+        unsafe { std::env::set_var(ENV_RERANK_MAX_SEQ, "0") };
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Above the model ceiling falls through to config.
+        unsafe {
+            std::env::set_var(
+                ENV_RERANK_MAX_SEQ,
+                (crate::reranker::CROSS_ENCODER_MAX_SEQ + 1).to_string(),
+            );
+        }
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Above-ceiling CONFIG value falls through to the compiled
+        // default (no admissible layer remains).
+        unsafe { std::env::remove_var(ENV_RERANK_MAX_SEQ) };
+        let mut cfg = AppConfig::default();
+        cfg.reranker = Some(RerankerSection {
+            max_seq_tokens: Some(crate::reranker::CROSS_ENCODER_MAX_SEQ + 1),
+            ..RerankerSection::default()
+        });
+        assert_eq!(
+            cfg.resolve_reranker().max_seq_tokens,
+            crate::reranker::RERANK_MAX_SEQ_DEFAULT
+        );
+
+        unsafe { std::env::remove_var(ENV_RERANK_MAX_SEQ) };
     }
 
     #[test]

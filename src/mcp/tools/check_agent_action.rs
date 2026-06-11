@@ -385,6 +385,45 @@ mod tests {
         assert_eq!(r["decision"]["decision"], "allow");
     }
 
+    /// #1605 — every action kind the capabilities surface advertises
+    /// under `governance.enforced_actions` MUST round-trip through this
+    /// tool's kind parser. The pre-#1605 capabilities list carried the
+    /// Rust variant names (`"Bash"`, `"FilesystemWrite"`, …), which the
+    /// parser refuses — a caller following the advertised vocabulary
+    /// verbatim got `unknown kind`. Minimal required args per kind so
+    /// the parse reaches the engine, not the missing-arg validation.
+    #[test]
+    fn advertised_enforced_actions_round_trip_the_kind_parser_1605() {
+        let _forensic = forensic_lock();
+        let conn = fresh_conn();
+        for kind in crate::config::ENFORCED_AGENT_ACTIONS {
+            let args = match *kind {
+                ak::BASH => json!({"kind": kind, "command": "ls"}),
+                ak::FILESYSTEM_WRITE => {
+                    json!({"kind": kind, "path": "./scratch.txt"})
+                }
+                ak::NETWORK_REQUEST => {
+                    json!({"kind": kind, "host": "example.com"})
+                }
+                ak::PROCESS_SPAWN => {
+                    json!({"kind": kind, "binary": "/usr/bin/ls"})
+                }
+                other => panic!(
+                    "ENFORCED_AGENT_ACTIONS advertises {other:?}, which this \
+                     round-trip test does not know how to construct — extend \
+                     the match alongside the new action kind"
+                ),
+            };
+            let r = handle_check_agent_action(&conn, &args)
+                .unwrap_or_else(|e| panic!("advertised kind {kind:?} must parse, got error: {e}"));
+            assert_eq!(
+                r["decision"]["decision"], "allow",
+                "advertised kind {kind:?} must reach the engine (no rules \
+                 seeded → allow)"
+            );
+        }
+    }
+
     #[test]
     fn filesystem_write_kind_refuses_on_glob() {
         // Issue #819 — suppress operator pubkey resolution for the

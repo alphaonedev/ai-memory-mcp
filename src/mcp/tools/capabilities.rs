@@ -729,7 +729,11 @@ pub fn tool_examples(name: &str) -> Vec<crate::config::ToolExample> {
             "Persists a long-tier memory; returns {id, status}.",
         )],
         tn::MEMORY_RECALL => vec![ex(
-            json!({"query": "atomisation gates", "namespace": "ai-memory", "limit": 5}),
+            // #1606 — the MCP wire param is `context` (the `query` alias
+            // ladder is HTTP-only); the example stays byte-equal to a
+            // valid call per the #1325 discipline, pinned by
+            // `recall_example_payload_parses_1606`.
+            json!({"context": "atomisation gates", "namespace": "ai-memory", "limit": 5}),
             "Hybrid FTS+semantic recall; returns top-K ranked memories.",
         )],
         tn::MEMORY_SEARCH => vec![ex(
@@ -1058,6 +1062,32 @@ fn compute_recall_mode(
         RecallMode::Hybrid
     } else {
         RecallMode::Degraded
+    }
+}
+
+#[cfg(test)]
+mod example_validity_1606_tests {
+    //! #1606 — capabilities examples must stay byte-equal to valid
+    //! calls (the #1325 discipline). The pre-#1606 `memory_recall`
+    //! example advertised `{"query": ...}`, a payload the MCP wire
+    //! parser refuses with "context is required" (the `query` alias
+    //! ladder is HTTP-only).
+
+    #[test]
+    fn recall_example_payload_parses_1606() {
+        let examples = super::tool_examples(crate::mcp::registry::tool_names::MEMORY_RECALL);
+        assert!(
+            !examples.is_empty(),
+            "memory_recall must carry a worked example (#803)"
+        );
+        for example in &examples {
+            crate::models::RecallRequest::from_mcp_params(&example.call).unwrap_or_else(|e| {
+                panic!(
+                    "memory_recall capabilities example must be byte-equal to a \
+                     valid MCP call (#1606/#1325); parser said: {e}"
+                )
+            });
+        }
     }
 }
 
