@@ -828,6 +828,84 @@ mod tests {
         );
     }
 
+    /// Coverage lift (per-module floor): pins the text-mode
+    /// `conf=NN%` suffix arm. Rows with `confidence < 1.0` must render
+    /// their confidence percentage in the header line; the seeded
+    /// default (1.0) never exercises that arm, so this seeds a 0.5-
+    /// confidence row directly via `db::insert`.
+    #[test]
+    fn test_recall_text_output_shows_confidence_below_full() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = crate::db::open(&db).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            let mem = crate::models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: crate::models::Tier::Mid,
+                namespace: "test".to_string(),
+                title: "needle low-confidence".to_string(),
+                content: "uncertain content".to_string(),
+                tags: vec![],
+                priority: 5,
+                confidence: 0.5,
+                source: "import".to_string(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: crate::models::default_metadata(),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+            };
+            crate::db::insert(&conn, &mem).unwrap();
+        }
+        let args = default_args();
+        let cfg = AppConfig::default();
+        {
+            let mut out = env.output();
+            run(&db, &args, false, &cfg, &mut out).unwrap();
+        }
+        let stdout = env.stdout_str();
+        assert!(
+            stdout.contains("conf=50%"),
+            "confidence < 1.0 must render the conf= suffix; got: {stdout}"
+        );
+    }
+
+    /// Coverage lift (per-module floor): pins the
+    /// `Handle::try_current()` → `block_in_place` bridge arm. When
+    /// `run()` is invoked from inside an existing multi-threaded tokio
+    /// runtime (the `daemon_runtime::run` path), it must NOT build a
+    /// nested runtime — it drives `build_embedder` on the ambient
+    /// handle via `block_in_place`. Keyword tier keeps the embedder
+    /// build a no-op so the test stays model-free and offline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_recall_inside_runtime_uses_block_in_place_bridge() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "test", "needle title", "haystack content");
+        let args = default_args();
+        let cfg = AppConfig::default();
+        {
+            let mut out = env.output();
+            run(&db, &args, true, &cfg, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["mode"].as_str().unwrap(), "keyword");
+        assert!(v["count"].as_u64().unwrap() >= 1, "seeded row must match");
+    }
+
     #[tokio::test]
     async fn test_shared_build_embedder_keyword_returns_none() {
         // W6 — recall now delegates embedder construction to

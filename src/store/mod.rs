@@ -3525,4 +3525,270 @@ mod tests {
         .expect("misaligned sweep must terminate, not loop forever");
         assert_eq!(written, 0, "misaligned chunk must be dropped, not written");
     }
+
+    // -----------------------------------------------------------------
+    // Coverage lift (per-module floor): exercise the default trait
+    // method body, the remaining StoreError display arms, and the
+    // Track-J row shapes' serde derives — all previously untested.
+    // -----------------------------------------------------------------
+
+    /// Minimal adapter that implements only the required trait methods
+    /// and deliberately does NOT override `begin_transaction`, so the
+    /// default-impl body in the trait definition is actually executed
+    /// (the older `default_begin_transaction_errors` test only
+    /// constructed the error variant by hand).
+    struct DefaultImplProbeStore;
+
+    #[async_trait::async_trait]
+    impl MemoryStore for DefaultImplProbeStore {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::empty()
+        }
+
+        async fn store(&self, _ctx: &CallerContext, _memory: &Memory) -> StoreResult<String> {
+            Err(StoreError::UnsupportedCapability {
+                capability: "store".to_string(),
+            })
+        }
+
+        async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+
+        async fn update(
+            &self,
+            _ctx: &CallerContext,
+            id: &str,
+            _patch: UpdatePatch,
+        ) -> StoreResult<()> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+
+        async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+
+        async fn list(&self, _ctx: &CallerContext, _filter: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(Vec::new())
+        }
+
+        async fn search(
+            &self,
+            _ctx: &CallerContext,
+            _query: &str,
+            _filter: &Filter,
+        ) -> StoreResult<Vec<Memory>> {
+            Ok(Vec::new())
+        }
+
+        async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+            Ok(VerifyReport {
+                memory_id: id.to_string(),
+                integrity_ok: true,
+                findings: Vec::new(),
+                signature_verified: false,
+            })
+        }
+
+        async fn link(&self, _ctx: &CallerContext, _link: &MemoryLink) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn list_links(&self, _namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+            Ok(vec![])
+        }
+
+        async fn register_agent(
+            &self,
+            _ctx: &CallerContext,
+            _agent: &AgentRegistration,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Pins the default-impl contract: an adapter that does not
+    /// override `begin_transaction` surfaces `UnsupportedCapability`
+    /// naming TRANSACTIONS, so upper layers can downgrade to
+    /// sequential ops (design principle 3 from the PR #222 red-team).
+    #[test]
+    fn default_begin_transaction_default_impl_returns_unsupported() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+        match rt.block_on(store.begin_transaction(&ctx)) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "TRANSACTIONS");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => panic!("default begin_transaction must error"),
+        }
+    }
+
+    /// Pins the human-readable Display contract for the StoreError
+    /// variants the original display test skipped (Conflict /
+    /// BackendUnavailable / InvalidInput / UnsupportedCapability /
+    /// IntegrityFailed / Backend-via-BoxBackendError).
+    #[test]
+    fn store_error_remaining_variants_display_their_detail() {
+        let conflict = StoreError::Conflict {
+            id: "dup-1".to_string(),
+        };
+        assert_eq!(conflict.to_string(), "identifier conflict on insert: dup-1");
+
+        let unavailable = StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            detail: "connection refused".to_string(),
+        };
+        assert!(unavailable.to_string().contains("postgres"));
+        assert!(unavailable.to_string().contains("connection refused"));
+
+        let invalid = StoreError::InvalidInput {
+            detail: "empty title".to_string(),
+        };
+        assert_eq!(invalid.to_string(), "invalid input: empty title");
+
+        let integrity = StoreError::IntegrityFailed {
+            detail: "missing agent_id".to_string(),
+        };
+        assert!(integrity.to_string().contains("missing agent_id"));
+
+        // BoxBackendError is the escape hatch — `new` + From wiring
+        // must preserve the underlying message verbatim.
+        let boxed: StoreError = BoxBackendError::new("native driver oops").into();
+        assert_eq!(
+            boxed.to_string(),
+            "underlying backend error: native driver oops"
+        );
+    }
+
+    /// Wire-shape pin for `KgQueryRow` (Track J substrate): the shared
+    /// projection both KG backends emit must round-trip through serde
+    /// without renaming or dropping fields.
+    #[test]
+    fn kg_query_row_serde_round_trips() {
+        let row = KgQueryRow {
+            target_id: "mem-2".to_string(),
+            relation: "related_to".to_string(),
+            depth: 2,
+            path: "mem-0->mem-1->mem-2".to_string(),
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("\"target_id\":\"mem-2\""));
+        assert!(json.contains("\"depth\":2"));
+        let back: KgQueryRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, row);
+    }
+
+    /// Wire-shape pin for `KgTimelineRow` (J3): optional
+    /// `valid_until` / `observed_by` must survive a round-trip in both
+    /// the Some and None forms — the SQL fallback emits NULLs for
+    /// legacy rows that predate observability tracking.
+    #[test]
+    fn kg_timeline_row_serde_round_trips_with_and_without_optionals() {
+        let full = KgTimelineRow {
+            target_id: "mem-9".to_string(),
+            relation: "supersedes".to_string(),
+            valid_from: "2026-01-01T00:00:00Z".to_string(),
+            valid_until: Some("2026-02-01T00:00:00Z".to_string()),
+            observed_by: Some("agent-a".to_string()),
+            title: "Title".to_string(),
+            target_namespace: "ns".to_string(),
+        };
+        let back: KgTimelineRow =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
+
+        let legacy = KgTimelineRow {
+            valid_until: None,
+            observed_by: None,
+            ..full
+        };
+        let back: KgTimelineRow =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(back, legacy);
+    }
+
+    /// Wire-shape pin for `KgInvalidateRow` (J4): the no-match outcome
+    /// is `found: false` with an empty `valid_until` — a no-op, not an
+    /// error — matching the SQLite dispatcher contract.
+    #[test]
+    fn kg_invalidate_row_serde_round_trips_both_outcomes() {
+        let matched = KgInvalidateRow {
+            found: true,
+            valid_until: "2026-03-01T00:00:00Z".to_string(),
+            previous_valid_until: Some("2026-02-01T00:00:00Z".to_string()),
+        };
+        let back: KgInvalidateRow =
+            serde_json::from_str(&serde_json::to_string(&matched).unwrap()).unwrap();
+        assert_eq!(back, matched);
+
+        let missed = KgInvalidateRow {
+            found: false,
+            valid_until: String::new(),
+            previous_valid_until: None,
+        };
+        let back: KgInvalidateRow =
+            serde_json::from_str(&serde_json::to_string(&missed).unwrap()).unwrap();
+        assert_eq!(back, missed);
+    }
+
+    /// Pins the #302-item-5 contract on `VerifyReport`: adapters that
+    /// perform no cryptographic verification MUST report
+    /// `signature_verified: false` even when `integrity_ok` is true —
+    /// and the struct's Clone/Debug derives keep that flag intact.
+    #[test]
+    fn verify_report_signature_flag_is_independent_of_integrity() {
+        let report = VerifyReport {
+            memory_id: "mem-7".to_string(),
+            integrity_ok: true,
+            findings: vec!["structural check only".to_string()],
+            signature_verified: false,
+        };
+        let cloned = report.clone();
+        assert!(cloned.integrity_ok);
+        assert!(!cloned.signature_verified);
+        let dbg = format!("{report:?}");
+        assert!(dbg.contains("signature_verified: false"), "got: {dbg}");
+    }
+
+    /// Pins the UpdatePatch "None means leave alone" default: a
+    /// default-constructed patch must not name any field.
+    #[test]
+    fn update_patch_default_touches_nothing() {
+        let patch = UpdatePatch::default();
+        assert!(patch.title.is_none());
+        assert!(patch.content.is_none());
+        assert!(patch.tier.is_none());
+        assert!(patch.namespace.is_none());
+        assert!(patch.tags.is_none());
+        assert!(patch.priority.is_none());
+        assert!(patch.confidence.is_none());
+        assert!(patch.metadata.is_none());
+    }
+
+    /// Drives the `DefaultImplProbeStore` happy paths through the trait object
+    /// surface so the trait's vtable dispatch (and the test double's
+    /// own arms) execute: `dyn MemoryStore` is exactly how the upper
+    /// layers consume adapters.
+    #[test]
+    fn minimal_store_dispatches_through_dyn_trait_object() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Box<dyn MemoryStore> = Box::new(DefaultImplProbeStore);
+        let ctx = CallerContext::for_agent("test-agent");
+        assert_eq!(store.capabilities(), Capabilities::empty());
+        let listed = rt
+            .block_on(store.list(&ctx, &Filter::default()))
+            .expect("list");
+        assert!(listed.is_empty());
+        let report = rt.block_on(store.verify(&ctx, "mem-1")).expect("verify");
+        assert_eq!(report.memory_id, "mem-1");
+        assert!(report.integrity_ok);
+        let err = rt.block_on(store.get(&ctx, "missing")).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { id } if id == "missing"));
+    }
 }
