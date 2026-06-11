@@ -593,6 +593,15 @@ pub struct PostgresStore {
     kg_backend: KgBackend,
 }
 
+/// #1628 — wire-pinned refusal text for legacy rows with no
+/// `metadata.agent_id` stamp (write-path verbs). One declaration site
+/// per pm-v3.1; consumed by the caller-owns mutation gate.
+const REASON_UNSTAMPED_TENANT_WRITE: &str =
+    "memory has no agent_id stamp; tenant writes refused (use admin path)";
+/// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
+const REASON_UNSTAMPED_TENANT_DELETE: &str =
+    "memory has no agent_id stamp; tenant deletes refused (use admin path)";
+
 impl PostgresStore {
     /// Connect using a Postgres URL (e.g. `postgres://user:pass@host:5432/db`).
     /// Runs the bootstrap schema on the first connection acquired.
@@ -2560,6 +2569,68 @@ impl PostgresStore {
     //     (Gap 3, #886)
     // ─────────────────────────────────────────────────────────────────
 
+    /// #1412/#1628 — owner pre-fetch for the caller-owns mutation gate.
+    /// One declaration site (pm-v3.1) for the three gate consumers.
+    const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str =
+        "SELECT metadata->>'agent_id' FROM memories WHERE id = $1";
+
+    /// #1412 caller-owns mutation gate shared by the tenant-facing
+    /// write paths: the trait `update`, the trait `delete`, and the
+    /// inherent `update_with_expected_version` (#1628). Threat model:
+    /// cross-tenant write hijack on postgres-backed daemons. Admin
+    /// paths skip via `ctx.bypass_visibility`; tenant-facing handlers
+    /// MUST NOT pass a bypass context.
+    ///
+    /// `action` names the refused operation in the `PermissionDenied`
+    /// envelope; `unstamped_reason` is the wire-pinned refusal text for
+    /// legacy rows carrying no `metadata.agent_id` stamp (the verb
+    /// differs between the write and delete gates —
+    /// [`REASON_UNSTAMPED_TENANT_WRITE`] /
+    /// [`REASON_UNSTAMPED_TENANT_DELETE`]). Hoisted per the pm-v3.1
+    /// hardcoded-literal gate when #1628 added the third copy of the
+    /// previously-inlined gate.
+    async fn assert_caller_owns_for_mutation(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        action: &str,
+        unstamped_reason: &str,
+    ) -> StoreResult<()> {
+        if ctx.bypass_visibility {
+            return Ok(());
+        }
+        let owner: Option<Option<String>> =
+            sqlx::query_scalar(Self::SQL_SELECT_OWNER_AGENT_ID_BY_ID)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err(&format!("{action}: pre-fetch owner"), e))?;
+        match owner {
+            None => Err(StoreError::NotFound { id: id.to_string() }),
+            Some(None) => {
+                // Row exists but has no agent_id stamp (legacy / migrated
+                // pre-v0.6.3 row). Block tenant mutations — the conservative
+                // posture lets the operator clean up via admin path.
+                Err(StoreError::PermissionDenied {
+                    action: action.to_string(),
+                    target: id.to_string(),
+                    reason: unstamped_reason.to_string(),
+                })
+            }
+            Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
+                Err(StoreError::PermissionDenied {
+                    action: action.to_string(),
+                    target: id.to_string(),
+                    reason: format!(
+                        "caller {:?} does not own memory (owner: {existing_owner:?})",
+                        ctx.effective_principal()
+                    ),
+                })
+            }
+            Some(Some(_)) => Ok(()), // owner matches; proceed
+        }
+    }
+
     /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
     /// aware update. Postgres twin of
     /// [`crate::storage::update_with_expected_version`].
@@ -2599,37 +2670,8 @@ impl PostgresStore {
         // HTTP `PUT /memories/{id}` If-Match branch), so it must apply
         // the SAME tenant-isolation gate; admin paths skip via
         // `ctx.bypass_visibility`.
-        if !ctx.bypass_visibility {
-            let owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| to_store_err("update: pre-fetch owner", e))?;
-            match owner {
-                None => return Err(StoreError::NotFound { id: id.to_string() }),
-                Some(None) => {
-                    return Err(StoreError::PermissionDenied {
-                        action: "update".to_string(),
-                        target: id.to_string(),
-                        reason:
-                            "memory has no agent_id stamp; tenant writes refused (use admin path)"
-                                .to_string(),
-                    });
-                }
-                Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
-                    return Err(StoreError::PermissionDenied {
-                        action: "update".to_string(),
-                        target: id.to_string(),
-                        reason: format!(
-                            "caller {:?} does not own memory (owner: {existing_owner:?})",
-                            ctx.effective_principal()
-                        ),
-                    });
-                }
-                Some(Some(_)) => {} // owner matches; proceed
-            }
-        }
+        self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
+            .await?;
         // Pre-read the current version so a CONFLICT carries the
         // observed-current value in the typed error. The UPDATE
         // re-asserts the gate atomically below.
@@ -9079,40 +9121,10 @@ impl MemoryStore for PostgresStore {
         // surfaces (migrate, federation catchup, GC sweeps) round-trip
         // every row regardless of ownership. Tenant-facing handlers
         // MUST NOT pass a bypass context.
-        if !ctx.bypass_visibility {
-            let owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| to_store_err("update: pre-fetch owner", e))?;
-            match owner {
-                None => return Err(StoreError::NotFound { id: id.to_string() }),
-                Some(None) => {
-                    // Row exists but has no agent_id stamp (legacy / migrated
-                    // pre-v0.6.3 row). Block tenant writes — the conservative
-                    // posture lets the operator clean up via admin path.
-                    return Err(StoreError::PermissionDenied {
-                        action: "update".to_string(),
-                        target: id.to_string(),
-                        reason:
-                            "memory has no agent_id stamp; tenant writes refused (use admin path)"
-                                .to_string(),
-                    });
-                }
-                Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
-                    return Err(StoreError::PermissionDenied {
-                        action: "update".to_string(),
-                        target: id.to_string(),
-                        reason: format!(
-                            "caller {:?} does not own memory (owner: {existing_owner:?})",
-                            ctx.effective_principal()
-                        ),
-                    });
-                }
-                Some(Some(_)) => {} // owner matches; proceed
-            }
-        }
+        // #1628 refactor — shared caller-owns gate (byte-equal wire
+        // errors; see assert_caller_owns_for_mutation).
+        self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
+            .await?;
 
         // One-shot COALESCE update — each patch field overrides only if
         // Some, otherwise falls through to the existing value.
@@ -9227,37 +9239,10 @@ impl MemoryStore for PostgresStore {
         // threat model (cross-tenant write hijack on postgres-backed
         // daemons) and same gate semantics (admin paths skip via
         // `bypass_visibility`, tenant-facing handlers MUST NOT bypass).
-        if !ctx.bypass_visibility {
-            let owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| to_store_err("delete: pre-fetch owner", e))?;
-            match owner {
-                None => return Err(StoreError::NotFound { id: id.to_string() }),
-                Some(None) => {
-                    return Err(StoreError::PermissionDenied {
-                        action: "delete".to_string(),
-                        target: id.to_string(),
-                        reason:
-                            "memory has no agent_id stamp; tenant deletes refused (use admin path)"
-                                .to_string(),
-                    });
-                }
-                Some(Some(existing_owner)) if existing_owner != ctx.effective_principal() => {
-                    return Err(StoreError::PermissionDenied {
-                        action: "delete".to_string(),
-                        target: id.to_string(),
-                        reason: format!(
-                            "caller {:?} does not own memory (owner: {existing_owner:?})",
-                            ctx.effective_principal()
-                        ),
-                    });
-                }
-                Some(Some(_)) => {} // owner matches; proceed
-            }
-        }
+        // #1628 refactor — shared caller-owns gate (byte-equal wire
+        // errors; see assert_caller_owns_for_mutation).
+        self.assert_caller_owns_for_mutation(ctx, id, "delete", REASON_UNSTAMPED_TENANT_DELETE)
+            .await?;
 
         // #1642 — parity with sqlite `storage::delete`
         // (`src/storage/mod.rs:1747-1751`): if this memory is registered
