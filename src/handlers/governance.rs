@@ -360,7 +360,7 @@ pub async fn approve_pending(
                 tracing::error!("execute pending error: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "approved but execution failed"})),
+                    Json(json!({"error": super::approvals::APPROVED_BUT_EXECUTION_FAILED})),
                 )
                     .into_response()
             }
@@ -374,6 +374,15 @@ pub async fn approve_pending(
                 "votes": votes,
                 "quorum": quorum,
                 "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+            })),
+        )
+            .into_response(),
+        // #1620 — missing pending id is 404, matching the postgres
+        // branch's StoreError::NotFound mapping (was 403 Rejected).
+        Ok(ApproveOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": crate::errors::msg::pending_action_not_found(&id),
             })),
         )
             .into_response(),

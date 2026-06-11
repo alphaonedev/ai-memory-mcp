@@ -758,23 +758,27 @@ pub trait MemoryStore: Send + Sync {
     /// the lookup uses the `namespace` btree index instead of
     /// seq-scanning every row on every write (the per-write dispatch
     /// hot path).
+    /// List memories whose namespace starts with `prefix`, newest-
+    /// priority-first, capped at `limit` MATCHES.
+    ///
+    /// #1625 — the old trait default applied `limit` BEFORE the prefix
+    /// filter (one `list(limit)` call, then in-process `starts_with`),
+    /// so on a corpus larger than `limit` it could return 0 matches
+    /// that exist. There is no offset on [`Filter`], so a correct
+    /// generic fallback cannot page; the default now fails LOUDLY with
+    /// `UnsupportedCapability` and each adapter implements a real
+    /// prefix query (PostgresStore: sargable `LIKE`; SqliteStore:
+    /// offset-paged scan over `db::list`).
     async fn list_by_namespace_prefix(
         &self,
-        ctx: &CallerContext,
-        prefix: &str,
-        limit: usize,
+        _ctx: &CallerContext,
+        _prefix: &str,
+        _limit: usize,
     ) -> StoreResult<Vec<Memory>> {
-        let filter = Filter {
-            namespace: None,
-            limit,
-            ..Default::default()
-        };
-        Ok(self
-            .list(ctx, &filter)
-            .await?
-            .into_iter()
-            .filter(|m| m.namespace.starts_with(prefix))
-            .collect())
+        Err(StoreError::UnsupportedCapability {
+            capability: "list_by_namespace_prefix (per-adapter implementation required; #1625)"
+                .to_string(),
+        })
     }
 
     /// Keyword search (FTS-equivalent). Adapters without full-text

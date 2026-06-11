@@ -201,6 +201,46 @@ impl MemoryStore for SqliteStore {
             .collect())
     }
 
+    // #1625 — real prefix listing for the sqlite adapter: offset-paged
+    // scan over `db::list` with the prefix + visibility filters applied
+    // per page, accumulating until `limit` MATCHES (the trait default
+    // used to truncate BEFORE filtering and is now UnsupportedCapability).
+    async fn list_by_namespace_prefix(
+        &self,
+        ctx: &CallerContext,
+        prefix: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        const PAGE: usize = 256;
+        let conn = self.state.lock().await;
+        let caller = ctx.effective_principal().to_string();
+        let mut out: Vec<Memory> = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let rows = db::list(
+                &conn, None, None, PAGE, offset, None, None, None, None, None,
+            )
+            .map_err(box_err)?;
+            let page_len = rows.len();
+            for m in rows {
+                if !m.namespace.starts_with(prefix) {
+                    continue;
+                }
+                if !ctx.bypass_visibility && !is_visible_to_caller(&m, &caller) {
+                    continue;
+                }
+                out.push(m);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            if page_len < PAGE {
+                return Ok(out);
+            }
+            offset += PAGE;
+        }
+    }
+
     async fn search(
         &self,
         ctx: &CallerContext,
@@ -803,6 +843,14 @@ impl MemoryStore for SqliteStore {
             db::ApproveOutcome::Pending { votes, quorum } => {
                 super::ApproveOutcome::Pending { votes, quorum }
             }
+            // #1620 — typed not-found maps to StoreError::NotFound so
+            // the HTTP layer 404s, byte-parity with the postgres
+            // adapter's get_pending(None) arm.
+            db::ApproveOutcome::NotFound => {
+                return Err(super::StoreError::NotFound {
+                    id: pending_id.to_string(),
+                });
+            }
             db::ApproveOutcome::Rejected(reason) => super::ApproveOutcome::Rejected(reason),
         };
         Ok(sal_outcome)
@@ -1321,6 +1369,14 @@ impl MemoryStore for SqliteStore {
             db::ApproveOutcome::Pending { votes, quorum } => {
                 super::ApproveOutcome::Pending { votes, quorum }
             }
+            // #1620 — typed not-found maps to StoreError::NotFound so
+            // the HTTP layer 404s, byte-parity with the postgres
+            // adapter's get_pending(None) arm.
+            db::ApproveOutcome::NotFound => {
+                return Err(super::StoreError::NotFound {
+                    id: pending_id.to_string(),
+                });
+            }
             db::ApproveOutcome::Rejected(reason) => super::ApproveOutcome::Rejected(reason),
         };
         Ok(sal)
@@ -1488,6 +1544,40 @@ mod tests {
             confidence_decayed_at: None,
             version: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn list_by_namespace_prefix_finds_matches_beyond_first_page_1625() {
+        // #1625 — the old trait default applied `limit` BEFORE the
+        // prefix filter, so matches sorting after the first `limit`
+        // rows were invisible. Seed 260 high-priority non-matching
+        // rows (crossing the 256-row page) + 2 LOW-priority matching
+        // rows that sort last; the paged adapter impl must find both.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let ctx = CallerContext::for_agent("alice");
+        for i in 0..260 {
+            let mut m = test_memory(&format!("bulk-{i}"), "filler row");
+            m.namespace = "bulk/noise".to_string();
+            m.priority = 9;
+            store.store(&ctx, &m).await.expect("store bulk");
+        }
+        for i in 0..2 {
+            let mut m = test_memory(&format!("pfx-{i}"), "target row");
+            m.namespace = "pfx/sub".to_string();
+            m.priority = 1;
+            store.store(&ctx, &m).await.expect("store pfx");
+        }
+        let got = store
+            .list_by_namespace_prefix(&ctx, "pfx", 10)
+            .await
+            .expect("prefix list");
+        assert_eq!(
+            got.len(),
+            2,
+            "#1625: both prefix matches must surface despite 260 noise rows sorting first"
+        );
+        assert!(got.iter().all(|m| m.namespace.starts_with("pfx")));
     }
 
     #[tokio::test]

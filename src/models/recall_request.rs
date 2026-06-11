@@ -260,7 +260,16 @@ impl RecallRequest {
             until: q.until.clone(),
             as_agent: q.as_agent.clone(),
             budget_tokens: q.budget_tokens.and_then(|v| i64::try_from(v).ok()),
-            context_tokens: None,
+            // #1622 — CSV on the GET surface (`context_tokens=a,b`),
+            // mirroring the `kinds` convention; pre-#1622 hard-coded
+            // None so HTTP GET callers could not reach the bias.
+            context_tokens: q.context_tokens.as_deref().map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(String::from)
+                    .collect()
+            }),
             session_default: q.session_default,
             session_id: q.session_id.clone(),
             // v0.7.0 #1098 — wired through from RecallQuery; pre-
@@ -306,7 +315,10 @@ impl RecallRequest {
             until: body.until.clone(),
             as_agent: body.as_agent.clone(),
             budget_tokens: body.budget_tokens.and_then(|v| i64::try_from(v).ok()),
-            context_tokens: None,
+            // #1622 — wired through from RecallBody; pre-#1622 this was
+            // hard-coded None so HTTP POST callers could not reach the
+            // 70/30 context-token embedding bias MCP/CLI callers could.
+            context_tokens: body.context_tokens.clone(),
             session_default: body.session_default,
             session_id: body.session_id.clone(),
             // v0.7.0 #1098 — wired through from RecallBody; pre-#1098
@@ -676,6 +688,7 @@ mod tests {
             until: None,
             as_agent: None,
             budget_tokens: None,
+            context_tokens: None,
             session_default: None,
             has_citations: None,
             source_uri_prefix: None,
@@ -706,6 +719,7 @@ mod tests {
             until: None,
             as_agent: None,
             budget_tokens: None,
+            context_tokens: None,
             session_default: None,
             has_citations: None,
             source_uri_prefix: None,
@@ -735,5 +749,55 @@ mod tests {
         assert_eq!(back.context, req.context);
         assert_eq!(back.namespace, req.namespace);
         assert_eq!(back.limit, req.limit);
+    }
+
+    #[test]
+    fn from_http_body_wires_context_tokens_1622() {
+        // #1622 — pre-fix this field was hard-coded None on the HTTP
+        // POST surface while MCP/CLI honored it (the #1098 class).
+        let body: crate::models::RecallBody =
+            serde_json::from_str(r#"{"context":"x","context_tokens":["alpha","beta"]}"#).unwrap();
+        let req = RecallRequest::from_http_body(&body);
+        assert_eq!(
+            req.context_tokens.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..]),
+            "#1622: POST body context_tokens must reach the DTO"
+        );
+    }
+
+    #[test]
+    fn from_http_query_parses_csv_context_tokens_1622() {
+        // #1622 — GET surface uses the `kinds`-style CSV convention.
+        let mut q = crate::models::RecallQuery {
+            context: Some("x".to_string()),
+            query: None,
+            q: None,
+            namespace: None,
+            limit: None,
+            tags: None,
+            since: None,
+            until: None,
+            as_agent: None,
+            budget_tokens: None,
+            context_tokens: Some(" alpha, beta ,,".to_string()),
+            session_default: None,
+            has_citations: None,
+            source_uri_prefix: None,
+            kinds: None,
+            session_id: None,
+            include_archived: None,
+            confidence_tier: None,
+            verbose_provenance: None,
+            format: None,
+        };
+        let req = RecallRequest::from_http_query(&q);
+        assert_eq!(
+            req.context_tokens.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..]),
+            "#1622: CSV parses with trim + empty-segment drop"
+        );
+        q.context_tokens = None;
+        let req2 = RecallRequest::from_http_query(&q);
+        assert!(req2.context_tokens.is_none());
     }
 }

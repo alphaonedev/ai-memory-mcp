@@ -349,6 +349,8 @@ pub fn handle_pending_approve(
             "quorum": quorum,
             "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
         })),
+        // #1620 — typed not-found (was a Rejected string).
+        ApproveOutcome::NotFound => Err(crate::errors::msg::pending_action_not_found(id)),
         ApproveOutcome::Rejected(reason) => Err(crate::errors::msg::approve_rejected(reason)),
     }
 }
@@ -646,7 +648,9 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("approve rejected"), "got: {err}");
+        // #1620 — unknown id is a typed not-found, no longer the
+        // collapsed "approve rejected" policy bucket.
+        assert!(err.contains("pending action not found"), "got: {err}");
     }
 
     // handle_pending_reject — happy path with session remember label.

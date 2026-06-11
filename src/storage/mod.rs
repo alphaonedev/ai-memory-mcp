@@ -729,7 +729,15 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- omits the structured entity_id metadata should NOT
             -- blank out the indexed column) while letting a fresh
             -- extraction populate previously-NULL rows.
-            mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
+            mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
+            -- #1632 — upsert-merge IS a mutation (content/tags/priority
+            -- can change), so the Gap-1 optimistic-concurrency counter
+            -- bumps here exactly like db::update. Pre-#1632 a re-store
+            -- rewrote content while version stood still, so a stale
+            -- If-Match could overwrite the merge invisibly. The decay
+            -- sweep remains the only documented non-bumping mutator
+            -- (tests/non_version_bumping_sites_1036.rs).
+            version = memories.version + 1
          RETURNING id",
     )?;
     let actual_id: String = insert_stmt.query_row(
@@ -6737,7 +6745,11 @@ pub fn list_archived(
         Some(ns) => (
             "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
              source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata \
+             expires_at, archived_at, archive_reason, metadata, \
+             reflection_depth, memory_kind, entity_id, persona_version, \
+             citations, source_uri, source_span, confidence_source, \
+             confidence_signals, confidence_decayed_at, version, \
+             atomised_into, atom_of, mentioned_entity_id \
              FROM archived_memories WHERE namespace = ?1 \
              ORDER BY archived_at DESC LIMIT ?2 OFFSET ?3"
                 .to_string(),
@@ -6746,7 +6758,11 @@ pub fn list_archived(
         None => (
             "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
              source, access_count, created_at, updated_at, last_accessed_at, \
-             expires_at, archived_at, archive_reason, metadata \
+             expires_at, archived_at, archive_reason, metadata, \
+             reflection_depth, memory_kind, entity_id, persona_version, \
+             citations, source_uri, source_span, confidence_source, \
+             confidence_signals, confidence_decayed_at, version, \
+             atomised_into, atom_of, mentioned_entity_id \
              FROM archived_memories \
              ORDER BY archived_at DESC LIMIT ?1 OFFSET ?2"
                 .to_string(),
@@ -6803,6 +6819,32 @@ pub fn list_archived(
             (field_names::ARCHIVED_AT): row.get::<_, String>(14)?,
             (field_names::ARCHIVE_REASON): row.get::<_, String>(15)?,
             "metadata": metadata,
+            // #1637 — the v49 columns (in the table since #1025; restore
+            // was lossless but the LISTING surface projected only the 17
+            // legacy columns, so archived v0.7.0 fields were invisible
+            // to memory_archive_list). Additive keys; JSON-ish columns
+            // parse to structured like tags/metadata above.
+            "reflection_depth": row.get::<_, Option<i64>>(17)?.unwrap_or(0),
+            "memory_kind": row.get::<_, Option<String>>(18)?,
+            "entity_id": row.get::<_, Option<String>>(19)?,
+            "persona_version": row.get::<_, Option<i64>>(20)?,
+            "citations": row
+                .get::<_, Option<String>>(21)?
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .unwrap_or_else(|| serde_json::json!([])),
+            "source_uri": row.get::<_, Option<String>>(22)?,
+            "source_span": row
+                .get::<_, Option<String>>(23)?
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
+            "confidence_source": row.get::<_, Option<String>>(24)?,
+            "confidence_signals": row
+                .get::<_, Option<String>>(25)?
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
+            "confidence_decayed_at": row.get::<_, Option<String>>(26)?,
+            "version": row.get::<_, Option<i64>>(27)?.unwrap_or(1),
+            (field_names::ATOMISED_INTO): row.get::<_, Option<String>>(28)?,
+            (field_names::ATOM_OF): row.get::<_, Option<String>>(29)?,
+            (field_names::MENTIONED_ENTITY_ID): row.get::<_, Option<String>>(30)?,
         }))
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -10148,6 +10190,11 @@ fn verify_payload_agent_id(pa: &PendingAction) -> Result<()> {
 /// Task 1.10 — outcome of an approver-aware approve call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApproveOutcome {
+    /// #1620 — no pending row with this id exists. Maps to 404 on
+    /// every surface; pre-#1620 this collapsed into `Rejected` and
+    /// surfaced as 403 on sqlite while postgres returned 404 for the
+    /// same probe.
+    NotFound,
     /// Approver check failed; policy identifies the reason.
     Rejected(String),
     /// Consensus quorum not yet met; vote recorded.
@@ -10166,9 +10213,8 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
 ) -> Result<ApproveOutcome> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
-        return Ok(ApproveOutcome::Rejected(
-            crate::errors::msg::pending_action_not_found(pending_id),
-        ));
+        // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
+        return Ok(ApproveOutcome::NotFound);
     };
     if pa.status != "pending" {
         return Ok(ApproveOutcome::Rejected(format!(

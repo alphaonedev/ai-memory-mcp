@@ -3838,11 +3838,12 @@ async fn http_list_pending_with_status_filter() {
 }
 
 #[tokio::test]
-async fn http_approve_pending_unknown_id_returns_403_or_500() {
+async fn http_approve_pending_unknown_id_returns_404_1620() {
     // approve_pending validates the id format, then attempts approval.
-    // An unknown but-valid uuid surfaces as 403 (rejected) or 500
-    // (DB row missing). Either is acceptable — both confirm the
-    // post-validation handler arms execute.
+    // #1620 — an unknown-but-valid uuid is a typed
+    // ApproveOutcome::NotFound → 404, matching the postgres branch's
+    // StoreError::NotFound mapping (pre-#1620 it collapsed into the
+    // 403 policy-refusal bucket while postgres 404'd).
     // S5-C1 (2026-05-13): /approve is now HMAC-gated; install the
     // server-wide secret and sign the empty body before dispatching.
     let _g = APPROVE_HMAC_TEST_LOCK
@@ -3869,12 +3870,10 @@ async fn http_approve_pending_unknown_id_returns_403_or_500() {
         .await
         .unwrap();
     crate::config::set_active_hooks_hmac_secret(None);
-    assert!(
-        resp.status() == StatusCode::FORBIDDEN
-            || resp.status() == StatusCode::INTERNAL_SERVER_ERROR
-            || resp.status() == StatusCode::ACCEPTED,
-        "unexpected status {}",
-        resp.status()
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "#1620: unknown pending id must be 404 on the sqlite branch"
     );
 }
 

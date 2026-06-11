@@ -511,6 +511,46 @@ pub async fn create_link(
             .into_response();
     }
 
+    // #1621 — K8 link-quota parity with the MCP path
+    // (src/mcp/tools/link.rs): charge `QuotaOp::Link` atomically
+    // (check + record in one tx) BEFORE the write. Anonymous callers
+    // (empty id) are uncharged, mirroring the memory-quota posture in
+    // handlers/create.rs; the 429 envelope is byte-equal to that
+    // path's QUOTA_EXCEEDED shape. Charged against the source
+    // memory's namespace (the per-namespace v50 accounting row), same
+    // anchor the MCP path uses.
+    if !caller.is_empty() {
+        if let Err(e) = crate::quotas::check_and_record(
+            &lock.0,
+            &caller,
+            &source_mem.namespace,
+            crate::quotas::QuotaOp::Link,
+        ) {
+            return match e {
+                crate::quotas::QuotaCheckError::Quota(qe) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+                        "error": qe.to_string(),
+                        "limit": qe.limit.as_str(),
+                        "current": qe.current,
+                        "max": qe.max,
+                        "agent_id": qe.agent_id,
+                    })),
+                )
+                    .into_response(),
+                crate::quotas::QuotaCheckError::Sql(se) => {
+                    tracing::error!("create_link: quota substrate error: {se}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "quota check failed"})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
+
     // v0.7 H2 — sign with the active keypair when one was loaded at
     // startup. Falls back to unsigned (signature NULL, attest_level
     // "unsigned") when no keypair is configured. Either way the chosen
