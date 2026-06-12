@@ -3870,4 +3870,134 @@ mod tests {
         mem.created_at = chrono::Utc::now().to_rfc3339();
         assert!(integrity_findings(&mem).is_empty());
     }
+    #[test]
+    fn for_admin_checked_constructor_cov() {
+        // for_admin_checked(.., true) yields a bypass-visibility admin
+        // ctx; (.., false) does not. Pins the #1062 constructor arms.
+        let admin = CallerContext::for_admin_checked("ops:admin", true);
+        assert!(admin.bypass_visibility, "is_admin=true ⇒ bypass");
+        let not_admin = CallerContext::for_admin_checked("ops:admin", false);
+        assert!(!not_admin.bypass_visibility, "is_admin=false ⇒ no bypass");
+    }
+
+    /// Track-J SAL row shapes — exercise the serde derives the cov
+    /// scan flagged (the derive code only runs on (de)serialize).
+    #[test]
+    fn track_j_row_shapes_serde_roundtrip_cov() {
+        let tl = KgTimelineRow {
+            target_id: "t".into(),
+            relation: "related_to".into(),
+            valid_from: "2026-01-01T00:00:00Z".into(),
+            valid_until: None,
+            observed_by: Some("ai:obs".into()),
+            title: "ti".into(),
+            target_namespace: "ns".into(),
+        };
+        let j = serde_json::to_string(&tl).expect("ser KgTimelineRow");
+        let back: KgTimelineRow = serde_json::from_str(&j).expect("de KgTimelineRow");
+        assert_eq!(back, tl);
+    }
+    /// Coverage (per-module floor): drive the existing test-mod mock
+    /// adapters through their FULL method surface. The backfill tests
+    /// only call `list_unembedded` + `set_embeddings_batch` on
+    /// `StalledBackfillStore`, and only `begin_transaction` on
+    /// `DefaultImplProbeStore`, leaving their other stub bodies (and
+    /// the inherited trait defaults they expose) unexercised. A
+    /// conformance sweep covers them and pins that the mocks behave as
+    /// documented — cheap, real, and zero new mock surface.
+    #[tokio::test]
+    async fn mock_adapters_method_surface_conformance_cov() {
+        let ctx = CallerContext::for_agent("cov-agent");
+        let mem = {
+            let now = chrono::Utc::now().to_rfc3339();
+            Memory {
+                id: "cov-mem".into(),
+                tier: Tier::Mid,
+                namespace: "cov".into(),
+                title: "t".into(),
+                content: "c".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                ..Memory::default()
+            }
+        };
+        let link = MemoryLink {
+            source_id: "a".into(),
+            target_id: "b".into(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+        };
+        let reg = AgentRegistration {
+            agent_id: "ai:cov".into(),
+            agent_type: "nhi".into(),
+            capabilities: vec![],
+            registered_at: chrono::Utc::now().to_rfc3339(),
+            last_seen_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let filter = Filter::default();
+
+        // --- StalledBackfillStore: exercise the methods the backfill
+        // tests never call.
+        let sb = StalledBackfillStore {
+            rows: 1,
+            written_per_chunk: 1,
+        };
+        assert!(!sb.capabilities().is_empty());
+        assert_eq!(sb.store(&ctx, &mem).await.unwrap(), mem.id);
+        assert!(sb.get(&ctx, "x").await.is_err());
+        sb.update(&ctx, "x", UpdatePatch::default()).await.unwrap();
+        sb.delete(&ctx, "x").await.unwrap();
+        assert!(sb.list(&ctx, &filter).await.unwrap().is_empty());
+        assert!(sb.search(&ctx, "q", &filter).await.unwrap().is_empty());
+        assert!(sb.verify(&ctx, "x").await.unwrap().integrity_ok);
+        sb.link(&ctx, &link).await.unwrap();
+        assert!(sb.list_links(None).await.unwrap().is_empty());
+        sb.register_agent(&ctx, &reg).await.unwrap();
+
+        // --- DefaultImplProbeStore: exercise every stub + the inherited
+        // trait defaults it does NOT override (list_by_namespace_prefix
+        // now surfaces UnsupportedCapability per #1625).
+        let dp = DefaultImplProbeStore;
+        assert!(dp.capabilities().is_empty());
+        assert!(dp.store(&ctx, &mem).await.is_err());
+        assert!(dp.get(&ctx, "x").await.is_err());
+        assert!(dp.update(&ctx, "x", UpdatePatch::default()).await.is_err());
+        assert!(dp.delete(&ctx, "x").await.is_err());
+        assert!(dp.list(&ctx, &filter).await.unwrap().is_empty());
+        assert!(dp.search(&ctx, "q", &filter).await.unwrap().is_empty());
+        assert!(dp.verify(&ctx, "x").await.unwrap().integrity_ok);
+        dp.link(&ctx, &link).await.unwrap();
+        assert!(dp.list_links(None).await.unwrap().is_empty());
+        dp.register_agent(&ctx, &reg).await.unwrap();
+        // Inherited defaults (no override on DefaultImplProbeStore):
+        assert!(
+            matches!(
+                dp.list_by_namespace_prefix(&ctx, "x", 10).await,
+                Err(StoreError::UnsupportedCapability { .. })
+            ),
+            "#1625: default surfaces UnsupportedCapability"
+        );
+        // store_with_embedding default forwards to store (Err here).
+        assert!(
+            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]))
+                .await
+                .is_err()
+        );
+        // list_unembedded default = empty; update_embedding default = Ok.
+        assert!(dp.list_unembedded(&ctx, 8).await.unwrap().is_empty());
+        dp.update_embedding(&ctx, "x", None).await.unwrap();
+    }
 }

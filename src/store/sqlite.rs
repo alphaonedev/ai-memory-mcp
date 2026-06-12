@@ -1531,6 +1531,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inherited_trait_defaults_roundtrip_cov() {
+        // Coverage: SqliteStore inherits the trait DEFAULT impls for
+        // store_with_embedding (forwards to store), store_batch (loops
+        // store), list_unembedded (empty), set_embeddings_batch (loops
+        // update_embedding — a no-op on the inline-vector-less sqlite
+        // adapter). Exercise each so the SAL default arms are covered.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let ctx = CallerContext::for_agent("alice");
+
+        let m = test_memory("def-emb", "store_with_embedding default forwards to store");
+        let id = store
+            .store_with_embedding(&ctx, &m, Some(&[0.1f32, 0.2, 0.3]))
+            .await
+            .expect("store_with_embedding default");
+        assert_eq!(id, m.id);
+        assert!(store.get(&ctx, &m.id).await.expect("get").id == m.id);
+
+        let batch = vec![
+            test_memory("def-batch-1", "batch row one body"),
+            test_memory("def-batch-2", "batch row two body"),
+        ];
+        let ids = store
+            .store_batch(&ctx, &batch)
+            .await
+            .expect("store_batch default");
+        assert_eq!(ids.len(), 2);
+
+        // list_unembedded default = empty; update_embedding default =
+        // no-op Ok; set_embeddings_batch default loops it and counts.
+        let unembedded = store
+            .list_unembedded(&ctx, 10)
+            .await
+            .expect("list_unembedded default");
+        assert!(unembedded.is_empty(), "default list_unembedded is empty");
+        let written = store
+            .set_embeddings_batch(&ctx, &[(m.id.clone(), vec![0.4f32, 0.5])])
+            .await
+            .expect("set_embeddings_batch default");
+        assert_eq!(
+            written, 1,
+            "default set_embeddings_batch counts the no-op writes"
+        );
+    }
+
+    #[tokio::test]
     async fn list_by_namespace_prefix_finds_matches_beyond_first_page_1625() {
         // #1625 — the old trait default applied `limit` BEFORE the
         // prefix filter, so matches sorting after the first `limit`
