@@ -11030,7 +11030,7 @@ impl MemoryStore for PostgresStore {
         })?;
 
         sqlx::query(
-            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
              WHERE namespace = $1 AND title = $2",
         )
         .bind(AGENTS_NAMESPACE)
@@ -11102,7 +11102,7 @@ impl MemoryStore for PostgresStore {
         })?;
 
         sqlx::query(
-            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
              WHERE namespace = $1 AND title = $2",
         )
         .bind(AGENTS_NAMESPACE)
