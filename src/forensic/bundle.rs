@@ -2019,4 +2019,254 @@ mod tests {
             "MAX_TAR_ENTRY_BYTES must accommodate the largest realistic forensic bundle"
         );
     }
+
+    // --- FUPC coverage additions (cov-fupc) ---
+
+    /// `run_export` with an explicit `--output` writes the bundle there
+    /// and prints the path, returning exit 0.
+    #[test]
+    fn run_export_explicit_output_writes_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, db_path) = open_tmp_db(&tmp);
+        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
+        drop(conn); // run_export reopens the db itself
+        let output = tmp.path().join("explicit.tar");
+        let args = ExportForensicBundleArgs {
+            memory_id: id,
+            include_reflections: true,
+            include_transcripts: false,
+            include_atomisation_chain: true,
+            output: Some(output.clone()),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            run_export(&db_path, &args, &mut out).expect("run_export")
+        };
+        assert_eq!(code, 0);
+        assert!(output.exists(), "bundle file must be written");
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(printed.contains("forensic bundle written"));
+        assert!(printed.contains("explicit.tar"));
+    }
+
+    /// `run_export` with no `--output` derives a default
+    /// `forensic-bundle-<short>-<ts>.tar` name in the cwd. We run it in
+    /// a scoped cwd so the derived file lands under the tempdir.
+    #[test]
+    fn run_export_default_output_name_derived() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, db_path) = open_tmp_db(&tmp);
+        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
+        drop(conn);
+        let args = ExportForensicBundleArgs {
+            memory_id: id.clone(),
+            include_reflections: false,
+            include_transcripts: false,
+            include_atomisation_chain: false,
+            output: None,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            run_export(&db_path, &args, &mut out).expect("run_export default name")
+        };
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(stdout).unwrap();
+        // The default name carries the 8-char short id prefix.
+        let short: String = id.chars().take(8).collect();
+        assert!(
+            printed.contains(&format!("forensic-bundle-{short}-")),
+            "default name must embed short id: {printed}"
+        );
+    }
+
+    /// `run_verify` returns exit 0 on a clean bundle and prints
+    /// "verification OK".
+    #[test]
+    fn run_verify_clean_bundle_exit_zero() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _) = open_tmp_db(&tmp);
+        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
+        let args = ExportForensicBundleArgs {
+            memory_id: id,
+            include_reflections: true,
+            include_transcripts: false,
+            include_atomisation_chain: true,
+            output: None,
+        };
+        let bundle_path = tmp.path().join("ok.tar");
+        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
+        let vargs = VerifyForensicBundleArgs {
+            bundle_path: bundle_path.clone(),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            run_verify(&vargs, &mut out).expect("run_verify")
+        };
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(printed.contains("verification OK"));
+    }
+
+    /// `run_verify` returns exit 2 (not 1) on a tampered bundle and
+    /// prints "verification FAILED".
+    #[test]
+    fn run_verify_tampered_bundle_exit_two() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _) = open_tmp_db(&tmp);
+        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
+        let args = ExportForensicBundleArgs {
+            memory_id: id,
+            include_reflections: true,
+            include_transcripts: false,
+            include_atomisation_chain: true,
+            output: None,
+        };
+        let bundle_path = tmp.path().join("bad.tar");
+        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
+        // Tamper a memory entry.
+        let bytes = fs::read(&bundle_path).unwrap();
+        let mut files = read_ustar(&bytes).unwrap();
+        let key = files
+            .keys()
+            .find(|k| k.starts_with("memories/"))
+            .unwrap()
+            .clone();
+        files.insert(key, b"tampered".to_vec());
+        fs::write(&bundle_path, pack_to_vec(&files).unwrap()).unwrap();
+
+        let vargs = VerifyForensicBundleArgs { bundle_path };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            run_verify(&vargs, &mut out).expect("run_verify")
+        };
+        assert_eq!(code, 2, "verification failure must exit 2 (#709)");
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(printed.contains("verification FAILED"));
+    }
+
+    /// `verify` flags an entry present in the tar but absent from the
+    /// manifest as an extra file (not part of the signed inventory).
+    #[test]
+    fn verify_detects_extra_file_in_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _) = open_tmp_db(&tmp);
+        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
+        let args = ExportForensicBundleArgs {
+            memory_id: id,
+            include_reflections: true,
+            include_transcripts: false,
+            include_atomisation_chain: true,
+            output: None,
+        };
+        let bundle_path = tmp.path().join("extra.tar");
+        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
+        let bytes = fs::read(&bundle_path).unwrap();
+        let mut files = read_ustar(&bytes).unwrap();
+        files.insert("memories/intruder.json".to_string(), b"{}".to_vec());
+        fs::write(&bundle_path, pack_to_vec(&files).unwrap()).unwrap();
+
+        let report = verify(&bundle_path).expect("verify");
+        assert!(
+            report
+                .extra_files
+                .contains(&"memories/intruder.json".to_string()),
+            "extra file must be reported: {:?}",
+            report.extra_files
+        );
+    }
+
+    /// `verify` reports a missing manifest as a hard error.
+    #[test]
+    fn verify_missing_manifest_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut files = BundleFiles::new();
+        files.insert("memories/x.json".to_string(), b"{}".to_vec());
+        let bundle_path = tmp.path().join("no-manifest.tar");
+        fs::write(&bundle_path, pack_to_vec(&files).unwrap()).unwrap();
+        let err = verify(&bundle_path).unwrap_err();
+        assert!(format!("{err:#}").contains("missing manifest"));
+    }
+
+    /// `verify_edge_envelope` returns true for an unsigned edge (no
+    /// signature to falsify).
+    #[test]
+    fn verify_edge_envelope_unsigned_is_ok() {
+        let edge = EdgeEnvelope {
+            source_id: "a".into(),
+            target_id: "b".into(),
+            relation: "reflects_on".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: "unsigned".into(),
+            signature_hex: None,
+        };
+        assert!(verify_edge_envelope(&edge));
+    }
+
+    /// A signed edge with no `observed_by` is a broken envelope → false.
+    #[test]
+    fn verify_edge_envelope_signed_without_agent_is_false() {
+        let edge = EdgeEnvelope {
+            source_id: "a".into(),
+            target_id: "b".into(),
+            relation: "reflects_on".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: "signed".into(),
+            signature_hex: Some("deadbeef".into()),
+        };
+        assert!(!verify_edge_envelope(&edge));
+    }
+
+    /// A signed edge naming an agent whose key is not enrolled locally
+    /// is conservatively treated as a verification failure → false.
+    #[test]
+    fn verify_edge_envelope_unknown_signer_is_false() {
+        let edge = EdgeEnvelope {
+            source_id: "a".into(),
+            target_id: "b".into(),
+            relation: "reflects_on".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            observed_by: Some("nobody:unenrolled".into()),
+            valid_from: None,
+            valid_until: None,
+            attest_level: "signed".into(),
+            signature_hex: Some("deadbeef".into()),
+        };
+        assert!(!verify_edge_envelope(&edge));
+    }
+
+    /// `SignatureStatus` + `VerificationReport` serialize to JSON (the
+    /// shape `run_verify` prints).
+    #[test]
+    fn verification_report_serializes() {
+        let report = VerificationReport {
+            ok: true,
+            bundle_path: "/x.tar".into(),
+            manifest_present: true,
+            schema_version: BUNDLE_SCHEMA_VERSION,
+            memory_id: "abc".into(),
+            signer_agent_id: None,
+            signature_status: SignatureStatus::Absent,
+            tampered_files: Vec::new(),
+            missing_files: Vec::new(),
+            extra_files: Vec::new(),
+            chain_edges_failed: Vec::new(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("abc"));
+    }
 }
