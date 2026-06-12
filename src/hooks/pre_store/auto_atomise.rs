@@ -676,4 +676,141 @@ mod tests {
         // outputs. The function must not panic regardless.
         let _ = _test_only_take_dispatch();
     }
+
+    // ------------------------------------------------------------------
+    // run_deferred_atomise worker-fn coverage (2026-06-11): drive the
+    // worker entry-point directly (no thread spawn) through its db-open
+    // failure arm and each AtomiseError match arm. The worker logs +
+    // swallows every outcome (notify-class contract), so the assertion
+    // is "no panic" + the side effect on the DB where observable.
+    // ------------------------------------------------------------------
+
+    use crate::atomisation::curator::{Atom, Curator, CuratorError};
+    use crate::atomisation::{Atomiser, AtomiserConfig};
+    use crate::config::FeatureTier;
+    use std::sync::Mutex as StdMutex;
+
+    /// Mock curator returning a programmable response sequence.
+    struct SeqCurator {
+        responses: StdMutex<Vec<Result<Vec<Atom>, CuratorError>>>,
+    }
+    impl SeqCurator {
+        fn new(responses: Vec<Result<Vec<Atom>, CuratorError>>) -> Self {
+            Self {
+                responses: StdMutex::new(responses),
+            }
+        }
+    }
+    impl Curator for SeqCurator {
+        fn decompose(
+            &self,
+            _body: &str,
+            _max_atom_tokens: u32,
+            _max_retries: u32,
+        ) -> Result<Vec<Atom>, CuratorError> {
+            let mut rs = self.responses.lock().unwrap();
+            if rs.is_empty() {
+                return Err(CuratorError::LlmUnavailable("seq exhausted".into()));
+            }
+            rs.remove(0)
+        }
+    }
+
+    fn atomiser_with(curator: Box<dyn Curator>, tier: FeatureTier) -> Atomiser {
+        Atomiser::new(curator, None, AtomiserConfig::default(), tier)
+    }
+
+    fn seed_big_memory(conn: &Connection, ns: &str) -> String {
+        // A body well over the default max_atom_tokens so the pre-flight
+        // token check does not short-circuit to SourceTooSmall.
+        let body = "sentence number that adds tokens. ".repeat(400);
+        let mem = make_memory(ns, &body);
+        db::insert(conn, &mem).unwrap()
+    }
+
+    #[test]
+    fn run_deferred_atomise_db_open_failure_is_swallowed() {
+        // Point at a path whose parent is a regular file → db::open
+        // fails → the worker logs the error and returns (no panic).
+        let (_conn, dir, _path) = fresh_db();
+        let file_as_parent = dir.path().join("not-a-dir");
+        std::fs::write(&file_as_parent, b"x").unwrap();
+        let bad_path = file_as_parent.join("child.db");
+        let atomiser = atomiser_with(Box::new(SeqCurator::new(vec![])), FeatureTier::Smart);
+        run_deferred_atomise(&bad_path, &atomiser, "mem-x", 200, "ai:test");
+    }
+
+    #[test]
+    fn run_deferred_atomise_not_found_arm() {
+        let (_conn, _dir, path) = fresh_db();
+        let atomiser = atomiser_with(Box::new(SeqCurator::new(vec![])), FeatureTier::Smart);
+        // No memory with this id exists → AtomiseError::NotFound arm.
+        run_deferred_atomise(&path, &atomiser, "no-such-id", 200, "ai:test");
+    }
+
+    #[test]
+    fn run_deferred_atomise_source_too_small_arm() {
+        let (conn, _dir, path) = fresh_db();
+        let mem = make_memory("ns-small", "tiny");
+        let id = db::insert(&conn, &mem).unwrap();
+        drop(conn); // worker opens its own connection
+        let atomiser = atomiser_with(Box::new(SeqCurator::new(vec![])), FeatureTier::Smart);
+        // Body under the token budget → SourceTooSmall warn arm.
+        run_deferred_atomise(&path, &atomiser, &id, 200, "ai:test");
+    }
+
+    #[test]
+    fn run_deferred_atomise_curator_failed_arm() {
+        let (conn, _dir, path) = fresh_db();
+        let id = seed_big_memory(&conn, "ns-curfail");
+        drop(conn);
+        let atomiser = atomiser_with(
+            Box::new(SeqCurator::new(vec![Err(CuratorError::LlmUnavailable(
+                "down".into(),
+            ))])),
+            FeatureTier::Smart,
+        );
+        // Curator errors → CuratorFailed error arm.
+        run_deferred_atomise(&path, &atomiser, &id, 50, "ai:test");
+    }
+
+    #[test]
+    fn run_deferred_atomise_tier_locked_arm() {
+        let (conn, _dir, path) = fresh_db();
+        let id = seed_big_memory(&conn, "ns-tier");
+        drop(conn);
+        // Keyword tier → atomise_sync returns TierLocked immediately.
+        let atomiser = atomiser_with(Box::new(SeqCurator::new(vec![])), FeatureTier::Keyword);
+        run_deferred_atomise(&path, &atomiser, &id, 50, "ai:test");
+    }
+
+    #[test]
+    fn run_deferred_atomise_success_arm() {
+        let (conn, _dir, path) = fresh_db();
+        let id = seed_big_memory(&conn, "ns-ok");
+        drop(conn);
+        // A valid 2-atom split → Ok success arm (info log + atom writes).
+        let atomiser = atomiser_with(
+            Box::new(SeqCurator::new(vec![Ok(vec![
+                Atom {
+                    text: "first atomic proposition".into(),
+                },
+                Atom {
+                    text: "second atomic proposition".into(),
+                },
+            ])])),
+            FeatureTier::Smart,
+        );
+        run_deferred_atomise(&path, &atomiser, &id, 50, "ai:test");
+        // Verify the atoms landed (the source got atomised).
+        let conn2 = db::open(&path).unwrap();
+        let atom_count: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                rusqlite::params![&id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(atom_count >= 2, "expected atoms written, got {atom_count}");
+    }
 }

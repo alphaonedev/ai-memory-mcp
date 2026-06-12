@@ -574,6 +574,63 @@ mod tests {
         assert!(matches!(err, CuratorError::LlmUnavailable(_)));
     }
 
+    /// Drives the production `LlmGenerate for OllamaClient` impl (the
+    /// error-mapping arm) AND the real-sleep `LlmCurator::new`
+    /// constructor. Points the client at an unreachable loopback port so
+    /// `generate` fails fast; `max_retries=0` means the real
+    /// `std::thread::sleep` is never actually called (no backoff on the
+    /// final attempt), keeping the test sub-second while still
+    /// exercising `LlmCurator::new`'s body.
+    #[test]
+    fn llm_curator_new_with_real_ollama_client_maps_unavailable() {
+        // Reserved-but-unbound loopback port (TEST-NET style high port).
+        let client = crate::llm::OllamaClient::new_with_url_no_health_check(
+            "http://127.0.0.1:1",
+            "test-model",
+        )
+        .expect("build no-health-check client");
+        // Exercise the production `LlmCurator::new` (real sleep) path.
+        let curator = LlmCurator::new(client);
+        let err = curator.decompose("body", 200, 0).unwrap_err();
+        // The OllamaClient generate failed (connection refused) and the
+        // production LlmGenerate impl mapped it to LlmUnavailable.
+        assert!(
+            matches!(err, CuratorError::LlmUnavailable(_)),
+            "expected LlmUnavailable, got {err:?}"
+        );
+    }
+
+    /// Drives the `LlmGenerate for Arc<OllamaClient>` pass-through impl
+    /// (lines 341-346) used by the MCP daemon wiring.
+    #[test]
+    fn llm_curator_arc_ollama_passthrough_maps_unavailable() {
+        let client = Arc::new(
+            crate::llm::OllamaClient::new_with_url_no_health_check(
+                "http://127.0.0.1:1",
+                "test-model",
+            )
+            .expect("build no-health-check client"),
+        );
+        let curator = LlmCurator::with_sleep(client, |_| {});
+        let err = curator.decompose("body", 200, 0).unwrap_err();
+        assert!(matches!(err, CuratorError::LlmUnavailable(_)));
+    }
+
+    /// CuratorError Display arms — both variants render their prefix.
+    #[test]
+    fn curator_error_display_arms() {
+        assert_eq!(
+            CuratorError::LlmUnavailable("x".into()).to_string(),
+            "curator LLM unavailable: x"
+        );
+        assert_eq!(
+            CuratorError::MalformedResponse("y".into()).to_string(),
+            "curator response malformed: y"
+        );
+        let e = CuratorError::MalformedResponse("z".into());
+        let _: &dyn std::error::Error = &e;
+    }
+
     #[test]
     fn extract_first_json_object_handles_braces_in_strings() {
         // Brace-counting must NOT be fooled by braces inside JSON strings.
