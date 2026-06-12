@@ -8375,4 +8375,123 @@ decision = "allow"
              (the .ok() arm), preset fallback fires"
         );
     }
+
+    // -----------------------------------------------------------------
+    // FUPC — body-exercising sweep-loop tests. The pre-existing
+    // spawn-and-abort smoke tests use a 60s interval, so the loop body
+    // (the actual db::gc / sweep / checkpoint calls + their info-log
+    // branches) never fires inside the 20ms abort window. These drive a
+    // 1ms interval against seeded state so the body runs at least once.
+    // -----------------------------------------------------------------
+
+    /// `spawn_gc_loop` body actually runs and archives an expired memory
+    /// (the `Ok(n) if n > 0` info-log arm fires).
+    #[tokio::test]
+    async fn fupc_spawn_gc_loop_body_archives_expired() {
+        use crate::models::{Memory, MemoryKind, Tier};
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        // Seed a memory already past its expiry so the gc sweep archives it.
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Short,
+            namespace: "gc-ns".to_string(),
+            title: "expired".to_string(),
+            content: "stale".to_string(),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            created_at: "2000-01-01T00:00:00Z".to_string(),
+            updated_at: "2000-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2000-01-01T01:00:00Z".to_string()),
+            memory_kind: MemoryKind::Observation,
+            ..Memory::default()
+        };
+        db::insert(&conn, &mem).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true, // archive_on_gc
+        )));
+        let h = spawn_gc_loop(state.clone(), Some(30), Duration::from_millis(1));
+        // Let several sweep ticks fire.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        h.abort();
+        let _ = h.await;
+        // The expired row must be gone from `memories` (archived + deleted).
+        let lock = state.lock().await;
+        let remaining: i64 = lock
+            .0
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'gc-ns'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "gc loop body must have archived the expired row"
+        );
+    }
+
+    /// `spawn_wal_checkpoint_loop` body actually runs (no panic, clean
+    /// abort) against a live WAL-mode db.
+    #[tokio::test]
+    async fn fupc_spawn_wal_checkpoint_loop_body_runs() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_wal_checkpoint_loop(state, Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    /// `spawn_transcript_lifecycle_sweep_loop` body runs at a 1ms cadence
+    /// against a clean db (the `Ok(r)` arm with a zero-count report — no
+    /// info-log, no panic, clean abort).
+    #[tokio::test]
+    async fn fupc_spawn_transcript_lifecycle_sweep_body_runs_clean() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_transcript_lifecycle_sweep_loop(
+            state,
+            crate::config::TranscriptsConfig::default(),
+            Duration::from_millis(1),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    /// `spawn_agent_quota_reset_loop` body runs at a 1ms cadence against
+    /// a clean db (the reset SQL touches zero rows, no panic, clean
+    /// abort).
+    #[tokio::test]
+    async fn fupc_spawn_agent_quota_reset_body_runs_clean() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_agent_quota_reset_loop(state, Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.abort();
+        let _ = h.await;
+    }
 }
