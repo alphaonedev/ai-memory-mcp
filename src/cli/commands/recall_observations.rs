@@ -174,4 +174,70 @@ mod tests {
             "got: {stdout}"
         );
     }
+
+    #[test]
+    fn recall_observations_cli_text_output_with_rows_and_filters() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Seed a real memory (the ledger FK requires it), then record a
+        // recall observation referencing it.
+        let mem_id = crate::cli::test_utils::seed_memory(&db, "ns", "obs-mem", "body");
+        {
+            let conn = db::open(&db).unwrap();
+            crate::observations::record_recall(
+                &conn,
+                "recall-xyz",
+                &[crate::observations::Candidate {
+                    memory_id: &mem_id,
+                    retriever: "hybrid",
+                    rank: 1,
+                    score: 0.9,
+                }],
+            )
+            .expect("record_recall");
+        }
+        let args = RecallObservationsArgs {
+            recall_id: Some("recall-xyz".into()),
+            consumed: false,
+            unconsumed: true,
+            since: Some("2026-01-01T00:00:00+00:00".into()),
+            until: Some("2030-01-01T00:00:00+00:00".into()),
+            limit: Some(50),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_recall_observations(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("1 row(s)"), "got: {stdout}");
+        assert!(stdout.contains("recall=recall-xyz"), "got: {stdout}");
+        assert!(
+            stdout.contains(&format!("memory={mem_id}")),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("rank=1"), "got: {stdout}");
+        assert!(stdout.contains("consumed=false"), "got: {stdout}");
+    }
+
+    #[test]
+    fn recall_observations_cli_consumed_filter_param() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = RecallObservationsArgs {
+            recall_id: None,
+            consumed: true,
+            unconsumed: false,
+            since: None,
+            until: None,
+            limit: None,
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_recall_observations(&db, &args, &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["count"].as_u64(), Some(0));
+    }
 }

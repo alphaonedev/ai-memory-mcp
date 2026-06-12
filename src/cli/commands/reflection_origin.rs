@@ -109,4 +109,26 @@ mod tests {
         let err = cmd_reflection_origin(&db, &args, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("reflection-origin"), "got: {err}");
     }
+
+    #[test]
+    fn reflection_origin_cli_text_output() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mid = seed_memory(&db, "ns", "plain-text", "body");
+        let args = ReflectionOriginArgs {
+            memory_id: mid,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_reflection_origin(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(
+            stdout.contains("reflection-origin: is_reflection=false"),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("peer_origin="), "got: {stdout}");
+        assert!(stdout.contains("original_depth="), "got: {stdout}");
+    }
 }

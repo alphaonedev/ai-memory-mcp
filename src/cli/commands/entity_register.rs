@@ -132,4 +132,27 @@ mod tests {
         let err = cmd_entity_register(&db, &args, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("entity-register"), "got: {err}");
     }
+
+    #[test]
+    fn entity_register_cli_text_output_no_aliases_no_agent() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = EntityRegisterArgs {
+            canonical_name: "Dave".into(),
+            namespace: "characters".into(),
+            aliases: vec![],
+            agent_id: None,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_entity_register(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(
+            stdout.contains("entity-register: entity_id="),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("created=true"), "got: {stdout}");
+    }
 }

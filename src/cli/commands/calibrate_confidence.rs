@@ -147,6 +147,65 @@ fn render_table(report: &CalibrationReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_utils::TestEnv;
+
+    #[test]
+    fn run_rejects_without_from_shadow() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = CalibrateConfidenceArgs {
+            from_shadow: false,
+            days: 30,
+            output_format: OutputFormat::Json,
+        };
+        let code = {
+            let mut out = env.output();
+            run(&db, &args, &mut out).expect("ok")
+        };
+        assert_eq!(code, 2);
+        assert!(env.stderr_str().contains("--from-shadow"));
+    }
+
+    #[test]
+    fn run_json_output_on_fresh_db() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // db::open materialises the schema (incl. the v39 shadow table)
+        // so calibrate_from_shadow runs against a real, empty table.
+        let _ = crate::storage::open(&db).unwrap();
+        let args = CalibrateConfidenceArgs {
+            from_shadow: true,
+            days: 7,
+            output_format: OutputFormat::Json,
+        };
+        let code = {
+            let mut out = env.output();
+            run(&db, &args, &mut out).expect("ok")
+        };
+        assert_eq!(code, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(parsed["window_days"].as_i64(), Some(7));
+        assert_eq!(parsed["total_observations"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn run_table_output_on_fresh_db() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let _ = crate::storage::open(&db).unwrap();
+        let args = CalibrateConfidenceArgs {
+            from_shadow: true,
+            days: 30,
+            output_format: OutputFormat::Table,
+        };
+        let code = {
+            let mut out = env.output();
+            run(&db, &args, &mut out).expect("ok")
+        };
+        assert_eq!(code, 0);
+        assert!(env.stdout_str().contains("CONFIDENCE CALIBRATION REPORT"));
+    }
 
     fn empty_report() -> CalibrationReport {
         CalibrationReport {
