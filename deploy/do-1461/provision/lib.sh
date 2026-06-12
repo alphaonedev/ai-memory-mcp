@@ -126,7 +126,7 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # routes 89/75), #1536 tooling fixes ride the repo not the binary,
 # plus the coverage-lift tests (no production codegen change). Schema
 # stays v57. Supersedes the e8783689 RE-RUN golden.
-GOLDEN_SHA256="${GOLDEN_SHA256:-19281891a196c8a93f33e6f6729f2fdbf4f9353862269d850e8b64cfde073818}"
+GOLDEN_SHA256="${GOLDEN_SHA256:-9300e7d8d195ff70dc327dcd8f00be3ea91f4aa3d64de4f0629ba25ad5251be5}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
