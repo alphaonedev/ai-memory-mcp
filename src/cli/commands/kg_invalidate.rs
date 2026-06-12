@@ -147,4 +147,58 @@ mod tests {
         let err = cmd_kg_invalidate(&db, &args, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("kg-invalidate"), "got: {err}");
     }
+
+    #[test]
+    fn kg_invalidate_cli_text_output_found_with_params() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let a = seed_memory(&db, "ns", "src", "alpha");
+        let b = seed_memory(&db, "ns", "tgt", "beta");
+        {
+            let conn = db::open(&db).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from)
+                 VALUES (?1, ?2, 'related_to', ?3, ?3)",
+                rusqlite::params![a, b, now],
+            )
+            .expect("insert link");
+        }
+        let args = KgInvalidateArgs {
+            source_id: a,
+            target_id: b,
+            relation: "related_to".into(),
+            valid_until: Some("2026-06-01T00:00:00+00:00".into()),
+            agent_id: Some("ai:invalidator".into()),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_kg_invalidate(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("invalidated"), "got: {stdout}");
+        assert!(stdout.contains("valid_until="), "got: {stdout}");
+    }
+
+    #[test]
+    fn kg_invalidate_cli_text_output_not_found() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let a = seed_memory(&db, "ns", "src2", "alpha");
+        let b = seed_memory(&db, "ns", "tgt2", "beta");
+        let args = KgInvalidateArgs {
+            source_id: a,
+            target_id: b,
+            relation: "related_to".into(),
+            valid_until: None,
+            agent_id: None,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_kg_invalidate(&db, &args, &mut out).expect("ok");
+        }
+        assert!(env.stdout_str().contains("kg-invalidate: not found"));
+    }
 }

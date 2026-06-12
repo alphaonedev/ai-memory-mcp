@@ -72,7 +72,37 @@ pub fn cmd_dependents_of_invalidated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_utils::TestEnv;
+    use crate::cli::test_utils::{TestEnv, seed_memory};
+
+    #[test]
+    fn dependents_of_invalidated_cli_text_output_with_dependents() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let target = seed_memory(&db, "ns", "invalidated-reflection", "content");
+        let dep = seed_memory(&db, "ns", "dependent-memory", "content");
+        {
+            let conn = db::open(&db).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from)
+                 VALUES (?1, ?2, 'reflects_on', ?3, ?3)",
+                rusqlite::params![dep, target, now],
+            )
+            .expect("insert reflects_on");
+        }
+        let args = DependentsOfInvalidatedArgs {
+            memory_id: target,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_dependents_of_invalidated(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("1 dependent(s)"), "got: {stdout}");
+        assert!(stdout.contains("ns=ns"), "got: {stdout}");
+        assert!(stdout.contains(&dep), "got: {stdout}");
+    }
 
     #[test]
     fn dependents_of_invalidated_cli_empty_returns_zero() {
