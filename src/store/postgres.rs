@@ -13775,6 +13775,26 @@ impl MemoryStore for PostgresStore {
         let written_id = self.store(ctx, &mem).await?;
         let created = prior.is_none();
 
+        // #1654 — populate the `entity_aliases` join table. The SAL
+        // trait `entity_get_by_alias` resolves by JOINing `entity_aliases`
+        // (NOT `metadata.aliases`), so without this insert a SAL-trait-
+        // registered entity is never alias-resolvable. Idempotent:
+        // PK (entity_id, alias) + ON CONFLICT DO NOTHING, so a re-register
+        // that unions new aliases only adds the missing rows. Mirrors the
+        // kg-handler `INSERT INTO entity_aliases` path so the two SAL
+        // methods are consistent.
+        for alias in &union {
+            sqlx::query(
+                "INSERT INTO entity_aliases (entity_id, alias) VALUES ($1, $2)
+                 ON CONFLICT (entity_id, alias) DO NOTHING",
+            )
+            .bind(&written_id)
+            .bind(alias)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("entity_register populate entity_aliases", e))?;
+        }
+
         Ok(EntityRegistration {
             entity_id: written_id,
             canonical_name: canonical_name.to_string(),
