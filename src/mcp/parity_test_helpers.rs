@@ -114,3 +114,42 @@ pub(crate) fn assert_descriptions_match(tool_name: &str, derived: &serde_json::M
         }
     }
 }
+
+#[cfg(test)]
+mod self_tests {
+    //! FUPC — direct happy-path exercise of the four shared parity
+    //! helpers from a single call site. The per-tool `d1_5_986_tests`
+    //! mods drive these in aggregate; this self-test pins the helper
+    //! bodies (legacy lookup, schemars derive, both ref-resolution
+    //! arms, set + description parity) so the module's own coverage is
+    //! not solely a side effect of caller compilation.
+    use super::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for, legacy_props,
+    };
+
+    #[test]
+    fn helpers_round_trip_on_memory_delete() {
+        // `memory_delete` exists in the legacy catalog and has a stable
+        // `DeleteRequest` schemars type → all four helpers run clean.
+        let legacy = legacy_props("memory_delete");
+        assert!(
+            !legacy.is_empty(),
+            "memory_delete must carry legacy properties"
+        );
+        let derived = derived_props_for::<crate::mcp::delete::DeleteRequest>();
+        assert_property_set_parity("memory_delete", &derived);
+        assert_descriptions_match("memory_delete", &derived);
+    }
+
+    #[test]
+    fn derived_props_for_empty_request_is_empty_map() {
+        // A unit-like request struct produces no `properties` key; the
+        // helper's empty-map fallback arm must yield an empty map, not
+        // panic.
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct EmptyReq {}
+        let derived = derived_props_for::<EmptyReq>();
+        assert!(derived.is_empty());
+    }
+}
