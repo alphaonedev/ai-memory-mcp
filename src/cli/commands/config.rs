@@ -444,6 +444,113 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::CliOutput;
+
+    /// Serialise the `$HOME`-mutating `run`/`migrate` tests — env
+    /// mutation is process-global, so two of these running concurrently
+    /// would race on `AppConfig::config_path()`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `migrate` against a `config.toml` materialised under a
+    /// tempdir `$HOME`. Returns (exit_code, stderr_text). Holds the
+    /// env lock for the duration.
+    fn run_migrate_with_home(
+        config_body: Option<&str>,
+        dry_run: bool,
+        also_clean: bool,
+    ) -> (i32, String) {
+        let _g = env_lock();
+        let home = tempfile::tempdir().expect("tempdir");
+        if let Some(body) = config_body {
+            let dir = home.path().join(".config/ai-memory");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.toml"), body).unwrap();
+        }
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: serialised via `env_lock()`; restored before the lock
+        // is released so no other test observes the tempdir HOME.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let code = {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let args = ConfigCliArgs {
+                action: ConfigAction::Migrate {
+                    dry_run,
+                    also_clean_claude_json: also_clean,
+                },
+            };
+            run(std::path::Path::new("unused.db"), args, &mut out).expect("run ok")
+        };
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        (code, String::from_utf8(stderr).unwrap())
+    }
+
+    #[test]
+    fn run_migrate_missing_file_returns_two() {
+        let (code, stderr) = run_migrate_with_home(None, false, false);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("no config file"), "got: {stderr}");
+    }
+
+    #[test]
+    fn run_migrate_invalid_toml_returns_three() {
+        let (code, stderr) = run_migrate_with_home(Some("this is { not valid toml"), false, false);
+        assert_eq!(code, 3);
+        assert!(stderr.contains("not valid TOML"), "got: {stderr}");
+    }
+
+    #[test]
+    fn run_migrate_already_v2_is_noop() {
+        let body = "schema_version = 2\ntier = \"autonomous\"\n\n[llm]\nbackend = \"xai\"\n";
+        let (code, stderr) = run_migrate_with_home(Some(body), false, false);
+        assert_eq!(code, 0);
+        assert!(stderr.contains("no migration needed"), "got: {stderr}");
+    }
+
+    #[test]
+    fn run_migrate_dry_run_returns_one() {
+        let body = "llm_model = \"gemma\"\nollama_url = \"http://localhost:11434\"\n";
+        let (code, stderr) = run_migrate_with_home(Some(body), true, true);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("DRY RUN"), "got: {stderr}");
+        assert!(
+            stderr.contains("also-clean-claude-json also skipped"),
+            "got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn run_migrate_apply_writes_backup_and_succeeds() {
+        let body = "llm_model = \"gemma\"\nollama_url = \"http://localhost:11434\"\n";
+        let (code, stderr) = run_migrate_with_home(Some(body), false, false);
+        assert_eq!(code, 0);
+        assert!(stderr.contains("OK: migrated"), "got: {stderr}");
+        assert!(stderr.contains("backup:"), "got: {stderr}");
+        // The non-clean branch advises re-running with the clean flag.
+        assert!(stderr.contains("--also-clean-claude-json"), "got: {stderr}");
+    }
+
+    #[test]
+    fn run_migrate_apply_with_clean_no_claude_json() {
+        let body = "embedding_model = \"nomic_embed_v15\"\n";
+        let (code, stderr) = run_migrate_with_home(Some(body), false, true);
+        assert_eq!(code, 0);
+        // No ~/.claude.json in the tempdir HOME → INFO no-change line.
+        assert!(stderr.contains("no mcpServers env block"), "got: {stderr}");
+    }
 
     #[test]
     fn migrate_v1_legacy_fields_to_sections() {
