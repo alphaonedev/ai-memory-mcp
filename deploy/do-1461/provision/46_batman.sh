@@ -144,8 +144,8 @@ activate_form7_on_peer() {
     # take (the pre-#1536 silent no-op class).
     VERDICT=\$(AM governance check-action --kind filesystem_write --path /tmp/probe-1536 --json 2>/dev/null | grep -o '\"decision\":\"[a-z]*\"' | head -1)
     case \"\$VERDICT\" in
-      *refuse*) : ;;
-      *) echo \"WARN: Form-7 verify on $host expected refuse for /tmp write, got '\$VERDICT'\" >&2; exit 64 ;;
+      *deny*|*refuse*) : ;;
+      *) echo \"WARN: Form-7 verify on $host expected deny for /tmp write, got '\$VERDICT'\" >&2; exit 64 ;;
     esac
   " || die "[$host] Form-7 activation/verification FAILED (see stderr above — an inactive rules engine on a fleet peer is fatal to the #1535 reference architecture; #1610/#1614)"
 
@@ -186,7 +186,13 @@ activate_form7_on_peer() {
   ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' -H 'x-agent-id: $HARNESS_AGENT_ID' -X POST -H 'content-type: application/json' --data '$std_payload' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" >/dev/null 2>&1 \
     || die "[$host] namespace set-standard HTTP call failed — Form-2/6 bind incomplete (#1614)"
   # Belt-and-braces: prove the standard round-trips from the live store.
-  ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' https://$host:$FEDERATION_PORT/api/v1/namespaces/$DEFAULT_NAMESPACE/standard" 2>/dev/null \
+  # NOTE (#1614): the path-form GET /namespaces/<ns>/standard is an honest
+  # HTTP 501 stub on postgres-backed daemons ("not yet implemented for
+  # postgres-backed daemon" — a v0.7.x trait-coverage parity gap; the SET
+  # path-form DOES persist, DB-confirmed). The IMPLEMENTED postgres read
+  # arm is the query-string form GET /namespaces?namespace=<ns>, which
+  # returns {standard_id: <id>, ...}. Probe that one.
+  ssh_node "$ip" "curl -fsS $curl_base -H 'x-api-key: $api_key' 'https://$host:$FEDERATION_PORT/api/v1/namespaces?namespace=$DEFAULT_NAMESPACE'" 2>/dev/null \
       | grep -q "$std_id" \
     || die "[$host] GET-standard probe did not return id=$std_id — Form-2/6 bind did not persist (#1614)"
   log "[$host] Form-2/6 namespace standard bound on $DEFAULT_NAMESPACE (id=$std_id, live store, GET-probe verified)"
