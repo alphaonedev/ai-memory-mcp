@@ -154,7 +154,18 @@ jobs:
       # Trim DWARF + LTO via env-var overrides on the dev profile
       # (NOT `--profile coverage`) so cargo-llvm-cov's report step
       # finds the artifact dir at its default `debug/` path.
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      #
+      # 2026-06-12 (GA coverage campaign) — debuginfo dropped 1 → 0.
+      # The uniform-90 campaign added ~25 new tests/cov_*.rs integration
+      # binaries; under `-C instrument-coverage` + debuginfo the
+      # `target/llvm-cov-target/` dir overflowed the runner root
+      # partition ("No space left on device" killed step 11 on run
+      # 27426987513). llvm-cov line/region coverage is sourced from the
+      # embedded `__llvm_covmap` instrumentation, NOT DWARF, so debug=0
+      # shrinks every instrumented binary (~half) with zero loss of the
+      # per-file line% the threshold checker reads. mold already cut
+      # link RSS; this cuts on-disk size.
+      CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_DEV_LTO: "false"
     steps:
       - uses: actions/checkout@v4
