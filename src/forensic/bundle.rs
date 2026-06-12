@@ -2077,10 +2077,20 @@ mod tests {
         let printed = String::from_utf8(stdout).unwrap();
         // The default name carries the 8-char short id prefix.
         let short: String = id.chars().take(8).collect();
+        let prefix = format!("forensic-bundle-{short}-");
         assert!(
-            printed.contains(&format!("forensic-bundle-{short}-")),
+            printed.contains(&prefix),
             "default name must embed short id: {printed}"
         );
+        // The default-name arm writes the bundle into the CWD (relative
+        // path). Clean up the artifact so the test does not litter the
+        // repo root. Recover the exact name from the stdout line.
+        if let Some(name) = printed
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("forensic bundle written: "))
+        {
+            let _ = fs::remove_file(name);
+        }
     }
 
     /// `run_verify` returns exit 0 on a clean bundle and prints
