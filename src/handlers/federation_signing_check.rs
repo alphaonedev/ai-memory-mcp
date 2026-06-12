@@ -1185,6 +1185,207 @@ pub(super) fn verify_get_signature_or_reject(
 // trait impl tests in `src/store/sqlite.rs::1639` and the postgres
 // adapter's coverage in `src/store/postgres.rs::5288+`. Composed
 // together this anchors the post-#961 contract.
+#[cfg(test)]
+mod verify_arm_tests {
+    //! cov3 — direct coverage for the `verify_signature_or_reject` /
+    //! `verify_get_signature_or_reject` enforcement-matrix arms the HTTP
+    //! integration suites do not reach: the `(sig, no-enrolled-key)`
+    //! refusal, the `(None, None)` `peer_not_enrolled` #1088 strict arm,
+    //! the require-sig-off bypass, and the `canonical_get_bytes` builder.
+    //! These functions are `pub(super)` so the test calls them directly
+    //! with synthetic headers rather than going through the router.
+
+    use super::{
+        canonical_get_bytes, require_peer_enrollment_enabled, verify_get_signature_or_reject,
+        verify_signature_or_reject,
+    };
+    use crate::federation::signing::{
+        ED25519_PREFIX, REQUIRE_NONCE_ENV, REQUIRE_SIG_ENV, SIGNATURE_HEADER,
+    };
+    use crate::identity::replay::FederationNonceCache;
+    use axum::http::{HeaderMap, HeaderValue};
+    use base64::Engine as _;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sig_header_value() -> HeaderValue {
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        HeaderValue::from_str(&format!("{ED25519_PREFIX}{b64}")).unwrap()
+    }
+
+    #[test]
+    fn canonical_get_bytes_joins_with_newlines() {
+        let out = canonical_get_bytes("GET", "/api/v1/sync/since", "limit=10");
+        assert_eq!(out, b"GET\n/api/v1/sync/since\nlimit=10");
+        // Empty query still emits the trailing newline boundary.
+        let out2 = canonical_get_bytes("GET", "/p", "");
+        assert_eq!(out2, b"GET\n/p\n");
+    }
+
+    #[test]
+    fn require_peer_enrollment_env_arms() {
+        let _g = env_lock();
+        // SAFETY: env mutation under the test-scoped lock.
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+        assert!(!require_peer_enrollment_enabled(), "unset → permissive");
+        unsafe {
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+        }
+        assert!(require_peer_enrollment_enabled(), "1 → strict");
+        unsafe {
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "true");
+        }
+        assert!(require_peer_enrollment_enabled(), "true → strict");
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+    }
+
+    #[test]
+    fn push_require_sig_off_bypasses() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "0");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("peer-x"), &cache);
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+        }
+        assert!(out.is_none(), "REQUIRE_SIG=0 bypasses every branch");
+    }
+
+    #[test]
+    fn push_sig_present_no_enrolled_key_refuses() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(SIGNATURE_HEADER, sig_header_value());
+        let cache = FederationNonceCache::default();
+        // peer-id has no on-disk key → (Some, None) arm.
+        let out = verify_signature_or_reject(&headers, b"{}", Some("no-such-peer"), &cache);
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+        }
+        let resp = out.expect("sig-present + no-key MUST refuse");
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn push_none_none_permissive_when_not_strict() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+        let cache = FederationNonceCache::default();
+        // No sig, no enrolled key, not strict → allow-with-WARN (None).
+        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+        }
+        assert!(out.is_none(), "(None,None) permissive arm must allow");
+    }
+
+    #[test]
+    fn push_none_none_strict_refuses_1088() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+        let resp = out.expect("#1088 strict must refuse unenrolled peer");
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn get_require_sig_off_bypasses() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "0");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_get_signature_or_reject(
+            "GET",
+            "/api/v1/sync/since",
+            "limit=10",
+            &HeaderMap::new(),
+            Some("peer-x"),
+            &cache,
+        );
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+        }
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn get_sig_present_no_enrolled_key_refuses() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::set_var(REQUIRE_NONCE_ENV, "0");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(SIGNATURE_HEADER, sig_header_value());
+        let cache = FederationNonceCache::default();
+        let out = verify_get_signature_or_reject(
+            "GET",
+            "/api/v1/sync/since",
+            "limit=10",
+            &headers,
+            Some("no-such-peer"),
+            &cache,
+        );
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var(REQUIRE_NONCE_ENV);
+        }
+        let resp = out.expect("get sig-present + no-key MUST refuse");
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn get_none_none_strict_refuses_1088() {
+        let _g = env_lock();
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_get_signature_or_reject(
+            "GET",
+            "/api/v1/sync/since",
+            "limit=10",
+            &HeaderMap::new(),
+            Some("unenrolled"),
+            &cache,
+        );
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+        let resp = out.expect("#1088 strict must refuse on GET path");
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+}
+
 #[cfg(all(test, feature = "sal"))]
 mod sal_boundary_961_tests {
     use crate::models::GovernancePolicy;

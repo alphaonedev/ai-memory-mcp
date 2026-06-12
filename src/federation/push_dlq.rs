@@ -668,3 +668,249 @@ impl FederationDlqSink for PostgresDlqSink {
         Ok(row.0)
     }
 }
+
+#[cfg(test)]
+mod replay_arm_tests {
+    //! Coverage for the `replay_once` decision arms that the
+    //! `tests/federation_dlq_replay.rs` integration suite does not reach
+    //! (quarantine skip, peer-no-longer-in-config, empty-queue gauge
+    //! refresh, pending-count-error fallback) plus the `replay_max_batch`
+    //! env resolver arms. A lightweight in-memory mock sink drives the
+    //! arms without any HTTP peer; the `Fail` arm is reached by pointing
+    //! the worker at a peer URL that refuses TCP.
+
+    use super::{
+        DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
+        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, replay_max_batch,
+        replay_once,
+    };
+    use crate::federation::{FederationConfig, PeerEndpoint};
+    use crate::replication::QuorumPolicy;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// In-memory mock sink that records which trait methods fired so the
+    /// test can assert the worker took the expected branch.
+    #[derive(Default)]
+    struct MockSink {
+        rows: Mutex<Vec<FederationPushDlqRow>>,
+        marked_replayed: Mutex<Vec<i64>>,
+        bumped: Mutex<Vec<(i64, String)>>,
+        count_should_err: bool,
+        take_should_err: bool,
+        take_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FederationDlqSink for MockSink {
+        async fn enqueue_push_failure(
+            &self,
+            memory_id: &str,
+            peer_id: &str,
+            payload_json: &serde_json::Value,
+            last_error: &str,
+        ) -> Result<(), String> {
+            self.rows.lock().unwrap().push(FederationPushDlqRow {
+                id: (self.rows.lock().unwrap().len() + 1) as i64,
+                memory_id: memory_id.to_string(),
+                peer_id: peer_id.to_string(),
+                payload_json: payload_json.clone(),
+                attempt_count: 1,
+                last_error: last_error.to_string(),
+            });
+            Ok(())
+        }
+
+        async fn take_pending_dlq_rows(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<FederationPushDlqRow>, String> {
+            self.take_calls.fetch_add(1, Ordering::SeqCst);
+            if self.take_should_err {
+                return Err("mock take error".to_string());
+            }
+            Ok(self.rows.lock().unwrap().clone())
+        }
+
+        async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+            self.marked_replayed.lock().unwrap().push(id);
+            Ok(())
+        }
+
+        async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
+            self.bumped
+                .lock()
+                .unwrap()
+                .push((id, last_error.to_string()));
+            Ok(())
+        }
+
+        async fn pending_dlq_count(&self) -> Result<i64, String> {
+            if self.count_should_err {
+                return Err("mock count error".to_string());
+            }
+            Ok(self.rows.lock().unwrap().len() as i64)
+        }
+    }
+
+    fn cfg_with_peer(peer_id: &str, url: &str) -> FederationConfig {
+        FederationConfig {
+            policy: QuorumPolicy::new(1, 1, Duration::from_millis(200), Duration::from_secs(30))
+                .unwrap(),
+            peers: vec![PeerEndpoint {
+                id: peer_id.to_string(),
+                sync_push_url: url.to_string(),
+            }],
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            sender_agent_id: "ai:cov3-dlq".to_string(),
+            api_key: None,
+            signing_key: None,
+            dlq_sink: None,
+        }
+    }
+
+    fn row(id: i64, peer_id: &str, attempt_count: i32) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: format!("mem-{id}"),
+            peer_id: peer_id.to_string(),
+            payload_json: serde_json::json!({"id": format!("mem-{id}")}),
+            attempt_count,
+            last_error: String::new(),
+        }
+    }
+
+    #[test]
+    fn replay_max_batch_env_arms() {
+        let _g = env_lock();
+        // SAFETY: env mutation under the test-scoped lock.
+        unsafe {
+            std::env::remove_var(ENV_FED_DLQ_REPLAY_MAX_BATCH);
+        }
+        assert_eq!(
+            replay_max_batch(),
+            DEFAULT_REPLAY_MAX_BATCH,
+            "unset → default"
+        );
+
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "5000");
+        }
+        assert_eq!(replay_max_batch(), 5000, "valid override honoured");
+
+        // Below the REPLAY_BATCH_SIZE floor → default with warn.
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "10");
+        }
+        assert_eq!(
+            replay_max_batch(),
+            DEFAULT_REPLAY_MAX_BATCH,
+            "below floor falls through"
+        );
+
+        // Garbage → default.
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "not-a-number");
+        }
+        assert_eq!(
+            replay_max_batch(),
+            DEFAULT_REPLAY_MAX_BATCH,
+            "garbage → default"
+        );
+
+        // Exactly the floor is accepted.
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, &REPLAY_BATCH_SIZE.to_string());
+        }
+        assert_eq!(replay_max_batch(), REPLAY_BATCH_SIZE, "floor accepted");
+
+        unsafe {
+            std::env::remove_var(ENV_FED_DLQ_REPLAY_MAX_BATCH);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_queue_only_refreshes_gauge() {
+        let sink = MockSink::default();
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert_eq!(sink.take_calls.load(Ordering::SeqCst), 1);
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+        assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quarantined_row_is_skipped() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(row(1, "peer-0", MAX_REPLAY_ATTEMPTS));
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        // Quarantined → neither replayed nor bumped; no POST attempted.
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+        assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_no_longer_in_config_bumps_and_leaves() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(row(7, "peer-gone", 1));
+        // Config has a DIFFERENT peer, so the row's peer is unresolvable.
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        let bumped = sink.bumped.lock().unwrap();
+        assert_eq!(bumped.len(), 1);
+        assert_eq!(bumped[0].0, 7);
+        assert!(bumped[0].1.contains("no longer in FederationConfig"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_peer_yields_fail_and_bumps() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(row(3, "peer-0", 1));
+        // TCP refused (port 1) → post_once returns Fail → bump.
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert!(
+            !sink.bumped.lock().unwrap().is_empty(),
+            "a failed POST must bump attempt_count"
+        );
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_count_error_degrades_to_fixed_batch() {
+        let mut sink = MockSink::default();
+        sink.count_should_err = true;
+        sink.rows.lock().unwrap().push(row(1, "peer-gone", 1));
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        // Count error → fixed batch; take still runs; peer-gone arm bumps.
+        replay_once(&cfg, &sink).await;
+        assert_eq!(sink.take_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn take_error_returns_early() {
+        let mut sink = MockSink::default();
+        sink.take_should_err = true;
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        // Take errored → early return, no replay/bump.
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+        assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+}

@@ -178,3 +178,138 @@ pub(crate) fn to_value_or_500<T: serde::Serialize + ?Sized>(
             .into_response()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the handler error-sanitization helpers. Each branch
+    //! of `sanitize_bulk_row_error` is pinned, and each response builder
+    //! is driven through `IntoResponse` so the status + sanitized body
+    //! are verified end-to-end (the bodies must NEVER echo the raw inner
+    //! error string).
+
+    use super::{
+        bad_request_opaque, governance_error_500, handler_error_500, internal_error_response,
+        sanitize_bulk_row_error, to_value_or_500,
+    };
+    use axum::http::StatusCode;
+
+    async fn body_string(resp: axum::response::Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("collect body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[test]
+    fn sanitize_classifies_each_allowlisted_bucket() {
+        // Validation family — every trigger substring maps to the same label.
+        for raw in [
+            "title cannot be empty",
+            "content exceeds max length",
+            "id has invalid characters",
+            "tag has invalid control characters",
+            "priority must be 1-10",
+            "namespace is required",
+        ] {
+            assert_eq!(
+                sanitize_bulk_row_error(raw),
+                "validation failed",
+                "validation trigger {raw:?} must classify as validation failed"
+            );
+        }
+        assert_eq!(
+            sanitize_bulk_row_error("title already exists in namespace alpha"),
+            "conflict: already exists"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("UNIQUE constraint failed: memories.id"),
+            "conflict: already exists"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("memory abc123 not found"),
+            "not found"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("write denied by governance policy"),
+            "forbidden"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("permission check failed"),
+            "forbidden"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("quorum not met for namespace"),
+            "replication unavailable"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("fanout to peer host:bob failed"),
+            "replication unavailable"
+        );
+        assert_eq!(
+            sanitize_bulk_row_error("peer host:bob unreachable"),
+            "replication unavailable"
+        );
+        // Unmatched → safe default; must NOT echo the raw SQL/path detail.
+        let raw = "near \"SELECT\": syntax error in /var/db/ai-memory.db";
+        let label = sanitize_bulk_row_error(raw);
+        assert_eq!(label, "internal error");
+        assert!(
+            !label.contains("SELECT") && !label.contains("/var/db"),
+            "default label must not leak the raw inner detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_error_response_is_sanitized_500() {
+        let resp = internal_error_response("ctx", &"raw sql leak DROP TABLE memories");
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("DROP TABLE"), "body must not echo raw error");
+        assert!(body.contains("error"));
+    }
+
+    #[tokio::test]
+    async fn handler_error_500_is_sanitized() {
+        let resp = handler_error_500(&"rusqlite: database is locked at /secret/path.db");
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("/secret/path"));
+    }
+
+    #[tokio::test]
+    async fn governance_error_500_is_sanitized() {
+        let resp = governance_error_500(&"rule provider timeout details");
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("timeout details"));
+        assert!(body.contains("error"));
+    }
+
+    #[tokio::test]
+    async fn bad_request_opaque_is_400_and_opaque() {
+        let resp = bad_request_opaque("ctx", &"INSERT INTO memories raw text");
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.contains("INSERT INTO"));
+        assert_eq!(body, r#"{"error":"invalid request"}"#);
+    }
+
+    #[test]
+    fn to_value_or_500_ok_on_serializable() {
+        let v = to_value_or_500("ctx", &serde_json::json!({"k": 1})).expect("serializes");
+        assert_eq!(v["k"], 1);
+    }
+
+    #[tokio::test]
+    async fn to_value_or_500_err_on_non_string_map_key() {
+        use std::collections::HashMap;
+        // serde_json fails to serialise a map with non-string keys.
+        let mut m: HashMap<Vec<u8>, i32> = HashMap::new();
+        m.insert(vec![1, 2, 3], 9);
+        let err = to_value_or_500("ctx", &m).expect_err("non-string key must fail");
+        let (status, body) = body_string(err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("serialisation failed"));
+    }
+}
