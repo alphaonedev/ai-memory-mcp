@@ -118,15 +118,19 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # parity fix; pre-fix every recall on a postgres-backed peer pulled a
 # mid-tier row's +7d backstop in to now+1d). Schema stays v57 (no new
 # migrations). Supersedes the e0ad8c34 Phase-3 golden.
-# Re-pinned 2026-06-11 (GA push): release/v0.7.0 @ ee00d8bb. Carries the
-# full GA fix train on top of e8783689: #1608 (27-column
+# Re-pinned 2026-06-12 (GA coverage campaign): release/v0.7.0 @ 5ffc33bb.
+# Carries the full GA fix train on top of e8783689 PLUS the COV-4
+# postgres source fix ffb87b6e (bind updated_at as ::timestamptz in
+# {bind,revoke}_agent_pubkey — the prior text bind broke on pg), which
+# changes the sal-postgres binary, so the golden is re-pinned off the
+# 9300e7d8 (ee00d8bb) build. Prior train still rides: #1608 (27-column
 # store_with_embedding + store/store_batch QW-2 parity), #1542
 # (AGE-projection SAVEPOINT isolation — links no longer silently
 # rolled back on LOAD-refused roles), #1539 (PUT /agents/{id}/pubkey,
 # routes 89/75), #1536 tooling fixes ride the repo not the binary,
-# plus the coverage-lift tests (no production codegen change). Schema
-# stays v57. Supersedes the e8783689 RE-RUN golden.
-GOLDEN_SHA256="${GOLDEN_SHA256:-9300e7d8d195ff70dc327dcd8f00be3ea91f4aa3d64de4f0629ba25ad5251be5}"
+# plus the uniform-90 coverage-lift tests (no production codegen
+# change beyond ffb87b6e). Schema stays v57. Supersedes 9300e7d8.
+GOLDEN_SHA256="${GOLDEN_SHA256:-c7c0bddaee3b601c8b18e07ec0a16d5d1e13a937a62e8d0827a147d66ee5fcac}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
