@@ -79,7 +79,19 @@ const QUAL_6_CEILING: usize = 90;
 /// verdict be unit-tested without env mutation), so collapsing it
 /// to dodge the ratchet would be a regression. Net acknowledged
 /// addition: +1.
-const QUAL_7_CEILING: usize = 26;
+///
+/// 2026-06-12 — raised 26 → 29 for the GA uniform-90 coverage
+/// campaign's in-file `#[cfg(test)]` mock impl of the
+/// `FederationDlqStore` trait in `src/federation/push_dlq.rs`
+/// (the replay-closure seam). The trait's methods
+/// (`mark_dlq_row_replayed` / `bump_dlq_attempt` / the take-closure)
+/// are deliberately `Result<(), String>` — the same documented
+/// closure-framework carve-out as the daemon_runtime pair above —
+/// so the test mock that exercises the postgres/sqlite replay arms
+/// MUST match the trait signature. These 3 sites are test-only and
+/// unavoidable; no new production string-error contract was added
+/// (the trait pre-existed). Net acknowledged addition: +3.
+const QUAL_7_CEILING: usize = 29;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {
