@@ -172,4 +172,116 @@ mod tests {
         let err = cmd_replay(&db, &args, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("replay"), "got: {err}");
     }
+
+    #[test]
+    fn replay_cli_text_output_with_transcript_lists_entries() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Anchor memory must be owned by the CLI-resolved caller so the
+        // #1075 visibility gate (default scope=private) lets the replay
+        // through.
+        let caller = crate::identity::resolve_agent_id(None, None).unwrap();
+        let mid = {
+            let conn = db::open(&db).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            let mem = crate::models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: crate::models::Tier::Mid,
+                namespace: "ns".to_string(),
+                title: "replay-text-src".to_string(),
+                content: "content".to_string(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "import".to_string(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({"agent_id": caller}),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+            };
+            db::insert(&conn, &mem).expect("insert anchor")
+        };
+        // Seed a transcript and a provenance link so the text-output
+        // transcript loop fires.
+        {
+            let conn = db::open(&db).unwrap();
+            let t = crate::transcripts::storage::store(&conn, "ns", "transcript body", None)
+                .expect("store transcript");
+            crate::transcripts::storage::link_transcript(&conn, &mid, &t.id, None, None)
+                .expect("link transcript");
+        }
+        let args = ReplayArgs {
+            memory_id: mid,
+            verbose: false,
+            depth: None,
+            agent_id: None,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_replay(&db, &args, &mut out).expect("replay ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("replay: 1 transcript(s)"), "got: {stdout}");
+        assert!(stdout.contains("created="), "got: {stdout}");
+        assert!(stdout.contains("truncated=false"), "got: {stdout}");
+    }
+
+    #[test]
+    fn replay_cli_text_output_no_transcripts() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mid = seed_memory(&db, "ns", "replay-empty", "content");
+        let args = ReplayArgs {
+            memory_id: mid,
+            verbose: false,
+            depth: None,
+            agent_id: None,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_replay(&db, &args, &mut out).expect("replay ok");
+        }
+        assert!(env.stdout_str().contains("replay: 0 transcript(s)"));
+    }
+
+    #[test]
+    fn replay_cli_depth_and_agent_id_params_threaded() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mid = seed_memory(&db, "ns", "replay-depth", "content");
+        let args = ReplayArgs {
+            memory_id: mid,
+            verbose: true,
+            depth: Some(0),
+            agent_id: Some("ai:replay-tester".to_string()),
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_replay(&db, &args, &mut out).expect("replay ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(
+            envelope
+                .get("transcripts")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            0
+        );
+    }
 }

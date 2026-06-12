@@ -131,4 +131,36 @@ mod tests {
         let err = cmd_kg_timeline(&db, &args, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("kg-timeline"), "got: {err}");
     }
+
+    #[test]
+    fn kg_timeline_cli_text_output_with_events_and_all_params() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let src = seed_memory(&db, "ns", "tl-src", "content");
+        let tgt = seed_memory(&db, "ns", "tl-tgt", "target content");
+        {
+            let conn = db::open(&db).unwrap();
+            let vf = "2026-01-02T00:00:00+00:00";
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from)
+                 VALUES (?1, ?2, 'related_to', ?3, ?3)",
+                rusqlite::params![src, tgt, vf],
+            )
+            .expect("insert link");
+        }
+        let args = KgTimelineArgs {
+            source_id: src,
+            since: Some("2026-01-01T00:00:00+00:00".into()),
+            until: Some("2026-12-31T00:00:00+00:00".into()),
+            limit: Some(100),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_kg_timeline(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("event(s)"), "got: {stdout}");
+        assert!(stdout.contains("related_to"), "got: {stdout}");
+    }
 }

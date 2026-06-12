@@ -150,4 +150,37 @@ mod tests {
         let err = cmd_find_paths(&db, &args, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("find-paths"), "got: {err}");
     }
+
+    #[test]
+    fn find_paths_cli_text_output_with_path_and_all_params() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let a = seed_memory(&db, "ns", "fp-src", "alpha");
+        let b = seed_memory(&db, "ns", "fp-tgt", "beta");
+        {
+            let conn = db::open(&db).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from)
+                 VALUES (?1, ?2, 'related_to', ?3, ?3)",
+                rusqlite::params![a, b, now],
+            )
+            .expect("insert link");
+        }
+        let args = FindPathsArgs {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            max_depth: Some(4),
+            max_results: Some(10),
+            include_invalidated: true,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_find_paths(&db, &args, &mut out).expect("find-paths ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("path(s)"), "got: {stdout}");
+        assert!(stdout.contains("->"), "got: {stdout}");
+    }
 }

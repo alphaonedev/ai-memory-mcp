@@ -190,4 +190,70 @@ mod tests {
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["count"].as_u64(), Some(0));
     }
+
+    /// Seed source + target memories with a `related_to` edge, then
+    /// drive the text-output path (the memory-row loop) plus every
+    /// optional param arm.
+    #[test]
+    fn kg_query_cli_text_output_with_rows_and_all_params() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let src = seed_memory(&db, "ns", "kg-src", "content");
+        let tgt = seed_memory(&db, "ns", "kg-tgt", "target content");
+        {
+            let conn = db::open(&db).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at, valid_from)
+                 VALUES (?1, ?2, 'related_to', ?3, ?3)",
+                rusqlite::params![src, tgt, now],
+            )
+            .expect("insert link");
+        }
+        let args = KgQueryArgs {
+            source_id: Some(src),
+            by_source_uri: None,
+            max_depth: Some(2),
+            namespace: Some("ns".into()),
+            valid_at: None,
+            allowed_agents: None,
+            limit: Some(100),
+            include_invalidated: true,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_kg_query(&db, &args, &mut out).expect("kg-query ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("row(s)"), "got: {stdout}");
+        assert!(stdout.contains("related_to"), "got: {stdout}");
+        assert!(stdout.contains("kg-tgt"), "got: {stdout}");
+    }
+
+    #[test]
+    fn kg_query_cli_by_source_uri_path() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "kg-uri", "content");
+        let args = KgQueryArgs {
+            source_id: None,
+            by_source_uri: Some("doc://nonexistent".into()),
+            max_depth: None,
+            namespace: None,
+            // Exercise the valid_at + allowed_agents param-build arms
+            // (they thread into the params bag regardless of row count).
+            valid_at: Some(chrono::Utc::now().to_rfc3339()),
+            allowed_agents: Some("test-agent, , ai:other".into()),
+            limit: None,
+            include_invalidated: false,
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_kg_query(&db, &args, &mut out).expect("kg-query ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["count"].as_u64(), Some(0));
+    }
 }

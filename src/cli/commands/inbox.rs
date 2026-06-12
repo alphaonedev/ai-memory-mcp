@@ -111,4 +111,52 @@ mod tests {
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["count"].as_u64(), Some(0));
     }
+
+    #[test]
+    fn inbox_cli_text_output_lists_messages() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Seed a message into _messages/ai:bob (the inbox namespace).
+        crate::cli::test_utils::seed_memory(
+            &db,
+            "_messages/ai:bob",
+            "hello bob",
+            "message payload",
+        );
+        let args = InboxArgs {
+            agent_id: Some("ai:bob".into()),
+            unread_only: false,
+            limit: Some(10),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_inbox(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("1 message(s) for ai:bob"), "got: {stdout}");
+        assert!(stdout.contains("from=test-agent"), "got: {stdout}");
+        assert!(stdout.contains("hello bob"), "got: {stdout}");
+        assert!(stdout.contains("read=false"), "got: {stdout}");
+    }
+
+    #[test]
+    fn inbox_cli_unread_only_filters() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        crate::cli::test_utils::seed_memory(&db, "_messages/ai:carol", "msg", "body");
+        let args = InboxArgs {
+            agent_id: Some("ai:carol".into()),
+            unread_only: true,
+            limit: None,
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_inbox(&db, &args, &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        // Freshly seeded row has access_count==0 → unread → still listed.
+        assert_eq!(envelope["count"].as_u64(), Some(1));
+    }
 }
