@@ -24,6 +24,25 @@ use ai_memory::cli::helpers::{human_age, id_short};
 #[cfg(test)]
 use ai_memory::tls;
 
+// COVERAGE NOTE (FUPC): the `#[tokio::main] async fn main()` body
+// (lines ~30-97 below) is the real process entry point. It is
+// UNREACHABLE from any in-process test — it performs `Cli::parse()`
+// (reads the live process argv), installs process-wide singletons
+// (color init, OnceLock-backed permissions/hmac/audit posture) and
+// can call `std::process::exit(78)` on a bad hmac secret, which would
+// abort the test harness. Its individual steps are covered indirectly:
+//   - `config::AppConfig::load` / `write_default_if_missing` — config tests
+//   - `daemon_runtime::apply_anonymize_default` — daemon_runtime tests
+//   - `config::set_active_permissions_mode` / `set_active_hooks_hmac_secret`
+//     / `set_allow_loopback_webhooks` — config tests
+//   - `subscriptions::validate_hmac_secret_hex` — subscriptions tests
+//   - `permissions::set_active_permission_rules` — permissions tests
+//   - `logging::init_file_logging` / `audit::init_from_config` — their
+//     own module tests
+//   - `init_forensic_audit` — see `tests::init_forensic_audit_*` below
+//   - `daemon_runtime::run` — the serve_*/cli_*/cov_* integration suite
+// The `std::process::exit(78)` arm (invalid hmac secret) is documented
+// as uncoverable: exercising it would terminate the test process.
 #[tokio::main]
 async fn main() -> Result<()> {
     color::init();
@@ -197,6 +216,36 @@ mod tests {
         assert!(set.contains(&[0xaa; 32]));
         assert!(set.contains(&[0xbb; 32]));
         assert!(set.contains(&[0xcc; 32]));
+    }
+
+    /// FUPC — `init_forensic_audit` resolves the audit dir (here pinned
+    /// to a temp path via `AI_MEMORY_AUDIT_DIR`), loads the (absent)
+    /// daemon signing key, and brings the sink up. A missing key is a
+    /// non-fatal unsigned-rows posture, never a panic. Exercises the
+    /// happy path through `resolve_audit_path` → `dir.parent()` →
+    /// `governance::audit::init`.
+    #[test]
+    fn init_forensic_audit_with_temp_dir_does_not_panic() {
+        // Scratch under the repo's gitignored .local-runs/ per the
+        // project no-/tmp HARD RULE.
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".local-runs")
+            .join("main-init-forensic-audit");
+        std::fs::create_dir_all(&root).ok();
+        let tmp = tempfile::tempdir_in(&root).expect("tempdir under .local-runs");
+        let prev = std::env::var("AI_MEMORY_AUDIT_DIR").ok();
+        // SAFETY: single-threaded test process; env set/restore is local.
+        unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", tmp.path()) };
+
+        let app_config = config::AppConfig::default();
+        // Must not panic and must leave the process bootable (unsigned).
+        init_forensic_audit(&app_config);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_AUDIT_DIR") },
+        }
     }
 
     #[tokio::test]
