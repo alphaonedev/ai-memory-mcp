@@ -124,4 +124,38 @@ mod tests {
         // Aggregate label.
         assert_eq!(envelope["namespace"].as_str(), Some("_global"));
     }
+
+    #[test]
+    fn quota_status_cli_text_output_count_branch() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = QuotaStatusArgs {
+            agent_id: None,
+            namespace: None,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_quota_status(&db, &args, &mut out).expect("ok");
+        }
+        assert!(env.stdout_str().contains("quota-status: 0 row(s)"));
+    }
+
+    #[test]
+    fn quota_status_cli_text_output_agent_namespace_branch() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = QuotaStatusArgs {
+            agent_id: Some("ai:bob".into()),
+            namespace: Some("proj".into()),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_quota_status(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("agent=ai:bob"), "got: {stdout}");
+        assert!(stdout.contains("namespace=proj"), "got: {stdout}");
+    }
 }

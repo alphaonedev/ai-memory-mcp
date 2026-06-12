@@ -88,4 +88,20 @@ mod tests {
         // envelope so existence isn't leaked (#1115 caller-ownership).
         assert_eq!(envelope["count"].as_u64(), Some(0));
     }
+
+    #[test]
+    fn subscription_replay_cli_text_output() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = SubscriptionReplayArgs {
+            subscription_id: "unknown-id".into(),
+            since: "2024-01-01T00:00:00Z".into(),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_subscription_replay(&db, &args, &mut out).expect("ok");
+        }
+        assert!(env.stdout_str().contains("subscription-replay: 0 event(s)"));
+    }
 }
