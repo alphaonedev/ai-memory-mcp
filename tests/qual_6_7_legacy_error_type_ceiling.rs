@@ -86,7 +86,7 @@ const QUAL_6_CEILING: usize = 90;
 /// (the replay-closure seam). The trait's methods
 /// (`mark_dlq_row_replayed` / `bump_dlq_attempt` / the take-closure)
 /// are deliberately `Result<(), String>` — the same documented
-/// closure-framework carve-out as the daemon_runtime pair above —
+/// closure-framework carve-out as the `daemon_runtime` pair above —
 /// so the test mock that exercises the postgres/sqlite replay arms
 /// MUST match the trait signature. These 3 sites are test-only and
 /// unavoidable; no new production string-error contract was added
