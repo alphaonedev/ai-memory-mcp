@@ -100,3 +100,25 @@ pub fn assert_descriptions_match(tool_name: &str, derived: &serde_json::Map<Stri
         }
     }
 }
+
+#[cfg(test)]
+mod self_tests {
+    //! FUPC — direct happy-path exercise of the four D1.4 (#985) shared
+    //! helpers from a single call site so the module's coverage is not
+    //! solely a side effect of the per-tool `d1_4_985_tests` callers.
+    use super::{
+        assert_descriptions_match, assert_property_set_parity, derived_props_for, legacy_props,
+    };
+
+    #[test]
+    fn helpers_round_trip_on_memory_get() {
+        let legacy = legacy_props("memory_get");
+        assert!(
+            !legacy.is_empty(),
+            "memory_get must carry legacy properties"
+        );
+        let derived = derived_props_for::<crate::mcp::get::GetRequest>();
+        assert_property_set_parity("memory_get", &derived);
+        assert_descriptions_match("memory_get", &derived);
+    }
+}
