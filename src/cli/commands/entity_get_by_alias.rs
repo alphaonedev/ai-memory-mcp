@@ -139,4 +139,49 @@ mod tests {
         assert_eq!(envelope["found"].as_bool(), Some(true));
         assert_eq!(envelope["entity_id"].as_str(), Some(expected_id.as_str()));
     }
+
+    #[test]
+    fn entity_get_by_alias_cli_text_output_not_found() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = EntityGetByAliasArgs {
+            alias: "nope".into(),
+            namespace: None,
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_entity_get_by_alias(&db, &args, &mut out).expect("ok");
+        }
+        assert!(env.stdout_str().contains("entity-get-by-alias: no match"));
+    }
+
+    #[test]
+    fn entity_get_by_alias_cli_text_output_found() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        crate::mcp::handle_entity_register(
+            &crate::storage::open(&db).unwrap(),
+            &json!({
+                "canonical_name": "Carol",
+                "namespace": "people",
+                "aliases": ["caz"],
+                "agent_id": "ai:tester",
+            }),
+            None,
+        )
+        .expect("register");
+        let args = EntityGetByAliasArgs {
+            alias: "caz".into(),
+            namespace: Some("people".into()),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_entity_get_by_alias(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("entity_id="), "got: {stdout}");
+        assert!(stdout.contains("canonical_name=Carol"), "got: {stdout}");
+    }
 }

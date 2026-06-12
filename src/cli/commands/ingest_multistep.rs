@@ -130,4 +130,25 @@ mod tests {
         let err = cmd_ingest_multistep(&args, &cfg, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("ingest-multistep"), "got: {err}");
     }
+
+    #[test]
+    fn ingest_multistep_cli_text_output_tier_locked_with_params() {
+        let mut env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let args = IngestMultistepArgs {
+            content: "hello world".into(),
+            namespace: Some("proj".into()),
+            pipeline_variant: Some("four_step".into()),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_ingest_multistep(&args, &cfg, &mut out).expect("ok");
+        }
+        // CLI passes handler=None → always the tier-locked advisory.
+        // (The `variant=...` else-branch in the text formatter is only
+        // reachable when a live LLM handler is present, which the CLI
+        // dispatcher never wires — see module docs.)
+        assert!(env.stdout_str().contains("ingest-multistep: tier-locked:"));
+    }
 }

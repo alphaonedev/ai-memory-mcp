@@ -205,4 +205,31 @@ mod tests {
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert!(envelope.get("id").and_then(Value::as_str).is_some());
     }
+
+    #[test]
+    fn reflect_cli_text_output_with_all_params() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let s = seed_memory(&db, "rns", "reflect-src2", "source content");
+        let args = ReflectArgs {
+            source_ids: vec![s],
+            title: "synthesis-text".into(),
+            content: "reflection body".into(),
+            tier: Some("mid".into()),
+            namespace: Some("rns".into()),
+            priority: Some(7),
+            confidence: Some(0.8),
+            tags: vec!["t1".into(), "t2".into()],
+            depth: Some(1),
+            agent_id: Some("ai:reflector".into()),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_reflect(&db, &args, &mut out).expect("reflect ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("reflect: id="), "got: {stdout}");
+        assert!(stdout.contains("depth="), "got: {stdout}");
+    }
 }

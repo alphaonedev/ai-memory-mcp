@@ -285,4 +285,65 @@ mod tests {
         assert_eq!(v["entity_id"], "alice");
         assert_eq!(v["persona_version"], 1);
     }
+
+    #[test]
+    fn cli_persona_regenerate_no_reflections_returns_two() {
+        // No reflections seeded → curator surfaces NoReflections → exit 2.
+        let (_conn, _dir, db_path) = fresh_db();
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let llm = StubLlm;
+        let args = PersonaArgs {
+            entity_id: "ghost".into(),
+            namespace: "team/alpha".into(),
+            regenerate: true,
+            json: false,
+        };
+        let code = run(&db_path, &args, Some(&llm), None, &mut out).unwrap();
+        assert_eq!(code, 2);
+        drop(out);
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(text.contains("no reflections"), "got: {text}");
+    }
+
+    #[test]
+    fn cli_persona_read_after_regenerate_succeeds() {
+        // Mint a persona via regenerate, then read it back (the default
+        // read path, lines 113-122).
+        let (conn, _dir, db_path) = fresh_db();
+        seed_reflection(&conn, "team/alpha", "alice is precise");
+        let llm = StubLlm;
+        {
+            let mut stdout: Vec<u8> = Vec::new();
+            let mut stderr: Vec<u8> = Vec::new();
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let regen = PersonaArgs {
+                entity_id: "alice".into(),
+                namespace: "team/alpha".into(),
+                regenerate: true,
+                json: false,
+            };
+            assert_eq!(
+                run(&db_path, &regen, Some(&llm), None, &mut out).unwrap(),
+                0
+            );
+        }
+        // Now read without --regenerate.
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let read = PersonaArgs {
+            entity_id: "alice".into(),
+            namespace: "team/alpha".into(),
+            regenerate: false,
+            json: true,
+        };
+        let code = run(&db_path, &read, None, None, &mut out).unwrap();
+        assert_eq!(code, 0);
+        drop(out);
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+        assert_eq!(v["entity_id"], "alice");
+    }
 }
