@@ -9,8 +9,9 @@
 //! Modules lifted here: `handlers/route_1111` (14 MCP-mirror routes),
 //! `handlers/recall` (GET + POST + format/scope/kinds arms),
 //! `handlers/links` (create / delete / get / verify validation arms),
-//! `handlers/kg` (entity_register / kg_query / kg_timeline / kg_invalidate /
-//! kg_find_paths validation arms), `handlers/hook_subscribers`,
+//! `handlers/kg` (`entity_register` / `kg_query` / `kg_timeline` /
+//! `kg_invalidate` / `kg_find_paths` validation arms),
+//! `handlers/hook_subscribers`,
 //! `handlers/subscriptions`.
 
 #![cfg(feature = "sal")]

@@ -15,6 +15,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::redundant_closure_for_method_calls)]
 #![allow(clippy::doc_markdown)]
+#![cfg(feature = "sal")]
 
 use std::sync::Arc;
 
