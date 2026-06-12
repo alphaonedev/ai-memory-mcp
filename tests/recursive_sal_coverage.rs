@@ -124,13 +124,22 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .expect("origin lookup ok for unknown id");
     assert!(missing.is_none(), "unknown id yields None");
 
-    // list_recall_observations() — read path returns Ok (empty ledger on a
-    // fresh store; the recall write path populates it elsewhere).
+    // list_recall_observations() — read path + recall_id filter. The
+    // postgres variant runs against the SHARED CI database, where other
+    // suites (e.g. cov_ga2_postgres's recall_observation_insert) write
+    // observations, so an UNFILTERED scan is non-deterministic. Query a
+    // recall_id this test never writes: the result is deterministically
+    // empty regardless of co-resident suites, and the call still
+    // exercises the read path AND the recall_id predicate.
+    let absent_recall = format!("sal-cov-absent-recall-{}", uuid_like());
     let obs = store
-        .list_recall_observations(None, None, None, None, 50)
+        .list_recall_observations(Some(&absent_recall), None, None, None, 50)
         .await
         .expect("list_recall_observations ok");
-    assert!(obs.is_empty(), "fresh store has no recall observations");
+    assert!(
+        obs.is_empty(),
+        "no observations exist for a recall_id this test never wrote"
+    );
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent
