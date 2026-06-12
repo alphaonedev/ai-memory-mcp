@@ -135,6 +135,13 @@ macro_rules! pg_test {
     };
 }
 
+/// Serializes the federation tests that mutate the process-global
+/// `REQUIRE_SIG_ENV` / `TRUST_BODY_AGENT_ID_ENV` env vars. cargo runs
+/// `#[tokio::test]`s in this binary concurrently, so without this guard
+/// one test's `remove_var` clobbers another's `set_var` mid-request,
+/// flipping the signature gate back on and yielding a spurious 403.
+static FED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
 // ---------------------------------------------------------------------------
 // recall — postgres hybrid/keyword branch
 // ---------------------------------------------------------------------------
@@ -321,6 +328,7 @@ pg_test!(pg_link_verify_nonexistent_arm, url, {
 // ---------------------------------------------------------------------------
 
 pg_test!(pg_sync_push_via_store_invalid_sender_rejected, url, {
+    let _env_guard = FED_ENV_LOCK.lock().await;
     // REQUIRE_SIG=0 so we skip the sig gate; TRUST_BODY so the
     // attestation gate trusts the body sender and we reach the postgres
     // sync_push_via_store entry where validate_agent_id fires.
@@ -361,6 +369,7 @@ pg_test!(pg_sync_push_via_store_invalid_sender_rejected, url, {
 });
 
 pg_test!(pg_sync_push_via_store_empty_batch_ok, url, {
+    let _env_guard = FED_ENV_LOCK.lock().await;
     unsafe {
         std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
         std::env::set_var(

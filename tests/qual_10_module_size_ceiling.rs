@@ -446,7 +446,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // Three lanes landed on this module in one train; the ceiling is
     // pinned from the measured post-merge union: actual LOC 8_293.
     // 8_400 = 8_293 + 107 headroom; far under the 1.5x cap.
-    ("src/daemon_runtime.rs", 8_400),
+    //
+    // 2026-06-12 (GA coverage campaign, uniform-90 floor) — bumped
+    // 8_400 → 8_600. The per-module 90% coverage drive added in-file
+    // `#[cfg(test)]` unit tests pinning previously-dark branches on
+    // existing daemon-boot / dispatch helpers (zero new production
+    // surface; qual_10 counts in-module test LOC), growing the file to
+    // 8_497. 8_600 = 8_497 + 103 headroom; far under the 1.5x cap.
+    ("src/daemon_runtime.rs", 8_600),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

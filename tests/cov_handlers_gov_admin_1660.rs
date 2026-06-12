@@ -24,6 +24,7 @@
 // mid-request by a sibling test — the same idiom (and same allow) as
 // `tests/k10_approval_postgres_dispatch_1618.rs`.
 #![allow(clippy::await_holding_lock)]
+#![cfg(feature = "sal")]
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
