@@ -323,3 +323,213 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::test_utils::{TestEnv, seed_memory};
+
+    fn run_action(env: &mut TestEnv, action: NamespaceAction, json_out: bool) -> Result<()> {
+        let db = env.db_path.clone();
+        let mut out = env.output();
+        run(&db, NamespaceArgs { action }, json_out, &mut out)
+    }
+
+    /// Seed a memory to use as a namespace-standard id (the handler
+    /// requires the standard `id` to resolve to an existing memory row).
+    fn seed_standard(env: &TestEnv, ns: &str, title: &str) -> String {
+        seed_memory(&env.db_path, ns, title, "standard body")
+    }
+
+    #[test]
+    fn set_standard_text_output_with_governance() {
+        let mut env = TestEnv::fresh();
+        let id = seed_standard(&env, "team/alpha", "alpha-standard");
+        run_action(
+            &mut env,
+            NamespaceAction::SetStandard {
+                namespace: "team/alpha".into(),
+                id,
+                parent: None,
+                governance: Some(r#"{"write":"owner"}"#.into()),
+            },
+            false,
+        )
+        .expect("set ok");
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("set standard:"), "got: {stdout}");
+        assert!(stdout.contains("governance merged:"), "got: {stdout}");
+    }
+
+    #[test]
+    fn get_standard_text_no_standard() {
+        let mut env = TestEnv::fresh();
+        run_action(
+            &mut env,
+            NamespaceAction::GetStandard {
+                namespace: "empty/ns".into(),
+                inherit: false,
+            },
+            false,
+        )
+        .expect("get ok");
+        assert!(env.stdout_str().contains("has no standard set"));
+    }
+
+    #[test]
+    fn get_standard_text_with_set_standard() {
+        let mut env = TestEnv::fresh();
+        let id = seed_standard(&env, "team/beta", "beta-standard");
+        run_action(
+            &mut env,
+            NamespaceAction::SetStandard {
+                namespace: "team/beta".into(),
+                id,
+                parent: None,
+                governance: Some(r#"{"write":"any"}"#.into()),
+            },
+            false,
+        )
+        .expect("set ok");
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            NamespaceAction::GetStandard {
+                namespace: "team/beta".into(),
+                inherit: false,
+            },
+            false,
+        )
+        .expect("get ok");
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("standard_id:"), "got: {stdout}");
+        assert!(stdout.contains("governance:"), "got: {stdout}");
+    }
+
+    #[test]
+    fn get_standard_text_inherit_chain() {
+        let mut env = TestEnv::fresh();
+        let id = seed_standard(&env, "team/gamma", "gamma-standard");
+        run_action(
+            &mut env,
+            NamespaceAction::SetStandard {
+                namespace: "team/gamma".into(),
+                id,
+                parent: None,
+                governance: None,
+            },
+            false,
+        )
+        .expect("set ok");
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            NamespaceAction::GetStandard {
+                namespace: "team/gamma".into(),
+                inherit: true,
+            },
+            false,
+        )
+        .expect("get ok");
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("chain:"), "got: {stdout}");
+    }
+
+    #[test]
+    fn clear_standard_text_no_op_then_cleared() {
+        let mut env = TestEnv::fresh();
+        // No standard yet → no-op.
+        run_action(
+            &mut env,
+            NamespaceAction::ClearStandard {
+                namespace: "team/delta".into(),
+            },
+            false,
+        )
+        .expect("clear ok");
+        assert!(env.stdout_str().contains("no-op"));
+
+        // Set then clear → cleared.
+        let id = seed_standard(&env, "team/delta", "delta-standard");
+        run_action(
+            &mut env,
+            NamespaceAction::SetStandard {
+                namespace: "team/delta".into(),
+                id,
+                parent: None,
+                governance: None,
+            },
+            false,
+        )
+        .expect("set ok");
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            NamespaceAction::ClearStandard {
+                namespace: "team/delta".into(),
+            },
+            false,
+        )
+        .expect("clear ok");
+        assert!(env.stdout_str().contains("cleared standard pointer"));
+    }
+
+    #[test]
+    fn batman_policy_emits_json_policy() {
+        let mut env = TestEnv::fresh();
+        run_action(
+            &mut env,
+            NamespaceAction::BatmanPolicy {
+                atomise_threshold: 512,
+                atom_max_tokens: 256,
+                max_reflection_depth: 3,
+                classify_mode: "regex_then_llm".into(),
+            },
+            false,
+        )
+        .expect("batman ok");
+        let policy: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(policy["auto_atomise"].as_bool(), Some(true));
+        assert_eq!(policy["max_reflection_depth"].as_u64(), Some(3));
+        assert_eq!(
+            policy["auto_classify_kind"].as_str(),
+            Some("regex_then_llm")
+        );
+    }
+
+    #[test]
+    fn set_standard_json_output() {
+        let mut env = TestEnv::fresh();
+        let id = seed_standard(&env, "team/json", "json-standard");
+        run_action(
+            &mut env,
+            NamespaceAction::SetStandard {
+                namespace: "team/json".into(),
+                id,
+                parent: None,
+                governance: None,
+            },
+            true,
+        )
+        .expect("set ok");
+        let resp: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(resp["namespace"].as_str(), Some("team/json"));
+    }
+
+    #[test]
+    fn set_standard_invalid_governance_json_errors() {
+        let mut env = TestEnv::fresh();
+        let err = run_action(
+            &mut env,
+            NamespaceAction::SetStandard {
+                namespace: "team/bad".into(),
+                id: "std-b".into(),
+                parent: None,
+                governance: Some("{not json".into()),
+            },
+            false,
+        )
+        .expect_err("must fail");
+        assert!(err.to_string().contains("valid JSON object"), "got: {err}");
+    }
+}

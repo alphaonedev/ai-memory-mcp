@@ -772,6 +772,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_sqlite_human_output_renders_report() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        let url = format!("sqlite://{path}");
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SchemaInitArgs {
+            store_url: url,
+            json: false,
+            embedding_dim: 384,
+        };
+        run(&args, &mut out)
+            .await
+            .expect("schema-init sqlite human");
+        let rendered = String::from_utf8(stdout).unwrap();
+        assert!(
+            rendered.contains("schema initialized at"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("tables:"), "got: {rendered}");
+        assert!(rendered.contains("schema_version:"), "got: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn run_unrecognised_url_bails() {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let args = SchemaInitArgs {
+            store_url: "mysql://user:secret@host/db".to_string(),
+            json: false,
+            embedding_dim: 384,
+        };
+        let err = run(&args, &mut out).await.expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("unrecognised store URL"), "got: {msg}");
+        // #1579 A3 — credential must be redacted in the error.
+        assert!(!msg.contains("secret"), "credential leaked: {msg}");
+    }
+
     // ----------------------------------------------------------------
     // v0.7.0 L3 — Postgres in-place `vector(N)` conversion.
     //
