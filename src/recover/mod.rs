@@ -887,4 +887,127 @@ mod tests {
         assert_eq!(report.lines_atomised, 0);
         assert!(!report.errors.is_empty());
     }
+
+    // Coverage uplift (2026-06-12): timer Default, opts constructor,
+    // error Display arms, db-open failure, cwd-resolve (no override),
+    // and tool-call-only content in write_recovered_turn.
+
+    #[test]
+    fn recover_timer_default_and_phase_lap() {
+        let mut t = RecoverTimer::default();
+        let _ = t.phase_lap();
+        let _ = t.overall_ms();
+    }
+
+    #[test]
+    fn recover_report_new_initializes_host_and_schema() {
+        let r = RecoverReport::new(HostKind::Codex, 57);
+        assert_eq!(r.host_kind, HostKind::Codex);
+        assert_eq!(r.schema_version_at_run, 57);
+        assert!(!r.fast_path_hit);
+    }
+
+    #[test]
+    fn for_session_start_hook_defaults() {
+        let opts = RecoverOpts::for_session_start_hook(HostKind::ClaudeCode, "ai:hook".to_string());
+        assert_eq!(opts.host, HostKind::ClaudeCode);
+        assert_eq!(opts.agent_id, "ai:hook");
+        assert_eq!(opts.limit, DEFAULT_RECOVER_LIMIT);
+        assert!(opts.quiet);
+        assert!(!opts.dry_run);
+        assert!(opts.transcript_override.is_none());
+        assert!(opts.since_iso.is_none());
+        assert!(opts.namespace.is_none());
+    }
+
+    #[test]
+    fn recover_error_display_arms() {
+        assert_eq!(
+            RecoverError::DbOpen("boom".to_string()).to_string(),
+            "recover: db open failed: boom"
+        );
+        assert_eq!(
+            RecoverError::InvalidOpts("bad".to_string()).to_string(),
+            "recover: invalid opts: bad"
+        );
+        let e = RecoverError::DbOpen("x".to_string());
+        let _: &dyn std::error::Error = &e;
+        assert!(format!("{e:?}").contains("DbOpen"));
+    }
+
+    #[test]
+    fn db_open_failure_returns_db_open_error() {
+        let dir = fresh_dir();
+        let file_as_parent = dir.path().join("not-a-dir");
+        std::fs::write(&file_as_parent, b"x").unwrap();
+        let bad_db = file_as_parent.join("child.db");
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
+        let err =
+            recover_from_transcript(&bad_db, &base_opts(transcript, "ai:test:dberr")).unwrap_err();
+        assert!(matches!(err, RecoverError::DbOpen(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn no_transcript_override_resolves_via_cwd_and_returns_none_gracefully() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let opts = RecoverOpts {
+            host: HostKind::ClaudeCode,
+            transcript_override: None,
+            since_iso: None,
+            namespace: Some("test-recover".to_string()),
+            limit: DEFAULT_RECOVER_LIMIT,
+            dry_run: false,
+            quiet: false,
+            agent_id: "ai:test:cwd".to_string(),
+        };
+        let report = recover_from_transcript(&db, &opts).unwrap();
+        assert!(report.errors.is_empty() || report.transcript_path.is_some());
+    }
+
+    #[test]
+    fn tool_call_only_turn_produces_tool_calls_content() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let tool_only = r#"{"timestamp":"2026-05-28T13:00:00Z","type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let transcript = write_transcript(dir.path(), &[tool_only]);
+        let report =
+            recover_from_transcript(&db, &base_opts(transcript, "ai:test:toolonly")).unwrap();
+        assert_eq!(report.lines_atomised, 1, "errors: {:?}", report.errors);
+        let conn = crate::storage::open(&db).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE id = ?1",
+                rusqlite::params![&report.memories_created[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(content.starts_with("[tool calls]"), "got: {content}");
+        assert!(content.contains("Bash"));
+    }
+
+    #[test]
+    fn quiet_mode_truncates_memory_id_preview() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let lines: Vec<String> = (0..(QUIET_MEMORY_ID_PREVIEW_CAP + 5))
+            .map(|i| {
+                format!(
+                    r#"{{"timestamp":"2026-05-28T12:{:02}:00Z","type":"user","message":{{"content":[{{"type":"text","text":"directive {i}"}}]}}}}"#,
+                    i % 60
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let transcript = write_transcript(dir.path(), &refs);
+        let mut opts = base_opts(transcript, "ai:test:quiet");
+        opts.quiet = true;
+        let report = recover_from_transcript(&db, &opts).unwrap();
+        assert!(usize::try_from(report.lines_atomised).unwrap() > QUIET_MEMORY_ID_PREVIEW_CAP);
+        assert_eq!(
+            report.memories_created.len(),
+            QUIET_MEMORY_ID_PREVIEW_CAP,
+            "quiet mode must cap the echoed id list"
+        );
+    }
 }

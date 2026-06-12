@@ -262,4 +262,108 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
     }
+
+    // Coverage uplift (2026-06-12): per-line skip branches, the
+    // tool_use_brief field-picking ladder, the truncate over-max arm,
+    // and the parse()-level malformed-line tolerance.
+
+    #[test]
+    fn parse_one_turn_requires_timestamp_and_type() {
+        let v: Value = serde_json::from_str(r#"{"type":"user"}"#).unwrap();
+        assert!(parse_one_turn(&v, "{}").is_none());
+        let v2: Value = serde_json::from_str(r#"{"timestamp":"2026-05-28T12:00:00Z"}"#).unwrap();
+        assert!(parse_one_turn(&v2, "{}").is_none());
+    }
+
+    #[test]
+    fn parse_one_turn_classifies_tool_roles_and_other() {
+        for (tag, want) in [
+            ("tool_use", TurnRole::ToolUse),
+            ("tool_result", TurnRole::ToolResult),
+            ("system", TurnRole::Other),
+        ] {
+            let line = format!(
+                r#"{{"timestamp":"2026-05-28T12:00:00Z","type":"{tag}","message":{{"content":"body"}}}}"#
+            );
+            let v: Value = serde_json::from_str(&line).unwrap();
+            let p = parse_one_turn(&v, &line).unwrap();
+            assert_eq!(p.role, want, "tag {tag}");
+        }
+    }
+
+    #[test]
+    fn parse_one_turn_legacy_string_content_and_top_level_content() {
+        let line = r#"{"timestamp":"2026-05-28T12:00:00Z","type":"user","message":{"content":"legacy string"}}"#;
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            parse_one_turn(&v, line).unwrap().content_text,
+            "legacy string"
+        );
+
+        let line2 = r#"{"timestamp":"2026-05-28T12:00:00Z","type":"tool_result","content":"top level body"}"#;
+        let v2: Value = serde_json::from_str(line2).unwrap();
+        assert_eq!(
+            parse_one_turn(&v2, line2).unwrap().content_text,
+            "top level body"
+        );
+    }
+
+    #[test]
+    fn parse_one_turn_captures_session_id() {
+        let line = r#"{"timestamp":"2026-05-28T12:00:00Z","type":"user","sessionId":"sess-xyz","message":{"content":"hi"}}"#;
+        let v: Value = serde_json::from_str(line).unwrap();
+        let p = parse_one_turn(&v, line).unwrap();
+        assert_eq!(p.host_session_id.as_deref(), Some("sess-xyz"));
+        assert!(p.host_turn_index.is_none());
+    }
+
+    #[test]
+    fn tool_use_brief_field_picking_ladder() {
+        let b = serde_json::json!({"name":"X","input":{"description":"d","command":"c"}});
+        assert_eq!(tool_use_brief(&b), "d");
+        let b = serde_json::json!({"name":"X","input":{"command":"ls -la"}});
+        assert_eq!(tool_use_brief(&b), "ls -la");
+        let b = serde_json::json!({"name":"Read","input":{"file_path":"/a/b.rs"}});
+        assert_eq!(tool_use_brief(&b), "/a/b.rs");
+        let b = serde_json::json!({"name":"Search","input":{"query":"needle"}});
+        assert_eq!(tool_use_brief(&b), "needle");
+        let b = serde_json::json!({"name":"Z","input":{"weird":"value"}});
+        assert_eq!(tool_use_brief(&b), "weird=\"value\"");
+        let b = serde_json::json!({"name":"Z"});
+        assert_eq!(tool_use_brief(&b), "");
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_over_max() {
+        assert_eq!(truncate("abc", 200), "abc");
+        let long: String = "x".repeat(250);
+        let out = truncate(&long, 200);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 201);
+    }
+
+    #[test]
+    fn parse_skips_blank_and_malformed_lines_but_keeps_good_ones() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "not json at all").unwrap();
+        writeln!(f, r#"{{"type":"last-prompt"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-05-28T12:00:00Z","type":"user","message":{{"content":"good"}}}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let turns = ClaudeCodeJsonlParser.parse(f.path(), None).unwrap();
+        assert_eq!(turns.len(), 1, "only the well-formed content turn survives");
+        assert_eq!(turns[0].content_text, "good");
+    }
+
+    #[test]
+    fn parse_open_error_surfaces_read_error() {
+        let missing = std::path::Path::new("/nonexistent/dir/does-not-exist.jsonl");
+        let err = ClaudeCodeJsonlParser.parse(missing, None).unwrap_err();
+        assert!(matches!(err, ParseError::Read(_)));
+    }
 }
