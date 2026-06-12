@@ -130,7 +130,11 @@ FED_TRUST_DOMAIN="${FED_TRUST_DOMAIN:-$CAMPAIGN.fleet}"
 # routes 89/75), #1536 tooling fixes ride the repo not the binary,
 # plus the uniform-90 coverage-lift tests (no production codegen
 # change beyond ffb87b6e). Schema stays v57. Supersedes 9300e7d8.
-GOLDEN_SHA256="${GOLDEN_SHA256:-c7c0bddaee3b601c8b18e07ec0a16d5d1e13a937a62e8d0827a147d66ee5fcac}"
+# Re-pinned 2026-06-12 (GA final): release/v0.7.0 @ 5c5b8b21. Adds the
+# #1654 fix (PostgresStore::entity_register populates entity_aliases so
+# entity_get_by_alias resolves SAL-trait-registered entities) on top of
+# the c7c0bdda train. Schema stays v57. Supersedes c7c0bdda.
+GOLDEN_SHA256="${GOLDEN_SHA256:-537a3c888c8311ba3705e57ce082d691747df9b72d34ba937d701a4cc3567574}"
 EXPECTED_VERSION="${EXPECTED_VERSION:-0.7.0}"
 EXPECTED_SCHEMA="${EXPECTED_SCHEMA:-57}"
 
