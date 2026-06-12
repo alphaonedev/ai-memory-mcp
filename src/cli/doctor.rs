@@ -3322,4 +3322,182 @@ enabled = true
             section.facts
         );
     }
+    // ---------------------------------------------------------------
+    // #1146 / #1598 reachability probes + #1598 GPU policy — coverage
+    // lift (GA push). Driven by wiremock + spawn_blocking (the
+    // reachability sections use reqwest::blocking) with the resolver
+    // env vars serialised on a module-local lock. Mirrors the
+    // remote-section test idiom above.
+    // ---------------------------------------------------------------
+
+    fn reach_env_lock() -> &'static std::sync::Mutex<()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII env setter scoped to a test; restores prior values on drop.
+    struct EnvScope(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvScope {
+        fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let mut prev = Vec::new();
+            for (k, v) in pairs {
+                prev.push((*k, std::env::var_os(k)));
+                // SAFETY: serialised by reach_env_lock in every caller.
+                unsafe { std::env::set_var(k, v) };
+            }
+            // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
+            // config.toml so the probe sees ONLY our env.
+            prev.push((
+                "AI_MEMORY_NO_CONFIG",
+                std::env::var_os("AI_MEMORY_NO_CONFIG"),
+            ));
+            unsafe { std::env::set_var("AI_MEMORY_NO_CONFIG", "1") };
+            Self(prev)
+        }
+    }
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    fn clear_llm_embed_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_EMBED_BACKEND",
+            "AI_MEMORY_EMBED_BASE_URL",
+            "AI_MEMORY_EMBED_API_KEY",
+            "AI_MEMORY_EMBED_MODEL",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    #[test]
+    fn gpu_policy_warn_applicable_matrix_1598() {
+        // API embed backend → never the GPU warn (GPU irrelevant).
+        assert!(!gpu_policy_warn_applicable("openai", true));
+        assert!(!gpu_policy_warn_applicable("openai", false));
+        // ollama + no GPU → warn applies; ollama + GPU → no warn.
+        assert!(gpu_policy_warn_applicable("ollama", false));
+        assert!(!gpu_policy_warn_applicable("ollama", true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_reachability_compiled_default_is_info_1146() {
+        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_llm_embed_env();
+        let _scope = EnvScope::set(&[]);
+        let section = tokio::task::spawn_blocking(section_llm_reachability_1146)
+            .await
+            .unwrap();
+        assert_eq!(section.severity, Severity::Info);
+        assert!(
+            section
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("no operator LLM configuration"),
+            "compiled-default note expected; got {:?}",
+            section.note
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_reachability_probe_arms_1146() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (code, want) in [
+            (200u16, Severity::Info),
+            (401, Severity::Warning),
+            (503, Severity::Warning),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(code))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let section = {
+                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                clear_llm_embed_env();
+                let _scope = EnvScope::set(&[
+                    ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
+                    ("AI_MEMORY_LLM_BASE_URL", &uri),
+                    ("AI_MEMORY_LLM_API_KEY", "probe-key"),
+                    ("AI_MEMORY_LLM_MODEL", "probe-model"),
+                ]);
+                tokio::task::spawn_blocking(section_llm_reachability_1146)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(section.severity, want, "LLM probe status {code}");
+            assert_eq!(fact(&section, "http_status"), code.to_string());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embeddings_reachability_compiled_default_is_info_1598() {
+        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_llm_embed_env();
+        let _scope = EnvScope::set(&[]);
+        let section = tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+            .await
+            .unwrap();
+        assert_eq!(section.severity, Severity::Info);
+        assert!(
+            section
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("no operator embeddings configuration"),
+            "compiled-default note expected; got {:?}",
+            section.note
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embeddings_reachability_api_probe_arms_1598() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (code, want) in [
+            (200u16, Severity::Info),
+            (401, Severity::Warning),
+            (500, Severity::Warning),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(code).set_body_json(serde_json::json!({"data": []})),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let section = {
+                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                clear_llm_embed_env();
+                let _scope = EnvScope::set(&[
+                    ("AI_MEMORY_EMBED_BACKEND", "openai-compatible"),
+                    ("AI_MEMORY_EMBED_BASE_URL", &uri),
+                    ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
+                    ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
+                ]);
+                tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(section.severity, want, "embed probe status {code}");
+            assert_eq!(fact(&section, "http_status"), code.to_string());
+        }
+    }
 }
