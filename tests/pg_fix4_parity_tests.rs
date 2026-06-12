@@ -74,7 +74,7 @@ fn sample_citation() -> Citation {
 /// sqlite `storage::insert` ON CONFLICT arms: a re-store of the same
 /// `(title, namespace)` WITHOUT citations / confidence provenance /
 /// with a lower priority must NOT wipe the stored provenance or
-/// downgrade priority/confidence, MUST keep entity_id sticky, MUST
+/// downgrade priority/confidence, MUST keep `entity_id` sticky, MUST
 /// follow the incoming `source`, and (#1632 pg twin) MUST bump the
 /// Gap-1 optimistic-concurrency `version` counter.
 #[tokio::test]
