@@ -180,3 +180,106 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_role_as_str_covers_every_variant() {
+        assert_eq!(TurnRole::User.as_str(), "user");
+        assert_eq!(TurnRole::Assistant.as_str(), "assistant");
+        assert_eq!(TurnRole::ToolUse.as_str(), "tool_use");
+        assert_eq!(TurnRole::ToolResult.as_str(), "tool_result");
+        assert_eq!(TurnRole::Other.as_str(), "other");
+    }
+
+    #[test]
+    fn turn_role_serde_round_trip_snake_case() {
+        for (role, wire) in [
+            (TurnRole::User, "\"user\""),
+            (TurnRole::Assistant, "\"assistant\""),
+            (TurnRole::ToolUse, "\"tool_use\""),
+            (TurnRole::ToolResult, "\"tool_result\""),
+            (TurnRole::Other, "\"other\""),
+        ] {
+            let s = serde_json::to_string(&role).unwrap();
+            assert_eq!(s, wire);
+            let back: TurnRole = serde_json::from_str(wire).unwrap();
+            assert_eq!(back, role);
+        }
+    }
+
+    fn sample_turn() -> ParsedTurn {
+        ParsedTurn {
+            timestamp_iso: "2026-05-28T12:00:00Z".to_string(),
+            role: TurnRole::Assistant,
+            content_text: "ran a tool".to_string(),
+            tool_calls: vec![
+                ToolCallSummary {
+                    tool: "Bash".to_string(),
+                    brief: "list files".to_string(),
+                },
+                ToolCallSummary {
+                    tool: "Read".to_string(),
+                    brief: "/a/b.rs".to_string(),
+                },
+            ],
+            line_sha256_hex: "ab".repeat(32),
+            host_session_id: Some("sess-1".to_string()),
+            host_turn_index: Some(7),
+        }
+    }
+
+    #[test]
+    fn normalized_sha256_is_64_hex_chars_and_stable() {
+        let t = sample_turn();
+        let a = t.normalized_sha256_hex();
+        let b = t.normalized_sha256_hex();
+        assert_eq!(a, b, "normalized hash must be deterministic");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn normalized_sha256_differs_with_content_and_tool_calls() {
+        let base = sample_turn();
+        let base_hash = base.normalized_sha256_hex();
+
+        // Different content text → different hash.
+        let mut changed_content = base.clone();
+        changed_content.content_text = "different".to_string();
+        assert_ne!(changed_content.normalized_sha256_hex(), base_hash);
+
+        // Different tool-call brief → different hash (covers the
+        // tool_calls loop with the 0x1f/0x1e separators).
+        let mut changed_tool = base.clone();
+        changed_tool.tool_calls[0].brief = "rm -rf /".to_string();
+        assert_ne!(changed_tool.normalized_sha256_hex(), base_hash);
+
+        // Absent session id (None branch of unwrap_or) still hashes.
+        let mut no_session = base.clone();
+        no_session.host_session_id = None;
+        assert_eq!(no_session.normalized_sha256_hex().len(), 64);
+        assert_ne!(no_session.normalized_sha256_hex(), base_hash);
+    }
+
+    #[test]
+    fn parse_error_display_and_error_trait() {
+        let e = ParseError::Read("boom".to_string());
+        assert_eq!(e.to_string(), "parser: read failed: boom");
+        let _: &dyn std::error::Error = &e;
+        assert!(format!("{e:?}").contains("Read"));
+    }
+
+    #[test]
+    fn parsed_turn_serde_round_trips() {
+        let t = sample_turn();
+        let json = serde_json::to_string(&t).unwrap();
+        let back: ParsedTurn = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.timestamp_iso, t.timestamp_iso);
+        assert_eq!(back.role, t.role);
+        assert_eq!(back.tool_calls.len(), 2);
+        assert_eq!(back.host_turn_index, Some(7));
+    }
+}

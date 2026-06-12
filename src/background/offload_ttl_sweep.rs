@@ -135,4 +135,110 @@ mod tests {
         let n = adapter.run_sweep(r.stored_at + 60).unwrap();
         assert_eq!(n, 1);
     }
+
+    /// Default-const sanity: the cadence + per-run + per-delete tunables
+    /// resolve to the documented values so a drift in the SECS_PER_DAY
+    /// SSOT or the magic-number consts trips here.
+    #[test]
+    fn tunable_defaults_are_documented_values() {
+        assert_eq!(
+            DEFAULT_INTERVAL,
+            Duration::from_secs(crate::SECS_PER_DAY as u64)
+        );
+        assert_eq!(MAX_PER_RUN, 1000);
+        assert_eq!(SLEEP_BETWEEN_DELETES, Duration::from_millis(10));
+    }
+
+    /// Adapter whose `run_sweep` always errors — exercises the `Err`
+    /// arm of the [`spawn`] loop's `match` (the `tracing::warn!` path).
+    struct ErrAdapter;
+    impl SweepAdapter for ErrAdapter {
+        fn run_sweep(&self, _now_unix: i64) -> anyhow::Result<usize> {
+            anyhow::bail!("synthetic sweep failure")
+        }
+    }
+
+    /// Adapter that reports a deletion count so the `Ok(n)` info-log arm
+    /// of the loop fires, and counts how many times the loop ticked so
+    /// the test can prove the spawned task actually ran the body.
+    struct CountingAdapter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SweepAdapter for CountingAdapter {
+        fn run_sweep(&self, _now_unix: i64) -> anyhow::Result<usize> {
+            // Report a non-zero deletion on the first tick (Ok(n) arm),
+            // zero thereafter (Ok(0) arm) — both loop arms get covered.
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(usize::from(n == 0))
+        }
+    }
+
+    /// Drive the real [`spawn`] tokio loop with a sub-millisecond
+    /// interval so the loop body (sleep → lock → run_sweep → match arms)
+    /// executes several times, then abort the handle. Covers the
+    /// `Ok(0)`, `Ok(n)`, and loop-cadence lines.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn spawn_loop_drives_run_sweep_across_arms() {
+        let adapter = Arc::new(Mutex::new(CountingAdapter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let handle = spawn(Arc::clone(&adapter), Duration::from_millis(1));
+        // With paused time we advance the clock deterministically so the
+        // loop wakes for several iterations.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            adapter
+                .lock()
+                .await
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "spawn loop should have ticked run_sweep at least twice"
+        );
+    }
+
+    /// Drive the [`spawn`] loop against an always-erroring adapter so the
+    /// `Err(e)` warn-log arm of the loop `match` is exercised.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn spawn_loop_tolerates_sweep_errors() {
+        let handle = spawn(Arc::new(Mutex::new(ErrAdapter)), Duration::from_millis(1));
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        // The loop must keep running (not panic) through the error arm.
+        assert!(!handle.is_finished());
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// The production blanket `impl SweepAdapter for (Connection, …)`
+    /// tuple delegates to [`sweep_expired`]. Drive it end-to-end so the
+    /// blanket impl body (lines 95-97) is covered, not just the test
+    /// `ConnAdapter`.
+    #[test]
+    fn production_tuple_adapter_runs_sweep_expired() {
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
+        let off = crate::offload::ContextOffloader::new(
+            &conn,
+            None,
+            crate::offload::OffloadConfig::default(),
+        );
+        let r = off.offload("expiring2", "ns", Some(1), "ai:bob").unwrap();
+        let tuple = (
+            conn,
+            std::path::PathBuf::from(":memory:"),
+            crate::config::ResolvedTtl::default(),
+            true,
+        );
+        // Before expiry: nothing removed.
+        assert_eq!(tuple.run_sweep(r.stored_at).unwrap(), 0);
+        // After expiry: the row is swept.
+        assert_eq!(tuple.run_sweep(r.stored_at + 60).unwrap(), 1);
+    }
 }

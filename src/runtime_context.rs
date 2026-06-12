@@ -278,4 +278,59 @@ mod tests {
         assert!(audit.sink.read().unwrap().is_none());
         assert_eq!(audit.sequence.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn debug_impl_redacts_secret_when_present() {
+        // #1262 — the manual Debug impl must never leak the HMAC bytes.
+        let ctx = RuntimeContext::default();
+        *ctx.hooks_hmac_secret.write().unwrap() = Some("super-secret-hmac-key".to_string());
+        let rendered = format!("{ctx:?}");
+        assert!(
+            !rendered.contains("super-secret-hmac-key"),
+            "Debug leaked the raw HMAC secret: {rendered}"
+        );
+        assert!(rendered.contains(crate::REDACTED_PLACEHOLDER));
+        assert!(rendered.contains("RuntimeContext"));
+    }
+
+    #[test]
+    fn debug_impl_marks_unset_secret() {
+        // The other Debug branch — `<unset>` when no secret is present.
+        let ctx = RuntimeContext::default();
+        let rendered = format!("{ctx:?}");
+        assert!(rendered.contains("<unset>"), "got: {rendered}");
+        assert!(rendered.contains("<recall_tracker>"));
+        assert!(rendered.contains("<keypair_cache>"));
+    }
+
+    #[test]
+    fn drop_zeroizes_secret_on_scope_exit() {
+        // #1258 — the Drop impl zeroizes the secret. We can't observe the
+        // freed heap directly, but we can drive the Drop body (the
+        // `if let Ok(...) { if let Some(...) }` arms) on a context that
+        // carries a secret, proving it runs without panic.
+        let ctx = RuntimeContext::default();
+        *ctx.hooks_hmac_secret.write().unwrap() = Some("to-be-zeroized".to_string());
+        drop(ctx); // exercises the Drop body's populated-secret path.
+
+        // And the empty-secret Drop path (the `Some` arm is skipped).
+        let empty = RuntimeContext::default();
+        drop(empty);
+    }
+
+    #[test]
+    fn install_global_is_last_writer_loses_against_lazy_init() {
+        // `install_global` is idempotent in the OnceLock sense. Because
+        // sibling tests in this binary may already have seeded the
+        // singleton via `global()`, a fresh install is silently ignored
+        // — the call must not panic regardless of prior seeding.
+        RuntimeContext::install_global(RuntimeContext::default());
+        // global() / global_arc() return a stable, non-null handle.
+        let a = RuntimeContext::global_arc();
+        let b = RuntimeContext::global_arc();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        // The borrowed accessor derefs the same backing Arc.
+        let r = RuntimeContext::global();
+        assert!(std::ptr::eq(r, a.as_ref()));
+    }
 }

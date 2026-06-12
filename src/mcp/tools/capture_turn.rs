@@ -877,4 +877,197 @@ mod handler_tests {
         assert_ne!(a_id, c_id, "distinct turns produce distinct memories");
         assert_ne!(b_id, c_id);
     }
+
+    // ------------------------------------------------------------------
+    // #1414 host-signature verification coverage (2026-06-11). Drives the
+    // `verify_host_signature` + `is_host_pubkey_enrolled` signed-path
+    // arms via the pure `prepare_capture_turn` so no governance gate /
+    // connection is needed.
+    // ------------------------------------------------------------------
+
+    /// Serialize the allowlist-env mutations across these tests.
+    fn allowlist_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct AllowlistGuard {
+        prev: Option<String>,
+    }
+    impl AllowlistGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var(L4_HOST_PUBKEY_ALLOWLIST_ENV).ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(L4_HOST_PUBKEY_ALLOWLIST_ENV, v),
+                    None => std::env::remove_var(L4_HOST_PUBKEY_ALLOWLIST_ENV),
+                }
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for AllowlistGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(L4_HOST_PUBKEY_ALLOWLIST_ENV, v),
+                    None => std::env::remove_var(L4_HOST_PUBKEY_ALLOWLIST_ENV),
+                }
+            }
+        }
+    }
+
+    /// Deserialize a request from a JSON object — the same path the
+    /// production handler uses (`serde_json::from_value`). Lets the
+    /// signed-path tests build requests without a `Default` impl.
+    fn req_from(v: Value) -> MemoryCaptureTurnRequest {
+        serde_json::from_value(v).expect("valid request shape")
+    }
+
+    /// Build a deterministic signing key + the canonical-bytes signature
+    /// for a `(session, turn, role, content)` tuple, mirroring the
+    /// substrate's canonical encoding, and return the request JSON +
+    /// the b64 pubkey for allowlist enrollment.
+    fn signed_req_json(
+        session: &str,
+        turn: i64,
+        role: &str,
+        content: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> (Value, String) {
+        use ed25519_dalek::Signer;
+        let canonical = format!("{session}\0{turn}\0{role}\0{content}");
+        let sig = key.sign(canonical.as_bytes());
+        let pubkey_b64 = B64_STD.encode(key.verifying_key().to_bytes());
+        let sig_b64 = B64_STD.encode(sig.to_bytes());
+        let v = json!({
+            "host_session_id": session,
+            "host_turn_index": turn,
+            "role": role,
+            "content": content,
+            "host_signature_b64": sig_b64,
+            "host_pubkey_b64": pubkey_b64,
+        });
+        (v, pubkey_b64)
+    }
+
+    fn test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    #[test]
+    fn signed_path_enrolled_pubkey_verifies_signed_by_peer() {
+        let _g = allowlist_lock();
+        let key = test_key();
+        let (v, pubkey_b64) = signed_req_json("sess-sig", 0, "user", "signed content", &key);
+        let _env = AllowlistGuard::set(Some(&pubkey_b64));
+        let write = prepare_capture_turn(&req_from(v), "ai:caller").expect("verify ok");
+        assert_eq!(
+            write.signed_event.attest_level,
+            crate::models::AttestLevel::SignedByPeer.as_str()
+        );
+        assert!(write.signed_event.signature.is_some());
+    }
+
+    #[test]
+    fn signed_path_unenrolled_pubkey_refused() {
+        let _g = allowlist_lock();
+        let key = test_key();
+        let (v, _pubkey) = signed_req_json("sess-sig", 0, "user", "signed content", &key);
+        // Allowlist empty → not enrolled.
+        let _env = AllowlistGuard::set(Some(""));
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("must refuse");
+        assert!(err.starts_with("HOST_PUBKEY_NOT_ENROLLED"), "got: {err}");
+    }
+
+    #[test]
+    fn signed_path_unset_allowlist_refuses_every_signed_call() {
+        let _g = allowlist_lock();
+        let key = test_key();
+        let (v, _pubkey) = signed_req_json("sess-sig", 0, "user", "c", &key);
+        let _env = AllowlistGuard::set(None);
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("must refuse");
+        assert!(err.starts_with("HOST_PUBKEY_NOT_ENROLLED"), "got: {err}");
+    }
+
+    #[test]
+    fn signed_path_tampered_signature_fails_verification() {
+        let _g = allowlist_lock();
+        let key = test_key();
+        let (mut v, pubkey_b64) = signed_req_json("sess-sig", 0, "user", "original", &key);
+        // Enroll the pubkey, but corrupt the content so the signature no
+        // longer matches the canonical bytes → verify_strict fails.
+        v["content"] = json!("tampered");
+        let _env = AllowlistGuard::set(Some(&pubkey_b64));
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("verify must fail");
+        assert!(err.contains("signature_verification_failed"), "got: {err}");
+    }
+
+    #[test]
+    fn signed_path_paired_fields_mismatch_rejected() {
+        // Exactly one of (sig, pubkey) present → paired-fields error.
+        let v = json!({
+            "host_session_id": "s",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "c",
+            "host_signature_b64": "AA",
+        });
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("paired-fields");
+        assert!(
+            err.contains("must both be present or both absent"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn signed_path_bad_base64_pubkey_rejected() {
+        let _g = allowlist_lock();
+        let v = json!({
+            "host_session_id": "s",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "c",
+            "host_signature_b64": "AA",
+            "host_pubkey_b64": "!!!not-base64!!!",
+        });
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("bad b64");
+        assert!(
+            err.contains("host_pubkey_b64 not valid base64"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn signed_path_wrong_length_pubkey_rejected() {
+        let _g = allowlist_lock();
+        // Valid base64 but decodes to != 32 bytes.
+        let short = B64_STD.encode([1u8; 16]);
+        let v = json!({
+            "host_session_id": "s",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "c",
+            "host_signature_b64": "AA",
+            "host_pubkey_b64": short,
+        });
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("wrong len");
+        assert!(err.contains("must decode to 32 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn agent_id_mismatch_rejected_in_prepare() {
+        // #1413 — metadata.agent_id must equal the resolved caller.
+        let v = json!({
+            "host_session_id": "s",
+            "host_turn_index": 0,
+            "role": "user",
+            "content": "c",
+            "metadata": {"agent_id": "ai:someone-else"},
+        });
+        let err = prepare_capture_turn(&req_from(v), "ai:caller").expect_err("agent mismatch");
+        assert!(err.contains("does not match resolved caller"), "got: {err}");
+    }
 }

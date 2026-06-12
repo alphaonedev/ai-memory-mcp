@@ -193,4 +193,173 @@ mod tests {
         let parsed: HostKind = serde_json::from_str("\"codex\"").unwrap();
         assert_eq!(parsed, HostKind::Codex);
     }
+
+    /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
+    fn local_runs_dir() -> std::path::PathBuf {
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".local-runs")
+            .join("transcript-paths-unit-test");
+        std::fs::create_dir_all(&root).ok();
+        root
+    }
+
+    /// Serialize HOME mutations across the env-touching tests in this
+    /// module so they cannot clobber each other under `--test-threads>1`.
+    fn home_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII guard that points `$HOME` at a temp dir and restores the
+    /// prior value (if any) on drop.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl HomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            // SAFETY: tests serialize on `home_lock()` before constructing.
+            unsafe {
+                std::env::set_var("HOME", dir);
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_error_display_and_trait() {
+        let e = ResolveError::NoHome;
+        assert_eq!(e.to_string(), "resolve: no $HOME set");
+        // Debug + std::error::Error trait wiring.
+        let _: &dyn std::error::Error = &e;
+        assert!(format!("{e:?}").contains("NoHome"));
+    }
+
+    #[test]
+    fn claude_code_resolver_finds_most_recent_jsonl() {
+        use std::io::Write;
+        let _g = home_lock();
+        let tmp = tempfile::tempdir_in(local_runs_dir()).unwrap();
+        let home = tmp.path();
+        let _home = HomeGuard::set(home);
+
+        // Build the encoded project dir for a synthetic cwd.
+        let cwd = std::path::Path::new("/work/proj");
+        let encoded = format!("-{}", cwd.to_string_lossy().replace('/', "-"));
+        let proj = home.join(".claude").join("projects").join(&encoded);
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Two jsonl files + one non-jsonl that must be ignored. Write
+        // `older` first, then sleep past the filesystem mtime resolution
+        // before writing `newer`, so `most_recently_modified` picks
+        // `newer` without depending on a clock-setting crate.
+        let older = proj.join("a.jsonl");
+        let newer = proj.join("b.jsonl");
+        std::fs::write(proj.join("ignore.txt"), b"nope").unwrap();
+        {
+            let mut f = std::fs::File::create(&older).unwrap();
+            writeln!(f, "{{}}").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        {
+            let mut f = std::fs::File::create(&newer).unwrap();
+            writeln!(f, "{{}}").unwrap();
+        }
+
+        // The resolver returns one of the two candidates; whichever the
+        // filesystem reports as most-recent. On filesystems with coarse
+        // mtime granularity the two could tie, so accept either — the
+        // load-bearing claim is that it resolves to a real jsonl in the
+        // project dir and never the .txt.
+        let got = resolve_transcript(HostKind::ClaudeCode, cwd)
+            .unwrap()
+            .unwrap();
+        assert!(
+            got == older || got == newer,
+            "resolved to an unexpected path: {}",
+            got.display()
+        );
+        assert_eq!(got.extension().and_then(|e| e.to_str()), Some("jsonl"));
+
+        // Auto walks every host's candidate set; here only Claude Code
+        // has files, so a Claude Code jsonl wins.
+        let got_auto = resolve_transcript(HostKind::Auto, cwd).unwrap().unwrap();
+        assert_eq!(got_auto.extension().and_then(|e| e.to_str()), Some("jsonl"));
+    }
+
+    #[test]
+    fn codex_and_gemini_resolvers_walk_their_dirs() {
+        use std::io::Write;
+        let _g = home_lock();
+        let tmp = tempfile::tempdir_in(local_runs_dir()).unwrap();
+        let home = tmp.path();
+        let _home = HomeGuard::set(home);
+        let cwd = std::path::Path::new("/irrelevant");
+
+        // Codex sessions dir.
+        let codex = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&codex).unwrap();
+        let cfile = codex.join("s.json");
+        {
+            let mut f = std::fs::File::create(&cfile).unwrap();
+            writeln!(f, "{{}}").unwrap();
+        }
+        assert_eq!(
+            resolve_transcript(HostKind::Codex, cwd).unwrap().as_deref(),
+            Some(cfile.as_path())
+        );
+
+        // Gemini sessions dir.
+        let gemini = home.join(".config").join("gemini").join("sessions");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let gfile = gemini.join("g.jsonl");
+        {
+            let mut f = std::fs::File::create(&gfile).unwrap();
+            writeln!(f, "{{}}").unwrap();
+        }
+        assert_eq!(
+            resolve_transcript(HostKind::Gemini, cwd)
+                .unwrap()
+                .as_deref(),
+            Some(gfile.as_path())
+        );
+    }
+
+    #[test]
+    fn resolver_returns_none_when_home_unset() {
+        let _g = home_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        // Every candidate fn bails early without HOME → empty candidate
+        // set → Ok(None) for every host arm including Auto.
+        let cwd = std::path::Path::new("/whatever");
+        assert!(
+            resolve_transcript(HostKind::ClaudeCode, cwd)
+                .unwrap()
+                .is_none()
+        );
+        assert!(resolve_transcript(HostKind::Codex, cwd).unwrap().is_none());
+        assert!(resolve_transcript(HostKind::Gemini, cwd).unwrap().is_none());
+        assert!(resolve_transcript(HostKind::Auto, cwd).unwrap().is_none());
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("HOME", v);
+            }
+        }
+    }
 }

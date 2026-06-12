@@ -560,4 +560,194 @@ mod tests {
         .unwrap_err();
         assert!(err.starts_with("MEMORY_NOT_FOUND:"), "got: {err}");
     }
+
+    // ------------------------------------------------------------------
+    // Engine-dispatch result-arm coverage (2026-06-11): drive the match
+    // arms of handle_atomise that map AtomiseError / AtomiseResult onto
+    // the MCP wire shape. Each uses a MockCurator with a canned response
+    // + a seeded source memory.
+    // ------------------------------------------------------------------
+
+    /// Build a handler whose atomiser uses the supplied canned curator
+    /// responses.
+    fn handler_with(
+        tier: FeatureTier,
+        responses: Vec<Result<Vec<Atom>, CuratorError>>,
+    ) -> AtomiseToolHandler {
+        let curator: Box<dyn Curator> = Box::new(MockCurator::new(responses));
+        let atomiser = Arc::new(Atomiser::new(
+            curator,
+            None,
+            AtomiserConfig::default(),
+            tier,
+        ));
+        AtomiseToolHandler::new(atomiser, tier)
+    }
+
+    /// Seed a source memory whose body is comfortably over the atom
+    /// token budget so the engine's pre-flight check does not
+    /// short-circuit to SourceTooSmall.
+    fn seed_big(conn: &rusqlite::Connection, ns: &str) -> String {
+        use crate::models::{Memory, MemoryKind, Tier};
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: format!("src-{}", uuid::Uuid::new_v4().simple()),
+            content: "proposition token padding here. ".repeat(400),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({"agent_id": "ai:test"}),
+            memory_kind: MemoryKind::Observation,
+            ..Default::default()
+        };
+        db::insert(conn, &mem).unwrap()
+    }
+
+    #[test]
+    fn successful_atomise_returns_atom_ids_and_count() {
+        let (_tmp, conn) = fresh_db();
+        let id = seed_big(&conn, "atomise-ok");
+        let h = handler_with(
+            FeatureTier::Smart,
+            vec![Ok(vec![
+                Atom {
+                    text: "first proposition".into(),
+                },
+                Atom {
+                    text: "second proposition".into(),
+                },
+            ])],
+        );
+        let resp = handle_atomise(
+            &conn,
+            &json!({"memory_id": id, "max_atom_tokens": 50}),
+            Some(&h),
+            FeatureTier::Smart,
+            None,
+        )
+        .expect("atomise ok");
+        assert_eq!(resp["source_id"].as_str(), Some(id.as_str()));
+        assert!(resp["atom_count"].as_u64().unwrap() >= 2);
+        assert!(resp["atom_ids"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn already_atomised_returns_existing_envelope() {
+        let (_tmp, conn) = fresh_db();
+        let id = seed_big(&conn, "atomise-twice");
+        // First pass atomises; second (force=false) hits AlreadyAtomised.
+        let h = handler_with(
+            FeatureTier::Smart,
+            vec![Ok(vec![
+                Atom {
+                    text: "a one".into(),
+                },
+                Atom {
+                    text: "a two".into(),
+                },
+            ])],
+        );
+        handle_atomise(
+            &conn,
+            &json!({"memory_id": id, "max_atom_tokens": 50}),
+            Some(&h),
+            FeatureTier::Smart,
+            None,
+        )
+        .expect("first atomise ok");
+        // Second call: handler's curator queue is now empty, but the
+        // idempotency check fires BEFORE the curator round-trip, so we
+        // get the AlreadyAtomised envelope.
+        let resp = handle_atomise(
+            &conn,
+            &json!({"memory_id": id, "max_atom_tokens": 50}),
+            Some(&h),
+            FeatureTier::Smart,
+            None,
+        )
+        .expect("already-atomised is informational");
+        assert_eq!(resp["already_atomised"].as_bool(), Some(true));
+        assert_eq!(resp["source_id"].as_str(), Some(id.as_str()));
+        assert!(resp["existing_atom_ids"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn source_too_small_returns_advisory() {
+        let (_tmp, conn) = fresh_db();
+        use crate::models::{Memory, MemoryKind, Tier};
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: "tiny".into(),
+            title: "tiny-src".into(),
+            content: "tiny".into(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({"agent_id": "ai:test"}),
+            memory_kind: MemoryKind::Observation,
+            ..Default::default()
+        };
+        let id = db::insert(&conn, &mem).unwrap();
+        let h = handler_with(FeatureTier::Smart, vec![]);
+        let resp = handle_atomise(
+            &conn,
+            &json!({"memory_id": id, "max_atom_tokens": 200}),
+            Some(&h),
+            FeatureTier::Smart,
+            None,
+        )
+        .expect("source-too-small is informational");
+        assert_eq!(resp["source_too_small"].as_bool(), Some(true));
+        assert_eq!(resp["source_id"].as_str(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn curator_failure_returns_typed_error() {
+        let (_tmp, conn) = fresh_db();
+        let id = seed_big(&conn, "atomise-curfail");
+        let h = handler_with(
+            FeatureTier::Smart,
+            vec![Err(CuratorError::LlmUnavailable("down".into()))],
+        );
+        let err = handle_atomise(
+            &conn,
+            &json!({"memory_id": id, "max_atom_tokens": 50}),
+            Some(&h),
+            FeatureTier::Smart,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("CURATOR_FAILED:"), "got: {err}");
+    }
+
+    #[test]
+    fn null_max_atom_tokens_uses_default() {
+        // Exercises the `v.is_null()` branch of the max_atom_tokens
+        // parser (explicit JSON null → compiled default).
+        let (_tmp, conn) = fresh_db();
+        let id = seed_big(&conn, "atomise-null");
+        let h = handler_with(
+            FeatureTier::Smart,
+            vec![Ok(vec![
+                Atom {
+                    text: "n one".into(),
+                },
+                Atom {
+                    text: "n two".into(),
+                },
+            ])],
+        );
+        let resp = handle_atomise(
+            &conn,
+            &json!({"memory_id": id, "max_atom_tokens": null, "force_re_atomise": null}),
+            Some(&h),
+            FeatureTier::Smart,
+            None,
+        )
+        .expect("null tokens defaults cleanly");
+        assert!(resp["atom_count"].as_u64().unwrap() >= 2);
+    }
 }
