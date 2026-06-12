@@ -86,4 +86,55 @@ mod tests {
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["removed"].as_bool(), Some(false));
     }
+
+    #[test]
+    fn unsubscribe_cli_text_output_unknown_id() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = UnsubscribeArgs {
+            id: "nonexistent".into(),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_unsubscribe(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(
+            stdout.contains("unsubscribe: id=nonexistent"),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("removed=false"), "got: {stdout}");
+    }
+
+    #[test]
+    fn unsubscribe_cli_removes_existing_subscription() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Register the CLI-resolved agent + create a subscription, then
+        // remove it via the unsubscribe handler.
+        let sub_id = {
+            let conn = db::open(&db).unwrap();
+            let agent_id = crate::identity::resolve_agent_id(None, None).unwrap();
+            db::register_agent(&conn, &agent_id, "test", &[]).expect("register");
+            let envelope = crate::mcp::handle_subscribe(
+                &conn,
+                &json!({"url": "https://example.com/hook", "secret": "topsecret"}),
+                None,
+            )
+            .expect("subscribe");
+            envelope["id"].as_str().unwrap().to_string()
+        };
+        let args = UnsubscribeArgs {
+            id: sub_id,
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_unsubscribe(&db, &args, &mut out).expect("ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(envelope["removed"].as_bool(), Some(true));
+    }
 }

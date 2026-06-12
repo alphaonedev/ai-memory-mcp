@@ -93,4 +93,23 @@ mod tests {
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
         assert_eq!(envelope["count"].as_u64(), Some(0));
     }
+
+    #[test]
+    fn subscription_dlq_list_cli_text_output_with_params() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = SubscriptionDlqListArgs {
+            subscription_id: Some("sub-123".into()),
+            limit: Some(50),
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_subscription_dlq_list(&db, &args, &mut out).expect("ok");
+        }
+        assert!(
+            env.stdout_str()
+                .contains("subscription-dlq-list: 0 entry(ies)")
+        );
+    }
 }

@@ -130,4 +130,66 @@ mod tests {
             "got: {err}"
         );
     }
+
+    /// Register the CLI-resolved agent so the success path (envelope
+    /// shaping) is exercised. Drives both json + text output and every
+    /// optional param arm.
+    #[test]
+    fn subscribe_cli_success_json_with_all_params() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            let agent_id = crate::identity::resolve_agent_id(None, None).unwrap();
+            db::register_agent(&conn, &agent_id, "test", &[]).expect("register");
+        }
+        let args = SubscribeArgs {
+            url: "https://example.com/hook".into(),
+            events: Some("memory_store,memory_link_created".into()),
+            secret: Some("topsecret".into()),
+            namespace_filter: Some("ns".into()),
+            agent_filter: Some("ai:other".into()),
+            event_types: vec!["memory_store".into()],
+            json: true,
+        };
+        {
+            let mut out = env.output();
+            cmd_subscribe(&db, &args, &mut out).expect("subscribe ok");
+        }
+        let envelope: Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert!(envelope["id"].is_string());
+        assert_eq!(envelope["url"], "https://example.com/hook");
+    }
+
+    #[test]
+    fn subscribe_cli_success_text_output() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            let agent_id = crate::identity::resolve_agent_id(None, None).unwrap();
+            db::register_agent(&conn, &agent_id, "test", &[]).expect("register");
+        }
+        let args = SubscribeArgs {
+            url: "https://example.com/hook2".into(),
+            events: None,
+            secret: Some("topsecret".into()),
+            namespace_filter: None,
+            agent_filter: None,
+            event_types: vec![],
+            json: false,
+        };
+        {
+            let mut out = env.output();
+            cmd_subscribe(&db, &args, &mut out).expect("subscribe ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("subscribe: id="), "got: {stdout}");
+        assert!(
+            stdout.contains("url=https://example.com/hook2"),
+            "got: {stdout}"
+        );
+    }
 }

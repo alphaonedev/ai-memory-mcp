@@ -96,4 +96,33 @@ mod tests {
             "got: {stdout}"
         );
     }
+
+    #[test]
+    fn list_subscriptions_cli_text_mode_lists_rows() {
+        crate::config::set_active_hooks_hmac_secret(None);
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            let agent_id = crate::identity::resolve_agent_id(None, None).unwrap();
+            db::register_agent(&conn, &agent_id, "test", &[]).expect("register");
+            crate::mcp::handle_subscribe(
+                &conn,
+                &serde_json::json!({"url": "https://example.com/hook", "secret": "topsecret"}),
+                None,
+            )
+            .expect("subscribe");
+        }
+        let args = ListSubscriptionsArgs { json: false };
+        {
+            let mut out = env.output();
+            cmd_list_subscriptions(&db, &args, &mut out).expect("ok");
+        }
+        let stdout = env.stdout_str();
+        assert!(stdout.contains("1 row(s)"), "got: {stdout}");
+        assert!(
+            stdout.contains("url=https://example.com/hook"),
+            "got: {stdout}"
+        );
+    }
 }
