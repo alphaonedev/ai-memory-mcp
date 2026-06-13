@@ -282,10 +282,18 @@ jobs:
               export *
           }
           MODULEMAP
+          # The two simulator slices (arm64-sim + x86_64-sim) are the same
+          # platform-variant; -create-xcframework rejects them as separate
+          # -library args ("equivalent library definitions"). lipo them into
+          # one fat simulator lib first, then pass device + fat-sim.
+          mkdir -p target/ios-sim-universal/release
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libai_memory.a \
+            target/x86_64-apple-ios/release/libai_memory.a \
+            -output target/ios-sim-universal/release/libai_memory.a
           xcodebuild -create-xcframework \
             -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers \
-            -library target/aarch64-apple-ios-sim/release/libai_memory.a -headers dist/headers \
-            -library target/x86_64-apple-ios/release/libai_memory.a -headers dist/headers \
+            -library target/ios-sim-universal/release/libai_memory.a -headers dist/headers \
             -output dist/AiMemory.xcframework
           ls -la dist/AiMemory.xcframework/
 
