@@ -257,7 +257,7 @@ jobs:
               echo "::error::libai_memory.a not produced for $TARGET"
               ls -la "target/$TARGET/release/" || true
               exit 1
-            fi
+            }
           done
 
       - name: Generate C header (cbindgen)
