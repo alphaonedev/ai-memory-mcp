@@ -1,0 +1,109 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone iOS xcframework re-publisher (workflow_dispatch). Builds the
+# iOS xcframework for an EXISTING release tag and attaches it, without
+# re-running the binary matrix / crates.io / Homebrew / COPR or touching
+# the curated release body. Used to re-attach the iOS artifact after the
+# v0.7.0 first-run mobile-build fixes (toolchain 1.96.0 pin + the
+# `|| { ... }` block fix). The same iOS steps live in release.yml's
+# mobile-ios job for normal releases.
+
+name: Mobile iOS re-publish (workflow_dispatch — attach xcframework to a release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build + attach the iOS xcframework to (e.g. v0.7.0).'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  mobile-ios:
+    name: Mobile artifact (iOS xcframework)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Rust 1.96.0 + iOS targets
+        # Pin to rust-toolchain.toml (1.96.0) so the iOS cross-target std
+        # lands on the toolchain that actually builds (else E0463).
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-ios-republish-${{ inputs.tag }}
+
+      - name: Install cbindgen
+        run: cargo install --locked cbindgen
+
+      - name: Build static libraries (release, --features sqlite-bundled)
+        run: |
+          set -euo pipefail
+          for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            echo "::group::cargo build --target $TARGET"
+            cargo build \
+              --release \
+              --target "$TARGET" \
+              --no-default-features \
+              --features sqlite-bundled \
+              --lib
+            echo "::endgroup::"
+            test -f "target/$TARGET/release/libai_memory.a" || {
+              echo "::error::libai_memory.a not produced for $TARGET"
+              ls -la "target/$TARGET/release/" || true
+              exit 1
+            }
+          done
+
+      - name: Generate C header (cbindgen)
+        run: |
+          set -euo pipefail
+          mkdir -p include
+          cbindgen --config cbindgen.toml --crate ai-memory --output include/ai_memory.h
+          echo "--- include/ai_memory.h ---"
+          head -50 include/ai_memory.h
+
+      - name: Assemble .xcframework
+        run: |
+          set -euo pipefail
+          mkdir -p dist/headers
+          cp include/ai_memory.h dist/headers/
+          cat > dist/headers/module.modulemap <<'MODULEMAP'
+          framework module AiMemory {
+              umbrella header "ai_memory.h"
+              export *
+          }
+          MODULEMAP
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers \
+            -library target/aarch64-apple-ios-sim/release/libai_memory.a -headers dist/headers \
+            -library target/x86_64-apple-ios/release/libai_memory.a -headers dist/headers \
+            -output dist/AiMemory.xcframework
+          ls -la dist/AiMemory.xcframework/
+
+      - name: Tar + sha256 the xcframework
+        run: |
+          set -euo pipefail
+          cd dist
+          tar czf ai-memory-ios.xcframework.tar.gz AiMemory.xcframework
+          shasum -a 256 ai-memory-ios.xcframework.tar.gz > ai-memory-ios.xcframework.tar.gz.sha256
+          ls -la ai-memory-ios.xcframework.tar.gz*
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: |
+            dist/ai-memory-ios.xcframework.tar.gz
+            dist/ai-memory-ios.xcframework.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
