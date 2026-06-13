@@ -69,6 +69,11 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org/"
+      # npm's OIDC Trusted Publishing token exchange requires npm >= 11.5.1.
+      # Node 20 bundles npm 10.x, which publishes *unauthenticated* and the
+      # registry then returns a disguised 404 on PUT. Pin a modern npm.
+      - name: upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
       - name: install + build
         working-directory: sdk/typescript
         run: |
