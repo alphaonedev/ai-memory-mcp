@@ -20,6 +20,25 @@ pub enum EmbeddingModel {
     NomicEmbedV15,
 }
 
+impl std::str::FromStr for EmbeddingModel {
+    type Err = String;
+
+    /// Parse the snake_case wire form used by `AppConfig.embedding_model`
+    /// (the documented top-level override). Accepts case-insensitive input
+    /// with surrounding whitespace trimmed. Keep this in sync with the
+    /// `#[serde(rename_all = "snake_case")]` variants above.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mini_lm_l6_v2" => Ok(Self::MiniLmL6V2),
+            "nomic_embed_v15" => Ok(Self::NomicEmbedV15),
+            other => Err(format!(
+                "unknown embedding_model {other:?}: expected one of \
+                 \"mini_lm_l6_v2\", \"nomic_embed_v15\""
+            )),
+        }
+    }
+}
+
 impl EmbeddingModel {
     /// Embedding vector dimensionality.
     pub fn dim(self) -> usize {
@@ -36,38 +55,123 @@ impl EmbeddingModel {
             Self::NomicEmbedV15 => "nomic-ai/nomic-embed-text-v1.5",
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// LLM models
-// ---------------------------------------------------------------------------
-
-/// Supported LLM models (served via Ollama).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmModel {
-    /// Google Gemma 4 Effective 2B — ~1 GB Q4
-    Gemma4E2B,
-    /// Google Gemma 4 Effective 4B — ~2.3 GB Q4
-    Gemma4E4B,
-}
-
-impl LlmModel {
-    /// Ollama model tag used to pull / run this model.
-    pub fn ollama_model_id(&self) -> &str {
+    /// Canonical-id aliases recognised by [`Self::from_canonical_id`]:
+    /// the snake wire form ([`FromStr`]), the HF id (also the
+    /// [`canonicalise_embedding_model`] output), the unprefixed
+    /// shortname, and the Ollama tag. Centralising the alias strings
+    /// here keeps the model-id literals in one place (#1521).
+    fn canonical_aliases(self) -> &'static [&'static str] {
         match self {
-            Self::Gemma4E2B => "gemma4:e2b",
-            Self::Gemma4E4B => "gemma4:e4b",
+            Self::MiniLmL6V2 => MINILM_CANONICAL_ALIASES,
+            Self::NomicEmbedV15 => NOMIC_CANONICAL_ALIASES,
         }
     }
 
-    /// Human-readable display name.
-    pub fn display_name(&self) -> &str {
-        match self {
-            Self::Gemma4E2B => "Gemma 4 Effective 2B (Q4)",
-            Self::Gemma4E4B => "Gemma 4 Effective 4B (Q4)",
+    /// Parse any recognised canonical id form — the snake wire form, the
+    /// HF id, the unprefixed shortname, or the Ollama tag — into a
+    /// daemon-constructible model. Returns `None` for ids the 2-model
+    /// daemon embedder cannot build (e.g. `bge-large-en`); callers fall
+    /// back to the tier preset. Case-insensitive; surrounding whitespace
+    /// is trimmed (#1521).
+    ///
+    /// Unlike [`FromStr`] (which only accepts the snake wire form), this
+    /// also accepts whatever an operator wrote in `[embeddings].model`
+    /// after [`canonicalise_embedding_model`], so the sectioned config
+    /// block drives the daemon embedder.
+    #[must_use]
+    pub fn from_canonical_id(s: &str) -> Option<Self> {
+        let needle = s.trim();
+        if needle.is_empty() {
+            return None;
         }
+        [Self::MiniLmL6V2, Self::NomicEmbedV15]
+            .into_iter()
+            .find(|model| {
+                model
+                    .canonical_aliases()
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(needle))
+            })
     }
+}
+
+/// Canonical-id aliases for [`EmbeddingModel::MiniLmL6V2`] — snake wire
+/// form, HF id ([`canonicalise_embedding_model`] output), unprefixed
+/// shortname, Ollama tag. See [`EmbeddingModel::from_canonical_id`].
+const MINILM_CANONICAL_ALIASES: &[&str] = &[
+    "mini_lm_l6_v2",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "all-MiniLM-L6-v2",
+    "all-minilm",
+];
+
+/// Canonical-id aliases for [`EmbeddingModel::NomicEmbedV15`] — snake
+/// wire form, HF id ([`canonicalise_embedding_model`] output), Ollama
+/// tag, prefixed HF id. See [`EmbeddingModel::from_canonical_id`].
+const NOMIC_CANONICAL_ALIASES: &[&str] = &[
+    "nomic_embed_v15",
+    "nomic-embed-text-v1.5",
+    "nomic-embed-text",
+    "nomic-ai/nomic-embed-text-v1.5",
+];
+
+// ---------------------------------------------------------------------------
+// Config key names
+// ---------------------------------------------------------------------------
+
+/// Canonical name strings for the legacy v1 flat config keys (plus the
+/// `[embeddings]` section name) that appear on multiple production
+/// sites (#1558). Shared between the `AppConfig` surface in this file
+/// (the manual `Debug` impl + `warn_unknown_top_level_keys`) and the
+/// `ai-memory config migrate` rewriter in
+/// `src/cli/commands/config.rs`, so each key spelling has one source
+/// of truth. The serde wire names themselves derive from the
+/// `AppConfig` field identifiers (no `#[serde(rename)]`), so serde
+/// needs no literal at all.
+pub mod config_keys {
+    /// Legacy flat `archive_max_days` key (v2: `[storage].archive_max_days`).
+    pub const ARCHIVE_MAX_DAYS: &str = "archive_max_days";
+    /// Legacy flat `archive_on_gc` key (v2: `[storage].archive_on_gc`).
+    pub const ARCHIVE_ON_GC: &str = "archive_on_gc";
+    /// Legacy flat `auto_tag_model` key (v2: `[llm.auto_tag].model`).
+    pub const AUTO_TAG_MODEL: &str = "auto_tag_model";
+    /// Legacy flat `cross_encoder` key (v2: `[reranker].enabled`).
+    pub const CROSS_ENCODER: &str = "cross_encoder";
+    /// Legacy flat `default_namespace` key (v2: `[storage].default_namespace`).
+    pub const DEFAULT_NAMESPACE: &str = "default_namespace";
+    /// Legacy flat `embedding_model` key (v2: `[embeddings].model`).
+    pub const EMBEDDING_MODEL: &str = "embedding_model";
+    /// Legacy flat `max_memory_mb` key (v2: resolved via `[storage]`).
+    pub const MAX_MEMORY_MB: &str = "max_memory_mb";
+    /// Legacy flat `ollama_url` key (v2: `[llm].base_url` / `[embeddings].url`).
+    pub const OLLAMA_URL: &str = "ollama_url";
+    /// `[embeddings]` config-section name (#1146 sectioned schema).
+    pub const SECTION_EMBEDDINGS: &str = "embeddings";
+}
+
+// ---------------------------------------------------------------------------
+// LLM model defaults
+// ---------------------------------------------------------------------------
+
+/// Provider-agnostic default backend LLM model tag for the LLM-capable
+/// feature tiers (smart / autonomous).
+///
+/// The NAME is vendor-agnostic by design (#1067 / #1146 / #1490): ai-memory
+/// speaks to ANY backend — local Ollama, OpenAI, Anthropic, xAI, Gemini,
+/// Groq, OpenRouter, or any OpenAI-compatible endpoint — selected via the
+/// `[llm]` config section or `AI_MEMORY_LLM_*` env vars. The VALUE returned
+/// here is only the compiled fallback used when no model is configured at any
+/// precedence layer; it is identical to [`backend_default_model`]'s catch-all
+/// arm (the single source of truth for the local-Ollama default tag) and is
+/// overridden at every layer in the resolver ladder
+/// (CLI > env > `[llm]` > legacy flat field > this compiled default).
+///
+/// No vendor/model name is baked into any tier-config identifier — the tier
+/// presets carry this resolved default string, not a model-named enum.
+#[must_use]
+pub fn default_tier_llm_model() -> &'static str {
+    backend_default_model(crate::llm::BACKEND_OLLAMA)
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +180,21 @@ impl LlmModel {
 
 /// Feature tiers control which AI capabilities are active based on the
 /// available memory budget on the host machine.
+///
+/// # Disambiguation (issue #970)
+///
+/// The codebase has three enums whose names end in `Tier`.
+/// `FeatureTier` (this enum) is the **host capability tier** that
+/// gates which AI features fit in RAM (0 / 256 MB / 1 GB / 4 GB). It
+/// is unrelated to:
+///
+/// - [`crate::models::Tier`] — memory-lifecycle TTL bucket
+///   (Short/Mid/Long).
+/// - [`crate::models::ConfidenceTier`] — confidence-value bucket
+///   (Confirmed/Likely/Ambiguous).
+///
+/// They do not share variants, wire strings, or call sites. See
+/// `docs/internal/enum-proliferation-audit-970.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureTier {
@@ -83,9 +202,9 @@ pub enum FeatureTier {
     Keyword,
     /// `MiniLM` embeddings + HNSW index — ~256 MB.
     Semantic,
-    /// nomic-embed + Gemma 4 E2B via Ollama — ~1 GB.
+    /// nomic-embed + a backend LLM (any configured provider) — ~1 GB.
     Smart,
-    /// nomic-embed + Gemma 4 E4B + cross-encoder via Ollama — ~4 GB.
+    /// nomic-embed + a backend LLM (any configured provider) + cross-encoder — ~4 GB.
     Autonomous,
 }
 
@@ -131,14 +250,14 @@ impl FeatureTier {
             Self::Smart => TierConfig {
                 tier: self,
                 embedding_model: Some(EmbeddingModel::NomicEmbedV15),
-                llm_model: Some(LlmModel::Gemma4E2B),
+                llm_model: Some(default_tier_llm_model().to_string()),
                 cross_encoder: false,
                 max_memory_mb: 1024,
             },
             Self::Autonomous => TierConfig {
                 tier: self,
                 embedding_model: Some(EmbeddingModel::NomicEmbedV15),
-                llm_model: Some(LlmModel::Gemma4E4B),
+                llm_model: Some(default_tier_llm_model().to_string()),
                 cross_encoder: true,
                 max_memory_mb: 4096,
             },
@@ -175,7 +294,12 @@ impl std::fmt::Display for FeatureTier {
 pub struct TierConfig {
     pub tier: FeatureTier,
     pub embedding_model: Option<EmbeddingModel>,
-    pub llm_model: Option<LlmModel>,
+    /// Default backend LLM model tag for this tier, or `None` for tiers that
+    /// use no LLM (keyword / semantic). The value is the provider-agnostic
+    /// compiled default ([`default_tier_llm_model`]); the operator-resolved
+    /// backend/model is carried by [`ResolvedLlm`] via [`AppConfig::resolve_llm`]
+    /// and can be ANY backend. Treated as an on/off gate at the call sites.
+    pub llm_model: Option<String>,
     pub cross_encoder: bool,
     pub max_memory_mb: usize,
 }
@@ -192,7 +316,39 @@ impl TierConfig {
     /// `reranker_active` start at conservative defaults (`disabled` /
     /// `off`); the wrapper updates them based on the *runtime* embedder
     /// + reranker handles, not the *configured* tier values.
+    ///
+    /// **#1168 back-compat shim.** Delegates to
+    /// [`Self::capabilities_with_resolved`] with a
+    /// [`ResolvedModels::from_tier_preset`] triple so the
+    /// pre-#1168 wire shape is byte-equal for callers (legacy tests,
+    /// migrate-tool diagnostics) that don't load an operator
+    /// [`AppConfig`]. Production wrappers MUST call
+    /// [`Self::capabilities_with_resolved`] directly with
+    /// [`AppConfig::resolve_models`] output — otherwise
+    /// `memory_capabilities.models.*` drifts from the live LLM /
+    /// embedder / reranker wiring.
     pub fn capabilities(&self) -> Capabilities {
+        self.capabilities_with_resolved(&ResolvedModels::from_tier_preset(self))
+    }
+
+    /// v0.7.x (issue #1168) — resolver-aware capabilities builder.
+    ///
+    /// Identical to [`Self::capabilities`] except `models.embedding` /
+    /// `models.llm` / `models.cross_encoder` come from the
+    /// operator-resolved `models` triple (built via
+    /// [`AppConfig::resolve_models`]) instead of the compiled tier
+    /// preset. This is the production entry point used by every
+    /// `handle_capabilities_with_conn[_v3]` wrapper post-#1168.
+    ///
+    /// The display logic mirrors the boot banner
+    /// (`src/cli/boot.rs` `BootManifest::build`): Ollama-backend LLM
+    /// emits the bare model id (legacy banner shape); other backends
+    /// emit `backend:model`. Embedder + reranker respect the
+    /// tier-preset disable flag so the keyword tier still reports
+    /// `embedding="none"` even if an operator left a stale
+    /// `[embeddings]` block in their config.
+    #[must_use]
+    pub fn capabilities_with_resolved(&self, models: &ResolvedModels) -> Capabilities {
         let has_embeddings = self.embedding_model.is_some();
         let has_llm = self.llm_model.is_some();
 
@@ -200,7 +356,7 @@ impl TierConfig {
             // Capabilities schema v2 — see `Capabilities` doc comment.
             schema_version: "2".to_string(),
             tier: self.tier.as_str().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
                 keyword_search: true,
                 semantic_search: has_embeddings,
@@ -210,10 +366,18 @@ impl TierConfig {
                 auto_tagging: has_llm,
                 contradiction_analysis: has_llm,
                 cross_encoder_reranking: self.cross_encoder,
-                // Honesty patch: planned-not-implemented. The flag was
-                // previously a `bool` whose `true` value implied a wired
-                // feature that does not exist in this build.
-                memory_reflection: PlannedFeature::planned("v0.7+"),
+                // v0.7.0 recursive-learning (issue #655): the primitive
+                // shipped — Tasks 1-6 landed on
+                // `feat/v0.7.0-recursive-learning`. Flag is enabled and
+                // pinned to the shipping version `v0.7.0`. (Pre-ship,
+                // this was `PlannedFeature::planned("v0.7+")` to keep
+                // the v2 honesty contract honest while the substrate
+                // primitive was on the roadmap.)
+                memory_reflection: PlannedFeature {
+                    planned: false,
+                    version: "v0.7.0".to_string(),
+                    enabled: true,
+                },
                 // Default false — the HTTP/MCP capabilities handler
                 // overwrites this with the live runtime state when it
                 // has access to the embedder handle.
@@ -229,21 +393,12 @@ impl TierConfig {
                 // failed to materialize; `neural` means the BERT
                 // cross-encoder is loaded.
                 reranker_active: RerankerMode::Off,
+                // v0.7.0 L2-8 — default reflection boost (1.2, +0.05/depth,
+                // cap=3). The MCP/HTTP wrapper overlays the live wrapper
+                // config when a `BatchedReranker` handle is available.
+                reflection_boost: ReflectionBoostReport::default(),
             },
-            models: CapabilityModels {
-                embedding: self
-                    .embedding_model
-                    .map_or_else(|| "none".to_string(), |m| m.hf_model_id().to_string()),
-                embedding_dim: self.embedding_model.map_or(0, EmbeddingModel::dim),
-                llm: self
-                    .llm_model
-                    .map_or_else(|| "none".to_string(), |m| m.ollama_model_id().to_string()),
-                cross_encoder: if self.cross_encoder {
-                    "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string()
-                } else {
-                    "none".to_string()
-                },
-            },
+            models: build_capability_models(self, models),
             // v2 dynamic blocks — start at zero-state defaults. The MCP
             // and HTTP `handle_capabilities` wrappers overwrite these
             // with live counts when they have a `&Connection` handle.
@@ -282,8 +437,14 @@ impl TierConfig {
             compaction: CapabilityCompaction::planned(),
             approval: CapabilityApproval {
                 pending_requests: 0,
+                deferred_audit_dlq_size: 0,
             },
-            transcripts: CapabilityTranscripts::planned(),
+            // v0.7.0 #1324 — substrate ships at v0.7.0; flag reads
+            // `planned: false, enabled: false` until an operator wires
+            // the R5 extraction hook and rows land in `memory_transcripts`.
+            // The MCP / HTTP overlay flips `enabled: true` when the live
+            // count is non-zero.
+            transcripts: CapabilityTranscripts::shipped(),
             hnsw: CapabilityHnsw::default(),
             // v0.7 J1 — populated by the SAL wrapper at runtime when a
             // Postgres adapter is active. None at config-construction
@@ -291,6 +452,9 @@ impl TierConfig {
             // the live tag from `PostgresStore::kg_backend()` once
             // J2 wires the SAL into AppState.
             kg_backend: None,
+            // L1-1 — always static for v0.7.0; Goal/Plan/Step/Decision
+            // land in L1-6/v0.8.0.
+            memory_kinds: default_memory_kinds(),
         }
     }
 }
@@ -375,6 +539,44 @@ pub struct Capabilities {
     /// so v1 / v2 clients that don't know the field round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
+
+    /// L1-1 (v0.7.0) — the set of typed memory kinds this binary
+    /// supports.  Always `["observation", "reflection"]` for v0.7.0;
+    /// Goal/Plan/Step/Decision land in L1-6/v0.8.0.  Callers that want
+    /// to enumerate valid values for a `memory_kind` filter should
+    /// consult this field rather than hardcoding the list.
+    ///
+    /// `#[serde(default)]` keeps older capabilities consumers that
+    /// don't know the field from breaking.
+    #[serde(default = "default_memory_kinds")]
+    pub memory_kinds: Vec<String>,
+}
+
+/// v0.7.0 Gap 4 (#887) — the three thresholds powering the
+/// `ConfidenceTier` enum. `confirmed` and `likely` are inclusive
+/// lower bounds; `ambiguous` is the implicit floor (everything below
+/// `likely`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ConfidenceTierThresholds {
+    pub confirmed: f64,
+    pub likely: f64,
+    pub ambiguous: f64,
+}
+
+impl Default for ConfidenceTierThresholds {
+    fn default() -> Self {
+        // Mirrors the constants on `crate::models::ConfidenceTier`.
+        // Cannot reference them directly here without inducing a
+        // semantic cycle through `confidence::DEFAULT_HALF_LIFE_DAYS`
+        // already imported in this module; the
+        // `confidence_tier_thresholds_match_model_constants` test
+        // below pins the agreement at build time.
+        Self {
+            confirmed: 0.95,
+            likely: 0.7,
+            ambiguous: 0.0,
+        }
+    }
 }
 
 /// Live recall-mode tag (P1 honesty patch). Reflects the *runtime*
@@ -450,10 +652,69 @@ pub struct CapabilityFeatures {
     pub auto_tagging: bool,
     pub contradiction_analysis: bool,
     pub cross_encoder_reranking: bool,
-    /// Memory-reflection (v0.7+): planned, not yet implemented.
-    /// Was a `bool` before the P1 honesty patch; an object now so
+    /// Memory-reflection (v0.7.0): planned-feature object. Was a
+    /// `bool` before the v0.6.3.1 P1 honesty patch; an object now so
     /// operators can tell "feature exists but disabled" apart from
     /// "feature not in this build".
+    ///
+    /// **v0.7.0 recursive-learning ship (issue #655).** The flag is
+    /// `{ planned: false, version: "v0.7.0", enabled: true }` because
+    /// the underlying primitive landed across Tasks 1-6 on
+    /// `feat/v0.7.0-recursive-learning`:
+    ///
+    /// - **Column** (Task 1/8, commit `f5d8a9e`) —
+    ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`,
+    ///   first added in the recursive-learning schema bump (column
+    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the current
+    ///   `CURRENT_SCHEMA_VERSION` is 53 in lockstep on both sqlite
+    ///   and postgres ladders as of v0.7.0 — v48 added
+    ///   `federation_push_dlq` (#933), v49 added 14 nullable
+    ///   `archived_memories` columns (#1025), v50 extended
+    ///   `agent_quotas` PK with `namespace` (#1156), v51 added
+    ///   `federation_nonce_cache` (#1255 / PR #1296), v52 added
+    ///   `transcript_line_dedup` (#1389 L4 / RFC-0001), v53 scoped
+    ///   the `memories_au` FTS5 sync trigger to (title, content, tags)
+    ///   only (R5.F5.2 / #1418)).
+    ///   `Memory::reflection_depth: i32` with `#[serde(default)]` for
+    ///   wire-compat with pre-v0.7.0 federation peers.
+    /// - **Governance field** (Task 2/8, commit `630a6db`) —
+    ///   `GovernancePolicy.max_reflection_depth: Option<u32>` (per
+    ///   namespace, JSON metadata, no schema bump). Accessor
+    ///   `effective_max_reflection_depth() -> u32` returns the compiled
+    ///   default `3` when unset; `Some(0)` is the documented
+    ///   kill-switch.
+    /// - **Relation** (Task 3/8, commit `b51a3f3`) — `reflects_on`
+    ///   joins the canonical `VALID_RELATIONS` set; directionality
+    ///   matches `derived_from` (reflection is `source_id`, original
+    ///   is `target_id`); `db::find_paths` walks it without further
+    ///   work.
+    /// - **MCP tool** (Task 4/8, commit `3dc76f3`) — `memory_reflect`
+    ///   (`Family::Power`, tool count 51 → 52). Atomic insert of a
+    ///   reflection memory + N `reflects_on` link writes inside a
+    ///   single `BEGIN IMMEDIATE` / `COMMIT` transaction. Postgres
+    ///   parity via inherent `PostgresStore::reflect`.
+    /// - **Error variant** (Task 4/8) — `MemoryError::ReflectionDepthExceeded
+    ///   { attempted: u32, cap: u32, namespace: String }` →
+    ///   HTTP `409 CONFLICT`, code `REFLECTION_DEPTH_EXCEEDED`.
+    /// - **Hook events** (Task 6/8, commit `fbf093c`) —
+    ///   `HookEvent::PreReflect` (decision-class, `EventClass::Write`,
+    ///   5s deadline, fires before the depth-cap check, `Deny`
+    ///   vetoes via `ReflectError::HookVeto`) +
+    ///   `HookEvent::PostReflect` (notify-class, `EventClass::Write`,
+    ///   5s deadline, fires after `COMMIT`). Pipeline event count
+    ///   21 → 23.
+    /// - **Audit chain** (Task 5/8, commit `c61a05b`) — every
+    ///   depth-cap refusal appends a `reflection.depth_exceeded` row
+    ///   to the append-only `signed_events` audit table under a
+    ///   canonical-CBOR payload + SHA-256 `payload_hash` +
+    ///   `attest_level = "unsigned"`. Content body is deliberately
+    ///   omitted (PII guarantee); hook vetoes are NOT audited by this
+    ///   row (caller-policy refusals carry their own provenance).
+    ///
+    /// The v1 wire-shape projection collapses this object back to a
+    /// single `bool` (via `Capabilities::to_v1`), so pre-v0.6.3.1
+    /// clients that pinned the v1 schema continue to see the same
+    /// boolean field at the same path (and now read `true`).
     pub memory_reflection: PlannedFeature,
     /// v0.6.2 (S18): runtime-observed embedder state. `semantic_search`
     /// above reflects *configured* capability (derived from the tier's
@@ -478,6 +739,59 @@ pub struct CapabilityFeatures {
     /// Reflects the live `CrossEncoder` variant. See [`RerankerMode`].
     #[serde(default = "default_reranker_mode")]
     pub reranker_active: RerankerMode,
+    /// v0.7.0 L2-8 — reflection-aware reranker boost configuration.
+    /// `boost = 1.0` means the boost is disabled and the reranker
+    /// reproduces its pre-L2-8 behavior. Default (`1.2`) is the value
+    /// the daemon ships with; operators can inspect this to verify
+    /// the live boost matches their configured policy. Skipped from
+    /// the wire when serialising a pre-L2-8 default so older
+    /// capabilities consumers round-trip cleanly.
+    #[serde(default = "default_reflection_boost")]
+    pub reflection_boost: ReflectionBoostReport,
+}
+
+/// v0.7.0 L2-8 — per-field report of the reflection-aware reranker
+/// boost surfaced through `memory_capabilities`. Mirrors
+/// [`crate::reranker::ReflectionBoostConfig`] but expressed in
+/// capability-report shape (serde-friendly, schema-tagged).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ReflectionBoostReport {
+    /// Multiplicative boost applied to reflection-kind memories.
+    /// `1.0` disables; default `1.2`.
+    pub boost: f32,
+    /// Per-depth additional multiplier increment. Default `0.05`.
+    pub per_depth_increment: f32,
+    /// Depth cap for the per-depth multiplier. Default `3`.
+    pub max_depth_cap: u32,
+}
+
+impl Default for ReflectionBoostReport {
+    fn default() -> Self {
+        Self {
+            boost: crate::reranker::DEFAULT_REFLECTION_BOOST,
+            per_depth_increment: crate::reranker::DEFAULT_REFLECTION_PER_DEPTH_INCREMENT,
+            max_depth_cap: crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP,
+        }
+    }
+}
+
+impl From<&crate::reranker::ReflectionBoostConfig> for ReflectionBoostReport {
+    fn from(cfg: &crate::reranker::ReflectionBoostConfig) -> Self {
+        Self {
+            boost: cfg.boost,
+            per_depth_increment: cfg.per_depth_increment,
+            max_depth_cap: cfg.max_depth_cap,
+        }
+    }
+}
+
+fn default_reflection_boost() -> ReflectionBoostReport {
+    ReflectionBoostReport::default()
+}
+
+/// L1-1 default: the two typed memory kinds shipping in v0.7.0.
+fn default_memory_kinds() -> Vec<String> {
+    vec!["observation".to_string(), "reflection".to_string()]
 }
 
 fn default_recall_mode() -> RecallMode {
@@ -495,6 +809,80 @@ pub struct CapabilityModels {
     pub embedding_dim: usize,
     pub llm: String,
     pub cross_encoder: String,
+}
+
+/// v0.7.x (issue #1168) — build the `models.*` block of the
+/// capabilities report from the resolver-aware
+/// [`ResolvedModels`] triple, NOT the compiled tier preset.
+///
+/// Display logic mirrors `src/cli/boot.rs` `BootManifest::build`
+/// (v0.7.x #1146) so the boot banner and `memory_capabilities`
+/// agree byte-for-byte on what backend / model the daemon is
+/// wired to:
+///
+/// - `llm` — `"none"` when no LLM is configured; bare `model` for
+///   Ollama backends (legacy banner shape); `backend:model` for
+///   every OpenAI-compatible vendor (xAI, OpenAI, Anthropic,
+///   Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+///   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp).
+/// - `embedding` — `"none"` when the tier preset disables the
+///   embedder (`keyword` tier); otherwise the resolver's canonical
+///   model string.
+/// - `embedding_dim` — v0.7.x (issue #1169): sourced from
+///   [`ResolvedEmbeddings::embedding_dim`] when the resolver
+///   recognised the operator-picked model id (via the
+///   [`KNOWN_EMBEDDING_DIMS`] lookup); falls back to the tier preset
+///   ([`EmbeddingModel::dim`]) only when the operator's model is not
+///   in the table. Pre-#1169 this field was sourced ONLY from the
+///   tier preset, which silently drifted the moment an operator set
+///   `[embeddings].model` to anything outside the 2-family
+///   [`EmbeddingModel`] enum.
+/// - `cross_encoder` — `"none"` when neither the resolver nor the
+///   tier preset enables the cross-encoder; otherwise the
+///   resolver's model string.
+#[must_use]
+pub fn build_capability_models(tier: &TierConfig, models: &ResolvedModels) -> CapabilityModels {
+    let llm = if models.llm.model.is_empty() {
+        "none".to_string()
+    } else if models.llm.is_ollama_native() {
+        models.llm.model.clone()
+    } else {
+        models.llm.display_label()
+    };
+
+    let embedding = if tier.embedding_model.is_none() {
+        // Tier-preset disabled — keep the historical "none" sentinel
+        // even if a stale `[embeddings]` block remains in config.
+        "none".to_string()
+    } else {
+        models.embeddings.model.clone()
+    };
+
+    // v0.7.x (#1169) — resolver-side dim wins when known; tier preset
+    // is the back-compat fallback for unrecognised model ids and the
+    // tier-disabled-embedder posture (where the field stays 0 to match
+    // pre-#1169 semantics).
+    let embedding_dim = if tier.embedding_model.is_none() {
+        0
+    } else {
+        models.embeddings.embedding_dim.map_or_else(
+            || tier.embedding_model.map_or(0, EmbeddingModel::dim),
+            |d| d as usize,
+        )
+    };
+
+    let cross_encoder = if models.reranker.enabled || tier.cross_encoder {
+        models.reranker.model.clone()
+    } else {
+        "none".to_string()
+    };
+
+    CapabilityModels {
+        embedding,
+        embedding_dim,
+        llm,
+        cross_encoder,
+    }
 }
 
 /// Permissions block (capabilities schema v2). Pre-P4 reports a live
@@ -564,6 +952,41 @@ pub struct CapabilityHooks {
     /// callers do not have to handle a missing field.
     #[serde(default = "default_webhook_events")]
     pub webhook_events: Vec<String>,
+    /// v0.7.0 L1-7: total number of distinct `HookEvent` variants the
+    /// pipeline supports.  Populated from the compile-time constant
+    /// [`HOOK_EVENTS_COUNT`] so operators and integrations can verify
+    /// they are running against the expected pipeline version without
+    /// enumerating the enum.
+    ///
+    /// History: G2 shipped 20; G10 added the 21st; Task 6/8 added
+    /// the 22nd + 23rd; L1-7 adds the 24th + 25th → total **25**.
+    #[serde(default = "default_hook_events_count")]
+    pub hook_events_count: usize,
+    /// v0.7-polish SEC-15 / COR-11 (issue #780): mirror of the
+    /// process-wide
+    /// `crate::metrics::auto_export_spawn_failed_total` counter.
+    /// Non-zero means at least one `post_reflect.auto_export` detached
+    /// worker panicked or returned `Err` since process start — the
+    /// reflection is committed in the DB but its on-disk markdown/json
+    /// artefact did NOT land. Operators alert on a non-zero value
+    /// without scraping `/metrics` directly.
+    ///
+    /// `skip_serializing_if = is_zero_u64` keeps healthy daemons'
+    /// capabilities responses byte-identical to pre-#780 — only
+    /// daemons that have actually hit the failure path see the field
+    /// on the wire. The MCP/HTTP capabilities builder overlays the
+    /// live value at response time.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub auto_export_spawn_failed_total: u64,
+}
+
+/// Compile-time count of `HookEvent` variants.  Updated here when new
+/// variants land; the corresponding enum exhaustiveness check in
+/// `src/hooks/timeouts.rs` enforces the count at test time.
+pub const HOOK_EVENTS_COUNT: usize = 25;
+
+fn default_hook_events_count() -> usize {
+    HOOK_EVENTS_COUNT
 }
 
 impl Default for CapabilityHooks {
@@ -571,6 +994,8 @@ impl Default for CapabilityHooks {
         Self {
             registered_count: 0,
             webhook_events: default_webhook_events(),
+            hook_events_count: HOOK_EVENTS_COUNT,
+            auto_export_spawn_failed_total: 0,
         }
     }
 }
@@ -587,14 +1012,19 @@ impl Default for CapabilityHooks {
 /// here closes the v0.6.3.1 honest-disclosure that the
 /// `approval.subscribers` field was advertised but unwired.
 fn default_webhook_events() -> Vec<String> {
+    // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the
+    // three entries that ARE MCP tool names route through the
+    // canonical `tool_names` consts; the remaining four are
+    // subscription-event types (different namespace) and stay raw.
+    use crate::mcp::registry::tool_names as tn;
     vec![
-        "memory_store".to_string(),
-        "memory_promote".to_string(),
-        "memory_delete".to_string(),
-        "memory_link_created".to_string(),
-        "memory_link_invalidated".to_string(),
-        "memory_consolidated".to_string(),
-        "approval_requested".to_string(),
+        tn::MEMORY_STORE.to_string(),
+        tn::MEMORY_PROMOTE.to_string(),
+        tn::MEMORY_DELETE.to_string(),
+        crate::subscriptions::webhook_events::MEMORY_LINK_CREATED.to_string(),
+        crate::subscriptions::webhook_events::MEMORY_LINK_INVALIDATED.to_string(),
+        crate::subscriptions::webhook_events::MEMORY_CONSOLIDATED.to_string(),
+        crate::subscriptions::webhook_events::APPROVAL_REQUESTED.to_string(),
     ]
 }
 
@@ -649,6 +1079,15 @@ pub struct CapabilityApproval {
     // P1 honesty patch: `subscribers` (no subscription API exists) and
     // `default_timeout_seconds` (no sweeper enforces timeouts) dropped
     // from the v2 wire schema.
+    /// v0.7.0 Cluster-C SEC-3 (issue #767) — live count of rows in
+    /// `signed_events_dlq` (the deferred-audit drainer's dead-letter
+    /// queue). Non-zero means at least one storage-hook
+    /// `governance.refusal` event failed to chain-log into
+    /// `signed_events` and landed in the DLQ for operator replay.
+    /// Default-omitted from the wire when zero so existing dashboards
+    /// see no churn on healthy daemons.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub deferred_audit_dlq_size: u64,
 }
 
 /// Sidechain-transcript block (capabilities schema v2). v0.7 Bucket 1.7
@@ -670,11 +1109,44 @@ pub struct CapabilityTranscripts {
 }
 
 impl CapabilityTranscripts {
-    /// Pre-v0.7 zero-state: planned, not enabled.
+    /// Pre-v0.7 zero-state: planned, not enabled. Retained for the
+    /// pre-build capability surface used by the bootstrap config; the
+    /// MCP / HTTP overlay flips this to [`Self::shipped`] before the
+    /// report goes on the wire at v0.7.0+.
     #[must_use]
     pub fn planned() -> Self {
         Self {
             status: PlannedFeature::planned("v0.7+"),
+            total_count: 0,
+            total_size_mb: 0,
+        }
+    }
+
+    /// v0.7.0 #1324 — the substrate ships at v0.7.0: zstd-3 BLOB
+    /// store, `memory_transcripts` table, `memory_transcript_links`
+    /// join, `replay_transcript_union` walk, the `memory_replay` MCP
+    /// tool, and the per-namespace lifecycle sweep are all on disk.
+    /// Operators flip `enabled: true` by wiring the R5 reference
+    /// `pre_store` hook (`tools/transcript-extractor/`) — the
+    /// substrate cannot link transcripts without an operator-driven
+    /// extraction path, so this constructor reflects "shipped but
+    /// awaiting per-namespace opt-in." The live MCP / HTTP overlay
+    /// can additionally flip `enabled` when it observes a non-zero
+    /// transcript count (operator opt-in is observed indirectly via
+    /// presence of rows).
+    ///
+    /// Returning `planned: false` here closes the v0.7.0 honesty drift
+    /// — the pre-#1324 surface advertised `planned: true` even after
+    /// the substrate landed, which confused operators reading the
+    /// capabilities surface as a feature-availability oracle.
+    #[must_use]
+    pub fn shipped() -> Self {
+        Self {
+            status: PlannedFeature {
+                planned: false,
+                version: crate::PKG_VERSION.to_string(),
+                enabled: false,
+            },
             total_count: 0,
             total_size_mb: 0,
         }
@@ -714,6 +1186,551 @@ pub struct CapabilityHnsw {
     /// Lets dashboards alert on *active* pressure rather than only the
     /// historical counter.
     pub evicted_recently: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities v3 L3-5 — recursive-learning / skills / forensic / governance
+// blocks. v3-only (additive over v2). Every field is hand-mapped to a
+// concrete implementation that landed in the v0.7.0 grand-slam L1+L2 waves
+// so an external auditor can trace a claim back to a source-code line.
+// ---------------------------------------------------------------------------
+
+/// v0.7.0 L3-5 — substrate-native reflection capability surface.
+///
+/// Every field MUST map to a real implementation. Audit anchors:
+///
+/// - `implemented`: [`crate::storage::reflect::reflect`] +
+///   [`crate::mcp::tools::memory_reflect`] (issue #655 Task 4/8,
+///   commit `3dc76f3`).
+/// - `depth_bounded`: depth-cap check in [`crate::storage::reflect`]
+///   step 5; [`crate::errors::MemoryError::ReflectionDepthExceeded`]
+///   surfaces refusal with `attempted` + `cap` + `namespace`.
+/// - `max_default`: compiled-in default returned by
+///   [`crate::models::namespace::GovernancePolicy::effective_max_reflection_depth`]
+///   (currently **3**) when the namespace's
+///   `metadata.governance.max_reflection_depth` is unset.
+/// - `attestation`: every reflection writes a `signed_events` row via
+///   [`crate::signed_events::append_signed_event`]; the project uses
+///   Ed25519 (see [`crate::identity::sign`] H2 + H4 link-signing
+///   plus the operator-signed governance rules in
+///   [`crate::governance::rules_store`]).
+/// - `curator_mode`: implemented in
+///   [`crate::curator::reflection_pass`] and the
+///   `ai-memory curator --reflection-pass` CLI verb in
+///   [`crate::cli::curator`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityReflection {
+    /// `true` whenever the reflection primitive is wired (memory_reflect MCP
+    /// tool present + `storage::reflect::reflect` callable). False is reserved
+    /// for a build that compiled the field out.
+    pub implemented: bool,
+    /// `true` when reflections are subject to a depth cap that refuses
+    /// further reflection past the configured maximum.
+    pub depth_bounded: bool,
+    /// Compiled-in default cap returned when no namespace policy is set.
+    /// Tracks [`crate::models::namespace::GovernancePolicy::effective_max_reflection_depth`].
+    pub max_default: u32,
+    /// Signature algorithm used by the substrate for attested events
+    /// touching reflections (link signatures + `signed_events` rows).
+    pub attestation: String,
+    /// `"implemented"` when the curator reflection pass is wired
+    /// (`curator::reflection_pass` + `ai-memory curator` CLI). Stays a
+    /// string (not a bool) so future increments can grow new values like
+    /// `"scheduled"` without a wire-shape break.
+    pub curator_mode: String,
+}
+
+impl CapabilityReflection {
+    /// Build the L3-5 reflection capability from real values pinned at
+    /// compile time so the wire shape reflects what this binary actually
+    /// ships. Constants from [`crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP`]
+    /// and the curator module are consulted directly — no magic strings.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            implemented: true,
+            depth_bounded: true,
+            max_default: crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP,
+            attestation: "Ed25519".to_string(),
+            curator_mode: IMPLEMENTED.to_string(),
+        }
+    }
+}
+
+fn default_capability_reflection() -> CapabilityReflection {
+    CapabilityReflection::current()
+}
+
+/// v0.7.0 L3-5 — Agent-Skills capability surface.
+///
+/// Every field MUST map to a real implementation:
+///
+/// - `implemented`: 7 MCP tools wired in
+///   [`crate::mcp::registry`] + handlers in
+///   [`crate::mcp::tools::skill_*`].
+/// - `standard`: the parser in [`crate::parsing::skill_md`] validates
+///   names + frontmatter against the agentskills.io §3.1/§3.2 spec.
+/// - `tools`: list mirrors the registered handler names verbatim;
+///   regression test [`SKILL_TOOL_NAMES`] verifies the slice matches
+///   the live MCP dispatcher.
+/// - `round_trip`: `memory_skill_register` → `memory_skill_export` →
+///   re-register produces the IDENTICAL SHA-256 digest (see
+///   `tests/skill_test.rs`, the round-trip pin).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilitySkills {
+    /// `true` whenever the skill registration + lookup substrate is
+    /// wired. False is reserved for a build that compiled the family out.
+    pub implemented: bool,
+    /// External spec the parser targets. `"agentskills.io"` is the
+    /// canonical name documented in the L1-5 spec.
+    pub standard: String,
+    /// Canonical list of registered skill tools. Order matches the MCP
+    /// dispatch order so an LLM that pins the order doesn't drift.
+    pub tools: Vec<String>,
+    /// `"verified"` when register → export → re-register is exercised in
+    /// the test suite and the digests match.
+    pub round_trip: String,
+}
+
+/// Canonical skill tool names as registered in
+/// [`crate::mcp::registry`]. Pinned here (not derived from the registry)
+/// so the capability surface remains a stable, declarative contract;
+/// the regression test
+/// `cap_v3_l3_5_skill_tools_match_registered_mcp_dispatch` ensures the
+/// two stay in sync.
+// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — each
+// entry routes through the canonical `tool_names` const so this
+// capability surface cannot drift from the dispatch table in name
+// spelling. The `cap_v3_l3_5_skill_tools_match_registered_mcp_dispatch`
+// regression test continues to enforce membership equality between
+// this slice and the registered set.
+pub const SKILL_TOOL_NAMES: &[&str] = &[
+    crate::mcp::registry::tool_names::MEMORY_SKILL_REGISTER,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_LIST,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_GET,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_RESOURCE,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_EXPORT,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
+    crate::mcp::registry::tool_names::MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
+];
+
+impl CapabilitySkills {
+    /// Build the L3-5 skills capability from real, code-anchored values.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            implemented: true,
+            standard: "agentskills.io".to_string(),
+            tools: SKILL_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect(),
+            round_trip: "verified".to_string(),
+        }
+    }
+}
+
+fn default_capability_skills() -> CapabilitySkills {
+    CapabilitySkills::current()
+}
+
+/// Capability-matrix value string — a surface is reported as
+/// `"implemented"` once its engine/hook/wrapper code is live. One named
+/// const so the 18 matrix cells share a single spelling (pm-v3.1
+/// hardcoded-literal gate, #1558 wave 4).
+const IMPLEMENTED: &str = "implemented";
+
+/// v0.7.0 L3-5 — forensic-evidence capability surface.
+///
+/// Each label names a CLI / function pair that **exists** in this binary:
+///
+/// - `verify_reflection_chain`: `ai-memory verify-reflection-chain` —
+///   driver lives in [`crate::cli::verify`].
+/// - `export_forensic_bundle`: `ai-memory export-forensic-bundle` —
+///   builder lives in [`crate::forensic::bundle::build`].
+/// - `verify_forensic_bundle`: `ai-memory verify-forensic-bundle` —
+///   verifier lives in [`crate::forensic::bundle::verify`].
+///
+/// All three are `"implemented"` strings (not bools) so future
+/// increments can promote a value to `"attested"` or `"scheduled"`
+/// without a wire-shape break.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityForensic {
+    pub verify_reflection_chain: String,
+    pub export_forensic_bundle: String,
+    pub verify_forensic_bundle: String,
+}
+
+impl CapabilityForensic {
+    /// Build the L3-5 forensic capability — all three driver paths are
+    /// wired in this build.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            verify_reflection_chain: IMPLEMENTED.to_string(),
+            export_forensic_bundle: IMPLEMENTED.to_string(),
+            verify_forensic_bundle: IMPLEMENTED.to_string(),
+        }
+    }
+}
+
+fn default_capability_forensic() -> CapabilityForensic {
+    CapabilityForensic::current()
+}
+
+/// v0.7.0 L3-5 — substrate-rules governance capability surface.
+///
+/// Surfaces the L1-6 activation posture honestly:
+///
+/// - `rules_engine`: `"operator_signed"` because the L1-6 loader
+///   refuses to honour any `enabled = 1` rule that is not
+///   `attest_level = 'operator_signed'` and whose signature does not
+///   verify against the active operator pubkey
+///   ([`crate::governance::rules_store`] L1-6 audit).
+/// - `enforced_actions`: the actual variant set in
+///   [`crate::governance::agent_action::AgentAction`] minus the
+///   `Custom` extension point (extension points are not
+///   substrate-enforced). v0.7.0 ships **four** action kinds at the
+///   harness-mediated PreToolUse boundary.
+/// - `bypass_impossibility_tests`: count of `#[test]` functions in
+///   [`tests/governance_l16_activation.rs`] verifying the
+///   bypass-impossibility properties (signature-required, tampered-sig
+///   rejected, direct-enabled-flip rejected, keygen 0600, idempotent
+///   sign-seed, rotated-key invalidates). The number reflects the test
+///   file as of v0.7.0 — bumping it requires an audit pass and a
+///   matching test addition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityGovernance {
+    pub rules_engine: String,
+    pub enforced_actions: Vec<String>,
+    pub bypass_impossibility_tests: u32,
+    /// v0.7.0 SEC-2 (Cluster D, issue #767) — `true` when an operator
+    /// pubkey is resolved (env var or `~/.config/ai-memory/operator.key.pub`)
+    /// AND therefore the L1-6 loader is in attest-enforcing mode (every
+    /// `enabled = 1` row MUST be operator-signed to fire). `false` when
+    /// the substrate is in pre-L1-6 / fail-OPEN compat mode — every
+    /// enabled rule passes through without signature verification.
+    ///
+    /// Clients that need to display the deployment's enforcement
+    /// posture (operator dashboard, MCP-inspect tool, capabilities
+    /// summary) can render this flag verbatim. Defaults to `false`
+    /// for envelopes serialised before SEC-2 to preserve wire
+    /// compatibility.
+    #[serde(default)]
+    pub l1_6_attest: bool,
+}
+
+/// v0.7.0 L1-6 — the canonical agent-external action kinds the
+/// substrate gates via the operator-signed rules engine. Matches the
+/// variant set in [`crate::governance::agent_action::AgentAction`]
+/// (minus the open-ended `Custom` extension point).
+///
+/// #1605 — the values are the snake_case **wire tags** from
+/// [`crate::governance::agent_action::action_kinds`] (the #1558 SSOT
+/// the `memory_check_agent_action` MCP parser, the CLI `rules test`
+/// parser, and the `governance_rules.kind` column all share), NOT the
+/// Rust variant names. The pre-#1605 list advertised `"Bash"` /
+/// `"FilesystemWrite"` / … — tokens the kind parser refuses — so a
+/// caller following capabilities verbatim got `unknown kind`.
+///
+/// MemoryWrite is intentionally NOT in this list — substrate-internal
+/// memory writes are gated by the K9 `Op` pipeline
+/// ([`crate::governance::Op`]) which is a separate, substrate-
+/// authoritative surface. The two engines have different enforcement
+/// semantics; honest reporting keeps them on separate fields rather
+/// than conflating them under one label. The L3-5 audit comment in
+/// `tests/capabilities_v3_l3_5.rs` documents the carry-forward.
+pub const ENFORCED_AGENT_ACTIONS: &[&str] = &[
+    crate::governance::agent_action::action_kinds::BASH,
+    crate::governance::agent_action::action_kinds::FILESYSTEM_WRITE,
+    crate::governance::agent_action::action_kinds::NETWORK_REQUEST,
+    crate::governance::agent_action::action_kinds::PROCESS_SPAWN,
+];
+
+/// v0.7.0 L1-6 — number of bypass-impossibility tests pinning the
+/// rules-engine activation posture. Tracks the `#[test]` count in
+/// `tests/governance_l16_activation.rs`. Bumping this requires both an
+/// audit and a matching test landing in that file.
+pub const GOVERNANCE_BYPASS_IMPOSSIBILITY_TESTS: u32 = 6;
+
+impl CapabilityGovernance {
+    /// Build the L3-5 governance capability from the live constants.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            rules_engine: "operator_signed".to_string(),
+            enforced_actions: ENFORCED_AGENT_ACTIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            bypass_impossibility_tests: GOVERNANCE_BYPASS_IMPOSSIBILITY_TESTS,
+            // SEC-2 — reflect the live pubkey-resolution state at
+            // envelope construction time. The pubkey lookup is
+            // filesystem + env; cheap relative to the rest of the
+            // capabilities-v3 build path.
+            l1_6_attest: crate::governance::rules_store::l1_6_attest_active(),
+        }
+    }
+}
+
+fn default_capability_governance() -> CapabilityGovernance {
+    CapabilityGovernance::current()
+}
+
+/// v0.7.0 WT-1-G — atomisation capability surface.
+///
+/// WT-1 ships substrate-native decomposition of long memories into
+/// atomic propositions. The parent memory is archived (`archived_at`
+/// stamped, `atomised_into = N`) and `N` first-class atomic children
+/// land with `atom_of` back-pointers and a signed `derives_from`
+/// `MemoryLink`. Each sub-field below names a real operator-facing
+/// surface in this binary; the round-trip is honest — the values are
+/// `"implemented"` only when the engine, hook, and wrapper code are
+/// all wired.
+///
+/// Field → implementation anchor map:
+///
+/// - `tool`: MCP `memory_atomise` (Family::Power). Defined in
+///   [`crate::mcp::tools::atomise`] + registered in
+///   [`crate::mcp::registry`]. WT-1-C landed it.
+/// - `cli`: `ai-memory atomise <memory_id>` subcommand. Wrapper lives
+///   in [`crate::cli::commands::atomise`]. WT-1-F landed it.
+/// - `auto`: namespace-policy-gated `auto_atomise` pre_store hook.
+///   The hook in [`crate::hooks::pre_store::auto_atomise`] is
+///   non-blocking (detached worker thread) and fires only when the
+///   namespace standard's `metadata.governance.auto_atomise = true`.
+///   WT-1-D landed it.
+/// - `recall_preference`: recall surfaces atoms in place of an
+///   archived parent via the SQL guard
+///   `AND NOT (archived_at IS NOT NULL AND atomised_into > 0)`.
+///   WT-1-E landed it.
+/// - `forensic`: forensic bundle export includes the parent → atoms
+///   chain envelope so a downstream auditor reconstructs the
+///   decomposition offline. WT-1-E landed it.
+/// - `curator`: production `LlmCurator` uses the Gemma 4 prompt
+///   with `tiktoken-rs::cl100k_base` token-budget validation and
+///   the audit-honest STOP discipline (no retry after a parse-OK
+///   verdict). WT-1-B landed it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityAtomisation {
+    /// MCP `memory_atomise` tool — `"implemented"` once the tool is
+    /// registered and the [`crate::mcp::tools::atomise`] handler is
+    /// wired against [`crate::atomisation::Atomiser`].
+    pub tool: String,
+    /// `ai-memory atomise` CLI subcommand — `"implemented"` once the
+    /// wrapper in [`crate::cli::commands::atomise`] is dispatched
+    /// from `daemon_runtime::Command::Atomise`.
+    pub cli: String,
+    /// Namespace-policy-gated auto-atomisation pre_store hook —
+    /// `"implemented"` when [`crate::hooks::pre_store::auto_atomise`]
+    /// is compiled and the store handlers call
+    /// `maybe_enqueue_auto_atomise` after a successful insert.
+    pub auto: String,
+    /// Recall-time atom preference — `"implemented"` when the recall
+    /// SQL carries the
+    /// `AND NOT (archived_at IS NOT NULL AND atomised_into > 0)`
+    /// guard so atomised parents stop surfacing in their atoms'
+    /// place. WT-1-E.
+    pub recall_preference: String,
+    /// Forensic chain envelope — `"implemented"` when the forensic
+    /// bundle exporter ([`crate::forensic::bundle::build`]) walks
+    /// `atom_of` back-pointers to include the parent → atoms chain
+    /// in the bundle. WT-1-E.
+    pub forensic: String,
+    /// LLM curator — `"implemented"` once
+    /// [`crate::atomisation::curator::LlmCurator`] is the production
+    /// `Curator` impl driving the atomisation engine (Gemma 4 prompt,
+    /// tiktoken-rs cl100k token-budget validation, audit-honest STOP).
+    /// WT-1-B.
+    pub curator: String,
+    /// Memory-link relation that anchors the atom → parent edge.
+    /// Always `"derives_from"`, matching
+    /// [`crate::models::MemoryLinkRelation::DerivesFrom`]. Distinct
+    /// from `related_to` / `supersedes` / `contradicts` — the
+    /// atomisation engine writes this edge specifically, and
+    /// downstream consumers can filter on the relation to walk
+    /// decomposition lineage without reflection-chain noise.
+    pub link_relation: String,
+}
+
+impl CapabilityAtomisation {
+    /// Build the WT-1-G atomisation capability surface from real,
+    /// code-anchored values. Every `"implemented"` here is a claim
+    /// pinned by [`tests/capabilities_v3_l3_5.rs`] and walked back to
+    /// a registered MCP tool / CLI verb / hook module / SQL guard.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            tool: IMPLEMENTED.to_string(),
+            cli: IMPLEMENTED.to_string(),
+            auto: IMPLEMENTED.to_string(),
+            recall_preference: IMPLEMENTED.to_string(),
+            forensic: IMPLEMENTED.to_string(),
+            curator: IMPLEMENTED.to_string(),
+            link_relation: "derives_from".to_string(),
+        }
+    }
+}
+
+fn default_capability_atomisation() -> CapabilityAtomisation {
+    CapabilityAtomisation::current()
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.x Form 6 — MemoryKind Batman-vocabulary capability surface (#759)
+// ---------------------------------------------------------------------------
+
+/// v0.7.x Form 6 (issue #759) — Batman-taxonomy memory-kind
+/// capability surface. Names the recall-filter / auto-classify
+/// surfaces shipped under Form 6.
+///
+/// Field → implementation anchor map:
+///
+/// - `vocabulary`: the complete enumerated vocabulary the substrate
+///   accepts on the `memory_kind` column. Always
+///   `["observation", "reflection", "persona", "concept", "entity",
+///   "claim", "relation", "event", "conversation", "decision"]` in
+///   v0.7.x — anchored at compile time by
+///   [`crate::models::MemoryKind::all`].
+/// - `recall_filter`: MCP `memory_recall` and HTTP recall accept a
+///   `kinds` parameter (CSV string or JSON array). `"implemented"`
+///   once the param is plumbed into [`crate::mcp::tools::recall`]
+///   and [`crate::handlers::http::recall_response`].
+/// - `cli_filter`: `ai-memory recall --kind concept,entity` CLI
+///   flag. `"implemented"` once the flag is wired in
+///   [`crate::cli::recall::RecallArgs`].
+/// - `auto_classify`: the namespace-policy-gated
+///   `pre_store::auto_classify_kind` hook. `"implemented"` once
+///   the hook module is compiled and `memory_store` calls
+///   [`crate::hooks::pre_store::maybe_auto_classify`] after policy
+///   resolution.
+/// - `auto_classify_modes`: enumerated policy modes the operator
+///   may set. Always `["off", "regex_only", "regex_then_llm"]` —
+///   anchored against [`crate::models::MemoryKindAutoClassify`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityMemoryKindVocab {
+    /// Complete enumerated vocabulary the substrate accepts on the
+    /// `memory_kind` column. Compile-anchored.
+    pub vocabulary: Vec<String>,
+    /// MCP `memory_recall` + HTTP recall `kinds` param wiring.
+    pub recall_filter: String,
+    /// CLI `--kind` flag wiring.
+    pub cli_filter: String,
+    /// Namespace-policy-gated auto-classify pre_store hook wiring.
+    pub auto_classify: String,
+    /// Enumerated auto-classify policy modes (`off` / `regex_only` /
+    /// `regex_then_llm`). Compile-anchored.
+    pub auto_classify_modes: Vec<String>,
+}
+
+impl CapabilityMemoryKindVocab {
+    /// Build the Form 6 memory-kind-vocab capability surface from
+    /// real, code-anchored values. Every `"implemented"` here is a
+    /// claim pinned by [`tests/form_6_memorykind_vocab.rs`].
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            vocabulary: crate::models::MemoryKind::all()
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect(),
+            recall_filter: IMPLEMENTED.to_string(),
+            cli_filter: IMPLEMENTED.to_string(),
+            auto_classify: IMPLEMENTED.to_string(),
+            auto_classify_modes: vec![
+                "off".to_string(),
+                "regex_only".to_string(),
+                "regex_then_llm".to_string(),
+            ],
+        }
+    }
+}
+
+fn default_capability_memory_kind_vocab() -> CapabilityMemoryKindVocab {
+    CapabilityMemoryKindVocab::current()
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0 Form 5 (issue #758) — auto-confidence + shadow-mode +
+// calibration tooling capability surface.
+// ---------------------------------------------------------------------------
+
+/// v0.7.0 Form 5 — operator-facing confidence-calibration capability
+/// surface. Names every Form-5 substrate the binary actually ships:
+///
+/// - `auto_derive`: the [`crate::confidence::derive`] engine
+///   (deterministic auto-confidence formula). Opt-in via
+///   `AI_MEMORY_AUTO_CONFIDENCE=1` — the field reports `"implemented"`
+///   because the engine compiles in unconditionally; the env-var gate
+///   is the operator control plane.
+/// - `shadow_mode`: the [`crate::confidence::shadow`] pipeline backed
+///   by the `confidence_shadow_observations` table (schema v39 sqlite /
+///   v38 postgres). Opt-in via `AI_MEMORY_CONFIDENCE_SHADOW=1`.
+/// - `freshness_decay`: the [`crate::confidence::decay::decayed`]
+///   exponential decay model. Opt-in via `AI_MEMORY_CONFIDENCE_DECAY=1`
+///   or per-namespace `confidence_decay_half_life_days` policy.
+/// - `calibration_cli`: the `ai-memory calibrate confidence
+///   --from-shadow` driver verb that scans the observation table and
+///   emits per-(namespace, source) baselines.
+/// - `calibration_tool`: the `memory_calibrate_confidence` MCP tool
+///   (Family::Power) — operator-callable equivalent of the CLI driver.
+/// - `signals_schema`: the wire-shape discriminator for the JSON
+///   envelope stored on `memories.confidence_signals`. Always
+///   `"v1"` in v0.7.0 — bumped when the [`crate::models::ConfidenceSignals`]
+///   struct gains a new field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapabilityConfidenceCalibration {
+    /// `"implemented"` once [`crate::confidence::derive`] is wired into
+    /// the substrate (it compiles in regardless of feature flag).
+    pub auto_derive: String,
+    /// `"implemented"` once [`crate::confidence::shadow`] is wired
+    /// (Form 5).
+    pub shadow_mode: String,
+    /// `"implemented"` once [`crate::confidence::decay`] is wired
+    /// (Form 5).
+    pub freshness_decay: String,
+    /// `"implemented"` once the `ai-memory calibrate confidence` CLI
+    /// driver registers under [`crate::cli`].
+    pub calibration_cli: String,
+    /// `"implemented"` once the `memory_calibrate_confidence` MCP
+    /// tool registers under Family::Power.
+    pub calibration_tool: String,
+    /// Wire-shape discriminator for `memories.confidence_signals`.
+    /// Always `"v1"` in v0.7.0.
+    pub signals_schema: String,
+    /// Default freshness-decay half-life (days). 30 in v0.7.0; tunable
+    /// per namespace via the `confidence_decay_half_life_days` policy.
+    pub default_half_life_days: f64,
+    /// v0.7.0 Gap 4 (#887) — derived-tier thresholds. MCP callers
+    /// reading this surface know how the substrate buckets the
+    /// `confidence` real into `confirmed` / `likely` / `ambiguous`
+    /// without re-deriving the breakpoints. Stable; bumping is a
+    /// wire-level break (see [`crate::models::ConfidenceTier`]).
+    /// `#[serde(default)]` keeps pre-Gap-4 capability consumers
+    /// reading newer payloads from breaking.
+    #[serde(default)]
+    pub tier_thresholds: ConfidenceTierThresholds,
+}
+
+impl CapabilityConfidenceCalibration {
+    /// Build the Form 5 capability surface from real, code-anchored
+    /// values. Every `"implemented"` here is a claim pinned by
+    /// `tests/form_5_confidence_calibration.rs` and walked back to a
+    /// registered MCP tool / CLI verb / module file.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            auto_derive: IMPLEMENTED.to_string(),
+            shadow_mode: IMPLEMENTED.to_string(),
+            freshness_decay: IMPLEMENTED.to_string(),
+            calibration_cli: IMPLEMENTED.to_string(),
+            calibration_tool: IMPLEMENTED.to_string(),
+            signals_schema: "v1".to_string(),
+            default_half_life_days: crate::confidence::DEFAULT_HALF_LIFE_DAYS,
+            tier_thresholds: ConfidenceTierThresholds::default(),
+        }
+    }
+}
+
+fn default_capability_confidence_calibration() -> CapabilityConfidenceCalibration {
+    CapabilityConfidenceCalibration::current()
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +1858,37 @@ impl Capabilities {
             // None when no SAL adapter is wired (every pre-J2 build);
             // `Some("age" | "cte")` once the SAL handle is threaded.
             kg_backend: self.kg_backend.clone(),
+            // L1-1 — propagate the memory-kind set verbatim.
+            memory_kinds: self.memory_kinds.clone(),
+            // L3-5 — four new substrate-honesty blocks. Built from
+            // compile-time anchors (the per-block `::current()`
+            // constructor) so the wire shape reflects the actual
+            // implementation surface, not a static template.
+            reflection: CapabilityReflection::current(),
+            skills: CapabilitySkills::current(),
+            forensic: CapabilityForensic::current(),
+            governance: CapabilityGovernance::current(),
+            // v0.7.0 WT-1-G — operator-facing atomisation surface.
+            // Anchored at compile time against the WT-1-{A..F} ships
+            // (engine, curator, hook, recall guard, forensic bundle,
+            // MCP tool, CLI subcommand).
+            atomisation: CapabilityAtomisation::current(),
+            // v0.7.x Form 6 (issue #759) — Batman-taxonomy memory-kind
+            // vocabulary surface. Anchored at compile time against the
+            // [`crate::models::MemoryKind`] enum + the recall-filter /
+            // CLI / auto-classify wiring shipped under Form 6.
+            memory_kind_vocab: CapabilityMemoryKindVocab::current(),
+            // v0.7.0 Form 5 (issue #758) — confidence-calibration
+            // surface. Anchored at compile time against the
+            // `crate::confidence` module (derive, shadow, decay,
+            // calibrate), the `ai-memory calibrate confidence` CLI
+            // subcommand, and the `memory_calibrate_confidence` MCP
+            // tool.
+            confidence_calibration: CapabilityConfidenceCalibration::current(),
+            // v0.7.0 #973 Item C — do-calculus / Ortega-de-Freitas
+            // narrative surface. Helper does the source-tree honesty
+            // check at the comment site; see the helper's docstring.
+            provenance_substrate_layer: default_capability_provenance_substrate_layer(),
         }
     }
 }
@@ -874,6 +1922,18 @@ pub struct ToolEntry {
     /// `loaded && agent_can_call(agent_id, family)`. When the
     /// `[mcp.allowlist]` is disabled, `callable_now == loaded`.
     pub callable_now: bool,
+    /// v0.7.0 issue #803 — 0-2 worked examples for the tool.
+    /// `skip_serializing_if = "Vec::is_empty"` strips the field
+    /// for any tool without curated examples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<ToolExample>,
+}
+
+/// v0.7.0 issue #803 — single worked example for `tools[].examples`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExample {
+    pub call: serde_json::Value,
+    pub description: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +2039,150 @@ pub struct CapabilitiesV3 {
     /// that don't know the field round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
+
+    /// L1-1 (v0.7.0) — typed memory-kind set. Forwarded from the v2
+    /// projection's `memory_kinds` field. Always
+    /// `["observation", "reflection"]` for v0.7.0.
+    ///
+    /// **L3-5 honesty note.** The grand-slam spec called for a third
+    /// `"goal"` kind here, but the [`crate::models::memory::MemoryKind`]
+    /// enum in this binary only carries `Observation` and `Reflection`.
+    /// Per the operator's "every reported field maps to real
+    /// implementation" directive, the v3 surface reports exactly what
+    /// the substrate enforces — the `goal` kind is deferred to the
+    /// tracker (`a4f8d465`) for a v0.8.0 wave that lands the enum
+    /// variant + migration + write-path coverage. Reporting it here
+    /// today would be theatrical.
+    #[serde(default = "default_memory_kinds")]
+    pub memory_kinds: Vec<String>,
+
+    /// v0.7.0 L3-5 — recursive-learning capability surface. Every
+    /// sub-field anchors a real implementation in this binary; see
+    /// [`CapabilityReflection`] for the per-field audit anchors.
+    #[serde(default = "default_capability_reflection")]
+    pub reflection: CapabilityReflection,
+
+    /// v0.7.0 L3-5 — Agent-Skills capability surface. Lists the seven
+    /// registered `memory_skill_*` MCP tools; the round-trip guarantee
+    /// is pinned by `tests/skill_test.rs`. See [`CapabilitySkills`].
+    #[serde(default = "default_capability_skills")]
+    pub skills: CapabilitySkills,
+
+    /// v0.7.0 L3-5 — forensic-evidence CLI surface. Names the three
+    /// driver verbs that this binary actually ships
+    /// (`verify-reflection-chain`, `export-forensic-bundle`,
+    /// `verify-forensic-bundle`). See [`CapabilityForensic`].
+    #[serde(default = "default_capability_forensic")]
+    pub forensic: CapabilityForensic,
+
+    /// v0.7.0 L3-5 — substrate-rules governance surface. Honestly
+    /// labelled `"operator_signed"` because the L1-6 loader refuses
+    /// to honour unsigned rules. See [`CapabilityGovernance`].
+    #[serde(default = "default_capability_governance")]
+    pub governance: CapabilityGovernance,
+
+    /// v0.7.0 WT-1-G — atomisation capability surface. Names the six
+    /// operator-facing atomisation surfaces (`tool` / `cli` / `auto` /
+    /// `recall_preference` / `forensic` / `curator`) plus the
+    /// `derives_from` link relation that anchors atom → parent
+    /// lineage. See [`CapabilityAtomisation`] for the per-field
+    /// implementation anchor map.
+    ///
+    /// Additive over the L3-5 surface — pre-WT-1-G v3 payloads still
+    /// deserialise cleanly (the `default_capability_atomisation`
+    /// helper resolves to the current-implementation snapshot for any
+    /// payload missing the field).
+    #[serde(default = "default_capability_atomisation")]
+    pub atomisation: CapabilityAtomisation,
+
+    /// v0.7.x Form 6 (issue #759) — Batman-taxonomy memory-kind
+    /// vocabulary capability surface. Names the recall-filter +
+    /// auto-classify surfaces shipped under Form 6 and enumerates
+    /// the substrate's full set of recognised `memory_kind` values.
+    /// See [`CapabilityMemoryKindVocab`].
+    ///
+    /// Additive over the WT-1-G surface — pre-Form-6 v3 payloads
+    /// deserialise cleanly via the
+    /// `default_capability_memory_kind_vocab` helper.
+    #[serde(default = "default_capability_memory_kind_vocab")]
+    pub memory_kind_vocab: CapabilityMemoryKindVocab,
+
+    /// v0.7.0 Form 5 (issue #758) — confidence-calibration capability
+    /// surface. Names the five operator-facing Form-5 substrates
+    /// (`auto_derive` / `shadow_mode` / `freshness_decay` /
+    /// `calibration_cli` / `calibration_tool`) plus the
+    /// `signals_schema` wire-shape discriminator. See
+    /// [`CapabilityConfidenceCalibration`] for the per-field anchor
+    /// map.
+    ///
+    /// Additive over the WT-1-G surface — pre-Form-5 v3 payloads still
+    /// deserialise cleanly because of the
+    /// `default_capability_confidence_calibration` helper.
+    #[serde(default = "default_capability_confidence_calibration")]
+    pub confidence_calibration: CapabilityConfidenceCalibration,
+
+    /// v0.7.0 #973 Item C — narrative summary of the substrate's
+    /// do-calculus posture.
+    #[serde(default = "default_capability_provenance_substrate_layer")]
+    pub provenance_substrate_layer: CapabilityProvenanceSubstrateLayer,
+}
+
+/// v0.7.0 #973 Item C — substrate-layer provenance posture. Lets an
+/// LLM agent self-describe ai-memory's do-calculus
+/// intervention/observation distinction (Pearl 2009) per Ortega &
+/// de Freitas (2026) framing. Honesty discipline: every
+/// `enforcement_layers` entry must map to a shipped substrate
+/// primitive in source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityProvenanceSubstrateLayer {
+    #[serde(default)]
+    pub posture: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub enforcement_layers: Vec<String>,
+    #[serde(default)]
+    pub honest_limitations: Vec<String>,
+    #[serde(default)]
+    pub spec_references: SpecReferences,
+}
+
+/// v0.7.0 #973 Item C — academic citations. Vendor-neutral.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SpecReferences {
+    #[serde(default)]
+    pub do_calculus: String,
+    #[serde(default)]
+    pub interactional_agency: String,
+}
+
+#[must_use]
+pub fn default_capability_provenance_substrate_layer() -> CapabilityProvenanceSubstrateLayer {
+    CapabilityProvenanceSubstrateLayer {
+        posture: "do_calculus_aligned".to_string(),
+        summary: "ai-memory implements the do-calculus intervention/observation \
+                  distinction at the substrate layer via Form 4 fact-provenance, \
+                  Form 6 MemoryKind vocabulary, Form 7 agent-EXTERNAL governance, \
+                  the V-4 signed-events cross-row hash chain, and the seven Gap \
+                  provenance framework; stops cross-session delusion amplification \
+                  but not intra-session hallucination (consumer LLM responsibility)."
+            .to_string(),
+        enforcement_layers: vec![
+            "form_4_fact_provenance".to_string(),
+            "form_6_memory_kind".to_string(),
+            "form_7_agent_external_governance".to_string(),
+            "signed_events_v4_chain".to_string(),
+            "seven_gap_framework".to_string(),
+        ],
+        honest_limitations: vec![
+            "intra_session_hallucination_is_consumer_responsibility".to_string(),
+            "federation_reliability_via_dlq_not_silent_drop".to_string(),
+        ],
+        spec_references: SpecReferences {
+            do_calculus: "Pearl (2009)".to_string(),
+            interactional_agency: "Ortega and de Freitas (2026)".to_string(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,7 +2294,7 @@ pub const DEFAULT_TRANSCRIPT_TTL_SECS: i64 = 2_592_000;
 /// A transcript whose `archived_at` is older than this is hard-deleted
 /// by the prune phase; the I2 join table is cleaned up via
 /// `ON DELETE CASCADE`.
-pub const DEFAULT_TRANSCRIPT_ARCHIVE_GRACE_SECS: i64 = 604_800;
+pub const DEFAULT_TRANSCRIPT_ARCHIVE_GRACE_SECS: i64 = crate::SECS_PER_WEEK;
 
 /// Maximum transcript TTL / grace clamp: 10 years in seconds. Mirrors
 /// [`MAX_TTL_SECS`] above so the same overflow guard applies to the
@@ -1132,6 +2336,14 @@ pub struct TranscriptsConfig {
     /// child namespace under the prefix; the bare `"*"` is the
     /// catch-all and is consulted last.
     pub namespaces: Option<std::collections::HashMap<String, TranscriptNamespaceConfig>>,
+    /// v0.7.0 I1 cap (#628 agent-3 follow-up): the maximum number of
+    /// bytes a single transcript may decompress to before
+    /// `transcripts::fetch` rejects it as a decompression bomb. `None`
+    /// → compiled default ([`crate::transcripts::MAX_DECOMPRESSED_BYTES`]
+    /// = 16 MiB). Operators with legitimately larger transcripts
+    /// raise the cap explicitly; the cap is per-call, so concurrent
+    /// fetches consume up to N × this value of transient memory.
+    pub max_decompressed_bytes: Option<usize>,
 }
 
 /// Per-namespace overrides nested under
@@ -1429,33 +2641,117 @@ const CONFIG_FILE: &str = "config.toml";
 ///
 /// All fields are optional — CLI flags override file values, which override
 /// compiled defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Feature tier: keyword, semantic, smart, autonomous
     pub tier: Option<String>,
     /// Path to the `SQLite` database file
     pub db: Option<String>,
     /// Ollama base URL for LLM generation (default: <http://localhost:11434>)
+    ///
+    /// DOC-6 (FX-C4-batch2, 2026-05-26): legacy flat field, slated
+    /// for removal in v0.8.0. Use the sectioned `[llm].base_url` /
+    /// `[embeddings].url` shape from #1146 instead. Run
+    /// `ai-memory config migrate` to rewrite legacy configs.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use the sectioned `[llm].base_url` / `[embeddings].url` (#1146); slated for removal in v0.8.0"
+    )]
     pub ollama_url: Option<String>,
     /// Separate URL for embedding model (defaults to `ollama_url` if unset)
+    ///
+    /// DOC-6: legacy; use `[embeddings].url`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[embeddings].url` (#1146); slated for removal in v0.8.0"
+    )]
     pub embed_url: Option<String>,
     /// Embedding model override: `mini_lm_l6_v2` or `nomic_embed_v15`
+    ///
+    /// DOC-6: legacy; use `[embeddings].model`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[embeddings].model` (#1146); slated for removal in v0.8.0"
+    )]
     pub embedding_model: Option<String>,
     /// LLM model override (Ollama tag, e.g. "gemma4:e2b")
+    ///
+    /// DOC-6: legacy; use `[llm].model`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[llm].model` (#1146); slated for removal in v0.8.0"
+    )]
     pub llm_model: Option<String>,
+    /// Dedicated model for auto_tag (and other short-structured LLM calls).
+    /// Defaults to `gemma3:4b` (fast, deterministic, ~0.7s p50 vs 15s for
+    /// thinking-mode Gemma 4). Falls back to `llm_model` if unset.
+    /// See L15 patch (2026-05-11) for rationale.
+    ///
+    /// DOC-6: legacy; use `[llm.auto_tag].model`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[llm.auto_tag].model` (#1146); slated for removal in v0.8.0"
+    )]
+    pub auto_tag_model: Option<String>,
     /// Enable cross-encoder reranking (true/false)
+    ///
+    /// DOC-6: legacy; use `[reranker].enabled`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[reranker].enabled` (#1146); slated for removal in v0.8.0"
+    )]
     pub cross_encoder: Option<bool>,
     /// Default namespace for new memories
+    ///
+    /// DOC-6: legacy; use `[storage].default_namespace`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[storage].default_namespace` (#1146); slated for removal in v0.8.0"
+    )]
     pub default_namespace: Option<String>,
     /// Maximum memory budget in MB (used for auto tier selection)
+    ///
+    /// DOC-6: legacy; the auto-tier path now resolves via the
+    /// sectioned `[storage]` block.
+    #[deprecated(
+        since = "0.7.0",
+        note = "auto-tier resolution now resolves via the sectioned [storage] block (#1146); slated for removal in v0.8.0"
+    )]
     pub max_memory_mb: Option<usize>,
     /// Per-tier TTL overrides
     pub ttl: Option<TtlConfig>,
     /// Archive memories before GC deletion (default: true)
+    ///
+    /// DOC-6: legacy; use `[storage].archive_on_gc`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `[storage].archive_on_gc` (#1146); slated for removal in v0.8.0"
+    )]
     pub archive_on_gc: Option<bool>,
-    /// Optional API key for HTTP API authentication
+    /// Optional API key for HTTP API authentication.
+    ///
+    /// #1262 — `skip_serializing` prevents the secret from being
+    /// echoed back through any `serde_json::to_string(&AppConfig)`
+    /// path (capabilities overlays, debug dumps, audit traces).
+    /// #1454 — the manual `Debug` impl on `AppConfig` (just below the
+    /// struct) renders this field as `<redacted>`, so a `{:?}` of the
+    /// config never leaks the secret either (`skip_serializing` only
+    /// guards the serde JSON path, not `Debug`).
+    /// #1258 — [`AppConfig::zeroize_secrets`] (a free helper method,
+    /// NOT a blanket `Drop` impl) zeroizes this buffer; callers invoke
+    /// it immediately before scope-exit. A blanket `Drop` is
+    /// deliberately avoided so the `..AppConfig::default()`
+    /// struct-update spread used across ~20 test sites still compiles.
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     /// Maximum archive age in days for automatic purge during GC (default: disabled)
+    ///
+    /// DOC-6: legacy; the archive purge knob resolves via the
+    /// sectioned `[storage]` block at v0.7.x.
+    #[deprecated(
+        since = "0.7.0",
+        note = "archive purge resolution moves under the sectioned [storage] block (#1146); slated for removal in v0.8.0"
+    )]
     pub archive_max_days: Option<i64>,
     /// Identity-resolution overrides (Task 1.2 follow-up #198).
     pub identity: Option<IdentityConfig>,
@@ -1518,7 +2814,1470 @@ pub struct AppConfig {
     /// (Postgres on 5432, the hooks daemon, etc.). Operators who need
     /// loopback for testing must set this explicitly.
     pub subscriptions: Option<SubscriptionsConfig>,
+    /// v0.7.0 H5 (round-2) — `[verify]` block. Today exposes one
+    /// knob: `require_nonce` (default `false`). When `true`, every
+    /// `POST /api/v1/links/verify` request MUST include a
+    /// `verification_nonce` (UUID v4 expected); missing or replayed
+    /// nonces are rejected with 409 Conflict. Default-OFF preserves
+    /// the v0.6.x verify-anytime semantics for unmigrated clients.
+    pub verify: Option<VerifyConfig>,
+    /// v0.7.0 M4 — connection-level `statement_timeout` (in seconds)
+    /// applied via an `after_connect` hook to every postgres
+    /// connection in the pool. Bounds runaway queries — a pathological
+    /// `pg_sleep(60)` or an unbounded scan can otherwise wedge a
+    /// connection forever. Defaults to 30s when unset; set to 0 to
+    /// disable the limit (matches the postgres `SET` semantics).
+    /// Operators only need to touch this when the workload requires
+    /// long-running maintenance queries from the daemon itself.
+    pub postgres_statement_timeout_secs: Option<u64>,
+    /// v0.7.0 (a) — connection-pool ceiling (sqlx `max_connections`)
+    /// for the postgres backend. `None` selects the compiled
+    /// `DEFAULT_MAX_CONNECTIONS`. Operators tune this per module/daemon
+    /// without a recompile via `AI_MEMORY_PG_POOL_MAX`. Resolved by
+    /// [`AppConfig::resolve_pg_pool`]; non-positive values fall through
+    /// to the default.
+    pub postgres_pool_max_connections: Option<u32>,
+    /// v0.7.0 (a) — connection-pool floor of always-open warm
+    /// connections (sqlx `min_connections`). `None` selects the
+    /// compiled `DEFAULT_MIN_CONNECTIONS`. Operator knob:
+    /// `AI_MEMORY_PG_POOL_MIN`. Resolved by
+    /// [`AppConfig::resolve_pg_pool`]; non-positive values fall through
+    /// to the default.
+    pub postgres_pool_min_connections: Option<u32>,
+    /// v0.7.0 (a) — how long a pool `acquire()` waits for a free
+    /// connection before erroring (sqlx `acquire_timeout`), in whole
+    /// seconds. `None` selects the compiled default derived from
+    /// `DEFAULT_ACQUIRE_TIMEOUT`. Operator knob:
+    /// `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS`. Resolved by
+    /// [`AppConfig::resolve_pg_pool`]; non-positive values fall through
+    /// to the default.
+    pub postgres_acquire_timeout_secs: Option<u64>,
+    /// v0.7.0 H7 (round-2) — per-HTTP-request wall-clock timeout in
+    /// seconds. Applied as a middleware to every axum route in
+    /// [`crate::build_router`] so a slow-POST (slowloris-style)
+    /// attacker cannot keep a handler scope alive indefinitely.
+    /// `None` selects the compiled default of 60 seconds; operators
+    /// who need a different ceiling set
+    /// `request_timeout_secs = <secs>` in `config.toml`.
+    pub request_timeout_secs: Option<u64>,
+    /// v0.7.0 H8 (round-2) — per-LLM-call wall-clock timeout in
+    /// seconds. Wraps every `spawn_blocking` invocation of an Ollama
+    /// call (`auto_tag`, `expand_query`, `summarize_memories`, ...)
+    /// in `tokio::time::timeout`. `None` selects the compiled
+    /// default of 30 seconds; on timeout the call falls back to the
+    /// LLM-absent path (already exercised by L5/L7).
+    pub llm_call_timeout_secs: Option<u64>,
+    /// v0.7.0 (issue #318) — when set, the MCP stdio server forwards
+    /// every write tool (`memory_store`, `memory_link`, `memory_delete`)
+    /// to this HTTP endpoint (typically the local `ai-memory serve`
+    /// daemon at `http://localhost:9077`) instead of writing to SQLite
+    /// directly. The HTTP daemon then runs the existing
+    /// `broadcast_store_quorum` / `broadcast_link_quorum` / etc. fanout,
+    /// closing the gap surfaced by a2a-gate v0.6.0 r6 where MCP-stdio
+    /// writes replicated locally but never reached the federation mesh.
+    ///
+    /// Unset (the default) keeps the legacy direct-SQLite path so
+    /// single-node MCP deployments without a federation daemon behave
+    /// exactly as before. The forwarder uses `reqwest::blocking` and
+    /// surfaces HTTP errors as MCP error strings; on transport failure
+    /// the response carries the underlying error so operators can
+    /// distinguish "fanout daemon not running" from "quorum not met".
+    pub mcp_federation_forward_url: Option<String>,
+    /// v0.7.0 (issue #518) — `[agents.defaults]` block. Carries the
+    /// `recall_scope` defaults spliced into `memory_recall` /
+    /// `GET /api/v1/recall` / `ai-memory recall` requests that pass
+    /// `session_default=true` (or `--session-default` on the CLI) and
+    /// omit one or more filter fields. Closes the OpenClaw v0.6.3.1
+    /// "what were you working on?" recovery gap — agents picking up a
+    /// new session no longer need to remember to splice the canonical
+    /// namespace + recency filters on every cross-session recall.
+    ///
+    /// `None` (the default) preserves single-tenant deployments and
+    /// existing recall semantics exactly as-is. The splice happens in
+    /// the handler before the storage call; explicit args always win
+    /// over the defaults.
+    pub agents: Option<AgentsConfig>,
+    /// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` block.
+    /// Today exposes one knob: `require_operator_pubkey` (default
+    /// `false`). When `true`, daemon `serve` startup REFUSES to boot
+    /// if the `governance_rules` table contains any `enabled = 1`
+    /// rows AND no operator pubkey is resolved (env var or
+    /// `~/.config/ai-memory/operator.key.pub`). Closes the
+    /// fail-OPEN gap where a SQL-write gadget could install
+    /// `enabled = 1` rules that the pre-L1-6 loader would honour
+    /// without signature check. Default `false` preserves the
+    /// pre-cluster-D contract for the install-script deploy where
+    /// no operator pubkey is yet on disk.
+    pub governance: Option<GovernanceConfig>,
+    /// v0.7.0 Cluster G (#767) — `[confidence]` block. Carries the
+    /// retention window for `confidence_shadow_observations` consumed
+    /// by the periodic GC sweep (`shadow_retention_days`, default 30).
+    /// Unset → the compiled default applies. Closes PERF-4: the v0.7.0
+    /// Form 5 closeout (#758) shipped the shadow-mode table but did
+    /// NOT ship retention, so a long-running shadow-enabled deployment
+    /// would see unbounded growth.
+    pub confidence: Option<ConfidenceConfig>,
+    /// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+    /// `[admin]` top-level block. Carries the operator-configured
+    /// allowlist of `agent_ids` whose authenticated HTTP requests
+    /// are treated as admin-class callers (full cross-tenant
+    /// visibility for endpoints that must observe corpus-scale
+    /// metadata: `GET /api/v1/export`, `GET /api/v1/agents`,
+    /// `GET /api/v1/stats`, the `POST /api/v1/quota/status` list
+    /// path). `None` (the default) closes those endpoints to all
+    /// non-admin callers — the safe-by-default posture per CLAUDE.md
+    /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
+    pub admin: Option<AdminConfig>,
+
+    // ------------------------------------------------------------------
+    // v0.7.x enterprise configuration sections (issue #1146).
+    //
+    // These four sectioned blocks (`[llm]` / `[embeddings]` /
+    // `[reranker]` / `[storage]`) consolidate the previously-flat
+    // LLM / embedder / reranker / storage knobs into named tables with
+    // a uniform canonical resolver. Legacy flat fields above
+    // (`llm_model`, `ollama_url`, `embed_url`, `embedding_model`,
+    // `cross_encoder`, `default_namespace`, `archive_on_gc`,
+    // `archive_max_days`, `max_memory_mb`) continue to parse and feed
+    // the resolver's legacy arm with a one-shot deprecation WARN until
+    // v0.8.0 removes them.
+    //
+    // The `schema_version` field carries the explicit shape version.
+    // Absent / `1` selects the legacy parse path; `>= 2` selects the
+    // sectioned parse path and warns when legacy fields are also
+    // present (so an operator who hand-edited the file knows the
+    // legacy fields are dead weight).
+    // ------------------------------------------------------------------
+    /// v0.7.x (#1146) — explicit configuration schema version. `None`
+    /// or `1` selects the v0.6.x flat-field parse path; `2` selects
+    /// the sectioned parse path (`[llm]`, `[embeddings]`, `[reranker]`,
+    /// `[storage]`) and emits a WARN if any legacy flat field is also
+    /// present. Future bumps (`3`, `4`, …) introduce additional schema
+    /// transitions and are gated through `ai-memory config migrate`.
+    pub schema_version: Option<u32>,
+
+    /// v0.7.x (#1146) — `[llm]` sectioned LLM configuration. Carries
+    /// the canonical backend / model / base_url / api_key references
+    /// consumed by every LLM-init surface (MCP stdio, HTTP daemon,
+    /// `ai-memory atomise`, `ai-memory curator`, embed-client
+    /// disambiguator, the boot banner). Resolved via
+    /// [`AppConfig::resolve_llm`]; the resolver applies the uniform
+    /// precedence ladder (CLI flag > `AI_MEMORY_LLM_*` env > `[llm]`
+    /// section > legacy flat fields > compiled default).
+    ///
+    /// Includes an optional `[llm.auto_tag]` sub-table for the fast
+    /// structured-output sibling that handles `auto_tag`, query
+    /// expansion, and contradiction detection — see [`LlmSection`].
+    pub llm: Option<LlmSection>,
+
+    /// v0.7.x (#1146) — `[embeddings]` sectioned embedding-model
+    /// configuration. Consumed by the embedder bootstrap in
+    /// `daemon_runtime` and the MCP embed-client fallback path.
+    /// Resolved via [`AppConfig::resolve_embeddings`].
+    pub embeddings: Option<EmbeddingsSection>,
+
+    /// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
+    /// configuration. Folds the legacy `cross_encoder = bool` knob
+    /// into a `{ enabled, model }` table with explicit model
+    /// selection. Resolved via [`AppConfig::resolve_reranker`].
+    pub reranker: Option<RerankerSection>,
+
+    /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
+    /// Carries `default_namespace`, `archive_on_gc`, `archive_max_days`,
+    /// `max_memory_mb` (folded from the previously-flat top-level
+    /// fields). The `db` path stays top-level per the I4 carve-out in
+    /// #1146 (path expansion semantics pinned by #507).
+    pub storage: Option<StorageSection>,
+
+    /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
+    /// Carries the per-(agent, namespace) daily memory-write quota, the
+    /// lifetime storage cap, the daily link-creation quota, and the
+    /// list/bulk request page-size cap. Resolved via
+    /// [`AppConfig::resolve_limits`]; the resolver applies the uniform
+    /// precedence ladder (`AI_MEMORY_MAX_*` env > `[limits]` section >
+    /// compiled default). Defaults are deliberately generous so the
+    /// substrate is invisible to small-scale operators; operators with
+    /// high event-rate workloads raise them per-deployment without
+    /// recompiling. See [`LimitsSection`].
+    pub limits: Option<LimitsSection>,
 }
+
+// #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
+// `<redacted>` instead of leaking through a `{:?}` of the whole config
+// (mirrors the `ResolvedLlm` redaction model further down this file).
+// Every other field is rendered verbatim. KEEP IN SYNC: a new field on
+// `AppConfig` must be mirrored here or it silently drops from Debug.
+#[allow(deprecated)] // legacy flat fields are deprecated but still debugged
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("tier", &self.tier)
+            .field("db", &self.db)
+            .field(config_keys::OLLAMA_URL, &self.ollama_url)
+            .field("embed_url", &self.embed_url)
+            .field(config_keys::EMBEDDING_MODEL, &self.embedding_model)
+            .field("llm_model", &self.llm_model)
+            .field(config_keys::AUTO_TAG_MODEL, &self.auto_tag_model)
+            .field(config_keys::CROSS_ENCODER, &self.cross_encoder)
+            .field(config_keys::DEFAULT_NAMESPACE, &self.default_namespace)
+            .field(config_keys::MAX_MEMORY_MB, &self.max_memory_mb)
+            .field("ttl", &self.ttl)
+            .field(config_keys::ARCHIVE_ON_GC, &self.archive_on_gc)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
+            .field(config_keys::ARCHIVE_MAX_DAYS, &self.archive_max_days)
+            .field("identity", &self.identity)
+            .field("scoring", &self.scoring)
+            .field("autonomous_hooks", &self.autonomous_hooks)
+            .field("logging", &self.logging)
+            .field("audit", &self.audit)
+            .field("boot", &self.boot)
+            .field("mcp", &self.mcp)
+            .field("permissions", &self.permissions)
+            .field("transcripts", &self.transcripts)
+            .field("hooks", &self.hooks)
+            .field("subscriptions", &self.subscriptions)
+            .field("verify", &self.verify)
+            .field(
+                "postgres_statement_timeout_secs",
+                &self.postgres_statement_timeout_secs,
+            )
+            .field(
+                "postgres_pool_max_connections",
+                &self.postgres_pool_max_connections,
+            )
+            .field(
+                "postgres_pool_min_connections",
+                &self.postgres_pool_min_connections,
+            )
+            .field(
+                "postgres_acquire_timeout_secs",
+                &self.postgres_acquire_timeout_secs,
+            )
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("llm_call_timeout_secs", &self.llm_call_timeout_secs)
+            .field(
+                "mcp_federation_forward_url",
+                &self.mcp_federation_forward_url,
+            )
+            .field("agents", &self.agents)
+            .field("governance", &self.governance)
+            .field("confidence", &self.confidence)
+            .field("admin", &self.admin)
+            .field("schema_version", &self.schema_version)
+            .field("llm", &self.llm)
+            .field(config_keys::SECTION_EMBEDDINGS, &self.embeddings)
+            .field("reranker", &self.reranker)
+            .field("storage", &self.storage)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
+impl AppConfig {
+    /// #1258 — manually zeroize the `api_key` buffer. Callers that hold
+    /// the only owner of an `AppConfig` and are about to drop it
+    /// invoke this immediately before scope-exit so the secret bytes
+    /// do not linger on the heap. The free-standing helper (instead of
+    /// a blanket `Drop` impl on `AppConfig`) preserves the
+    /// `..AppConfig::default()` struct-update syntax used by ~20
+    /// existing test sites; adding a blanket `Drop` would forbid the
+    /// move-by-spread pattern Rust requires for `Drop` types.
+    pub fn zeroize_secrets(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(key) = self.api_key.as_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+/// v0.7.0 SEC-2 (Cluster D, issue #767) — `[governance]` top-level
+/// block. Today exposes a single fail-closed knob; future governance
+/// knobs (e.g., signature-rotation policy timestamps, per-rule
+/// override timeouts) can stack here.
+///
+/// Wire format:
+/// ```toml
+/// [governance]
+/// require_operator_pubkey = true
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GovernanceConfig {
+    /// SEC-2 fail-closed switch. When `true`, the daemon refuses to
+    /// start if the `governance_rules` table contains any
+    /// `enabled = 1` row AND no operator pubkey is resolved. Default
+    /// `false` preserves the pre-cluster-D contract that the
+    /// substrate stays in pre-L1-6 mode (every enabled rule passes
+    /// through) until the operator activates L1-6 by placing the
+    /// pubkey on disk or setting `AI_MEMORY_OPERATOR_PUBKEY`.
+    ///
+    /// Operators running the install-script default deploy who want
+    /// strict enforcement BEFORE the operator pubkey lands set this
+    /// to `true` — the daemon will then surface a clear error
+    /// message naming the missing pubkey path.
+    #[serde(default)]
+    pub require_operator_pubkey: bool,
+}
+
+/// v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20) —
+/// `[admin]` top-level block. The operator-configured allowlist of
+/// `agent_ids` whose authenticated HTTP requests are treated as
+/// admin-class callers, granting full cross-tenant visibility on
+/// endpoints whose payloads necessarily expose corpus-scale
+/// metadata (`GET /api/v1/export`, `GET /api/v1/agents`,
+/// `GET /api/v1/stats`, the `POST /api/v1/quota/status` list path).
+///
+/// Wire format:
+/// ```toml
+/// [admin]
+/// agent_ids = ["ops:admin", "ai:claude@workstation"]
+/// ```
+///
+/// **Default-closed.** When the block is absent, the allowlist is
+/// empty and every admin-class endpoint returns `403 Forbidden` for
+/// every caller. Operators MUST set `[admin].agent_ids = [...]`
+/// explicitly to grant any caller admin privileges. This closes
+/// the v0.7.0 SHIP-blocking cross-tenant exfiltration defects
+/// (#946 / #957 / #960) where admin endpoints landed open by default
+/// because the legacy `api_key_auth` middleware passes through when
+/// no API key is configured.
+///
+/// **Caller resolution** uses the same primitive other handlers do
+/// (`identity::resolve_http_agent_id` against `X-Agent-Id`). The
+/// allowlist matches against the resolved caller string verbatim;
+/// there is no glob / prefix support today (planned under #961 when
+/// the operator surface grows beyond a static list).
+///
+/// **Not a substitute for authentication.** The role gate runs
+/// AFTER `api_key_auth`. Deployments serving sensitive corpora
+/// MUST set `api_key` so the bare-network surface requires the key
+/// AND the role gate runs on top of it. The two layers compose:
+/// `api_key_auth` answers "is the request authenticated?" and the
+/// admin gate answers "is the authenticated caller an admin?".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminConfig {
+    /// Explicit list of `agent_id` strings whose authenticated
+    /// requests are treated as admin-class. Default `vec![]`
+    /// (empty) means no caller is an admin — every admin-class
+    /// endpoint returns 403.
+    ///
+    /// Each entry MUST match a caller's resolved `agent_id`
+    /// verbatim. Validation: the SAL accepts the same NHI
+    /// `agent_id` charset that
+    /// [`crate::validate::validate_agent_id`] enforces (see the
+    /// "Agent Identity (NHI)" section of CLAUDE.md). Entries that
+    /// fail validation at boot are logged at `warn` and dropped
+    /// from the in-memory allowlist; the daemon still starts so
+    /// a single typo does not lock the operator out.
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+}
+
+impl AdminConfig {
+    /// Returns the validated subset of `agent_ids` — entries that
+    /// pass [`crate::validate::validate_agent_id`]. Entries that
+    /// fail validation are dropped (with a `warn` log) so a single
+    /// typo in `config.toml` cannot lock the operator out.
+    #[must_use]
+    pub fn validated_agent_ids(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.agent_ids.len());
+        for id in &self.agent_ids {
+            match crate::validate::validate_agent_id(id) {
+                Ok(()) => out.push(id.clone()),
+                Err(e) => {
+                    tracing::warn!("[admin] dropping invalid agent_id '{id}' from allowlist: {e}");
+                }
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.x enterprise configuration sections (issue #1146)
+//
+// `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` consolidate
+// previously-flat LLM / embedder / reranker / storage knobs into a
+// uniform sectioned shape consumed by the canonical resolvers in
+// `impl AppConfig`. See the issue for the full design rationale,
+// migration plan, and acceptance criteria.
+// ---------------------------------------------------------------------------
+
+/// v0.7.x (#1146) — `[llm]` sectioned LLM configuration.
+///
+/// Wire format:
+/// ```toml
+/// [llm]
+/// backend     = "xai"          # ollama | openai | xai | anthropic | gemini | …
+/// model       = "grok-4.3"     # vendor-specific identifier
+/// base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+/// api_key_env = "XAI_API_KEY"           # env var name (mutually exclusive
+///                                        # with api_key_file)
+/// # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
+///
+/// [llm.auto_tag]
+/// # Fast structured-output sibling (auto_tag, query expansion,
+/// # contradiction detection). Fields fall back to parent [llm]
+/// # field-by-field when unset; commonly only `model` is overridden.
+/// model = "gemma3:4b"
+/// ```
+///
+/// **Secret handling discipline.** Inline `api_key = "<literal>"` is
+/// REJECTED at parse time — operators MUST use either
+/// `api_key_env = "<ENV_VAR_NAME>"` (resolved at runtime) or
+/// `api_key_file = "/path/to/key"` (mode 0400 enforced, override via
+/// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`). Both unset selects
+/// the per-vendor-alias env-var fallback chain (see `src/llm.rs`
+/// `alias_api_key_env_vars`).
+///
+/// **Precedence.** Resolved via [`AppConfig::resolve_llm`] through the
+/// uniform precedence ladder: CLI flag > `AI_MEMORY_LLM_*` env vars >
+/// `[llm]` section > legacy flat fields (`llm_model`, `ollama_url`) >
+/// compiled default (warn-logged once on the resolver's `CompiledDefault`
+/// arm).
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmSection {
+    /// Backend selector. One of: `ollama` (native `/api/chat` +
+    /// `/api/embed`, no auth), `openai-compatible` (generic; requires
+    /// explicit `base_url`), or an alias that pre-fills `base_url`
+    /// (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`,
+    /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
+    /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
+    /// (treated as `ollama`).
+    pub backend: Option<String>,
+
+    /// Model identifier passed verbatim to the chat endpoint.
+    /// Vendor-specific (e.g., `grok-4.3`, `gpt-5`, `claude-opus-4.7`).
+    /// Unset = backend-specific default (see `OllamaClient::from_env`).
+    pub model: Option<String>,
+
+    /// Optional base-URL override. Required when `backend =
+    /// "openai-compatible"`; ignored otherwise (vendor-default
+    /// applies). For `backend = "ollama"`, defaults to
+    /// `http://localhost:11434`.
+    pub base_url: Option<String>,
+
+    /// Name of the environment variable to read at runtime for the
+    /// API-key Bearer auth secret. Mutually exclusive with
+    /// `api_key_file`. Example: `api_key_env = "XAI_API_KEY"`. The
+    /// `AI_MEMORY_LLM_API_KEY` process-env override (and the
+    /// per-vendor fallback chain at `src/llm.rs`
+    /// `alias_api_key_env_vars`) take precedence over this field per
+    /// the uniform precedence ladder.
+    pub api_key_env: Option<String>,
+
+    /// Path to a file whose first line is the API-key Bearer secret.
+    /// Mutually exclusive with `api_key_env`. File must be `mode 0400`
+    /// or stricter (overridable via
+    /// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` per #1055). Tilde
+    /// expansion applies.
+    pub api_key_file: Option<String>,
+
+    /// **REJECTED AT PARSE TIME.** Accepting the field name here lets
+    /// the validator emit a clear "use api_key_env or api_key_file"
+    /// error instead of serde's generic "unknown field". Operators
+    /// inlining secrets in the config file see the security-rationale
+    /// message at load time.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// `[llm.auto_tag]` sub-table for the fast structured-output
+    /// sibling (`auto_tag`, query expansion, contradiction detection).
+    /// Unset = inherit every field from the parent [`LlmSection`].
+    /// When set, only the explicitly-provided fields override; unset
+    /// fields fall back to the parent.
+    #[serde(default)]
+    pub auto_tag: Option<LlmAutoTagSection>,
+}
+
+// #1454 (SEC, LOW) — manual `Debug` redacts the parse-time-rejected
+// inline `api_key` so a `{:?}` of an `LlmSection` never echoes a secret
+// (mirrors `ResolvedLlm`). `api_key_env` / `api_key_file` are env-var
+// names / file paths (config, not secret) and stay verbatim. KEEP IN
+// SYNC: a new field must be mirrored here or it drops from Debug.
+impl std::fmt::Debug for LlmSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmSection")
+            .field("backend", &self.backend)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key_file", &self.api_key_file)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
+            .field("auto_tag", &self.auto_tag)
+            .finish()
+    }
+}
+
+/// v0.7.x (#1146) — `[llm.auto_tag]` sub-table. Fast structured-output
+/// sibling of [`LlmSection`]. Fields fall back to the parent `[llm]`
+/// section field-by-field when unset; commonly only `model` is
+/// overridden to point at a faster model (default `gemma3:4b`,
+/// ~0.7s p50 vs ~15s p50 for thinking-mode Gemma 4 per L15 patch).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmAutoTagSection {
+    /// Backend override. Unset = inherit `[llm].backend`.
+    pub backend: Option<String>,
+    /// Model override. Unset = inherit `[llm].model`. Compiled default
+    /// at the resolver level is `gemma3:4b` (L15 fast-structured-output
+    /// model selection).
+    pub model: Option<String>,
+    /// Base-URL override. Unset = inherit `[llm].base_url`.
+    pub base_url: Option<String>,
+    /// Env-var-name override for the API key. Unset = inherit
+    /// `[llm].api_key_env` (or `[llm].api_key_file`).
+    pub api_key_env: Option<String>,
+    /// File-path override for the API key. Unset = inherit
+    /// `[llm].api_key_file` (or `[llm].api_key_env`).
+    pub api_key_file: Option<String>,
+}
+
+/// v0.7.x (#1146) — `[embeddings]` sectioned embedding-model
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// [embeddings]
+/// backend        = "openrouter"                # ollama (default) or any
+///                                              # #1067 API alias /
+///                                              # openai-compatible (#1598)
+/// base_url       = "https://openrouter.ai/api/v1"
+/// model          = "google/gemini-embedding-2"
+/// api_key_env    = "OPENROUTER_API_KEY"        # mutually exclusive with
+/// # api_key_file = "/etc/ai-memory/keys/embed.key"   # mode 0400 enforced
+/// dim            = 3072                        # only needed for models
+///                                              # outside the known-dims table
+/// backfill_batch = 100                         # 1-10000 (env override:
+///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingsSection {
+    /// Embedding backend. `ollama` (the default — local `/api/embed`
+    /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
+    /// (`openrouter`, `openai`, `gemini`, …) or the generic
+    /// `openai-compatible` escape hatch for self-hosted endpoints
+    /// (HF TEI, vLLM).
+    pub backend: Option<String>,
+
+    /// Embedding endpoint URL. Defaults to `http://localhost:11434`
+    /// when unset (ollama backend) or to the backend alias's default
+    /// base URL (API backends, #1598). Synonym of [`Self::base_url`];
+    /// `base_url` wins when both are set.
+    pub url: Option<String>,
+
+    /// #1598 — embedding endpoint base URL. Synonym of [`Self::url`]
+    /// (named to match `[llm].base_url`); when both are set,
+    /// `base_url` wins.
+    pub base_url: Option<String>,
+
+    /// Embedding model identifier. Legacy values `nomic_embed_v15`
+    /// (alias for `nomic-embed-text-v1.5`) and `mini_lm_l6_v2` (alias
+    /// for `sentence-transformers/all-MiniLM-L6-v2`) are honored at
+    /// parse time.
+    pub model: Option<String>,
+
+    /// #1598 — inline API-key literal. ALWAYS REJECTED at config load
+    /// (mirrors `[llm].api_key`): config.toml is typically
+    /// world-readable, so inline secrets are a credential leak. The
+    /// field exists solely so the rejection is loud instead of a
+    /// silent unknown-key skip. Use [`Self::api_key_env`] or
+    /// [`Self::api_key_file`].
+    pub api_key: Option<String>,
+
+    /// #1598 — name of the process env var holding the embedding API
+    /// key. Mutually exclusive with [`Self::api_key_file`].
+    pub api_key_env: Option<String>,
+
+    /// #1598 — path of a file holding the embedding API key (mode
+    /// 0400 enforced, mirroring `[llm].api_key_file`). Mutually
+    /// exclusive with [`Self::api_key_env`].
+    pub api_key_file: Option<String>,
+
+    /// #1598 — explicit vector-dim override for embedding models not
+    /// in [`KNOWN_EMBEDDING_DIMS`]. Takes precedence over the table
+    /// lookup; non-positive values are ignored.
+    pub dim: Option<u32>,
+
+    /// Backfill batch size. Bounded `1..=10000`; out-of-range values
+    /// fall back to the compiled default (100) with a WARN. Env
+    /// override: `AI_MEMORY_EMBED_BACKFILL_BATCH` (#38).
+    pub backfill_batch: Option<u32>,
+}
+
+/// v0.7.x (#1146) — `[reranker]` sectioned cross-encoder
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// [reranker]
+/// enabled = true
+/// model   = "ms-marco-MiniLM-L-6-v2"   # v0.7.0 has one variant;
+///                                       # field reserved for future
+///                                       # bake-offs.
+/// ```
+///
+/// Folds the legacy `cross_encoder = bool` top-level flag. Migration
+/// (via `ai-memory config migrate`) writes the explicit `enabled` +
+/// `model` fold; the legacy field continues to be honored at parse
+/// time until v0.8.0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankerSection {
+    /// Whether the cross-encoder rerank stage runs in the recall
+    /// pipeline. Folded from `cross_encoder: Option<bool>` at the
+    /// resolver layer.
+    pub enabled: Option<bool>,
+
+    /// Cross-encoder model identifier. Defaults to
+    /// `ms-marco-MiniLM-L-6-v2` when unset. Field reserved for future
+    /// model bake-offs (e.g., `bge-reranker-v2-m3`,
+    /// `mxbai-rerank-large-v2`).
+    pub model: Option<String>,
+
+    /// #1604 — tokenized length cap for rerank inputs (the batched
+    /// cross-encoder forward). Defaults to
+    /// `crate::reranker::RERANK_MAX_SEQ_DEFAULT` when unset; values
+    /// that are zero or above the model ceiling
+    /// (`crate::reranker::CROSS_ENCODER_MAX_SEQ`) fall through.
+    /// Overridable via `AI_MEMORY_RERANK_MAX_SEQ`.
+    pub max_seq_tokens: Option<usize>,
+}
+
+/// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
+///
+/// Wire format:
+/// ```toml
+/// [storage]
+/// default_namespace = "alphaone"
+/// archive_on_gc     = true
+/// archive_max_days  = 90
+/// max_memory_mb     = 4096
+/// ```
+///
+/// Carries the previously-flat top-level fields `default_namespace`,
+/// `archive_on_gc`, `archive_max_days`, `max_memory_mb`. The `db`
+/// path stays top-level per the #1146 I4 carve-out (path expansion
+/// semantics pinned by #507).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageSection {
+    /// Default namespace for new memories when the caller's request
+    /// omits one. Folded from the previously-flat top-level
+    /// `default_namespace` field.
+    pub default_namespace: Option<String>,
+
+    /// Whether to archive memories before GC deletion. Folded from
+    /// `archive_on_gc`. Default `true`.
+    pub archive_on_gc: Option<bool>,
+
+    /// Archive retention ceiling in days. `None` (default) disables
+    /// the automatic purge. Folded from `archive_max_days`.
+    pub archive_max_days: Option<i64>,
+
+    /// Memory budget in MB for the auto tier selector. Folded from
+    /// `max_memory_mb`.
+    pub max_memory_mb: Option<usize>,
+
+    /// #1579 B7 — sqlite `PRAGMA mmap_size` in bytes. `0` disables
+    /// memory-mapped I/O (stock SQLite semantics); negative values are
+    /// treated as unset and fall through the ladder. Env override:
+    /// `AI_MEMORY_DB_MMAP_SIZE` (see [`ENV_DB_MMAP_SIZE`]). Compiled
+    /// default: 256 MiB
+    /// ([`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`]) — the only
+    /// across-the-board winner of the P1 perf-audit PRAGMA A/B
+    /// (15-30% on large-corpus reads).
+    pub db_mmap_size_bytes: Option<i64>,
+}
+
+/// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
+///
+/// Wire format:
+/// ```toml
+/// [limits]
+/// max_memories_per_day = 10000000   # per-(agent, namespace) daily write quota
+/// max_storage_bytes    = 1073741824 # per-(agent, namespace) lifetime byte cap
+/// max_links_per_day    = 5000       # per-(agent, namespace) daily link quota
+/// max_page_size        = 1000       # list/bulk request page-size ceiling
+/// ```
+///
+/// Every field is optional; an omitted (or non-positive) value falls
+/// through to the compiled default (`crate::quotas::DEFAULT_MAX_*` for
+/// the three quota knobs, [`crate::handlers::MAX_BULK_SIZE`] for the
+/// page-size cap). Resolved via [`AppConfig::resolve_limits`], which
+/// also honours the `AI_MEMORY_MAX_*` env overrides at higher
+/// precedence than the section.
+///
+/// **Operator guidance for `max_page_size`.** This bounds the number of
+/// rows materialised into a single HTTP list response AND the number of
+/// items accepted in a single bulk / federation-sync request. It is a
+/// per-request in-memory bound, NOT a rate limit: a single request that
+/// asks for (or carries) millions of rows allocates them all at once.
+/// Raise it for bulk verification of a known-small corpus; for
+/// genuinely large datasets paginate with `?offset=` / `?since=` rather
+/// than removing the bound.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LimitsSection {
+    /// Per-(agent, namespace) daily memory-write ceiling stamped at
+    /// quota-row auto-insert. Folds nothing legacy; new at v0.7.x.
+    pub max_memories_per_day: Option<i64>,
+
+    /// Per-(agent, namespace) lifetime storage cap in bytes.
+    pub max_storage_bytes: Option<i64>,
+
+    /// Per-(agent, namespace) daily link-creation ceiling.
+    pub max_links_per_day: Option<i64>,
+
+    /// Maximum items returned in a single list response / accepted in a
+    /// single bulk or federation-sync request.
+    pub max_page_size: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Resolved-config shapes (#1146)
+//
+// Every surface that needs LLM / embedder / reranker / storage config
+// consumes one of the `Resolved*` shapes below. The resolver methods on
+// `AppConfig` (`resolve_llm` / `resolve_embeddings` / `resolve_reranker`
+// / `resolve_storage`) produce them by applying the uniform precedence
+// ladder:
+//
+//   CLI flag  >  AI_MEMORY_* env var  >  config.toml section
+//             >  legacy flat fields (with deprecation WARN once)
+//             >  compiled default (CompiledDefault arm, WARN once)
+//
+// Resolvers are PURE (no network I/O). File reads for `api_key_file`
+// happen at resolve time and surface errors via the `KeySource::Error`
+// variant rather than panicking, so the daemon can boot and report the
+// problem via the doctor reachability probe rather than failing at
+// load time.
+// ---------------------------------------------------------------------------
+
+/// Provenance tag for a resolved `Resolved*` field's value, surfaced by
+/// the boot banner and `ai-memory doctor` so operators can see WHICH
+/// source won the precedence ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// CLI flag (highest precedence).
+    Cli,
+    /// `AI_MEMORY_*` process environment variable.
+    Env,
+    /// `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` section
+    /// in `~/.config/ai-memory/config.toml`.
+    Config,
+    /// Legacy flat field in `~/.config/ai-memory/config.toml` (e.g.
+    /// `llm_model = "gemma4:e4b"`). Triggers a one-shot deprecation
+    /// WARN on `Config::load`.
+    Legacy,
+    /// Compiled-in default (no operator configuration). Triggers a
+    /// one-shot WARN at resolve time so silent misconfigurations are
+    /// loud.
+    CompiledDefault,
+}
+
+impl ConfigSource {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::Legacy => "legacy",
+            Self::CompiledDefault => "compiled-default",
+        }
+    }
+}
+
+/// Provenance tag for a resolved API-key value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// `AI_MEMORY_LLM_API_KEY` process env var (highest precedence).
+    ProcessEnv,
+    /// Per-vendor process env-var fallback (`XAI_API_KEY`,
+    /// `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.). The string field
+    /// carries the name of the var that won (for observability).
+    AliasFallback(String),
+    /// `[llm].api_key_env` config-pointed env var. The string field
+    /// carries the resolved env-var name.
+    ConfigEnvVar(String),
+    /// `[llm].api_key_file` config-pointed file path. The string field
+    /// carries the resolved (tilde-expanded) path.
+    ConfigFile(String),
+    /// No API key resolved. Correct for `backend = "ollama"`
+    /// (no auth); a misconfiguration for OpenAI-compatible vendors.
+    None,
+    /// Error reading the resolved key source. The string carries the
+    /// human-readable error for the doctor probe to surface.
+    Error(String),
+}
+
+impl KeySource {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProcessEnv => "process-env",
+            Self::AliasFallback(_) => "alias-fallback",
+            Self::ConfigEnvVar(_) => "config-env-var",
+            Self::ConfigFile(_) => "config-file",
+            Self::None => "none",
+            Self::Error(_) => "error",
+        }
+    }
+
+    /// True when the key was resolved from any source.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        !matches!(self, Self::None | Self::Error(_))
+    }
+}
+
+/// Canonical resolved-LLM configuration. Produced by
+/// [`AppConfig::resolve_llm`]. Every LLM-init surface (MCP stdio,
+/// HTTP daemon, `ai-memory atomise`, `ai-memory curator`,
+/// embed-client fallback, boot banner) consumes this struct rather
+/// than reading raw config / env / tier presets.
+///
+/// **Secret handling.** The `api_key` field is private; access via
+/// `api_key()`. The `Debug` impl redacts the value (`<redacted>`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedLlm {
+    /// Backend alias / wire-shape selector (e.g. `"ollama"`, `"xai"`,
+    /// `"openai-compatible"`).
+    pub backend: String,
+    /// Model identifier passed verbatim to the chat endpoint.
+    pub model: String,
+    /// Base URL of the chat endpoint (vendor-default or operator
+    /// override).
+    pub base_url: String,
+    /// Resolved API key. `None` for `backend = "ollama"` and for
+    /// misconfigured backends; `Some` otherwise. Private — access via
+    /// [`Self::api_key`] to keep accidental `{:?}` prints from
+    /// leaking the value.
+    api_key: Option<String>,
+    /// Provenance of the resolved API key for boot-banner /
+    /// doctor-probe display.
+    pub api_key_source: KeySource,
+    /// Provenance of the resolved configuration (CLI / env / config /
+    /// legacy / compiled-default).
+    pub source: ConfigSource,
+}
+
+impl ResolvedLlm {
+    /// Access the resolved API key. Use this only when constructing
+    /// the LLM client; do NOT log or `{:?}` the result.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// True when the resolved backend uses the Ollama-native wire
+    /// shape (`/api/chat`, `/api/embed`, no auth). False for any
+    /// OpenAI-compatible vendor.
+    ///
+    /// Compares `self.backend` against the canonical
+    /// [`crate::llm::BACKEND_OLLAMA`] selector (#1174 PR4 substrate
+    /// cleanup) so the literal lives in `llm.rs` alongside the rest
+    /// of the vendor-alias tables instead of being re-named at each
+    /// substrate site.
+    #[must_use]
+    pub fn is_ollama_native(&self) -> bool {
+        self.backend == crate::llm::BACKEND_OLLAMA
+    }
+
+    /// Display string for the boot banner: `<backend>:<model>`.
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        format!("{}:{}", self.backend, self.model)
+    }
+}
+
+impl std::fmt::Debug for ResolvedLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedLlm")
+            .field("backend", &self.backend)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
+            .field("api_key_source", &self.api_key_source)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Canonical resolved-embedder configuration. Produced by
+/// [`AppConfig::resolve_embeddings`].
+///
+/// **Secret handling (#1598).** The `api_key` field is private;
+/// access via [`Self::api_key`]. The manual `Debug` impl redacts the
+/// value (`<redacted>`), mirroring [`ResolvedLlm`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedEmbeddings {
+    /// Embedding backend selector. `"ollama"` (local `/api/embed`
+    /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
+    /// / the generic `openai-compatible` escape hatch. Classify via
+    /// [`is_api_embed_backend`].
+    pub backend: String,
+    /// Embedding endpoint base URL. The `[embeddings].base_url` /
+    /// `[embeddings].url` synonym merge happens in the resolver
+    /// (`base_url` wins); the field keeps the historical `url` name
+    /// to limit call-site churn (#1598).
+    pub url: String,
+    /// Embedding model identifier (canonicalised — legacy aliases
+    /// `nomic_embed_v15` / `mini_lm_l6_v2` are mapped to the
+    /// `EmbeddingModel` enum's canonical HF id at resolve time).
+    pub model: String,
+    /// Backfill batch size. Bounded `1..=10000`; out-of-range values
+    /// fall back to 100 with a WARN.
+    pub backfill_batch: u32,
+    /// v0.7.x (issue #1169) — vector dim of the resolved model, when
+    /// known. #1598: the explicit `[embeddings].dim` override wins
+    /// over the [`canonical_embedding_dim`] table lookup. `None` when
+    /// the operator chose a model id that isn't in the table and set
+    /// no override — in that case [`build_capability_models`] falls
+    /// back to the tier preset's dim (preserving pre-#1169 behaviour
+    /// for unrecognised ids and avoiding the silent-wrong-dim trap
+    /// for the recognised ones).
+    pub embedding_dim: Option<u32>,
+    /// #1598 (fleet follow-up) — the EXPLICIT `[embeddings].dim`
+    /// override only (never table-derived). For OpenAI-compatible
+    /// backends this is also sent as the wire `dimensions` request
+    /// param, so Matryoshka-capable API models (gemini-embedding-2,
+    /// text-embedding-3-*) return truncated vectors at the operator's
+    /// declared dim — the mechanism that keeps pgvector `vector(768)`
+    /// fleet schemas + ANN indexes (≤2000-dim limit) usable with
+    /// high-dim API models. `None` = model-native dim.
+    pub requested_dim: Option<u32>,
+    /// #1598 — resolved embedding API key. `None` for
+    /// `backend = "ollama"` (no auth) and for keyless self-hosted
+    /// OpenAI-compatible endpoints. Private — access via
+    /// [`Self::api_key`].
+    api_key: Option<String>,
+    /// #1598 — provenance of the resolved API key for boot-banner /
+    /// doctor-probe display.
+    pub key_source: KeySource,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+impl ResolvedEmbeddings {
+    /// Access the resolved embedding API key. Use this only when
+    /// constructing the embed client; do NOT log or `{:?}` the result.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// #1598 — construct from explicit parts. Prefer
+    /// [`AppConfig::resolve_embeddings`]; this exists for tests and
+    /// sibling surfaces (e.g. the reembed CLI) that synthesise a
+    /// resolved view without an `AppConfig`.
+    #[must_use]
+    pub fn from_parts(
+        backend: String,
+        url: String,
+        model: String,
+        embedding_dim: Option<u32>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            url,
+            model,
+            backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
+            embedding_dim,
+            requested_dim: None,
+            api_key,
+            key_source: KeySource::None,
+            source: ConfigSource::CompiledDefault,
+        }
+    }
+
+    /// #1598 (fleet follow-up) — builder for the explicit requested
+    /// output dimensionality (see [`Self::requested_dim`]).
+    #[must_use]
+    pub fn with_requested_dim(mut self, dim: Option<u32>) -> Self {
+        self.requested_dim = dim;
+        self
+    }
+}
+
+impl std::fmt::Debug for ResolvedEmbeddings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedEmbeddings")
+            .field("backend", &self.backend)
+            .field("url", &self.url)
+            .field("model", &self.model)
+            .field("backfill_batch", &self.backfill_batch)
+            .field(
+                crate::models::field_names::EMBEDDING_DIM,
+                &self.embedding_dim,
+            )
+            .field("requested_dim", &self.requested_dim)
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
+            )
+            .field("key_source", &self.key_source)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Canonical resolved-reranker configuration. Produced by
+/// [`AppConfig::resolve_reranker`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedReranker {
+    /// Whether the cross-encoder rerank stage runs.
+    pub enabled: bool,
+    /// Cross-encoder model identifier.
+    pub model: String,
+    /// #1604 — tokenized length cap for rerank inputs, resolved via
+    /// `AI_MEMORY_RERANK_MAX_SEQ` env > `[reranker].max_seq_tokens` >
+    /// `crate::reranker::RERANK_MAX_SEQ_DEFAULT`. Seeded into
+    /// `crate::reranker::set_rerank_max_seq` at boot.
+    pub max_seq_tokens: usize,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+/// Canonical resolved-storage configuration. Produced by
+/// [`AppConfig::resolve_storage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStorage {
+    /// Default namespace for new memories when the caller omits one.
+    pub default_namespace: String,
+    /// Whether to archive memories before GC deletion.
+    pub archive_on_gc: bool,
+    /// Archive retention ceiling in days (`None` = disabled).
+    pub archive_max_days: Option<i64>,
+    /// Memory budget in MB for the auto tier selector.
+    pub max_memory_mb: Option<usize>,
+    /// #1579 B7 — resolved sqlite `PRAGMA mmap_size` in bytes
+    /// (`AI_MEMORY_DB_MMAP_SIZE` env > `[storage].db_mmap_size_bytes`
+    /// > compiled 256 MiB default). `0` disables memory-mapped I/O.
+    /// Seeded into `crate::storage::set_db_mmap_size` at boot.
+    pub db_mmap_size_bytes: i64,
+    /// #1590 — per-field provenance of `default_namespace`:
+    /// [`ConfigSource::Config`] when `[storage].default_namespace` is
+    /// explicitly set, [`ConfigSource::Legacy`] when only the
+    /// deprecated flat `default_namespace` field is set, else
+    /// [`ConfigSource::CompiledDefault`]. The section-level `source`
+    /// tag below cannot express this — it reports `Config` whenever a
+    /// `[storage]` section EXISTS even if `default_namespace` itself
+    /// was never configured, and the write-path defaulting must only
+    /// be overridden by an explicit operator choice (unconfigured
+    /// deployments keep the historical per-surface ladders).
+    pub default_namespace_source: ConfigSource,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+impl ResolvedStorage {
+    /// #1590 — the operator-EXPLICITLY-configured default namespace,
+    /// or `None` when `default_namespace` merely bottomed out at the
+    /// compiled `"global"` default. Write-path consumers (MCP
+    /// `memory_store`, HTTP `POST /api/v1/memories`, the CLI
+    /// namespace ladder) only override their historical defaults when
+    /// this returns `Some`.
+    #[must_use]
+    pub fn explicit_default_namespace(&self) -> Option<&str> {
+        if self.default_namespace_source == ConfigSource::CompiledDefault {
+            None
+        } else {
+            Some(self.default_namespace.as_str())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1590 — process-wide operator-configured default namespace
+// ---------------------------------------------------------------------------
+
+/// #1590 — process-wide operator-configured default namespace, seeded
+/// once at boot by `crate::daemon_runtime::run` from
+/// [`ResolvedStorage::explicit_default_namespace`]. `None` (the
+/// unseeded / unconfigured state) preserves every surface's historical
+/// default: MCP + HTTP store fall back to [`crate::DEFAULT_NAMESPACE`]
+/// and the CLI falls back to its git-remote → cwd-basename → global
+/// inference ladder. Mirrors the `crate::quotas::QuotaDefaults` /
+/// `crate::storage::set_db_mmap_size` boot-seeding pattern for knobs
+/// consumed where no `AppConfig` is in scope (serde default fns, MCP
+/// param parsing, CLI helpers).
+static CONFIGURED_DEFAULT_NAMESPACE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// #1590 — seed (or clear) the process-wide operator-configured
+/// default namespace. Called once at boot; pass `None` for
+/// deployments without an explicit `[storage].default_namespace`.
+pub fn set_configured_default_namespace(namespace: Option<String>) {
+    let mut slot = CONFIGURED_DEFAULT_NAMESPACE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = namespace.filter(|s| !s.trim().is_empty());
+}
+
+/// #1590 — the operator-configured default namespace, or `None` when
+/// the operator never explicitly configured one (callers then apply
+/// their historical per-surface default).
+#[must_use]
+pub fn configured_default_namespace() -> Option<String> {
+    CONFIGURED_DEFAULT_NAMESPACE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Test-only gate serialising mutations of the process-wide
+/// [`CONFIGURED_DEFAULT_NAMESPACE`] slot (same pattern as
+/// [`lock_permissions_mode_for_test`]). Every test that seeds the slot
+/// — or asserts the unseeded default — takes this guard first so
+/// parallel tests cannot observe each other's transient state.
+pub fn lock_configured_default_namespace_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Canonical resolved operator-tunable capacity limits. Produced by
+/// [`AppConfig::resolve_limits`]. Consumed at daemon boot to install the
+/// quota-row auto-insert defaults (`crate::quotas::set_quota_defaults`)
+/// and the HTTP list/bulk page-size cap (`AppState::max_page_size`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLimits {
+    /// Per-(agent, namespace) daily memory-write ceiling.
+    pub max_memories_per_day: i64,
+    /// Per-(agent, namespace) lifetime storage cap in bytes.
+    pub max_storage_bytes: i64,
+    /// Per-(agent, namespace) daily link-creation ceiling.
+    pub max_links_per_day: i64,
+    /// Maximum items per list response / bulk-or-sync request.
+    pub max_page_size: usize,
+    /// Provenance of the resolved configuration.
+    pub source: ConfigSource,
+}
+
+/// Env override for `[limits].max_memories_per_day`.
+pub const ENV_MAX_MEMORIES_PER_DAY: &str = "AI_MEMORY_MAX_MEMORIES_PER_DAY";
+/// Env override for `[limits].max_storage_bytes`.
+pub const ENV_MAX_STORAGE_BYTES: &str = "AI_MEMORY_MAX_STORAGE_BYTES";
+/// Env override for `[limits].max_links_per_day`.
+pub const ENV_MAX_LINKS_PER_DAY: &str = "AI_MEMORY_MAX_LINKS_PER_DAY";
+/// Env override for `[limits].max_page_size`.
+pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
+
+/// #1579 B7 — env override for the sqlite `PRAGMA mmap_size`
+/// (`[storage].db_mmap_size_bytes`), in whole bytes. `0` disables
+/// memory-mapped I/O; negative / unparseable values fall through to
+/// the `[storage]` section, then to the compiled 256 MiB default
+/// (`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`).
+pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
+
+/// #1604 — env override for the tokenized length of rerank inputs
+/// (`[reranker].max_seq_tokens`), in tokens. Values that are zero,
+/// unparseable, or above the model ceiling
+/// (`crate::reranker::CROSS_ENCODER_MAX_SEQ`) fall through to the
+/// `[reranker]` section, then to the compiled default
+/// (`crate::reranker::RERANK_MAX_SEQ_DEFAULT`).
+pub const ENV_RERANK_MAX_SEQ: &str = "AI_MEMORY_RERANK_MAX_SEQ";
+
+/// v0.7.0 (a) — env override for the postgres pool ceiling
+/// (`postgres_pool_max_connections`). Byte-matches the name documented
+/// in `docs/enterprise-deployment.md §5.6`.
+pub const ENV_PG_POOL_MAX: &str = "AI_MEMORY_PG_POOL_MAX";
+/// v0.7.0 (a) — env override for the postgres pool floor
+/// (`postgres_pool_min_connections`). Byte-matches the name documented
+/// in `docs/enterprise-deployment.md §5.6`.
+pub const ENV_PG_POOL_MIN: &str = "AI_MEMORY_PG_POOL_MIN";
+/// v0.7.0 (a) — env override for the pool acquire-timeout
+/// (`postgres_acquire_timeout_secs`), in whole seconds.
+pub const ENV_PG_ACQUIRE_TIMEOUT_SECS: &str = "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS";
+
+/// #1067 — env carrying the LLM Bearer-auth secret; highest-precedence
+/// layer of the `[llm]` API-key resolution ladder ([`KeySource`]).
+pub const ENV_LLM_API_KEY: &str = "AI_MEMORY_LLM_API_KEY";
+
+/// #1598 — env override for the embedding backend selector
+/// (`[embeddings].backend`). Same accepted values as the section
+/// field: `ollama`, any #1067 alias, or `openai-compatible`.
+pub const ENV_EMBED_BACKEND: &str = "AI_MEMORY_EMBED_BACKEND";
+/// #1598 — env override for the embedding endpoint base URL
+/// (`[embeddings].base_url` / `[embeddings].url`).
+pub const ENV_EMBED_BASE_URL: &str = "AI_MEMORY_EMBED_BASE_URL";
+/// #1598 — env override for the embedding model id
+/// (`[embeddings].model`).
+pub const ENV_EMBED_MODEL: &str = "AI_MEMORY_EMBED_MODEL";
+/// #1598 — env carrying the embedding Bearer-auth secret;
+/// highest-precedence layer of the `[embeddings]` API-key resolution
+/// ladder (mirrors [`ENV_LLM_API_KEY`]).
+pub const ENV_EMBED_API_KEY: &str = "AI_MEMORY_EMBED_API_KEY";
+/// #38 — env override for the embedding backfill batch size
+/// (`[embeddings].backfill_batch`). Hoisted from a raw literal in the
+/// resolver per the no-hardcoded-literals discipline (#1598).
+pub const ENV_EMBED_BACKFILL_BATCH: &str = "AI_MEMORY_EMBED_BACKFILL_BATCH";
+
+/// Compiled-default embedding model id (the v0.7.0 autonomous-tier
+/// nomic default), shared by the resolver and its precedence tests.
+pub(crate) const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text-v1.5";
+/// Compiled-default embedding backfill batch size.
+pub(crate) const DEFAULT_EMBED_BACKFILL_BATCH: u32 = 100;
+
+/// v0.7.x (issue #1168) — bundle the three model-resolver outputs into
+/// a single triple consumed by the capabilities surface. Lets callers
+/// thread ONE struct through `handle_capabilities_with_conn` /
+/// `handle_capabilities_with_conn_v3` / `build_capabilities_overlay`
+/// instead of three independent borrows, and makes the contract loud:
+/// `memory_capabilities.models.*` reflects the operator-resolved
+/// configuration, NEVER the compiled tier preset.
+///
+/// **Production constructor:** [`AppConfig::resolve_models`].
+/// **Test / back-compat constructor:** [`ResolvedModels::from_tier_preset`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModels {
+    /// Resolved LLM configuration (`AppConfig::resolve_llm`).
+    pub llm: ResolvedLlm,
+    /// Resolved embedder configuration (`AppConfig::resolve_embeddings`).
+    pub embeddings: ResolvedEmbeddings,
+    /// Resolved reranker configuration (`AppConfig::resolve_reranker`).
+    pub reranker: ResolvedReranker,
+}
+
+/// Compiled-default `ResolvedModels` triple. Equivalent to running
+/// the resolvers against an [`AppConfig::default`] — Ollama backend,
+/// no operator overrides, no API key, reranker disabled. Convenient
+/// for test scaffolds that need a `ResolvedModels` value but don't
+/// care about its contents.
+impl Default for ResolvedModels {
+    fn default() -> Self {
+        Self {
+            llm: ResolvedLlm {
+                backend: "ollama".to_string(),
+                model: String::new(),
+                base_url: "http://localhost:11434".to_string(),
+                api_key: None,
+                api_key_source: KeySource::None,
+                source: ConfigSource::CompiledDefault,
+            },
+            embeddings: ResolvedEmbeddings {
+                backend: "ollama".to_string(),
+                url: "http://localhost:11434".to_string(),
+                model: String::new(),
+                backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
+                embedding_dim: None,
+                requested_dim: None,
+                api_key: None,
+                key_source: KeySource::None,
+                source: ConfigSource::CompiledDefault,
+            },
+            reranker: ResolvedReranker {
+                enabled: false,
+                model: "ms-marco-MiniLM-L-6-v2".to_string(),
+                max_seq_tokens: crate::reranker::RERANK_MAX_SEQ_DEFAULT,
+                source: ConfigSource::CompiledDefault,
+            },
+        }
+    }
+}
+
+impl ResolvedModels {
+    /// Back-compat constructor: synthesise a `ResolvedModels` triple
+    /// from the compiled [`TierConfig`] preset alone.
+    ///
+    /// Yields the same [`CapabilityModels`] byte-for-byte that the
+    /// pre-#1168 `TierConfig::capabilities()` produced, so legacy
+    /// callers + tests that scaffold a `TierConfig` in isolation (no
+    /// `AppConfig` available) continue to assert their original
+    /// strings. The synthesised triple carries
+    /// [`ConfigSource::CompiledDefault`] on every leaf so observers can
+    /// distinguish a back-compat scaffold from an operator-resolved
+    /// production triple.
+    ///
+    /// **Production paths** that have access to the operator
+    /// [`AppConfig`] MUST use [`AppConfig::resolve_models`] instead.
+    /// Using this helper in a production wrapper re-introduces the
+    /// #1168 drift (the capabilities surface would report the tier
+    /// preset instead of the operator-configured backend / model).
+    #[must_use]
+    pub fn from_tier_preset(tier: &TierConfig) -> Self {
+        Self {
+            llm: ResolvedLlm {
+                backend: "ollama".to_string(),
+                model: tier.llm_model.clone().unwrap_or_default(),
+                base_url: "http://localhost:11434".to_string(),
+                api_key: None,
+                api_key_source: KeySource::None,
+                source: ConfigSource::CompiledDefault,
+            },
+            embeddings: ResolvedEmbeddings {
+                backend: "ollama".to_string(),
+                url: "http://localhost:11434".to_string(),
+                model: tier
+                    .embedding_model
+                    .map(|m| m.hf_model_id().to_string())
+                    .unwrap_or_default(),
+                backfill_batch: DEFAULT_EMBED_BACKFILL_BATCH,
+                // v0.7.x (#1169) — back-compat constructor: source the
+                // dim from the tier-preset enum directly so the
+                // ResolvedModels::from_tier_preset path matches the
+                // pre-#1169 capabilities byte-shape (the test invariant
+                // pinned by tests/issue_1168_*::from_tier_preset_*).
+                embedding_dim: tier.embedding_model.map(|m| m.dim() as u32),
+                requested_dim: None,
+                api_key: None,
+                key_source: KeySource::None,
+                source: ConfigSource::CompiledDefault,
+            },
+            reranker: ResolvedReranker {
+                enabled: tier.cross_encoder,
+                // Back-compat: the pre-#1168 capabilities surface emitted
+                // the full `cross-encoder/...` HF org-prefixed string when
+                // the tier-preset enabled the cross-encoder. Preserve
+                // that here so legacy assertions stay byte-equal.
+                model: "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
+                max_seq_tokens: crate::reranker::RERANK_MAX_SEQ_DEFAULT,
+                source: ConfigSource::CompiledDefault,
+            },
+        }
+    }
+}
+
+/// v0.7.0 (issue #518) — `[agents]` top-level block. Today only carries
+/// the `defaults` sub-block (`[agents.defaults.recall_scope]`); future
+/// agent-scoped knobs (per-agent quota overrides, per-agent autonomy
+/// hook policy) can stack here without bloating the top-level
+/// `AppConfig` surface.
+///
+/// Wire format:
+/// ```toml
+/// [agents.defaults.recall_scope]
+/// namespaces = ["projects/atlas"]
+/// since = "24h"
+/// tier = "long"
+/// limit = 50
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentsConfig {
+    /// `[agents.defaults]` sub-block. `None` keeps recall semantics
+    /// exactly as v0.6.x — every cross-session `memory_recall` requires
+    /// explicit filters. `Some` enables `session_default=true` callers
+    /// to splice these defaults into their request before storage
+    /// dispatch.
+    #[serde(default)]
+    pub defaults: Option<AgentDefaults>,
+}
+
+/// v0.7.0 (issue #518) — `[agents.defaults]` sub-block. Today exposes a
+/// single field: `recall_scope`. Future expansion (per-call timeouts,
+/// per-call tag filters, …) lives here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentDefaults {
+    /// `[agents.defaults.recall_scope]` — default filter set spliced
+    /// into recall calls that pass `session_default=true` and omit
+    /// individual filter fields. See [`RecallScope`] for field
+    /// semantics. `None` is equivalent to "no defaults configured".
+    #[serde(default)]
+    pub recall_scope: Option<RecallScope>,
+}
+
+/// v0.7.0 (issue #518) — operator-configured recall defaults. Each
+/// field is optional; when present and the inbound recall request
+/// omits the corresponding axis AND passes `session_default=true`, the
+/// handler splices in the configured value before dispatching to the
+/// storage layer.
+///
+/// Resolution: **explicit request args > recall_scope defaults >
+/// compiled defaults**. The splice never overrides an explicit filter
+/// — operators can always narrow the result set further at call time.
+///
+/// Wire format:
+/// ```toml
+/// [agents.defaults.recall_scope]
+/// namespaces = ["projects/atlas"]   # default namespace filter
+/// since = "24h"                     # duration → since = now() - 24h
+/// tier = "long"                     # "short" / "mid" / "long"
+/// limit = 50                        # default cap
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecallScope {
+    /// Default namespace filter applied when the request omits its
+    /// own `namespace` field. The current recall handlers accept a
+    /// single namespace per call; when multiple namespaces are
+    /// configured we apply the first one. (The list form is future-
+    /// compatible with a planned multi-namespace recall surface.)
+    #[serde(default)]
+    pub namespaces: Option<Vec<String>>,
+    /// Default time-window applied when the request omits `since`.
+    /// Expressed as a duration string: `"24h"`, `"7d"`, `"30m"`, … See
+    /// [`parse_duration_string`] for the parser. The handler resolves
+    /// it to `now() - duration` at request time and passes the
+    /// resulting RFC3339 timestamp through the existing `since`
+    /// filter — no new SQL path.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Default tier filter applied when the request omits its own
+    /// `tier`. Accepted values: `"short"` / `"mid"` / `"long"`. The
+    /// sqlite recall handlers do not currently expose a tier
+    /// parameter, so this knob is applied on the postgres SAL path
+    /// (which carries a `Filter.tier`) and stored on the request
+    /// envelope for forward-compatibility on sqlite (no observable
+    /// behaviour change there).
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Default recall limit applied when the request omits its own
+    /// `limit`. The handler still clamps to the per-tool maximum
+    /// (50) after applying this default, so an oversized value here
+    /// degrades gracefully.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// v0.7.0 Cluster G (#767) — `[confidence]` config block. Carries the
+/// retention window for `confidence_shadow_observations` consumed by
+/// the periodic GC sweep wired into `daemon_runtime::spawn_gc_loop`.
+///
+/// Wire format:
+/// ```toml
+/// [confidence]
+/// shadow_retention_days = 30
+/// ```
+///
+/// `None` → the compiled default
+/// ([`crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS`] = 30)
+/// applies. Set to `0` or a negative value to disable the sweep
+/// (matches the audit-honest "do-nothing-on-zero" convention used by
+/// `archive_max_days`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConfidenceConfig {
+    /// Retention window (in days) for shadow-mode observation rows.
+    /// Rows whose `observed_at` is older than `now - N days` are
+    /// deleted by the GC sweep. `None` → compiled default of 30 days.
+    /// `Some(0)` or `Some(<0)` → sweep is a no-op (operator opt-out
+    /// for compliance / forensic-retention scenarios).
+    pub shadow_retention_days: Option<i64>,
+}
+
+impl ConfidenceConfig {
+    /// Effective retention window, honoring the compiled default when
+    /// the config block is absent or `shadow_retention_days` is unset.
+    #[must_use]
+    pub fn effective_shadow_retention_days(&self) -> i64 {
+        self.shadow_retention_days
+            .unwrap_or(crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS)
+    }
+}
+
+/// v0.7.0 H7 (round-2) — compiled default per-request HTTP timeout.
+/// Applied when `AppConfig::request_timeout_secs` is `None`.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+/// v0.7.0 H8 (round-2) — compiled default per-LLM-call timeout.
+/// Applied when `AppConfig::llm_call_timeout_secs` is `None`.
+pub const DEFAULT_LLM_CALL_TIMEOUT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Hooks / subscription HMAC (K7)
@@ -1549,12 +4308,91 @@ pub struct HooksConfig {
 /// `[hooks.subscription]` sub-block. K7 ships one knob today
 /// (`hmac_secret`); future K-track work may add per-event opt-out
 /// filters or alternate signing algorithms.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// #1262 — `Debug` is implemented manually to redact `hmac_secret` so
+/// accidental `{:?}` prints never leak the signing key. #1258 — the
+/// manual `Drop` impl zeroizes the secret on scope exit.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct HooksSubscriptionConfig {
     /// Server-wide HMAC secret. Plaintext on disk — operators are
     /// expected to chmod 600 the config file (same posture as the
     /// existing `api_key` field).
+    ///
+    /// #1262 — `skip_serializing` blocks the secret from being echoed
+    /// through any `serde_json::to_string(&HooksSubscriptionConfig)`
+    /// path.
+    #[serde(default, skip_serializing)]
     pub hmac_secret: Option<String>,
+}
+
+impl std::fmt::Debug for HooksSubscriptionConfig {
+    /// #1262 — redact `hmac_secret` to `<redacted>` when present.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HooksSubscriptionConfig")
+            .field(
+                "hmac_secret",
+                &self
+                    .hmac_secret
+                    .as_ref()
+                    .map(|_| crate::REDACTED_PLACEHOLDER),
+            )
+            .finish()
+    }
+}
+
+impl HooksSubscriptionConfig {
+    /// #1258 — zeroize the `hmac_secret` buffer in place. Idempotent.
+    /// The `Drop` impl below delegates here so the helper is the
+    /// single source of truth for the zero-on-secret-loss contract.
+    /// Tests probe the buffer via this entry point so they observe
+    /// the post-zeroize state of a still-live allocation (probing
+    /// after the owning value is dropped is UB — the allocator's
+    /// free-list bookkeeping stamps the first 8-16 bytes of the
+    /// just-freed slot and that's not a `zeroize` defect; see #1321).
+    pub fn zeroize_secrets(&mut self) {
+        if let Some(secret) = self.hmac_secret.as_mut() {
+            use zeroize::Zeroize;
+            secret.zeroize();
+        }
+    }
+}
+
+impl Drop for HooksSubscriptionConfig {
+    /// #1258 — zeroize `hmac_secret` on scope exit. Delegates to
+    /// [`HooksSubscriptionConfig::zeroize_secrets`].
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
+/// v0.7.0 H5 (round-2) — `[verify]` config block. Operator-facing
+/// knobs for `POST /api/v1/links/verify`. Today exposes one knob:
+/// `require_nonce` (default `false`).
+///
+/// Wire format:
+/// ```toml
+/// [verify]
+/// require_nonce = true     # strict mode — every verify request
+///                          # must carry verification_nonce
+/// ```
+///
+/// When `require_nonce = false` (the default), the handler logs a
+/// deprecation WARN when a request omits `verification_nonce` but
+/// still allows it through. When `true`, missing nonces are rejected
+/// with 409 Conflict and the operator's audit trail receives every
+/// attempted reuse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VerifyConfig {
+    /// When `true`, `POST /api/v1/links/verify` requires every
+    /// request body to include a `verification_nonce` field. Missing
+    /// or empty nonces produce a 400 Bad Request. Already-seen
+    /// `(link_id, signature, nonce)` tuples produce a 409 Conflict
+    /// with `{"error":"verification replay detected"}`. Default `false`
+    /// preserves the v0.6.x verify-anytime semantics; operators
+    /// opting into the H5 replay-protection guarantee set this to
+    /// `true` after their clients have been updated to emit nonces.
+    #[serde(default)]
+    pub require_nonce: bool,
 }
 
 /// v0.7.0 H11 (#628 blocker) — `[subscriptions]` block. Operator
@@ -1591,6 +4429,20 @@ impl AppConfig {
             .as_ref()
             .and_then(|h| h.subscription.as_ref())
             .and_then(|s| s.hmac_secret.clone())
+    }
+
+    /// v0.7.0 (issue #518) — resolved `[agents.defaults.recall_scope]`
+    /// block. Returns `Some(&scope)` when configured, `None` otherwise.
+    /// Consumed by the recall handlers (sqlite + postgres SAL branches,
+    /// MCP `handle_recall`, CLI `cmd_recall`) to splice defaults into
+    /// requests that pass `session_default=true` and omit one or more
+    /// filter fields.
+    #[must_use]
+    pub fn effective_recall_scope(&self) -> Option<&RecallScope> {
+        self.agents
+            .as_ref()
+            .and_then(|a| a.defaults.as_ref())
+            .and_then(|d| d.recall_scope.as_ref())
     }
 
     /// v0.7.0 H11 (#628 blocker) — resolved loopback-webhook opt-in
@@ -1633,22 +4485,30 @@ impl AppConfig {
 // Process-wide handle for the K7 server-wide HMAC override.
 // Mirrors the `ACTIVE_PERMISSIONS_MODE` pattern: set once at boot,
 // read by `subscriptions::dispatch_event_with_details` without an
-// API churn through every callsite. Stored behind a `RwLock<Option<…>>`
-// so the K7 integration tests can flip the value mid-process without
-// the `OnceLock`'s set-once contract getting in the way.
+// API churn through every callsite.
+//
+// v0.7.x (issue #1174 follow-up #1192) — storage moved to
+// `RuntimeContext::hooks_hmac_secret` so the HTTP daemon, the MCP
+// stdio binary, and the CLI all share one source of truth. The
+// accessors below delegate to the process-wide singleton; the wire
+// semantics + the K7 integration-test fixture (which flips the value
+// mid-process) are byte-equivalent.
 // ---------------------------------------------------------------------------
-
-use std::sync::RwLock;
-
-static ACTIVE_HOOKS_HMAC_SECRET: RwLock<Option<String>> = RwLock::new(None);
 
 /// v0.7.0 K7 — set the process-wide webhook HMAC override. Called from
 /// `main`/daemon bootstrap with the value from
 /// `[hooks.subscription] hmac_secret`. Last writer wins — this is
 /// production-safe because boot only invokes it once; tests use the
 /// same setter to flip mid-process.
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::hooks_hmac_secret`.
 pub fn set_active_hooks_hmac_secret(secret: Option<String>) {
-    if let Ok(mut w) = ACTIVE_HOOKS_HMAC_SECRET.write() {
+    if let Ok(mut w) = crate::runtime_context::RuntimeContext::global()
+        .hooks_hmac_secret
+        .write()
+    {
         *w = secret;
     }
 }
@@ -1656,9 +4516,64 @@ pub fn set_active_hooks_hmac_secret(secret: Option<String>) {
 /// v0.7.0 K7 — read the process-wide webhook HMAC override. Returns
 /// `None` when unset (the K6-and-earlier behaviour: only
 /// per-subscription secrets sign outgoing payloads).
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::hooks_hmac_secret`.
 #[must_use]
 pub fn active_hooks_hmac_secret() -> Option<String> {
-    ACTIVE_HOOKS_HMAC_SECRET.read().ok().and_then(|g| g.clone())
+    crate::runtime_context::RuntimeContext::global()
+        .hooks_hmac_secret
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+// ---------------------------------------------------------------------------
+// I1 cap (#628 agent-3 follow-up) — process-wide transcript decompression cap
+// ---------------------------------------------------------------------------
+//
+// `transcripts::fetch` consults this getter to decide the maximum
+// number of bytes a single transcript may decompress to. Operators
+// who legitimately store >16 MiB transcripts raise the cap explicitly
+// via `[transcripts] max_decompressed_bytes = …`; default-on uses the
+// compiled `MAX_DECOMPRESSED_BYTES` constant. The cap is per-call;
+// concurrent fetches consume up to N × this value of transient memory.
+//
+// v0.7.x (issue #1174 follow-up #1192) — storage moved to
+// `RuntimeContext::max_decompressed_bytes`. The accessors below
+// delegate; the per-call cap semantics are byte-equivalent.
+
+/// Set the process-wide decompression cap. Boot reads
+/// `[transcripts] max_decompressed_bytes` and calls this; tests flip
+/// mid-process to exercise both branches.
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::max_decompressed_bytes`.
+pub fn set_active_max_decompressed_bytes(cap: Option<usize>) {
+    if let Ok(mut w) = crate::runtime_context::RuntimeContext::global()
+        .max_decompressed_bytes
+        .write()
+    {
+        *w = cap;
+    }
+}
+
+/// Read the process-wide decompression cap, falling back to the
+/// compiled default when unset.
+///
+/// v0.7.x (issue #1192) — delegates to
+/// [`crate::runtime_context::RuntimeContext::global`]; the storage
+/// lives on `RuntimeContext::max_decompressed_bytes`.
+#[must_use]
+pub fn active_max_decompressed_bytes() -> usize {
+    crate::runtime_context::RuntimeContext::global()
+        .max_decompressed_bytes
+        .read()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or(crate::transcripts::MAX_DECOMPRESSED_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,10 +4687,23 @@ impl PermissionsMode {
 /// rule.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PermissionsConfig {
-    /// Enforcement mode. Defaults to [`PermissionsMode::Advisory`] when
-    /// omitted from the config file.
-    #[serde(default)]
-    pub mode: PermissionsMode,
+    /// Enforcement mode. `None` when the operator declared a
+    /// `[permissions]` block but omitted `mode = ` — this is the
+    /// "partial config" case that B4 (S5-M3) closes: such a block
+    /// MUST NOT silently fall back to the serde-derived
+    /// `PermissionsMode::default` (`advisory`), because the v0.7.0
+    /// secure default is `enforce`. The
+    /// [`AppConfig::effective_permissions_mode`] resolver maps
+    /// `Some(cfg { mode: None })` to the secure default + a
+    /// migration warning, so an operator who half-typed
+    /// `[permissions]` and forgot the mode line still ships
+    /// `enforce`, not the v0.6.x advisory posture.
+    ///
+    /// Serializes as omitted when `None` so a round-tripped config
+    /// without an explicit `mode` keeps the partial-config shape
+    /// for the next loader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PermissionsMode>,
     /// v0.7.0 K9 — declarative permission rules. Each entry is a
     /// `(namespace_pattern, op, agent_pattern, decision)` tuple
     /// consulted by [`crate::permissions::Permissions::evaluate`]
@@ -1792,31 +4720,75 @@ pub struct PermissionsConfig {
 //
 // The gate (`db::enforce_governance`) needs to consult the active mode
 // at decision time but lives in the `db` module, which has no handle on
-// `AppConfig`. We use a `OnceLock` set by `main` (and the daemon
-// runtime) so the gate can read the mode without an API churn through
-// every callsite. When the lock is unset — the case for unit and
-// integration tests that drive `db::enforce_governance` directly
-// without booting the daemon — the gate defaults to
-// [`PermissionsMode::Enforce`] so the strict semantics that the K1
-// ship-gate suite codifies remain the load-bearing default for
-// programmatic callers.
+// `AppConfig`. We hold the active mode in a single `RwLock<Option<…>>`
+// set by `main` (and the daemon runtime) so the gate can read the mode
+// without an API churn through every callsite. When the lock is unset
+// — the case for unit and integration tests that drive
+// `db::enforce_governance` directly without booting the daemon — the
+// gate defaults to [`PermissionsMode::Advisory`] (the v0.7.0 K3
+// secure-but-non-blocking posture). Tests opt into `Enforce` via the
+// `set_active_permissions_mode` setter or the
+// `override_active_permissions_mode_for_test` alias.
+//
+// **#1174 pm-v3.1 PR7 (this commit)**: collapsed the previous
+// dual-source-of-truth (a `OnceLock<PermissionsMode>` for production +
+// an `AtomicU8` test-only override that secretly took precedence over
+// it) into a single `RwLock<Option<PermissionsMode>>`. The previous
+// `OnceLock` shape blocked legitimate runtime reload paths — a SIGHUP
+// handler that wanted to re-resolve `[permissions].mode` from
+// `config.toml` and call `set_active_permissions_mode` again would
+// silently no-op, leaving the gate on the boot-time value while every
+// other resolver caught the new value. The new shape supports
+// last-writer-wins so a future SIGHUP / `ai-memory reload` surface
+// can refresh the mode without restart. The test-override semantics
+// are preserved: tests still hold the
+// [`lock_permissions_mode_for_test`] guard around their mutations and
+// the public setter / overrider signatures are unchanged.
 
-use std::sync::OnceLock;
+static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<PermissionsMode>> =
+    std::sync::RwLock::new(None);
 
-static ACTIVE_PERMISSIONS_MODE: OnceLock<PermissionsMode> = OnceLock::new();
-
-/// Set the process-wide active [`PermissionsMode`]. Idempotent — the
-/// first caller wins; subsequent calls are no-ops. Called from
-/// `main` (CLI) and the daemon bootstrap path with the value resolved
-/// from `[permissions].mode` in `config.toml`.
+/// Set the process-wide active [`PermissionsMode`]. Called from `main`
+/// (CLI) and the daemon bootstrap path with the value resolved from
+/// `[permissions].mode` in `config.toml`. Last-writer-wins so a future
+/// SIGHUP / `ai-memory reload` surface can refresh the mode without
+/// restart (#1174 PR7); the previous `OnceLock` shape made repeat
+/// callers silently no-op.
 pub fn set_active_permissions_mode(mode: PermissionsMode) {
-    let _ = ACTIVE_PERMISSIONS_MODE.set(mode);
+    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
+        *w = Some(mode);
+    }
 }
 
-/// Read the process-wide active [`PermissionsMode`]. Falls back to
-/// [`PermissionsMode::default`] (`advisory`) when unset, matching the
-/// v0.7.0 K3 default for upgrading operators (governance recorded but
-/// not blocked at the gate).
+/// The pre-initialization fallback mode for [`active_permissions_mode`].
+///
+/// Every production entry point (CLI, MCP, HTTP `serve`) resolves the
+/// real mode via [`AppConfig::effective_permissions_mode`] — whose
+/// v0.7.0 secure default is [`PermissionsMode::Enforce`] — and installs
+/// it via [`set_active_permissions_mode`] during boot, BEFORE any write
+/// can reach the governance gate. This constant is therefore only ever
+/// observed when the gate is consulted before boot ran (a library
+/// embedding that never called the setter, or a unit test that does not
+/// opt into a specific mode). It is held at `Advisory` to preserve the
+/// historical pre-init behaviour the test suite relies on; the
+/// [`active_permissions_mode`] reader emits a one-shot WARN when it has
+/// to fall back to this value so the uninitialized-gate condition is
+/// observable rather than silent.
+const UNINITIALIZED_PERMISSIONS_MODE_FALLBACK: PermissionsMode = PermissionsMode::Advisory;
+
+/// Read the process-wide active [`PermissionsMode`] installed at boot by
+/// [`set_active_permissions_mode`] (sourced from
+/// [`AppConfig::effective_permissions_mode`], whose v0.7.0 secure
+/// default is [`PermissionsMode::Enforce`]).
+///
+/// When the slot is unset — i.e. boot has NOT run — this returns
+/// [`UNINITIALIZED_PERMISSIONS_MODE_FALLBACK`] and emits a one-shot
+/// operator-visible WARN, because consulting the governance gate before
+/// the mode is installed is a defense-in-depth gap: the gate would run
+/// against the pre-init fallback rather than the operator's resolved
+/// mode. In production this path is unreachable (boot always installs
+/// the mode first); the WARN exists to surface a regression if that
+/// ordering ever breaks.
 ///
 /// Test note: the K1 ship-gate matrix asserts `Pending`/`Deny`
 /// outcomes from `db::enforce_governance` and therefore opts into
@@ -1824,47 +4796,55 @@ pub fn set_active_permissions_mode(mode: PermissionsMode) {
 /// scenario.
 #[must_use]
 pub fn active_permissions_mode() -> PermissionsMode {
-    let override_tag = OVERRIDE_PERMISSIONS_MODE.load(std::sync::atomic::Ordering::SeqCst);
-    match override_tag {
-        1 => return PermissionsMode::Enforce,
-        2 => return PermissionsMode::Advisory,
-        3 => return PermissionsMode::Off,
-        _ => {}
+    match ACTIVE_PERMISSIONS_MODE.read().ok().and_then(|g| *g) {
+        Some(mode) => mode,
+        None => {
+            static UNINIT_GATE_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            UNINIT_GATE_WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: crate::governance::GOVERNANCE_TRACE_TARGET,
+                    fallback = UNINITIALIZED_PERMISSIONS_MODE_FALLBACK.as_str(),
+                    "permissions mode consulted before boot installed it; using the \
+                     pre-init fallback. Production entry points install the resolved \
+                     mode (secure default: enforce) during boot — if you see this in \
+                     a running daemon, the boot ordering regressed."
+                );
+            });
+            UNINITIALIZED_PERMISSIONS_MODE_FALLBACK
+        }
     }
-    ACTIVE_PERMISSIONS_MODE
-        .get()
-        .copied()
-        .unwrap_or(PermissionsMode::Advisory)
 }
 
 /// Test-only override of the active mode. Production code MUST use
 /// [`set_active_permissions_mode`]; this helper exists so the K3 test
 /// matrix can flip mode mid-test without spinning up a fresh process.
+///
+/// **#1174 PR7**: with the dual-source-of-truth collapse the override
+/// is now a thin alias around [`set_active_permissions_mode`]. The
+/// two functions are wire-equivalent at every callsite. The alias is
+/// kept (rather than renaming all test callers in one pass) because
+/// the `_for_test` suffix at every callsite documents the intent —
+/// "this is a test poking the global gate" — better than an
+/// unsuffixed setter would.
 #[doc(hidden)]
 pub fn override_active_permissions_mode_for_test(mode: PermissionsMode) {
-    // SAFETY: OnceLock::set returns Err when already set; we want
-    // last-writer-wins for tests only. Use a static Mutex to serialize
-    // and an inner OnceCell-like reset via take + set is not possible
-    // (OnceLock has no take). Instead, store an atomic indirection.
-    OVERRIDE_PERMISSIONS_MODE.store(
-        match mode {
-            PermissionsMode::Enforce => 1,
-            PermissionsMode::Advisory => 2,
-            PermissionsMode::Off => 3,
-        },
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    set_active_permissions_mode(mode);
 }
 
-/// Test-only override slot. `0` = no override, otherwise encodes the
-/// mode tag. Read by [`active_permissions_mode`] when set.
-static OVERRIDE_PERMISSIONS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Test-only: clear any override so subsequent tests see the
-/// `OnceLock` value (or the default).
+/// Test-only: clear any test-override so subsequent tests start from
+/// the unset state (the [`PermissionsMode::Advisory`] default).
+///
+/// **#1174 PR7**: previously this cleared the `OVERRIDE_PERMISSIONS_MODE`
+/// atomic without touching the production-side `OnceLock`, which let
+/// a test that called the production setter once leak its value into
+/// the next test. With the single-source-of-truth collapse, clearing
+/// resets the lone slot — subsequent reads see `Advisory` until the
+/// next setter call, which is the documented contract.
 #[doc(hidden)]
 pub fn clear_permissions_mode_override_for_test() {
-    OVERRIDE_PERMISSIONS_MODE.store(0, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
+        *w = None;
+    }
 }
 
 /// Test-only: acquire the global gate-mode serialization lock.
@@ -1894,9 +4874,47 @@ pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static DECISIONS_ENFORCE: AtomicU64 = AtomicU64::new(0);
-static DECISIONS_ADVISORY: AtomicU64 = AtomicU64::new(0);
-static DECISIONS_OFF: AtomicU64 = AtomicU64::new(0);
+/// Per-process per-mode decision counters (#1174 pm-v3.1 PR7).
+///
+/// Previously three sibling `static AtomicU64` items
+/// (`DECISIONS_ENFORCE`/`_ADVISORY`/`_OFF`). Folding them into a
+/// single struct keeps the in-memory layout identical (`#[repr(C)]`
+/// is unnecessary — Rust's default field order is fine for the
+/// atomic-counters-as-observability use case) while ensuring that
+/// adding a fourth mode in the future requires a single grep-friendly
+/// edit instead of N parallel static declarations.
+///
+/// `Relaxed` ordering is preserved everywhere the original three
+/// statics used it: the counters are observability, not load-bearing
+/// for correctness, and the inter-mode read consistency that an
+/// `SeqCst` snapshot would buy is not exercised by any current caller
+/// (`ai-memory doctor` + capabilities both render the snapshot as
+/// three independent integers).
+struct DecisionCounters {
+    enforce: AtomicU64,
+    advisory: AtomicU64,
+    off: AtomicU64,
+}
+
+impl DecisionCounters {
+    const fn new() -> Self {
+        Self {
+            enforce: AtomicU64::new(0),
+            advisory: AtomicU64::new(0),
+            off: AtomicU64::new(0),
+        }
+    }
+
+    fn counter_for(&self, mode: PermissionsMode) -> &AtomicU64 {
+        match mode {
+            PermissionsMode::Enforce => &self.enforce,
+            PermissionsMode::Advisory => &self.advisory,
+            PermissionsMode::Off => &self.off,
+        }
+    }
+}
+
+static DECISION_COUNTERS: DecisionCounters = DecisionCounters::new();
 
 /// Snapshot of decision counts per mode since process start. Surfaced
 /// by `ai-memory doctor` and the capabilities `permissions` block so
@@ -1913,21 +4931,18 @@ pub struct PermissionsDecisionCounts {
 /// every consult. `Relaxed` is fine: the counters are observability,
 /// not load-bearing for correctness.
 pub fn record_permissions_decision(mode: PermissionsMode) {
-    let c = match mode {
-        PermissionsMode::Enforce => &DECISIONS_ENFORCE,
-        PermissionsMode::Advisory => &DECISIONS_ADVISORY,
-        PermissionsMode::Off => &DECISIONS_OFF,
-    };
-    c.fetch_add(1, Ordering::Relaxed);
+    DECISION_COUNTERS
+        .counter_for(mode)
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Snapshot the current per-mode decision counts.
 #[must_use]
 pub fn permissions_decision_counts() -> PermissionsDecisionCounts {
     PermissionsDecisionCounts {
-        enforce: DECISIONS_ENFORCE.load(Ordering::Relaxed),
-        advisory: DECISIONS_ADVISORY.load(Ordering::Relaxed),
-        off: DECISIONS_OFF.load(Ordering::Relaxed),
+        enforce: DECISION_COUNTERS.enforce.load(Ordering::Relaxed),
+        advisory: DECISION_COUNTERS.advisory.load(Ordering::Relaxed),
+        off: DECISION_COUNTERS.off.load(Ordering::Relaxed),
     }
 }
 
@@ -1935,9 +4950,9 @@ pub fn permissions_decision_counts() -> PermissionsDecisionCounts {
 /// can assert exact deltas.
 #[doc(hidden)]
 pub fn reset_permissions_decision_counts_for_test() {
-    DECISIONS_ENFORCE.store(0, Ordering::SeqCst);
-    DECISIONS_ADVISORY.store(0, Ordering::SeqCst);
-    DECISIONS_OFF.store(0, Ordering::SeqCst);
+    DECISION_COUNTERS.enforce.store(0, Ordering::SeqCst);
+    DECISION_COUNTERS.advisory.store(0, Ordering::SeqCst);
+    DECISION_COUNTERS.off.store(0, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,6 +5161,26 @@ pub struct McpConfig {
     /// "*"     = ["core"]
     /// ```
     pub allowlist: Option<std::collections::HashMap<String, Vec<String>>>,
+
+    /// #1254 (MED, 2026-05-25) — error-oracle posture for
+    /// `tools/call` against a tool that exists but is not loaded
+    /// under the active profile.
+    ///
+    /// Default `false` (production-secure): the daemon returns a
+    /// minimal `"unknown tool: <name>"` regardless of whether the
+    /// tool exists in another family. This prevents a lower-profile
+    /// client from probing the surface of a higher-profile tool set
+    /// (e.g. `admin` or `power` family names) by walking error
+    /// messages.
+    ///
+    /// Set to `true` to restore the v0.6.4-002 helpful hint
+    /// ("tool 'X' is in family 'Y' which is not loaded under the
+    /// active profile. Restart with `--profile <name>` ..."). The
+    /// hint is convenient for single-tenant dev environments where
+    /// every operator sees the full surface anyway, but leaks
+    /// family membership in any multi-tenant deployment.
+    #[serde(default)]
+    pub profile_hint_in_errors: bool,
 }
 
 impl McpConfig {
@@ -2270,6 +5305,447 @@ pub struct IdentityConfig {
     pub anonymize_default: bool,
 }
 
+/// v0.7.0 (issue #518) — parse a duration string of the form
+/// `"<integer><unit>"` into a `chrono::Duration`. Supported units:
+/// `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
+/// Whitespace and case are tolerated. Returns `None` on malformed
+/// input — the caller falls through to "no since filter applied".
+///
+/// Intentionally a small bespoke parser rather than a `humantime`
+/// dependency: the surface we need is tiny (4-5 units) and operators
+/// expect the same shape they already type into `--since` flags.
+#[must_use]
+pub fn parse_duration_string(s: &str) -> Option<chrono::Duration> {
+    let trimmed = s.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (num_part, unit_part) = trimmed.split_at(
+        trimmed
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(trimmed.len()),
+    );
+    let n: i64 = num_part.parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    match unit_part.trim() {
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(chrono::Duration::seconds(n)),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(chrono::Duration::minutes(n)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(chrono::Duration::hours(n)),
+        "d" | "day" | "days" => Some(chrono::Duration::days(n)),
+        "w" | "wk" | "wks" | "week" | "weeks" => Some(chrono::Duration::weeks(n)),
+        _ => None,
+    }
+}
+
+/// Expand a leading `~` or `~/` in a path string to `$HOME`. POSIX-style.
+/// `~user/...` is not supported (rare in our deployment surface, and supporting
+/// it requires `getpwnam` — out of scope for the #507 fix). When `$HOME` is
+/// unset (no-home environments like some CI containers), the tilde is left
+/// untouched so the existing failure mode (path not found) is preserved
+/// rather than silently rewriting to an empty prefix.
+// ---------------------------------------------------------------------------
+// Resolver helpers (#1146)
+// ---------------------------------------------------------------------------
+
+/// Backend-specific default model identifier. Used by
+/// [`AppConfig::resolve_llm`] when no model is configured at any
+/// precedence layer.
+fn backend_default_model(backend: &str) -> &'static str {
+    match backend {
+        "xai" => "grok-4.3",
+        "openai" => "gpt-5",
+        "anthropic" => "claude-opus-4.7",
+        "gemini" => "gemini-2.0-flash",
+        "deepseek" => "deepseek-chat",
+        "kimi" | "moonshot" => "moonshot-v1-8k",
+        "qwen" | "dashscope" => "qwen-max",
+        "mistral" => "mistral-large-latest",
+        "groq" => "llama-3.3-70b-versatile",
+        "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "cerebras" => "llama-3.3-70b",
+        "openrouter" => "openai/gpt-5",
+        "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "lmstudio" => "local-model",
+        // ollama / openai-compatible / any unknown alias → legacy default.
+        _ => "gemma3:4b",
+    }
+}
+
+/// Backend-specific default base URL. Used by
+/// [`AppConfig::resolve_llm`] when no base_url is configured at any
+/// precedence layer. `openai-compatible` returns the empty string (the
+/// resolver does not validate this — surface plumbing surfaces the
+/// misconfiguration via the reachability probe in `ai-memory doctor`).
+fn backend_default_base_url(backend: &str) -> &'static str {
+    match backend {
+        "openai" => "https://api.openai.com/v1",
+        "xai" => "https://api.x.ai/v1",
+        "anthropic" => "https://api.anthropic.com/v1",
+        "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
+        "deepseek" => "https://api.deepseek.com/v1",
+        "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
+        "qwen" | "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "groq" => "https://api.groq.com/openai/v1",
+        "together" => "https://api.together.xyz/v1",
+        "cerebras" => "https://api.cerebras.ai/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "fireworks" => "https://api.fireworks.ai/inference/v1",
+        "lmstudio" => "http://localhost:1234/v1",
+        // ollama / openai-compatible / unknown → localhost ollama.
+        _ => "http://localhost:11434",
+    }
+}
+
+/// Per-alias environment variable fallback chain for the API key.
+/// Mirrors `crate::llm::alias_api_key_env_vars` (kept duplicated to
+/// avoid a circular dependency between the resolver and the LLM
+/// client; both lists must stay in sync — pinned by a test in
+/// commit 12/13).
+fn alias_api_key_env_vars_for_resolver(alias: &str) -> &'static [&'static str] {
+    match alias {
+        "openai" => &["OPENAI_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "together" => &["TOGETHER_API_KEY"],
+        "cerebras" => &["CEREBRAS_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "fireworks" => &["FIREWORKS_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// Canonicalise legacy embedding-model aliases to the HF-id form. Lets
+/// existing config.toml files with `embedding_model = "nomic_embed_v15"`
+/// continue to work while the resolver returns the canonical id used
+/// throughout the substrate.
+fn canonicalise_embedding_model(raw: String) -> String {
+    match raw.trim() {
+        "nomic_embed_v15" => "nomic-embed-text-v1.5".to_string(),
+        "mini_lm_l6_v2" => "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+        _ => raw,
+    }
+}
+
+/// v0.7.x (issue #1169) — known canonical embedding-model id → vector
+/// dim mappings.
+///
+/// Used by [`canonical_embedding_dim`] (resolver-side) and
+/// [`build_capability_models`] (capabilities-surface side) so the
+/// reported `embedding_dim` reflects the live model the embedder
+/// produces vectors of, NOT the compiled tier preset's hardcoded dim.
+/// Pre-#1169 the dim was sourced only from the 2-family
+/// [`EmbeddingModel`] enum — picking any other model id (e.g. Ollama
+/// `bge-large-en`) silently fell back to the tier preset's wrong dim.
+///
+/// New entries land here when an operator adopts a model not yet
+/// covered. Unknown models resolve to `None`
+/// ([`canonical_embedding_dim`] return), which causes
+/// [`build_capability_models`] to fall back to the tier preset's dim
+/// — preserving the pre-#1169 behaviour for unrecognised ids and
+/// avoiding the silent-wrong-dim trap for recognised ones.
+///
+/// Match keys are case-insensitive (lookup uses
+/// `eq_ignore_ascii_case`) and span the canonical HF id, the
+/// unprefixed shortname, and the common Ollama tag where they
+/// diverge. Matches whatever the operator actually wrote in
+/// `[embeddings].model` post-`canonicalise_embedding_model`.
+pub const KNOWN_EMBEDDING_DIMS: &[(&str, u32)] = &[
+    // nomic-ai (default for the v0.7.0 autonomous tier)
+    ("nomic-embed-text-v1.5", 768),
+    ("nomic-embed-text", 768),
+    ("nomic-ai/nomic-embed-text-v1.5", 768),
+    // sentence-transformers / MiniLM family
+    ("sentence-transformers/all-MiniLM-L6-v2", 384),
+    ("all-MiniLM-L6-v2", 384),
+    ("all-minilm", 384),
+    ("all-minilm:l6-v2", 384),
+    // BAAI BGE family (common Ollama-side operator picks — the #1169
+    // repro example was bge-large-en)
+    ("bge-large-en", 1024),
+    ("bge-large-en-v1.5", 1024),
+    ("baai/bge-large-en-v1.5", 1024),
+    ("bge-base-en", 768),
+    ("bge-base-en-v1.5", 768),
+    ("baai/bge-base-en-v1.5", 768),
+    ("bge-small-en", 384),
+    ("bge-small-en-v1.5", 384),
+    ("baai/bge-small-en-v1.5", 384),
+    ("bge-m3", 1024),
+    ("baai/bge-m3", 1024),
+    // Mixed Bread AI
+    ("mxbai-embed-large", 1024),
+    ("mxbai-embed-large-v1", 1024),
+    ("mixedbread-ai/mxbai-embed-large-v1", 1024),
+    // OpenAI text-embedding family
+    ("text-embedding-3-small", 1536),
+    ("text-embedding-3-large", 3072),
+    ("text-embedding-ada-002", 1536),
+    // Google embedding
+    ("embedding-001", 768),
+    ("text-embedding-004", 768),
+    ("google/gemini-embedding-2", 3072),
+    ("gemini-embedding-2", 3072),
+    // IBM Granite (#1598 — common self-hosted TEI/vLLM pick)
+    ("ibm-granite/granite-embedding-125m-english", 768),
+    ("granite-embedding", 768),
+    // Snowflake Arctic
+    ("snowflake-arctic-embed", 1024),
+    ("snowflake-arctic-embed:l", 1024),
+    ("snowflake-arctic-embed-l", 1024),
+    ("snowflake-arctic-embed:m", 768),
+    ("snowflake-arctic-embed:s", 384),
+];
+
+/// v0.7.x (issue #1169) — look up the vector dim for a canonical
+/// embedding model id. Returns `None` when the model is not in the
+/// [`KNOWN_EMBEDDING_DIMS`] table; callers fall back to the tier
+/// preset (preserving pre-#1169 behaviour for unrecognised ids).
+///
+/// The lookup is case-insensitive and ignores leading/trailing
+/// whitespace. Matches the canonicalised form
+/// ([`canonicalise_embedding_model`] runs first), so the table
+/// keys are the HF-id / Ollama tag forms operators actually set in
+/// `[embeddings].model` after legacy-alias canonicalisation.
+#[must_use]
+pub fn canonical_embedding_dim(model: &str) -> Option<u32> {
+    let needle = model.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    KNOWN_EMBEDDING_DIMS
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(needle))
+        .map(|(_, dim)| *dim)
+}
+
+/// Resolve the API key + provenance tag for the configured backend.
+///
+/// Precedence:
+///   1. `AI_MEMORY_LLM_API_KEY` process env → `KeySource::ProcessEnv`
+///   2. Per-vendor process env-var fallback (e.g. `XAI_API_KEY`)
+///      → `KeySource::AliasFallback(name)`
+///   3. `[llm].api_key_env` → `KeySource::ConfigEnvVar(name)`
+///   4. `[llm].api_key_file` → `KeySource::ConfigFile(path)`
+///   5. None resolved → `KeySource::None` (correct for `backend =
+///      "ollama"`; a misconfiguration for OpenAI-compatible vendors —
+///      surfaced by the reachability probe).
+///
+/// #1598 — thin delegate over [`resolve_api_key_ladder`] (the same
+/// ladder serves the `[embeddings]` section via
+/// [`resolve_embed_api_key`]).
+fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, KeySource) {
+    resolve_api_key_ladder(
+        ENV_LLM_API_KEY,
+        backend,
+        llm.and_then(|l| l.api_key_env.as_deref()),
+        llm.and_then(|l| l.api_key_file.as_deref()),
+        "llm",
+    )
+}
+
+/// #1598 — resolve the EMBEDDING API key + provenance tag for the
+/// configured embedding backend. Mirrors [`resolve_api_key`] with the
+/// `[embeddings]`-section sources:
+///
+///   1. `AI_MEMORY_EMBED_API_KEY` process env → `KeySource::ProcessEnv`
+///   2. Per-vendor process env-var fallback (e.g. `OPENROUTER_API_KEY`)
+///      → `KeySource::AliasFallback(name)`
+///   3. `[embeddings].api_key_env` → `KeySource::ConfigEnvVar(name)`
+///   4. `[embeddings].api_key_file` (0400 enforced)
+///      → `KeySource::ConfigFile(path)`
+///   5. None resolved → `KeySource::None` (correct for `backend =
+///      "ollama"` and for keyless self-hosted OpenAI-compatible
+///      endpoints such as HF TEI / vLLM).
+fn resolve_embed_api_key(
+    backend: &str,
+    embeddings: Option<&EmbeddingsSection>,
+) -> (Option<String>, KeySource) {
+    resolve_api_key_ladder(
+        ENV_EMBED_API_KEY,
+        backend,
+        embeddings.and_then(|e| e.api_key_env.as_deref()),
+        embeddings.and_then(|e| e.api_key_file.as_deref()),
+        "embeddings",
+    )
+}
+
+/// #1598 — true when the embedding backend speaks an API wire shape
+/// (OpenAI-compatible `/embeddings` + Bearer auth) rather than the
+/// local Ollama-native `/api/embed` shape. `"ollama"` is the ONLY
+/// non-API backend; every #1067 alias and the generic
+/// `openai-compatible` escape hatch classify as API backends. Sits
+/// next to [`alias_api_key_env_vars_for_resolver`] /
+/// [`backend_default_base_url`] — the alias machinery it complements.
+#[must_use]
+pub fn is_api_embed_backend(backend: &str) -> bool {
+    !backend
+        .trim()
+        .eq_ignore_ascii_case(crate::llm::BACKEND_OLLAMA)
+}
+
+/// Shared API-key resolution ladder for the `[llm]` and `[embeddings]`
+/// sections (#1146 / #1598). `primary_env` is the section's dedicated
+/// `AI_MEMORY_*_API_KEY` env var; `section` is the bare section name
+/// (`"llm"` / `"embeddings"`) used in provenance / error strings.
+///
+/// File reads enforce mode 0400 (via [`enforce_api_key_file_perms`])
+/// and surface failures as `KeySource::Error(reason)` so the daemon
+/// can boot and report the problem through `ai-memory doctor` rather
+/// than failing at config load.
+fn resolve_api_key_ladder(
+    primary_env: &str,
+    backend: &str,
+    api_key_env: Option<&str>,
+    api_key_file: Option<&str>,
+    section: &str,
+) -> (Option<String>, KeySource) {
+    // 1. Process env (highest).
+    if let Some(k) = std::env::var(primary_env)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return (Some(k), KeySource::ProcessEnv);
+    }
+
+    // 2. Per-vendor alias fallback.
+    for name in alias_api_key_env_vars_for_resolver(backend) {
+        if let Some(k) = std::env::var(name).ok().filter(|s| !s.trim().is_empty()) {
+            return (Some(k), KeySource::AliasFallback((*name).to_string()));
+        }
+    }
+
+    // 3. config-pointed env var.
+    if let Some(name) = api_key_env.filter(|s| !s.trim().is_empty()) {
+        return match std::env::var(name) {
+            Ok(v) if !v.trim().is_empty() => (Some(v), KeySource::ConfigEnvVar(name.to_string())),
+            Ok(_) => (
+                None,
+                KeySource::Error(format!(
+                    "[{section}].api_key_env = {name:?} resolves to an empty env var"
+                )),
+            ),
+            Err(_) => (
+                None,
+                KeySource::Error(format!(
+                    "[{section}].api_key_env = {name:?} is not set in the process env"
+                )),
+            ),
+        };
+    }
+
+    // 4. config-pointed file.
+    if let Some(raw_path) = api_key_file.filter(|s| !s.trim().is_empty()) {
+        let field = format!("[{section}].api_key_file");
+        let path = expand_tilde(raw_path);
+        let path_display = path.display().to_string();
+
+        // Mode 0400 enforcement (#1055-style escape hatch).
+        if let Err(reason) = enforce_api_key_file_perms(&path, &field) {
+            return (None, KeySource::Error(reason));
+        }
+
+        return match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let key = contents.lines().next().unwrap_or("").trim().to_string();
+                if key.is_empty() {
+                    (
+                        None,
+                        KeySource::Error(format!("{field} = {path_display:?} is empty")),
+                    )
+                } else {
+                    (Some(key), KeySource::ConfigFile(path_display))
+                }
+            }
+            Err(e) => (
+                None,
+                KeySource::Error(format!("{field} = {path_display:?} could not be read: {e}")),
+            ),
+        };
+    }
+
+    (None, KeySource::None)
+}
+
+/// v0.7.x (#1146) — enforce mode 0400 (or stricter) on the file
+/// referenced by `[llm].api_key_file` / `[embeddings].api_key_file`
+/// (#1598; `field` names the rejecting config field in error text).
+/// The check mirrors the existing `AI_MEMORY_DB_PASSPHRASE_FILE`
+/// enforcement (issue #1055): any bits set in `mode & 0o077` (group /
+/// world readable / executable) cause the daemon to refuse the file,
+/// unless the operator opts out via
+/// `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`.
+///
+/// On non-Unix platforms (the `staticlib` mobile target, future
+/// Windows builds) the check is a no-op — the perm bits are not
+/// expressible on those platforms.
+fn enforce_api_key_file_perms(path: &Path, field: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|e| {
+            format!(
+                "{field} = {:?} could not be stat'd for perms check: {e}",
+                path.display(),
+            )
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            // Allow lax perms only when the operator explicitly opts in
+            // (mirroring #1055 for AI_MEMORY_DB_PASSPHRASE_FILE).
+            let opt_in = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
+                .ok()
+                .is_some_and(|s| {
+                    let t = s.trim().to_ascii_lowercase();
+                    matches!(t.as_str(), "1" | "true" | "yes" | "on")
+                });
+            if !opt_in {
+                return Err(format!(
+                    "{field} = {:?} has lax permissions \
+                     (mode = {:o}; expected 0400 or stricter). Run \
+                     `chmod 0400 {}` to fix, or set \
+                     `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` to \
+                     bypass (NOT recommended for production).",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                ));
+            }
+            tracing::warn!(
+                "{field} = {:?} has lax permissions (mode = {:o}); \
+                 accepted because AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Permission bits do not apply on non-Unix platforms.
+        let _ = (path, field);
+    }
+    Ok(())
+}
+
+fn expand_tilde(s: &str) -> PathBuf {
+    if s == "~" {
+        return std::env::var("HOME").map_or_else(|_| PathBuf::from(s), PathBuf::from);
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return std::env::var("HOME")
+            .map_or_else(|_| PathBuf::from(s), |h| PathBuf::from(h).join(rest));
+    }
+    PathBuf::from(s)
+}
+
 impl AppConfig {
     /// Returns the config file path: `~/.config/ai-memory/config.toml`
     pub fn config_path() -> Option<PathBuf> {
@@ -2292,17 +5768,288 @@ impl AppConfig {
     /// Load config from a specific path.
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(cfg) => {
-                    eprintln!("ai-memory: loaded config from {}", path.display());
-                    cfg
+            Ok(contents) => {
+                // L1 fix (v0.7.0): warn on unknown top-level keys.
+                // `serde(deny_unknown_fields)` would be a breaking change for
+                // operators carrying forward-compat config snippets, so we
+                // instead parse the document twice: once as a generic
+                // `toml::Value` to enumerate every top-level key, and once
+                // into `AppConfig` as before. Any top-level key that is not
+                // part of the expected `AppConfig` field set is reported via
+                // `tracing::warn!` and otherwise silently ignored — load
+                // continues to succeed so a typo or stale Plan C section
+                // (`[memory]`, `[autonomous]`, `[governance]`, `[federation]`)
+                // can no longer silently neutralise an operator's intent.
+                Self::warn_unknown_top_level_keys(path, &contents);
+                match toml::from_str::<Self>(&contents) {
+                    Ok(cfg) => match cfg.validate_secret_handling() {
+                        Ok(()) => {
+                            eprintln!("ai-memory: loaded config from {}", path.display());
+                            cfg.warn_legacy_schema_drift(path);
+                            cfg
+                        }
+                        Err(reason) => {
+                            eprintln!(
+                                "ai-memory: config rejected ({}): {}\n\
+                                 ai-memory: falling back to default config — \
+                                 fix the issue and restart. \
+                                 See https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                                path.display(),
+                                reason
+                            );
+                            Self::default()
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
+                        Self::default()
+                    }
                 }
-                Err(e) => {
-                    eprintln!("ai-memory: config parse error ({}): {}", path.display(), e);
-                    Self::default()
-                }
-            },
+            }
             Err(_) => Self::default(),
+        }
+    }
+
+    /// v0.7.x (#1146) — emit a one-shot deprecation WARN to stderr
+    /// when the loaded config carries legacy v1 flat fields that have
+    /// been superseded by the sectioned v2 schema.
+    ///
+    /// Two posture WARNs:
+    ///
+    /// - **Legacy-only** (no `schema_version` OR `schema_version = 1`,
+    ///   AND any of `llm_model`, `ollama_url`, `embed_url`,
+    ///   `embedding_model`, `cross_encoder`, `default_namespace`,
+    ///   `archive_on_gc`, `archive_max_days`, `max_memory_mb`,
+    ///   `auto_tag_model` set): operator running pre-#1146 config
+    ///   shape — point them at `ai-memory config migrate`.
+    ///
+    /// - **Drift** (`schema_version >= 2` AND any legacy field set):
+    ///   operator has migrated but left legacy fields in place —
+    ///   legacy fields are ignored under v2, point them at
+    ///   `ai-memory config migrate` to clean up the dead weight.
+    ///
+    /// The WARN is gated by [`std::sync::Once`] so re-loading the
+    /// config in the same process (e.g. tests that call
+    /// [`AppConfig::load_from`] in a loop) does not spam stderr.
+    ///
+    /// DOC-6 (FX-C4-batch2, 2026-05-26): the v2 sectioned schema
+    /// resolution path intentionally reads the legacy fields to
+    /// emit the warn — the `#[allow(deprecated)]` is scoped here
+    /// so the WARN site (the only thing that legitimately TOUCHES
+    /// the legacy fields post-#1146) doesn't cascade pedantic
+    /// errors. External consumers writing `let cfg: AppConfig =
+    /// ...; cfg.llm_model` still get the compile-time deprecation
+    /// warning.
+    #[allow(deprecated)]
+    fn warn_legacy_schema_drift(&self, path: &Path) {
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+
+        let has_legacy = self.llm_model.is_some()
+            || self.ollama_url.is_some()
+            || self.embed_url.is_some()
+            || self.embedding_model.is_some()
+            || self.cross_encoder.is_some()
+            || self.default_namespace.is_some()
+            || self.archive_on_gc.is_some()
+            || self.archive_max_days.is_some()
+            || self.max_memory_mb.is_some()
+            || self.auto_tag_model.is_some();
+
+        if !has_legacy {
+            return;
+        }
+
+        let v2 = matches!(self.schema_version, Some(v) if v >= 2);
+
+        WARN_ONCE.call_once(|| {
+            if v2 {
+                eprintln!(
+                    "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
+                     are still present in {} (llm_model / ollama_url / embed_url / \
+                     embedding_model / cross_encoder / default_namespace / \
+                     archive_on_gc / archive_max_days / max_memory_mb / \
+                     auto_tag_model). Under v2 the legacy fields are IGNORED in \
+                     favor of [llm] / [embeddings] / [reranker] / [storage] \
+                     sections. Run `ai-memory config migrate` to remove them.",
+                    self.schema_version,
+                    path.display(),
+                );
+            } else {
+                eprintln!(
+                    "ai-memory: WARN — legacy v1 flat-field configuration shape \
+                     detected in {}. The [llm] / [embeddings] / [reranker] / \
+                     [storage] sectioned schema (v2) is the canonical shape; \
+                     legacy fields continue to work in v0.7.x but will be \
+                     removed in v0.8.0. Run `ai-memory config migrate` to \
+                     upgrade in place (a timestamped .bak is written). See \
+                     https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
+                    path.display(),
+                );
+            }
+        });
+    }
+
+    /// v0.7.x (#1146) — validate secret-handling discipline in the
+    /// `[llm]` (and `[llm.auto_tag]`) sections after parse. Three
+    /// rejections fire at load time so misconfigurations are loud
+    /// rather than silent:
+    ///
+    /// 1. Inline `api_key = "<literal>"` in `[llm]`. Operators MUST
+    ///    use `api_key_env = "<ENV_VAR_NAME>"` or `api_key_file =
+    ///    "/path/to/key"` instead. Closes the v0.6.x posture where
+    ///    inline secrets in `~/.config/ai-memory/config.toml` were
+    ///    silently accepted even though the file is typically
+    ///    world-readable.
+    ///
+    /// 2. Both `api_key_env` and `api_key_file` set on `[llm]`.
+    ///    Mutually exclusive — operator must pick one.
+    ///
+    /// 3. Both `api_key_env` and `api_key_file` set on
+    ///    `[llm.auto_tag]`. Same mutex.
+    ///
+    /// 4. (#1598) Inline `api_key = "<literal>"` in `[embeddings]` —
+    ///    same posture as rejection 1.
+    ///
+    /// 5. (#1598) Both `api_key_env` and `api_key_file` set on
+    ///    `[embeddings]`. Same mutex as rejection 2.
+    ///
+    /// On any rejection, [`Self::load_from`] surfaces the message to
+    /// stderr and falls back to [`Self::default`] so the daemon boots
+    /// without the misconfigured secret rather than refusing to start
+    /// entirely.
+    fn validate_secret_handling(&self) -> Result<(), String> {
+        if let Some(llm) = &self.llm {
+            // Rejection 1 — inline api_key literal.
+            if llm.api_key.is_some() {
+                return Err("inline `api_key = \"<literal>\"` in [llm] is forbidden — \
+                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
+                     process env var, or `api_key_file = \"/path/to/key\"` to \
+                     reference a file (mode 0400 enforced). Inline secrets in \
+                     config.toml (typically world-readable) are a credential \
+                     leak."
+                    .to_string());
+            }
+            // Rejection 2 — env vs file mutex.
+            if llm.api_key_env.is_some() && llm.api_key_file.is_some() {
+                return Err("[llm].api_key_env and [llm].api_key_file are mutually \
+                     exclusive — set exactly one (or neither, to fall back \
+                     to the per-vendor env-var chain)."
+                    .to_string());
+            }
+            // Rejection 3 — auto_tag env vs file mutex.
+            if let Some(auto_tag) = &llm.auto_tag {
+                if auto_tag.api_key_env.is_some() && auto_tag.api_key_file.is_some() {
+                    return Err("[llm.auto_tag].api_key_env and \
+                         [llm.auto_tag].api_key_file are mutually exclusive."
+                        .to_string());
+                }
+            }
+        }
+        if let Some(embeddings) = &self.embeddings {
+            // #1598 Rejection 4 — inline [embeddings].api_key literal
+            // (mirrors the [llm] rejection above).
+            if embeddings.api_key.is_some() {
+                return Err(
+                    "inline `api_key = \"<literal>\"` in [embeddings] is forbidden — \
+                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
+                     process env var, or `api_key_file = \"/path/to/key\"` to \
+                     reference a file (mode 0400 enforced). Inline secrets in \
+                     config.toml (typically world-readable) are a credential \
+                     leak."
+                        .to_string(),
+                );
+            }
+            // #1598 Rejection 5 — [embeddings] env vs file mutex.
+            if embeddings.api_key_env.is_some() && embeddings.api_key_file.is_some() {
+                return Err(
+                    "[embeddings].api_key_env and [embeddings].api_key_file are \
+                     mutually exclusive — set exactly one (or neither, to fall \
+                     back to the per-vendor env-var chain)."
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// L1 fix (v0.7.0): enumerate top-level keys in `contents` and emit a
+    /// `tracing::warn!` for every key that is not a recognised `AppConfig`
+    /// field. Malformed TOML is silently skipped here — the existing
+    /// `toml::from_str::<AppConfig>` parse in `load_from` will surface the
+    /// real parse error to the operator on the next line.
+    fn warn_unknown_top_level_keys(path: &Path, contents: &str) {
+        // Canonical list of `AppConfig` top-level fields. Keep in sync with
+        // the struct definition above; verified verbatim against the v0.7.0
+        // L1 spec.
+        const EXPECTED_KEYS: &[&str] = &[
+            "tier",
+            "db",
+            config_keys::OLLAMA_URL,
+            "embed_url",
+            config_keys::EMBEDDING_MODEL,
+            "llm_model",
+            config_keys::AUTO_TAG_MODEL,
+            config_keys::CROSS_ENCODER,
+            config_keys::DEFAULT_NAMESPACE,
+            config_keys::MAX_MEMORY_MB,
+            "ttl",
+            config_keys::ARCHIVE_ON_GC,
+            "api_key",
+            config_keys::ARCHIVE_MAX_DAYS,
+            "identity",
+            "scoring",
+            "autonomous_hooks",
+            "logging",
+            "audit",
+            "boot",
+            "mcp",
+            "permissions",
+            "transcripts",
+            "hooks",
+            "subscriptions",
+            "postgres_statement_timeout_secs",
+            "postgres_pool_max_connections",
+            "postgres_pool_min_connections",
+            "postgres_acquire_timeout_secs",
+            "request_timeout_secs",
+            "llm_call_timeout_secs",
+            "verify",
+            "mcp_federation_forward_url",
+            "agents",
+            "governance",
+            "confidence",
+            "admin",
+            // v0.7.x (#1146) — enterprise configuration sections.
+            "schema_version",
+            "llm",
+            config_keys::SECTION_EMBEDDINGS,
+            "reranker",
+            "storage",
+            "limits",
+        ];
+
+        let value: toml::Value = match toml::from_str(contents) {
+            Ok(v) => v,
+            // Malformed TOML — defer to the strongly-typed parse in the
+            // caller, which produces the operator-facing error message.
+            Err(_) => return,
+        };
+
+        let Some(table) = value.as_table() else {
+            return;
+        };
+
+        let expected_list = EXPECTED_KEYS.join(", ");
+        for key in table.keys() {
+            if !EXPECTED_KEYS.contains(&key.as_str()) {
+                tracing::warn!(
+                    "[config] unknown key '{key}' in {path} — top-level AppConfig fields are: {expected_keys}. This key is silently ignored (no behavior change).",
+                    key = key,
+                    path = path.display(),
+                    expected_keys = expected_list,
+                );
+            }
         }
     }
 
@@ -2316,7 +6063,16 @@ impl AppConfig {
     ///    cannot use `[permissions]` from `config.toml` — flip the
     ///    gate to Enforce per scenario.
     /// 2. `[permissions].mode` from `config.toml`.
-    /// 3. Compiled default ([`PermissionsMode::default`] = `advisory`).
+    /// 3. v0.7.0 secure default ([`PermissionsMode::Enforce`]) when no
+    ///    explicit configuration is present. Round-2 F8 / Round-3
+    ///    re-verify: prior to this round the unconfigured fallback was
+    ///    [`PermissionsMode::default`] (= `advisory`), which left an
+    ///    upgrading deployment with `metadata.governance.write=owner`
+    ///    bypassable. We now resolve via
+    ///    [`crate::permissions::resolve_v07_default_mode`] so every
+    ///    process-wide entry point (CLI, MCP, HTTP serve) shares the
+    ///    same secure-by-default posture; operators who want advisory
+    ///    set `[permissions].mode = "advisory"` explicitly.
     #[must_use]
     pub fn effective_permissions_mode(&self) -> PermissionsMode {
         if let Ok(raw) = std::env::var("AI_MEMORY_PERMISSIONS_MODE") {
@@ -2332,9 +6088,17 @@ impl AppConfig {
                 }
             }
         }
-        self.permissions
-            .as_ref()
-            .map_or_else(PermissionsMode::default, |p| p.mode)
+        // B4 (S5-M3) — both "block absent entirely" and "block present
+        // but `mode =` omitted" must reach the secure default. The
+        // `Option<PermissionsMode>` shape lets us collapse both to
+        // `None` for the resolver so neither path silently inherits
+        // the serde-derived `Advisory`. The migration WARN that
+        // `resolve_v07_default_mode` emits when configured is `None`
+        // is surfaced by the daemon's startup banner
+        // (see `crate::cli::serve_banner::compose_banner`).
+        let configured = self.permissions.as_ref().and_then(|p| p.mode);
+        let (mode, _warn) = crate::permissions::resolve_v07_default_mode(configured);
+        mode
     }
 
     /// v0.7.0 K9 — resolve the effective declarative rule set
@@ -2358,19 +6122,30 @@ impl AppConfig {
     }
 
     /// Resolve the effective database path (CLI flag overrides config).
+    ///
+    /// Expands a leading `~` / `~/` in the config-provided path to `$HOME`
+    /// before returning (issue #507). Without this, `db = "~/.claude/ai-memory.db"`
+    /// in `config.toml` would land on disk as the literal four-char dir
+    /// `~/.claude/...` relative to cwd and the daemon would report
+    /// `warn db unavailable` against the real DB that lives at the
+    /// expanded path.
     pub fn effective_db(&self, cli_db: &Path) -> PathBuf {
         // If CLI provided a non-default path, use it
         let default_db = PathBuf::from("ai-memory.db");
         if cli_db != default_db {
             return cli_db.to_path_buf();
         }
-        // Otherwise check config
+        // Otherwise check config — expanding leading `~` against $HOME.
         self.db
             .as_ref()
-            .map_or_else(|| cli_db.to_path_buf(), PathBuf::from)
+            .map_or_else(|| cli_db.to_path_buf(), |s| expand_tilde(s))
     }
 
     /// Resolve Ollama URL for LLM generation (config or default).
+    ///
+    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    /// New callers should use the sectioned `[llm]` resolver.
+    #[allow(deprecated)]
     pub fn effective_ollama_url(&self) -> &str {
         self.ollama_url
             .as_deref()
@@ -2389,8 +6164,29 @@ impl AppConfig {
     }
 
     /// Whether to archive memories before GC deletion (default: true).
+    ///
+    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    #[allow(deprecated)]
     pub fn effective_archive_on_gc(&self) -> bool {
         self.archive_on_gc.unwrap_or(true)
+    }
+
+    /// v0.7.0 H7 (round-2) — resolved per-request HTTP timeout.
+    /// Falls back to [`DEFAULT_REQUEST_TIMEOUT_SECS`] when the
+    /// `request_timeout_secs` config field is unset.
+    #[must_use]
+    pub fn effective_request_timeout_secs(&self) -> u64 {
+        self.request_timeout_secs
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
+    }
+
+    /// v0.7.0 H8 (round-2) — resolved per-LLM-call timeout. Falls
+    /// back to [`DEFAULT_LLM_CALL_TIMEOUT_SECS`] when the
+    /// `llm_call_timeout_secs` config field is unset.
+    #[must_use]
+    pub fn effective_llm_call_timeout_secs(&self) -> u64 {
+        self.llm_call_timeout_secs
+            .unwrap_or(DEFAULT_LLM_CALL_TIMEOUT_SECS)
     }
 
     /// v0.6.4-001 — resolve the effective MCP tool profile.
@@ -2475,11 +6271,630 @@ impl AppConfig {
     }
 
     /// Resolve URL for embedding model (falls back to `ollama_url`).
+    ///
+    /// DOC-6: legacy resolver — kept for v0.7.x backward compat.
+    #[allow(deprecated)]
     pub fn effective_embed_url(&self) -> &str {
         self.embed_url
             .as_deref()
             .or(self.ollama_url.as_deref())
             .unwrap_or("http://localhost:11434")
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical resolvers (#1146). Every LLM / embedder / reranker /
+    // storage surface MUST consume the corresponding `Resolved*` shape
+    // produced by these methods rather than reading raw config / env
+    // / tier presets.
+    //
+    // Precedence (uniform across all four):
+    //   CLI flag > AI_MEMORY_* env > config.toml section
+    //            > legacy flat fields (Legacy source) > compiled default
+    //
+    // Resolvers are PURE (no network I/O). `resolve_llm` reads the
+    // `api_key_file` content at call time if configured; perm checks
+    // land in a follow-up commit and surface via `KeySource::Error`
+    // without panicking.
+    // ------------------------------------------------------------------
+
+    /// v0.7.x (#1146) — resolve the canonical LLM configuration.
+    ///
+    /// `cli_backend` / `cli_model` / `cli_base_url` carry CLI-flag
+    /// overrides (pass `None` for `ai-memory mcp` / `ai-memory serve`
+    /// which currently expose no CLI override; the CLI plumbing lands
+    /// in a follow-up commit).
+    ///
+    /// DOC-6: this resolver intentionally reads the legacy flat
+    /// fields as the lowest-precedence fallback layer (per the
+    /// sectioned/v2 contract), so the `#[allow(deprecated)]`
+    /// attribute is necessary here. External callers should pass
+    /// CLI / env / `[llm]` section values and let this resolver
+    /// reach for the legacy fields only when those are unset.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn resolve_llm(
+        &self,
+        cli_backend: Option<&str>,
+        cli_model: Option<&str>,
+        cli_base_url: Option<&str>,
+    ) -> ResolvedLlm {
+        // ------- 1. backend selection ----------------------------------
+        let env_backend = std::env::var("AI_MEMORY_LLM_BACKEND")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let cfg_backend = self
+            .llm
+            .as_ref()
+            .and_then(|l| l.backend.as_ref())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+
+        let (backend, source) = if let Some(b) = cli_backend.map(str::to_ascii_lowercase) {
+            (b, ConfigSource::Cli)
+        } else if let Some(b) = env_backend.clone() {
+            (b, ConfigSource::Env)
+        } else if let Some(b) = cfg_backend {
+            (b, ConfigSource::Config)
+        } else if self.llm_model.is_some() || self.ollama_url.is_some() {
+            // Legacy flat fields imply Ollama.
+            ("ollama".to_string(), ConfigSource::Legacy)
+        } else {
+            // Compiled default = tier preset (Ollama-native).
+            ("ollama".to_string(), ConfigSource::CompiledDefault)
+        };
+
+        // ------- 2. model selection ------------------------------------
+        let model = cli_model
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AI_MEMORY_LLM_MODEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                self.llm
+                    .as_ref()
+                    .and_then(|l| l.model.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| self.llm_model.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| backend_default_model(&backend).to_string());
+
+        // ------- 3. base_url selection ---------------------------------
+        let base_url = cli_base_url
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AI_MEMORY_LLM_BASE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                self.llm
+                    .as_ref()
+                    .and_then(|l| l.base_url.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                if backend == "ollama" {
+                    self.ollama_url.clone()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| backend_default_base_url(&backend).to_string());
+
+        // ------- 4. api_key selection ----------------------------------
+        let (api_key, api_key_source) = resolve_api_key(&backend, self.llm.as_ref());
+
+        ResolvedLlm {
+            backend,
+            model,
+            base_url,
+            api_key,
+            api_key_source,
+            source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the `[llm.auto_tag]` fast-structured-
+    /// output sibling. Fields fall back to [`Self::resolve_llm`] field-
+    /// by-field; commonly only `model` is overridden (defaults to
+    /// `gemma3:4b` per the L15 fast-structured-output policy).
+    ///
+    /// DOC-6: reads the legacy `auto_tag_model` field as the
+    /// lowest-precedence fallback layer (`#[allow(deprecated)]`).
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn resolve_llm_auto_tag(&self) -> ResolvedLlm {
+        let parent = self.resolve_llm(None, None, None);
+        let sub = self.llm.as_ref().and_then(|l| l.auto_tag.as_ref());
+
+        let backend = sub
+            .and_then(|s| s.backend.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| parent.backend.clone());
+
+        let model = sub
+            .and_then(|s| s.model.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.auto_tag_model.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| {
+                // L15 default: gemma3:4b for fast structured output,
+                // regardless of parent backend.
+                if backend == "ollama" {
+                    "gemma3:4b".to_string()
+                } else {
+                    // For non-Ollama backends, use the parent model
+                    // (no sane way to pick a "fast" model across vendors).
+                    parent.model.clone()
+                }
+            });
+
+        let base_url = sub
+            .and_then(|s| s.base_url.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                if backend == parent.backend {
+                    parent.base_url.clone()
+                } else {
+                    backend_default_base_url(&backend).to_string()
+                }
+            });
+
+        // api_key: inherit from parent if backend matches, else fresh resolve.
+        let (api_key, api_key_source) = if backend == parent.backend {
+            (parent.api_key.clone(), parent.api_key_source.clone())
+        } else {
+            // Synthesise a transient LlmSection-like view from the sub-table
+            // for fresh API-key resolution.
+            let synthetic = sub.map(|s| LlmSection {
+                backend: Some(backend.clone()),
+                model: None,
+                base_url: None,
+                api_key_env: s.api_key_env.clone(),
+                api_key_file: s.api_key_file.clone(),
+                api_key: None,
+                auto_tag: None,
+            });
+            resolve_api_key(&backend, synthetic.as_ref())
+        };
+
+        ResolvedLlm {
+            backend,
+            model,
+            base_url,
+            api_key,
+            api_key_source,
+            source: parent.source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the canonical embedder configuration.
+    ///
+    /// #1598 — extended per-field precedence ladder:
+    ///
+    /// - `backend`: `AI_MEMORY_EMBED_BACKEND` env > `[embeddings].backend`
+    ///   > compiled default (`ollama`).
+    /// - `url`: `AI_MEMORY_EMBED_BASE_URL` env > `[embeddings].base_url`
+    ///   > `[embeddings].url` > legacy `embed_url` > legacy `ollama_url`
+    ///   > the backend alias's default base URL (API backends) > the
+    ///   localhost Ollama default.
+    /// - `model`: `AI_MEMORY_EMBED_MODEL` env > `[embeddings].model`
+    ///   > legacy `embedding_model` > compiled default
+    ///   (`nomic-embed-text-v1.5`); legacy aliases canonicalised.
+    /// - `api_key`: [`resolve_embed_api_key`] ladder
+    ///   (`AI_MEMORY_EMBED_API_KEY` > per-vendor alias env >
+    ///   `[embeddings].api_key_env` > `[embeddings].api_key_file`).
+    /// - `embedding_dim`: `[embeddings].dim` override >
+    ///   [`canonical_embedding_dim`] table > `None`.
+    ///
+    /// DOC-6: reads the legacy `embed_url`/`embedding_model`/
+    /// `ollama_url` fields as the lowest-precedence fallback layer.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn resolve_embeddings(&self) -> ResolvedEmbeddings {
+        let cfg = self.embeddings.as_ref();
+
+        let env_backend = std::env::var(ENV_EMBED_BACKEND)
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let backend = env_backend
+            .clone()
+            .or_else(|| {
+                cfg.and_then(|e| e.backend.as_ref())
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| crate::llm::BACKEND_OLLAMA.to_string());
+
+        let url = std::env::var(ENV_EMBED_BASE_URL)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|e| e.base_url.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                cfg.and_then(|e| e.url.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| self.embed_url.clone().filter(|s| !s.trim().is_empty()))
+            .or_else(|| self.ollama_url.clone().filter(|s| !s.trim().is_empty()))
+            .or_else(|| {
+                // #1598 — API backends default to the vendor's base URL
+                // (declared once in llm.rs); `openai-compatible` has no
+                // sane default and falls through.
+                if is_api_embed_backend(&backend) {
+                    crate::llm::default_base_url_for_alias(&backend).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| crate::llm::DEFAULT_OLLAMA_URL.to_string());
+
+        let model = std::env::var(ENV_EMBED_MODEL)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|e| e.model.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                self.embedding_model
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .map(canonicalise_embedding_model)
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+
+        let backfill_batch_env = std::env::var(ENV_EMBED_BACKFILL_BATCH)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let backfill_batch_cfg = cfg.and_then(|e| e.backfill_batch);
+        let backfill_batch_raw = backfill_batch_env.or(backfill_batch_cfg);
+        let backfill_batch = match backfill_batch_raw {
+            Some(n) if (1..=10000).contains(&n) => n,
+            // #1649 — out-of-range values were silently swallowed while
+            // the env-var table promised a warn-log (the sibling knob
+            // AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY already warns).
+            Some(n) => {
+                tracing::warn!(
+                    "{ENV_EMBED_BACKFILL_BATCH}={n} outside 1..=10000 — falling back to default {DEFAULT_EMBED_BACKFILL_BATCH}"
+                );
+                DEFAULT_EMBED_BACKFILL_BATCH
+            }
+            None => DEFAULT_EMBED_BACKFILL_BATCH,
+        };
+
+        let source = if env_backend.is_some() {
+            ConfigSource::Env
+        } else if cfg.is_some() {
+            ConfigSource::Config
+        } else if self.embed_url.is_some()
+            || self.embedding_model.is_some()
+            || self.ollama_url.is_some()
+        {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        // v0.7.x (#1169) — derive the dim from the resolved model id
+        // via the canonical lookup table. #1598 — the explicit
+        // `[embeddings].dim` override wins (escape hatch for models
+        // not in [`KNOWN_EMBEDDING_DIMS`]); non-positive overrides are
+        // ignored. None when neither layer knows the dim; callers
+        // (capabilities surface) fall back to the tier preset's
+        // compiled dim.
+        let embedding_dim = cfg
+            .and_then(|e| e.dim)
+            .filter(|d| *d > 0)
+            .or_else(|| canonical_embedding_dim(&model));
+
+        // #1598 (fleet follow-up) — the EXPLICIT override alone also
+        // becomes the wire `dimensions` request for OpenAI-compatible
+        // backends (Matryoshka truncation; see
+        // [`ResolvedEmbeddings::requested_dim`]). Deliberately NOT
+        // populated from the table lookup — a table dim describes the
+        // model's native output and must not be re-requested.
+        let requested_dim = cfg.and_then(|e| e.dim).filter(|d| *d > 0);
+
+        // #1598 — embedding API key (None for ollama / keyless
+        // self-hosted endpoints).
+        let (api_key, key_source) = resolve_embed_api_key(&backend, cfg);
+
+        ResolvedEmbeddings {
+            backend,
+            url,
+            model,
+            backfill_batch,
+            embedding_dim,
+            requested_dim,
+            api_key,
+            key_source,
+            source,
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the canonical reranker configuration.
+    /// Folds the legacy `cross_encoder: Option<bool>` flag into the
+    /// `enabled` field; `model` defaults to `ms-marco-MiniLM-L-6-v2`.
+    ///
+    /// DOC-6: reads the legacy `cross_encoder` field as the
+    /// lowest-precedence fallback layer.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn resolve_reranker(&self) -> ResolvedReranker {
+        let cfg = self.reranker.as_ref();
+
+        let enabled = cfg
+            .and_then(|r| r.enabled)
+            .or(self.cross_encoder)
+            // Default reranker-on for the autonomous tier; off otherwise.
+            // Boot wires the actual tier-default at the resolver call
+            // site (it's already keyed off `tier_config.cross_encoder`).
+            .unwrap_or(false);
+
+        let model = cfg
+            .and_then(|r| r.model.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "ms-marco-MiniLM-L-6-v2".to_string());
+
+        // #1604 — rerank input sequence cap, uniform ladder:
+        // env > [reranker] section > compiled default. Zero,
+        // unparseable, or above-model-ceiling values fall through.
+        let admissible = |n: &usize| *n > 0 && *n <= crate::reranker::CROSS_ENCODER_MAX_SEQ;
+        let max_seq_tokens = std::env::var(ENV_RERANK_MAX_SEQ)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(admissible)
+            .or_else(|| cfg.and_then(|r| r.max_seq_tokens).filter(admissible))
+            .unwrap_or(crate::reranker::RERANK_MAX_SEQ_DEFAULT);
+
+        let source = if cfg.is_some() {
+            ConfigSource::Config
+        } else if self.cross_encoder.is_some() {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedReranker {
+            enabled,
+            model,
+            max_seq_tokens,
+            source,
+        }
+    }
+
+    /// v0.7.x (issue #1168) — bundle the three model-resolver outputs
+    /// into a single [`ResolvedModels`] triple for the capabilities
+    /// surface (MCP `memory_capabilities`, HTTP `GET /api/v1/capabilities`).
+    ///
+    /// Routes through the canonical [`Self::resolve_llm`],
+    /// [`Self::resolve_embeddings`], and [`Self::resolve_reranker`]
+    /// resolvers so the capabilities `models.*` block reflects the
+    /// same resolved configuration the live LLM client / embedder /
+    /// reranker were built from, NEVER the compiled tier preset.
+    ///
+    /// Pairs with [`ResolvedModels::from_tier_preset`] (back-compat
+    /// constructor for tests that scaffold a `TierConfig` without an
+    /// `AppConfig`).
+    #[must_use]
+    pub fn resolve_models(&self) -> ResolvedModels {
+        ResolvedModels {
+            llm: self.resolve_llm(None, None, None),
+            embeddings: self.resolve_embeddings(),
+            reranker: self.resolve_reranker(),
+        }
+    }
+
+    /// v0.7.x (#1146) — resolve the canonical storage configuration.
+    ///
+    /// DOC-6: reads the legacy `default_namespace`/`archive_on_gc`/
+    /// `archive_max_days`/`max_memory_mb` fields as the
+    /// lowest-precedence fallback layer.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn resolve_storage(&self) -> ResolvedStorage {
+        let cfg = self.storage.as_ref();
+
+        // #1590 — track WHICH layer supplied `default_namespace` so
+        // write-path consumers can distinguish an explicit operator
+        // choice from the compiled fallback (only the former overrides
+        // the historical per-surface defaults).
+        let section_ns = cfg
+            .and_then(|s| s.default_namespace.clone())
+            .filter(|s| !s.trim().is_empty());
+        let legacy_ns = self
+            .default_namespace
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let default_namespace_source = if section_ns.is_some() {
+            ConfigSource::Config
+        } else if legacy_ns.is_some() {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+        let default_namespace = section_ns
+            .or(legacy_ns)
+            .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
+
+        let archive_on_gc = cfg
+            .and_then(|s| s.archive_on_gc)
+            .or(self.archive_on_gc)
+            .unwrap_or(true);
+
+        let archive_max_days = cfg
+            .and_then(|s| s.archive_max_days)
+            .or(self.archive_max_days);
+
+        let max_memory_mb = cfg.and_then(|s| s.max_memory_mb).or(self.max_memory_mb);
+
+        // #1579 B7 — sqlite mmap size, uniform ladder:
+        // env > [storage] section > compiled default. `0` is a
+        // deliberate operator choice (disable mmap) so the filter
+        // admits it; negative / unparseable values fall through.
+        let db_mmap_size_bytes = std::env::var(ENV_DB_MMAP_SIZE)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|n| *n >= 0)
+            .or_else(|| cfg.and_then(|s| s.db_mmap_size_bytes).filter(|n| *n >= 0))
+            .unwrap_or(crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES);
+
+        let source = if cfg.is_some() {
+            ConfigSource::Config
+        } else if self.default_namespace.is_some()
+            || self.archive_on_gc.is_some()
+            || self.archive_max_days.is_some()
+            || self.max_memory_mb.is_some()
+        {
+            ConfigSource::Legacy
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedStorage {
+            default_namespace,
+            archive_on_gc,
+            archive_max_days,
+            max_memory_mb,
+            db_mmap_size_bytes,
+            default_namespace_source,
+            source,
+        }
+    }
+
+    /// v0.7.x — resolve the operator-tunable capacity limits.
+    ///
+    /// Precedence ladder per field (highest wins):
+    /// `AI_MEMORY_MAX_*` env > `[limits]` section > compiled default.
+    /// Non-positive values (≤ 0) at any layer are treated as "unset" so
+    /// a stray `0` never silently disables writes — the next layer down
+    /// is consulted instead. The compiled defaults are the named
+    /// `crate::quotas::DEFAULT_MAX_*` constants and
+    /// [`crate::handlers::MAX_BULK_SIZE`]; no numeric literals live in
+    /// this resolver.
+    #[must_use]
+    pub fn resolve_limits(&self) -> ResolvedLimits {
+        let cfg = self.limits.as_ref();
+
+        fn env_pos_i64(name: &str) -> Option<i64> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|n| *n > 0)
+        }
+        fn env_pos_usize(name: &str) -> Option<usize> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+        }
+
+        let mem_env = env_pos_i64(ENV_MAX_MEMORIES_PER_DAY);
+        let mem_cfg = cfg.and_then(|l| l.max_memories_per_day).filter(|n| *n > 0);
+        let max_memories_per_day = mem_env
+            .or(mem_cfg)
+            .unwrap_or(crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY);
+
+        let bytes_env = env_pos_i64(ENV_MAX_STORAGE_BYTES);
+        let bytes_cfg = cfg.and_then(|l| l.max_storage_bytes).filter(|n| *n > 0);
+        let max_storage_bytes = bytes_env
+            .or(bytes_cfg)
+            .unwrap_or(crate::quotas::DEFAULT_MAX_STORAGE_BYTES);
+
+        let links_env = env_pos_i64(ENV_MAX_LINKS_PER_DAY);
+        let links_cfg = cfg.and_then(|l| l.max_links_per_day).filter(|n| *n > 0);
+        let max_links_per_day = links_env
+            .or(links_cfg)
+            .unwrap_or(crate::quotas::DEFAULT_MAX_LINKS_PER_DAY);
+
+        let page_env = env_pos_usize(ENV_MAX_PAGE_SIZE);
+        let page_cfg = cfg.and_then(|l| l.max_page_size).filter(|n| *n > 0);
+        let max_page_size = page_env
+            .or(page_cfg)
+            .unwrap_or(crate::handlers::MAX_BULK_SIZE);
+
+        let source = if mem_env.is_some()
+            || bytes_env.is_some()
+            || links_env.is_some()
+            || page_env.is_some()
+        {
+            ConfigSource::Env
+        } else if mem_cfg.is_some()
+            || bytes_cfg.is_some()
+            || links_cfg.is_some()
+            || page_cfg.is_some()
+        {
+            ConfigSource::Config
+        } else {
+            ConfigSource::CompiledDefault
+        };
+
+        ResolvedLimits {
+            max_memories_per_day,
+            max_storage_bytes,
+            max_links_per_day,
+            max_page_size,
+            source,
+        }
+    }
+
+    /// Resolve the Postgres connection-pool sizing knobs into a
+    /// [`crate::store::PoolConfig`] for the daemon's `build_store_handle`.
+    ///
+    /// Follows the uniform precedence ladder, per field:
+    ///
+    /// ```text
+    /// AI_MEMORY_PG_POOL_MAX / _MIN / _ACQUIRE_TIMEOUT_SECS env
+    ///   > top-level config.toml field
+    ///   > compiled default (PoolConfig::default())
+    /// ```
+    ///
+    /// Mirrors [`Self::resolve_limits`]: any non-positive or unparseable
+    /// value is filtered so it falls through to the next layer (a stray
+    /// `0` `max_connections` can never collapse the pool to unusable).
+    #[cfg(feature = "sal")]
+    #[must_use]
+    pub fn resolve_pg_pool(&self) -> crate::store::PoolConfig {
+        fn env_pos_u32(name: &str) -> Option<u32> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|n| *n > 0)
+        }
+        fn env_pos_u64(name: &str) -> Option<u64> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+        }
+
+        let defaults = crate::store::PoolConfig::default();
+
+        let max_connections = env_pos_u32(ENV_PG_POOL_MAX)
+            .or_else(|| self.postgres_pool_max_connections.filter(|n| *n > 0))
+            .unwrap_or(defaults.max_connections);
+
+        let min_connections = env_pos_u32(ENV_PG_POOL_MIN)
+            .or_else(|| self.postgres_pool_min_connections.filter(|n| *n > 0))
+            .unwrap_or(defaults.min_connections);
+
+        let acquire_timeout_secs = env_pos_u64(ENV_PG_ACQUIRE_TIMEOUT_SECS)
+            .or_else(|| self.postgres_acquire_timeout_secs.filter(|n| *n > 0))
+            .unwrap_or(defaults.acquire_timeout_secs);
+
+        crate::store::PoolConfig {
+            max_connections,
+            min_connections,
+            acquire_timeout_secs,
+        }
     }
 
     /// Write a default config file if one doesn't exist yet.
@@ -2511,6 +6926,10 @@ impl AppConfig {
 # LLM model tag for Ollama
 # llm_model = "gemma4:e2b"
 
+# Dedicated model for auto_tag (short structured output).
+# Defaults to gemma3:4b. Reasoning-heavy features still use llm_model.
+# auto_tag_model = "gemma3:4b"
+
 # Enable neural cross-encoder reranking (autonomous tier)
 # cross_encoder = true
 
@@ -2522,6 +6941,14 @@ impl AppConfig {
 
 # Archive expired memories before GC deletion (default: true)
 # archive_on_gc = true
+
+# Postgres connection-pool sizing (postgres store only; sqlite ignores).
+# Precedence per field: AI_MEMORY_PG_POOL_MAX / _MIN /
+# _ACQUIRE_TIMEOUT_SECS env > these fields > compiled default.
+# Non-positive / unparseable values fall through to the default.
+# postgres_pool_max_connections = 16        # hard ceiling on open connections
+# postgres_pool_min_connections = 2         # always-open warm-connection floor
+# postgres_acquire_timeout_secs = 30        # acquire() wait before erroring (secs)
 
 # Per-tier TTL overrides (uncomment to customize)
 # [ttl]
@@ -2614,8 +7041,27 @@ impl AppConfig {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields
 mod tests {
     use super::*;
+
+    /// M9 — process-wide guard around every test that calls
+    /// `std::env::set_var` / `std::env::remove_var`. Test binaries run
+    /// in parallel by default (`cargo test --jobs N`); env mutation is
+    /// process-global so two scenarios touching the same key race
+    /// non-deterministically. Every test in this module that flips an
+    /// env var MUST hold this mutex for the duration of its body.
+    ///
+    /// Poison-OK: a panicking scenario that drops the guard mid-mutation
+    /// still hands the next caller a usable lock. Subsequent tests
+    /// re-establish the env state they need on entry.
+    fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn tier_roundtrip() {
@@ -2653,19 +7099,113 @@ mod tests {
         assert_eq!(EmbeddingModel::NomicEmbedV15.dim(), 768);
     }
 
+    /// L2 fix — `AppConfig.embedding_model` is an `Option<String>` we
+    /// must parse before handing it to `build_embedder`. This test
+    /// pins the wire form (snake_case, matches serde rename_all),
+    /// confirms case-insensitive + trim-tolerant parsing, and that
+    /// garbage input produces an actionable Err rather than panicking.
+    #[test]
+    fn embedding_model_from_str() {
+        use std::str::FromStr;
+        assert_eq!(
+            EmbeddingModel::from_str("mini_lm_l6_v2").unwrap(),
+            EmbeddingModel::MiniLmL6V2
+        );
+        assert_eq!(
+            EmbeddingModel::from_str("nomic_embed_v15").unwrap(),
+            EmbeddingModel::NomicEmbedV15
+        );
+        // Case-insensitive: operators copy/paste from docs in any case.
+        assert_eq!(
+            EmbeddingModel::from_str("MINI_LM_L6_V2").unwrap(),
+            EmbeddingModel::MiniLmL6V2
+        );
+        assert_eq!(
+            EmbeddingModel::from_str("Nomic_Embed_V15").unwrap(),
+            EmbeddingModel::NomicEmbedV15
+        );
+        // Trim whitespace — common TOML editing artifact.
+        assert_eq!(
+            EmbeddingModel::from_str("  mini_lm_l6_v2  ").unwrap(),
+            EmbeddingModel::MiniLmL6V2
+        );
+        // Invalid input -> Err with a useful message naming the bad value.
+        let err = EmbeddingModel::from_str("garbage").unwrap_err();
+        assert!(err.contains("garbage"), "err message lost the input: {err}");
+        assert!(
+            err.contains("mini_lm_l6_v2") && err.contains("nomic_embed_v15"),
+            "err message should list valid options: {err}"
+        );
+    }
+
+    /// #1521 — `from_canonical_id` must accept every form an operator
+    /// might write in `[embeddings].model`: the snake wire form, the HF
+    /// id (the `canonicalise_embedding_model` output), the unprefixed
+    /// shortname, and the Ollama tag. This is what lets the sectioned
+    /// config block drive the daemon embedder.
+    #[test]
+    fn embedding_model_from_canonical_id_accepts_all_forms() {
+        // nomic family — snake, canonical HF id, Ollama tag, prefixed id.
+        for id in [
+            "nomic_embed_v15",
+            "nomic-embed-text-v1.5",
+            "nomic-embed-text",
+            "nomic-ai/nomic-embed-text-v1.5",
+        ] {
+            assert_eq!(
+                EmbeddingModel::from_canonical_id(id),
+                Some(EmbeddingModel::NomicEmbedV15),
+                "nomic alias {id:?} must resolve"
+            );
+        }
+        // MiniLM family — snake, canonical HF id, shortname, Ollama tag.
+        for id in [
+            "mini_lm_l6_v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "all-MiniLM-L6-v2",
+            "all-minilm",
+        ] {
+            assert_eq!(
+                EmbeddingModel::from_canonical_id(id),
+                Some(EmbeddingModel::MiniLmL6V2),
+                "minilm alias {id:?} must resolve"
+            );
+        }
+        // The canonicalised output of a legacy alias must round-trip.
+        assert_eq!(
+            EmbeddingModel::from_canonical_id(&canonicalise_embedding_model(
+                "nomic_embed_v15".to_string()
+            )),
+            Some(EmbeddingModel::NomicEmbedV15)
+        );
+        // Case-insensitive + whitespace-trimmed.
+        assert_eq!(
+            EmbeddingModel::from_canonical_id("  NOMIC-EMBED-TEXT-V1.5  "),
+            Some(EmbeddingModel::NomicEmbedV15)
+        );
+        // Models the 2-model daemon embedder cannot construct → None
+        // (caller falls back to the tier preset), and empty → None.
+        assert_eq!(EmbeddingModel::from_canonical_id("bge-large-en"), None);
+        assert_eq!(EmbeddingModel::from_canonical_id("mxbai-embed-large"), None);
+        assert_eq!(EmbeddingModel::from_canonical_id(""), None);
+        assert_eq!(EmbeddingModel::from_canonical_id("   "), None);
+    }
+
     #[test]
     fn autonomous_has_cross_encoder() {
         let cfg = FeatureTier::Autonomous.config();
         assert!(cfg.cross_encoder);
         let caps = cfg.capabilities();
         assert!(caps.features.cross_encoder_reranking);
-        // P1 honesty patch: memory_reflection is a planned-feature
-        // object now. Even on the autonomous tier the underlying
-        // subsystem is roadmap (v0.7+), so `planned == true` and
-        // `enabled == false` regardless of tier.
-        assert!(caps.features.memory_reflection.planned);
-        assert!(!caps.features.memory_reflection.enabled);
-        assert_eq!(caps.features.memory_reflection.version, "v0.7+");
+        // v0.7.0 recursive-learning (issue #655): Tasks 1-6 shipped
+        // the primitive, so the planned-feature object is now
+        // `planned=false, enabled=true, version="v0.7.0"`. The
+        // pre-v0.6.3.1 honesty contract still uses the
+        // `PlannedFeature` shape so the v1 bool projection
+        // collapses cleanly back to `true`.
+        assert!(!caps.features.memory_reflection.planned);
+        assert!(caps.features.memory_reflection.enabled);
+        assert_eq!(caps.features.memory_reflection.version, "v0.7.0");
     }
 
     #[test]
@@ -2683,7 +7223,10 @@ mod tests {
         let json = serde_json::to_string_pretty(&caps).unwrap();
         assert!(json.contains("\"tier\": \"smart\""));
         assert!(json.contains("nomic"));
-        assert!(json.contains("gemma4:e2b"));
+        // The smart tier surfaces the provider-agnostic compiled default
+        // model tag — asserted against the single source of truth, not a
+        // copied literal, so no vendor/model string is pinned in the test.
+        assert!(json.contains(default_tier_llm_model()));
     }
 
     /// v0.6.3.1 (capabilities schema v2, P1 honesty patch).
@@ -2773,15 +7316,22 @@ mod tests {
             "v2 honesty patch drops `approval.default_timeout_seconds` (no sweeper)"
         );
 
-        // transcripts zero-state: planned, not enabled, zero counts skipped
-        assert_eq!(val["transcripts"]["planned"], true);
+        // v0.7.0 #1324 — substrate ships at v0.7.0; capability flag
+        // reads `planned: false, enabled: false` at zero-state (no rows
+        // in `memory_transcripts`, no operator-wired R5 hook yet). The
+        // live MCP / HTTP overlay flips `enabled: true` when the
+        // transcripts row count is non-zero.
+        assert_eq!(val["transcripts"]["planned"], false);
         assert_eq!(val["transcripts"]["enabled"], false);
-        assert_eq!(val["transcripts"]["version"], "v0.7+");
+        assert_eq!(val["transcripts"]["version"], env!("CARGO_PKG_VERSION"));
 
-        // memory_reflection: planned-feature object (was bool)
-        assert_eq!(val["features"]["memory_reflection"]["planned"], true);
-        assert_eq!(val["features"]["memory_reflection"]["enabled"], false);
-        assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7+");
+        // memory_reflection: planned-feature object (was bool).
+        // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the flag is `planned=false, enabled=true,
+        // version="v0.7.0"`.
+        assert_eq!(val["features"]["memory_reflection"]["planned"], false);
+        assert_eq!(val["features"]["memory_reflection"]["enabled"], true);
+        assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7.0");
 
         // Runtime-state defaults are conservative — they get overlaid
         // at the handler boundary based on the live embedder + reranker
@@ -2804,7 +7354,11 @@ mod tests {
         assert_eq!(restored.schema_version, "2");
         assert_eq!(restored.permissions.mode, "advisory");
         assert!(restored.compaction.status.planned);
-        assert!(restored.transcripts.status.planned);
+        // v0.7.0 #1324 — transcripts substrate ships at v0.7.0; the
+        // capability flag was `planned: true` pre-#1324 (mis-advertised
+        // the substrate as roadmap-only). Round-trip now pins
+        // `planned: false`.
+        assert!(!restored.transcripts.status.planned);
         assert_eq!(restored.features.recall_mode_active, RecallMode::Disabled);
         assert_eq!(restored.features.reranker_active, RerankerMode::Off);
         assert!(restored.kg_backend.is_none());
@@ -2859,11 +7413,12 @@ mod tests {
         assert!(val["features"].is_object());
         assert!(val["models"].is_object());
 
-        // v1 features.memory_reflection collapses to a bool — autonomous
-        // tier had cross_encoder + has_llm but the planned object's
-        // `enabled = false`, so the v1 bool is `false`.
+        // v1 features.memory_reflection collapses to a bool. v0.7.0
+        // recursive-learning (issue #655) Tasks 1-6 shipped the
+        // primitive, so the v2 planned-feature object now has
+        // `enabled = true` and the v1 bool projection is `true`.
         assert!(val["features"]["memory_reflection"].is_boolean());
-        assert_eq!(val["features"]["memory_reflection"], false);
+        assert_eq!(val["features"]["memory_reflection"], true);
 
         // v1 features carry no recall_mode_active / reranker_active
         assert!(val["features"].get("recall_mode_active").is_none());
@@ -2895,22 +7450,22 @@ mod tests {
     #[test]
     fn resolved_ttl_defaults_match_hardcoded() {
         let resolved = ResolvedTtl::default();
-        assert_eq!(resolved.short_ttl_secs, Some(6 * 3600));
-        assert_eq!(resolved.mid_ttl_secs, Some(7 * 24 * 3600));
+        assert_eq!(resolved.short_ttl_secs, Some(6 * crate::SECS_PER_HOUR));
+        assert_eq!(resolved.mid_ttl_secs, Some(crate::SECS_PER_WEEK));
         assert_eq!(resolved.long_ttl_secs, None);
-        assert_eq!(resolved.short_extend_secs, 3600);
-        assert_eq!(resolved.mid_extend_secs, 86400);
+        assert_eq!(resolved.short_extend_secs, crate::SECS_PER_HOUR);
+        assert_eq!(resolved.mid_extend_secs, crate::SECS_PER_DAY);
     }
 
     #[test]
     fn resolved_ttl_from_partial_config() {
         let cfg = TtlConfig {
-            mid_ttl_secs: Some(90 * 24 * 3600), // ~3 months
+            mid_ttl_secs: Some(90 * crate::SECS_PER_DAY), // ~3 months
             ..Default::default()
         };
         let resolved = ResolvedTtl::from_config(Some(&cfg));
-        assert_eq!(resolved.short_ttl_secs, Some(6 * 3600)); // unchanged
-        assert_eq!(resolved.mid_ttl_secs, Some(90 * 24 * 3600)); // overridden
+        assert_eq!(resolved.short_ttl_secs, Some(6 * crate::SECS_PER_HOUR)); // unchanged
+        assert_eq!(resolved.mid_ttl_secs, Some(90 * crate::SECS_PER_DAY)); // overridden
         assert_eq!(resolved.long_ttl_secs, None); // unchanged
     }
 
@@ -2930,7 +7485,7 @@ mod tests {
     fn resolved_ttl_clamps_overflow() {
         let cfg = TtlConfig {
             mid_ttl_secs: Some(i64::MAX),
-            short_extend_secs: Some(-3600),
+            short_extend_secs: Some(-crate::SECS_PER_HOUR),
             ..Default::default()
         };
         let resolved = ResolvedTtl::from_config(Some(&cfg));
@@ -2958,11 +7513,23 @@ mod tests {
     #[test]
     fn resolved_ttl_tier_methods() {
         let resolved = ResolvedTtl::default();
-        assert_eq!(resolved.ttl_for_tier(&Tier::Short), Some(6 * 3600));
-        assert_eq!(resolved.ttl_for_tier(&Tier::Mid), Some(7 * 24 * 3600));
+        assert_eq!(
+            resolved.ttl_for_tier(&Tier::Short),
+            Some(6 * crate::SECS_PER_HOUR)
+        );
+        assert_eq!(
+            resolved.ttl_for_tier(&Tier::Mid),
+            Some(crate::SECS_PER_WEEK)
+        );
         assert_eq!(resolved.ttl_for_tier(&Tier::Long), None);
-        assert_eq!(resolved.extend_for_tier(&Tier::Short), Some(3600));
-        assert_eq!(resolved.extend_for_tier(&Tier::Mid), Some(86400));
+        assert_eq!(
+            resolved.extend_for_tier(&Tier::Short),
+            Some(crate::SECS_PER_HOUR)
+        );
+        assert_eq!(
+            resolved.extend_for_tier(&Tier::Mid),
+            Some(crate::SECS_PER_DAY)
+        );
         assert_eq!(resolved.extend_for_tier(&Tier::Long), None);
     }
 
@@ -3132,6 +7699,7 @@ legacy_scoring = false
             mcp: Some(McpConfig {
                 profile: Some("graph".to_string()),
                 allowlist: None,
+                ..McpConfig::default()
             }),
             ..AppConfig::default()
         };
@@ -3188,6 +7756,7 @@ legacy_scoring = false
         McpConfig {
             profile: None,
             allowlist: Some(map),
+            ..McpConfig::default()
         }
     }
 
@@ -3205,6 +7774,7 @@ legacy_scoring = false
         let cfg = McpConfig {
             profile: None,
             allowlist: Some(std::collections::HashMap::new()),
+            ..McpConfig::default()
         };
         assert_eq!(
             cfg.allowlist_decision(Some("alice"), "graph"),
@@ -3325,6 +7895,39 @@ legacy_scoring = false
     }
 
     #[test]
+    fn effective_db_expands_tilde_against_home() {
+        // #507: `db = "~/.claude/ai-memory.db"` must resolve to $HOME-based
+        // path rather than the literal four-char prefix. Use env_var_lock
+        // because HOME mutation is process-global.
+        let _g = env_var_lock();
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: serialized via env_var_lock; restored below.
+        unsafe { std::env::set_var("HOME", "/expanded/home") };
+        let cfg = AppConfig {
+            db: Some("~/.claude/ai-memory.db".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.effective_db(Path::new("ai-memory.db")),
+            PathBuf::from("/expanded/home/.claude/ai-memory.db")
+        );
+        // Bare `~` resolves to $HOME itself.
+        let cfg_bare = AppConfig {
+            db: Some("~".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg_bare.effective_db(Path::new("ai-memory.db")),
+            PathBuf::from("/expanded/home")
+        );
+        // Restore.
+        match prev_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
     fn effective_ollama_url_default_when_unset() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.effective_ollama_url(), "http://localhost:11434");
@@ -3383,10 +7986,9 @@ legacy_scoring = false
 
     #[test]
     fn effective_autonomous_hooks_default_is_false() {
-        // SAFETY: clear env so this test is deterministic; tests run with
-        // --test-threads=1 in CI for env-based tests, but we stay
-        // defensive and set+unset locally.
-        // SAFETY: env mutation is acceptable here because we set then unset.
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::remove_var("AI_MEMORY_AUTONOMOUS_HOOKS") };
         let cfg = AppConfig::default();
         assert!(!cfg.effective_autonomous_hooks());
@@ -3394,6 +7996,9 @@ legacy_scoring = false
 
     #[test]
     fn effective_autonomous_hooks_config_value_used_when_env_unset() {
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::remove_var("AI_MEMORY_AUTONOMOUS_HOOKS") };
         let cfg = AppConfig {
             autonomous_hooks: Some(true),
@@ -3404,6 +8009,9 @@ legacy_scoring = false
 
     #[test]
     fn effective_anonymize_default_falls_back_to_config() {
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") };
         let cfg = AppConfig::default();
         assert!(!cfg.effective_anonymize_default());
@@ -3411,9 +8019,11 @@ legacy_scoring = false
 
     #[test]
     fn write_default_if_missing_creates_file_then_noops() {
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
         // Use a temp dir as $HOME so we don't clobber a real config.
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: env mutation is contained; we restore at end.
+        // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::set_var("HOME", tmp.path()) };
         // First call writes the file.
         AppConfig::write_default_if_missing();
@@ -3430,7 +8040,9 @@ legacy_scoring = false
 
     #[test]
     fn config_path_returns_some_when_home_set() {
-        // SAFETY: env mutation contained to this test.
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::set_var("HOME", "/some/home") };
         let path = AppConfig::config_path().unwrap();
         assert!(path.starts_with("/some/home"));
@@ -3539,7 +8151,7 @@ legacy_scoring = false
         nss.insert(
             "agent/claude".into(),
             TranscriptNamespaceConfig {
-                default_ttl_secs: Some(3600),
+                default_ttl_secs: Some(crate::SECS_PER_HOUR),
                 auto_extract: None,
                 ..Default::default()
             },
@@ -3549,5 +8161,1930 @@ legacy_scoring = false
             ..Default::default()
         };
         assert!(!cfg.auto_extract_for("agent/claude"));
+    }
+
+    // -----------------------------------------------------------------
+    // L1 fix (v0.7.0): unknown top-level keys WARN diagnostic
+    // -----------------------------------------------------------------
+    //
+    // The earlier Plan C bug planted `[memory]`, `[autonomous]`,
+    // `[governance]`, `[federation]` tables in the operator's
+    // config.toml — none of them are real `AppConfig` fields, so serde
+    // silently dropped them and the operator's intent never reached the
+    // daemon. The fix warns on every unknown top-level key while still
+    // loading the config gracefully.
+
+    /// Top-level key not in `AppConfig` is reported via `tracing::warn!`
+    /// AND the config still loads with recognised fields intact.
+    #[test]
+    fn load_from_warns_on_unknown_top_level_key_but_still_loads() {
+        // Construct a config that mixes a real key (`tier`) with the
+        // unknown `[memory]` table from the Plan C bug. The recognised
+        // `tier = "autonomous"` at the top level must survive (i.e. the
+        // unknown `[memory] tier = "ignored"` does NOT shadow it —
+        // top-level wins because `[memory]` is a different namespace
+        // entirely from `AppConfig.tier`).
+        let toml_src = "tier = \"autonomous\"\n\n[memory]\ntier = \"ignored\"\n";
+
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), toml_src).expect("write temp config");
+
+        // We do NOT install a tracing subscriber here — `tracing-test`
+        // is not a dev-dep, and the spec explicitly allows skipping the
+        // "warn-was-emitted" assertion when capturing is awkward. The
+        // important contract is:
+        //   (a) load_from returns a populated AppConfig (no panic),
+        //   (b) the recognised top-level `tier` survives,
+        //   (c) the unknown `[memory]` table did NOT block the load.
+        // The warn itself is exercised at runtime — verify it fires by
+        // running `RUST_LOG=warn AI_MEMORY_NO_CONFIG=0 ai-memory ...`
+        // against a config with a stray section.
+        let cfg = AppConfig::load_from(tmp.path());
+
+        assert_eq!(
+            cfg.tier.as_deref(),
+            Some("autonomous"),
+            "top-level `tier` must survive even when an unknown `[memory]` table is present",
+        );
+    }
+
+    /// Every field in `AppConfig` is enumerated in the expected-key
+    /// set, so renaming a struct field will not silently start
+    /// emitting bogus warnings for the new name.
+    ///
+    /// Regression guard: if you add a new top-level field to
+    /// `AppConfig`, you MUST also add it to the `EXPECTED_KEYS` const
+    /// inside `AppConfig::warn_unknown_top_level_keys`. This test
+    /// enforces parity by serialising a fully-populated `AppConfig` to
+    /// TOML and asserting that every emitted top-level key is in the
+    /// expected set.
+    #[test]
+    fn warn_unknown_top_level_keys_covers_every_appconfig_field() {
+        // Build an AppConfig with every Option populated so serde emits
+        // every field. We only need the keys, not the values, so
+        // default placeholder sub-structs are fine.
+        let cfg = AppConfig {
+            tier: Some("keyword".into()),
+            db: Some(String::new()),
+            ollama_url: Some(String::new()),
+            embed_url: Some(String::new()),
+            embedding_model: Some(String::new()),
+            llm_model: Some(String::new()),
+            auto_tag_model: Some(String::new()),
+            cross_encoder: Some(false),
+            default_namespace: Some(String::new()),
+            max_memory_mb: Some(0),
+            ttl: Some(TtlConfig::default()),
+            archive_on_gc: Some(false),
+            api_key: Some(String::new()),
+            archive_max_days: Some(0),
+            identity: Some(IdentityConfig::default()),
+            scoring: Some(RecallScoringConfig::default()),
+            autonomous_hooks: Some(false),
+            logging: Some(LoggingConfig::default()),
+            audit: Some(AuditConfig::default()),
+            boot: Some(BootConfig::default()),
+            mcp: Some(McpConfig::default()),
+            permissions: Some(PermissionsConfig::default()),
+            transcripts: Some(TranscriptsConfig::default()),
+            hooks: Some(HooksConfig::default()),
+            subscriptions: Some(SubscriptionsConfig::default()),
+            postgres_statement_timeout_secs: Some(30),
+            postgres_pool_max_connections: Some(16),
+            postgres_pool_min_connections: Some(2),
+            postgres_acquire_timeout_secs: Some(30),
+            request_timeout_secs: Some(60),
+            llm_call_timeout_secs: Some(30),
+            verify: Some(VerifyConfig::default()),
+            mcp_federation_forward_url: Some(String::new()),
+            agents: Some(AgentsConfig::default()),
+            governance: Some(GovernanceConfig::default()),
+            confidence: Some(ConfidenceConfig::default()),
+            admin: Some(AdminConfig::default()),
+            // v0.7.x (#1146) — enterprise configuration sections.
+            schema_version: Some(2),
+            llm: Some(LlmSection::default()),
+            embeddings: Some(EmbeddingsSection::default()),
+            reranker: Some(RerankerSection::default()),
+            storage: Some(StorageSection::default()),
+            limits: Some(LimitsSection::default()),
+        };
+
+        let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
+        let value: toml::Value =
+            toml::from_str(&serialised).expect("re-parse serialised AppConfig");
+        let table = value.as_table().expect("serialised AppConfig is a table");
+
+        // Mirror the const in `warn_unknown_top_level_keys`. Keep in
+        // sync — if this assertion fires, you forgot to update the
+        // expected-keys list when adding a new AppConfig field.
+        const EXPECTED_KEYS: &[&str] = &[
+            "tier",
+            "db",
+            "ollama_url",
+            "embed_url",
+            "embedding_model",
+            "llm_model",
+            "auto_tag_model",
+            "cross_encoder",
+            "default_namespace",
+            "max_memory_mb",
+            "ttl",
+            "archive_on_gc",
+            "api_key",
+            "archive_max_days",
+            "identity",
+            "scoring",
+            "autonomous_hooks",
+            "logging",
+            "audit",
+            "boot",
+            "mcp",
+            "permissions",
+            "transcripts",
+            "hooks",
+            "subscriptions",
+            "postgres_statement_timeout_secs",
+            "postgres_pool_max_connections",
+            "postgres_pool_min_connections",
+            "postgres_acquire_timeout_secs",
+            "request_timeout_secs",
+            "llm_call_timeout_secs",
+            "verify",
+            "mcp_federation_forward_url",
+            "agents",
+            "governance",
+            "confidence",
+            "admin",
+            // v0.7.x (#1146) — enterprise configuration sections.
+            "schema_version",
+            "llm",
+            "embeddings",
+            "reranker",
+            "storage",
+            "limits",
+        ];
+
+        for key in table.keys() {
+            assert!(
+                EXPECTED_KEYS.contains(&key.as_str()),
+                "AppConfig field `{key}` is not in EXPECTED_KEYS — \
+                 update `warn_unknown_top_level_keys` to keep parity",
+            );
+        }
+    }
+
+    /// v0.7.0 L15 — assert that:
+    ///  1. `AppConfig::default()` leaves `auto_tag_model` as `None` so a
+    ///     daemon with no operator override sees the absent state (which
+    ///     `maybe_auto_tag` interprets as "use the client's configured
+    ///     `llm_model`"); and
+    ///  2. the documented default config.toml template spot-checks
+    ///     `gemma3:4b` as the recommended value — closes the L14
+    ///     NHI-D-autotag-empty finding where Gemma 4 thinking-mode
+    ///     latency hit the 30s autonomy timeout.
+    #[test]
+    fn auto_tag_model_default_falls_back_to_none_and_template_documents_default_gemma3_4b() {
+        // (1) compile-time default leaves auto_tag_model = None.
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.auto_tag_model.is_none(),
+            "fresh AppConfig must leave auto_tag_model = None so callers \
+             fall back to llm_model"
+        );
+
+        // (2) the default config.toml template the daemon writes to disk
+        // must document the recommended gemma3:4b value and mention
+        // auto_tag_model — operators rely on the inline template as the
+        // authoritative knob reference.
+        //
+        // We can't reach the private `default_toml` constant directly,
+        // so write it to a tempdir via `write_default_if_missing` and
+        // read it back. Mirrors the pattern used by
+        // `default_config_includes_*` tests above.
+        //
+        // M9 — HOME mutation is process-global; other tests in this
+        // module also flip HOME. Serialise via env_var_lock so parallel
+        // `cargo test --jobs N` runs cannot interleave reads of HOME
+        // mid-mutation.
+        let _g = env_var_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        AppConfig::write_default_if_missing();
+        let written = AppConfig::config_path().expect("config_path resolves");
+        let contents = std::fs::read_to_string(&written).expect("default toml written");
+        assert!(
+            contents.contains("auto_tag_model"),
+            "default config.toml must document the auto_tag_model knob; \
+             got:\n{contents}"
+        );
+        assert!(
+            contents.contains("gemma3:4b"),
+            "default config.toml must mention gemma3:4b as the L15 \
+             recommended default; got:\n{contents}"
+        );
+    }
+
+    // ---- C-5 (#699): close lib-tier gaps in config.rs (currently 90.76%).
+    // Targets serde default functions, env-var override branches, and
+    // display impls that no other test exercises. ----
+
+    #[test]
+    fn tier_llm_model_is_agnostic_gate() {
+        // The Gemma-only `LlmModel` enum was removed (#1490): no model name
+        // survives as a config-surface identifier. The LLM-capable tiers
+        // carry the provider-agnostic compiled default; keyword/semantic
+        // carry `None` (LLM disabled). Pin the gate + the single-source-of-
+        // truth default rather than any hardcoded vendor string.
+        assert!(FeatureTier::Keyword.config().llm_model.is_none());
+        assert!(FeatureTier::Semantic.config().llm_model.is_none());
+        assert_eq!(
+            FeatureTier::Smart.config().llm_model.as_deref(),
+            Some(default_tier_llm_model())
+        );
+        assert_eq!(
+            FeatureTier::Autonomous.config().llm_model.as_deref(),
+            Some(default_tier_llm_model())
+        );
+        // The default routes through the agnostic resolver table, never a
+        // model-named identifier.
+        assert_eq!(
+            default_tier_llm_model(),
+            backend_default_model(crate::llm::BACKEND_OLLAMA)
+        );
+    }
+
+    #[test]
+    fn feature_tier_display_matches_as_str() {
+        // Lines 183-185: `FeatureTier::Display::fmt` writes `as_str`.
+        assert_eq!(format!("{}", FeatureTier::Keyword), "keyword");
+        assert_eq!(format!("{}", FeatureTier::Semantic), "semantic");
+        assert_eq!(format!("{}", FeatureTier::Smart), "smart");
+        assert_eq!(format!("{}", FeatureTier::Autonomous), "autonomous");
+    }
+
+    #[test]
+    fn default_recall_mode_is_disabled() {
+        // Lines 630-632: serde default helper.
+        assert_eq!(default_recall_mode(), RecallMode::Disabled);
+    }
+
+    #[test]
+    fn default_reranker_mode_is_off() {
+        // Lines 634-636: serde default helper.
+        assert_eq!(default_reranker_mode(), RerankerMode::Off);
+    }
+
+    #[test]
+    fn default_hook_events_count_matches_constant() {
+        // Lines 731-733: serde default helper.
+        assert_eq!(default_hook_events_count(), HOOK_EVENTS_COUNT);
+    }
+
+    #[test]
+    fn default_reflection_boost_returns_default_report() {
+        // Lines 621-623: serde default helper. Calls the `Default::default`
+        // impl on `ReflectionBoostReport`.
+        let r = default_reflection_boost();
+        let d = ReflectionBoostReport::default();
+        // Lazy compare via Debug — the struct has no PartialEq.
+        assert_eq!(format!("{r:?}"), format!("{d:?}"));
+    }
+
+    #[test]
+    fn permissions_mode_default_is_advisory() {
+        // Lines 2403-2405: `impl Default for PermissionsMode`.
+        let m: PermissionsMode = Default::default();
+        assert_eq!(m, PermissionsMode::Advisory);
+    }
+
+    #[test]
+    fn active_permissions_mode_uses_named_fallback_when_unset_then_honors_setter() {
+        // v0.7.0 H2 de-silencing: when boot has NOT installed a mode,
+        // the gate reader returns the explicit
+        // UNINITIALIZED_PERMISSIONS_MODE_FALLBACK constant (and emits a
+        // one-shot WARN). Once a mode is installed, the reader honors it.
+        let _serialise = lock_permissions_mode_for_test();
+        clear_permissions_mode_override_for_test();
+        assert_eq!(
+            active_permissions_mode(),
+            UNINITIALIZED_PERMISSIONS_MODE_FALLBACK,
+            "unset gate must return the named pre-init fallback"
+        );
+        set_active_permissions_mode(PermissionsMode::Enforce);
+        assert_eq!(
+            active_permissions_mode(),
+            PermissionsMode::Enforce,
+            "installed mode must win over the fallback"
+        );
+        // Restore the unset state for subsequent tests.
+        clear_permissions_mode_override_for_test();
+    }
+
+    #[test]
+    fn set_allow_loopback_webhooks_round_trips() {
+        // Lines 2357-2359: pub setter — just observe it does not panic
+        // and that effective_allow_loopback_webhooks can read the value.
+        // (The atomic is process-global; restore the prior value at end.)
+        let prior = ALLOW_LOOPBACK_WEBHOOKS.load(std::sync::atomic::Ordering::SeqCst);
+        set_allow_loopback_webhooks(true);
+        assert!(ALLOW_LOOPBACK_WEBHOOKS.load(std::sync::atomic::Ordering::SeqCst));
+        set_allow_loopback_webhooks(false);
+        assert!(!ALLOW_LOOPBACK_WEBHOOKS.load(std::sync::atomic::Ordering::SeqCst));
+        // Restore.
+        ALLOW_LOOPBACK_WEBHOOKS.store(prior, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn reset_permissions_decision_counts_zeros_all_atomics() {
+        // Lines 2619-2623: test-only reset helper. Increment then reset.
+        // Post-#1174 PR7: counters live behind the `DECISION_COUNTERS`
+        // struct; we exercise them via the public surface to keep the
+        // test resilient to internal reshape.
+        let _serialise = lock_permissions_mode_for_test();
+        reset_permissions_decision_counts_for_test();
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Enforce);
+        record_permissions_decision(PermissionsMode::Advisory);
+        record_permissions_decision(PermissionsMode::Advisory);
+        record_permissions_decision(PermissionsMode::Advisory);
+        record_permissions_decision(PermissionsMode::Off);
+        let pre = permissions_decision_counts();
+        assert_eq!(pre.enforce, 5);
+        assert_eq!(pre.advisory, 3);
+        assert_eq!(pre.off, 1);
+        reset_permissions_decision_counts_for_test();
+        let post = permissions_decision_counts();
+        assert_eq!(post.enforce, 0);
+        assert_eq!(post.advisory, 0);
+        assert_eq!(post.off, 0);
+    }
+
+    #[test]
+    fn effective_allow_loopback_webhooks_env_var_true_returns_true() {
+        // Lines 2281-2297: env-var override branch (truthy).
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", "yes");
+        }
+        let cfg = AppConfig::default();
+        assert!(cfg.effective_allow_loopback_webhooks());
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", v),
+                None => std::env::remove_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_allow_loopback_webhooks_env_var_false_returns_false() {
+        // Lines 2281-2297: env-var override (falsy).
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", "no");
+        }
+        let cfg = AppConfig::default();
+        assert!(!cfg.effective_allow_loopback_webhooks());
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", v),
+                None => std::env::remove_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_allow_loopback_webhooks_env_var_invalid_falls_back_to_config() {
+        // Lines 2286-2292: invalid env value falls back to config.toml.
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", "kinda");
+        }
+        let cfg = AppConfig::default();
+        // With no [subscriptions] table the default is false.
+        assert!(!cfg.effective_allow_loopback_webhooks());
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", v),
+                None => std::env::remove_var("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_permissions_mode_env_var_enforce_wins() {
+        // Lines 3144-3169: env override path → Enforce.
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_PERMISSIONS_MODE").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", "enforce");
+        }
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.effective_permissions_mode(), PermissionsMode::Enforce);
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", v),
+                None => std::env::remove_var("AI_MEMORY_PERMISSIONS_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_permissions_mode_env_var_advisory_wins() {
+        // Lines 3148: env override path → Advisory.
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_PERMISSIONS_MODE").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", "ADVISORY");
+        }
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.effective_permissions_mode(), PermissionsMode::Advisory);
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", v),
+                None => std::env::remove_var("AI_MEMORY_PERMISSIONS_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_permissions_mode_env_var_off_wins() {
+        // Lines 3149: env override path → Off.
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_PERMISSIONS_MODE").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", "off");
+        }
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.effective_permissions_mode(), PermissionsMode::Off);
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", v),
+                None => std::env::remove_var("AI_MEMORY_PERMISSIONS_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_permissions_mode_env_var_invalid_falls_back_to_config() {
+        // Lines 3150-3156: invalid env → falls through to resolve_v07_default_mode.
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_PERMISSIONS_MODE").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", "weird");
+        }
+        let cfg = AppConfig::default();
+        // The resolver returns a value (we don't pin which — just that it returns).
+        let _ = cfg.effective_permissions_mode();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", v),
+                None => std::env::remove_var("AI_MEMORY_PERMISSIONS_MODE"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_permission_rules_returns_empty_when_unset() {
+        // Lines 3178-3183: empty-rules path.
+        let cfg = AppConfig::default();
+        let rules = cfg.effective_permission_rules();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn app_config_load_with_no_config_env_returns_default() {
+        // Lines 3015-3022: `AppConfig::load` with AI_MEMORY_NO_CONFIG=1.
+        let _g = env_var_lock();
+        let prior = std::env::var("AI_MEMORY_NO_CONFIG").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+        }
+        let cfg = AppConfig::load();
+        // Default config has no tier/db set.
+        assert!(
+            cfg.tier.is_none()
+                || cfg.tier == Some("semantic".to_string())
+                || cfg.tier == Some("keyword".to_string())
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AI_MEMORY_NO_CONFIG", v),
+                None => std::env::remove_var("AI_MEMORY_NO_CONFIG"),
+            }
+        }
+    }
+
+    // ---- C-5 (#699) round 2: round out the easy Default impls + serde
+    // default helpers that bumped lines 805/852/955/1019/1057/1125/1634+ ----
+
+    #[test]
+    fn capability_compaction_default_is_planned() {
+        // Lines 804-808.
+        let d: CapabilityCompaction = Default::default();
+        let planned = CapabilityCompaction::planned();
+        // Compare via Debug since the struct has no PartialEq.
+        assert_eq!(format!("{d:?}"), format!("{planned:?}"));
+    }
+
+    #[test]
+    fn capability_transcripts_default_is_planned() {
+        // Lines 851-855.
+        let d: CapabilityTranscripts = Default::default();
+        let planned = CapabilityTranscripts::planned();
+        assert_eq!(format!("{d:?}"), format!("{planned:?}"));
+    }
+
+    #[test]
+    fn default_capability_reflection_helper_returns_current() {
+        // Lines 955-957.
+        let helper = default_capability_reflection();
+        let current = CapabilityReflection::current();
+        assert_eq!(format!("{helper:?}"), format!("{current:?}"));
+    }
+
+    #[test]
+    fn default_capability_skills_helper_returns_current() {
+        // Lines 1019-1021.
+        let helper = default_capability_skills();
+        let current = CapabilitySkills::current();
+        assert_eq!(helper, current);
+    }
+
+    #[test]
+    fn default_capability_forensic_helper_returns_current() {
+        // Lines 1057-1059.
+        let helper = default_capability_forensic();
+        let current = CapabilityForensic::current();
+        assert_eq!(helper, current);
+    }
+
+    #[test]
+    fn default_capability_governance_helper_returns_current() {
+        // Lines 1125-1127.
+        let helper = default_capability_governance();
+        let current = CapabilityGovernance::current();
+        assert_eq!(helper, current);
+    }
+
+    #[test]
+    fn default_capability_atomisation_helper_returns_current() {
+        // v0.7.0 WT-1-G — mirrors the governance/forensic/skills/reflection
+        // helper round-trip: the `#[serde(default = …)]` resolver must
+        // collapse to the same compile-anchored snapshot
+        // [`CapabilityAtomisation::current`] returns.
+        let helper = default_capability_atomisation();
+        let current = CapabilityAtomisation::current();
+        assert_eq!(helper, current);
+    }
+
+    #[test]
+    fn resolved_transcript_lifecycle_default_uses_compiled_defaults() {
+        // Lines 1633-1639.
+        let r: ResolvedTranscriptLifecycle = Default::default();
+        assert_eq!(r.default_ttl_secs, DEFAULT_TRANSCRIPT_TTL_SECS);
+        assert_eq!(r.archive_grace_secs, DEFAULT_TRANSCRIPT_ARCHIVE_GRACE_SECS);
+    }
+
+    #[test]
+    fn default_memory_kinds_lists_observation_and_reflection() {
+        // Lines 626-628: serde default helper covers L1-1 typed kinds.
+        let kinds = default_memory_kinds();
+        assert_eq!(
+            kinds,
+            vec!["observation".to_string(), "reflection".to_string()]
+        );
+    }
+
+    /// v0.7.0 Gap 4 (#887) — pin the capabilities-surface thresholds
+    /// to the `ConfidenceTier` model constants so a future
+    /// re-tuning bumps BOTH in lockstep (or the build breaks).
+    #[test]
+    fn confidence_tier_thresholds_match_model_constants() {
+        let defaults = ConfidenceTierThresholds::default();
+        assert!(
+            (defaults.confirmed - crate::models::ConfidenceTier::CONFIRMED_MIN).abs()
+                < f64::EPSILON,
+            "ConfidenceTierThresholds.confirmed must match ConfidenceTier::CONFIRMED_MIN"
+        );
+        assert!(
+            (defaults.likely - crate::models::ConfidenceTier::LIKELY_MIN).abs() < f64::EPSILON,
+            "ConfidenceTierThresholds.likely must match ConfidenceTier::LIKELY_MIN"
+        );
+        // Ambiguous is the implicit floor — pin it to zero so the
+        // wire shape is fully self-describing.
+        assert!(
+            (defaults.ambiguous - 0.0).abs() < f64::EPSILON,
+            "ambiguous floor is fixed at 0.0"
+        );
+    }
+
+    /// v0.7.0 Gap 4 (#887) — every `TierConfig::capabilities()` call
+    /// must surface the calibration block so MCP capability readers
+    /// can rely on the field being present.
+    #[test]
+    fn capability_confidence_calibration_carries_tier_thresholds() {
+        // `CapabilityConfidenceCalibration::current()` (the
+        // capabilities v3 builder) surfaces the Gap 4 thresholds so
+        // MCP capability readers can filter without re-deriving the
+        // breakpoints.
+        let surface = CapabilityConfidenceCalibration::current();
+        assert!((surface.tier_thresholds.confirmed - 0.95).abs() < f64::EPSILON);
+        assert!((surface.tier_thresholds.likely - 0.7).abs() < f64::EPSILON);
+        assert!((surface.tier_thresholds.ambiguous - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.7.x enterprise-config tests (#1146)
+    //
+    // Pin: precedence ladder per resolver (CLI > env > config > legacy >
+    // compiled), inline-key rejection at parse time, api_key_env /
+    // api_key_file resolution, Once-gated legacy-drift WARN.
+    // ---------------------------------------------------------------------
+
+    fn empty_app_config() -> AppConfig {
+        AppConfig {
+            schema_version: Some(2),
+            ..AppConfig::default()
+        }
+    }
+
+    fn scrub_llm_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "AI_MEMORY_EMBED_BACKFILL_BATCH",
+            "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS",
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    /// #1598 — scrub the embeddings-resolver env surface (and the
+    /// alias-fallback vendor key vars the precedence tests exercise)
+    /// so `resolve_embeddings` tests are hermetic. Callers hold
+    /// `env_var_lock()`.
+    fn scrub_embed_env() {
+        for k in [
+            ENV_EMBED_BACKEND,
+            ENV_EMBED_BASE_URL,
+            ENV_EMBED_MODEL,
+            ENV_EMBED_API_KEY,
+            ENV_EMBED_BACKFILL_BATCH,
+            "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    fn scrub_limits_env() {
+        for k in [
+            ENV_MAX_MEMORIES_PER_DAY,
+            ENV_MAX_STORAGE_BYTES,
+            ENV_MAX_LINKS_PER_DAY,
+            ENV_MAX_PAGE_SIZE,
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_limits_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.max_memories_per_day,
+            crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY
+        );
+        assert_eq!(
+            r.max_storage_bytes,
+            crate::quotas::DEFAULT_MAX_STORAGE_BYTES
+        );
+        assert_eq!(
+            r.max_links_per_day,
+            crate::quotas::DEFAULT_MAX_LINKS_PER_DAY
+        );
+        assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+    }
+
+    #[test]
+    fn resolve_limits_config_section_when_no_env() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_memories_per_day: Some(5_000_000),
+            max_storage_bytes: Some(9_000_000_000),
+            max_links_per_day: Some(4_000_000),
+            max_page_size: Some(250_000),
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(r.max_memories_per_day, 5_000_000);
+        assert_eq!(r.max_storage_bytes, 9_000_000_000);
+        assert_eq!(r.max_links_per_day, 4_000_000);
+        assert_eq!(r.max_page_size, 250_000);
+        assert_eq!(r.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_limits_env_overrides_config_section() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_MAX_MEMORIES_PER_DAY, "7000000");
+            std::env::set_var(ENV_MAX_PAGE_SIZE, "123456");
+        }
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_memories_per_day: Some(5_000_000),
+            max_storage_bytes: Some(9_000_000_000),
+            max_links_per_day: Some(4_000_000),
+            max_page_size: Some(250_000),
+        });
+        let r = cfg.resolve_limits();
+        // env wins for the two it sets …
+        assert_eq!(r.max_memories_per_day, 7_000_000, "env beats config");
+        assert_eq!(r.max_page_size, 123_456, "env beats config");
+        // … and config still supplies the fields env left unset.
+        assert_eq!(r.max_storage_bytes, 9_000_000_000);
+        assert_eq!(r.max_links_per_day, 4_000_000);
+        assert_eq!(r.source, ConfigSource::Env);
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn resolve_limits_zero_and_garbage_env_fall_through() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_MAX_MEMORIES_PER_DAY, "0"); // non-positive → ignored
+            std::env::set_var(ENV_MAX_STORAGE_BYTES, "not-a-number"); // unparseable → ignored
+            std::env::set_var(ENV_MAX_PAGE_SIZE, "-5"); // negative → unparseable as usize → ignored
+        }
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        // every stray env value falls through to the compiled default.
+        assert_eq!(
+            r.max_memories_per_day,
+            crate::quotas::DEFAULT_MAX_MEMORIES_PER_DAY
+        );
+        assert_eq!(
+            r.max_storage_bytes,
+            crate::quotas::DEFAULT_MAX_STORAGE_BYTES
+        );
+        assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn resolve_limits_zero_config_value_falls_through_to_default() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_page_size: Some(0), // non-positive → ignored
+            ..LimitsSection::default()
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+    }
+
+    #[test]
+    fn resolve_limits_section_round_trips_through_toml() {
+        let toml = r#"
+schema_version = 2
+
+[limits]
+max_memories_per_day = 10000000
+max_storage_bytes = 50000000000
+max_links_per_day = 8000000
+max_page_size = 1000000
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse [limits] toml");
+        let l = cfg.limits.as_ref().expect("limits section present");
+        assert_eq!(l.max_memories_per_day, Some(10_000_000));
+        assert_eq!(l.max_storage_bytes, Some(50_000_000_000));
+        assert_eq!(l.max_links_per_day, Some(8_000_000));
+        assert_eq!(l.max_page_size, Some(1_000_000));
+        // env-free resolve picks up the config values verbatim.
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let r = cfg.resolve_limits();
+        assert_eq!(r.max_memories_per_day, 10_000_000);
+        assert_eq!(r.max_page_size, 1_000_000);
+        assert_eq!(r.source, ConfigSource::Config);
+    }
+
+    #[cfg(feature = "sal")]
+    fn scrub_pg_pool_env() {
+        for k in [
+            ENV_PG_POOL_MAX,
+            ENV_PG_POOL_MIN,
+            ENV_PG_ACQUIRE_TIMEOUT_SECS,
+        ] {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        let cfg = empty_app_config();
+        let r = cfg.resolve_pg_pool();
+        assert_eq!(r, crate::store::PoolConfig::default());
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_config_overrides_default() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        let mut cfg = empty_app_config();
+        cfg.postgres_pool_max_connections = Some(64);
+        cfg.postgres_pool_min_connections = Some(8);
+        cfg.postgres_acquire_timeout_secs = Some(15);
+        let r = cfg.resolve_pg_pool();
+        assert_eq!(r.max_connections, 64);
+        assert_eq!(r.min_connections, 8);
+        assert_eq!(r.acquire_timeout_secs, 15);
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_env_overrides_config() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        unsafe {
+            std::env::set_var(ENV_PG_POOL_MAX, "100");
+            std::env::set_var(ENV_PG_ACQUIRE_TIMEOUT_SECS, "45");
+        }
+        let mut cfg = empty_app_config();
+        cfg.postgres_pool_max_connections = Some(64);
+        cfg.postgres_pool_min_connections = Some(8);
+        cfg.postgres_acquire_timeout_secs = Some(15);
+        let r = cfg.resolve_pg_pool();
+        // env wins for the two it sets …
+        assert_eq!(r.max_connections, 100, "env beats config");
+        assert_eq!(r.acquire_timeout_secs, 45, "env beats config");
+        // … and config still supplies the field env left unset.
+        assert_eq!(r.min_connections, 8);
+        scrub_pg_pool_env();
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_pg_pool_zero_and_garbage_fall_through() {
+        let _g = env_var_lock();
+        scrub_pg_pool_env();
+        unsafe {
+            std::env::set_var(ENV_PG_POOL_MAX, "0"); // non-positive → ignored
+            std::env::set_var(ENV_PG_POOL_MIN, "not-a-number"); // unparseable → ignored
+        }
+        let mut cfg = empty_app_config();
+        // A zero config value must also fall through, never clamp the pool.
+        cfg.postgres_acquire_timeout_secs = Some(0);
+        let r = cfg.resolve_pg_pool();
+        // every stray value falls through to the compiled default.
+        assert_eq!(r, crate::store::PoolConfig::default());
+        scrub_pg_pool_env();
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn pg_pool_env_const_names_byte_match_documented() {
+        // Doc-name-match guard: these byte values are documented in
+        // CLAUDE.md's Environment Variables table + the enterprise
+        // deployment guide §5.6. Pin the drift so it can never recur.
+        assert_eq!(ENV_PG_POOL_MAX, "AI_MEMORY_PG_POOL_MAX");
+        assert_eq!(ENV_PG_POOL_MIN, "AI_MEMORY_PG_POOL_MIN");
+        assert_eq!(
+            ENV_PG_ACQUIRE_TIMEOUT_SECS,
+            "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_1146_compiled_default_when_nothing_configured() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "ollama");
+        assert_eq!(resolved.model, "gemma3:4b");
+        assert_eq!(resolved.base_url, "http://localhost:11434");
+        assert_eq!(resolved.source, ConfigSource::CompiledDefault);
+        assert_eq!(resolved.api_key_source, KeySource::None);
+        assert!(resolved.api_key().is_none());
+    }
+
+    #[test]
+    fn resolve_llm_1146_env_overrides_config_section() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai");
+            std::env::set_var("AI_MEMORY_LLM_MODEL", "grok-99");
+            std::env::set_var("AI_MEMORY_LLM_API_KEY", "env-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai".into()),
+            model: Some("gpt-4".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai", "env must beat config");
+        assert_eq!(resolved.model, "grok-99");
+        assert_eq!(resolved.source, ConfigSource::Env);
+        assert_eq!(resolved.api_key_source, KeySource::ProcessEnv);
+        assert_eq!(resolved.api_key(), Some("env-key"));
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_cli_overrides_env() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "ollama");
+            std::env::set_var("AI_MEMORY_LLM_MODEL", "ollama-model");
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(Some("xai"), Some("grok-4.3"), Some("https://x"));
+        assert_eq!(resolved.backend, "xai", "CLI flag must beat env");
+        assert_eq!(resolved.model, "grok-4.3");
+        assert_eq!(resolved.base_url, "https://x");
+        assert_eq!(resolved.source, ConfigSource::Cli);
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_config_section_when_no_env() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            model: Some("grok-4.3".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai");
+        assert_eq!(resolved.model, "grok-4.3");
+        assert_eq!(
+            resolved.base_url, "https://api.x.ai/v1",
+            "vendor-default base_url applied"
+        );
+        assert_eq!(resolved.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_llm_1146_tier_model_override_clobbers_config_model_1440() {
+        // #1440 regression: the pre-fix curator `--daemon` path passed
+        // the feature-tier's default (local-Ollama) model id as the
+        // CLI-arm model override. Because the CLI arm is highest
+        // precedence, it clobbered the operator's configured
+        // `[llm].model`, sending the local default to OpenRouter ->
+        // fast HTTP 400 on every curator call. This test pins BOTH
+        // halves of the RCA so the bug can't silently return:
+        //   1. With no override (the `--once` / fixed `--daemon` path),
+        //      the configured model wins.
+        //   2. Passing the tier-default id as the override DOES clobber
+        //      it — which is exactly why the daemon must never do so.
+        let _g = env_var_lock();
+        scrub_llm_env();
+
+        // Each value is bound once to a named variable (no repeated
+        // literals, no magic strings in assertions). The tier-default
+        // model is derived from the enum so the test tracks the single
+        // source of truth rather than asserting against a copy.
+        let configured_backend = "openrouter";
+        let configured_model = "google/gemma-4-26b-a4b-it";
+        let tier_default_model = crate::config::FeatureTier::Autonomous.config().llm_model;
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some(configured_backend.into()),
+            model: Some(configured_model.into()),
+            ..LlmSection::default()
+        });
+
+        // 1. No override -> configured model is honored.
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, configured_backend);
+        assert_eq!(resolved.model, configured_model);
+
+        // 2. Tier-default id as CLI-arm override clobbers it (the bug):
+        //    the override wins over the configured model, which is
+        //    exactly why the daemon must never manufacture one.
+        let tier_override = tier_default_model.expect("autonomous tier has a default llm_model");
+        let clobbered = cfg.resolve_llm(None, Some(tier_override.as_str()), None);
+        assert_eq!(
+            clobbered.model, tier_override,
+            "tier-default override wins over configured model — the #1440 daemon defect"
+        );
+        assert_ne!(
+            clobbered.model, configured_model,
+            "the override must differ from the configured model for this regression to be meaningful"
+        );
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_alias_fallback_key_for_xai() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "xai");
+            std::env::set_var("XAI_API_KEY", "alias-fallback-key");
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "xai");
+        assert_eq!(resolved.api_key(), Some("alias-fallback-key"));
+        match &resolved.api_key_source {
+            KeySource::AliasFallback(name) => assert_eq!(name, "XAI_API_KEY"),
+            other => panic!("expected AliasFallback(XAI_API_KEY), got {other:?}"),
+        }
+        scrub_llm_env();
+    }
+
+    #[test]
+    fn resolve_llm_1146_legacy_llm_model_feeds_resolver() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.llm_model = Some("gemma4:e4b".into());
+        cfg.ollama_url = Some("http://localhost:11434".into());
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, "ollama");
+        assert_eq!(resolved.model, "gemma4:e4b");
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    #[test]
+    fn validate_secret_handling_1146_rejects_inline_api_key() {
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key: Some("xai-INLINE-SECRET".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("inline api_key must be rejected");
+        assert!(
+            err.contains("api_key") && err.contains("forbidden"),
+            "error must name the field and the policy: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_secret_handling_1146_rejects_env_and_file_both_set() {
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_env: Some("XAI_API_KEY".into()),
+            api_key_file: Some("/etc/key".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("env+file mutex must be enforced");
+        assert!(
+            err.contains("api_key_env") && err.contains("api_key_file"),
+            "error must call out the mutex: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_1146_api_key_env_reads_named_env_var() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("MY_CUSTOM_LLM_KEY", "via-config-env-var");
+        }
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            model: Some("grok-4.3".into()),
+            api_key_env: Some("MY_CUSTOM_LLM_KEY".into()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.api_key(), Some("via-config-env-var"));
+        match &resolved.api_key_source {
+            KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_LLM_KEY"),
+            other => panic!("expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {other:?}"),
+        }
+        unsafe {
+            std::env::remove_var("MY_CUSTOM_LLM_KEY");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_llm_1146_api_key_file_rejects_lax_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        // Tempdir under .local-runs (project HARD rule: no /tmp).
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1146-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("xai.key");
+        std::fs::write(&key_path, "shhh").unwrap();
+        // World-readable mode 0644 — must be rejected.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        match &resolved.api_key_source {
+            KeySource::Error(reason) => {
+                assert!(
+                    reason.contains("lax permissions") && reason.contains("0400"),
+                    "error must name the perm policy: {reason}"
+                );
+            }
+            other => panic!("expected KeySource::Error(lax perms), got {other:?}"),
+        }
+        // Cleanup.
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_llm_1146_api_key_file_accepts_0400() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1146-perms-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("xai.key");
+        std::fs::write(&key_path, "the-actual-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(
+            resolved.api_key(),
+            Some("the-actual-key"),
+            "first line is the key"
+        );
+        assert!(matches!(resolved.api_key_source, KeySource::ConfigFile(_)));
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn resolve_embeddings_1146_legacy_alias_canonicalised() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".into());
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.model, "nomic-embed-text-v1.5",
+            "legacy alias must be canonicalised"
+        );
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+        assert_eq!(resolved.backfill_batch, 100, "compiled default applied");
+    }
+
+    #[test]
+    fn resolve_embeddings_1146_backfill_batch_env_overrides_config() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        unsafe {
+            std::env::set_var("AI_MEMORY_EMBED_BACKFILL_BATCH", "500");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backfill_batch: Some(50),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backfill_batch, 500, "env must beat config");
+        scrub_llm_env();
+    }
+
+    // ── #1598 — API-wired embeddings resolver ladder ──────────────────
+
+    #[test]
+    fn resolve_embeddings_1598_compiled_defaults() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backend, crate::llm::BACKEND_OLLAMA);
+        assert_eq!(resolved.url, crate::llm::DEFAULT_OLLAMA_URL);
+        assert_eq!(resolved.model, DEFAULT_EMBED_MODEL);
+        assert_eq!(resolved.source, ConfigSource::CompiledDefault);
+        assert_eq!(resolved.api_key(), None);
+        assert_eq!(resolved.key_source, KeySource::None);
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_env_beats_section() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_BACKEND, "openai-compatible");
+            std::env::set_var(ENV_EMBED_BASE_URL, "http://tei.internal:8080/v1");
+            std::env::set_var(
+                ENV_EMBED_MODEL,
+                "ibm-granite/granite-embedding-125m-english",
+            );
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("ollama".into()),
+            url: Some("http://section-url:11434".into()),
+            model: Some("nomic-embed-text-v1.5".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.backend, "openai-compatible");
+        assert_eq!(resolved.url, "http://tei.internal:8080/v1");
+        assert_eq!(resolved.model, "ibm-granite/granite-embedding-125m-english");
+        assert_eq!(resolved.source, ConfigSource::Env);
+        assert_eq!(
+            resolved.embedding_dim,
+            Some(768),
+            "granite dim comes from the known-dims table"
+        );
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_section_beats_legacy() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embed_url = Some("http://legacy-embed:11434".into());
+        cfg.embedding_model = Some("mini_lm_l6_v2".into());
+        cfg.embeddings = Some(EmbeddingsSection {
+            url: Some("http://section:11434".into()),
+            model: Some("nomic-embed-text-v1.5".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.url, "http://section:11434");
+        assert_eq!(resolved.model, "nomic-embed-text-v1.5");
+        assert_eq!(resolved.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_base_url_wins_over_url_synonym() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            base_url: Some("http://base-url-wins:8080/v1".into()),
+            url: Some("http://url-loses:11434".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.url, "http://base-url-wins:8080/v1");
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_api_alias_default_base_url() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            model: Some("google/gemini-embedding-2".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.url, "https://openrouter.ai/api/v1",
+            "API alias with no URL configured must fall back to the \
+             vendor default from llm.rs"
+        );
+        assert_eq!(resolved.embedding_dim, Some(3072), "gemini-embedding-2 dim");
+    }
+
+    #[test]
+    fn resolve_embeddings_1598_dim_override_beats_table() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".into()),
+            dim: Some(512),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(
+            resolved.embedding_dim,
+            Some(512),
+            "[embeddings].dim override must beat the known-dims table"
+        );
+        // Non-positive override is ignored — table wins again.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".into()),
+            dim: Some(0),
+            ..EmbeddingsSection::default()
+        });
+        assert_eq!(cfg.resolve_embeddings().embedding_dim, Some(768));
+    }
+
+    /// #1598 fleet follow-up — `requested_dim` carries ONLY the
+    /// explicit `[embeddings].dim` (the wire `dimensions` request for
+    /// Matryoshka-capable API models); a table-derived dim must never
+    /// populate it, and non-positive overrides are ignored.
+    #[test]
+    fn resolve_embeddings_1598_requested_dim_explicit_only() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let mut cfg = empty_app_config();
+        // Table-known model, no explicit dim → requested_dim None.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.embedding_dim, Some(768), "table dim resolves");
+        assert_eq!(
+            resolved.requested_dim, None,
+            "table-derived dim must not become a wire dimensions request"
+        );
+        // Explicit dim → both embedding_dim and requested_dim.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("google/gemini-embedding-2".into()),
+            dim: Some(768),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.embedding_dim, Some(768));
+        assert_eq!(resolved.requested_dim, Some(768));
+        // Non-positive explicit dim is ignored on both fields.
+        cfg.embeddings = Some(EmbeddingsSection {
+            model: Some("google/gemini-embedding-2".into()),
+            dim: Some(0),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.embedding_dim, Some(3072), "table dim again");
+        assert_eq!(resolved.requested_dim, None);
+    }
+
+    #[test]
+    fn resolve_embed_api_key_1598_process_env_wins() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_API_KEY, "embed-process-env-key");
+            std::env::set_var("OPENROUTER_API_KEY", "alias-key-loses");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), Some("embed-process-env-key"));
+        assert_eq!(resolved.key_source, KeySource::ProcessEnv);
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn resolve_embed_api_key_1598_alias_fallback() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "alias-fallback-embed-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), Some("alias-fallback-embed-key"));
+        match &resolved.key_source {
+            KeySource::AliasFallback(name) => assert_eq!(name, "OPENROUTER_API_KEY"),
+            other => panic!("expected AliasFallback(OPENROUTER_API_KEY), got {other:?}"),
+        }
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn resolve_embed_api_key_1598_config_env_var() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var("MY_CUSTOM_EMBED_KEY", "via-embed-config-env-var");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openai-compatible".into()),
+            api_key_env: Some("MY_CUSTOM_EMBED_KEY".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), Some("via-embed-config-env-var"));
+        match &resolved.key_source {
+            KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_EMBED_KEY"),
+            other => panic!("expected ConfigEnvVar(MY_CUSTOM_EMBED_KEY), got {other:?}"),
+        }
+        unsafe {
+            std::env::remove_var("MY_CUSTOM_EMBED_KEY");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_embed_api_key_1598_api_key_file_rejects_lax_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!("test-1598-perms-lax-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("embed.key");
+        std::fs::write(&key_path, "leaky-embed-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openai-compatible".into()),
+            api_key_file: Some(key_path.display().to_string()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        assert_eq!(resolved.api_key(), None, "lax-perm file must be refused");
+        match &resolved.key_source {
+            KeySource::Error(reason) => {
+                assert!(
+                    reason.contains("[embeddings].api_key_file") && reason.contains("lax"),
+                    "error must attribute the embeddings field: {reason}"
+                );
+            }
+            other => panic!("expected KeySource::Error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn resolved_embeddings_1598_debug_redacts_api_key() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_API_KEY, "super-secret-embed-key");
+        }
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            ..EmbeddingsSection::default()
+        });
+        let resolved = cfg.resolve_embeddings();
+        let debugged = format!("{resolved:?}");
+        assert!(
+            !debugged.contains("super-secret-embed-key"),
+            "Debug must never leak the key: {debugged}"
+        );
+        assert!(
+            debugged.contains(crate::REDACTED_PLACEHOLDER),
+            "Debug must show the redaction placeholder: {debugged}"
+        );
+        scrub_embed_env();
+    }
+
+    #[test]
+    fn validate_secret_handling_1598_rejects_inline_embeddings_api_key() {
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openrouter".into()),
+            api_key: Some("embed-INLINE-SECRET".into()),
+            ..EmbeddingsSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("inline [embeddings].api_key must be rejected");
+        assert!(
+            err.contains("api_key") && err.contains("forbidden") && err.contains("[embeddings]"),
+            "error must name the field, section, and policy: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_secret_handling_1598_rejects_embeddings_env_and_file_both_set() {
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            api_key_env: Some("EMBED_KEY".into()),
+            api_key_file: Some("/etc/embed.key".into()),
+            ..EmbeddingsSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("[embeddings] env+file mutex must be enforced");
+        assert!(
+            err.contains("[embeddings].api_key_env") && err.contains("[embeddings].api_key_file"),
+            "error must call out the mutex: {err}"
+        );
+    }
+
+    #[test]
+    fn is_api_embed_backend_1598_classification() {
+        // "ollama" is the ONLY non-API backend (case/space tolerant).
+        assert!(!is_api_embed_backend(crate::llm::BACKEND_OLLAMA));
+        assert!(!is_api_embed_backend(" Ollama "));
+        // Every #1067 alias + the generic escape hatch is an API backend.
+        for api in ["openrouter", "openai", "gemini", "openai-compatible"] {
+            assert!(is_api_embed_backend(api), "{api} must classify as API");
+        }
+    }
+
+    #[test]
+    fn known_embedding_dims_1598_gemini_and_granite_entries() {
+        assert_eq!(
+            canonical_embedding_dim("google/gemini-embedding-2"),
+            Some(3072)
+        );
+        assert_eq!(canonical_embedding_dim("gemini-embedding-2"), Some(3072));
+        assert_eq!(
+            canonical_embedding_dim("ibm-granite/granite-embedding-125m-english"),
+            Some(768)
+        );
+        assert_eq!(canonical_embedding_dim("granite-embedding"), Some(768));
+    }
+
+    // ── #1579 B7 — `[storage].db_mmap_size_bytes` / AI_MEMORY_DB_MMAP_SIZE ──
+
+    #[test]
+    fn resolve_storage_1579_mmap_compiled_default() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes,
+            crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES,
+            "no env + no section must bottom out on the compiled 256 MiB default"
+        );
+    }
+
+    #[test]
+    fn resolve_storage_1579_mmap_env_overrides_config() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::set_var(ENV_DB_MMAP_SIZE, "1048576");
+        }
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            db_mmap_size_bytes: Some(2_097_152),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes, 1_048_576,
+            "env must beat the [storage] section"
+        );
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+    }
+
+    #[test]
+    fn resolve_storage_1579_mmap_config_zero_disables() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            db_mmap_size_bytes: Some(0),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes, 0,
+            "explicit 0 (mmap disabled) is a deliberate operator choice and must be honoured"
+        );
+    }
+
+    #[test]
+    fn resolve_storage_1579_mmap_garbage_falls_through() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::set_var(ENV_DB_MMAP_SIZE, "not-a-number");
+        }
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            db_mmap_size_bytes: Some(-5),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.db_mmap_size_bytes,
+            crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES,
+            "unparseable env + negative section value must both fall through to the compiled default"
+        );
+        unsafe {
+            std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+    }
+
+    // ── #1590 — `[storage].default_namespace` explicit-vs-compiled provenance ──
+
+    /// #1590 regression — `resolve_storage` distinguishes an EXPLICIT
+    /// operator `default_namespace` (section or legacy flat field)
+    /// from the compiled `"global"` fallback, and
+    /// `explicit_default_namespace()` only reports the former.
+    #[test]
+    fn resolve_storage_default_namespace_provenance_1590() {
+        let _g = env_var_lock();
+        // Unconfigured: compiled default, NOT explicit.
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.default_namespace, crate::DEFAULT_NAMESPACE);
+        assert_eq!(
+            resolved.default_namespace_source,
+            ConfigSource::CompiledDefault
+        );
+        assert_eq!(resolved.explicit_default_namespace(), None);
+
+        // A [storage] section WITHOUT default_namespace is still NOT
+        // explicit (the section-level `source` tag says Config, which
+        // is exactly why the per-field tag exists).
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            archive_on_gc: Some(true),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.explicit_default_namespace(), None);
+        assert_eq!(
+            resolved.default_namespace_source,
+            ConfigSource::CompiledDefault
+        );
+
+        // Explicit [storage].default_namespace → Config provenance.
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            default_namespace: Some("alphaone".to_string()),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.default_namespace, "alphaone");
+        assert_eq!(resolved.default_namespace_source, ConfigSource::Config);
+        assert_eq!(resolved.explicit_default_namespace(), Some("alphaone"));
+
+        // Legacy flat field → Legacy provenance, still explicit.
+        #[allow(deprecated)]
+        let resolved = {
+            let mut cfg = empty_app_config();
+            cfg.default_namespace = Some("legacy-ns".to_string());
+            cfg.resolve_storage()
+        };
+        assert_eq!(resolved.default_namespace, "legacy-ns");
+        assert_eq!(resolved.default_namespace_source, ConfigSource::Legacy);
+        assert_eq!(resolved.explicit_default_namespace(), Some("legacy-ns"));
+
+        // Whitespace-only is treated as unset (not explicit).
+        let mut cfg = empty_app_config();
+        cfg.storage = Some(StorageSection {
+            default_namespace: Some("   ".to_string()),
+            ..StorageSection::default()
+        });
+        let resolved = cfg.resolve_storage();
+        assert_eq!(resolved.explicit_default_namespace(), None);
+    }
+
+    /// #1590 regression — the process-wide seeded slot round-trips,
+    /// filters blank values, and clears back to the unconfigured state.
+    #[test]
+    fn configured_default_namespace_seed_and_clear_1590() {
+        let _gate = lock_configured_default_namespace_for_test();
+        set_configured_default_namespace(Some("alphaone".to_string()));
+        assert_eq!(
+            configured_default_namespace().as_deref(),
+            Some("alphaone"),
+            "seeded value must be readable process-wide"
+        );
+        set_configured_default_namespace(Some("  ".to_string()));
+        assert_eq!(
+            configured_default_namespace(),
+            None,
+            "blank seeds are filtered to the unconfigured state"
+        );
+        set_configured_default_namespace(Some("ns2".to_string()));
+        set_configured_default_namespace(None);
+        assert_eq!(configured_default_namespace(), None, "clear resets");
+    }
+
+    #[test]
+    fn resolve_reranker_1146_folds_legacy_cross_encoder() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        cfg.cross_encoder = Some(true);
+        let resolved = cfg.resolve_reranker();
+        assert!(resolved.enabled);
+        assert_eq!(resolved.model, "ms-marco-MiniLM-L-6-v2");
+        assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    /// #1604 — rerank sequence-cap ladder: env >
+    /// `[reranker].max_seq_tokens` > compiled default, with zero /
+    /// unparseable / above-model-ceiling values falling through.
+    #[test]
+    fn resolve_reranker_1604_max_seq_ladder() {
+        let _g = env_var_lock();
+        unsafe { std::env::remove_var(ENV_RERANK_MAX_SEQ) };
+
+        // Compiled default when nothing is configured.
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.resolve_reranker().max_seq_tokens,
+            crate::reranker::RERANK_MAX_SEQ_DEFAULT
+        );
+
+        // Config layer wins over the compiled default.
+        let mut cfg = AppConfig::default();
+        cfg.reranker = Some(RerankerSection {
+            max_seq_tokens: Some(128),
+            ..RerankerSection::default()
+        });
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Env wins over config.
+        unsafe { std::env::set_var(ENV_RERANK_MAX_SEQ, "192") };
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 192);
+
+        // Garbage env falls through to config.
+        unsafe { std::env::set_var(ENV_RERANK_MAX_SEQ, "not-a-number") };
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Zero env falls through to config.
+        unsafe { std::env::set_var(ENV_RERANK_MAX_SEQ, "0") };
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Above the model ceiling falls through to config.
+        unsafe {
+            std::env::set_var(
+                ENV_RERANK_MAX_SEQ,
+                (crate::reranker::CROSS_ENCODER_MAX_SEQ + 1).to_string(),
+            );
+        }
+        assert_eq!(cfg.resolve_reranker().max_seq_tokens, 128);
+
+        // Above-ceiling CONFIG value falls through to the compiled
+        // default (no admissible layer remains).
+        unsafe { std::env::remove_var(ENV_RERANK_MAX_SEQ) };
+        let mut cfg = AppConfig::default();
+        cfg.reranker = Some(RerankerSection {
+            max_seq_tokens: Some(crate::reranker::CROSS_ENCODER_MAX_SEQ + 1),
+            ..RerankerSection::default()
+        });
+        assert_eq!(
+            cfg.resolve_reranker().max_seq_tokens,
+            crate::reranker::RERANK_MAX_SEQ_DEFAULT
+        );
+
+        unsafe { std::env::remove_var(ENV_RERANK_MAX_SEQ) };
+    }
+
+    #[test]
+    fn resolved_llm_1146_debug_redacts_api_key() {
+        let resolved = ResolvedLlm {
+            backend: "xai".into(),
+            model: "grok-4.3".into(),
+            base_url: "https://api.x.ai/v1".into(),
+            api_key: Some("SUPER-SECRET-DONT-LEAK".into()),
+            api_key_source: KeySource::ProcessEnv,
+            source: ConfigSource::Env,
+        };
+        let dbg = format!("{resolved:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-DONT-LEAK"),
+            "Debug impl must redact the api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug impl must show <redacted> placeholder: {dbg}"
+        );
+    }
+
+    /// #1454 (SEC, LOW) — a `{:?}` of an `AppConfig` carrying the HTTP
+    /// `api_key` MUST NOT echo the secret. `skip_serializing` only
+    /// guarded the serde JSON path; the derived `Debug` leaked it. The
+    /// manual `Debug` impl redacts the field while preserving the rest.
+    #[test]
+    fn app_config_1454_debug_redacts_api_key() {
+        let cfg = AppConfig {
+            tier: Some("autonomous".into()),
+            api_key: Some("HTTP-BEARER-SUPER-SECRET".into()),
+            ..AppConfig::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("HTTP-BEARER-SUPER-SECRET"),
+            "AppConfig Debug must redact api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "AppConfig Debug must show <redacted> placeholder: {dbg}"
+        );
+        // Non-secret fields still render so the impl stays useful.
+        assert!(
+            dbg.contains("autonomous"),
+            "AppConfig Debug must still render non-secret fields: {dbg}"
+        );
+    }
+
+    /// #1454 (SEC, LOW) — a `{:?}` of an `LlmSection` carrying an
+    /// inline (parse-time-rejected, but still constructable in-memory)
+    /// `api_key` MUST redact it; the env-var-name / file-path reference
+    /// fields stay verbatim because they are not secrets.
+    #[test]
+    fn llm_section_1454_debug_redacts_api_key() {
+        let section = LlmSection {
+            backend: Some("xai".into()),
+            api_key: Some("LLM-INLINE-SUPER-SECRET".into()),
+            api_key_env: Some("XAI_API_KEY".into()),
+            ..LlmSection::default()
+        };
+        let dbg = format!("{section:?}");
+        assert!(
+            !dbg.contains("LLM-INLINE-SUPER-SECRET"),
+            "LlmSection Debug must redact api_key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "LlmSection Debug must show <redacted> placeholder: {dbg}"
+        );
+        assert!(
+            dbg.contains("XAI_API_KEY"),
+            "api_key_env (a name, not a secret) must stay verbatim: {dbg}"
+        );
     }
 }

@@ -1,0 +1,26 @@
+regression	create	memory id	0b387833-db81-4cb3-8599-a9b470f39a83	PASS
+regression	get_by_id	content present	p3-20260606T025050Z-22378 found	PASS
+regression	search_semantic	id in results (count=1)	0b387833-db81-4cb3-8599-a9b470f39a83	PASS
+regression	list_namespace	id listed in _test	0b387833-db81-4cb3-8599-a9b470f39a83	PASS
+regression	private_isolation	404 for non-owner	not visible to ai:agent-beta@hive-1461	PASS
+regression	ns_cross_isolation	absent from other ns	isolated	PASS
+crypto	no_client_cert	refused (000)	000	PASS
+crypto	rogue_client_cert	refused (000)	000	PASS
+crypto	wrong_server_ca	refused (000)	000	PASS
+crypto	apikey_required	401	401	PASS
+crypto	apikey_accepted	200	200	PASS
+crypto	health_exempt	200	200	PASS
+crypto	admin_gated	403	403	PASS
+federation	write	memory id	f49289be-be7f-48e0-95d4-bc6434fb0cc1	PASS
+federation	converge_same_region	f49289be-be7f-48e0-95d4-bc6434fb0cc1 on hive-peer-nyc3-02	present on hive-peer-nyc3-02	PASS
+federation	converge_cross_region	f49289be-be7f-48e0-95d4-bc6434fb0cc1 on hive-peer-sfo2-01	present on hive-peer-sfo2-01	PASS
+zerotouch	enrolled_write	memory id	6e5589b5-a534-4c00-b0ac-fc2fd1906bad	PASS
+zerotouch	enrolled_converge	6e5589b5-a534-4c00-b0ac-fc2fd1906bad on hive-peer-nyc3-02 (credential-only trust)	present on hive-peer-nyc3-02 via CA credential (no pushed pubkey)	PASS
+zerotouch	unenrolled_status	401	401	PASS
+zerotouch	unenrolled_reason	peer_not_enrolled	fail-closed	PASS
+a2a	agent_write	memory id (alpha->peer1)	fd7cc8d4-3459-4ec5-9ffb-e67a6a09daf7	PASS
+a2a	beta_read_writepeer	visible cross-agent	fd7cc8d4-3459-4ec5-9ffb-e67a6a09daf7 present	PASS
+a2a	beta_read_fedpeer	visible on federated peer	fd7cc8d4-3459-4ec5-9ffb-e67a6a09daf7 present on hive-peer-nyc3-02	PASS
+ai_nhi	llm_decision	non-empty expanded_terms	term=Paxos algorithm	PASS
+ai_nhi	nhi_commit	memory id (alpha decision->peer1)	d4c6d4fe-f00a-4cc5-9d17-7bae7c068ea1	PASS
+ai_nhi	nhi_converge	decision visible on federated peer	d4c6d4fe-f00a-4cc5-9d17-7bae7c068ea1 present on hive-peer-nyc3-02	PASS

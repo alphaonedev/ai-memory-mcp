@@ -49,7 +49,21 @@ mesh.
   with a 2xx that carries their post-commit memory id.
 - Peers that fail to ack within a deadline (`--quorum-timeout-ms`,
   default 2000 ms) are marked **lagging** and tracked by the reconciliation
-  loop.
+  loop. The 2000 ms default is tuned for **same-DC peers**; cross-region
+  meshes need 5000-10000 ms. The do-1461 3-region reference deploy pins
+  `FED_QUORUM_TIMEOUT_MS=8000` (`deploy/do-1461/provision/lib.sh`):
+  the synchronous ack must cover a cross-continent RTT plus the
+  receiver's commit work. Receive-side embedding no longer rides this
+  window
+  ([#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566),
+  fixed under #1579 B1): the push ships the sender's vector inside the
+  signed payload (optional `embeddings` field — older peers
+  interoperate), dim-matching receivers store it directly, and rows
+  without a usable shipped vector are embedded in the background
+  AFTER the ack (pre-fix: synchronous ~1 s/row embed on receive).
+  Because the write commits locally first, a longer remote-ack wait
+  widens only the synchronous-durability gate, not the local commit
+  ([#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)).
 - `memory_recall` is served from the local replica only — strong
   consistency is NOT promised. Reads are **eventually consistent**
   within one sync-daemon cycle (default 30 s) across peers, plus one

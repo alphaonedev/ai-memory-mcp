@@ -1,0 +1,445 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  Federation identity at scale — enterprise zero-touch trust.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory · Zero-touch trust — CA-rooted federation identity at scale</title>
+<meta name="description" content="CA-rooted, attestation-issued, short-lived credentials replace O(N²) manual key exchange with O(1) trust-the-CA enrollment. Scale a federated AI-memory fleet from 1 to 1,000,000 agents. OS-agnostic: Linux, Windows, macOS.">
+<meta property="og:title" content="ai-memory · Zero-touch trust (federation identity at scale)">
+<meta property="og:description" content="O(1) CA-rooted trust replaces O(N²) per-peer .pub enrollment. Short-lived auto-rotating credentials, hierarchical trust, GitOps inventory. OS-agnostic.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/zero-touch-trust.html">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
+pre{font-family:var(--font-mono);font-size:.82rem;background:var(--bg-code);padding:1rem 1.1rem;border-radius:8px;border:1px solid var(--border);overflow-x:auto;line-height:1.55;color:var(--text-muted);margin:1rem 0}
+pre code{padding:0;background:none;font-size:.82rem}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem;margin:1.25rem 0 .35rem}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero h1{font-size:clamp(2rem,4.5vw,3rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
+.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
+.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
+.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
+section{padding:3rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
+.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
+section h2{font-family:var(--font-sans);font-size:1.6rem;margin-bottom:.6rem}
+footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
+footer a{color:var(--text-muted)}
+.topnav .menu{position:relative;display:inline-block}
+.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
+.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
+.topnav .menu-btn.active{color:var(--text)}
+.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
+.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
+.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
+.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
+.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
+ul li,ol li{margin-bottom:.4rem}
+table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
+table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
+table td{color:var(--text-muted)}
+table tr:last-child td{border-bottom:none}
+blockquote{border-left:4px solid var(--p1);background:rgba(110,231,255,.05);padding:1rem 1.25rem;margin:1.25rem 0;border-radius:0 8px 8px 0;color:var(--text-muted)}
+blockquote strong{color:var(--p1)}
+.tier-primary{color:var(--good);font-weight:600}
+.tier-tertiary{color:var(--p2);font-weight:600}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Zero-Touch Trust</span></a>
+    <div class="right">
+      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
+      <div class="menu">
+        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
+          <a href="feature-matrix.html">Feature Matrix</a>
+          <a href="data-flow.html">Data Flow</a>
+          <a href="integrations.html">Integrations</a>
+          <a href="import-history.html">Import History</a>
+          <a href="release-pipeline.html">Release Pipeline</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn active">Features<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="memory-tiers.html">Memory Tiers</a>
+          <a href="memory-rules.html">Memory Rules</a>
+          <a href="ttl-controls.html">TTL Controls</a>
+          <a href="archival.html">Archival</a>
+          <a href="encryption.html">Encryption</a>
+          <a href="hierarchies.html">Hierarchies</a>
+          <a href="knowledge-graph.html">Knowledge Graph</a>
+          <a href="autonomous.html">Autonomous</a>
+          <a href="a2a-messaging.html">A2A Messaging</a>
+          <a href="lifecycle.html">Lifecycle</a>
+          <a href="performance.html">Performance</a>
+          <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html" class="current">Zero-Touch Trust</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Architectures<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="architectures.html">Overview</a>
+          <a href="architectures-t1.html">T1 — Single Agent</a>
+          <a href="architectures-t2.html">T2 — Many Agents</a>
+          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+          <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Internals<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="schema.html">Schema</a>
+          <a href="types.html">Types</a>
+          <a href="validators.html">Validators</a>
+          <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
+          <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+          <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+          <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        </div>
+      </div>
+      <a href="credits.html">Credits</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+    </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
+  </div>
+</nav>
+
+<section class="hero">
+  <h1>Zero-touch trust</h1>
+  <p class="tagline">CA-rooted, attestation-issued, short-lived credentials replace O(N²) manual key exchange with O(1) "trust the CA". Scale a federated fleet from 1 to ~1,000,000 AI agents — without touching a single peer to add the next node.</p>
+  <div class="pills">
+    <span class="pill">O(1) enrollment</span>
+    <span class="pill">first-party CA</span>
+    <span class="pill">short-lived · auto-rotating</span>
+    <span class="pill">hierarchical trust</span>
+    <span class="pill">OS-agnostic</span>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <blockquote>
+      <strong>Adding a node reconfigures nobody.</strong> A node proves who it is via attestation, a CA mints it a short-lived credential, and receivers verify that credential against a small trust bundle holding only the CA's key. No peer-to-peer <code>.pub</code> copy. No restart fan-out. The trust domain grows by trusting the CA — not by introducing every node to every other node.
+    </blockquote>
+    <p>This is the <strong>shape</strong> of SPIFFE/SPIRE (CA-rooted, attestation-issued, short-lived, auto-rotating) but <strong>first-party</strong>: it composes the Ed25519 sign/verify and canonical-CBOR primitives already in <code>ai-memory</code>. <strong>No new dependency</strong> — no rcgen, no openssl, no X.509.</p>
+    <p>Full operator + configuration reference: <a href="federation-identity.md" style="color:var(--p1)">docs/federation-identity.md</a>. Transport hardening beneath it (mTLS, X-API-Key, peer attestation): <a href="federation.md" style="color:var(--p1)">docs/federation.md</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">The problem</span>
+    <h2>O(N²) doesn't scale.</h2>
+    <p>Before v0.7.0 a node's federation identity was <em>its hostname</em>, and trust meant copying every peer's Ed25519 <code>.pub</code> onto every other peer. Three hard limits:</p>
+    <ul>
+      <li><strong>O(N²) mutual enrollment.</strong> Every node pair exchanges key material. At 1e6 agents that's ~5e11 enrollment relations — unmanageable.</li>
+      <li><strong>Identity == hostname.</strong> No rotation, no revocation, no short-lived creds. A compromised key is valid until someone manually re-keys a host.</li>
+      <li><strong>Partition footgun.</strong> Enrollment order is load-bearing and manual; one wrong step strict-refuses a live peer.</li>
+    </ul>
+    <p>Zero-touch trust replaces all three with one move: <strong>trust the CA, not the peers.</strong></p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">The credential</span>
+    <h2>What a node presents.</h2>
+    <p>A <code>FederationCredential</code> is the node's Ed25519 public key bound to its agent-id and a short validity window, <strong>signed by a CA key</strong> (canonical-CBOR, the same encoder as link signing). It travels base64 next to <code>X-Memory-Sig</code> under <code>x-memory-cred: v1=&lt;base64&gt;</code>.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>subject_agent_id</code></td><td>The node identity (SPIFFE-style path allowed)</td></tr>
+        <tr><td><code>subject_pubkey</code></td><td>The node's Ed25519 verifying key (32 bytes)</td></tr>
+        <tr><td><code>issuer_id</code></td><td>The CA / intermediate that minted it</td></tr>
+        <tr><td><code>not_before</code> / <code>not_after</code></td><td>Unix-seconds validity window (short TTL — default 1h)</td></tr>
+        <tr><td><code>trust_domain</code></td><td>Fleet namespace for multi-tenant isolation</td></tr>
+        <tr><td><code>cred_version</code></td><td>Wire/format version (<code>CRED_VERSION = 1</code>)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Negotiated, no partition:</strong> if a credential header is present and a trust bundle is configured, the receiver takes the credential path; otherwise it falls back to the legacy per-peer <code>.pub</code> path. An un-upgraded peer keeps working; an upgraded peer accepts both. Every phase ships independently and a mixed fleet stays safe.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Configuration</span>
+    <h2>Every <code>AI_MEMORY_FED_*</code> knob.</h2>
+    <p>Federation identity is configured entirely through the <code>AI_MEMORY_FED_*</code> env-var family:</p>
+    <table>
+      <thead><tr><th>Env var</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>AI_MEMORY_FED_IDENTITY</code></td><td>Overrides the node's federation identity. Highest precedence; blank is ignored. Default: <code>host:&lt;hostname&gt;</code>.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_TRUST_DOMAIN</code></td><td>The trust domain a receiver's bundle is scoped to. Cross-domain creds are rejected.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_TRUST_BUNDLE_DIR</code></td><td>Directory of trusted <strong>issuer</strong> verifying keys — the O(1) enrollment surface.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_CRED_PATH</code></td><td>Path to this node's issued leaf credential (what it presents).</td></tr>
+        <tr><td><code>AI_MEMORY_FED_CRED_CHAIN_PATH</code></td><td>Path to the anchor-first intermediate chain (hierarchical trust).</td></tr>
+        <tr><td><code>AI_MEMORY_FED_INVENTORY_PATH</code></td><td>Path to the declarative GitOps inventory YAML.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code></td><td><strong>Fail-closed gate.</strong> When <code>=1</code>, a receiver rejects any peer with no valid CA-signed credential — <code>401 peer_not_enrolled</code>. The switch that makes enrollment mandatory.</td></tr>
+        <tr><td><code>AI_MEMORY_KEY_DIR</code></td><td>Directory holding this node's signing keypair at <code>&lt;key_dir&gt;/&lt;federation-identity&gt;.{pub,priv}</code>, loaded by the resolved (slashed) identity.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_REQUIRE_SIG</code></td><td>Receivers reject unsigned posts (default-on; inherited enforcement gate).</td></tr>
+      </tbody>
+    </table>
+    <p>Compiled defaults (SSOT constants): leaf TTL <code>1h</code>, intermediate TTL <code>1d</code>, clock skew <code>30s</code>, max chain depth <code>2</code>, renewal interval <code>60s</code>, renewal lead <code>15m</code>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">GitOps</span>
+    <h2>Declarative inventory.</h2>
+    <p>A repo-reviewed YAML file is the source of truth for fleet membership, trust topology, and enforcement. Parsed <strong>strictly</strong> (<code>deny_unknown_fields</code>) so a typo is a load-time error, never a silently-weakened posture. Point the daemon at it with <code>AI_MEMORY_FED_INVENTORY_PATH</code>.</p>
+<pre><code>trust_domain: fleet.example
+root_ca: root/ca
+regions:
+  - name: nyc
+    intermediate_ca: region/nyc/ca   # optional — omit for single-tier
+    nodes:
+      - id: region/nyc/node-1        # SPIFFE-style
+        attestor: mtls-cert          # mtls-cert | node-plugin
+        cred_ttl: 1h
+        renew_before: 15m            # must be &lt; cred_ttl
+        roles: [writer]
+quorum:
+  width: 2                           # W-of-N; &gt;= 1
+enforcement:
+  require_sig: true                  # maps to AI_MEMORY_FED_REQUIRE_SIG</code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Lifecycle</span>
+    <h2>Mint · rotate · revoke.</h2>
+    <ul>
+      <li><strong>Issue</strong> — node attests (mTLS client cert) → issuer maps the verified identity to the agent-id → mints a short-lived leaf (default 1h).</li>
+      <li><strong>Hierarchical</strong> — root mints an intermediate CA (default 1d); the region issuer mints leaves and assembles an anchor-first chain; receivers trusting <strong>only the root</strong> verify the whole chain in one shot (depth ≤ 2). Each link enforces name binding (<code>child.issuer_id == parent.subject_agent_id</code>) and domain binding.</li>
+      <li><strong>Renew</strong> — a background worker wakes every 60s and re-issues within the 15m lead window before expiry. A missed renewal fails closed <em>for the lapsed node only</em>.</li>
+      <li><strong>Revoke</strong> — = <em>stop renewing</em>. Remove the node from the inventory; its credential simply expires. No peer visit.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Operate</span>
+    <h2>Reconciler, rollout &amp; SLOs.</h2>
+    <p>The reconciler is a <strong>pure diff</strong> of desired inventory vs. observed state → a partition-safe <code>ReconcilePlan</code> (strict-enforcement actions are emitted <em>last</em>, gated on observed sign-capability). The side-effecting Apply half — <code>scripts/federation-rollout.sh</code> — does health-gated, mTLS-verified binary swaps with <strong>automatic rollback</strong>; if both new and previous binaries fail health it emits a loud MANUAL INTERVENTION block rather than leaving the fleet dark.</p>
+    <p>Four Prometheus SLO series surface the trust path's health, refreshed every renewal tick:</p>
+    <table>
+      <thead><tr><th>Metric</th><th>SLO</th></tr></thead>
+      <tbody>
+        <tr><td><code>ai_memory_federation_cred_verify_total{result}</code></td><td>verify-failure-rate = fail / (ok + fail)</td></tr>
+        <tr><td><code>ai_memory_federation_inbound_cred_total{presence}</code></td><td>signed-vs-unsigned ratio (climbs to 1.0 as peers upgrade)</td></tr>
+        <tr><td><code>ai_memory_federation_cred_max_age_seconds</code></td><td>max-cred-age — alert as it nears the leaf TTL</td></tr>
+        <tr><td><code>ai_memory_federation_renewal_lag_seconds</code></td><td>renewal-lag — alert when it exceeds the refresh interval</td></tr>
+      </tbody>
+    </table>
+    <p>Every issue / renew / revoke is also recorded on the <code>signed_events</code> audit chain.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Platform</span>
+    <h2>OS-agnostic by design.</h2>
+    <p>The daemon and the <strong>entire</strong> federation-identity core are pure Rust with no platform-bound logic in the trust path. The credential format, issuer, trust bundle, chain verification, inventory parsing, renewal worker, and reconciler behave <strong>identically</strong> on Linux, Windows, and macOS — the CI matrix runs the full suite on all three on every change. A credential minted on a Linux root CA verifies on a Windows node and a macOS node with byte-identical results. A federated fleet can be <strong>heterogeneous</strong> across operating systems in one trust domain.</p>
+    <p>Support <em>focus</em> is tiered by where production enterprise fleets actually run — a priority ranking, not a capability limit:</p>
+    <table>
+      <thead><tr><th>Priority</th><th>Platform</th><th>Default shell</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tier-primary">Primary</span></td><td>Linux (x86_64 / aarch64)</td><td>Bash</td><td>Reference enterprise target — systemd rollout, Unix key-mode enforcement, container / Kubernetes substrate.</td></tr>
+        <tr><td><span class="tier-primary">Primary</span></td><td>Windows (x86_64)</td><td>PowerShell</td><td>First-class daemon + federation node. Key-directory hardening via NTFS ACLs (POSIX mode bits don't apply).</td></tr>
+        <tr><td><span class="tier-tertiary">Tertiary</span></td><td>macOS (Apple Silicon / x86_64)</td><td>Zsh</td><td>Startup / small-enterprise niche — e.g. Mac Mini clusters. Fully functional node; Unix mode enforcement as on Linux.</td></tr>
+      </tbody>
+    </table>
+    <p>The <code>ai-memory</code> binary is shell-agnostic; only the env-var-setting syntax differs per platform's default shell. The same <code>AI_MEMORY_FED_*</code> knob, set three ways:</p>
+<pre><code># Linux (Bash) / macOS (Zsh)
+export AI_MEMORY_FED_TRUST_DOMAIN="fleet.example"
+export AI_MEMORY_FED_IDENTITY="region/nyc/node-1"
+
+# Windows (PowerShell)
+$env:AI_MEMORY_FED_TRUST_DOMAIN = "fleet.example"
+$env:AI_MEMORY_FED_IDENTITY     = "region/nyc/node-1"</code></pre>
+    <p>The only OS-specific differences are <strong>operational plumbing</strong> — the service supervisor (systemd / launchd / Windows Service or WSL2) and the key-directory permission mechanism (POSIX mode bits on Unix, NTFS ACLs on Windows). The trust model itself is identical everywhere.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Reproducible tooling</span>
+    <h2>The first-party issuer.</h2>
+    <p>All CA / node / credential material is minted by <code>examples/fed_issue.rs</code> — a <strong>standalone first-party <code>cargo</code> example</strong> that composes the Ed25519 + canonical-CBOR primitives already in <code>ai-memory</code>. It is <strong>never linked into the golden binary</strong>: there is no <code>Cargo.toml</code> change and the pinned <code>sha256</code> is unchanged. Build + run it on demand — the first call compiles, the rest are cache hits. Every verb is idempotent, so a re-run yields a <strong>stable</strong> trust topology.</p>
+    <table>
+      <thead><tr><th>Verb</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>mint-ca</code></td><td>Generate the campaign CA keypair (<code>--key-dir</code>, <code>--issuer-id</code>).</td></tr>
+        <tr><td><code>export-bundle</code></td><td>Publish <strong>only the CA verifying key</strong> to the trust bundle dir — the sole anchor a receiver needs.</td></tr>
+        <tr><td><code>gen-node</code></td><td>Generate a node signing keypair (<code>--agent-id</code> may be a slashed federation identity).</td></tr>
+        <tr><td><code>issue</code></td><td>Mint a short-lived CA-signed credential binding the node's identity → its verifying key, scoped to the trust domain (<code>--ttl-secs</code> default 3600).</td></tr>
+      </tbody>
+    </table>
+    <blockquote>
+      <strong>One footgun:</strong> <code>issuer-id</code> MUST be slash-free. <code>TrustBundle::from_dir</code> is non-recursive, so a slashed id would nest the published <code>&lt;issuer-id&gt;.pub</code> in a skipped sub-dir → empty bundle → <code>UnknownIssuer</code>. The tool's <code>validate_issuer_id</code> rejects it at the boundary; node <code>subject-agent-id</code>s, by contrast, may be slashed.
+    </blockquote>
+    <p>The push-based <code>deploy/hive-1461/provision/45_zero_touch.sh</code> drives these four verbs per peer: mint the CA once, then per peer generate a keypair, issue a credential, fan out <code>keys/</code> + <code>trust/</code> + <code>credential</code> to <code>/etc/ai-memory</code> (private key <code>0400</code>, public <code>0444</code>), and append the five daemon env vars. Agents and <code>ctrl</code> are pure mTLS API clients, not mesh members, and are skipped. Step-by-step: <a href="zero-touch-quickstart.md" style="color:var(--p1)">docs/zero-touch-quickstart.md</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Validated</span>
+    <h2>Proven on a live fleet.</h2>
+    <p>The <code>hive-1461</code> reproducible baseline runs this arm as provisioning step 45 and the full-spectrum P3 suite exercises it over the <strong>real TLS+mTLS path</strong> against the live mesh. The committed canonical report is <strong class="tier-primary">TOTAL=26 PASS=26 FAIL=0</strong>, including four dedicated <code>zerotouch</code> checks:</p>
+    <table>
+      <thead><tr><th>Check</th><th>Proves</th></tr></thead>
+      <tbody>
+        <tr><td><code>enrolled_write</code></td><td>An enrolled peer writes a collective memory using only its CA-signed credential.</td></tr>
+        <tr><td><code>enrolled_converge</code></td><td>That memory converges on a federated peer <strong>via the CA credential</strong> — no operator-pushed pubkey.</td></tr>
+        <tr><td><code>unenrolled_status</code></td><td>A peer with valid api-key + mTLS but <strong>no enrollment</strong> is refused <code>401</code> on <code>/sync/since</code>.</td></tr>
+        <tr><td><code>unenrolled_reason</code></td><td>The refusal is <code>peer_not_enrolled</code> — the <code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1</code> fail-closed gate.</td></tr>
+      </tbody>
+    </table>
+    <p>Both the environment <em>and</em> the results are peer-reproducible: <code>make seed up provision validate test</code> stands the fleet up and re-proves all 26 checks. The report ships at <code>deploy/hive-1461/results/test-full-spectrum.{json,tsv}</code>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Next</span>
+    <h2>Where to go.</h2>
+    <ul>
+      <li>→ <a href="zero-touch-quickstart.md" style="color:var(--p1)">Zero-touch quickstart</a> — the concrete operator how-to: the <code>fed_issue</code> verbs, on-disk layout, and the push-based enrollment flow.</li>
+      <li>→ <a href="federation-identity.md" style="color:var(--p1)">Federation identity at scale</a> — the full configuration + admin reference (every env var, the inventory schema, the rollout playbook).</li>
+      <li>→ <a href="federation.md" style="color:var(--p1)">Federation hardening</a> — the mTLS / X-API-Key / peer-attestation transport layer beneath this.</li>
+      <li>→ <a href="agent-identity.html" style="color:var(--p1)">Agent identity (NHI)</a> — the per-memory provenance this trust domain authenticates.</li>
+      <li>→ <a href="architectures-t5.html" style="color:var(--p1)">Architectures · T5 — Global Hive</a> — zero-touch trust at fleet scale.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+</footer>
+
+</body>
+</html>

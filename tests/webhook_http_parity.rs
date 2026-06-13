@@ -57,6 +57,22 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::subscriptions::{self, NewSubscription};
 
+/// #1478 — upper bound on how long each lifecycle-parity test waits for
+/// the dispatched POST to land at the wiremock sink. Generous so a slow
+/// host under full-suite `--features sal` HTTP contention — where the
+/// `std::thread::spawn`-detached dispatch (`src/subscriptions.rs`) plus
+/// the `Connection::open` reopen and first-call cold root-cert TLS init
+/// can take several seconds — still observes the POST within it. A
+/// genuine dispatch-drop never reaches the sink and still trips this
+/// deadline, so detection power is preserved. Mirrors the #1477
+/// `SINK_POLL_DEADLINE` / #1475 `DRAIN_DEADLINE` convention (the prior
+/// inline 5s budget was too tight and flaked under full-suite
+/// saturation; the stale "within 2s" panic strings predated even that).
+const WEBHOOK_RECEIPT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// #1478 — poll cadence while waiting for the dispatched POST to arrive.
+const WEBHOOK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 // --------------------------------------------------------------------
 // Test harness
 // --------------------------------------------------------------------
@@ -82,6 +98,10 @@ impl HttpHarness {
             ResolvedTtl::default(),
             true,
         )));
+        #[cfg(feature = "sal")]
+        let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
+            ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
+        );
         let app_state = AppState {
             db,
             embedder: Arc::new(None),
@@ -93,8 +113,31 @@ impl HttpHarness {
             mcp_config: Arc::new(None),
             active_keypair: Arc::new(None),
             family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+            storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+            #[cfg(feature = "sal")]
+            store,
+            llm: Arc::new(None),
+            auto_tag_model: Arc::new(None),
+            llm_call_timeout: std::time::Duration::from_secs(30),
+            replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+            verify_require_nonce: false,
+            federation_nonce_cache: std::sync::Arc::new(
+                ai_memory::identity::replay::FederationNonceCache::default(),
+            ),
+            autonomous_hooks: false,
+            recall_scope: Arc::new(None),
+            deferred_audit_queue: Arc::new(None),
+            admin_agent_ids: Arc::new(Vec::new()),
+            rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+            resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+            runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         };
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         let router = ai_memory::build_router(api_key_state, app_state);
 
         Self {
@@ -154,32 +197,75 @@ fn subscribe_all(db_path: &Path, mock_url: &str) -> String {
     .expect("insert subscription")
 }
 
-/// Wait up to `total` for the mock server to receive at least one
-/// request, polling every 25 ms. Returns the captured requests.
-async fn wait_for_dispatch(mock: &MockServer, total: Duration) -> Vec<wiremock::Request> {
+/// Wait for the mock server to receive a request whose JSON body has
+/// `event == expected_event` AND whose URL path matches `expected_path`.
+/// Tolerates cross-test bleed: dispatch from prior `#[tokio::test]`
+/// runs `std::thread::spawn`-detached
+/// (`src/subscriptions.rs:738`), so a slow dispatch from a prior test
+/// can land on this test's mock if port reuse aligns under wiremock's
+/// internal `MOCK_SERVER_POOL`
+/// (`wiremock-0.6.5/src/mock_server/pool.rs`). #1201 — the per-test
+/// UUID path + the dedicated listener pin in `fresh_mock` together
+/// ensure stragglers cannot pollute the count.
+async fn wait_for_event(
+    mock: &MockServer,
+    expected_event: &str,
+    expected_path: &str,
+    total: Duration,
+) -> Option<wiremock::Request> {
     let deadline = std::time::Instant::now() + total;
     loop {
         let received = mock.received_requests().await.unwrap_or_default();
-        if !received.is_empty() {
-            return received;
+        for req in &received {
+            if req.url.path() != expected_path {
+                continue;
+            }
+            if let Ok(body) = serde_json::from_slice::<Value>(&req.body)
+                && body["event"].as_str() == Some(expected_event)
+            {
+                return Some(req.clone());
+            }
         }
         if std::time::Instant::now() >= deadline {
-            return received;
+            return None;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(WEBHOOK_POLL_INTERVAL).await;
     }
 }
 
-/// Stand up a wiremock that always returns 200 OK on POST `/hook`.
-async fn fresh_mock() -> (MockServer, String) {
-    let mock = MockServer::start().await;
+/// Stand up a wiremock that always returns 200 OK on POST `/hook/<uuid>`.
+///
+/// #1201 — every test gets a dedicated `TcpListener` (bypassing the
+/// `MOCK_SERVER_POOL`) AND a unique per-test path. Both layers
+/// independently prevent the cross-test bleed surfaced under
+/// full-suite parallel-binary load.
+fn fresh_mock_listener() -> std::net::TcpListener {
+    // bind retries on EADDRINUSE (5 attempts, 50 ms backoff).
+    let mut last_err = None;
+    for _ in 0..5 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
+}
+
+async fn fresh_mock() -> (MockServer, String, String) {
+    let listener = fresh_mock_listener();
+    let mock = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/hook/{unique}");
     Mock::given(method("POST"))
-        .and(path("/hook"))
+        .and(path(path_str.clone()))
         .respond_with(ResponseTemplate::new(200))
         .mount(&mock)
         .await;
-    let url = format!("{}/hook", mock.uri());
-    (mock, url)
+    let url = format!("{}{}", mock.uri(), path_str);
+    (mock, path_str, url)
 }
 
 /// Insert a memory directly via the DB layer (skipping the HTTP create
@@ -206,7 +292,7 @@ fn seed_memory(db_path: &Path, title: &str, namespace: &str) -> String {
 #[tokio::test]
 async fn webhook_fires_on_http_delete() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     let _sub_id = subscribe_all(&harness.db_path, &hook_url);
 
     let mem_id = seed_memory(&harness.db_path, "delete-target", "v064-017");
@@ -215,15 +301,16 @@ async fn webhook_fires_on_http_delete() {
         .await;
     assert_eq!(status, StatusCode::OK, "delete should succeed");
 
-    let received = wait_for_dispatch(&mock, Duration::from_secs(2)).await;
-    assert!(
-        !received.is_empty(),
-        "expected memory_delete webhook to fire on HTTP DELETE; \
-         received nothing within 2s"
-    );
+    let req = wait_for_event(&mock, "memory_delete", &mock_path, WEBHOOK_RECEIPT_DEADLINE)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "memory_delete webhook must fire on HTTP DELETE within {WEBHOOK_RECEIPT_DEADLINE:?}"
+            )
+        });
 
     // Validate the event payload shape matches the MCP precedent.
-    let body: Value = serde_json::from_slice(&received[0].body).expect("payload is valid JSON");
+    let body: Value = serde_json::from_slice(&req.body).expect("payload is valid JSON");
     assert_eq!(body["event"], "memory_delete");
     assert_eq!(body["memory_id"], mem_id);
     assert_eq!(body["namespace"], "v064-017");
@@ -239,7 +326,7 @@ async fn webhook_fires_on_http_delete() {
 #[tokio::test]
 async fn webhook_fires_on_http_promote() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     subscribe_all(&harness.db_path, &hook_url);
 
     let mem_id = seed_memory(&harness.db_path, "promote-target", "v064-017");
@@ -248,13 +335,20 @@ async fn webhook_fires_on_http_promote() {
         .await;
     assert_eq!(status, StatusCode::OK, "promote should succeed");
 
-    let received = wait_for_dispatch(&mock, Duration::from_secs(2)).await;
-    assert!(
-        !received.is_empty(),
-        "expected memory_promote webhook to fire on HTTP promote"
-    );
+    let req = wait_for_event(
+        &mock,
+        "memory_promote",
+        &mock_path,
+        WEBHOOK_RECEIPT_DEADLINE,
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "memory_promote webhook must fire on HTTP promote within {WEBHOOK_RECEIPT_DEADLINE:?}"
+        )
+    });
 
-    let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_promote");
     assert_eq!(body["memory_id"], mem_id);
     // HTTP only does tier promotion. Vertical mode is MCP-only.
@@ -266,7 +360,7 @@ async fn webhook_fires_on_http_promote() {
 #[tokio::test]
 async fn webhook_fires_on_http_link_created() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     subscribe_all(&harness.db_path, &hook_url);
 
     let src_id = seed_memory(&harness.db_path, "link-source", "v064-017");
@@ -283,13 +377,20 @@ async fn webhook_fires_on_http_link_created() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "link should be created");
 
-    let received = wait_for_dispatch(&mock, Duration::from_secs(2)).await;
-    assert!(
-        !received.is_empty(),
-        "expected memory_link_created webhook to fire on HTTP link"
-    );
+    let req = wait_for_event(
+        &mock,
+        "memory_link_created",
+        &mock_path,
+        WEBHOOK_RECEIPT_DEADLINE,
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "memory_link_created webhook must fire on HTTP link within {WEBHOOK_RECEIPT_DEADLINE:?}"
+        )
+    });
 
-    let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_link_created");
     assert_eq!(body["memory_id"], src_id, "outer memory_id is the source");
     // Details flattened.
@@ -301,7 +402,7 @@ async fn webhook_fires_on_http_link_created() {
 #[tokio::test]
 async fn webhook_fires_on_http_consolidate() {
     let harness = HttpHarness::new();
-    let (mock, hook_url) = fresh_mock().await;
+    let (mock, mock_path, hook_url) = fresh_mock().await;
     subscribe_all(&harness.db_path, &hook_url);
 
     let src_a = seed_memory(&harness.db_path, "consolidate-a", "v064-017");
@@ -327,13 +428,18 @@ async fn webhook_fires_on_http_consolidate() {
         .expect("response carries new id")
         .to_string();
 
-    let received = wait_for_dispatch(&mock, Duration::from_secs(2)).await;
-    assert!(
-        !received.is_empty(),
-        "expected memory_consolidated webhook to fire on HTTP consolidate"
-    );
+    let req = wait_for_event(
+        &mock,
+        "memory_consolidated",
+        &mock_path,
+        WEBHOOK_RECEIPT_DEADLINE,
+    )
+    .await
+    .unwrap_or_else(|| {
+        panic!("memory_consolidated webhook must fire on HTTP consolidate within {WEBHOOK_RECEIPT_DEADLINE:?}")
+    });
 
-    let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["event"], "memory_consolidated");
     assert_eq!(body["memory_id"], new_id);
     // Details flattened.

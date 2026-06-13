@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::doc_markdown)]
 //! v0.7.0 K8 — `memory_quota_status` MCP-tool wiring test.
 //!
 //! K8 ships the per-agent quota substrate + the operator-facing
@@ -20,17 +22,12 @@
 
 use ai_memory::mcp::handle_quota_status;
 use ai_memory::profile::{Family, Profile};
-use ai_memory::quotas::{self, QuotaOp};
+use ai_memory::quotas::{self, GLOBAL_NAMESPACE, QuotaOp};
 use rusqlite::Connection;
 use serde_json::json;
-use tempfile::NamedTempFile;
 
-fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
-    let f = NamedTempFile::new().expect("tempfile");
-    let p = f.path().to_path_buf();
-    let _ = ai_memory::db::open(&p).expect("db::open");
-    (f, p)
-}
+mod common;
+use common::{describe_counts, fresh_db_tempfile_path as fresh_db};
 
 #[test]
 fn k8_quota_status_registered_under_power_family() {
@@ -55,10 +52,16 @@ fn k8_quota_status_loaded_under_full_profile() {
         Profile::full().loads("memory_quota_status"),
         "full profile must load memory_quota_status (K8 cascade 50 -> 51 post-B2)"
     );
+    // The full advertised count = the substantive memory-tool surface
+    // (SSOT-derived from Family::tool_names) + the always-on
+    // memory_capabilities bootstrap. No hardcoded literal — adding a
+    // tool to any family floats both sides in lockstep.
+    let (n_full_substantive, _) = describe_counts(&Profile::full());
     assert_eq!(
         Profile::full().expected_tool_count(),
-        51,
-        "tool count cascade must advance to 51 with K8 (post-B2 rebase)"
+        n_full_substantive + ai_memory::profile::ALWAYS_ON_TOOLS.len(),
+        "full advertised count must equal the substantive surface plus the \
+         always-on bootstrap (both SSOT-derived)"
     );
 }
 
@@ -67,7 +70,13 @@ fn k8_quota_status_with_agent_id_returns_single_row_envelope() {
     let (_keep, db_path) = fresh_db();
     let conn = Connection::open(&db_path).unwrap();
 
-    quotas::record_op(&conn, "agent-status", QuotaOp::Memory { bytes: 42 }).unwrap();
+    quotas::record_op(
+        &conn,
+        "agent-status",
+        GLOBAL_NAMESPACE,
+        QuotaOp::Memory { bytes: 42 },
+    )
+    .unwrap();
 
     let envelope = handle_quota_status(&conn, &json!({"agent_id": "agent-status"}))
         .expect("quota_status with agent_id should succeed");
@@ -91,7 +100,7 @@ fn k8_quota_status_without_agent_id_returns_list_envelope_sorted() {
 
     // Seed three agents in non-alphabetical order so the sort is observable.
     for aid in ["zeta-agent", "alpha-agent", "mu-agent"] {
-        quotas::record_op(&conn, aid, QuotaOp::Memory { bytes: 1 }).unwrap();
+        quotas::record_op(&conn, aid, GLOBAL_NAMESPACE, QuotaOp::Memory { bytes: 1 }).unwrap();
     }
 
     let envelope =

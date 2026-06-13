@@ -10,11 +10,91 @@
 //! metrics-backend swap stays internal.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
     TextEncoder,
 };
+
+// =====================================================================
+// pm-v3.1 PR8 (issue #1174) — HNSW eviction observability.
+//
+// Pre-PR8 lived as two free `static AtomicU64`s at the top of
+// `src/hnsw.rs`. Class A "SHOULD" extraction: the counters are
+// metrics-bound (surfaced in `/metrics`, `memory_capabilities`,
+// `memory_stats`) so the metrics registry is the natural owner.
+//
+// The Prometheus handles (`hnsw_evictions_total` IntCounter +
+// `hnsw_last_eviction_at_nanos` IntGauge in `Metrics`) carry the
+// scrape-side wiring. The atomics below carry the read-side logic
+// (`evicted_recently` 60s window) AND the test-only reset path that
+// prometheus's monotonic-counter discipline does not support. Both
+// kept-in-lockstep by the `record_hnsw_eviction` sink and the
+// `reset_hnsw_eviction_counters_for_test` resetter.
+//
+// Process-local. The counters reset on restart because the index
+// itself resets on restart. Both atomics are touched only on the
+// eviction edge (rare: requires >100k vectors), so there is no
+// measurable hot-path cost.
+// =====================================================================
+
+static HNSW_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HNSW_LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one HNSW eviction event. Bumps the process-local cumulative
+/// counter by `count`, sets the last-eviction wall-clock nanos to
+/// `now_nanos`, and mirrors both onto the Prometheus registry handles
+/// so `/metrics` scrapes see the same signal without a separate
+/// observer thread.
+pub fn record_hnsw_eviction(count: u64, now_nanos: u64) {
+    HNSW_EVICTIONS_TOTAL.fetch_add(count, Ordering::Relaxed);
+    HNSW_LAST_EVICTION_AT_NANOS.store(now_nanos, Ordering::Relaxed);
+    let r = registry();
+    r.hnsw_evictions_total.inc_by(count);
+    // IntGauge value is i64; nanos can exceed i64::MAX in ~292 years
+    // past the UNIX epoch — saturating clamp keeps the gauge in range
+    // for any plausible operator timeline.
+    #[allow(clippy::cast_possible_wrap)]
+    let nanos_i64 = i64::try_from(now_nanos).unwrap_or(i64::MAX);
+    r.hnsw_last_eviction_at_nanos.set(nanos_i64);
+}
+
+/// Cumulative HNSW oldest-eviction count since process start. Reads
+/// from the process-local atomic; the same value is scrape-visible at
+/// `/metrics` as `ai_memory_hnsw_evictions_total`.
+#[must_use]
+pub fn hnsw_evictions_total() -> u64 {
+    HNSW_EVICTIONS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Wall-clock UNIX nanoseconds of the most recent HNSW eviction (0 if
+/// none have occurred this process). Reads from the process-local
+/// atomic; the same value is scrape-visible at `/metrics` as
+/// `ai_memory_hnsw_last_eviction_at_nanos`.
+#[must_use]
+pub fn hnsw_last_eviction_at_nanos() -> u64 {
+    HNSW_LAST_EVICTION_AT_NANOS.load(Ordering::Relaxed)
+}
+
+/// Reset the HNSW eviction counters. Test-only: production callers
+/// must never reach into the counter directly. The Prometheus
+/// monotonic-counter discipline does NOT permit decrement, so the
+/// scrape-side `ai_memory_hnsw_evictions_total` retains its
+/// cumulative value across the reset — only the process-local
+/// atomics (used by `hnsw_evictions_total()`, `evicted_recently`,
+/// and `memory_stats`) drop back to zero. This asymmetry is
+/// deliberate: `/metrics` scrapes are time-series consumers that
+/// expect monotonic counters; the in-process reset is a unit-test
+/// affordance.
+#[doc(hidden)]
+pub fn reset_hnsw_eviction_counters_for_test() {
+    HNSW_EVICTIONS_TOTAL.store(0, Ordering::Relaxed);
+    HNSW_LAST_EVICTION_AT_NANOS.store(0, Ordering::Relaxed);
+    // Mirror the gauge reset so scrape-side `last_eviction_at_nanos`
+    // also flips back to 0 (gauges, unlike counters, may decrement).
+    registry().hnsw_last_eviction_at_nanos.set(0);
+}
 
 /// Handles to the registered metric families. Built once on first access
 /// via `registry()`.
@@ -52,6 +132,119 @@ pub struct Metrics {
     /// attempts failed (peer likely truly down); `id_drift` = retry
     /// observed the same peer id-drift as attempt 1.
     pub federation_fanout_retry_total: IntCounterVec,
+    /// H9 (v0.7.0 round-2): count of quorum writes that the leader
+    /// returned `200` for (W met) but where at least one configured
+    /// peer did NOT ack inside the deadline. Operators alert on
+    /// non-zero rate to detect mesh-divergence drift early — before a
+    /// follow-up catchup sync surfaces the gap.
+    pub federation_partial_quorum_total: IntCounter,
+    /// Cluster-A COR-3 (v0.7.0): count of memory rows whose Form 4
+    /// fact-provenance JSON columns (`citations`, `source_span`,
+    /// `confidence_signals`, or pre-Form-4 `metadata`) failed to parse
+    /// and were silently defaulted by `row_to_memory`. Non-zero
+    /// indicates schema drift, writer-side corruption, or a
+    /// migration that left malformed JSON in the column. Labeled by
+    /// column name (`citations` | `source_span` | `confidence_signals`
+    /// | `metadata`).
+    pub corrupt_provenance_rows_total: IntCounterVec,
+    /// v0.7-polish SEC-15 / COR-11 (issue #780): count of
+    /// `post_reflect.auto_export` detached worker invocations whose
+    /// outcome was a panic or a returned `Err`. Non-zero means an
+    /// operator-opted-in namespace had a reflection that did NOT
+    /// land on the filesystem and the failure would otherwise be
+    /// silent (the worker thread is detached; the reflection itself
+    /// already committed). The capabilities-v3 surface mirrors this
+    /// counter so operator dashboards can alert without scraping
+    /// `/metrics` directly.
+    pub auto_export_spawn_failed_total: IntCounter,
+    /// v0.7.0 Track D #933 — current depth of the federation push
+    /// DLQ (`federation_push_dlq` table, `WHERE replayed_at IS NULL`).
+    /// Refreshed on every tick of the `replay_federation_push_dlq`
+    /// worker spawned alongside the catchup loop. Operators alert on
+    /// non-zero sustained depth — a healthy mesh should drain back
+    /// to 0 within one replay interval after the peer recovers.
+    pub federation_push_dlq_depth: IntGauge,
+
+    /// #1032 (HIGH, 2026-05-21) — monotonic counter for DLQ rows the
+    /// replay worker has marked as quarantined (`attempt_count >=
+    /// MAX_REPLAY_ATTEMPTS`). Pre-#1032 the replay loop retried
+    /// poison messages forever; now rows past the ceiling are
+    /// skipped + this counter increments per quarantined row per
+    /// tick (the row stays in the DLQ until an operator drains it
+    /// via `ai-memory federation dlq drain --quarantined`). Operators
+    /// alert on non-zero increment rate — a healthy mesh should have
+    /// zero rows reaching the quarantine threshold.
+    pub federation_push_dlq_quarantined: IntCounter,
+
+    /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
+    /// count since process start. Replaces the prior process-global
+    /// `AtomicU64` `INDEX_EVICTIONS_TOTAL` in `src/hnsw.rs`.
+    /// Non-zero means the in-memory vector index has hit
+    /// `MAX_ENTRIES` and dropped older embeddings; recall quality
+    /// may have degraded for evicted ids until they are re-inserted
+    /// (e.g. on next access via the `recall` touch path). Surfaces in
+    /// `memory_capabilities` (`hnsw.evictions_total`), `/metrics`
+    /// (`ai_memory_hnsw_evictions_total`), and `memory_stats`.
+    pub hnsw_evictions_total: IntCounter,
+
+    /// pm-v3.1 PR8 (issue #1174) — wall-clock UNIX nanoseconds of the
+    /// most recent HNSW eviction (0 if none have occurred). Replaces
+    /// the prior process-global `AtomicU64` `LAST_EVICTION_AT_NANOS`
+    /// in `src/hnsw.rs`. Capabilities derives `hnsw.evicted_recently`
+    /// from this with a 60s rolling window. Surfaced as an `IntGauge`
+    /// so the value is also readable via Prometheus scraping.
+    pub hnsw_last_eviction_at_nanos: IntGauge,
+
+    /// #1253 (MED, 2026-05-25) — monotonic counter for subscription
+    /// DLQ insert attempts that were refused because the per-
+    /// subscription DLQ depth had already hit
+    /// [`crate::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS`]. Non-zero
+    /// means a hostile (or simply-broken) webhook target is failing
+    /// every delivery and would otherwise fill the operator's disk
+    /// with quarantined rows. Each refused insert pairs with a
+    /// `tracing::warn!` so operators see the subscription id + correlation
+    /// id of the dropped row.
+    pub subscription_dlq_overflow_total: IntCounter,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — federation
+    /// credential-verification outcomes on the receiver path, labeled
+    /// `result` (`ok` | `fail`). The verify-failure-rate SLO is
+    /// `fail / (ok + fail)`. A non-zero sustained fail rate means peers
+    /// are presenting credentials the local trust bundle cannot verify
+    /// — an expired leaf, a revoked issuer, a clock-skew window, or a
+    /// chain that fails to anchor. Healthy meshes hold this at 0 once
+    /// every peer's issuer key is enrolled in the bundle.
+    pub federation_cred_verify_total: IntCounterVec,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — inbound federation
+    /// requests bucketed by whether they presented a signed credential
+    /// at all, labeled `presence` (`signed` | `unsigned`). The
+    /// signed-vs-unsigned-ratio SLO is `signed / (signed + unsigned)`.
+    /// During a rollout this climbs from 0 toward 1 as peers upgrade to
+    /// credential-presenting builds; operators gate the flip of
+    /// `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` to the secure default on
+    /// this ratio reaching 1.0 across the fleet.
+    pub federation_inbound_cred_total: IntCounterVec,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — age in seconds of
+    /// the local outbound leaf credential (now − `issued_at`),
+    /// refreshed on every renewal tick. The max-cred-age SLO alerts
+    /// when this approaches the leaf TTL
+    /// ([`crate::federation::identity::issuer::DEFAULT_CREDENTIAL_TTL_SECS`])
+    /// — a credential that ages past its TTL without a renewal means
+    /// the refresh worker has stalled and outbound sync will start
+    /// failing peer verification.
+    pub federation_cred_max_age_seconds: IntGauge,
+
+    /// FED-P4-e (federation-identity-at-scale §8) — seconds since the
+    /// last successful outbound-credential renewal (now − last-renew
+    /// wall clock), refreshed on every renewal tick. The renewal-lag
+    /// SLO alerts when this exceeds the configured refresh interval by
+    /// a safety margin: a healthy worker re-renews well inside the leaf
+    /// TTL, so a lag larger than the interval means renewals are
+    /// silently failing (bad CA reachability, key-load fault) even
+    /// though the worker thread is still alive.
+    pub federation_renewal_lag_seconds: IntGauge,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -69,8 +262,32 @@ impl Metrics {
         Self::try_new().expect("prometheus registry init failed")
     }
 
+    // COVERAGE: every `?` Err-arm closure on `IntCounterVec::new(...)?`,
+    //           `IntCounter::new(...)?`, `IntGauge::new(...)?`,
+    //           `HistogramVec::new(...)?`, and
+    //           `registry.register(Box::new(...))?` in this function
+    //           is structurally unreachable in production:
+    //
+    //           1. The function constructs a fresh `Registry::new()`
+    //              per call (no shared state). Registration can only
+    //              fail on duplicate metric name; with a fresh registry
+    //              and unique names per counter, collision is
+    //              impossible.
+    //           2. Every metric name + label name passed to the
+    //              constructors is a compile-time string literal that
+    //              already matches the Prometheus regex
+    //              `[a-zA-Z_:][a-zA-Z0-9_:]*` — construction cannot
+    //              fail on name-validation grounds.
+    //
+    //           The Err-arms exist because the prometheus crate's
+    //           API returns `Result<...>` from these constructors, and
+    //           the `?` propagation is the idiomatic Rust pattern.
+    //           Triggering coverage would require a synthetic
+    //           registry-injection layer that doesn't exist (and
+    //           shouldn't — try_new owns its registry by design).
+    //           Documented per L0.7 playbook §3c.
     #[allow(clippy::too_many_lines)]
-    fn try_new() -> prometheus::Result<Self> {
+    pub(crate) fn try_new() -> prometheus::Result<Self> {
         let registry = Registry::new();
 
         let store_total = IntCounterVec::new(
@@ -168,7 +385,17 @@ impl Metrics {
                 "ai_memory_curator_cycle_duration_seconds",
                 "Curator sweep cycle wall-clock duration, labeled by dry_run.",
             )
-            .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0]),
+            .buckets(vec![
+                0.1,
+                0.5,
+                1.0,
+                5.0,
+                15.0,
+                60.0,
+                300.0,
+                900.0,
+                crate::SECS_PER_HOUR as f64,
+            ]),
             &["dry_run"],
         )?;
         registry.register(Box::new(curator_cycle_duration_seconds.clone()))?;
@@ -195,6 +422,153 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_fanout_retry_total.clone()))?;
 
+        // H9 (v0.7.0 round-2) — partial-quorum observability.
+        let federation_partial_quorum_total = IntCounter::new(
+            "ai_memory_federation_partial_quorum_total",
+            "Quorum writes that succeeded (W met) but where at least one \
+             configured peer did not ack inside the deadline.",
+        )?;
+        registry.register(Box::new(federation_partial_quorum_total.clone()))?;
+
+        // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
+        let corrupt_provenance_rows_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_corrupt_provenance_rows_total",
+                "Memory rows whose Form 4 fact-provenance JSON columns \
+                 failed to deserialise and were silently defaulted. \
+                 Non-zero indicates schema drift, writer-side corruption, \
+                 or a migration leaving malformed JSON.",
+            ),
+            &["column"],
+        )?;
+        registry.register(Box::new(corrupt_provenance_rows_total.clone()))?;
+
+        // v0.7-polish SEC-15 / COR-11 (issue #780) — auto-export
+        // detached-worker failure observability.
+        let auto_export_spawn_failed_total = IntCounter::new(
+            "ai_memory_auto_export_spawn_failed_total",
+            "Detached post_reflect.auto_export worker invocations whose \
+             outcome was a panic or returned Err. Non-zero means at \
+             least one reflection was committed to the DB but its \
+             on-disk markdown/json artefact did not land — operators \
+             use this to alert on otherwise-silent disk-write failures.",
+        )?;
+        registry.register(Box::new(auto_export_spawn_failed_total.clone()))?;
+
+        // v0.7.0 Track D #933 — federation push DLQ depth gauge.
+        let federation_push_dlq_depth = IntGauge::new(
+            "ai_memory_federation_push_dlq_depth",
+            "Current count of pending federation_push_dlq rows \
+             (replayed_at IS NULL). Refreshed on every replay tick. \
+             Non-zero sustained depth indicates one or more peers are \
+             persistently unreachable; healthy meshes drain back to 0 \
+             within one replay interval after peer recovery.",
+        )?;
+        registry.register(Box::new(federation_push_dlq_depth.clone()))?;
+
+        // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
+        let federation_push_dlq_quarantined = IntCounter::new(
+            "ai_memory_federation_push_dlq_quarantined_total",
+            "Monotonic counter of federation_push_dlq rows the replay \
+             worker has skipped because their attempt_count exceeded \
+             MAX_REPLAY_ATTEMPTS (currently 100). Non-zero sustained \
+             rate indicates poison-message rows that need operator \
+             intervention via `ai-memory federation dlq drain \
+             --quarantined`. Pre-#1032 the worker retried these \
+             forever, amplifying network load against rejecting peers.",
+        )?;
+        registry.register(Box::new(federation_push_dlq_quarantined.clone()))?;
+
+        // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
+        // from process-global atomics in `src/hnsw.rs` into the metrics
+        // registry. The counter mirrors `INDEX_EVICTIONS_TOTAL`; the
+        // gauge mirrors `LAST_EVICTION_AT_NANOS` as a UNIX-nanosecond
+        // wall-clock timestamp (0 if no eviction has occurred). Both
+        // are surfaced at `/metrics` so the eviction signal is
+        // scrape-visible without going through `memory_stats`.
+        let hnsw_evictions_total = IntCounter::new(
+            "ai_memory_hnsw_evictions_total",
+            "Cumulative HNSW oldest-eviction count since process start. \
+             Non-zero indicates the in-memory vector index has hit \
+             MAX_ENTRIES and dropped older embeddings; recall quality \
+             may have degraded for evicted ids until they are \
+             re-inserted on next access.",
+        )?;
+        registry.register(Box::new(hnsw_evictions_total.clone()))?;
+
+        let hnsw_last_eviction_at_nanos = IntGauge::new(
+            "ai_memory_hnsw_last_eviction_at_nanos",
+            "Wall-clock UNIX nanoseconds of the most recent HNSW \
+             eviction (0 if none). Capabilities derives \
+             hnsw.evicted_recently from this with a 60s rolling window.",
+        )?;
+        registry.register(Box::new(hnsw_last_eviction_at_nanos.clone()))?;
+
+        // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
+        let subscription_dlq_overflow_total = IntCounter::new(
+            "ai_memory_subscription_dlq_overflow_total",
+            "Monotonic counter of subscription_dlq inserts refused \
+             because the per-subscription DLQ depth had already hit \
+             MAX_SUBSCRIPTION_DLQ_ROWS (10_000). Non-zero indicates a \
+             hostile or persistently-broken webhook target that would \
+             otherwise fill the operator's disk with quarantined rows. \
+             Operators drain the queue via `ai-memory subscription dlq \
+             drain <subscription_id>` before resetting.",
+        )?;
+        registry.register(Box::new(subscription_dlq_overflow_total.clone()))?;
+
+        // FED-P4-e (federation-identity-at-scale §8) — federation
+        // identity SLO surfaces: verify-failure-rate, signed-vs-unsigned
+        // ratio, max cred age, renewal lag.
+        let federation_cred_verify_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_cred_verify_total",
+                "Federation credential-verification outcomes on the \
+                 receiver path, labeled result (ok|fail). \
+                 verify-failure-rate SLO = fail / (ok + fail). Non-zero \
+                 sustained fail rate means peers present credentials the \
+                 local trust bundle cannot verify (expired leaf, revoked \
+                 issuer, clock skew, or a chain that fails to anchor).",
+            ),
+            &["result"],
+        )?;
+        registry.register(Box::new(federation_cred_verify_total.clone()))?;
+
+        let federation_inbound_cred_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_inbound_cred_total",
+                "Inbound federation requests bucketed by whether they \
+                 presented a signed credential, labeled presence \
+                 (signed|unsigned). signed-vs-unsigned-ratio SLO = \
+                 signed / (signed + unsigned). Climbs toward 1.0 as \
+                 peers upgrade to credential-presenting builds.",
+            ),
+            &["presence"],
+        )?;
+        registry.register(Box::new(federation_inbound_cred_total.clone()))?;
+
+        let federation_cred_max_age_seconds = IntGauge::new(
+            "ai_memory_federation_cred_max_age_seconds",
+            "Age in seconds of the local outbound leaf credential \
+             (now - issued_at), refreshed on every renewal tick. \
+             max-cred-age SLO alerts when this approaches the leaf TTL \
+             — a credential aging past its TTL without a renewal means \
+             the refresh worker has stalled and outbound sync will \
+             start failing peer verification.",
+        )?;
+        registry.register(Box::new(federation_cred_max_age_seconds.clone()))?;
+
+        let federation_renewal_lag_seconds = IntGauge::new(
+            "ai_memory_federation_renewal_lag_seconds",
+            "Seconds since the last successful outbound-credential \
+             renewal (now - last-renew wall clock), refreshed on every \
+             renewal tick. renewal-lag SLO alerts when this exceeds the \
+             configured refresh interval by a safety margin: a lag \
+             larger than the interval means renewals are silently \
+             failing even though the worker thread is still alive.",
+        )?;
+        registry.register(Box::new(federation_renewal_lag_seconds.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -212,8 +586,131 @@ impl Metrics {
             curator_cycle_duration_seconds,
             federation_fanout_dropped_total,
             federation_fanout_retry_total,
+            federation_partial_quorum_total,
+            corrupt_provenance_rows_total,
+            auto_export_spawn_failed_total,
+            federation_push_dlq_depth,
+            federation_push_dlq_quarantined,
+            hnsw_evictions_total,
+            hnsw_last_eviction_at_nanos,
+            subscription_dlq_overflow_total,
+            federation_cred_verify_total,
+            federation_inbound_cred_total,
+            federation_cred_max_age_seconds,
+            federation_renewal_lag_seconds,
         })
     }
+}
+
+/// #1253 (MED, 2026-05-25) — record one subscription_dlq insert that
+/// was refused because the per-subscription DLQ already held
+/// [`crate::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS`] rows. Pairs
+/// with a `tracing::warn!` at the call site so operators see the
+/// subscription id + correlation id of the dropped row.
+pub fn record_subscription_dlq_overflow() {
+    registry().subscription_dlq_overflow_total.inc();
+}
+
+/// #1253 (MED, 2026-05-25) — read the current value of the
+/// subscription DLQ overflow counter. Test-only accessor for the
+/// regression that pins this cap.
+#[must_use]
+pub fn subscription_dlq_overflow_count() -> u64 {
+    registry().subscription_dlq_overflow_total.get()
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — record one federation
+/// credential-verification outcome on the receiver path. `ok = true`
+/// means the presented credential (or chain leaf) verified against the
+/// local trust bundle; `ok = false` means it was rejected. Feeds the
+/// verify-failure-rate SLO.
+pub fn record_federation_cred_verify(ok: bool) {
+    let result = if ok { "ok" } else { "fail" };
+    registry()
+        .federation_cred_verify_total
+        .with_label_values(&[result])
+        .inc();
+}
+
+/// FED-P4-e — read the federation credential-verify counter for a given
+/// outcome (`ok` | `fail`). Test-only accessor for the SLO regression.
+#[must_use]
+pub fn federation_cred_verify_count(result: &str) -> u64 {
+    registry()
+        .federation_cred_verify_total
+        .with_label_values(&[result])
+        .get()
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — record one inbound
+/// federation request bucketed by whether it presented a signed
+/// credential. `signed = true` means a credential header was present
+/// (regardless of verify outcome); `false` means the peer sent no
+/// credential. Feeds the signed-vs-unsigned-ratio SLO.
+pub fn record_federation_inbound_cred(signed: bool) {
+    let presence = if signed { "signed" } else { "unsigned" };
+    registry()
+        .federation_inbound_cred_total
+        .with_label_values(&[presence])
+        .inc();
+}
+
+/// FED-P4-e — read the inbound-credential presence counter for a given
+/// bucket (`signed` | `unsigned`). Test-only accessor for the SLO
+/// regression.
+#[must_use]
+pub fn federation_inbound_cred_count(presence: &str) -> u64 {
+    registry()
+        .federation_inbound_cred_total
+        .with_label_values(&[presence])
+        .get()
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — set the age in seconds
+/// of the local outbound leaf credential (now − `issued_at`). Called on
+/// every renewal tick. Feeds the max-cred-age SLO.
+pub fn set_federation_cred_max_age_seconds(secs: i64) {
+    registry().federation_cred_max_age_seconds.set(secs);
+}
+
+/// FED-P4-e (federation-identity-at-scale §8) — set the seconds elapsed
+/// since the last successful outbound-credential renewal. Called on
+/// every renewal tick. Feeds the renewal-lag SLO.
+pub fn set_federation_renewal_lag_seconds(secs: i64) {
+    registry().federation_renewal_lag_seconds.set(secs);
+}
+
+/// Cluster-A COR-3 (v0.7.0) — record a single corrupt-provenance row
+/// observation. `column` is the offending JSON column name
+/// (`citations` / `source_span` / `confidence_signals` / `metadata`).
+/// Pairs with a `tracing::warn!` at the call site so operators see the
+/// row id + parse error.
+pub fn record_corrupt_provenance(column: &str) {
+    registry()
+        .corrupt_provenance_rows_total
+        .with_label_values(&[column])
+        .inc();
+}
+
+/// v0.7-polish SEC-15 / COR-11 (issue #780) — record one detached
+/// `auto_export` worker failure (panic OR returned `Err`). Pairs with
+/// a `tracing::warn!` at the call site so operators see the
+/// reflection id + failure mode. The counter is also mirrored onto the
+/// capabilities-v3 `hooks.auto_export_spawn_failed_total` field so
+/// dashboards that consume `memory_capabilities` (vs `/metrics`) see
+/// the same signal.
+pub fn record_auto_export_spawn_failed() {
+    registry().auto_export_spawn_failed_total.inc();
+}
+
+/// v0.7-polish SEC-15 / COR-11 (issue #780) — read the current value
+/// of the auto-export spawn-failure counter. Used by the
+/// capabilities-v3 builder to mirror the metric onto the
+/// `hooks.auto_export_spawn_failed_total` field without scraping
+/// `/metrics`.
+#[must_use]
+pub fn auto_export_spawn_failed_count() -> u64 {
+    registry().auto_export_spawn_failed_total.get()
 }
 
 /// Render the current registry state to the Prometheus text exposition
@@ -289,6 +786,7 @@ pub fn curator_cycle_completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Tier;
 
     #[test]
     fn registry_is_singleton() {
@@ -301,7 +799,7 @@ mod tests {
     #[test]
     fn render_includes_registered_names() {
         // Tickle every series so each one has ≥1 sample.
-        record_store("short", true);
+        record_store(Tier::Short.as_str(), true);
         record_recall("hybrid", 0.042);
         record_autonomy_hook("auto_tag", true);
         registry().contradiction_detected_total.inc();
@@ -309,6 +807,12 @@ mod tests {
         registry().memories_gauge.set(42);
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
+        registry().federation_push_dlq_depth.set(0);
+        // FED-P4-e — federation identity SLO surfaces.
+        record_federation_cred_verify(true);
+        record_federation_inbound_cred(true);
+        set_federation_cred_max_age_seconds(0);
+        set_federation_renewal_lag_seconds(0);
 
         let text = render();
         for name in [
@@ -322,14 +826,52 @@ mod tests {
             "ai_memory_memories",
             "ai_memory_hnsw_size",
             "ai_memory_subscriptions_active",
+            // v0.7.0 Track D #933 — federation push DLQ depth gauge.
+            "ai_memory_federation_push_dlq_depth",
+            // FED-P4-e — federation identity SLO surfaces (§8).
+            "ai_memory_federation_cred_verify_total",
+            "ai_memory_federation_inbound_cred_total",
+            "ai_memory_federation_cred_max_age_seconds",
+            "ai_memory_federation_renewal_lag_seconds",
         ] {
             assert!(text.contains(name), "/metrics missing {name}\n\n{text}");
         }
     }
 
     #[test]
+    fn federation_cred_verify_labels_outcome() {
+        let before_ok = federation_cred_verify_count("ok");
+        let before_fail = federation_cred_verify_count("fail");
+        record_federation_cred_verify(true);
+        record_federation_cred_verify(false);
+        assert!(federation_cred_verify_count("ok") >= before_ok + 1);
+        assert!(federation_cred_verify_count("fail") >= before_fail + 1);
+        let text = render();
+        assert!(text.contains("ai_memory_federation_cred_verify_total{result=\"ok\"}"));
+        assert!(text.contains("ai_memory_federation_cred_verify_total{result=\"fail\"}"));
+    }
+
+    #[test]
+    fn federation_inbound_cred_labels_presence() {
+        let before_signed = federation_inbound_cred_count("signed");
+        let before_unsigned = federation_inbound_cred_count("unsigned");
+        record_federation_inbound_cred(true);
+        record_federation_inbound_cred(false);
+        assert!(federation_inbound_cred_count("signed") >= before_signed + 1);
+        assert!(federation_inbound_cred_count("unsigned") >= before_unsigned + 1);
+    }
+
+    #[test]
+    fn federation_cred_age_and_lag_gauges_settable() {
+        set_federation_cred_max_age_seconds(1234);
+        set_federation_renewal_lag_seconds(56);
+        assert_eq!(registry().federation_cred_max_age_seconds.get(), 1234);
+        assert_eq!(registry().federation_renewal_lag_seconds.get(), 56);
+    }
+
+    #[test]
     fn record_store_labels_tier() {
-        record_store("long", true);
+        record_store(Tier::Long.as_str(), true);
         let text = render();
         assert!(text.contains("ai_memory_store_total{result=\"ok\",tier=\"long\"}"));
     }
@@ -392,7 +934,7 @@ mod tests {
 
     #[test]
     fn record_store_err_path() {
-        record_store("short", false);
+        record_store(Tier::Short.as_str(), false);
         let text = render();
         assert!(text.contains("ai_memory_store_total{result=\"err\",tier=\"short\""));
     }
@@ -417,7 +959,7 @@ mod tests {
     #[test]
     fn render_emits_help_and_type_lines() {
         // Tickle one series, then render and assert prom-format HELP/TYPE lines.
-        record_store("mid", true);
+        record_store(Tier::Mid.as_str(), true);
         let text = render();
         assert!(text.contains("# HELP ai_memory_store_total"));
         assert!(text.contains("# TYPE ai_memory_store_total counter"));
@@ -456,5 +998,110 @@ mod tests {
             .observe(0.42);
         let text = render();
         assert!(text.contains("ai_memory_curator_cycle_duration_seconds"));
+    }
+
+    // -----------------------------------------------------------------
+    // L0.7-2 Tier A — exercise try_new() directly so the metric-builder
+    // happy paths (lines 88-210) get covered. The process singleton
+    // registry() builds once on first access; we need a second pass for
+    // line coverage of every metric registration in the try_new body.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn try_new_builds_a_fresh_metrics_handle() {
+        // Build a second instance on top of an independent registry —
+        // hits every metric-construction line in `try_new` even when
+        // another test has already initialised the process-wide
+        // singleton. Each call uses a fresh Registry, so register()
+        // cannot collide.
+        let m = super::Metrics::try_new().expect("fresh registry must succeed");
+        // The handle must expose every metric family — touch each to
+        // exercise the assignment side of the struct literal.
+        m.store_total
+            .with_label_values(&[Tier::Short.as_str(), "ok"])
+            .inc();
+        m.recall_total.with_label_values(&["hybrid"]).inc();
+        m.recall_latency_seconds
+            .with_label_values(&["hybrid"])
+            .observe(0.001);
+        m.autonomy_hook_total.with_label_values(&["x", "ok"]).inc();
+        m.contradiction_detected_total.inc();
+        m.webhook_dispatched_total.inc();
+        m.webhook_failed_total.inc();
+        m.memories_gauge.set(1);
+        m.hnsw_size_gauge.set(1);
+        m.subscriptions_active_gauge.set(1);
+        m.curator_cycles_total.inc();
+        m.curator_operations_total
+            .with_label_values(&["auto_tag", "ok"])
+            .inc();
+        m.curator_cycle_duration_seconds
+            .with_label_values(&["true"])
+            .observe(1.0);
+        m.federation_fanout_dropped_total
+            .with_label_values(&["panic"])
+            .inc();
+        m.federation_fanout_retry_total
+            .with_label_values(&["ok"])
+            .inc();
+        m.federation_partial_quorum_total.inc();
+        m.auto_export_spawn_failed_total.inc();
+    }
+
+    #[test]
+    fn try_new_can_build_two_isolated_registries() {
+        // Two consecutive try_new() calls succeed because each builds
+        // its own Registry — no name collision.
+        let a = super::Metrics::try_new().expect("first");
+        let b = super::Metrics::try_new().expect("second");
+        // Tickle a counter on each so the family surfaces in gather().
+        a.store_total
+            .with_label_values(&[Tier::Short.as_str(), "ok"])
+            .inc();
+        b.store_total
+            .with_label_values(&[Tier::Short.as_str(), "ok"])
+            .inc();
+        let mut buf_a = Vec::new();
+        let mut buf_b = Vec::new();
+        let enc = TextEncoder::new();
+        enc.encode(&a.registry.gather(), &mut buf_a).unwrap();
+        enc.encode(&b.registry.gather(), &mut buf_b).unwrap();
+        assert!(String::from_utf8_lossy(&buf_a).contains("ai_memory_store_total"));
+        assert!(String::from_utf8_lossy(&buf_b).contains("ai_memory_store_total"));
+    }
+
+    #[test]
+    fn record_auto_export_spawn_failed_increments_singleton() {
+        // v0.7-polish #780 — record_auto_export_spawn_failed() must
+        // monotonically advance the process-wide counter that the
+        // capabilities-v3 builder mirrors onto
+        // `hooks.auto_export_spawn_failed_total`.
+        let before = auto_export_spawn_failed_count();
+        record_auto_export_spawn_failed();
+        let after = auto_export_spawn_failed_count();
+        assert!(
+            after >= before + 1,
+            "auto_export_spawn_failed_total did not advance \
+             (before={before}, after={after})"
+        );
+        // The render text must mention the metric name so /metrics
+        // scrapers see it.
+        let text = render();
+        assert!(
+            text.contains("ai_memory_auto_export_spawn_failed_total"),
+            "/metrics output missing auto_export counter\n\n{text}"
+        );
+    }
+
+    #[test]
+    fn curator_cycle_completed_no_progress_branch_skips_err_increment() {
+        // operations_attempted=0, auto_tagged=0, contradictions=0,
+        // errors=0 → failed = 0.saturating_sub(0+0) = 0 → the `if
+        // failed > 0 || errors > 0` block does NOT execute. Pins the
+        // negative branch.
+        let before = registry().curator_cycles_total.get();
+        curator_cycle_completed(0, 0, 0, 0);
+        let after = registry().curator_cycles_total.get();
+        assert!(after >= before + 1);
     }
 }

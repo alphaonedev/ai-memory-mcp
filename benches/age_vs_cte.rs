@@ -59,6 +59,19 @@
 //! artifact and (b) regression-gate behaviour at process exit, neither
 //! of which Criterion's bench_function shape gives us cleanly.
 
+// Bench-only file. Percentile math casts u128 nanosecond samples to
+// f64 for human-readable reporting; the main function body is the
+// orchestration of the whole bench harness (setup + warm-up + sample
+// + report + gate-check) and exceeds the default `too_many_lines`
+// threshold by design.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::doc_markdown
+)]
+
 use std::path::PathBuf;
 #[cfg(feature = "sal-postgres")]
 use std::time::Instant;
@@ -521,6 +534,24 @@ async fn insert_fixture(
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "ai:j8-bench"}),
+            // v0.7.0 Task 1/8 — substrate-native reflection depth. J8
+            // bench fixture nodes are caller-equivalent (depth 0), so the
+            // KG traversal benchmark targets the same shape it would in
+            // production.
+            reflection_depth: 0,
+            memory_kind: ai_memory::models::MemoryKind::Observation,
+            // v0.7.0 QW-2 + Form 4 + Form 5 fields. Bench fixtures use
+            // defaults (no persona, no citations, caller-provided
+            // confidence) — KG-traversal perf doesn't depend on these.
+            entity_id: None,
+            persona_version: None,
+            citations: vec![],
+            source_uri: None,
+            source_span: None,
+            confidence_source: ai_memory::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         store.store(&ctx, &mem).await?;
     }

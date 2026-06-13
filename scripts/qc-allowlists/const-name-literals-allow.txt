@@ -1,0 +1,26 @@
+# const-name-literals allowlist — IDENTIFIER regexes for domain-number
+# tokens where the number IS the term (algorithm/format names), never a
+# tuned value. Operator-gated: extend only for genuine domain terms.
+# See scripts/check-const-name-literals.sh.
+SHA256
+SHA512
+ED25519
+X25519
+BLAKE3
+ARGON2
+CHACHA20
+POLY1305
+AES128
+AES256
+BASE64
+UTF8
+FTS5
+HTTP2
+CL100K
+IPV4
+IPV6
+CRC32
+P256
+P384
+[Bb]64
+^V[0-9]+_

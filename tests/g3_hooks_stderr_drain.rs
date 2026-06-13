@@ -1,5 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
+// clippy allows (test scaffolding): pedantic lints with no behavioral impact.
+#![allow(clippy::doc_markdown)]
 //
 // v0.7.0 review #628 blocker H9 — daemon-mode stderr never drained.
 //
@@ -29,10 +31,10 @@
 //      executor surfaces `Timeout` cleanly without hanging — the
 //      drain task must let the executor's `tokio::time::timeout`
 //      trip on schedule rather than getting stuck on a full pipe.
-
 #![cfg(unix)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_memory::hooks::{
@@ -139,7 +141,7 @@ done
     // stderr piping in well under a minute. Anything close to this
     // bound suggests the drain task is missing or under-buffering.
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < Duration::from_mins(1),
         "5 fires of 1 MiB stderr each took {elapsed:?}; suggests drain task is missing",
     );
 
@@ -155,11 +157,52 @@ done
 /// cleanly when the child genuinely stops responding. A regressed
 /// drain task that buffered unboundedly could mask a hung child by
 /// keeping the pipe forever drainable; we want the executor to
-/// surface `Timeout` in bounded wall-clock regardless.
+/// surface `Timeout` deterministically regardless.
 ///
 /// The script writes one Allow then sleeps forever — the second fire
 /// must trip the configured 500ms timeout.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// Issue #1206 — rewritten from wall-clock-coupled to **fake clock**
+/// for the timeout-trip half of the test.
+///
+/// The pre-#1206 shape used a real `Instant::now()` budget + 5s
+/// assertion ceiling and a 10× macOS multiplier (PR #1203), which
+/// still flaked on stressed macOS hosts because the `fork+exec+sh`
+/// cold-start cycle plus the executor's 500ms timeout left no
+/// safety margin under contention (issue #1193).
+///
+/// The rewrite splits the test into two phases with different
+/// time-source disciplines:
+///
+///   * **Phase 1 — first fire (real clock).** The first fire spawns
+///     the child via `tokio::process::Command`, writes the envelope,
+///     and reads the child's response. The H9 contract under test
+///     here is that the executor doesn't deadlock on a verbose child
+///     — that's a real-I/O contract, not a timer contract, so this
+///     phase runs against the real tokio clock. The child responds
+///     in real milliseconds; the 500ms timeout is a backstop that
+///     never trips.
+///   * **Phase 2 — second fire (paused clock).** After the first
+///     fire completes, `tokio::time::pause()` freezes the clock.
+///     The second fire is spawned (the child is sleeping for 60s
+///     wall-clock and will never respond) and the test future
+///     explicitly `tokio::time::advance`s past the 500ms deadline.
+///     The executor's `tokio::time::timeout(deadline, exchange)`
+///     trips deterministically against the advanced fake clock,
+///     surfacing `Timeout`. No wall-clock dependence; no flake band.
+///
+/// Runtime flavor is `current_thread` because `tokio::time::pause()`
+/// is `current_thread`-only (it operates on the runtime-local clock).
+/// `tokio::process` works fine on `current_thread` — the child's
+/// stdin/stdout/stderr pipes are async-readable via the runtime's
+/// I/O driver and the stderr-drain task runs as a `tokio::spawn`
+/// cooperative task on the same thread. We do **not** use
+/// `start_paused = true` because auto-advance would leap over the
+/// child's real `fork+exec+sh` cold-start before its first response;
+/// `tokio::time::pause()` is called explicitly between phase 1 and
+/// phase 2 so the first fire keeps wall-clock semantics and only
+/// the second fire's deadline-trip becomes deterministic.
+#[tokio::test(flavor = "current_thread")]
 async fn daemon_mode_timeout_still_trips_with_drain_task_running() {
     let dir = tempfile::tempdir().expect("tempdir");
     let script = write_script(
@@ -177,30 +220,49 @@ sleep 60
 "#,
     );
 
-    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 500));
+    // Arc-wrap so we can share the executor with the spawned second
+    // fire below. `DaemonExecutor: Send + Sync` (its only interior
+    // mutability is the async `tokio::sync::Mutex<Option<…>>`).
+    let executor = Arc::new(DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 500)));
 
-    // First fire warms the connection — must succeed.
+    // Phase 1 — first fire (real clock). Warms the daemon connection
+    // via real fork/exec/read/write; the child responds in real ms
+    // and the 500ms timeout never trips.
     let r1 = executor
         .fire(HookEvent::PostStore, json!({"first": true}))
         .await
         .expect("first fire warms the daemon connection");
     assert_eq!(r1, HookDecision::Allow);
 
-    // Second fire must trip Timeout (script is sleeping). The window
-    // is generous — the configured budget is 500ms; if we don't see
-    // an answer inside 5s the drain task itself is hung.
-    let started = Instant::now();
-    let r2 = executor
-        .fire(HookEvent::PostStore, json!({"second": true}))
-        .await;
-    let elapsed = started.elapsed();
+    // Phase 2 — pause the tokio clock so the second fire's timeout
+    // is driven by `tokio::time::advance` instead of wall-clock.
+    // This is the #1206 fix: deterministic timeout-trip regardless
+    // of host contention / `fork+exec+sh` cold-start variance.
+    tokio::time::pause();
+
+    let executor2 = Arc::clone(&executor);
+    let fire2 = tokio::spawn(async move {
+        executor2
+            .fire(HookEvent::PostStore, json!({"second": true}))
+            .await
+    });
+
+    // Let the spawned task start, hit its envelope-write, and park
+    // awaiting the child's stdout response (which will never come —
+    // the script is in `sleep 60`).
+    tokio::task::yield_now().await;
+
+    // Advance the paused clock past the 500ms executor deadline.
+    // The tokio timer wired inside `fire_inner` now trips and the
+    // executor records `Timeout` with no wall-clock dependence.
+    tokio::time::advance(Duration::from_millis(600)).await;
+
+    // The spawned fire should be resolved — Timeout surfaced
+    // deterministically.
+    let r2 = fire2.await.expect("spawned fire must not panic");
     assert!(
         matches!(r2, Err(ExecutorError::Timeout { .. })),
         "second fire should have surfaced Timeout, got {r2:?}",
-    );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "Timeout took {elapsed:?}; bounded budget should be ~500ms",
     );
 }
 
@@ -227,7 +289,14 @@ printf '%s\n' '{"action":"allow"}'
 "#,
     );
 
-    let executor = ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000));
+    // 60s budget (was 30s, originally 5s) — issue #824: macOS-latest CI
+    // runners have grown slower since 0536e96 bumped 5→30s; runs in
+    // 2026-05-17 timed out at the 30s mark. Local runs finish in ~130ms.
+    // Budget is for CI-flake resilience, not real workload. Real-deployment
+    // hook timeouts are operator-configured. If this bump is also
+    // insufficient, switch to #[cfg_attr(target_os = "macos", ignore)]
+    // and file a runner-investigation follow-up.
+    let executor = ExecExecutor::new(cfg_for(script, HookMode::Exec, 60_000));
     let r = executor
         .fire(HookEvent::PostStore, json!({}))
         .await

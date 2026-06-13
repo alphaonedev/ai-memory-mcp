@@ -40,12 +40,189 @@ are advisory targets.
 | `memory_get_taxonomy` (full tree) | < 100 ms | < 250 ms | *[advisory]* New v0.6.3 |
 | `curator cycle` (1k memories) | < 60 s | < 120 s | *[advisory]* Background |
 | `federation ack` (W=2 quorum) | < 2 s | < 5 s | *[advisory]* Multi-machine |
+| `memory_recall` during HNSW rebuild | < 35 ms | < 100 ms | #968 Wave-2 Tier-C3. v0.6 baseline (synchronous rebuild) blocked search for ~3-10 s on a 100k-vector rebuild; v0.7.x post-#968 uses the async-rebuild + double-buffer pattern so search p95 stays under 35 ms during a rebuild. Bench-verified by `cargo bench --bench hnsw_rebuild_async` (release build, 2k-vector fixture: p95 43 µs, p99 56 µs). |
+| MCP tool dispatch (serial, p95 vs slowest-tool wall-clock) | N/A — bounded by slowest tool | N/A | #965 Wave-2 Tier-B5 audit (2026-05-21). MCP stdio is single-threaded by JSON-RPC protocol design (`for line in stdin.lock().lines()` in `src/mcp/mod.rs:2263`); throughput is bounded by the slowest tool's wall-clock latency, NOT by lock contention. There is no `Arc<Mutex<Connection>>` in the MCP path — `handle_request` takes a plain `&Connection`. The "73 tools serialize on a mutex" framing in #842 Tier-B5 / #965 conflated the HTTP daemon's `Arc<Mutex<...>>` shape with MCP; corrected at audit. Regression-pinned by `src/mcp/mod.rs::tests::issue_965_audit_*` (3 tests, all green). HTTP path lock contention IS a real perf concern and is tracked separately. |
 
 > **See also:** `docs/performance.html` publishes a complementary,
 > per-feature-tier view (keyword / semantic / autonomous) of these
 > budgets — equal-or-tighter targets stratified by which capabilities
 > are loaded. Both surfaces are kept in agreement; this file is the
 > canonical aggregate contract that the `bench.yml` CI guard reads.
+
+## Boot Time-to-Ready — Async HNSW Warm-up (#1579 B3)
+
+Since #1579 (v0.7.0 performance final gate), the daemon (`serve`) and
+the MCP stdio server (`mcp`) **no longer build the HNSW vector index
+on the startup path**. Both surfaces become ready immediately with an
+empty index; a background loader reads the stored embeddings over its
+own connection, builds the graph on the #968 double-buffer rebuild
+thread, and atomically swaps it in. Operators see one line when the
+swap lands:
+
+- `serve`: INFO `HNSW index warm (#1579 B3): async boot build swapped
+  in; semantic recall is now index-backed` (with `entries` +
+  `elapsed_ms` fields).
+- `mcp`: stderr `ai-memory: HNSW index ready (N entries, warmed in
+  X.Xs)`.
+
+**Warm-window semantics** (between process start and the swap):
+
+- Semantic recall serves the keyword/FTS blend (the same degraded mode
+  used when no embedder is configured); results are correct but ranked
+  without the vector phase.
+- The #519 proactive conflict check routes to a bounded recency scan
+  (newest `PROACTIVE_CONFLICT_SCAN_LIMIT` rows) instead of the index.
+- Writes are unaffected — rows inserted during the window are
+  index-visible immediately (overflow path) and survive the swap.
+
+Pre-#1579 baseline (P1 audit, synchronous boot build): 35 ms keyword
+(any corpus), **40 s at 10k embedded rows, >28 min at 100k** from
+spawn to the first `initialize` answer. Post-#1579 the first answer is
+independent of corpus size; only time-to-*semantic-index-warm* scales
+with N (same build cost, now off the readiness path).
+
+**One-shot CLI** (`ai-memory recall`) never amortises a graph build,
+so it skips HNSW construction entirely below
+`hnsw::CLI_HNSW_BUILD_MIN_ENTRIES` (20 000 embedded rows — SSOT const)
+and uses the recall pipeline's linear-scan fallback, which answers in
+≤ 35 ms at that scale. Embedding backfill on the CLI path is batched
+(`embed_batch` + one multi-row UPDATE per chunk) per the #1146
+`[embeddings].backfill_batch` resolver.
+
+## Corpus-scale budgets (#1579 B8)
+
+The budget table above is enforced by the **default** `ai-memory bench`
+workload, which (per-op seeding included) never grows past ~500 rows —
+small enough that corpus-scale regressions are invisible (the #1579 P1
+perf audit measured `memory_recall` p95 at **361 ms vs the 50 ms
+budget on a 100k-row corpus** while the default bench stayed green).
+
+`ai-memory bench --scale <rows>` closes that blind spot: it seeds a
+scratch corpus of `<rows>` rows into the disposable in-memory DB
+before running the same 7 operations, and gates the verdict against
+the per-scale budget table below instead of the default budgets.
+Omitting `--scale` keeps the default workload and default budgets
+byte-for-byte.
+
+### `[scale]` budget table
+
+| Scale (rows) | Operation | Target (p95) | Notes |
+|---|---|---|---|
+| 10,000 | `memory_store` (no embedding) | < 120 ms | keyword-tier write incl. FTS5 trigger sync at scale |
+| 10,000 | `memory_search` (FTS5) | < 60 ms | |
+| 10,000 | `memory_recall` (hot, keyword) | < 80 ms | |
+| 10,000 | `memory_list` | < 10 ms | *[advisory]* — no bench row yet (the 7-op workload does not cover list); pinned per the #1579 remediation plan |
+| 10,000 | `memory_kg_query` / `memory_kg_timeline` | unchanged | KG fixtures are fixed-size (50×4 fan-out, 50×5 chains) — corpus scale does not change traversal cost, so the canonical budgets above apply |
+
+SSOT: `src/bench.rs::SCALE_BUDGETS` (pinned by the
+`operation_scale_targets_match_performance_md` test — change both
+together).
+
+**Rationale for the 10k numbers.** Pinned per the operator-approved
+#1579 remediation plan from the audit's POST-fix expectations,
+verified by a measured release-build run on this branch
+(`ai-memory bench --scale 10000`, Linux x86_64 reference hardware —
+see the table below). Each pinned budget keeps ≥ 50% headroom over
+the measured p95 and never exceeds the plan's conservative ceilings
+(store ≤ 120 ms, search ≤ 60 ms, recall ≤ 80 ms). Scales beyond the
+largest pinned row reuse the largest row's budgets best-effort — pin
+a new table row before gating larger scales.
+
+Measured on this branch at `--scale 10000` (release build):
+
+| Operation | Measured p95 | Pinned budget | Headroom |
+|---|---|---|---|
+| `memory_store` (no embedding) | 0.45 ms | 120 ms | ~266× |
+| `memory_search` (FTS5) | 1.42 ms | 60 ms | ~42× |
+| `memory_recall` (hot, keyword) | 15.44 ms | 80 ms | ~5.2× |
+
+### CI enforcement
+
+`.github/workflows/bench.yml` runs `ai-memory bench --scale 10000`
+as a dedicated gate step on every PR + trunk push (alongside the
+default-workload gate) and uploads `bench-results-10k.json` with the
+artifact set. The run fails when any operation's measured p95 exceeds
+its scale budget by more than the published 10% tolerance.
+
+## Autonomous-Tier Latency Tax — Batman-Active Write Path
+
+> **v0.7.0 Gap #4 (issue #805) attack plan.** Cross-refs #654 (distilled
+> hot-path model, TABLED). This section closes the operator-facing gap
+> by publishing measured budgets + a concrete remediation queue.
+
+In **Batman-active mode** every `memory_store` runs through:
+
+- **Form 1** — online dedup-and-synthesis LLM call (one prompt; up to 5
+  candidates).
+- **Form 2** — synchronous atomise-before-embed.
+- **Form 6** — `regex_then_llm` kind classification (one prompt).
+
+All three are blocking on the write path. Until #654's distilled
+300M hot-path model lands, these are the **measured** budgets against
+`gemma4:e4b` on the Apple M4 reference baseline:
+
+| Form | Stage | p50 warm | p95 warm | p99 cold | Knob to bypass |
+|------|-------|----------|----------|----------|----------------|
+| Form 1 | synthesis batch | 0.5 s | 3 s   | 30 s | `autonomous_hooks=false` (per-namespace) |
+| Form 2 | atomise sync    | 0.4 s | 2.5 s | 25 s | `auto_atomise_mode = "deferred"` |
+| Form 6 | kind classify   | 0.2 s | 1.5 s | 15 s | `auto_classify_kind = "regex_only"` |
+| **End-to-end `memory_store`** | (sum) | **~1.1 s** | **~7 s** | **~70 s** | All three |
+
+The p99 cold ceiling is the load-bearing number — a thinking-mode
+gemma cold start blocks an entire 70 s on the worst case. The same
+write without Batman-active mode is < 50 ms.
+
+### Operator knobs (interim, while #654 TABLED)
+
+Three documented operator escape hatches let a Batman-active deployment
+trade latency for capability without re-compiling:
+
+1. `auto_classify_kind = "regex_only"` (per-namespace `GovernancePolicy`)
+   — removes Form 6 entirely. Recovers ~1.5 s p95 / 15 s p99 cold.
+2. `auto_atomise_mode = "deferred"` — Form 2 runs in a background
+   worker. Recovers ~2.5 s p95 / 25 s p99 cold. The atomise-result
+   row appears via the curator sweep within 60 s.
+3. `AI_MEMORY_AUTO_CONFIDENCE=0` — disables Form 5 calibration on the
+   write path. Recovers ~100 ms p95 (small; Form 5 is the cheapest of
+   the four).
+
+A namespace that sets all three knobs falls back to the keyword-tier
+write budget (< 50 ms p95).
+
+### v0.7.0 attack plan — measured contributors
+
+The **worst single contributor** measured on `scripts/batman-bench.sh`
+is Form 1 synthesis cold start (LLM round-trip + JSON-extract).
+Ranked by p99 contribution:
+
+| Rank | Contributor                       | p99 cold | v0.7.1 attack |
+|------|-----------------------------------|----------|---------------|
+| 1    | LLM cold start (model load)       | ~25 s    | model-keep-alive warmup hook in curator |
+| 2    | gemma thinking-mode generation    | ~12 s    | thinking-mode opt-out per Form (Form 1 doesn't need it) |
+| 3    | Form 1 JSON re-extract loop       | ~0.8 s   | switch to strict-JSON Ollama mode (already supported); we currently re-extract on the failure path |
+| 4    | Form 2 atom de-dup pass           | ~0.6 s   | bench-verified; in scope for v0.7.1 PERF-17 |
+| 5    | Form 6 regex pre-pass             | ~0.05 s  | already optimal |
+
+### v0.7.1 work queue
+
+- **PERF-17** — Form 1 strict-JSON Ollama mode (eliminates re-extract
+  loop on ~30% of responses).
+- **PERF-18** — curator-keep-alive hook (`ollama pull --keep-alive`)
+  warms the model behind the write path so a fresh `memory_store`
+  never pays the cold-start cost.
+- **PERF-19** — per-Form thinking-mode opt-out config knob (Form 1
+  doesn't need extended reasoning; Form 3 and Form 5 do).
+
+These three changes target the top-3 contributors and are estimated
+at ~150 LOC total. They land in v0.7.1 if #654 stays TABLED past the
+v0.7.0 ship date.
+
+### Bench harness
+
+`scripts/batman-bench.sh` produces the JSON measurement table; the
+shape is suitable for ingestion by the bench-results artifact already
+attached to `bench.yml`. The script is reproducible (operator runs
+it locally, on the dogfood node, or in CI nightly).
 
 ## CI Guard Threshold
 
@@ -120,6 +297,9 @@ memory_kg_timeline              <  100 ms           0.1 ms         0.1      0.1 
 `--iterations` and `--warmup` (clamped to `[1, 100_000]` and
 `[0, 10_000]` respectively) tune the sample size. `--json` emits the
 same numbers as a single JSON document for downstream tooling.
+`--scale <rows>` (#1579 B8, clamped to `[1, 1_000_000]`) seeds a
+scratch corpus of `<rows>` rows first and gates against the
+"Corpus-scale budgets" table above instead of the default budgets.
 
 The KG rows seed two in-process fixtures so every traversal runs
 end-to-end with no external service:

@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Memory Tiers — Short / Mid / Long with auto-TTL</title>
-<meta name="description" content="ai-memory v0.6.3.1 tier system. Short (6h) / Mid (7d) / Long (no TTL). Mirrors human memory architecture. Promotion path with governance gates. The default that lets agents forget noise and keep what matters.">
+<meta name="description" content="ai-memory v0.7.0 tier system. Short (6h) / Mid (7d) / Long (no TTL). Mirrors human memory architecture. Promotion path with governance gates. The default that lets agents forget noise and keep what matters.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/memory-tiers.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--short:#ffb86b;--mid:#c8a2ff;--long:#6ee7ff;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -98,6 +98,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -107,11 +118,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Memory Tiers</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -134,6 +148,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -145,6 +160,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -154,23 +172,91 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -197,7 +283,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Working memory. Notes from <em>right now</em>. Things you'd lose if you slept on them. Auto-expires unless explicitly extended. Use for: call logs, transient observations, "remind me at 3pm," intermediate reasoning steps.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">6 × 3600s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">+1h on access</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">reset to now+1h on access</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">0</span></div>
         </div>
@@ -208,7 +294,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Episodic memory. Project context. The default tier. A week is enough for a sprint, a deal cycle, or a research thread. Auto-expires unless promoted to Long. Use for: sprint goals, customer notes, debugging sessions, draft decisions.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">7 × 86400s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">+1d on access</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">reset to now+1d on access</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">1</span></div>
         </div>
@@ -232,7 +318,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The TTL ladder</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">From hours to days to forever — three slopes.</h2>
-    <p class="lede">Each tier has its own decay slope. Short bleeds out in hours. Mid in days. Long holds. Access bumps the expiry forward by a tier-specific extend interval, so memories that matter get used and earn more time.</p>
+    <p class="lede">Each tier has its own decay slope. Short bleeds out in hours. Mid in days. Long holds. Access raises the expiry to <code>MAX(current expiry, now + extend interval)</code> — an extension floor (#1596) — so memories that matter get used and earn more time, and an access never shortens a memory's remaining life.</p>
     <svg class="ladder-svg" viewBox="0 0 1180 360" xmlns="http://www.w3.org/2000/svg">
       <style>
         .axis{stroke:#3d3d3d;stroke-width:1.2}
@@ -323,7 +409,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Promotion path</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Mid → Long, the only edit that affects retention.</h2>
-    <p class="lede">A memory's tier can change. The most important transition is <code>Mid → Long</code> — the moment something stops being session context and starts being durable knowledge. ai-memory routes promotion through governance, so the right caller (or the right approver) decides what lives forever.</p>
+    <p class="lede">A memory's tier can change. The most important transition is <code>Mid → Long</code> — the moment something stops being session context and starts being durable knowledge. ai-memory routes promotion through governance, so the right caller (or the right approver) decides what lives forever. There are two paths: <strong>automatic</strong> — a Mid-tier memory auto-promotes to Long at 5 accesses (<code>PROMOTION_THRESHOLD</code> in <code>src/models/mod.rs</code>) — and <strong>explicit</strong> via <code>memory_promote</code> (jumps to Long in a single call by default; an optional <code>target_tier</code> parameter stops at Mid).</p>
     <div class="flow">
       <div class="step"><div class="t">step 1</div><div class="h">Caller submits</div><div class="b"><code>memory_promote</code> with the target id. The daemon resolves the memory's namespace.</div></div>
       <div class="step"><div class="t">step 2</div><div class="h">Governance check</div><div class="b">Pick <code>policy.promote</code> from the namespace standard. Default <code>Any</code>. Other levels: <code>Registered</code>, <code>Owner</code>, <code>Approve</code>.</div></div>
@@ -355,8 +441,8 @@ footer a{color:var(--text-muted)}
 short_ttl_secs = <span class="num">3600</span>     <span class="cm"># 1h instead of 6h</span>
 mid_ttl_secs   = <span class="num">2592000</span>  <span class="cm"># 30d instead of 7d</span>
 long_ttl_secs  = <span class="val">0</span>        <span class="cm"># 0 = no TTL (default for Long)</span>
-short_extend_secs = <span class="num">1800</span>  <span class="cm"># bump expiry 30min on access</span>
-mid_extend_secs   = <span class="num">86400</span> <span class="cm"># bump 1d on access</span></div>
+short_extend_secs = <span class="num">1800</span>  <span class="cm"># access resets expiry to now+30min</span>
+mid_extend_secs   = <span class="num">86400</span> <span class="cm"># access resets expiry to now+1d</span></div>
     <h3 style="margin-top:1.5rem">Per-namespace governance — gate the promotion</h3>
     <div class="snip"><span class="cm">// namespace standard's metadata.governance</span>
 {
@@ -374,7 +460,7 @@ mid_extend_secs   = <span class="num">86400</span> <span class="cm"># bump 1d on
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Garbage collection — automatic, observable.</h2>
     <p class="lede">When a memory's <code>expires_at</code> passes, GC sweeps it on the next cycle. Two paths: hard delete, or archive-on-GC (configurable). Archived memories are restorable; deleted ones are not. Default is archive — recoverable by design.</p>
     <div class="flow">
-      <div class="step"><div class="t">cycle</div><div class="h">memory_gc tick</div><div class="b">Periodic sweep. Walks <code>memories WHERE expires_at &lt; now()</code>. Default cadence configurable; can also be invoked on-demand via the MCP <code>memory_gc</code> tool.</div></div>
+      <div class="step"><div class="t">cycle</div><div class="h">memory_gc tick</div><div class="b">Periodic sweep. Walks <code>memories WHERE expires_at &lt; now()</code>. The daemon's background loop runs every 30 minutes (<code>GC_INTERVAL_SECS</code>); can also be invoked on-demand via the MCP <code>memory_gc</code> tool.</div></div>
       <div class="step"><div class="t">option A</div><div class="h">archive_on_gc=true (default)</div><div class="b">Row moves to <code>archived_memories</code> with full metadata. Restorable via <code>memory_archive_restore</code>. Purge-able via <code>memory_archive_purge</code> when you really want it gone.</div></div>
       <div class="step"><div class="t">option B</div><div class="h">archive_on_gc=false</div><div class="b">Hard delete. Row removed from <code>memories</code>. FTS index updated. HNSW vector evicted. Federation fanout deletes peer copies.</div></div>
       <div class="step"><div class="t">forever</div><div class="h">Long tier untouched</div><div class="b">No <code>expires_at</code> means GC's WHERE clause never matches. Long memories survive every sweep until something else (delete, forget, archive) touches them.</div></div>
@@ -397,7 +483,7 @@ mid_extend_secs   = <span class="num">86400</span> <span class="cm"># bump 1d on
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · tier semantics in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/models.rs">models.rs</a> · TTL config in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/config.rs">config.rs</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · tier semantics in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/models/mod.rs">models.rs</a> · TTL config in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/config.rs">config.rs</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="hierarchies.html">Hierarchies</a> · <a href="lifecycle.html">Lifecycle</a> · <a href="governance.html">Governance</a></p>
 </footer>
 

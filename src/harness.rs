@@ -7,7 +7,7 @@
 //! a `clientInfo` object with a `name` field that identifies the
 //! harness — e.g. `"claude-code"`, `"codex"`, `"cursor"`, `"cline"`.
 //! The substrate captures that string at handshake time
-//! (`src/mcp.rs::serve_stdio` already stashes it as `mcp_client_name`)
+//! (`crate::mcp::serve_stdio` already stashes it as `mcp_client_name`)
 //! and then needs to make a behavioural decision: does this harness
 //! surface tools registered *after* the initial `tools/list` to the
 //! LLM, or does it cache the manifest at session start?

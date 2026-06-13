@@ -58,6 +58,65 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+// L4 layered-capture DTOs live in `models` (always compiled) so the MCP
+// tool, the sqlite SSOT free function, and the HTTP route handler can
+// reach them in standard (non-`sal`) builds; re-export here so the SAL
+// trait + both adapters keep referencing `crate::store::CaptureTurn*`.
+pub use crate::models::{CaptureTurnResult, CaptureTurnWrite};
+use crate::quotas::QuotaStatus;
+
+/// Default connection pool ceiling. Tuned for a mid-range ai-memory
+/// daemon — operators override via the `AI_MEMORY_PG_POOL_MAX` /
+/// `AI_MEMORY_PG_POOL_MIN` / `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` knobs
+/// (resolved by `AppConfig::resolve_pg_pool` and threaded in as a
+/// [`PoolConfig`]) when wiring a larger deployment.
+///
+/// Lives here in `store` (the `sal`-gated module) rather than in the
+/// `sal-postgres`-gated `store::postgres` so the daemon's
+/// `build_store_handle` — which is `#[cfg(feature = "sal")]` and must
+/// name `PoolConfig` in its signature even in a `sal`-only build with no
+/// postgres adapter compiled — can reference the type. The postgres
+/// adapter re-exports it (`pub use crate::store::PoolConfig;`).
+const DEFAULT_MAX_CONNECTIONS: u32 = 16;
+
+/// Default floor of always-open connections kept warm in the pool.
+/// Mirrors the long-documented `min=2` posture so a daemon that has
+/// gone idle still answers the next request without paying full TCP +
+/// TLS + `after_connect` setup latency on a cold pool. sqlx's own
+/// default is `0`; we set `2` explicitly because the prior code never
+/// wired `min_connections`, leaving the documented floor un-shipped.
+const DEFAULT_MIN_CONNECTIONS: u32 = 2;
+
+/// Default `acquire()` wait before erroring, in whole seconds.
+const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+
+/// Resolved connection-pool sizing knobs threaded from
+/// `AppConfig::resolve_pg_pool` down into the sqlx `PgPoolOptions`
+/// build. Mirrors the `statement_timeout_secs` threading pattern: a
+/// small `Copy` bundle so the connect chain takes one parameter
+/// instead of three positional `u32`/`u64`s. Construct via
+/// [`PoolConfig::default`] for the compiled defaults, or build
+/// explicitly from resolved config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Hard ceiling on open connections (sqlx `max_connections`).
+    pub max_connections: u32,
+    /// Floor of always-open warm connections (sqlx `min_connections`).
+    pub min_connections: u32,
+    /// How long `acquire()` waits for a free connection before erroring
+    /// (sqlx `acquire_timeout`), in whole seconds.
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            min_connections: DEFAULT_MIN_CONNECTIONS,
+            acquire_timeout_secs: DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        }
+    }
+}
 
 /// Knowledge-graph backend resolved at adapter init.
 ///
@@ -214,6 +273,17 @@ pub enum StoreError {
     #[error("invalid input: {detail}")]
     InvalidInput { detail: String },
 
+    /// #1568 (H1 residual) — link write refused by a substrate
+    /// pre-link gate (the `reflects_on` cycle invariant). `detail`
+    /// carries the canonical
+    /// [`crate::storage::LINK_CYCLE_ERR_PREFIX`]-prefixed message
+    /// byte-identical to the sqlite path's
+    /// `StorageError::LinkReflectionCycle` Display, so the
+    /// trait-routed HTTP surface returns the same 409 CONFLICT body
+    /// shape on both backends.
+    #[error("{detail}")]
+    LinkRefused { detail: String },
+
     #[error("requested capability not supported by this backend: {capability}")]
     UnsupportedCapability { capability: String },
 
@@ -222,6 +292,37 @@ pub enum StoreError {
 
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
+}
+
+impl StoreError {
+    /// ARCH-9 (FX-C4-batch2, 2026-05-26) — canonical stable error
+    /// slug for each variant.
+    ///
+    /// Mirrors [`crate::errors::MemoryError::code`] and
+    /// [`crate::storage::error::StorageError::code`]. The three
+    /// `code()` methods together let cross-surface (HTTP / MCP /
+    /// CLI) parity tests assert byte-equal slug values from a
+    /// single source of truth at [`crate::errors::error_codes`].
+    /// Adding a variant requires extending the match below and the
+    /// test `arch_9_store_error_slug_round_trip` in the
+    /// `error_codes` test module.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        use crate::errors::error_codes;
+        match self {
+            Self::NotFound { .. } => error_codes::NOT_FOUND,
+            Self::Conflict { .. } => error_codes::CONFLICT,
+            Self::PermissionDenied { .. } => error_codes::GOVERNANCE_REFUSED,
+            Self::BackendUnavailable { .. } => error_codes::STORE_BACKEND_UNAVAILABLE,
+            Self::InvalidInput { .. } => error_codes::VALIDATION_FAILED,
+            // #1568 — a refused link is a graph-state conflict (409),
+            // matching the sqlite branch's LinkReflectionCycle mapping.
+            Self::LinkRefused { .. } => error_codes::CONFLICT,
+            Self::UnsupportedCapability { .. } => error_codes::STORE_UNSUPPORTED_CAPABILITY,
+            Self::IntegrityFailed { .. } => error_codes::STORE_OPERATION_FAILED,
+            Self::Backend(_) => error_codes::DATABASE_ERROR,
+        }
+    }
 }
 
 /// Escape hatch for adapter-specific errors that don't map cleanly to
@@ -242,6 +343,31 @@ impl BoxBackendError {
 /// Convenience alias — every trait method returns this.
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// #1624 — shared integrity finding-checks for [`MemoryStore::verify`]
+/// so both adapters report IDENTICAL findings for identical rows.
+/// Union of the two pre-#1624 checkers (sqlite: title/content/agent_id;
+/// postgres: content + a HARD error on unparseable `created_at`).
+/// A malformed `created_at` is now a FINDING on both backends rather
+/// than a postgres-only `IntegrityFailed` error — verify is a report
+/// surface, not a gate.
+#[must_use]
+pub fn integrity_findings(mem: &Memory) -> Vec<String> {
+    let mut findings: Vec<String> = Vec::new();
+    if mem.title.trim().is_empty() {
+        findings.push("title is empty".to_string());
+    }
+    if mem.content.trim().is_empty() {
+        findings.push("content is empty".to_string());
+    }
+    if mem.metadata.get("agent_id").is_none() {
+        findings.push("metadata.agent_id missing".to_string());
+    }
+    if chrono::DateTime::parse_from_rfc3339(&mem.created_at).is_err() {
+        findings.push(format!("created_at is not RFC3339: '{}'", mem.created_at));
+    }
+    findings
+}
+
 /// Identity + visibility + governance context threaded through every
 /// mutating operation. Reuses the NHI-hardened `agent_id` from the
 /// existing `crate::identity` resolution chain.
@@ -256,6 +382,13 @@ pub struct CallerContext {
     /// Optional request correlator for audit trails. Opaque string;
     /// adapters may persist as metadata.
     pub request_id: Option<String>,
+    /// #910 (SAL-level enforcement, 2026-05-19) — when true, the
+    /// SAL-layer scope=private visibility filter is BYPASSED for this
+    /// context. Reserved for operator-/admin-only call paths
+    /// (migrate, full export, federation catchup, GC sweeps); MUST
+    /// NOT be set by any tenant-facing handler. Default `false` — the
+    /// safe-by-default posture per the CLAUDE.md NHI contract.
+    pub bypass_visibility: bool,
 }
 
 impl CallerContext {
@@ -267,9 +400,91 @@ impl CallerContext {
             agent_id: agent_id.into(),
             as_agent: None,
             request_id: None,
+            bypass_visibility: false,
         }
     }
+
+    /// Construct an operator-/admin-only context that BYPASSES the
+    /// SAL-level scope=private visibility filter. Reserved for
+    /// migrate, full export, federation catchup, GC sweeps —
+    /// operator surfaces that must round-trip every row regardless
+    /// of `metadata.scope`. Never call this from a tenant-facing
+    /// handler.
+    ///
+    /// v0.7.0 #1062 (Agent-2 #9) — `for_admin_checked` (below) is
+    /// the preferred constructor for handler-side use because it
+    /// requires the caller to thread the `is_admin` bool from the
+    /// handler's admin gate, surfacing the dependency in the type
+    /// signature instead of relying on the CodeGraph allowlist
+    /// precheck (which can't match a dynamic `caller.clone()`
+    /// argument). The literal-arg form is still used by
+    /// background paths (federation catchup, GC sweeps) where the
+    /// admin posture is structural, not request-gated.
+    #[must_use]
+    pub fn for_admin(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            as_agent: None,
+            request_id: None,
+            bypass_visibility: true,
+        }
+    }
+
+    /// v0.7.0 #1062 (Agent-2 #9) — admin-context constructor that
+    /// REQUIRES the caller to thread an `is_admin` bool. Returns
+    /// the admin-bypass context when `is_admin` is true and a
+    /// tenant-scoped agent context when false. Use this from
+    /// tenant-facing handlers that may need admin-mode access for
+    /// admin-tagged callers — the `is_admin` argument forces the
+    /// type-level dependency so a future refactor that moves the
+    /// `for_admin` call earlier in the function (or removes the
+    /// gate) becomes a compile error rather than a silent
+    /// privilege escalation.
+    #[must_use]
+    pub fn for_admin_checked(agent_id: impl Into<String>, is_admin: bool) -> Self {
+        if is_admin {
+            Self::for_admin(agent_id)
+        } else {
+            Self::for_agent(agent_id)
+        }
+    }
+
+    /// The effective principal used by SAL-layer visibility filtering.
+    /// Returns `as_agent` when set (Task 1.5 — operator-impersonates-
+    /// agent), else `agent_id`. See [`is_visible_to_caller`].
+    #[must_use]
+    pub fn effective_principal(&self) -> &str {
+        self.as_agent.as_deref().unwrap_or(&self.agent_id)
+    }
 }
+
+/// #910 (security-medium, 2026-05-19 — SAL-level enforcement) — the
+/// canonical scope=private visibility predicate. Every SAL adapter
+/// query method that returns [`Memory`] rows runs the result set
+/// through this filter so a caller authenticated as `bob` cannot
+/// enumerate `alice`'s scope=private rows by any path (list, search,
+/// recall_hybrid, get, find_paths, export, etc.). Per the operator
+/// directive (pm-v3, memory `cd8ede94`), the SAL layer is the
+/// load-bearing enforcement surface; the handler-level filters in
+/// `src/handlers/memories_query.rs` + `src/handlers/kg.rs` are
+/// kept as belt-and-suspenders defense-in-depth.
+///
+/// Visibility rule (mirrors `storage::is_visible_to_agent` + the
+/// generated `scope_idx` column's COALESCE-to-`private` default):
+/// a row is visible iff
+///   `metadata.scope != "private"` (rows w/o the field are private
+///   by the CLAUDE.md NHI contract) OR
+///   `metadata.agent_id == caller`.
+///
+/// The `caller` argument is typically [`CallerContext::effective_principal`]
+/// so the `as_agent` override (operator-impersonates-agent) flows
+/// through correctly.
+/// #951 (Track A QC sweep, 2026-05-20) — single canonical
+/// implementation lives at [`crate::visibility::is_visible_to_caller`].
+/// This re-export preserves the existing call-site shape (`crate::
+/// store::is_visible_to_caller`) used by the SAL adapter ports and
+/// substrate code so the move is a no-op for callers.
+pub use crate::visibility::is_visible_to_caller;
 
 bitflags! {
     /// Capability flags advertised by each adapter. Enables feature
@@ -332,16 +547,212 @@ pub struct Filter {
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /
 /// MCP / CLI handlers depend only on `dyn MemoryStore`.
+///
+/// ## SAL-level scope=private visibility (issue #910, 2026-05-19)
+///
+/// Every query method that returns [`Memory`] rows MUST drop rows the
+/// caller cannot see per the scope=private rule. The canonical
+/// predicate is [`is_visible_to_caller`]; the resolved principal is
+/// [`CallerContext::effective_principal`]. Adapter implementations
+/// apply this filter post-fetch (correctness-equivalent to a SQL
+/// WHERE clause for limit-bounded result sets) so a caller
+/// authenticated as `bob` cannot enumerate `alice`'s scope=private
+/// rows by ANY query path — list, search, recall_hybrid, get,
+/// find_paths, list_memories_updated_since, export_memories, etc.
+///
+/// This is the load-bearing enforcement surface (per pm-v3,
+/// memory `cd8ede94`); the handler-level filters in
+/// `src/handlers/memories_query.rs` + `src/handlers/kg.rs` are
+/// kept as belt-and-suspenders defense-in-depth.
+///
+/// Future trait additions: any new query method that returns
+/// `Memory` (or memory ids that resolve to memories) MUST inherit
+/// this filter — either by accepting a `&CallerContext` and routing
+/// through `is_visible_to_caller`, or by documenting an
+/// admin-/operator-only contract that bypasses the filter.
 #[async_trait::async_trait]
 pub trait MemoryStore: Send + Sync {
     /// Capability bits advertised by this adapter. Stable across the
     /// process lifetime.
     fn capabilities(&self) -> Capabilities;
 
+    /// v0.7.0.1 S75 — return the highest applied DB schema-migration
+    /// version (the integer recorded in `schema_version.MAX(version)`)
+    /// from the underlying store. Surfaced through
+    /// `/api/v1/capabilities.db_schema_version` so operators can confirm
+    /// at runtime whether a deployed daemon's DB is on the schema the
+    /// binary expects (target is currently 28 — see the
+    /// `CURRENT_SCHEMA_VERSION` constant on each adapter).
+    ///
+    /// Default returns `0` so adapters that don't track a numeric
+    /// migration ladder (a future in-memory test adapter, etc.) round-
+    /// trip cleanly — clients that interpret `0` as "unknown / empty"
+    /// can branch off the typed value without parsing magic strings.
+    /// Adapters with real migration ladders (sqlite, postgres) MUST
+    /// override this method with a live lookup against their own
+    /// `schema_version` table.
+    async fn schema_version(&self) -> StoreResult<i64> {
+        Ok(0)
+    }
+
     /// Store a memory. The `ctx` supplies the calling agent; the
     /// `Memory.metadata.agent_id` field is authoritative over any
     /// client-supplied value.
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String>;
+
+    /// Store a memory together with its pre-computed embedding vector.
+    /// v0.7.0 Wave-3 Continuation 5 — semantic recall on postgres-
+    /// backed daemons relies on `memories.embedding` being populated
+    /// at write time; the SQLite path does the same via
+    /// `db::insert_with_embedding`. Adapters that don't have a vector
+    /// column (sqlite — embeddings live in a separate side-table)
+    /// fall back to plain `store` and ignore the vector; the
+    /// PostgresStore overrides this to bind the vector into the
+    /// INSERT. Default implementation forwards to `store`.
+    async fn store_with_embedding(
+        &self,
+        ctx: &CallerContext,
+        memory: &Memory,
+        _embedding: Option<&[f32]>,
+    ) -> StoreResult<String> {
+        self.store(ctx, memory).await
+    }
+
+    /// Store many memories in as few round-trips as the backend allows
+    /// (#1481). Returns the upserted ids in input order.
+    ///
+    /// Contract: callers MUST pre-validate and pre-govern each row
+    /// (the bulk HTTP path filters Deny/Pending/validation failures out
+    /// before calling). This method is the persistence primitive only —
+    /// it is atomic (all rows commit or none do), so a single row that
+    /// fails to persist rolls the whole batch back.
+    ///
+    /// The default implementation loops [`store`](Self::store) so every
+    /// adapter is correct without an override; SQLite inherits it
+    /// unchanged because its writes are in-process (no per-row network
+    /// round-trip to amortise). `PostgresStore` overrides this with one
+    /// multi-row `INSERT ... ON CONFLICT` so an N-row bulk ingest costs a
+    /// single round-trip instead of N.
+    async fn store_batch(
+        &self,
+        ctx: &CallerContext,
+        memories: &[Memory],
+    ) -> StoreResult<Vec<String>> {
+        let mut ids = Vec::with_capacity(memories.len());
+        for memory in memories {
+            ids.push(self.store(ctx, memory).await?);
+        }
+        Ok(ids)
+    }
+
+    /// Set or clear the embedding column for an existing memory.
+    /// v0.7.0 Wave-3 Continuation 5 — federation receivers re-embed
+    /// peer-pushed memories via this path so `recall_hybrid` can find
+    /// them. Default implementation is a no-op for adapters that
+    /// don't store embeddings inline (sqlite — embeddings live in a
+    /// side table).
+    async fn update_embedding(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _embedding: Option<&[f32]>,
+    ) -> StoreResult<()> {
+        Ok(())
+    }
+
+    /// #1579 A4 — bounded scan of memories whose inline `embedding`
+    /// column is NULL. Returns up to `limit` `(id, title, content)`
+    /// triples for the serve-boot embedding-backfill sweep
+    /// ([`run_embedding_backfill_on_store`]).
+    ///
+    /// **Why this exists.** The legacy backfill
+    /// (`crate::mcp::run_embedding_backfill*`) is implemented against
+    /// a `rusqlite::Connection` and is invoked ONLY from the MCP stdio
+    /// boot path — the `serve` daemon (the only postgres-capable
+    /// surface) never ran any sweep, so rows whose embeddings were
+    /// NULLed by the v29 embedding-dim migration stayed NULL forever
+    /// on postgres fleets (P3 audit: 37/7,994 rows embedded). This
+    /// trait method is the SAL-level enumerator that closes that gap.
+    ///
+    /// Default returns an empty vec: adapters that don't store
+    /// embeddings inline (sqlite — embeddings live in a side table and
+    /// are backfilled by the MCP-boot path / the `src/storage` sweep)
+    /// make the serve-boot sweep a structural no-op, preserving their
+    /// existing behaviour exactly.
+    async fn list_unembedded(
+        &self,
+        _ctx: &CallerContext,
+        _limit: usize,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// #1579 A4 — write a batch of freshly-computed embeddings in as
+    /// few round-trips as the backend allows. Mirrors the sqlite-side
+    /// `db::set_embeddings_batch` bounded-batch shape (F5.6 semantics:
+    /// one transaction per chunk, so a fault aborts at most one chunk
+    /// of work). Returns the number of rows actually updated.
+    ///
+    /// Default implementation loops [`update_embedding`]
+    /// (Self::update_embedding) so every adapter is correct without an
+    /// override; `PostgresStore` overrides it with a single-transaction
+    /// multi-UPDATE so an N-row chunk costs one commit instead of N.
+    async fn set_embeddings_batch(
+        &self,
+        ctx: &CallerContext,
+        entries: &[(String, Vec<f32>)],
+    ) -> StoreResult<usize> {
+        let mut written = 0usize;
+        for (id, vec) in entries {
+            self.update_embedding(ctx, id, Some(vec)).await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Execute an approved pending governance action — mirrors
+    /// `db::execute_pending_action` on the SQLite path. The pending
+    /// row's `action_type` selects the operation (`store` / `delete`
+    /// / `promote`) and the `payload` carries the materialised
+    /// memory data. Returns the resulting memory id when the action
+    /// produced one (store + promote), or `None` for a delete.
+    /// Default returns `UnsupportedCapability`.
+    async fn execute_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        _pending_id: &str,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_EXECUTE_PENDING".to_string(),
+        })
+    }
+
+    /// Perform the L4 layered-capture idempotent write (#1416 /
+    /// RFC-0001 §"Idempotency contract").
+    ///
+    /// Atomic contract — given a prepared [`CaptureTurnWrite`]:
+    /// 1. SELECT `memory_id` FROM `transcript_line_dedup` on the
+    ///    canonical `(host_session_id, host_turn_index)` key.
+    /// 2. On hit: return `{memory_id, dedup_hit: true}` with NO write.
+    /// 3. On miss: INSERT the memory + the `transcript_line_dedup` row +
+    ///    the `signed_events` chain row inside ONE transaction; any
+    ///    failure rolls all three back so an orphaned memory can never
+    ///    exist without its dedup row OR its audit row.
+    ///
+    /// This is the single SSOT routing the L4 transaction through the
+    /// SAL so postgres-backed daemons gain a callable L4 surface — the
+    /// sqlite MCP handler and the HTTP `memory_capture_turn` route both
+    /// reach it via `app.store`. Default returns `UnsupportedCapability`
+    /// so a future test/in-memory adapter round-trips cleanly.
+    async fn capture_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        _write: &CaptureTurnWrite,
+    ) -> StoreResult<CaptureTurnResult> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "L4_CAPTURE_TURN".to_string(),
+        })
+    }
 
     /// Fetch a memory by id. Returns `NotFound` when the memory does
     /// not exist OR when the caller lacks read permission (the trait
@@ -360,6 +771,40 @@ pub trait MemoryStore: Send + Sync {
     /// List matching memories. Ordering is adapter-specific but
     /// deterministic across calls with identical `Filter`.
     async fn list(&self, ctx: &CallerContext, filter: &Filter) -> StoreResult<Vec<Memory>>;
+
+    /// Fetch rows whose namespace begins with `prefix`, capped at
+    /// `limit`. Used by event dispatch to pull the subscription mirror
+    /// (`_subscriptions/<agent>`) without enumerating the whole store.
+    ///
+    /// The default impl preserves the historical behavior — a full
+    /// [`list`](Self::list) with an in-process prefix filter — so
+    /// adapters that have no cheaper path keep working unchanged. The
+    /// postgres adapter overrides this with a sargable prefix query so
+    /// the lookup uses the `namespace` btree index instead of
+    /// seq-scanning every row on every write (the per-write dispatch
+    /// hot path).
+    /// List memories whose namespace starts with `prefix`, newest-
+    /// priority-first, capped at `limit` MATCHES.
+    ///
+    /// #1625 — the old trait default applied `limit` BEFORE the prefix
+    /// filter (one `list(limit)` call, then in-process `starts_with`),
+    /// so on a corpus larger than `limit` it could return 0 matches
+    /// that exist. There is no offset on [`Filter`], so a correct
+    /// generic fallback cannot page; the default now fails LOUDLY with
+    /// `UnsupportedCapability` and each adapter implements a real
+    /// prefix query (PostgresStore: sargable `LIKE`; SqliteStore:
+    /// offset-paged scan over `db::list`).
+    async fn list_by_namespace_prefix(
+        &self,
+        _ctx: &CallerContext,
+        _prefix: &str,
+        _limit: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "list_by_namespace_prefix (per-adapter implementation required; #1625)"
+                .to_string(),
+        })
+    }
 
     /// Keyword search (FTS-equivalent). Adapters without full-text
     /// search may return `UnsupportedCapability` and let upper
@@ -386,7 +831,92 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// Create a typed link between two memories.
+    ///
+    /// Always writes `attest_level = "unsigned"` — callers that want a
+    /// signed write must reach for [`MemoryStore::link_signed`].
     async fn link(&self, ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()>;
+
+    /// Create a typed link signed by the supplied agent keypair.
+    ///
+    /// v0.7.0 F6 Gap 3 — exposes the full signed-link contract through
+    /// the SAL so federation and self-signed writes do not have to dip
+    /// into adapter-specific helpers (`db::create_link_signed`,
+    /// `PostgresStore::link_signed`). Mirrors the H2 contract:
+    /// when `keypair` is `Some(kp)` AND `kp.can_sign()`, the six
+    /// signable fields are CBOR-canonicalised and signed; the resulting
+    /// 64-byte signature is persisted with `attest_level = "self_signed"`
+    /// and `observed_by = kp.agent_id`. Otherwise the row lands with
+    /// `attest_level = "unsigned"`, `signature = NULL`, `observed_by =
+    /// NULL` — the same fallback every backend already implements
+    /// through [`MemoryStore::link`].
+    ///
+    /// Returns the resolved attestation level so callers (HTTP / MCP
+    /// surfaces) can surface it in the wire response without re-querying.
+    ///
+    /// The default implementation forwards to [`MemoryStore::link`] and
+    /// returns `"unsigned"`, preserving wire-shape parity for adapters
+    /// that haven't wired the signing path yet.
+    async fn link_signed(
+        &self,
+        ctx: &CallerContext,
+        link: &MemoryLink,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
+        let _ = keypair;
+        self.link(ctx, link).await?;
+        Ok(crate::models::AttestLevel::Unsigned.as_str())
+    }
+
+    /// Enumerate every link in the store, optionally narrowed to a
+    /// namespace.
+    ///
+    /// v0.7.0 F6 Gap 2 — required by the SAL-driven migrate so
+    /// `memory_links` rows survive a cross-backend copy. Adapters
+    /// stream through their own `memory_links` table and project into
+    /// [`MemoryLink`]; the namespace filter, when set, matches links
+    /// whose **source** memory lives in the given namespace (the same
+    /// affinity SQLite's `migrate` uses for memories — links live with
+    /// their source).
+    ///
+    /// Ordering is deterministic across calls — adapters sort by
+    /// `(source_id, target_id, relation)` so a paginated migrate can
+    /// resume mid-stream without losing rows.
+    async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>>;
+
+    /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Returns
+    /// every link where `anchor_id` is either the source or the target
+    /// (the inbound + outbound union — same shape `db::get_links` has
+    /// returned since v0.6 for the `memory_get_links` MCP tool).
+    ///
+    /// Replaces the audit's missing-trait reach at `links.rs:894` and
+    /// `power.rs:280` so the per-anchor scan can ride the SAL trait
+    /// instead of falling through to the legacy free-function path.
+    /// [`MemoryStore::list_links`] is namespace-scoped, not
+    /// anchor-scoped, so the two methods are complementary — list_links
+    /// powers migrate/export; get_links_for_anchor powers the graph
+    /// view at a specific node.
+    ///
+    /// Wire-shape contract (matches `db::get_links`):
+    /// - `source_id`, `target_id`, `relation` populated from the row.
+    /// - `created_at`, `valid_from`, `valid_until`, `observed_by`,
+    ///   `attest_level` projected so the `memory_get_links` MCP tool's
+    ///   docstring promise holds on both backends.
+    /// - `signature` stays `None` (the verifier surface owns the bytes
+    ///   blob; exposing it here would force every existing caller to
+    ///   ignore a base64 blob in the response).
+    ///
+    /// Ordering: descending by `created_at` (most-recent edges first)
+    /// to match the SQLite `db::get_links` natural ordering after the
+    /// v0.7.0 issue #860 row-projection widening.
+    ///
+    /// Default returns `UnsupportedCapability` so adapters that don't
+    /// yet wire the per-anchor probe fail loudly rather than silently
+    /// degrade to an empty list (which would mask graph data loss).
+    async fn get_links_for_anchor(&self, _anchor_id: &str) -> StoreResult<Vec<MemoryLink>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_LINKS_FOR_ANCHOR".to_string(),
+        })
+    }
 
     /// Register an agent in the adapter's `_agents` namespace (Task
     /// 1.3).
@@ -395,6 +925,1314 @@ pub trait MemoryStore: Send + Sync {
         ctx: &CallerContext,
         agent: &AgentRegistration,
     ) -> StoreResult<()>;
+
+    /// Bind (or rotate) an agent's Ed25519 public key into its
+    /// registration metadata (#626 Layer-3, Task 1.3 / C3).
+    ///
+    /// The bound key is the anchor the write-path attestation gate
+    /// verifies a signed write against — upgrading the write's
+    /// `agent_id` from *claimed* to *attested*. The agent must already
+    /// be registered; re-binding rotates the key.
+    ///
+    /// Default returns `UnsupportedCapability` so an adapter that has
+    /// not wired key provisioning fails loudly rather than silently
+    /// dropping a key an operator believes is bound.
+    async fn bind_agent_pubkey(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _pubkey_b64: &str,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "BIND_AGENT_PUBKEY".to_string(),
+        })
+    }
+
+    /// Fetch the Ed25519 public key bound to `agent_id`, if any (#626
+    /// Layer-3, Task 1.3 / C3).
+    ///
+    /// `Ok(None)` means "no key to verify against" — the agent is
+    /// registered without a key (permissive-default posture) OR is not
+    /// registered at all. The verifier treats both alike unless
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set.
+    ///
+    /// Default returns `Ok(None)` (permissive): an adapter without key
+    /// provisioning behaves as "no agent has an attestable key", so
+    /// every write stays at the *claimed* level rather than erroring.
+    async fn agent_pubkey(&self, _agent_id: &str) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Revoke the Ed25519 public key bound to `agent_id` (#626 Layer-3,
+    /// Task 1.3 / C5).
+    ///
+    /// Clears the bound key so the agent reverts to the permissive
+    /// *claimed* posture until a fresh key is bound. The agent must
+    /// already be registered; revoking an agent that never bound a key
+    /// is a no-op success (idempotent).
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors
+    /// `bind_agent_pubkey`) so an adapter without key provisioning fails
+    /// loudly rather than silently leaving a key an operator believes
+    /// is revoked.
+    async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, _agent_id: &str) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REVOKE_AGENT_PUBKEY".to_string(),
+        })
+    }
+
+    /// v0.7.0 Wave-3 Continuation — adapter-specific downcast hatch.
+    ///
+    /// Returns the adapter as `&dyn Any` so that downstream callers
+    /// holding an `Arc<dyn MemoryStore>` can recover the concrete
+    /// adapter type when they need to call adapter-only helpers
+    /// (e.g. `PostgresStore::list_archived` which projects from a
+    /// table not yet covered by the trait surface).
+    ///
+    /// Default returns a unit reference; adapters override to return
+    /// `self`.
+    ///
+    /// ARCH-15 (FX-C4-batch2, 2026-05-26): renamed from
+    /// `as_any_for_postgres` to the generic `as_any`. The legacy name
+    /// would have locked the hatch to today's two adapters; a future
+    /// third adapter (in-memory test adapter, AGE-only path) can now
+    /// override the same hook without a trait-surface rename. The
+    /// `as_any_for_postgres` shim below is kept as a compat alias so
+    /// any out-of-tree consumers that depended on the original name
+    /// don't break at v0.7.0 — the alias is `#[deprecated]` and slated
+    /// for removal in v0.8.0.
+    fn as_any(&self) -> &dyn std::any::Any {
+        &()
+    }
+
+    /// Compat alias for the pre-ARCH-15 method name.
+    ///
+    /// This shim simply delegates to [`MemoryStore::as_any`]. Out-of-tree
+    /// callers that pin the old name should migrate to `as_any` before
+    /// v0.8.0 when this alias is removed.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `MemoryStore::as_any` directly; will be removed in v0.8.0"
+    )]
+    fn as_any_for_postgres(&self) -> &dyn std::any::Any {
+        self.as_any()
+    }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 2 — federation surface (Phase 8).
+    //
+    // The two methods below underpin the peer-to-peer sync transport.
+    // `list_memories_updated_since` powers `GET /api/v1/sync/since`
+    // (peer catchup pulls); `apply_remote_memory` powers each row of
+    // `POST /api/v1/sync/push` (peer fanout pushes).
+    //
+    // Both adapters implement. Federation between two postgres-backed
+    // daemons and heterogeneous federation (sqlite ↔ postgres) ride
+    // exclusively through these trait methods so the wire shape is
+    // backend-blind.
+    // ==================================================================
+
+    /// List memories whose `updated_at` is strictly greater than the
+    /// supplied RFC-3339 timestamp, ordered ascending by `updated_at`.
+    ///
+    /// `since == None` returns the oldest `limit` memories (initial-sync
+    /// posture). Implementations MUST cap their result at the supplied
+    /// `limit` value AND apply a sane upper bound (10_000) to prevent
+    /// a misbehaving caller from page-pulling the entire database in
+    /// one shot.
+    ///
+    /// Default implementation: `UnsupportedCapability` so adapters that
+    /// don't yet wire federation degrade gracefully rather than
+    /// silently returning an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `since` does not parse as RFC-3339.
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_memories_updated_since(
+        &self,
+        _since: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_LIST_SINCE".to_string(),
+        })
+    }
+
+    /// Apply a remote-origin memory through an idempotent
+    /// "insert-if-newer" path. Returns the resolved memory id (the
+    /// adapter's row id, which may differ from the supplied `memory.id`
+    /// when an upsert collapses onto an existing row by `(title,
+    /// namespace)`).
+    ///
+    /// Semantics MUST mirror the sqlite `db::insert_if_newer` contract:
+    /// 1. If no existing row matches, INSERT verbatim.
+    /// 2. If an existing row matches by id AND its `updated_at` is
+    ///    older than the incoming memory's `updated_at`, UPDATE.
+    /// 3. If an existing row matches by id AND its `updated_at` is
+    ///    newer-or-equal, NOOP (return the existing id).
+    /// 4. Tier never downgrades — incoming `mid` does not overwrite
+    ///    existing `long`.
+    /// 5. `metadata.agent_id` is preserved across upsert.
+    ///
+    /// Default implementation: `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `memory` fails validation. Returns
+    /// `Backend` for storage errors.
+    async fn apply_remote_memory(
+        &self,
+        _ctx: &CallerContext,
+        _memory: &Memory,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_APPLY_REMOTE".to_string(),
+        })
+    }
+
+    /// Apply a remote-origin link via the same idempotent posture as
+    /// [`MemoryStore::apply_remote_memory`]. The unique
+    /// `(source_id, target_id, relation)` index makes duplicate
+    /// federation pushes a no-op.
+    ///
+    /// `attest_level` is the resolved attestation level the receiver
+    /// computed (see `handlers::sync_push` H3 verify path) — adapters
+    /// stamp this into the row so subsequent reads carry the
+    /// peer-attested / unsigned distinction.
+    ///
+    /// Default implementation: forward to [`MemoryStore::link`] which
+    /// always lands the row as `unsigned`. Postgres + SQLite override
+    /// to honor `attest_level`.
+    async fn apply_remote_link(
+        &self,
+        ctx: &CallerContext,
+        link: &MemoryLink,
+        attest_level: &str,
+    ) -> StoreResult<()> {
+        let _ = attest_level;
+        self.link(ctx, link).await
+    }
+
+    /// Hard-delete a memory by id, returning `true` when a row was
+    /// removed and `false` when no row matched (already-deleted /
+    /// never-existed). Default implementation lifts the trait `delete`
+    /// surface — which returns `NotFound` on miss — into a boolean for
+    /// federation's no-op-on-missing-row contract.
+    async fn apply_remote_deletion(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        match self.delete(ctx, id).await {
+            Ok(()) => Ok(true),
+            Err(StoreError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 2 — full hybrid recall pipeline
+    // (Phase 10).
+    //
+    // The recall pipeline blends FTS keyword scoring with semantic
+    // (embedding cosine) similarity, then applies adaptive blending
+    // (semantic weight varies by content length: 0.50 for short
+    // content ≤500 chars, 0.15 for long content ≥5000 chars, lerp in
+    // between). Each candidate gets a 6-factor blended score, then
+    // the survivors are touched (access_count++, TTL extended,
+    // mid→long auto-promotion at 5 accesses, priority++ every 10
+    // accesses).
+    //
+    // Both adapters implement; sqlite delegates to db::recall_hybrid,
+    // postgres synthesises the same 6-factor blend over pgvector +
+    // tsvector + ts_rank.
+    // ==================================================================
+
+    /// Run a hybrid (FTS + semantic) recall against the store. Returns
+    /// up to `limit` `(Memory, score)` pairs, ranked descending by
+    /// blended score. The `query_embedding` is the caller-supplied
+    /// embedding for `query`; adapters that lack a native vector index
+    /// MAY ignore it and fall back to keyword-only.
+    ///
+    /// Default implementation: keyword fallback through `search`. This
+    /// preserves wire-shape parity for adapters that haven't yet wired
+    /// the full pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage-level errors. `InvalidInput` when
+    /// `since` / `until` fail to parse.
+    async fn recall_hybrid(
+        &self,
+        ctx: &CallerContext,
+        query: &str,
+        _query_embedding: Option<&[f32]>,
+        filter: &Filter,
+    ) -> StoreResult<Vec<(Memory, f64)>> {
+        // Default: degrade to keyword-only via the existing `search`
+        // method. Synthetic descending score so wire shape parity for
+        // clients that sort/limit by score.
+        let mems = self.search(ctx, query, filter).await?;
+        let scored = mems
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| {
+                #[allow(clippy::cast_precision_loss)]
+                let synthetic = 1.0 - (i as f64) * 0.01;
+                (m, synthetic)
+            })
+            .collect();
+        Ok(scored)
+    }
+
+    /// Touch the supplied memory ids: increment `access_count`,
+    /// extend TTL (1h short / 1d mid by default — adapters honor the
+    /// resolved TTL config), auto-promote mid→long at 5 accesses,
+    /// increment priority every 10 accesses (capped at 10).
+    ///
+    /// Idempotent on a per-id basis; missing ids are silently skipped.
+    /// Default returns `Ok(())` — adapters that wire touch ops override.
+    async fn touch_after_recall(&self, _ids: &[String]) -> StoreResult<()> {
+        Ok(())
+    }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 2 — governance write paths
+    // (Phase 11).
+    //
+    // These trait methods cover the simple, structural operations on
+    // the governance surface — pending decision (approve/reject) +
+    // namespace standard (set/clear/get). The full governance walk
+    // (namespace inheritance chain, approver_type policy, consensus
+    // tracking) remains where it lives: SQLite-backed daemons get the
+    // full pipeline through `db::*` free functions; postgres-backed
+    // daemons get the structural surface here. Operators who need the
+    // full consensus + approver_type pipeline on postgres pin to the
+    // `--store-url sqlite://` form for v0.7.0 — a follow-on track will
+    // port the governance walk to the trait surface.
+    // ==================================================================
+
+    /// Decide a pending action (approve when `approve == true`, reject
+    /// otherwise). Returns `true` when the row transitioned from
+    /// `pending` to a decided state, `false` when no row matched or
+    /// the row was already decided. Adapters MUST stamp `decided_by`
+    /// and `decided_at`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn pending_decide(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _approve: bool,
+        _decided_by: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_PENDING_DECIDE".to_string(),
+        })
+    }
+
+    /// Read a pending action by id. Returns `None` when no row matches.
+    /// Default returns `UnsupportedCapability`.
+    async fn get_pending(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::PendingAction>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_GET_PENDING".to_string(),
+        })
+    }
+
+    /// Set the namespace standard memory id, optionally with an
+    /// explicit parent namespace for the inheritance chain. Adapters
+    /// validate that `standard_id` references an existing memory.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn set_namespace_standard(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _standard_id: &str,
+        _parent: Option<&str>,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_SET_STANDARD".to_string(),
+        })
+    }
+
+    /// Clear the namespace standard. Returns `true` when a row was
+    /// removed, `false` when no namespace_meta row matched. Default
+    /// returns `UnsupportedCapability`.
+    async fn clear_namespace_standard(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_CLEAR_STANDARD".to_string(),
+        })
+    }
+
+    /// Read the namespace standard tuple `(standard_id, parent_namespace)`.
+    /// Default returns `UnsupportedCapability`.
+    async fn get_namespace_standard(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+    ) -> StoreResult<Option<(String, Option<String>)>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_GET_STANDARD".to_string(),
+        })
+    }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths
+    // (Phase 13/14/16/17/18/19).
+    //
+    // These trait methods cover the remaining sqlite-only HTTP endpoints
+    // so postgres-backed daemons can serve them without falling through
+    // to the 501 envelope. Default implementations return
+    // `UnsupportedCapability`; both adapters override.
+    // ==================================================================
+
+    /// Forget memories matching a (namespace, pattern, tier) filter.
+    /// Returns the count deleted. When `archive` is true, matching rows
+    /// are inserted into the archive table with `archive_reason='forget'`
+    /// before deletion. At least one of namespace/pattern/tier must be
+    /// non-None — adapters return `InvalidInput` otherwise.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn forget(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: Option<&str>,
+        _pattern: Option<&str>,
+        _tier: Option<&Tier>,
+        _archive: bool,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FORGET".to_string(),
+        })
+    }
+
+    /// Consolidate a set of memory ids into a single new memory. Returns
+    /// the new memory's id. Adapters MUST:
+    /// 1. Verify all source ids exist (else `NotFound`).
+    /// 2. Merge tags (de-duplicated, sorted) + metadata (skipping
+    ///    `agent_id` to avoid forgery).
+    /// 3. Take `max(priority)` across sources; `sum(access_count)`.
+    /// 4. Stamp `consolidator_agent_id` as the new `metadata.agent_id`.
+    /// 5. Preserve original authors in `metadata.consolidated_from_agents`.
+    /// 6. Record source ids in `metadata.derived_from`.
+    /// 7. Delete the source rows.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn consolidate(
+        &self,
+        _ctx: &CallerContext,
+        _ids: &[String],
+        _title: &str,
+        _summary: &str,
+        _namespace: &str,
+        _tier: &Tier,
+        _source: &str,
+        _consolidator_agent_id: &str,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CONSOLIDATE".to_string(),
+        })
+    }
+
+    /// Recursive-learning primitive (#655 Task 4/8): mint a reflection
+    /// memory over `input.source_ids`, computing
+    /// `reflection_depth = max(source depths) + 1`, refusing with
+    /// `ReflectionDepthExceeded` when the proposed depth exceeds the
+    /// namespace `effective_max_reflection_depth` (and appending the
+    /// `reflection.depth_exceeded` row to the tamper-evident
+    /// `signed_events` chain), then persisting the new memory plus one
+    /// `reflects_on` edge per source in a single atomic transaction.
+    /// When `signing_key` is `Some`, each `reflects_on` edge is signed
+    /// (Ed25519) so it lands `attest_level='self_signed'` (#815).
+    ///
+    /// Mirrors the sqlite `storage::reflect_with_hooks` contract.
+    /// Returns the rich [`crate::storage::reflect::ReflectError`] (not
+    /// `StoreError`) so callers can render the stable
+    /// `REFLECTION_DEPTH_EXCEEDED` / `CALLER_DEPTH_MISMATCH` /
+    /// `REFLECTION_HOOK_VETO` wire slugs uniformly across backends via
+    /// `crate::mcp::map_reflect_error_to_wire_string`.
+    ///
+    /// Default returns a backend-unsupported `ReflectError::Database`
+    /// (only `SqliteStore` + `PostgresStore` override this in
+    /// production).
+    async fn reflect(
+        &self,
+        _ctx: &CallerContext,
+        _input: &crate::storage::reflect::ReflectInput,
+        _signing_key: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
+    {
+        Err(crate::storage::reflect::ReflectError::Database(
+            "reflect is not supported on this storage backend".to_string(),
+        ))
+    }
+
+    /// Recursive-learning provenance (L2-2): walk a reflection memory's
+    /// origin metadata, returning the `ReflectionOrigin` record
+    /// (peer-origin, signing agent, original depth, local cap at
+    /// arrival, is-reflection flag) or `None` when the id is unknown.
+    /// Read-only. Default returns `UnsupportedCapability`.
+    async fn get_reflection_origin(
+        &self,
+        _id: &str,
+    ) -> StoreResult<Option<crate::federation::reflection_bookkeeping::ReflectionOrigin>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REFLECTION_ORIGIN".to_string(),
+        })
+    }
+
+    /// Recall-consumption ledger read (Provenance Gap 3): list
+    /// `recall_observations` rows filtered by recall id / consumed flag
+    /// / time window, capped at `limit`. Read-only. Default returns
+    /// `UnsupportedCapability`.
+    async fn list_recall_observations(
+        &self,
+        _recall_id: Option<&str>,
+        _consumed: Option<bool>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::observations::Observation>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECALL_OBSERVATIONS".to_string(),
+        })
+    }
+
+    /// Run a GC cycle: delete (or archive-then-delete) all memories
+    /// whose `expires_at` is in the past. Returns the count deleted.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn run_gc(&self, _archive: bool) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GC".to_string(),
+        })
+    }
+
+    /// Restore an archived memory back to the live `memories` table.
+    /// Returns true iff a row was restored. Adapters MUST:
+    /// 1. Return Ok(false) when no archive row matches.
+    /// 2. Reject (Conflict) when the id already exists in active memories.
+    /// 3. Restore with `original_tier` / `original_expires_at` / embedding.
+    /// 4. Delete the archive row.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_restore(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_RESTORE".to_string(),
+        })
+    }
+
+    /// Purge archived rows older than `older_than_days`. When `None`,
+    /// purge ALL archived rows MATCHING THE CALLER'S OWNERSHIP scope
+    /// (NOT a global wipe — see below). Returns the count purged.
+    ///
+    /// # Caller-vs-row-owner gate (#936, 2026-05-20)
+    ///
+    /// Pre-#936 the trait method took only `older_than_days` and the
+    /// handler at `src/handlers/archive.rs::purge_archive` did not
+    /// gate the call — any authenticated HTTP caller could
+    /// permanently destroy every owner's archived memories. The
+    /// signature now requires a [`CallerContext`] and adapters MUST
+    /// constrain the DELETE to rows whose `metadata.agent_id`
+    /// matches `ctx.effective_principal()` (with the inbox-target
+    /// carve-out preserved by [`is_visible_to_caller`]) UNLESS
+    /// `ctx.bypass_visibility` is set — that's the operator/admin
+    /// surface (`POST /api/v1/export`'s sibling) and is gated by
+    /// the shared admin-role allowlist before the handler ever
+    /// reaches the SAL.
+    ///
+    /// **Owner-blind purges are gone.** A non-admin call with no
+    /// matching rows returns `Ok(0)`; the caller cannot enumerate
+    /// other owners' archive corpus via this surface.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_purge(
+        &self,
+        _ctx: &CallerContext,
+        _older_than_days: Option<i64>,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_PURGE".to_string(),
+        })
+    }
+
+    /// Soft-archive a set of memory ids. Returns the count moved into
+    /// the archive table. Adapters MUST stamp `archive_reason` (defaults
+    /// to `"manual"` when None) and preserve the original tier + expiry.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_by_ids(
+        &self,
+        _ctx: &CallerContext,
+        _ids: &[String],
+        _reason: Option<&str>,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_BY_IDS".to_string(),
+        })
+    }
+
+    /// Export all live memories. Returns the full row set in stable
+    /// (id ascending) order; adapters MAY cap at a sane upper bound and
+    /// surface that via the response envelope.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_memories(&self) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT".to_string(),
+        })
+    }
+
+    /// Export all links. Returns the full link set in deterministic
+    /// `(source_id, target_id, relation)` order.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT_LINKS".to_string(),
+        })
+    }
+
+    /// Notify a target agent. Stamps a memory in the `_inbox` namespace
+    /// with the supplied payload + `metadata.target_agent_id =
+    /// target_agent`. Returns the new memory's id.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn notify(
+        &self,
+        _ctx: &CallerContext,
+        _target_agent: &str,
+        _title: &str,
+        _payload: &str,
+        _priority: Option<i32>,
+        _tier: Option<&Tier>,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "NOTIFY".to_string(),
+        })
+    }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 3 — full governance pipeline (Phase 20).
+    //
+    // Closes the parity gap on multi-vote consensus + approver_type
+    // variations + inheritance-chain walk on writes. The trait method
+    // below encapsulates the full state machine so handlers can stay
+    // backend-blind. Both adapters override.
+    // ==================================================================
+
+    /// Build the namespace inheritance chain top-down (`["*", root, ...,
+    /// leaf]`). Adapters must:
+    /// 1. Always start with the global standard `*`.
+    /// 2. Walk explicit `namespace_meta.parent_namespace` ancestors
+    ///    (bounded by 8 hops, cycle-safe).
+    /// 3. Append `/`-derived hierarchical ancestors top-down.
+    ///
+    /// Default returns `[namespace.to_string()]` so adapters that
+    /// haven't wired the namespace_meta walk degrade to a single-level
+    /// chain.
+    async fn build_namespace_chain(&self, namespace: &str) -> StoreResult<Vec<String>> {
+        Ok(vec![namespace.to_string()])
+    }
+
+    /// Resolve the governance policy that gates writes in `namespace`.
+    /// Walks the inheritance chain leaf-first; returns the most-specific
+    /// policy. When no policy is found in the chain, returns `None`.
+    ///
+    /// Default returns `None` so adapters that haven't wired the walk
+    /// surface "no governance configured" (the v0.6.x default).
+    async fn resolve_governance_policy(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
+        Ok(None)
+    }
+
+    /// Apply an approval vote against a pending action with full
+    /// approver_type semantics:
+    /// - `Human`: any caller approves; transitions to `approved`.
+    /// - `Agent(required)`: only `required` can approve.
+    /// - `Consensus(quorum)`: voter must be a registered agent; vote
+    ///   is recorded; threshold transitions to `approved`.
+    ///
+    /// Returns the resolved [`ApproveOutcome`] so the caller can
+    /// surface the appropriate wire envelope (Approved / Pending /
+    /// Rejected).
+    ///
+    /// Default returns `UnsupportedCapability` so backends that don't
+    /// yet wire the consensus state machine fail loudly rather than
+    /// silently downgrade to single-vote approval.
+    async fn governance_approve_with_consensus(
+        &self,
+        _ctx: &CallerContext,
+        _pending_id: &str,
+        _approver_agent_id: &str,
+    ) -> StoreResult<ApproveOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_CONSENSUS".to_string(),
+        })
+    }
+
+    /// True iff `agent_id` is registered in the adapter's `_agents`
+    /// namespace. Used by the consensus state machine to gate
+    /// otherwise-anonymous voters.
+    ///
+    /// Default returns `Ok(false)` so adapters that haven't wired the
+    /// agent registry default to "unregistered" (the safe-by-default
+    /// posture for the consensus path).
+    async fn is_registered_agent(&self, _agent_id: &str) -> StoreResult<bool> {
+        Ok(false)
+    }
+
+    /// Enforce governance for a write/delete/promote action against the
+    /// resolved policy. Returns the decision per the same contract as
+    /// `db::enforce_governance`:
+    /// - `Allow` — action proceeds.
+    /// - `Deny(reason)` — action blocked.
+    /// - `Pending(pending_id)` — action queued; caller must surface
+    ///   the pending id and wait for approval.
+    ///
+    /// Default returns `Allow` so adapters that haven't wired the walk
+    /// surface the v0.6.x posture (no governance) — consistent with
+    /// `resolve_governance_policy`'s default.
+    async fn enforce_governance_action(
+        &self,
+        _action: GovernedAction,
+        _namespace: &str,
+        _agent_id: &str,
+        _memory_id: Option<&str>,
+        _memory_owner: Option<&str>,
+        _payload: &serde_json::Value,
+    ) -> StoreResult<crate::models::GovernanceDecision> {
+        Ok(crate::models::GovernanceDecision::Allow)
+    }
+
+    // ==================================================================
+    // v0.7.0 Wave-3 Continuation 6 — quota + verify-link parity.
+    //
+    // The three trait methods below close the F7 cert-harness gaps for
+    // S52 (link verify), S61 (quota status), and S65 (find-paths over
+    // HTTP). All three adapters implement; the default returns
+    // `UnsupportedCapability` so backends that haven't wired them yet
+    // fail loudly rather than silently no-op.
+    // ==================================================================
+
+    /// Read the agent's quota row, auto-inserting a default row when
+    /// none exists. Mirrors `crate::quotas::get_aggregate_status` on
+    /// the SQLite path (v0.7.0 #1156 — returns the agent-wide
+    /// aggregate, summing counters across every namespace the agent
+    /// has written into so the pre-#1156 single-row response shape is
+    /// preserved at the SAL boundary).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status(&self, _agent_id: &str) -> StoreResult<QuotaStatus> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS".to_string(),
+        })
+    }
+
+    /// v0.7.0 #1156 — read the agent's quota row for one specific
+    /// namespace, auto-inserting a default row when none exists.
+    /// Drives the namespace-scoped form of `memory_quota_status` /
+    /// `POST /api/v1/quota/status {agent_id, namespace}`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status_ns(&self, _agent_id: &str, _namespace: &str) -> StoreResult<QuotaStatus> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS_NS".to_string(),
+        })
+    }
+
+    /// List every quota row in the substrate, sorted ascending by
+    /// `(agent_id, namespace)`. Operator-facing surface that backs
+    /// `quota_status`'s "no agent_id supplied" path.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS_LIST".to_string(),
+        })
+    }
+
+    /// v0.7.0 #1156 — list every quota row in one namespace, sorted
+    /// ascending by `agent_id`. Drives the namespace-scoped form of
+    /// the operator-facing list path (`POST /api/v1/quota/status
+    /// {namespace}` with admin-gate).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn quota_status_list_ns(&self, _namespace: &str) -> StoreResult<Vec<QuotaStatus>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "QUOTA_STATUS_LIST_NS".to_string(),
+        })
+    }
+
+    /// Verify a single link by `(source_id, target_id?)` or by
+    /// `link_id`. Returns the resolved [`VerifyLinkReport`] including
+    /// `verified`, `attest_level`, `signature_present`, and
+    /// `observed_by`. Returns [`StoreError::NotFound`] when the filter
+    /// resolves no row, and [`StoreError::InvalidInput`] when the
+    /// filter does not specify either a `source_id` or a `link_id`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn verify_link(&self, _filter: VerifyFilter) -> StoreResult<VerifyLinkReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "VERIFY_LINK".to_string(),
+        })
+    }
+
+    /// v0.7 J7 / Continuation 6 — enumerate up to `max_results` paths
+    /// between two memories, bounded by `max_depth`. Mirrors the
+    /// adapter-specific `find_paths` call but lifted to the trait
+    /// surface so handlers can stay backend-blind.
+    ///
+    /// #910 (SAL-level enforcement, 2026-05-19): the `ctx` argument
+    /// supplies the calling principal so adapters can drop any path
+    /// whose node set traverses a scope=private memory the caller
+    /// does not own. The fail-closed posture matches the canonical
+    /// [`is_visible_to_caller`] contract — if the predicate cannot
+    /// resolve a node, that path is dropped (defense in depth against
+    /// race conditions between traversal and fetch).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn find_paths(
+        &self,
+        _ctx: &CallerContext,
+        _source_id: &str,
+        _target_id: &str,
+        _max_depth: Option<usize>,
+        _max_results: Option<usize>,
+    ) -> StoreResult<Vec<Vec<String>>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_PATHS".to_string(),
+        })
+    }
+
+    // ==================================================================
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — read-only trait
+    // completions. Each closes a "Missing-trait" handler reach so the
+    // SAL becomes the canonical read surface for these probes.
+    // Defaults return `UnsupportedCapability` so adapters that don't
+    // implement the probe fail loudly rather than silently returning
+    // empty results.
+    // ==================================================================
+
+    /// Enumerate live (non-expired) namespaces with their memory counts.
+    /// Closes `db::list_namespaces` (handler reach at `power.rs:411`).
+    ///
+    /// Ordering: descending by count, then ascending by name for stable
+    /// tie-breaking. The result excludes namespaces whose entire content
+    /// has expired but does NOT cascade through TTL semantics for
+    /// individual rows (callers requesting that should use `list` with a
+    /// namespace filter).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_namespaces(&self) -> StoreResult<Vec<crate::models::NamespaceCount>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_NAMESPACES".to_string(),
+        })
+    }
+
+    /// Hierarchical namespace taxonomy. Closes `db::get_taxonomy`
+    /// (handler reach at `power.rs:620`).
+    ///
+    /// `namespace_prefix` filters the tree root; `max_depth` caps how
+    /// many `/`-separated segments are surfaced below the prefix;
+    /// `limit` caps the number of `(namespace, count)` rows walked.
+    /// Adapters MUST clamp `max_depth` and `limit` to safe bounds so
+    /// pathological callers cannot exhaust memory.
+    ///
+    /// Returned [`Taxonomy::total_count`] reflects the FULL prefix
+    /// total (not the truncated walk) and [`Taxonomy::truncated`] is
+    /// set when `limit` dropped rows so callers can warn the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn get_taxonomy(
+        &self,
+        _namespace_prefix: Option<&str>,
+        _max_depth: usize,
+        _limit: usize,
+    ) -> StoreResult<crate::models::Taxonomy> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_TAXONOMY".to_string(),
+        })
+    }
+
+    /// Enumerate registered agents in the `_agents` namespace. Closes
+    /// `db::list_agents` (handler reaches at `subscriptions.rs:454`,
+    /// `admin.rs:280`).
+    ///
+    /// Ordering: ascending by `registered_at` so audit consumers can
+    /// observe stable enrollment chronology. Each [`AgentRegistration`]
+    /// projects `agent_id`, `agent_type`, `capabilities`,
+    /// `registered_at`, `last_seen_at` parsed out of the underlying
+    /// memory row's metadata blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error or
+    /// when metadata fails to parse as JSON.
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRegistration>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_AGENTS".to_string(),
+        })
+    }
+
+    /// Enumerate pending governance actions with optional status
+    /// filter. Closes `db::list_pending_actions` (handler reaches at
+    /// `governance.rs:130`, `approvals.rs:277` indirectly).
+    ///
+    /// `status` filters by the exact status string (`"pending"`,
+    /// `"approved"`, `"rejected"`, `"expired"`). `None` returns every
+    /// row regardless of status. `limit` caps row count; callers MUST
+    /// pass a positive value (zero behaves as "no rows" by SQL
+    /// convention).
+    ///
+    /// Ordering: descending by `requested_at` so the freshest entries
+    /// surface first, matching the legacy `db::list_pending_actions`
+    /// shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn list_pending_actions(
+        &self,
+        _status: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::PendingAction>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_PENDING_ACTIONS".to_string(),
+        })
+    }
+
+    /// Resolve a knowledge-graph entity by alias (case-sensitive
+    /// match). Closes `db::entity_get_by_alias` (handler reach at
+    /// `kg.rs:468`).
+    ///
+    /// `namespace`, when set, restricts the alias resolution to a
+    /// specific tenant. When `None`, the most-recently-created
+    /// matching entity wins (deterministic disambiguation if the same
+    /// alias was registered in multiple namespaces).
+    ///
+    /// Returns `Ok(None)` if no entity claims this alias; returns the
+    /// full alias set for the resolved entity otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn entity_get_by_alias(
+        &self,
+        _alias: &str,
+        _namespace: Option<&str>,
+    ) -> StoreResult<Option<crate::models::EntityRecord>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ENTITY_GET_BY_ALIAS".to_string(),
+        })
+    }
+
+    /// Deep health check — verifies the underlying store is reachable
+    /// AND the full-text index (or postgres equivalent) is functional.
+    /// Closes `db::health_check` (handler reach at `transport.rs:840`).
+    ///
+    /// Returns `Ok(true)` on success. Implementations SHOULD perform a
+    /// cheap write-side probe (e.g. SQLite FTS integrity-check) so
+    /// degradation surfaces before the next user-facing recall fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store is unreachable or
+    /// the FTS / index probe fails.
+    async fn health_check(&self) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "HEALTH_CHECK".to_string(),
+        })
+    }
+
+    /// Aggregate database statistics — total rows, per-tier counts,
+    /// per-namespace counts, expiring-soon count, link count, on-disk
+    /// size, dim violations, HNSW evictions. Closes `db::stats`
+    /// (handler reaches at `transport.rs:876`, `admin.rs:505`).
+    ///
+    /// Adapters SHOULD populate every field they can; missing fields
+    /// (e.g. `db_size_bytes` on Postgres where path-based sizing isn't
+    /// meaningful) default to zero so the response shape stays
+    /// constant across backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn stats(&self) -> StoreResult<crate::models::Stats> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "STATS".to_string(),
+        })
+    }
+
+    /// Resolve a memory id by `(title, namespace)` — used by the
+    /// `on_conflict=error` path during `memory_store` to surface a
+    /// `409 CONFLICT` envelope citing the colliding row's id. Closes
+    /// `db::find_by_title_namespace` (handler reach at
+    /// `create.rs:187`).
+    ///
+    /// Returns `Ok(None)` when no live row matches the tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn find_by_title_namespace(
+        &self,
+        _title: &str,
+        _namespace: &str,
+    ) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_BY_TITLE_NAMESPACE".to_string(),
+        })
+    }
+
+    /// Pick a title that does not collide with an existing
+    /// `(title, namespace)` row by appending `(2)`, `(3)`, ... up to
+    /// the substrate's hard cap. Used by `on_conflict='version'`.
+    /// Closes `db::next_versioned_title` (handler reach at
+    /// `create.rs:210`).
+    ///
+    /// Returns the original title when no row claims it; otherwise
+    /// the first available `"<base> (N)"` suffix. Errors with the
+    /// substrate's `UniqueConflict` envelope when the cap is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on store errors; `UniqueConflict` when the
+    /// substrate cap is exhausted.
+    async fn next_versioned_title(
+        &self,
+        _base_title: &str,
+        _namespace: &str,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "NEXT_VERSIONED_TITLE".to_string(),
+        })
+    }
+
+    /// Detect potential contradictions: memories in the same
+    /// namespace with FTS-similar titles. Closes
+    /// `db::find_contradictions` (handler reach at `create.rs:1025`).
+    ///
+    /// Returns up to 5 candidates ranked by FTS score (no embedding
+    /// pass). Used by the autonomous-hooks fan-out to seed the
+    /// contradiction-detection LLM with deterministic candidates
+    /// before pricing the cosine pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn find_contradictions(
+        &self,
+        _title: &str,
+        _namespace: &str,
+    ) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FIND_CONTRADICTIONS".to_string(),
+        })
+    }
+
+    /// Mark a KG link as superseded by setting its `valid_until`
+    /// column. Closes `db::invalidate_link` (handler reach at
+    /// `kg.rs:932`); the Postgres branch routes through the inherent
+    /// `PostgresStore::kg_invalidate` method which preserves the
+    /// AGE↔CTE dual-path discipline.
+    ///
+    /// Returns a [`KgInvalidateRow`] carrying `found = false` when the
+    /// `(source_id, target_id, relation)` triple does not match an
+    /// existing link, matching the SQLite-side `Ok(None)` contract
+    /// projected into the SAL row shape.
+    ///
+    /// Idempotent: calling repeatedly overwrites the prior
+    /// `valid_until` (the prior value is returned in
+    /// `previous_valid_until` so callers can detect the overwrite).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn invalidate_link(
+        &self,
+        _source_id: &str,
+        _target_id: &str,
+        _relation: &str,
+        _valid_until: Option<&str>,
+    ) -> StoreResult<KgInvalidateRow> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "INVALIDATE_LINK".to_string(),
+        })
+    }
+
+    /// Content-hash + embedding-cosine duplicate detector. Closes
+    /// `db::check_duplicate_with_text` (handler reach at
+    /// `power.rs:825`).
+    ///
+    /// Phase 1 SHA-256-matches the canonical `title content` text
+    /// against every live, namespace-matching candidate; an exact
+    /// match short-circuits at `similarity=1.0`. Phase 2 falls
+    /// through to the embedding-based nearest-neighbor scan so
+    /// near-but-not-exact hits still surface a closest-existing
+    /// signal.
+    ///
+    /// `query_text` MUST be the exact string used to produce
+    /// `query_embedding` (typically `crate::embeddings::embedding_document(title, content)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn check_duplicate_with_text(
+        &self,
+        _query_embedding: &[f32],
+        _query_text: &str,
+        _namespace: Option<&str>,
+        _threshold: f32,
+    ) -> StoreResult<crate::models::DuplicateCheck> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CHECK_DUPLICATE_WITH_TEXT".to_string(),
+        })
+    }
+
+    // ==================================================================
+    // v0.7.0 ARCH-2 followup (FX-C2-batch5) — final 6 trait additions
+    // that close the last "Missing-trait" handler reaches on the
+    // governance + KG + archive surfaces. Each default returns
+    // `UnsupportedCapability` so backends that don't wire the operation
+    // fail loudly rather than silently returning empty / stale results.
+    // ==================================================================
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — approver_type-aware approve. Mirrors
+    /// the canonical sqlite primitive `db::approve_with_approver_type`
+    /// (see `src/storage/mod.rs::approve_with_approver_type`); closes
+    /// the missing-trait reach at `governance.rs:306` / `approvals.rs:280`.
+    ///
+    /// Wire-shape contract: identical to
+    /// [`MemoryStore::governance_approve_with_consensus`] — both fan in
+    /// to the same `ApproveOutcome` enum, both enforce the same
+    /// Human / Agent(required) / Consensus(quorum) state machine. The
+    /// two names are the same operation; this alias exists so the
+    /// handler-side routing stays nominally aligned with the SQLite
+    /// primitive name (`db::approve_with_approver_type`) the audit doc
+    /// cites and so future backends can override either method.
+    ///
+    /// Default forwards to
+    /// [`MemoryStore::governance_approve_with_consensus`] so adapters
+    /// only have to wire one entry point. Override either if the
+    /// adapter wants nominally-distinct implementations.
+    async fn approve_with_approver_type(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<ApproveOutcome> {
+        self.governance_approve_with_consensus(ctx, pending_id, approver_agent_id)
+            .await
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — decide a pending action (approve /
+    /// reject). Closes the missing-trait reach at `governance.rs:480` /
+    /// `approvals.rs:328` / `federation_receive.rs:941`.
+    ///
+    /// Wire-shape contract: identical to
+    /// [`MemoryStore::pending_decide`] (same `(id, approve, decided_by)`
+    /// signature, same `bool` return semantics — `true` when the row
+    /// transitioned from `pending`, `false` otherwise). The two names
+    /// are the same operation; this alias preserves nominal parity with
+    /// the SQLite primitive name (`db::decide_pending_action`) the
+    /// audit doc cites.
+    ///
+    /// Default forwards to [`MemoryStore::pending_decide`].
+    async fn decide_pending_action(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        approve: bool,
+        decided_by: &str,
+    ) -> StoreResult<bool> {
+        self.pending_decide(ctx, id, approve, decided_by).await
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — outbound knowledge-graph traversal.
+    /// Closes the missing-trait reach at `kg.rs:1359`.
+    ///
+    /// Returns up to `limit` reachable nodes from `source_id`, walking
+    /// the link graph up to `max_depth` hops. `include_invalidated`
+    /// lifts the default `valid_until` filter so callers can see the
+    /// full historical edge graph (S45's `as_of=past` semantics). The
+    /// Postgres adapter resolves AGE vs the CTE fallback at adapter
+    /// connect time; SQLite uses the recursive CTE in
+    /// `db::kg_query`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `max_depth` is zero or exceeds the
+    /// adapter's supported ceiling. Returns `Backend` for storage errors.
+    async fn kg_query(
+        &self,
+        _source_id: &str,
+        _max_depth: usize,
+        _include_invalidated: bool,
+    ) -> StoreResult<Vec<KgQueryRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "KG_QUERY".to_string(),
+        })
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — knowledge-graph timeline scan.
+    /// Closes the missing-trait reach at `kg.rs:735`.
+    ///
+    /// Returns outbound link assertions from `source_id` ordered by
+    /// `valid_from` ASC (most recent → oldest scan via tie-broken
+    /// `created_at`). `since` / `until` constrain the window;
+    /// `limit` caps row count. Adapters MUST drop rows whose
+    /// `valid_from` is NULL — the timeline is anchored on the
+    /// authoritative validity timestamp.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors.
+    async fn kg_timeline(
+        &self,
+        _source_id: &str,
+        _since: Option<&str>,
+        _until: Option<&str>,
+        _limit: Option<usize>,
+    ) -> StoreResult<Vec<KgTimelineRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "KG_TIMELINE".to_string(),
+        })
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — register a knowledge-graph entity.
+    /// Closes the missing-trait reach at `kg.rs:311` (drift — postgres
+    /// adapter previously bypassed the trait via a bespoke handler-side
+    /// store + alias-union walk).
+    ///
+    /// Idempotent on `(canonical_name, namespace)`: on first call
+    /// inserts an entity-tagged Memory row; on subsequent calls unions
+    /// the new aliases into the existing row's
+    /// `metadata.aliases` array. Returns the resolved
+    /// [`crate::models::EntityRegistration`] so callers can surface
+    /// `entity_id` + the post-union alias set + the `created` flag.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Conflict` (mapped to 409) when a non-entity memory
+    /// already claims the `(canonical_name, namespace)` tuple.
+    /// Returns `Backend` for storage errors.
+    async fn entity_register(
+        &self,
+        _ctx: &CallerContext,
+        _canonical_name: &str,
+        _namespace: &str,
+        _aliases: &[String],
+        _extra_metadata: &serde_json::Value,
+        _agent_id: Option<&str>,
+    ) -> StoreResult<crate::models::EntityRegistration> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ENTITY_REGISTER".to_string(),
+        })
+    }
+
+    /// v0.7.0 ARCH-2 FX-C2-batch5 — list archived memories. Closes the
+    /// archive-list reach currently going through the
+    /// `list_archived_via_store` downcast hatch (`archive.rs:85`); the
+    /// SAL trait method makes the read backend-blind.
+    ///
+    /// Returns up to `limit` archived rows skipping `offset`, ordered
+    /// descending by `archived_at` (newest first). `namespace`, when
+    /// set, restricts the projection to a single tenant. The wire
+    /// shape mirrors `db::list_archived` on the SQLite path and
+    /// `PostgresStore::list_archived` on the Postgres path — a
+    /// JSON-shaped row per archived memory carrying every column on the
+    /// `archived_memories` table, including the v49 14-column expansion
+    /// for round-trip restore parity.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors. Returns `InvalidInput`
+    /// when the adapter's `limit` clamp rejects the supplied value.
+    async fn list_archived(
+        &self,
+        _namespace: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> StoreResult<Vec<serde_json::Value>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_ARCHIVED".to_string(),
+        })
+    }
+}
+
+/// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded
+/// through the governance enforce surface. Mirrors
+/// `crate::models::GovernedAction` but lives at the SAL layer so the
+/// trait isn't forced to import the models crate's enum at every site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernedAction {
+    Store,
+    Delete,
+    Promote,
+    /// v0.7.0 L1-8: `memory_reflect` approval gate.
+    Reflect,
+}
+
+impl GovernedAction {
+    /// Stable lowercase tag for the `pending_actions.action_type`
+    /// column + log lines.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::Delete => "delete",
+            Self::Promote => "promote",
+            Self::Reflect => "reflect",
+        }
+    }
+}
+
+impl From<crate::models::GovernedAction> for GovernedAction {
+    fn from(value: crate::models::GovernedAction) -> Self {
+        match value {
+            crate::models::GovernedAction::Store => Self::Store,
+            crate::models::GovernedAction::Delete => Self::Delete,
+            crate::models::GovernedAction::Promote => Self::Promote,
+            crate::models::GovernedAction::Reflect => Self::Reflect,
+        }
+    }
+}
+
+/// v0.7.0 Wave-3 Continuation 3 (Phase 20) — outcome of a single
+/// governance approval call. Mirrors the legacy
+/// `crate::db::ApproveOutcome` so the trait surface and the sqlite
+/// `db::*` free-function path can share a wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    /// The action transitioned to `approved` and is ready for the
+    /// caller to execute its payload.
+    Approved,
+    /// The action remains `pending` (Consensus quorum not yet met).
+    /// `votes` is the count of unique voters; `quorum` is the target.
+    Pending { votes: usize, quorum: u32 },
+    /// The vote was rejected. `reason` is human-readable.
+    Rejected(String),
 }
 
 /// Partial-update payload. `None` means "leave this field alone" —
@@ -409,6 +2247,24 @@ pub struct UpdatePatch {
     pub priority: Option<i32>,
     pub confidence: Option<f64>,
     pub metadata: Option<serde_json::Value>,
+    /// v0.7.0 Provenance Gap 2 (#906) — opt-in source_uri patch.
+    /// `None` leaves the stored value untouched (COALESCE semantics
+    /// on the SQL layer). `Some("scheme:payload")` rewrites the row's
+    /// `source_uri` verbatim (rename / scheme migration / bad-data
+    /// correction). Validated via `crate::validate::validate_source_uri`
+    /// before reaching the storage layer; the storage layer trusts the
+    /// patch as already-validated.
+    pub source_uri: Option<String>,
+    /// v0.7.0 #1423 — opt-in expires_at patch. Pre-#1423 the postgres
+    /// PUT handler silently dropped `body.expires_at` because this
+    /// field didn't exist on the patch — `UpdateMemory.expires_at`
+    /// flowed in from the wire, the postgres `app.store.update`
+    /// branch built an `UpdatePatch` without it, and the SQL UPDATE
+    /// never touched the `expires_at` column. `None` leaves stored
+    /// value untouched (COALESCE semantics on the SQL layer);
+    /// `Some(s)` where `s` is an RFC3339 timestamp string rewrites
+    /// it. Validated by the handler / caller before reaching storage.
+    pub expires_at: Option<String>,
 }
 
 /// Report produced by `verify`.
@@ -432,6 +2288,179 @@ pub struct VerifyReport {
     pub signature_verified: bool,
 }
 
+/// v0.7.0 Continuation 6 — filter shape for [`MemoryStore::verify_link`].
+///
+/// Mirrors the wire shape of `POST /api/v1/links/verify`: callers can
+/// scope the verify by `(source_id, target_id)` (the canonical link
+/// composite key minus relation, which is rarely known up-front), or by
+/// the rowid-style `link_id` when the cert harness already has it. At
+/// least one of `(source_id, target_id)` OR `link_id` MUST be set —
+/// adapters return [`StoreError::InvalidInput`] otherwise.
+///
+/// `target_id` is optional even when `source_id` is set: an unset
+/// `target_id` requests the first outbound link from `source_id`,
+/// matching the cert harness's "verify a link this memory authored"
+/// posture.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyFilter {
+    /// Source memory id. Required unless `link_id` is set.
+    pub source_id: Option<String>,
+    /// Target memory id. Optional when `source_id` is set — the adapter
+    /// resolves the first outbound link from `source_id`.
+    pub target_id: Option<String>,
+    /// Internal link rowid. When set, takes precedence over
+    /// `(source_id, target_id)`. Format is adapter-specific.
+    pub link_id: Option<String>,
+}
+
+/// v0.7.0 Continuation 6 — report produced by [`MemoryStore::verify_link`].
+///
+/// Wire shape mirrors what the cert harness expects from
+/// `POST /api/v1/links/verify`: `{verified, attest_level,
+/// signature_present, observed_by}`. `verified` is `true` iff the link
+/// row was found AND, when a signature is present, the adapter ran a
+/// real cryptographic verify against the enrolled peer public key.
+/// `attest_level` is the link's stored level (`unsigned` |
+/// `self_signed` | `peer_attested`) — same vocabulary as the SQLite
+/// `db::create_link_signed` write path. `signature_present` is `true`
+/// when the link carries a signature blob; `observed_by` is the agent
+/// id that signed (or `None` for unsigned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyLinkReport {
+    /// Source memory id of the link that was verified.
+    pub source_id: String,
+    /// Target memory id of the link that was verified.
+    pub target_id: String,
+    /// Relation tag (e.g. `"related_to"`).
+    pub relation: String,
+    /// True when the link exists AND, if a signature is present, the
+    /// signature verifies against the enrolled peer key. False when the
+    /// link is missing OR the signature is present but does not verify.
+    pub verified: bool,
+    /// Attest level stored on the row: `unsigned` | `self_signed` |
+    /// `peer_attested`.
+    pub attest_level: String,
+    /// True when the row carries a signature blob.
+    pub signature_present: bool,
+    /// Agent id that signed the row, or `None` for unsigned links.
+    pub observed_by: Option<String>,
+    /// Diagnostic findings — non-fatal observations populated by the
+    /// adapter (e.g. "signature blob present but no enrolled peer key
+    /// for observed_by"). Empty on a clean verify.
+    pub findings: Vec<String>,
+}
+
+/// #1579 A4 — SAL-level embedding-backfill sweep. Drains every row the
+/// adapter reports as unembedded ([`MemoryStore::list_unembedded`]) in
+/// bounded `batch_size` chunks: embed via [`crate::embeddings::Embed::embed_batch`],
+/// persist via [`MemoryStore::set_embeddings_batch`] (one transaction
+/// per chunk — F5.6 bounded-batch semantics), repeat until the scan
+/// comes back empty. Returns the total number of rows written.
+///
+/// This is the serve-daemon twin of the MCP-boot
+/// [`crate::mcp::run_embedding_backfill_with_batch_size`] (which is
+/// rusqlite-`Connection`-bound and therefore never ran on
+/// postgres-backed daemons — the #1579 A4 root cause). Adapters whose
+/// `list_unembedded` default to empty (sqlite) make this a true no-op,
+/// so spawning it unconditionally on `serve` boot changes nothing for
+/// sqlite deployments.
+///
+/// **Failure semantics** mirror the MCP twin: a per-chunk embedder or
+/// writer fault is logged and the sweep STOPS (rather than skipping —
+/// a failed chunk would be re-scanned by the next pass and spin the
+/// loop forever); the remaining rows are retried on the next daemon
+/// boot. A zero-progress pass also terminates the loop defensively.
+/// Nothing propagates — the sweep must never block daemon readiness.
+pub async fn run_embedding_backfill_on_store(
+    store: &dyn MemoryStore,
+    ctx: &CallerContext,
+    emb: &dyn crate::embeddings::Embed,
+    batch_size: usize,
+) -> usize {
+    // Defensive: a zero chunk size would make the scan a no-op loop.
+    // Same coercion as the MCP twin (`chunks(0)` panics there; here a
+    // `LIMIT 0` scan would return empty and silently skip the sweep).
+    let batch_size = if batch_size == 0 {
+        crate::mcp::DEFAULT_EMBED_BACKFILL_BATCH_SIZE
+    } else {
+        batch_size
+    };
+
+    let mut total = 0usize;
+    loop {
+        let chunk = match store.list_unembedded(ctx, batch_size).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("embedding backfill: unembedded scan failed: {e} (sweep stopped)");
+                break;
+            }
+        };
+        if chunk.is_empty() {
+            break;
+        }
+
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|(_, t, c)| crate::embeddings::embedding_document(t, c))
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let embeddings = match emb.embed_batch(&text_refs) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "embedding backfill: embed_batch failed for chunk of {} rows: {e} \
+                     (sweep stopped; remaining rows retry on next boot)",
+                    chunk.len()
+                );
+                break;
+            }
+        };
+        // Defensive: a well-behaved embedder returns one vector per
+        // input. Misalignment would pair ids with the wrong vectors —
+        // stop rather than corrupt semantic recall.
+        if embeddings.len() != chunk.len() {
+            tracing::warn!(
+                "embedding backfill: embed_batch returned {} vectors for {} inputs (sweep stopped)",
+                embeddings.len(),
+                chunk.len()
+            );
+            break;
+        }
+
+        let entries: Vec<(String, Vec<f32>)> = chunk
+            .iter()
+            .zip(embeddings)
+            .map(|((id, _, _), v)| (id.clone(), v))
+            .collect();
+        let written = match store.set_embeddings_batch(ctx, &entries).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "embedding backfill: set_embeddings_batch failed for chunk of {} rows: {e} \
+                     (sweep stopped; remaining rows retry on next boot)",
+                    entries.len()
+                );
+                break;
+            }
+        };
+        total += written;
+        tracing::info!(
+            "embedding backfill: wrote {written}/{} embeddings this pass ({total} total)",
+            entries.len()
+        );
+        if written == 0 {
+            // Zero-progress guard: the same rows would be re-scanned
+            // forever. Terminate; next boot retries.
+            tracing::warn!(
+                "embedding backfill: zero-progress pass on {} candidate row(s); sweep stopped",
+                chunk.len()
+            );
+            break;
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +2471,19 @@ mod tests {
         assert_eq!(ctx.agent_id, "alice");
         assert!(ctx.as_agent.is_none());
         assert!(ctx.request_id.is_none());
+    }
+
+    #[test]
+    fn pool_config_default_equals_named_constants() {
+        let d = PoolConfig::default();
+        assert_eq!(d.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(d.min_connections, DEFAULT_MIN_CONNECTIONS);
+        assert_eq!(d.acquire_timeout_secs, DEFAULT_ACQUIRE_TIMEOUT_SECS);
+        // Documented compiled defaults (CLAUDE.md env table + enterprise
+        // deployment §5.6): min=2, max=16, acquire-timeout=30s.
+        assert_eq!(d.max_connections, 16);
+        assert_eq!(d.min_connections, 2);
+        assert_eq!(d.acquire_timeout_secs, 30);
     }
 
     #[test]
@@ -513,5 +2555,1449 @@ mod tests {
         assert_eq!(KgBackend::Age.as_str(), "age");
         assert_eq!(format!("{}", KgBackend::Cte), "cte");
         assert_eq!(format!("{}", KgBackend::Age), "age");
+    }
+
+    // ---------------------------------------------------------------------
+    // L0.7-6 Tier E coverage — pin every trait-default method to the
+    // documented `UnsupportedCapability` / fallthrough behavior via a
+    // minimal mock adapter that only implements the trait-required
+    // methods. Without these tests the default-method bodies are
+    // unreachable from any cargo-test path.
+    // ---------------------------------------------------------------------
+
+    use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+    use async_trait::async_trait;
+
+    /// Minimal mock adapter that implements only the trait-required
+    /// methods. Every default-bodied method on `MemoryStore` is exercised
+    /// through this adapter so the default bodies have coverage.
+    struct MinimalStore;
+
+    fn dummy_memory(id: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            tier: Tier::Mid,
+            namespace: "mock".to_string(),
+            title: "mock title".to_string(),
+            content: "mock content".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "mock".to_string(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"agent_id": "alice"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        }
+    }
+
+    #[async_trait]
+    impl MemoryStore for MinimalStore {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::DURABLE
+        }
+        async fn store(&self, _ctx: &CallerContext, mem: &Memory) -> StoreResult<String> {
+            Ok(mem.id.clone())
+        }
+        async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
+            if id == "exists" {
+                Ok(dummy_memory(id))
+            } else {
+                Err(StoreError::NotFound { id: id.to_string() })
+            }
+        }
+        async fn update(
+            &self,
+            _ctx: &CallerContext,
+            _id: &str,
+            _patch: UpdatePatch,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _ctx: &CallerContext, _id: &str) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list(&self, _ctx: &CallerContext, _filter: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![dummy_memory("listed")])
+        }
+        async fn search(
+            &self,
+            _ctx: &CallerContext,
+            _query: &str,
+            _filter: &Filter,
+        ) -> StoreResult<Vec<Memory>> {
+            Ok(vec![dummy_memory("searched")])
+        }
+        async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+            Ok(VerifyReport {
+                memory_id: id.to_string(),
+                integrity_ok: true,
+                findings: vec![],
+                signature_verified: false,
+            })
+        }
+        async fn link(&self, _ctx: &CallerContext, _link: &MemoryLink) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_links(&self, _ns: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+            Ok(vec![])
+        }
+        async fn register_agent(
+            &self,
+            _ctx: &CallerContext,
+            _agent: &AgentRegistration,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_schema_version_returns_zero() {
+        let s = MinimalStore;
+        assert_eq!(s.schema_version().await.expect("schema_version"), 0);
+    }
+
+    #[tokio::test]
+    async fn default_store_with_embedding_falls_through_to_store() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let mem = dummy_memory("with-emb");
+        // The default body forwards to `store` (ignoring the vector).
+        let id = s
+            .store_with_embedding(&ctx, &mem, Some(&[0.1_f32, 0.2, 0.3]))
+            .await
+            .expect("store_with_embedding default");
+        assert_eq!(id, "with-emb");
+    }
+
+    #[tokio::test]
+    async fn default_update_embedding_is_noop() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        s.update_embedding(&ctx, "any", Some(&[0.5_f32]))
+            .await
+            .expect("noop");
+    }
+
+    #[tokio::test]
+    async fn default_execute_pending_action_unsupported() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let err = s.execute_pending_action(&ctx, "any").await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_begin_transaction_returns_unsupported() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        // Box<dyn Transaction> is not Debug; map_err to a Debug-friendly
+        // String first so we can call expect_err / matches! cleanly.
+        let result = s.begin_transaction(&ctx).await.map(|_| "got txn");
+        let err = match result {
+            Ok(_) => panic!("expected UnsupportedCapability"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_link_signed_forwards_and_reports_unsigned() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let link = MemoryLink {
+            source_id: "a".to_string(),
+            target_id: "b".to_string(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+        };
+        let level = s
+            .link_signed(&ctx, &link, None)
+            .await
+            .expect("default link_signed");
+        assert_eq!(level, "unsigned");
+    }
+
+    #[tokio::test]
+    async fn default_apply_remote_memory_unsupported() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let err = s
+            .apply_remote_memory(&ctx, &dummy_memory("rem"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_list_memories_updated_since_unsupported() {
+        let s = MinimalStore;
+        let err = s.list_memories_updated_since(None, 10).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_apply_remote_link_forwards_to_link() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let link = MemoryLink {
+            source_id: "a".to_string(),
+            target_id: "b".to_string(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+        };
+        // Default forwards to link(); MinimalStore::link returns Ok.
+        s.apply_remote_link(&ctx, &link, "unsigned")
+            .await
+            .expect("apply_remote_link default");
+    }
+
+    #[tokio::test]
+    async fn default_apply_remote_deletion_true_on_ok_false_on_notfound() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        // MinimalStore::delete returns Ok regardless → true.
+        let gone = s
+            .apply_remote_deletion(&ctx, "any")
+            .await
+            .expect("delete ok");
+        assert!(gone, "Ok delete must surface as true");
+        // Use the NotFound branch — wrap MinimalStore in a delegating
+        // adapter that surfaces NotFound from delete().
+        struct NotFoundDeleter;
+        #[async_trait]
+        impl MemoryStore for NotFoundDeleter {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::DURABLE
+            }
+            async fn store(&self, _: &CallerContext, m: &Memory) -> StoreResult<String> {
+                Ok(m.id.clone())
+            }
+            async fn get(&self, _: &CallerContext, id: &str) -> StoreResult<Memory> {
+                Err(StoreError::NotFound { id: id.to_string() })
+            }
+            async fn update(&self, _: &CallerContext, _: &str, _: UpdatePatch) -> StoreResult<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &CallerContext, id: &str) -> StoreResult<()> {
+                Err(StoreError::NotFound { id: id.to_string() })
+            }
+            async fn list(&self, _: &CallerContext, _: &Filter) -> StoreResult<Vec<Memory>> {
+                Ok(vec![])
+            }
+            async fn search(
+                &self,
+                _: &CallerContext,
+                _: &str,
+                _: &Filter,
+            ) -> StoreResult<Vec<Memory>> {
+                Ok(vec![])
+            }
+            async fn verify(&self, _: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+                Ok(VerifyReport {
+                    memory_id: id.to_string(),
+                    integrity_ok: true,
+                    findings: vec![],
+                    signature_verified: false,
+                })
+            }
+            async fn link(&self, _: &CallerContext, _: &MemoryLink) -> StoreResult<()> {
+                Ok(())
+            }
+            async fn list_links(&self, _: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+                Ok(vec![])
+            }
+            async fn register_agent(
+                &self,
+                _: &CallerContext,
+                _: &AgentRegistration,
+            ) -> StoreResult<()> {
+                Ok(())
+            }
+        }
+        let n = NotFoundDeleter;
+        let still = n
+            .apply_remote_deletion(&ctx, "missing")
+            .await
+            .expect("notfound branch");
+        assert!(!still, "NotFound must surface as false");
+    }
+
+    #[tokio::test]
+    async fn default_recall_hybrid_falls_back_to_search() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let filter = Filter::default();
+        let scored = s
+            .recall_hybrid(&ctx, "q", None, &filter)
+            .await
+            .expect("default recall_hybrid");
+        // MinimalStore::search returns 1 row; recall_hybrid scores it.
+        assert_eq!(scored.len(), 1);
+        assert!(scored[0].1 > 0.0);
+    }
+
+    #[tokio::test]
+    async fn default_touch_after_recall_is_ok_for_any_ids() {
+        let s = MinimalStore;
+        s.touch_after_recall(&["a".to_string(), "b".to_string()])
+            .await
+            .expect("touch default ok");
+    }
+
+    #[tokio::test]
+    async fn default_governance_methods_unsupported_or_safe_default() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+
+        // pending_decide → UnsupportedCapability
+        let err = s
+            .pending_decide(&ctx, "any", true, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+
+        // get_pending → UnsupportedCapability
+        let err = s.get_pending(&ctx, "any").await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+
+        // set_namespace_standard → UnsupportedCapability
+        let err = s
+            .set_namespace_standard(&ctx, "ns", "sid", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+
+        // clear_namespace_standard → UnsupportedCapability
+        let err = s.clear_namespace_standard(&ctx, "ns").await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+
+        // get_namespace_standard → UnsupportedCapability
+        let err = s.get_namespace_standard(&ctx, "ns").await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+
+        // governance_approve_with_consensus → UnsupportedCapability
+        let err = s
+            .governance_approve_with_consensus(&ctx, "pid", "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+
+        // is_registered_agent → default false
+        let yes = s.is_registered_agent("alice").await.expect("default");
+        assert!(!yes);
+
+        // enforce_governance_action → default Allow
+        let decision = s
+            .enforce_governance_action(
+                GovernedAction::Store,
+                "ns",
+                "alice",
+                None,
+                None,
+                &serde_json::json!({}),
+            )
+            .await
+            .expect("default Allow");
+        assert!(matches!(decision, crate::models::GovernanceDecision::Allow));
+
+        // build_namespace_chain → single-element default
+        let chain = s.build_namespace_chain("leaf").await.expect("chain");
+        assert_eq!(chain, vec!["leaf".to_string()]);
+
+        // resolve_governance_policy → None
+        let policy = s.resolve_governance_policy("ns").await.expect("policy");
+        assert!(policy.is_none());
+    }
+
+    #[tokio::test]
+    async fn default_lifecycle_methods_unsupported() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+
+        assert!(matches!(
+            s.forget(&ctx, Some("ns"), None, None, false)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.consolidate(&ctx, &[], "t", "s", "ns", &Tier::Mid, "src", "alice")
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.run_gc(false).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.archive_restore(&ctx, "id").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.archive_purge(&ctx, None).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.archive_by_ids(&ctx, &[], None).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.export_memories().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.export_links().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.notify(&ctx, "agent", "t", "p", None, None)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_quota_and_verify_methods_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.quota_status("agent").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.quota_status_list().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.verify_link(VerifyFilter::default()).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        let ctx = CallerContext::for_agent("alice");
+        assert!(matches!(
+            s.find_paths(&ctx, "a", "b", None, None).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    #[test]
+    fn default_as_any_is_unit() {
+        let s: Box<dyn MemoryStore> = Box::new(MinimalStore);
+        let any = s.as_any();
+        // Default returns a unit reference; downcast must fail.
+        assert!(any.downcast_ref::<()>().is_some());
+    }
+
+    #[test]
+    fn arch_15_as_any_for_postgres_alias_delegates_to_as_any() {
+        // FX-C4-batch2 ARCH-15: the legacy `as_any_for_postgres` shim
+        // must delegate to `as_any` so existing callers keep working
+        // until v0.8.0 removes the alias.
+        let s: Box<dyn MemoryStore> = Box::new(MinimalStore);
+        #[allow(deprecated)]
+        let any_legacy = s.as_any_for_postgres();
+        let any_new = s.as_any();
+        // Both surfaces return the same default unit reference.
+        assert!(any_legacy.downcast_ref::<()>().is_some());
+        assert!(any_new.downcast_ref::<()>().is_some());
+    }
+
+    #[test]
+    fn governed_action_string_round_trip() {
+        // Trait surface uses GovernedAction::as_str for log lines + the
+        // pending_actions.action_type column. Drift is caught here.
+        assert_eq!(GovernedAction::Store.as_str(), "store");
+        assert_eq!(GovernedAction::Delete.as_str(), "delete");
+        assert_eq!(GovernedAction::Promote.as_str(), "promote");
+        assert_eq!(GovernedAction::Reflect.as_str(), "reflect");
+    }
+
+    #[test]
+    fn governed_action_from_models_matches_local_enum() {
+        // Conversion from the models::GovernedAction (used by the legacy
+        // db:: path) to the SAL-layer GovernedAction must preserve every
+        // variant. A missed variant would silently change behavior at
+        // the SAL boundary.
+        assert!(matches!(
+            GovernedAction::from(crate::models::GovernedAction::Store),
+            GovernedAction::Store
+        ));
+        assert!(matches!(
+            GovernedAction::from(crate::models::GovernedAction::Delete),
+            GovernedAction::Delete
+        ));
+        assert!(matches!(
+            GovernedAction::from(crate::models::GovernedAction::Promote),
+            GovernedAction::Promote
+        ));
+        assert!(matches!(
+            GovernedAction::from(crate::models::GovernedAction::Reflect),
+            GovernedAction::Reflect
+        ));
+    }
+
+    #[test]
+    fn store_error_invalid_input_and_integrity_displays() {
+        // Pin the Display impl for every variant the test surface has
+        // not yet exercised. Wire shape: HTTP error envelopes interpolate
+        // these strings — silent drift is a compatibility break.
+        let e = StoreError::InvalidInput {
+            detail: "missing source_id".to_string(),
+        };
+        assert!(e.to_string().contains("missing source_id"));
+        let e = StoreError::IntegrityFailed {
+            detail: "checksum mismatch".to_string(),
+        };
+        assert!(e.to_string().contains("checksum mismatch"));
+        let e = StoreError::Conflict {
+            id: "dup-id".to_string(),
+        };
+        assert!(e.to_string().contains("dup-id"));
+        let e = StoreError::UnsupportedCapability {
+            capability: "FOO".to_string(),
+        };
+        assert!(e.to_string().contains("FOO"));
+        let e = StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            detail: "connection refused".to_string(),
+        };
+        assert!(e.to_string().contains("postgres"));
+        assert!(e.to_string().contains("connection refused"));
+        let e = StoreError::Backend(BoxBackendError::new("raw"));
+        assert!(e.to_string().contains("raw"));
+    }
+
+    #[test]
+    fn box_backend_error_display_round_trips() {
+        let e = BoxBackendError::new("a custom error");
+        assert!(format!("{e}").contains("a custom error"));
+    }
+
+    #[test]
+    fn approve_outcome_variants_distinct() {
+        let a = ApproveOutcome::Approved;
+        let p = ApproveOutcome::Pending {
+            votes: 1,
+            quorum: 3,
+        };
+        let r = ApproveOutcome::Rejected("nope".to_string());
+        assert!(a != p);
+        assert!(p != r);
+        assert!(a != r);
+    }
+
+    #[test]
+    fn verify_filter_default_fields_unset() {
+        let f = VerifyFilter::default();
+        assert!(f.source_id.is_none());
+        assert!(f.target_id.is_none());
+        assert!(f.link_id.is_none());
+    }
+
+    #[test]
+    fn verify_report_construction_round_trip() {
+        let r = VerifyReport {
+            memory_id: "id".to_string(),
+            integrity_ok: true,
+            findings: vec!["finding".to_string()],
+            signature_verified: false,
+        };
+        assert_eq!(r.memory_id, "id");
+        assert!(r.integrity_ok);
+        assert_eq!(r.findings.len(), 1);
+        assert!(!r.signature_verified);
+    }
+
+    // ===========================================================================
+    // FX-F1 (2026-05-27) — coverage uplift for the FX-C2 batch3+batch5
+    // trait additions. The pre-FX-F1 tests covered ~70% of the default
+    // impls; FX-F1 walks every remaining default body so the
+    // store/mod.rs floor (92%) holds against the 21-method trait
+    // expansion. Each default returns `UnsupportedCapability` or
+    // forwards to another method that does — both arms are pinned
+    // below.
+    // ===========================================================================
+
+    /// FX-F1 — covers `health_check`, `stats`, `find_by_title_namespace`,
+    /// `next_versioned_title`, `find_contradictions`,
+    /// `check_duplicate_with_text` defaults. Each returns the
+    /// `UnsupportedCapability` envelope so handlers can surface
+    /// `BACKEND_UNAVAILABLE` to the wire rather than silently degrading
+    /// to "everything's fine" / "no candidates".
+    #[tokio::test]
+    async fn default_probe_methods_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.health_check().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.stats().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.find_by_title_namespace("t", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.next_versioned_title("t", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.find_contradictions("t", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.check_duplicate_with_text(&[0.1_f32, 0.2], "title content", Some("ns"), 0.9)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — covers the FX-C2-batch5 KG / archive default surface:
+    /// `kg_query`, `kg_timeline`, `entity_register`, `list_archived`,
+    /// `invalidate_link`. Each MUST surface `UnsupportedCapability`
+    /// rather than silently returning empty rows.
+    #[tokio::test]
+    async fn default_kg_archive_methods_unsupported() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        assert!(matches!(
+            s.kg_query("src", 2, false).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.kg_timeline("src", None, None, Some(10))
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.entity_register(
+                &ctx,
+                "Acme",
+                "ns",
+                &["acme".to_string()],
+                &serde_json::json!({}),
+                Some("alice")
+            )
+            .await
+            .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_archived(Some("ns"), 10, 0).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.invalidate_link("src", "tgt", "related_to", Some("2026-01-01T00:00:00Z"))
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — covers the FX-C2-batch3 read-only probe defaults:
+    /// `list_namespaces`, `get_taxonomy`, `list_agents`,
+    /// `list_pending_actions`, `entity_get_by_alias`.
+    #[tokio::test]
+    async fn default_listing_methods_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.list_namespaces().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.get_taxonomy(Some("ns"), 5, 100).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_agents().await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_pending_actions(Some("pending"), 50)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.entity_get_by_alias("acme", Some("ns")).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — covers the v0.7.0 #1156 namespace-scoped quota defaults
+    /// (`quota_status_ns`, `quota_status_list_ns`). The non-NS forms
+    /// are pinned in `default_quota_and_verify_methods_unsupported`
+    /// above; this test pins the per-namespace siblings.
+    #[tokio::test]
+    async fn default_quota_namespace_scoped_unsupported() {
+        let s = MinimalStore;
+        assert!(matches!(
+            s.quota_status_ns("alice", "ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.quota_status_list_ns("ns").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+    }
+
+    /// FX-F1 — `approve_with_approver_type` forwards to
+    /// `governance_approve_with_consensus` (the alias preserves
+    /// nominal parity with the SQLite primitive name). Pins the
+    /// forwarding-default arm.
+    #[tokio::test]
+    async fn default_approve_with_approver_type_forwards_to_consensus() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        // MinimalStore doesn't override governance_approve_with_consensus,
+        // so the trait default fires and returns UnsupportedCapability.
+        let err = s
+            .approve_with_approver_type(&ctx, "pid", "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    /// FX-F1 — `decide_pending_action` forwards to `pending_decide`.
+    /// MinimalStore takes the default `pending_decide` path which
+    /// returns `UnsupportedCapability`; the forwarding default
+    /// surfaces the same envelope. Pins the alias contract.
+    #[tokio::test]
+    async fn default_decide_pending_action_forwards_to_pending_decide() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let err = s
+            .decide_pending_action(&ctx, "any", true, "alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    /// FX-F1 — pin the `link_signed` forwarding contract: when no
+    /// signature is supplied the default reports `"unsigned"` while
+    /// still calling through to `link()`. The existing
+    /// `default_link_signed_forwards_and_reports_unsigned` test pins
+    /// the no-signature arm; this test pins the supplied-signature
+    /// arm, which still routes through the same default body
+    /// (signature is forwarded onto the link insertion via
+    /// `MemoryLink::signature`).
+    #[tokio::test]
+    async fn default_link_signed_with_signature_still_forwards() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let link = MemoryLink {
+            source_id: "a".to_string(),
+            target_id: "b".to_string(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: Some(b"sig-bytes".to_vec()),
+            attest_level: Some("ed25519".to_string()),
+        };
+        // The default body forwards to link() and reports the
+        // (caller-supplied) attest_level when no signature override
+        // was passed to link_signed. MinimalStore::link returns Ok,
+        // so this is the success path.
+        let level = s
+            .link_signed(&ctx, &link, None)
+            .await
+            .expect("default link_signed forwards");
+        // The default body returns "unsigned" because no signing key
+        // is supplied to link_signed; the link row's pre-baked
+        // signature is preserved through the forward but the
+        // attestation level reported is "unsigned" (the trait default
+        // does not introspect the link's own signature column —
+        // adapters that do override).
+        assert_eq!(level, "unsigned");
+    }
+
+    /// FX-F1 — pin the `verify_link` default behaviour with
+    /// non-default filters so the default body exercises every
+    /// non-`None` filter field. Covers the same default as
+    /// `default_quota_and_verify_methods_unsupported` but with a
+    /// populated `VerifyFilter`, hitting a code path llvm-cov may
+    /// have flagged unreachable when only the default filter was
+    /// passed.
+    #[tokio::test]
+    async fn default_verify_link_with_populated_filter_unsupported() {
+        let s = MinimalStore;
+        let filter = VerifyFilter {
+            source_id: Some("src".to_string()),
+            target_id: Some("tgt".to_string()),
+            link_id: Some("lid".to_string()),
+        };
+        let err = s.verify_link(filter).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    /// FX-F1 — pin the `schema_version` default behaviour: returns
+    /// zero. The existing `default_schema_version_returns_zero` test
+    /// covers the same body; this re-pin adds a second-shot guarantee
+    /// that the default body lands at zero so a future drift to (say)
+    /// returning `i64::MIN` is caught immediately.
+    #[tokio::test]
+    async fn default_schema_version_zero_invariant() {
+        let s = MinimalStore;
+        let v = s.schema_version().await.expect("default schema_version");
+        assert_eq!(v, 0, "default body MUST return 0");
+    }
+
+    // ------------------------------------------------------------------
+    // #1579 A4 — serve-boot embedding-backfill sweep
+    // (`run_embedding_backfill_on_store`) loop-termination pins. The
+    // sweep re-scans `list_unembedded` until empty, so every "stop"
+    // arm (zero-progress, embedder fault, vector-count misalignment)
+    // is load-bearing against an infinite boot-task loop.
+    // ------------------------------------------------------------------
+
+    /// Configurable backfill double for the sweep loop-termination
+    /// pins: `list_unembedded` always reports `rows` candidate rows
+    /// (a stalled scan — the pathological re-scan-forever shape), and
+    /// `set_embeddings_batch` reports `written_per_chunk` rows
+    /// actually updated (0 models every row vanishing between scan
+    /// and write).
+    struct StalledBackfillStore {
+        rows: usize,
+        written_per_chunk: usize,
+    }
+
+    #[async_trait]
+    impl MemoryStore for StalledBackfillStore {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::DURABLE
+        }
+        async fn store(&self, _: &CallerContext, m: &Memory) -> StoreResult<String> {
+            Ok(m.id.clone())
+        }
+        async fn get(&self, _: &CallerContext, id: &str) -> StoreResult<Memory> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+        async fn update(&self, _: &CallerContext, _: &str, _: UpdatePatch) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &CallerContext, _: &str) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list(&self, _: &CallerContext, _: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn search(&self, _: &CallerContext, _: &str, _: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(vec![])
+        }
+        async fn verify(&self, _: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+            Ok(VerifyReport {
+                memory_id: id.to_string(),
+                integrity_ok: true,
+                findings: vec![],
+                signature_verified: false,
+            })
+        }
+        async fn link(&self, _: &CallerContext, _: &MemoryLink) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_links(&self, _: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+            Ok(vec![])
+        }
+        async fn register_agent(
+            &self,
+            _: &CallerContext,
+            _: &AgentRegistration,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn list_unembedded(
+            &self,
+            _ctx: &CallerContext,
+            limit: usize,
+        ) -> StoreResult<Vec<(String, String, String)>> {
+            Ok((0..self.rows.min(limit))
+                .map(|i| {
+                    (
+                        format!("stalled-{i}"),
+                        format!("title {i}"),
+                        format!("content {i}"),
+                    )
+                })
+                .collect())
+        }
+        async fn set_embeddings_batch(
+            &self,
+            _ctx: &CallerContext,
+            _entries: &[(String, Vec<f32>)],
+        ) -> StoreResult<usize> {
+            Ok(self.written_per_chunk)
+        }
+    }
+
+    /// #1579 A4 — adapters that inherit the `list_unembedded` default
+    /// (sqlite) make the serve-boot sweep a structural no-op: the
+    /// first scan is empty, the loop exits immediately, zero rows are
+    /// written. This is the "sqlite serve surface unchanged" pin.
+    #[tokio::test]
+    async fn backfill_sweep_is_noop_on_default_list_unembedded() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let written = run_embedding_backfill_on_store(&s, &ctx, &emb, 8).await;
+        assert_eq!(
+            written, 0,
+            "default (sqlite-shape) adapters must make the sweep a no-op"
+        );
+    }
+
+    /// #1579 A4 — the default `set_embeddings_batch` body loops
+    /// `update_embedding` and reports one written row per entry, so
+    /// every adapter is correct without an override.
+    #[tokio::test]
+    async fn default_set_embeddings_batch_loops_update_embedding() {
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let entries = vec![
+            ("a".to_string(), vec![0.1_f32]),
+            ("b".to_string(), vec![0.2_f32]),
+        ];
+        let written = s
+            .set_embeddings_batch(&ctx, &entries)
+            .await
+            .expect("default batch write");
+        assert_eq!(written, 2, "default body reports one row per entry");
+    }
+
+    /// #1579 A4 — zero-progress guard: a scan that keeps reporting the
+    /// same candidate rows while the batch write lands 0 of them (rows
+    /// deleted between scan and write, or a pathological adapter) MUST
+    /// terminate the sweep instead of re-scanning forever. Also passes
+    /// `batch_size = 0` to pin the zero→default chunk-size coercion
+    /// (a `LIMIT 0` scan would otherwise silently skip the sweep). The
+    /// timeout converts a guard regression into a test failure rather
+    /// than a hung suite.
+    #[tokio::test]
+    async fn backfill_sweep_zero_progress_guard_terminates() {
+        let s = StalledBackfillStore {
+            rows: 3,
+            written_per_chunk: 0,
+        };
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_embedding_backfill_on_store(&s, &ctx, &emb, 0),
+        )
+        .await
+        .expect("zero-progress sweep must terminate, not loop forever");
+        assert_eq!(written, 0, "zero-progress pass writes nothing");
+    }
+
+    /// #1579 A4 — embedder/scan misalignment guard: when `embed_batch`
+    /// returns a different number of vectors than inputs, pairing ids
+    /// with the wrong vectors would corrupt semantic recall. The sweep
+    /// must stop WITHOUT writing the misaligned chunk (and without
+    /// spinning on the unchanged scan).
+    #[tokio::test]
+    async fn backfill_sweep_stops_on_embedder_vector_count_mismatch() {
+        /// Trait-only fake: always returns ONE vector regardless of
+        /// input count (the `MockEmbedder` is documented never to
+        /// misalign, so the guard arm needs this fake to be reachable).
+        struct MisalignedEmbedder;
+        impl crate::embeddings::Embed for MisalignedEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32])
+            }
+            fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![0.0_f32]])
+            }
+        }
+
+        let s = StalledBackfillStore {
+            rows: 3,
+            // Would-be progress if the misaligned chunk were written —
+            // the guard must stop BEFORE the write, so the sweep still
+            // returns 0.
+            written_per_chunk: 3,
+        };
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_embedding_backfill_on_store(&s, &ctx, &MisalignedEmbedder, 8),
+        )
+        .await
+        .expect("misaligned sweep must terminate, not loop forever");
+        assert_eq!(written, 0, "misaligned chunk must be dropped, not written");
+    }
+
+    // -----------------------------------------------------------------
+    // Coverage lift (per-module floor): exercise the default trait
+    // method body, the remaining StoreError display arms, and the
+    // Track-J row shapes' serde derives — all previously untested.
+    // -----------------------------------------------------------------
+
+    /// Minimal adapter that implements only the required trait methods
+    /// and deliberately does NOT override `begin_transaction`, so the
+    /// default-impl body in the trait definition is actually executed
+    /// (the older `default_begin_transaction_errors` test only
+    /// constructed the error variant by hand).
+    struct DefaultImplProbeStore;
+
+    #[async_trait::async_trait]
+    impl MemoryStore for DefaultImplProbeStore {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::empty()
+        }
+
+        async fn store(&self, _ctx: &CallerContext, _memory: &Memory) -> StoreResult<String> {
+            Err(StoreError::UnsupportedCapability {
+                capability: "store".to_string(),
+            })
+        }
+
+        async fn get(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+
+        async fn update(
+            &self,
+            _ctx: &CallerContext,
+            id: &str,
+            _patch: UpdatePatch,
+        ) -> StoreResult<()> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+
+        async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
+            Err(StoreError::NotFound { id: id.to_string() })
+        }
+
+        async fn list(&self, _ctx: &CallerContext, _filter: &Filter) -> StoreResult<Vec<Memory>> {
+            Ok(Vec::new())
+        }
+
+        async fn search(
+            &self,
+            _ctx: &CallerContext,
+            _query: &str,
+            _filter: &Filter,
+        ) -> StoreResult<Vec<Memory>> {
+            Ok(Vec::new())
+        }
+
+        async fn verify(&self, _ctx: &CallerContext, id: &str) -> StoreResult<VerifyReport> {
+            Ok(VerifyReport {
+                memory_id: id.to_string(),
+                integrity_ok: true,
+                findings: Vec::new(),
+                signature_verified: false,
+            })
+        }
+
+        async fn link(&self, _ctx: &CallerContext, _link: &MemoryLink) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn list_links(&self, _namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
+            Ok(vec![])
+        }
+
+        async fn register_agent(
+            &self,
+            _ctx: &CallerContext,
+            _agent: &AgentRegistration,
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Pins the default-impl contract: an adapter that does not
+    /// override `begin_transaction` surfaces `UnsupportedCapability`
+    /// naming TRANSACTIONS, so upper layers can downgrade to
+    /// sequential ops (design principle 3 from the PR #222 red-team).
+    #[test]
+    fn default_begin_transaction_default_impl_returns_unsupported() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+        match rt.block_on(store.begin_transaction(&ctx)) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "TRANSACTIONS");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => panic!("default begin_transaction must error"),
+        }
+    }
+
+    /// Pins the human-readable Display contract for the StoreError
+    /// variants the original display test skipped (Conflict /
+    /// BackendUnavailable / InvalidInput / UnsupportedCapability /
+    /// IntegrityFailed / Backend-via-BoxBackendError).
+    #[test]
+    fn store_error_remaining_variants_display_their_detail() {
+        let conflict = StoreError::Conflict {
+            id: "dup-1".to_string(),
+        };
+        assert_eq!(conflict.to_string(), "identifier conflict on insert: dup-1");
+
+        let unavailable = StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            detail: "connection refused".to_string(),
+        };
+        assert!(unavailable.to_string().contains("postgres"));
+        assert!(unavailable.to_string().contains("connection refused"));
+
+        let invalid = StoreError::InvalidInput {
+            detail: "empty title".to_string(),
+        };
+        assert_eq!(invalid.to_string(), "invalid input: empty title");
+
+        let integrity = StoreError::IntegrityFailed {
+            detail: "missing agent_id".to_string(),
+        };
+        assert!(integrity.to_string().contains("missing agent_id"));
+
+        // BoxBackendError is the escape hatch — `new` + From wiring
+        // must preserve the underlying message verbatim.
+        let boxed: StoreError = BoxBackendError::new("native driver oops").into();
+        assert_eq!(
+            boxed.to_string(),
+            "underlying backend error: native driver oops"
+        );
+    }
+
+    /// Wire-shape pin for `KgQueryRow` (Track J substrate): the shared
+    /// projection both KG backends emit must round-trip through serde
+    /// without renaming or dropping fields.
+    #[test]
+    fn kg_query_row_serde_round_trips() {
+        let row = KgQueryRow {
+            target_id: "mem-2".to_string(),
+            relation: "related_to".to_string(),
+            depth: 2,
+            path: "mem-0->mem-1->mem-2".to_string(),
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("\"target_id\":\"mem-2\""));
+        assert!(json.contains("\"depth\":2"));
+        let back: KgQueryRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, row);
+    }
+
+    /// Wire-shape pin for `KgTimelineRow` (J3): optional
+    /// `valid_until` / `observed_by` must survive a round-trip in both
+    /// the Some and None forms — the SQL fallback emits NULLs for
+    /// legacy rows that predate observability tracking.
+    #[test]
+    fn kg_timeline_row_serde_round_trips_with_and_without_optionals() {
+        let full = KgTimelineRow {
+            target_id: "mem-9".to_string(),
+            relation: "supersedes".to_string(),
+            valid_from: "2026-01-01T00:00:00Z".to_string(),
+            valid_until: Some("2026-02-01T00:00:00Z".to_string()),
+            observed_by: Some("agent-a".to_string()),
+            title: "Title".to_string(),
+            target_namespace: "ns".to_string(),
+        };
+        let back: KgTimelineRow =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
+
+        let legacy = KgTimelineRow {
+            valid_until: None,
+            observed_by: None,
+            ..full
+        };
+        let back: KgTimelineRow =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(back, legacy);
+    }
+
+    /// Wire-shape pin for `KgInvalidateRow` (J4): the no-match outcome
+    /// is `found: false` with an empty `valid_until` — a no-op, not an
+    /// error — matching the SQLite dispatcher contract.
+    #[test]
+    fn kg_invalidate_row_serde_round_trips_both_outcomes() {
+        let matched = KgInvalidateRow {
+            found: true,
+            valid_until: "2026-03-01T00:00:00Z".to_string(),
+            previous_valid_until: Some("2026-02-01T00:00:00Z".to_string()),
+        };
+        let back: KgInvalidateRow =
+            serde_json::from_str(&serde_json::to_string(&matched).unwrap()).unwrap();
+        assert_eq!(back, matched);
+
+        let missed = KgInvalidateRow {
+            found: false,
+            valid_until: String::new(),
+            previous_valid_until: None,
+        };
+        let back: KgInvalidateRow =
+            serde_json::from_str(&serde_json::to_string(&missed).unwrap()).unwrap();
+        assert_eq!(back, missed);
+    }
+
+    /// Pins the #302-item-5 contract on `VerifyReport`: adapters that
+    /// perform no cryptographic verification MUST report
+    /// `signature_verified: false` even when `integrity_ok` is true —
+    /// and the struct's Clone/Debug derives keep that flag intact.
+    #[test]
+    fn verify_report_signature_flag_is_independent_of_integrity() {
+        let report = VerifyReport {
+            memory_id: "mem-7".to_string(),
+            integrity_ok: true,
+            findings: vec!["structural check only".to_string()],
+            signature_verified: false,
+        };
+        let cloned = report.clone();
+        assert!(cloned.integrity_ok);
+        assert!(!cloned.signature_verified);
+        let dbg = format!("{report:?}");
+        assert!(dbg.contains("signature_verified: false"), "got: {dbg}");
+    }
+
+    /// Pins the UpdatePatch "None means leave alone" default: a
+    /// default-constructed patch must not name any field.
+    #[test]
+    fn update_patch_default_touches_nothing() {
+        let patch = UpdatePatch::default();
+        assert!(patch.title.is_none());
+        assert!(patch.content.is_none());
+        assert!(patch.tier.is_none());
+        assert!(patch.namespace.is_none());
+        assert!(patch.tags.is_none());
+        assert!(patch.priority.is_none());
+        assert!(patch.confidence.is_none());
+        assert!(patch.metadata.is_none());
+    }
+
+    /// Drives the `DefaultImplProbeStore` happy paths through the trait object
+    /// surface so the trait's vtable dispatch (and the test double's
+    /// own arms) execute: `dyn MemoryStore` is exactly how the upper
+    /// layers consume adapters.
+    #[test]
+    fn minimal_store_dispatches_through_dyn_trait_object() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Box<dyn MemoryStore> = Box::new(DefaultImplProbeStore);
+        let ctx = CallerContext::for_agent("test-agent");
+        assert_eq!(store.capabilities(), Capabilities::empty());
+        let listed = rt
+            .block_on(store.list(&ctx, &Filter::default()))
+            .expect("list");
+        assert!(listed.is_empty());
+        let report = rt.block_on(store.verify(&ctx, "mem-1")).expect("verify");
+        assert_eq!(report.memory_id, "mem-1");
+        assert!(report.integrity_ok);
+        let err = rt.block_on(store.get(&ctx, "missing")).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { id } if id == "missing"));
+    }
+    #[test]
+    fn integrity_findings_union_checks_1624() {
+        // #1624 — one checker for both adapters: the union of the two
+        // pre-fix sets, with malformed created_at as a FINDING (the
+        // postgres adapter used to hard-error; sqlite silently passed).
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut mem = Memory {
+            id: "v-1624".to_string(),
+            tier: Tier::Mid,
+            namespace: "ns".to_string(),
+            title: "  ".to_string(),
+            content: String::new(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: "not-a-timestamp".to_string(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            ..Memory::default()
+        };
+        let findings = integrity_findings(&mem);
+        assert!(
+            findings.iter().any(|f| f == "title is empty"),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f == "content is empty"),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f == "metadata.agent_id missing"),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.starts_with("created_at is not RFC3339")),
+            "{findings:?}"
+        );
+        // A clean row yields zero findings.
+        mem.title = "t".to_string();
+        mem.content = "c".to_string();
+        mem.metadata = serde_json::json!({"agent_id": "alice"});
+        mem.created_at = chrono::Utc::now().to_rfc3339();
+        assert!(integrity_findings(&mem).is_empty());
+    }
+    #[test]
+    fn for_admin_checked_constructor_cov() {
+        // for_admin_checked(.., true) yields a bypass-visibility admin
+        // ctx; (.., false) does not. Pins the #1062 constructor arms.
+        let admin = CallerContext::for_admin_checked("ops:admin", true);
+        assert!(admin.bypass_visibility, "is_admin=true ⇒ bypass");
+        let not_admin = CallerContext::for_admin_checked("ops:admin", false);
+        assert!(!not_admin.bypass_visibility, "is_admin=false ⇒ no bypass");
+    }
+
+    /// Track-J SAL row shapes — exercise the serde derives the cov
+    /// scan flagged (the derive code only runs on (de)serialize).
+    #[test]
+    fn track_j_row_shapes_serde_roundtrip_cov() {
+        let tl = KgTimelineRow {
+            target_id: "t".into(),
+            relation: "related_to".into(),
+            valid_from: "2026-01-01T00:00:00Z".into(),
+            valid_until: None,
+            observed_by: Some("ai:obs".into()),
+            title: "ti".into(),
+            target_namespace: "ns".into(),
+        };
+        let j = serde_json::to_string(&tl).expect("ser KgTimelineRow");
+        let back: KgTimelineRow = serde_json::from_str(&j).expect("de KgTimelineRow");
+        assert_eq!(back, tl);
+    }
+    /// Coverage (per-module floor): drive the existing test-mod mock
+    /// adapters through their FULL method surface. The backfill tests
+    /// only call `list_unembedded` + `set_embeddings_batch` on
+    /// `StalledBackfillStore`, and only `begin_transaction` on
+    /// `DefaultImplProbeStore`, leaving their other stub bodies (and
+    /// the inherited trait defaults they expose) unexercised. A
+    /// conformance sweep covers them and pins that the mocks behave as
+    /// documented — cheap, real, and zero new mock surface.
+    #[tokio::test]
+    async fn mock_adapters_method_surface_conformance_cov() {
+        let ctx = CallerContext::for_agent("cov-agent");
+        let mem = {
+            let now = chrono::Utc::now().to_rfc3339();
+            Memory {
+                id: "cov-mem".into(),
+                tier: Tier::Mid,
+                namespace: "cov".into(),
+                title: "t".into(),
+                content: "c".into(),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".into(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: serde_json::json!({}),
+                ..Memory::default()
+            }
+        };
+        let link = MemoryLink {
+            source_id: "a".into(),
+            target_id: "b".into(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+        };
+        let reg = AgentRegistration {
+            agent_id: "ai:cov".into(),
+            agent_type: "nhi".into(),
+            capabilities: vec![],
+            registered_at: chrono::Utc::now().to_rfc3339(),
+            last_seen_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let filter = Filter::default();
+
+        // --- StalledBackfillStore: exercise the methods the backfill
+        // tests never call.
+        let sb = StalledBackfillStore {
+            rows: 1,
+            written_per_chunk: 1,
+        };
+        assert!(!sb.capabilities().is_empty());
+        assert_eq!(sb.store(&ctx, &mem).await.unwrap(), mem.id);
+        assert!(sb.get(&ctx, "x").await.is_err());
+        sb.update(&ctx, "x", UpdatePatch::default()).await.unwrap();
+        sb.delete(&ctx, "x").await.unwrap();
+        assert!(sb.list(&ctx, &filter).await.unwrap().is_empty());
+        assert!(sb.search(&ctx, "q", &filter).await.unwrap().is_empty());
+        assert!(sb.verify(&ctx, "x").await.unwrap().integrity_ok);
+        sb.link(&ctx, &link).await.unwrap();
+        assert!(sb.list_links(None).await.unwrap().is_empty());
+        sb.register_agent(&ctx, &reg).await.unwrap();
+
+        // --- DefaultImplProbeStore: exercise every stub + the inherited
+        // trait defaults it does NOT override (list_by_namespace_prefix
+        // now surfaces UnsupportedCapability per #1625).
+        let dp = DefaultImplProbeStore;
+        assert!(dp.capabilities().is_empty());
+        assert!(dp.store(&ctx, &mem).await.is_err());
+        assert!(dp.get(&ctx, "x").await.is_err());
+        assert!(dp.update(&ctx, "x", UpdatePatch::default()).await.is_err());
+        assert!(dp.delete(&ctx, "x").await.is_err());
+        assert!(dp.list(&ctx, &filter).await.unwrap().is_empty());
+        assert!(dp.search(&ctx, "q", &filter).await.unwrap().is_empty());
+        assert!(dp.verify(&ctx, "x").await.unwrap().integrity_ok);
+        dp.link(&ctx, &link).await.unwrap();
+        assert!(dp.list_links(None).await.unwrap().is_empty());
+        dp.register_agent(&ctx, &reg).await.unwrap();
+        // Inherited defaults (no override on DefaultImplProbeStore):
+        assert!(
+            matches!(
+                dp.list_by_namespace_prefix(&ctx, "x", 10).await,
+                Err(StoreError::UnsupportedCapability { .. })
+            ),
+            "#1625: default surfaces UnsupportedCapability"
+        );
+        // store_with_embedding default forwards to store (Err here).
+        assert!(
+            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]))
+                .await
+                .is_err()
+        );
+        // list_unembedded default = empty; update_embedding default = Ok.
+        assert!(dp.list_unembedded(&ctx, 8).await.unwrap().is_empty());
+        dp.update_embedding(&ctx, "x", None).await.unwrap();
     }
 }

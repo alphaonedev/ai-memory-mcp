@@ -1,0 +1,116 @@
+# C8 orchestrator safeguard CI gate (issue #953, CLAUDE.md §"Enforceable
+# Orchestrator Safeguards") + #1174 PR10 vendor-monoculture lint-gate.
+#
+# Two HARD-BLOCK jobs:
+#
+#   1. c8-precheck — `CallerContext::for_agent("<literal>")` /
+#      `for_admin("<literal>")` allowlist enforcement (issue #953).
+#      These literals bypass the request-scoped caller identity that
+#      the SAL #910 visibility filter depends on; an un-reviewed
+#      addition would silently re-introduce cross-tenant leak surfaces
+#      of the kind QC sweep #947/#955/#959 remediated.
+#
+#   2. vendor-literal-gate — vendor-identifier + SECS_PER_* magic-number
+#      regression detection (issue #1174 PR10, pm-v3.1 lint-gate). Without
+#      this gate, the Wave 1+2 refactor's vendor-monoculture cleanup
+#      (PRs 1-9) decays as new code lands with hardcoded `"claude"` /
+#      `"openai"` / `"anthropic"` strings outside the 6-file substrate
+#      allowlist, AND the SECS_PER_* named-constant discipline (PR3)
+#      regresses as new `Duration::from_secs(3600)` etc. land. Both
+#      gates are load-bearing per the pm-v3.2 NO FAIL MISSION closure
+#      audit (ai-memory global/policies memory
+#      2cb15d34-2399-4611-a020-df6ef91683fe).
+#
+# Mirrors the local-developer flow: both `scripts/qc-codegraph-precheck.sh`
+# and `scripts/check-vendor-literals.sh` are the same scripts CI uses.
+# Run `scripts/qc-codegraph-precheck.sh --update` locally to regenerate
+# the C8 allowlist when you deliberately add a new exception; run
+# `scripts/check-vendor-literals.sh --self-test` locally to confirm the
+# vendor gate still catches a contrived violation.
+
+name: c8-precheck
+
+on:
+  push:
+    branches: [main, develop, "release/**", "local/**"]
+  pull_request:
+    branches: [main, develop, "release/**"]
+
+# Fork-PR-safe concurrency key: coalesces push + same-branch internal
+# PR events; isolates fork PRs by PR number. See ci.yml for full
+# rationale.
+concurrency:
+  group: c8-precheck-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  c8-precheck:
+    name: C8 caller-context allowlist check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run C8 precheck
+        run: bash scripts/qc-codegraph-precheck.sh
+
+  vendor-literal-gate:
+    name: Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run vendor-literal gate
+        run: bash scripts/check-vendor-literals.sh
+      - name: Self-test the gate (regression evidence)
+        # Pm-v3.2 NO FAIL MISSION closure-audit discipline: the gate
+        # itself must be load-bearing. The --self-test mode injects a
+        # contrived `"anthropic"` literal at a production site outside
+        # the allowlist, runs the gate, verifies the gate exits non-zero
+        # + emits the expected violation message, then cleans up. Any
+        # regression in the gate's detection logic (e.g. an over-broad
+        # allowlist, a broken test-boundary heuristic) trips here.
+        run: bash scripts/check-vendor-literals.sh --self-test
+
+  hardcoded-literal-gate:
+    name: Hardcoded-literal duplication ratchet (pm-v3.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Operator directive (~6mo, escalated 2026-06-09): no hardcoded literal
+    # values; no literals embedded in variable/constant names. Instructions
+    # alone did not stop the regression — this gate makes it mechanical.
+    # HARD-BLOCKS any string literal (>= 10 chars) duplicated across >= 3
+    # production sites whose count rose above the frozen baseline (a ratchet:
+    # existing rot is grandfathered, new duplication fails, baseline only
+    # shrinks). See ai-memory `no-hardcoded-literals-enforcement`.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hardcoded-literal gate
+        run: bash scripts/check-hardcoded-literals.sh
+      - name: Self-test the gate (regression evidence)
+        # Injects a brand-new triplicated magic string at a production site,
+        # confirms the gate exits non-zero + names the offender, cleans up.
+        run: bash scripts/check-hardcoded-literals.sh --self-test
+
+  docs-vs-ssot-drift:
+    # v0.7.0 (operator directive 2026-05-31: "can we use variables in
+    # documentation for versions instead of literals?") — Markdown has
+    # no native variables; this gate is the minimal-infra answer.
+    # Parses the canonical Rust SSOTs (CURRENT_SCHEMA_VERSION,
+    # EXPECTED_*, Profile::full().expected_tool_count(), etc.) + walks
+    # the operator-facing .md files for known narrative-count patterns
+    # + fails CI if any cited value drifts from the canonical. New
+    # schema bumps / SSOT-const changes now fail loudly here when
+    # narrative isn't updated in lockstep.
+    name: Docs vs SSOT drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run docs-vs-SSOT drift gate
+        run: bash scripts/check-docs-vs-ssot.sh
+      - name: Self-test the gate (regression evidence)
+        # Mirrors the vendor-literal self-test discipline. The
+        # --self-test mode stages a contrived stale-claim CLAUDE.md
+        # in a tmpdir + invokes the gate against AI_MEMORY_DOCS_GATE_ROOT
+        # = tmpdir; the gate must catch the drift.
+        run: bash scripts/check-docs-vs-ssot.sh --self-test

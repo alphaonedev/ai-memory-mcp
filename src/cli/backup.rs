@@ -10,6 +10,12 @@ use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+/// `<stem>.manifest.json` — sidecar manifest name for a snapshot stem
+/// (#1558 batch 6).
+fn manifest_file_name(stem: &str) -> String {
+    format!("{stem}.manifest.json")
+}
+
 /// Timestamp format used for snapshot filenames. RFC3339-compatible but
 /// filesystem-safe: no colons, no slashes.
 const BACKUP_TS_FMT: &str = "%Y-%m-%dT%H%M%SZ";
@@ -98,7 +104,7 @@ pub fn run_backup(
         sha256: sha.clone(),
         bytes,
         source_db: db_path.to_string_lossy().into_owned(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::PKG_VERSION.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let manifest_path = args.to.join(format!("ai-memory-{ts}.manifest.json"));
@@ -147,7 +153,7 @@ fn prune_old_snapshots(dir: &Path, keep: usize) -> Result<()> {
         let _ = std::fs::remove_file(&path);
         // Matching manifest (same stem, .manifest.json extension pattern)
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            let manifest = dir.join(format!("{stem}.manifest.json"));
+            let manifest = dir.join(manifest_file_name(stem));
             let _ = std::fs::remove_file(manifest);
         }
     }
@@ -188,14 +194,14 @@ pub fn run_restore(
             .map(|(_, p)| p)
             .ok_or_else(|| anyhow::anyhow!("no snapshots found in {}", args.from.display()))?;
         let stem = snap.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let manifest = args.from.join(format!("{stem}.manifest.json"));
+        let manifest = args.from.join(manifest_file_name(stem));
         (snap, manifest)
     } else {
         // File path supplied directly.
         let snap = args.from.clone();
         let stem = snap.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let parent = snap.parent().unwrap_or_else(|| Path::new("."));
-        let manifest = parent.join(format!("{stem}.manifest.json"));
+        let manifest = parent.join(manifest_file_name(stem));
         (snap, manifest)
     };
 

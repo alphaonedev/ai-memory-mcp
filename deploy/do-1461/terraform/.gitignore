@@ -1,0 +1,12 @@
+# Local Terraform provider cache + state — never committed.
+# The pinned provider versions live in .terraform.lock.hcl (which IS committed).
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.auto.tfvars

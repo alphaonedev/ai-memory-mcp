@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
 #![allow(clippy::doc_lazy_continuation)]
 
 //
@@ -30,9 +31,10 @@ use ai_memory::config::{
     reset_permissions_decision_counts_for_test,
 };
 use ai_memory::db;
+use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{
-    ApproverType, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction, Memory,
-    Tier, default_metadata,
+    ApproverType, CorePolicy, GovernanceDecision, GovernanceLevel, GovernancePolicy,
+    GovernedAction, Memory, Tier, default_metadata,
 };
 use rusqlite::Connection;
 
@@ -70,6 +72,18 @@ fn seed_policy(
         last_accessed_at: None,
         expires_at: None,
         metadata,
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
     };
     let standard_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();
@@ -77,11 +91,15 @@ fn seed_policy(
 
 fn approve_write_policy() -> GovernancePolicy {
     GovernancePolicy {
-        write: GovernanceLevel::Approve,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
+        core: CorePolicy {
+            write: GovernanceLevel::Approve,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     }
 }
 

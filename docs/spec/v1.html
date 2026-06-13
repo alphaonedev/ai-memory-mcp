@@ -65,8 +65,8 @@ hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
 <body>
 <div class="wrap">
   <div class="crumb">
-    <a href="../../at-a-glance.html">Atlas</a> /
-    <a href="../">spec</a> /
+    <a href="../at-a-glance.html">Atlas</a> /
+    <span>spec</span> /
     <strong>v1</strong>
   </div>
 
@@ -75,7 +75,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
     <span class="tag">Status: Draft v1</span>
     <span class="tag">Release: v0.6.3.1</span>
     <span class="tag">Encodings: JSON + TOON</span>
-    <span class="tag">Round-trip: guaranteed</span>
+    <span class="tag">Round-trip: byte-equivalent (spec contract)</span>
   </p>
 
   <p>
@@ -122,7 +122,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
     <thead><tr><th>Magic</th><th>Meaning</th><th>Reader behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>0x01</code></td><td>Little-endian f32</td><td>Accept</td></tr>
-      <tr><td><code>0x02</code></td><td>Big-endian f32</td><td>Reject (until v0.7)</td></tr>
+      <tr><td><code>0x02</code></td><td>Big-endian f32</td><td>Reject (<code>BigEndianUnsupported</code> — reserved; conversion has not shipped as of v0.7.0)</td></tr>
       <tr><td>(no header)</td><td>Legacy LE-f32</td><td>Accept (one major version)</td></tr>
       <tr><td>any other</td><td>Unknown</td><td>Reject with EmbeddingFormatError</td></tr>
     </tbody>
@@ -140,7 +140,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
   <ul>
     <li>Multi-implementation interop (v2.0 — ROADMAP §7.6).</li>
     <li>Federation identity attestation (v0.7).</li>
-    <li>Big-endian conversion (v0.7).</li>
+    <li>Big-endian conversion (still reserved at v0.7.0 — <code>0x02</code> rejects with <code>BigEndianUnsupported</code>).</li>
     <li>Streaming exports / encrypted envelope (v2).</li>
   </ul>
 

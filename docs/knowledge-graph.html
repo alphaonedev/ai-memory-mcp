@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Knowledge Graph — links, entities, temporal validity</title>
-<meta name="description" content="ai-memory v0.6.3.1 knowledge graph. memory_links with 4 relations, entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate. The structured-cognition layer that v0.6.3 Streams B+C unlock.">
+<meta name="description" content="ai-memory v0.7.0 knowledge graph. memory_links with 6 relations (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from), entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate + memory_find_paths. The structured-cognition layer that v0.6.3 Streams B+C unlocked and v0.7.0 extended with recursive-learning + atomisation provenance.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/knowledge-graph.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -86,6 +86,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -95,11 +106,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Knowledge Graph</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -122,6 +136,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -133,6 +148,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -142,35 +160,104 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>Knowledge Graph — structured cognition.</h1>
-  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>4 relation types</strong>, an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable, and three new MCP tools (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>) that turn the graph into a first-class API surface. Shipped in v0.6.3 Streams B + C — the foundation v0.7's Apache AGE acceleration replaces the dual-path stubs of.</p>
+  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>6 relation variants at v0.7.0</strong> (related_to, supersedes, contradicts, derived_from, plus the v0.7 additions <code>reflects_on</code> for recursive-learning + <code>derives_from</code> for atomisation atom→parent links), an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable + Ed25519 per-link attestation populated, and an <strong>11-tool <code>graph</code> MCP family at v0.7.0</strong> headlined by the four dedicated KG query tools (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>, <code>memory_find_paths</code>; the family also carries <code>memory_link</code>, <code>memory_entity_register</code>, <code>memory_entity_get_by_alias</code>, <code>memory_get_taxonomy</code>, <code>memory_load_family</code>, <code>memory_replay</code>, <code>memory_verify</code>). v0.6.3 Streams B + C laid the foundation; <strong>v0.7.0 ships the Apache AGE Cypher backend</strong> (auto-detected when the AGE Postgres extension is installed) — what was "planned" in v0.6.x is now a feature gate.</p>
   <div class="pills">
-    <span class="pill">4 relations</span>
+    <span class="pill">6 relations (v0.7.0)</span>
     <span class="pill">entity registry (Stream C)</span>
     <span class="pill">temporal validity (Stream B)</span>
-    <span class="pill">3 KG MCP tools</span>
-    <span class="pill">v0.7: Apache AGE acceleration</span>
+    <span class="pill">Ed25519 attestation (v0.7.0)</span>
+    <span class="pill">11-tool graph family</span>
+    <span class="pill">Apache AGE Cypher (shipped)</span>
   </div>
 </section>
 
@@ -178,7 +265,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The graph</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Memories + edges = the KG.</h2>
-    <p class="lede">Every memory is a node. Every <code>memory_link</code> row is a directed edge with a typed relation and (since v0.6.3) a temporal validity window. The graph is queryable via recursive CTE today, and via Apache AGE Cypher in v0.7.</p>
+    <p class="lede">Every memory is a node. Every <code>memory_link</code> row is a directed edge with a typed relation and (since v0.6.3) a temporal validity window. The graph is queryable via recursive CTE on the sqlite backend, and via Apache AGE Cypher on the postgres backend (shipped at v0.7.0).</p>
     <svg class="kg-svg" viewBox="0 0 1180 420" xmlns="http://www.w3.org/2000/svg">
       <style>
         .nb{stroke-width:2;rx:8;ry:8}
@@ -249,10 +336,10 @@ footer a{color:var(--text-muted)}
       <text class="lab" x="305" y="223" text-anchor="middle" fill="#ff6b9d">contradicts</text>
 
       <line class="ll r1" x1="150" y1="260" x2="150" y2="328" marker-end="url(#ar1)"/>
-      <text class="lab" x="170" y="295">about_entity</text>
+      <text class="lab" x="170" y="295">mentioned_entity_id</text>
 
       <line class="ll r1" x1="380" y1="240" x2="380" y2="330" marker-end="url(#ar1)"/>
-      <text class="lab" x="335" y="295">about_entity</text>
+      <text class="lab" x="335" y="295">mentioned_entity_id</text>
 
       <!-- Legend -->
       <text class="lab" x="950" y="60">Memory node</text>
@@ -265,9 +352,9 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="eyebrow">The four relations</span>
+    <span class="eyebrow">The six relations (v0.7.0)</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Closed set — wire-format stable.</h2>
-    <p class="lede">Every <code>memory_link</code> row carries one of these four relation tags. The set is closed (validators reject anything else); adding a new relation is a wire-format change, not a content tweak.</p>
+    <p class="lede">Every <code>memory_link</code> row carries one of these six relation tags at v0.7.0 (was four at v0.6.x; <code>reflects_on</code> joined the set with recursive-learning Task 1/8 and <code>derives_from</code> joined with WT-1-A atomisation). The six canonical names always pass; since v0.7.0 Wave-3 Continuation 5, <code>validate_relation</code> additionally accepts any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier (mirroring the AGE Cypher edge-label convention) — whitespace, control chars, and shell metacharacters are still rejected.</p>
     <div class="rel-grid">
       <div class="rel r1">
         <div class="nm">related_to</div>
@@ -286,8 +373,18 @@ footer a{color:var(--text-muted)}
       </div>
       <div class="rel r4">
         <div class="nm">derived_from</div>
-        <p>Provenance. Used by <code>memory_consolidate</code> to link N source memories to the consolidated output. Audit chain stays intact.</p>
+        <p>Consolidation provenance. Used by <code>memory_consolidate</code> to link N source memories to the consolidated output. Audit chain stays intact.</p>
         <div class="ex">e.g. consolidated retro derived_from each weekly note</div>
+      </div>
+      <div class="rel r5">
+        <div class="nm">reflects_on (v0.7.0)</div>
+        <p>Recursive-learning provenance. Used by <code>memory_reflect</code> to link a reflection to the lower-depth peers it was synthesised over. Bounded by <code>reflection_depth</code> caps so the recursion can't run away.</p>
+        <div class="ex">e.g. weekly retro <code>reflects_on</code> each daily journal in the period</div>
+      </div>
+      <div class="rel r6">
+        <div class="nm">derives_from (v0.7.0)</div>
+        <p>Atomisation provenance (WT-1-A). Distinct from <code>derived_from</code> — atomisation is a finer-grained, recoverable split that emits one <code>derives_from</code> edge per atom, while consolidation merges several memories into one and emits <code>derived_from</code> edges.</p>
+        <div class="ex">e.g. each atomic proposition <code>derives_from</code> its parent long-form memory</div>
       </div>
     </div>
   </div>
@@ -297,7 +394,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Temporal validity — v0.6.3 Stream B</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Edges with a window.</h2>
-    <p class="lede">Schema v15 (v0.6.3) adds four nullable columns to <code>memory_links</code>: <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, and <code>signature</code> (placeholder for v0.7 attested identity). Edges now carry a window — "this relation was true between Mar 15 and Apr 20." Past states stay queryable via <code>memory_kg_timeline</code>; the present query (<code>memory_kg_query</code>) walks only currently-valid edges.</p>
+    <p class="lede">Schema v15 (v0.6.3) added four nullable columns to <code>memory_links</code>: <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, and <code>signature</code>. <strong>v0.7.0 populates the <code>signature</code> column with Ed25519 per-link attestation</strong> (was placeholder pre-v0.7) — links now carry cryptographic provenance + <code>attest_level</code> (<code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code> / <code>signed_by_peer</code> / <code>daemon_signed</code> — the H4 <code>AttestLevel</code> enum). Edges carry a temporal window — "this relation was true between Mar 15 and Apr 20." Past states stay queryable via <code>memory_kg_timeline</code>; the present query (<code>memory_kg_query</code>) walks only currently-valid edges.</p>
     <div class="snip"><span class="cm">// SQL — schema v15 memory_links columns</span>
 CREATE TABLE memory_links (
   source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -307,7 +404,8 @@ CREATE TABLE memory_links (
   <span class="ok">valid_from   TEXT</span>,        <span class="cm">// when the edge started being true (default = source.created_at)</span>
   <span class="ok">valid_until  TEXT</span>,        <span class="cm">// NULL = still valid; non-null = invalidated at this time</span>
   <span class="ok">observed_by  TEXT</span>,        <span class="cm">// agent_id of the observer (provenance)</span>
-  <span class="ok">signature    BLOB</span>,        <span class="cm">// v0.7 placeholder for Ed25519 attestation</span>
+  <span class="ok">signature    BLOB</span>,        <span class="cm">// v0.7.0 POPULATED with Ed25519 per-link attestation</span>
+  <span class="ok">attest_level TEXT</span>,        <span class="cm">// v0.7.0: "unsigned" | "self_signed" | "peer_attested" | "signed_by_peer" | "daemon_signed"</span>
   PRIMARY KEY (source_id, target_id, relation)
 );
 
@@ -356,12 +454,12 @@ CREATE INDEX idx_links_relation     (relation, valid_from);</div>
 
     <div class="tool kg">
       <div class="tool-head"><span class="tool-name">memory_kg_query</span><span class="tool-tag">since v0.6.3</span></div>
-      <div class="tool-desc">Walks currently-valid edges from a starting memory or entity. Recursive CTE in v0.6.3, replaced by Apache AGE Cypher in v0.7. Supports filters by relation type, depth, and namespace.</div>
+      <div class="tool-desc">Walks currently-valid edges from a starting memory or entity. Recursive CTE on sqlite; Apache AGE Cypher on the postgres backend at v0.7.0. Supports filters by relation type, depth, and namespace.</div>
       <div class="snip"><span class="cm">// MCP — memory_kg_query</span>
 {
-  <span class="key">"start_id"</span>:  <span class="val">"550e8400-…"</span>,
+  <span class="key">"source_id"</span>:  <span class="val">"550e8400-…"</span>,
   <span class="key">"relations"</span>: [<span class="val">"supersedes"</span>, <span class="val">"derived_from"</span>],   <span class="cm">// optional filter</span>
-  <span class="key">"depth"</span>:     <span class="num">3</span>,                              <span class="cm">// optional · default 3 · max 8</span>
+  <span class="key">"max_depth"</span>: <span class="num">1</span>,                              <span class="cm">// optional · default 1 · max 5</span>
   <span class="key">"as_of"</span>:     <span class="val">"2026-04-15T00:00:00Z"</span>            <span class="cm">// optional · point-in-time (default: now)</span>
 }
 
@@ -420,7 +518,7 @@ WITH RECURSIVE walk(source, target, depth) <span class="key">AS</span> (
 )
 <span class="key">SELECT</span> * <span class="key">FROM</span> walk;
 
-<span class="cm">// v0.7 — Apache AGE Cypher (planned)</span>
+<span class="cm">// v0.7.0 — Apache AGE Cypher (SHIPPED — auto-detected when pg_extension installed)</span>
 MATCH (m:Memory {id: $id})-[r:RELATED_TO|SUPERSEDES*1..8]-&gt;(target)
 WHERE r.valid_until IS NULL OR r.valid_until &gt; datetime()
 RETURN target, r;</div>
@@ -441,7 +539,7 @@ RETURN target, r;</div>
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · KG schema in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql">migrations/sqlite/0010</a> · query layer in <code>db.rs</code> · v0.7 AGE wrapper planned per v0.7 charter Bucket 2</p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · KG schema in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql">migrations/sqlite/0010</a> · query layer in <code>src/kg/</code> + <code>src/handlers/kg.rs</code> · Apache AGE wrapper SHIPPED at v0.7.0 (auto-detected via pg_extension; <code>--features sal-postgres</code>)</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="schema.html">Schema</a> · <a href="hierarchies.html">Hierarchies</a></p>
 </footer>
 

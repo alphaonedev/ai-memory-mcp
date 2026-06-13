@@ -33,6 +33,7 @@
 //! - [`run_curator_daemon_with_shutdown`],
 //!   [`run_curator_daemon_with_primitives`] — the curator-daemon body.
 
+use crate::models::field_names;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -65,10 +66,13 @@ use crate::cli::link::{LinkArgs, ResolveArgs};
 use crate::cli::logs::LogsArgs;
 use crate::cli::promote::PromoteArgs;
 use crate::cli::recall::RecallArgs;
+use crate::cli::rules::RulesArgs;
 use crate::cli::search::SearchArgs;
 use crate::cli::store::StoreArgs;
 use crate::cli::sync::{SyncArgs, SyncDaemonArgs};
 use crate::cli::update::UpdateArgs;
+use crate::cli::verify::VerifyChainArgs;
+use crate::cli::verify_signed_events::VerifySignedEventsChainArgs;
 use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
 use crate::embeddings::Embedder;
@@ -81,10 +85,10 @@ use crate::migrate;
 
 const DEFAULT_DB: &str = "ai-memory.db";
 const DEFAULT_PORT: u16 = 9077;
-const GC_INTERVAL_SECS: u64 = 1800;
+const GC_INTERVAL_SECS: u64 = 30 * crate::SECS_PER_MINUTE as u64;
 /// WAL auto-checkpoint cadence in the HTTP daemon. Bounds `*-wal`
 /// file growth between `SQLite`'s internal page-count checkpoints.
-const WAL_CHECKPOINT_INTERVAL_SECS: u64 = 600;
+const WAL_CHECKPOINT_INTERVAL_SECS: u64 = 10 * crate::SECS_PER_MINUTE as u64;
 /// v0.7.0 K2 — pending_actions timeout sweeper cadence. Fires every
 /// 60s and transitions `status='pending'` rows whose age exceeds the
 /// per-row `default_timeout_seconds` (or the global default below) to
@@ -94,7 +98,7 @@ const PENDING_TIMEOUT_SWEEP_INTERVAL_SECS: u64 = 60;
 /// `default_timeout_seconds`. 24 hours — matches the operator-facing
 /// `doctor` warning window so a row already classed CRITICAL by
 /// `doctor_oldest_pending_age_secs` is also a sweeper candidate.
-const PENDING_TIMEOUT_DEFAULT_SECS: i64 = 86_400;
+const PENDING_TIMEOUT_DEFAULT_SECS: i64 = crate::SECS_PER_DAY;
 /// v0.7.0 I3 — transcript archive→prune sweeper cadence. The lifecycle
 /// scan walks every transcript row plus a per-candidate join into
 /// `memories`, so we run it less aggressively than the K2 60-second
@@ -152,7 +156,18 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the HTTP memory daemon
+    /// Start the HTTP memory daemon.
+    ///
+    /// **Tier resolution.** Unlike `mcp` / `store` / `recall`, the
+    /// `serve` subcommand does NOT accept a `--tier` flag. The
+    /// daemon's effective feature tier is resolved from the `tier`
+    /// field in `config.toml`, falling back to the compiled-in
+    /// default (`semantic`). For per-invocation tier overrides use
+    /// the `mcp` / `store` / `recall` subcommands, which expose
+    /// `--tier` directly. See `docs/ADMIN_GUIDE.md` §"Feature tiers"
+    /// and issue #703 for the rationale (a long-running daemon owns
+    /// embedder / LLM resources that are expensive to swap mid-run,
+    /// so tier is fixed at startup via configuration).
     Serve(ServeArgs),
     /// Run as an MCP (Model Context Protocol) tool server over stdio
     Mcp {
@@ -161,10 +176,19 @@ pub enum Command {
         tier: String,
         /// v0.6.4 — Tool surface profile. One of `core`, `graph`, `admin`,
         /// `power`, `full`, or a comma-separated custom list (e.g.,
-        /// `core,graph,archive`). Default `core` (5 tools). Resolution
-        /// order: this CLI flag > `AI_MEMORY_PROFILE` env > `[mcp].profile`
-        /// in config.toml > `core`. Set `--profile full` to reproduce
-        /// v0.6.3 surface 1:1 (43 tools).
+        /// `core,graph,archive`). Default `core` (7 tools at v0.7.0:
+        /// the original 5 + `memory_load_family` + `memory_smart_load`).
+        /// Resolution order: this CLI flag > `AI_MEMORY_PROFILE` env >
+        /// `[mcp].profile` in config.toml > `core`. Set `--profile full`
+        /// to expose every family — at v0.7.0,
+        /// `Profile::full().expected_tool_count()` returns 74 (canonical
+        /// SSOT; pinned by `profile_full_matches_registry_all` against
+        /// `crate::mcp::registry::tool_names::ALL.len()`). The 74
+        /// advertised entries decompose as 73 callable "memory tools"
+        /// plus the always-on `memory_capabilities` bootstrap; the
+        /// `build_capabilities_summary` "{n} memory tools" phrasing
+        /// reports the 73 memory-tool count to reconcile with the
+        /// user-facing summary (see issue #862 for the disambiguation).
         #[arg(long, env = "AI_MEMORY_PROFILE")]
         profile: Option<String>,
     },
@@ -196,6 +220,23 @@ pub enum Command {
     Stats,
     /// List all namespaces
     Namespaces,
+    /// v0.7.0 (issue #800) — operator CRUD for the per-namespace
+    /// standard policy memory pointer (Batman Mode Crack 1). Three
+    /// verbs: `set-standard` / `get-standard` / `clear-standard`, plus
+    /// the `batman-policy` helper that prints the canonical Batman
+    /// `GovernancePolicy` JSON blob. Closes the friction that kept
+    /// Batman Forms 2 + 6 dormant on most installs by replacing the
+    /// MCP-stdio JSON-RPC dance with first-class CLI surface.
+    Namespace(crate::cli::namespace::NamespaceArgs),
+    /// v0.7.x (#1146) — enterprise configuration tooling.
+    /// `ai-memory config migrate` rewrites a legacy v1 (flat-field)
+    /// `config.toml` to the v2 sectioned shape (`[llm]`, `[embeddings]`,
+    /// `[reranker]`, `[storage]`) with a timestamped `.bak` backup.
+    /// `--dry-run` prints the diff without writing.
+    /// `--also-clean-claude-json` additionally removes the
+    /// `mcpServers.<*>.env` block from `~/.claude.json` after the
+    /// operator has verified the new config.
+    Config(crate::cli::commands::config::ConfigCliArgs),
     /// Export all memories as JSON
     Export,
     /// Import memories from JSON (stdin)
@@ -229,6 +270,23 @@ pub enum Command {
     /// key storage (TPM/HSM/Secure Enclave) is out of OSS scope and
     /// lives in the AgenticMem commercial layer.
     Identity(IdentityArgs),
+    /// v0.7.0 QW-3 — context-offload substrate primitive. Persists a
+    /// file (or `-` for stdin) into the `offloaded_blobs` substrate
+    /// and prints the short `ref_id` callers keep in their working
+    /// window. Pairs with `ai-memory deref <ref_id>`.
+    Offload(crate::cli::offload::OffloadArgs),
+    /// v0.7.0 QW-3 — dereference a previously-offloaded `ref_id`.
+    /// Refuses tampered rows (SHA-256 mismatch). Pairs with
+    /// `ai-memory offload <file>`.
+    Deref(crate::cli::offload::DerefArgs),
+    /// v0.7.0 (issue #691) — substrate-level agent-action rules engine.
+    /// CRUD over the `governance_rules` table consulted by
+    /// `check_agent_action`. Mutation verbs (add/enable/disable/remove)
+    /// require the operator's Ed25519 keypair on disk at
+    /// `<key-dir>/operator.priv` (mode 0600); without `--sign` they
+    /// refuse with `governance.no_operator_key`. Read verbs (list /
+    /// check) are unprivileged.
+    Rules(RulesArgs),
     /// List / approve / reject governance-pending actions (Task 1.9)
     Pending(PendingArgs),
     /// v0.6.0.0: snapshot the `SQLite` database to a timestamped backup
@@ -257,6 +315,17 @@ pub enum Command {
     /// and both adapters upsert on id.
     #[cfg(feature = "sal")]
     Migrate(MigrateArgs),
+    /// v0.7.0 Wave-1 Fix 3: bootstrap a SAL backend's schema by URL.
+    /// Opens the target store via the same factory as `migrate` (which
+    /// triggers `INIT_SCHEMA` as a side effect) then enumerates the
+    /// resulting catalog (tables, views, functions, indices,
+    /// extensions, schema_version). On Postgres with Apache AGE
+    /// installed it also bootstraps the `memory_graph` projection via
+    /// `SELECT create_graph('memory_graph')`. Idempotent — safe to
+    /// re-run against an already-initialized store. Gated behind
+    /// `--features sal`.
+    #[cfg(feature = "sal")]
+    SchemaInit(crate::cli::schema_init::SchemaInitArgs),
     /// v0.6.3.1 (P7 / R7): operator-visible health dashboard. Reads
     /// Capabilities v2 (P1) + data integrity surfaces (P2) + recall
     /// observability (P3). With `--remote <url>` becomes a fleet doctor
@@ -302,6 +371,166 @@ pub enum Command {
     /// PATH` to write the rendered block to a file (or merge in-place
     /// when `PATH` matches the loaded config).
     Governance(GovernanceCliArgs),
+    /// v0.7.0 L1-3 — external verifier for reflection chains
+    /// (procurement-grade audit tool). Walks `reflects_on` edges
+    /// backward from `<memory_id>` to depth 0, verifies each
+    /// Ed25519 signature, and emits a structured chain-integrity
+    /// report. Exit 0 if fully verified; non-zero otherwise.
+    VerifyReflectionChain(VerifyChainArgs),
+    /// v0.7.0 V-4 closeout (#698) — walk the SQL-side `signed_events`
+    /// cross-row hash chain (schema v34) and emit a structured
+    /// report. Distinct from `verify-reflection-chain` (which walks
+    /// reflects_on edges) and from `audit verify` (which walks the
+    /// JSONL audit log). Exit 0 if the chain holds; 1 on chain
+    /// break.
+    VerifySignedEventsChain(VerifySignedEventsChainArgs),
+    /// v0.7.0 L2-5 (issue #670) — export a procurement-grade forensic
+    /// evidence bundle (signed tarball) for a memory and its
+    /// reflection chain. The OSS surface for the `AgenticMem Attest`
+    /// tier; see [`crate::forensic::bundle`] for the bundle layout.
+    ExportForensicBundle(crate::forensic::bundle::ExportForensicBundleArgs),
+    /// v0.7.0 L2-5 (issue #670) — verify a forensic evidence bundle.
+    /// Re-hashes every file, checks the manifest signature when
+    /// present, and re-verifies every edge signature against the
+    /// bundled `observed_by` public key.
+    VerifyForensicBundle(crate::forensic::bundle::VerifyForensicBundleArgs),
+    /// v0.7.0 QW-1 — write every reflection memory to a file under
+    /// `~/.ai-memory/reflections/<namespace>/<id>.md` (or `.json` with
+    /// `--format json`) so operators can `cat` what the substrate has
+    /// synthesised without learning SQL. The on-disk artefact is
+    /// derived; the SQL row stays canonical.
+    ExportReflections(crate::cli::commands::export_reflections::ExportReflectionsArgs),
+    /// v0.7.0 (issue #1389) — fail-safe recovery of agent context
+    /// from a host's per-turn transcript file when the previous
+    /// session terminated ungracefully (SIGKILL, tmux lockup, host
+    /// crash) between turns. Closes the #1388 substrate failure
+    /// mode. Designed for SessionStart-hook chaining after
+    /// `ai-memory boot`; the in-session counterpart is the
+    /// `memory_recover_previous_session` MCP tool.
+    RecoverPreviousSession(
+        crate::cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
+    ),
+    /// v0.7.0 WT-1-F — operator-side wrapper over the atomisation
+    /// engine ([`crate::atomisation::Atomiser`]). Decomposes one
+    /// long-form memory into atomic propositions; surfaces every
+    /// substrate failure with a stable exit code (see
+    /// [`crate::cli::commands::atomise::exit_code`]).
+    Atomise(crate::cli::commands::atomise::AtomiseArgs),
+    /// v0.7.0 QW-2 — fetch (or regenerate) the Persona artefact for
+    /// an entity. Read-only by default; pass `--regenerate` to run
+    /// the curator and persist a fresh row.
+    Persona(crate::cli::commands::persona::PersonaArgs),
+    /// v0.7.0 Form 5 (issue #758) — calibration driver verbs.
+    /// `ai-memory calibrate confidence --from-shadow` reads
+    /// `confidence_shadow_observations` and emits per-(namespace,
+    /// source) baselines computed over the window.
+    Calibrate(crate::cli::commands::calibrate_confidence::CalibrateArgs),
+    /// v0.7.0 Cluster E API-2 (issue #767) — `ai-memory skill
+    /// <register|list|get|resource|export|promote|compose>` CLI parity
+    /// surface for the 7 L1-5 Agent Skills MCP tools. Dispatches into
+    /// the same substrate handlers (re-exported under
+    /// `crate::mcp::handle_skill_*`); no business logic is duplicated.
+    Skill(crate::cli::commands::skill::SkillArgs),
+    /// v0.7.0 #1095 — `ai-memory share` subcommand. Closes the SR-4
+    /// three-surface-parity gap. Copies a memory into the recipient
+    /// agent's shared namespace `_shared/<from>→<to>/` via the same
+    /// substrate primitive the MCP tool (`memory_share`) and HTTP
+    /// route (`POST /api/v1/share`) consume — guaranteeing byte-equal
+    /// envelopes across the three surfaces.
+    Share(crate::cli::share::ShareArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory kg-query` subcommand.
+    /// Outbound KG traversal from a source memory (<=5 hops). CLI
+    /// parity for the MCP `memory_kg_query` tool.
+    KgQuery(crate::cli::commands::kg_query::KgQueryArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory find-paths` subcommand.
+    /// Enumerate up to N paths through the KG between two memories
+    /// (BFS, `max_depth<=7`). CLI parity for `memory_find_paths`.
+    FindPaths(crate::cli::commands::find_paths::FindPathsArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory recall-observations`
+    /// subcommand. List rows from the recall-consumption ledger
+    /// (#886). CLI parity for `memory_recall_observations`.
+    RecallObservations(crate::cli::commands::recall_observations::RecallObservationsArgs),
+    /// v0.7.0 #1443 — `ai-memory expand` subcommand. LLM query-expansion
+    /// over a free-text query. CLI parity for the MCP
+    /// `memory_expand_query` tool + the `POST /api/v1/expand_query` HTTP
+    /// route — all three share [`crate::mcp::handle_expand_query`]. Lets
+    /// a harness inject expansion as a one-shot without an MCP stdio
+    /// server or HTTP daemon. Requires a configured LLM (any tier via
+    /// `AI_MEMORY_LLM_BACKEND`, or smart/autonomous preset).
+    Expand(crate::cli::commands::expand::ExpandArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory check-duplicate`
+    /// subcommand. Pre-write near-duplicate check via cosine over
+    /// stored embeddings. CLI parity for `memory_check_duplicate`.
+    /// Requires the embedder (semantic tier or above).
+    CheckDuplicate(crate::cli::commands::check_duplicate::CheckDuplicateArgs),
+    /// v0.7.0 #1598 — `ai-memory reembed` subcommand. Full-corpus
+    /// vector-space migration: re-embeds every live memory (optionally
+    /// `--namespace`-filtered) with the resolved embedding
+    /// backend/model and REPLACES the stored vectors (unlike the boot
+    /// backfill, which only fills missing ones). `--dry-run` prints
+    /// the plan; per-row #1595 failure isolation (skip-with-WARN)
+    /// keeps one poison row from stopping the sweep. Resolves the
+    /// embedder via the same `AppConfig::resolve_embeddings()` +
+    /// `Embedder::from_resolved` path as daemon/MCP boot.
+    Reembed(crate::cli::commands::reembed::ReembedArgs),
+    /// v0.7.0 ARCH-3 / FX-12 — `ai-memory replay` subcommand.
+    /// Reconstruct the conversation transcript chain that produced a
+    /// memory. CLI parity for `memory_replay`.
+    Replay(crate::cli::commands::replay::ReplayArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory reflect`. CLI
+    /// parity for `memory_reflect`. CLI dispatcher uses
+    /// `active_keypair=None` / `embedder=None`; operators who need
+    /// signing or LLM dedup drive the daemon via MCP / HTTP.
+    Reflect(crate::cli::commands::reflect::ReflectArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory subscribe`. CLI
+    /// parity for `memory_subscribe`.
+    Subscribe(crate::cli::commands::subscribe::SubscribeArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory unsubscribe`. CLI
+    /// parity for `memory_unsubscribe`.
+    Unsubscribe(crate::cli::commands::unsubscribe::UnsubscribeArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory list-subscriptions`.
+    /// CLI parity for `memory_list_subscriptions`.
+    ListSubscriptions(crate::cli::commands::list_subscriptions::ListSubscriptionsArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory subscription-replay`.
+    /// CLI parity for `memory_subscription_replay`.
+    SubscriptionReplay(crate::cli::commands::subscription_replay::SubscriptionReplayArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory subscription-dlq-list`.
+    /// CLI parity for `memory_subscription_dlq_list`.
+    SubscriptionDlqList(crate::cli::commands::subscription_dlq_list::SubscriptionDlqListArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory notify`. CLI
+    /// parity for `memory_notify`.
+    Notify(crate::cli::commands::notify::NotifyArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory inbox`. CLI
+    /// parity for `memory_inbox`.
+    Inbox(crate::cli::commands::inbox::InboxArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory ingest-multistep`.
+    /// CLI parity for `memory_ingest_multistep`. CLI dispatcher passes
+    /// `handler=None`; tier-locked advisory returns on every tier
+    /// because the CLI does not own the LLM dispatch.
+    IngestMultistep(crate::cli::commands::ingest_multistep::IngestMultistepArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory kg-invalidate`.
+    /// CLI parity for `memory_kg_invalidate`.
+    KgInvalidate(crate::cli::commands::kg_invalidate::KgInvalidateArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory kg-timeline`. CLI
+    /// parity for `memory_kg_timeline`.
+    KgTimeline(crate::cli::commands::kg_timeline::KgTimelineArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory entity-register`.
+    /// CLI parity for `memory_entity_register`.
+    EntityRegister(crate::cli::commands::entity_register::EntityRegisterArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory entity-get-by-alias`.
+    /// CLI parity for `memory_entity_get_by_alias`.
+    EntityGetByAlias(crate::cli::commands::entity_get_by_alias::EntityGetByAliasArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory dependents-of-invalidated`.
+    /// CLI parity for `memory_dependents_of_invalidated`.
+    DependentsOfInvalidated(
+        crate::cli::commands::dependents_of_invalidated::DependentsOfInvalidatedArgs,
+    ),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory reflection-origin`.
+    /// CLI parity for `memory_reflection_origin`.
+    ReflectionOrigin(crate::cli::commands::reflection_origin::ReflectionOriginArgs),
+    /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory quota-status`. CLI
+    /// parity for `memory_quota_status`.
+    QuotaStatus(crate::cli::commands::quota_status::QuotaStatusArgs),
 }
 
 /// `ai-memory governance` parent argument struct.
@@ -311,14 +540,26 @@ pub struct GovernanceCliArgs {
     pub action: GovernanceAction,
 }
 
-/// `ai-memory governance` sub-subcommands. Today only the K11 migrator
-/// lives here; future K-track work may add more verbs (`lint`,
-/// `explain`, …) so the surface is shaped as an enum from day one.
+/// `ai-memory governance` sub-subcommands. K11 migrator + 7th-form
+/// `install-defaults` (issue #760) bulk-activator for seed rules
+/// R001-R004 live here; future K-track work may add more verbs
+/// (`lint`, `explain`, …) so the surface is shaped as an enum from
+/// day one.
 #[derive(clap::Subcommand)]
 pub enum GovernanceAction {
     /// Translate legacy [governance] policies to v0.7
     /// [[permissions.rules]] (K9 format).
     MigrateToPermissions(crate::cli::governance_migrate::MigrateToPermissionsArgs),
+    /// v0.7.0 7th-form closeout (issue #760) — flip the seeded
+    /// operator hard rules R001-R004 (migration
+    /// `0024_v07_governance_rules.sql`) to `enabled = 1`. Interactive
+    /// confirmation by default; `--yes` overrides for CI/scripts.
+    InstallDefaults(crate::cli::governance_install_defaults::InstallDefaultsArgs),
+    /// v0.7.0 issue #863 — shell-side parity for the MCP tool
+    /// `memory_check_agent_action`. Dry-run a substrate agent-action
+    /// rule (R001-R004 plus any operator-added rule) and emit the
+    /// Allow / Refuse / Warn verdict.
+    CheckAction(crate::cli::governance_check_action::CheckActionArgs),
 }
 
 /// Arguments for the `doctor` subcommand. Lives next to `Cli` so clap
@@ -401,7 +642,20 @@ pub struct BenchArgs {
     /// still prints; this flag only adds the append side effect.
     #[arg(long, value_name = "PATH")]
     pub history: Option<PathBuf>,
+    /// #1579 B8 — seed a scratch corpus of N rows before running the
+    /// workload and gate the verdict against the per-scale budget
+    /// table in `PERFORMANCE.md` §"Corpus-scale budgets". Omitting the
+    /// flag keeps the legacy ~500-row workload and legacy budgets.
+    /// Clamped to `[1, 1_000_000]`.
+    #[arg(long, value_name = "ROWS")]
+    pub scale: Option<usize>,
 }
+
+/// Default `--batch` page-size hint for `ai-memory migrate`. Currently
+/// an API-compatibility hint only — see the `MAX_ROWS` note in
+/// `src/migrate.rs::migrate`.
+#[cfg(feature = "sal")]
+const MIGRATE_BATCH_DEFAULT: usize = 1000;
 
 #[cfg(feature = "sal")]
 #[derive(Args)]
@@ -413,8 +667,10 @@ pub struct MigrateArgs {
     /// Destination URL. Same URL shape as `--from`.
     #[arg(long)]
     pub to: String,
-    /// Page size. Clamped to [1, 10000]. Default 1000.
-    #[arg(long, default_value_t = 1000)]
+    /// Page-size hint. Default 1000. Retained for API compatibility —
+    /// the current migrator reads one page capped at `MAX_ROWS`
+    /// (1,000,000) and refuses loudly past it; see `src/migrate.rs`.
+    #[arg(long, default_value_t = MIGRATE_BATCH_DEFAULT)]
     pub batch: usize,
     /// Only migrate memories in this namespace.
     #[arg(long)]
@@ -474,7 +730,10 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
     /// Deadline for quorum-ack collection. After this many ms the
-    /// write returns 503 `quorum_not_met`. Default 2000.
+    /// write returns 503 `quorum_not_met`. Default 2000 assumes
+    /// same-DC peers; cross-region (WAN) meshes need 5000-10000 —
+    /// the do-1461 reference deployment uses 8000. See
+    /// docs/federation.md for sizing guidance. (#1565)
     #[arg(long, default_value_t = 2000)]
     pub quorum_timeout_ms: u64,
     /// Optional mTLS client cert for outbound federation POSTs. Same
@@ -498,6 +757,38 @@ pub struct ServeArgs {
     /// node convergent within one interval after resume.
     #[arg(long, default_value_t = 30)]
     pub catchup_interval_secs: u64,
+    /// v0.7.0 epic (ADR-001) — the federation identity this node signs and
+    /// presents as (`sender_agent_id`). Precedence-2 source, below the
+    /// `AI_MEMORY_FED_IDENTITY` env override and above the historical
+    /// `host:<hostname>` default. Set this to a stable, trust-domain-scoped
+    /// id (e.g. `region/nyc/node-7`) so a node's identity survives a
+    /// hostname change. Unset = keep the hostname default.
+    #[arg(long)]
+    pub federation_identity: Option<String>,
+
+    // -------- v0.7.0 Wave-3 — adapter selection --------------------
+    /// v0.7.0 Wave-3 — full SAL store URL. When set, the daemon binds
+    /// its [`MemoryStore`] handle to the URL-resolved adapter instead
+    /// of the default SQLite path derived from `--db`.
+    ///
+    /// Accepted shapes:
+    ///
+    /// - `sqlite:///absolute/path/to/file.db` — SQLite adapter (same
+    ///   semantics as `--db`).
+    /// - `postgres://user:pass@host:port/dbname` — Postgres adapter.
+    /// - `postgresql://...` — alias for the Postgres scheme.
+    ///
+    /// `--db` and `--store-url` are mutually exclusive: passing both
+    /// is rejected at startup with a clear error.
+    ///
+    /// Postgres-backed daemons require `--features sal,sal-postgres`
+    /// at build time; otherwise the URL is rejected at startup. See
+    /// `docs/postgres-age-guide.md` for the operator workflow.
+    ///
+    /// [`MemoryStore`]: crate::store::MemoryStore
+    #[cfg(feature = "sal")]
+    #[arg(long, value_name = "URL")]
+    pub store_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -528,6 +819,47 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
         unsafe { std::env::set_var("AI_MEMORY_DB_PASSPHRASE", passphrase) };
     }
     let db_path = app_config.effective_db(&cli.db);
+    // Seed the process-wide per-agent quota defaults from the resolved
+    // `[limits]` config (env `AI_MEMORY_MAX_*` > `[limits]` > compiled
+    // default). `ensure_row` / the Postgres quota-row auto-inserts read
+    // these when stamping a fresh `agent_quotas` row, so every
+    // subcommand path (serve / mcp / CLI writes) charges the same
+    // operator-tuned daily caps. Idempotent — first writer wins; later
+    // calls are no-ops.
+    {
+        let limits = app_config.resolve_limits();
+        crate::quotas::set_quota_defaults(crate::quotas::QuotaDefaults {
+            max_memories_per_day: limits.max_memories_per_day,
+            max_storage_bytes: limits.max_storage_bytes,
+            max_links_per_day: limits.max_links_per_day,
+        });
+    }
+    // #1579 B7 — seed the process-wide sqlite `PRAGMA mmap_size` from
+    // the resolved `[storage]` config (env `AI_MEMORY_DB_MMAP_SIZE` >
+    // `[storage].db_mmap_size_bytes` > compiled 256 MiB default).
+    // Every subsequent `db::open` on any subcommand path (serve / mcp /
+    // CLI) applies it. Idempotent — first writer wins, same as the
+    // quota seeding above.
+    let resolved_storage = app_config.resolve_storage();
+    crate::storage::set_db_mmap_size(resolved_storage.db_mmap_size_bytes);
+    // #1604 — seed the process-wide rerank input-sequence cap from the
+    // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
+    // `[reranker].max_seq_tokens` > compiled default). Every subsequent
+    // batched cross-encoder rerank forward on any subcommand path
+    // (serve / mcp / CLI) applies it. Idempotent — first writer wins,
+    // same as the mmap seeding above.
+    crate::reranker::set_rerank_max_seq(app_config.resolve_reranker().max_seq_tokens);
+    // #1590 — seed the process-wide operator-configured default
+    // namespace (Some ONLY when `[storage].default_namespace` — or the
+    // legacy flat field — was explicitly set). Every write surface
+    // (MCP `memory_store`, HTTP `POST /api/v1/memories`, the CLI
+    // namespace ladder) consults this; unconfigured deployments keep
+    // their historical per-surface defaults.
+    crate::config::set_configured_default_namespace(
+        resolved_storage
+            .explicit_default_namespace()
+            .map(str::to_string),
+    );
     let j = cli.json;
     let cli_agent_id: Option<String> = cli.agent_id.clone();
     // Track whether command writes to DB (for WAL checkpoint)
@@ -539,7 +871,37 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     };
 
     let result = match cli.command {
-        Command::Serve(a) => serve(db_path, a, app_config).await,
+        Command::Serve(a) => {
+            // v0.7.0 Wave-3 — `--db` and `--store-url` are mutually
+            // exclusive when both are explicitly supplied. clap can't
+            // express this conflict cross-struct (the global `--db`
+            // lives on `Cli`, the new `--store-url` lives on
+            // `ServeArgs`), so the check happens here at runtime.
+            //
+            // `--db` carries a non-`None` `default_value`, so we can't
+            // tell from the parsed value alone whether the operator
+            // typed it on the command line. We approximate explicit
+            // intent through the `AI_MEMORY_DB` env var (which clap
+            // resolves into the same field) and a non-default path.
+            // When both signals indicate `--db` was deliberate AND
+            // `--store-url` is set, refuse to start.
+            #[cfg(feature = "sal")]
+            if let Some(ref url) = a.store_url {
+                let db_was_explicit =
+                    std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
+                if db_was_explicit {
+                    // #1579 A3 (SECURITY) — redact the URL credential
+                    // before it lands in the error output.
+                    anyhow::bail!(
+                        "--db and --store-url are mutually exclusive. \
+                         Pass exactly one. Got --db={} and --store-url={}",
+                        db_path.display(),
+                        crate::logging::redact_url_password(url),
+                    );
+                }
+            }
+            serve(db_path, a, app_config).await
+        }
         Command::Mcp { tier, profile } => {
             let feature_tier = app_config.effective_tier(Some(&tier));
             // v0.6.4-001 — resolve profile (CLI/env > config > default core).
@@ -553,7 +915,41 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                     std::process::exit(2);
                 }
             };
-            mcp::run_mcp_server(&db_path, feature_tier, app_config, &resolved_profile)?;
+            // v0.7.0 F6 — `mcp::run_mcp_server` is a synchronous
+            // stdin-reading loop that internally calls
+            // `reqwest::blocking::Client` for every LLM-backed tool
+            // (`memory_consolidate`, `memory_expand_query`,
+            // `memory_auto_tag`, `memory_detect_contradiction`).
+            // Running that on a tokio worker thread directly does
+            // two bad things at once:
+            //   1. Pegs a worker thread on a synchronous read and
+            //      keeps the multi-threaded runtime spinning on
+            //      the remaining workers (the 99.3% CPU
+            //      `clock_gettime` / `mach_absolute_time` poll loop
+            //      observed in Round-2 sample profiling).
+            //   2. Calls `reqwest::blocking::Client::send()` from
+            //      within an active tokio runtime context, which
+            //      either panics ("Cannot start a runtime from
+            //      within a runtime") or silently fails the chat
+            //      RPC ("Failed to send chat request") — the
+            //      proximate cause of the four LLM-backed tools
+            //      returning errors while ollama itself was healthy.
+            // Routing the entire MCP loop through `spawn_blocking`
+            // gives it its own dedicated thread with no tokio
+            // runtime context, so the blocking reqwest calls inside
+            // `OllamaClient::generate` are issued cleanly.
+            let db_path_owned = db_path.clone();
+            let app_config_owned = app_config.clone();
+            tokio::task::spawn_blocking(move || {
+                mcp::run_mcp_server(
+                    &db_path_owned,
+                    feature_tier,
+                    &app_config_owned,
+                    &resolved_profile,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("mcp join: {e}"))??;
             Ok(())
         }
         Command::Store(a) => {
@@ -701,6 +1097,33 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::gc::run_namespaces(&db_path, j, &mut out)
         }
+        Command::Namespace(a) => {
+            // v0.7.0 (issue #800) — Batman Mode Crack 1. First-class CLI
+            // wrapper around the MCP `memory_namespace_set_standard` /
+            // `_get_standard` / `_clear_standard` tools so operators
+            // don't need to drop into MCP-stdio JSON-RPC just to bind
+            // a `GovernancePolicy` to a namespace.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::namespace::run(&db_path, a, j, &mut out)
+        }
+        Command::Config(a) => {
+            // v0.7.x (#1146) — enterprise configuration tooling.
+            // `ai-memory config migrate` rewrites a legacy v1
+            // (flat-field) `config.toml` to the v2 sectioned shape.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::config::run(&db_path, a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         Command::Export => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -774,6 +1197,40 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::identity::run(a, j, &mut out)
         }
+        Command::Offload(a) => {
+            // v0.7.0 QW-3 — context-offload substrate primitive.
+            // Reads `--file` (or `-` stdin), writes a row into
+            // `offloaded_blobs`, returns the `ref_id`. The full
+            // short-term-context-compression pattern (Mermaid canvas
+            // + auto-cadence + node_id integration) targets v0.8.0.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::offload::run_offload(&db_path, &a, &mut out)
+        }
+        Command::Deref(a) => {
+            // v0.7.0 QW-3 — dereference a `ref_id` produced by
+            // `ai-memory offload`. Refuses tampered rows.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::offload::run_deref(&db_path, &a, &mut out)
+        }
+        Command::Rules(a) => {
+            // v0.7.0 (issue #691) — substrate-level agent-action rules
+            // engine. Mutation verbs require the operator key on disk;
+            // read verbs (list / check) work without it.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::rules::run(&db_path, a, j, &mut out)
+        }
         Command::Pending(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -799,16 +1256,70 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             cli::backup::run_restore(&db_path, &a, j, &mut out)
         }
         Command::Curator(a) => {
+            // v0.7.0 #1548 — `--db` and `--store-url` are mutually
+            // exclusive when both are explicitly supplied, mirroring the
+            // `serve` arm above. The global `--db` carries a non-`None`
+            // `default_value`, so we approximate explicit operator
+            // intent through the `AI_MEMORY_DB` env var (which clap
+            // resolves into the same field) or a non-default path.
+            #[cfg(feature = "sal")]
+            if let Some(ref url) = a.store_url {
+                let db_was_explicit =
+                    std::env::var("AI_MEMORY_DB").is_ok() || db_path != PathBuf::from(DEFAULT_DB);
+                if db_was_explicit {
+                    // #1579 A3 (SECURITY) — redact the URL credential
+                    // before it lands in the error output.
+                    anyhow::bail!(
+                        "--db and --store-url are mutually exclusive. \
+                         Pass exactly one. Got --db={} and --store-url={}",
+                        db_path.display(),
+                        crate::logging::redact_url_password(url),
+                    );
+                }
+            }
+            // Initialize the tracing subscriber so the daemon-start
+            // banner and per-cycle `tracing::info!` lines in
+            // `curator::run_daemon` actually emit. Previously only the
+            // HTTP `serve` path called `init_tracing()`, leaving the
+            // curator path silent regardless of `RUST_LOG`. `try_init`
+            // inside `init_tracing` makes this safe to call even when
+            // another subscriber is already installed.
+            init_tracing();
+            // Daemon mode runs indefinitely on a `spawn_blocking` worker
+            // that itself calls `tracing::info!`. If the dispatch held
+            // the process-wide `Stdout::lock()` while the daemon ran,
+            // the blocking thread's tracing write would deadlock on the
+            // ReentrantMutex (same-thread re-entry is fine; cross-thread
+            // contention isn't). `--daemon` doesn't write to `out`
+            // anyway, so route it to `io::sink()` and only lock the
+            // real stdout/stderr for the modes that actually emit CLI
+            // output (`--once`, `--reflect`, `--rollback`).
+            if a.daemon {
+                let mut so = std::io::sink();
+                let mut se = std::io::sink();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::curator::run(&db_path, &a, app_config, &mut out).await
+            } else {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::curator::run(&db_path, &a, app_config, &mut out).await
+            }
+        }
+        Command::Bench(a) => cmd_bench(&a),
+        #[cfg(feature = "sal")]
+        Command::Migrate(a) => cmd_migrate(&a).await,
+        #[cfg(feature = "sal")]
+        Command::SchemaInit(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::curator::run(&db_path, &a, app_config, &mut out).await
+            cli::schema_init::run(&a, &mut out).await
         }
-        Command::Bench(a) => cmd_bench(&a),
-        #[cfg(feature = "sal")]
-        Command::Migrate(a) => cmd_migrate(&a).await,
         Command::Doctor(a) => {
             // P7 / R7. The doctor is read-only; it never sets
             // `needs_checkpoint`. We compute the exit code from the
@@ -965,7 +1476,373 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 GovernanceAction::MigrateToPermissions(args) => {
                     cli::governance_migrate::run(args, &mut out)
                 }
+                GovernanceAction::InstallDefaults(args) => {
+                    cli::governance_install_defaults::run(&db_path, args, &mut out)
+                }
+                GovernanceAction::CheckAction(args) => {
+                    cli::governance_check_action::run(&db_path, &args, &mut out)
+                }
             }
+        }
+        Command::VerifyReflectionChain(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::verify::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::VerifySignedEventsChain(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::verify_signed_events::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::ExportForensicBundle(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::export::export(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::VerifyForensicBundle(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::export::verify(&a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::ExportReflections(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::export_reflections::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::RecoverPreviousSession(a) => {
+            // Issue #1389 — fail-safe recovery from host transcripts.
+            // Graceful by design: the SessionStart-hook chain MUST
+            // NOT wedge the agent boot, so per-line parse errors
+            // surface in the report rather than as Err.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::recover_previous_session::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Atomise(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::atomise::run(
+                &db_path,
+                &a,
+                app_config,
+                cli_agent_id.as_deref(),
+                &mut out,
+            )? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Persona(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 QW-2 — the CLI deliberately runs WITHOUT a live
+            // LLM client. `--regenerate` requires one; we surface the
+            // documented "install Ollama" hint via exit code 2 rather
+            // than spinning up a transient OllamaClient here. Operators
+            // who want the regenerate path call `memory_persona_generate`
+            // through MCP (where the daemon already owns the LLM).
+            match cli::commands::persona::run(&db_path, &a, None, None, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Calibrate(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 Form 5 (issue #758) — calibration driver.
+            // Currently dispatches `calibrate confidence`; future
+            // subcommands (e.g. `calibrate recall`) layer on alongside.
+            match a.subcommand {
+                cli::commands::calibrate_confidence::CalibrateSubcommand::Confidence(ref conf) => {
+                    match cli::commands::calibrate_confidence::run(&db_path, conf, &mut out)? {
+                        0 => Ok(()),
+                        code => std::process::exit(code),
+                    }
+                }
+            }
+        }
+        Command::Skill(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 Cluster E API-2 (issue #767) — `ai-memory skill
+            // <subcommand>`. The CLI dispatches with `active_keypair =
+            // None` to match the existing CLI convention (Persona /
+            // Calibrate also run without daemon-side ambient state).
+            // Operators who want signed skill registers/exports/promotes
+            // hit the MCP / HTTP surface where the daemon owns the
+            // keypair; the CLI surface stays unsigned by design so
+            // shell scripts can drive skills without re-implementing
+            // the keypair-load ceremony.
+            match cli::commands::skill::run(&db_path, &a, None, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Share(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 #1095 — `ai-memory share`. Wraps the same substrate
+            // primitive (`mcp::tools::share::handle_share`) the MCP +
+            // HTTP surfaces consume; wire envelope is byte-equal across
+            // the three.
+            cli::share::cmd_share(&db_path, &a, &mut out)
+        }
+        // v0.7.0 ARCH-3 / FX-12 — MCP/CLI parity build-out. Each
+        // dispatch arm wraps the same substrate primitive the MCP tool
+        // consumes; wire envelope is byte-equal across MCP / HTTP /
+        // CLI. See `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md`.
+        Command::KgQuery(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::kg_query::cmd_kg_query(&db_path, &a, &mut out)
+        }
+        Command::FindPaths(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::find_paths::cmd_find_paths(&db_path, &a, &mut out)
+        }
+        Command::RecallObservations(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::recall_observations::cmd_recall_observations(&db_path, &a, &mut out)
+        }
+        Command::CheckDuplicate(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::check_duplicate::cmd_check_duplicate(&db_path, &a, app_config, &mut out)
+                .await
+        }
+        Command::Expand(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::commands::expand::cmd_expand(&a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Reembed(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.7.0 #1598 — full-corpus vector-space migration.
+            // Non-zero exit codes map configuration outcomes
+            // (no-embedder / init-failed) like `ai-memory expand`.
+            match cli::commands::reembed::cmd_reembed(&db_path, &a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Replay(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::replay::cmd_replay(&db_path, &a, &mut out)
+        }
+        // v0.7.0 ARCH-3 / FX-C3 (batch2) — 16 additional CLI parity
+        // dispatch arms. Each wraps the same substrate primitive the
+        // MCP tool consumes; wire envelope is byte-equal across MCP /
+        // HTTP / CLI. See
+        // `docs/v0.7.0/arch-3-mcp-cli-parity-audit.md` §"Added in
+        // fix/arch3-mcp-cli-parity-batch2".
+        Command::Reflect(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::reflect::cmd_reflect(&db_path, &a, &mut out)
+        }
+        Command::Subscribe(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::subscribe::cmd_subscribe(&db_path, &a, &mut out)
+        }
+        Command::Unsubscribe(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::unsubscribe::cmd_unsubscribe(&db_path, &a, &mut out)
+        }
+        Command::ListSubscriptions(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::list_subscriptions::cmd_list_subscriptions(&db_path, &a, &mut out)
+        }
+        Command::SubscriptionReplay(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::subscription_replay::cmd_subscription_replay(&db_path, &a, &mut out)
+        }
+        Command::SubscriptionDlqList(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::subscription_dlq_list::cmd_subscription_dlq_list(&db_path, &a, &mut out)
+        }
+        Command::Notify(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::notify::cmd_notify(&db_path, &a, app_config, &mut out)
+        }
+        Command::Inbox(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::inbox::cmd_inbox(&db_path, &a, &mut out)
+        }
+        Command::IngestMultistep(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::ingest_multistep::cmd_ingest_multistep(&a, app_config, &mut out)
+        }
+        Command::KgInvalidate(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::kg_invalidate::cmd_kg_invalidate(&db_path, &a, &mut out)
+        }
+        Command::KgTimeline(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::kg_timeline::cmd_kg_timeline(&db_path, &a, &mut out)
+        }
+        Command::EntityRegister(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::entity_register::cmd_entity_register(&db_path, &a, &mut out)
+        }
+        Command::EntityGetByAlias(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::entity_get_by_alias::cmd_entity_get_by_alias(&db_path, &a, &mut out)
+        }
+        Command::DependentsOfInvalidated(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::dependents_of_invalidated::cmd_dependents_of_invalidated(
+                &db_path, &a, &mut out,
+            )
+        }
+        Command::ReflectionOrigin(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::reflection_origin::cmd_reflection_origin(&db_path, &a, &mut out)
+        }
+        Command::QuotaStatus(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::quota_status::cmd_quota_status(&db_path, &a, &mut out)
         }
     };
 
@@ -1003,6 +1880,37 @@ pub fn is_write_command(cmd: &Command) -> bool {
             | Command::Import(_)
             | Command::AutoConsolidate(_)
             | Command::Gc
+            | Command::Atomise(_)
+            // v0.7.0 Cluster E API-2 (issue #767) — register / export /
+            // promote write to the `skills` and `signed_events` tables.
+            // List / get / resource / compose are read-only but classify
+            // the whole verb family as write-class so the post-run WAL
+            // checkpoint keeps the long-lived sqlite file from growing
+            // unbounded under register-heavy workloads.
+            | Command::Skill(_)
+            // v0.7.0 Batman Mode (issue #800) — `namespace set-standard`
+            // and `clear-standard` write to `namespace_meta`. The
+            // `get-standard` and `batman-policy` verbs are read-only
+            // but we classify the whole family as write-class so the
+            // post-run WAL checkpoint runs.
+            | Command::Namespace(_)
+            // v0.7.0 #1095 — `ai-memory share` copies a row into the
+            // recipient agent's `_shared/<from>→<to>/` namespace, so
+            // it must trip the post-run WAL checkpoint.
+            | Command::Share(_)
+            // v0.7.0 ARCH-3 / FX-C3 (batch2) — write-class verbs in
+            // the new parity batch. The reads (list-subscriptions /
+            // subscription-replay / subscription-dlq-list / inbox /
+            // kg-timeline / entity-get-by-alias / dependents-of-
+            // invalidated / reflection-origin / quota-status) are
+            // omitted from this list.
+            | Command::Reflect(_)
+            | Command::Subscribe(_)
+            | Command::Unsubscribe(_)
+            | Command::Notify(_)
+            | Command::IngestMultistep(_)
+            | Command::KgInvalidate(_)
+            | Command::EntityRegister(_)
     )
 }
 
@@ -1014,14 +1922,80 @@ pub fn is_write_command(cmd: &Command) -> bool {
 /// newline / CRLF; rejects an empty passphrase (post-strip) with an error;
 /// preserves all other internal whitespace.
 ///
+/// v0.7.0 #1055 (Agent-2 #5) — on Unix, the function rejects the
+/// passphrase file when its mode allows ANY group or world access
+/// (`mode & 0o077 != 0`). Pre-#1055 the function accepted
+/// world-readable / group-readable files even though CLAUDE.md and
+/// the doc comment at `src/storage/connection.rs:139-141` promise the
+/// passphrase file is mode 0400. Any local user with read access to
+/// the configured path could read the `SQLCipher` passphrase and
+/// decrypt the on-disk DB offline. Operators with a legitimate need
+/// for the legacy permissive posture (shared-container deploys where
+/// the secret is already gated upstream by the orchestrator) can opt
+/// back in via `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`. The
+/// unsafe override is logged at WARN on every fire.
+///
 /// # Errors
 ///
 /// - The file cannot be read (e.g. missing, permission denied).
 /// - The passphrase, after stripping the trailing newline, is empty.
+/// - (Unix only, post-#1055) the file's mode allows group or world
+///   access without the env-var escape hatch.
 pub fn passphrase_from_file(path: &Path) -> Result<String> {
-    let raw = std::fs::read_to_string(path)
+    // v0.7.0 #1055 — Unix permission check. We use the `mode & 0o077`
+    // bitmask which fires on any group or world rwx bit. Windows
+    // has no equivalent file-mode ACL primitive; the check is
+    // compile-conditional so the function still works on cross-
+    // platform builds.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).with_context(|| {
+            format!(
+                "stat passphrase file {} for permission check (#1055)",
+                path.display()
+            )
+        })?;
+        let mode = meta.permissions().mode();
+        let lax_bits = mode & 0o077;
+        if lax_bits != 0 {
+            let fail_open = std::env::var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if fail_open {
+                tracing::warn!(
+                    target: "ai_memory::daemon_runtime",
+                    path = %path.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "passphrase_from_file: file is group/world-readable; \
+                     AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1 — accepting \
+                     (UNSAFE, legacy posture). Tighten with `chmod 0400 <path>` \
+                     and clear the env var."
+                );
+            } else {
+                anyhow::bail!(
+                    "passphrase file {} has lax permissions (mode {:o}, group/world bits set); \
+                     tighten with `chmod 0400 {}` OR set \
+                     AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1 to opt out (#1055)",
+                    path.display(),
+                    mode & 0o777,
+                    path.display(),
+                );
+            }
+        }
+    }
+    let mut raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading passphrase file {}", path.display()))?;
     let passphrase = raw.trim_end_matches(['\n', '\r']).to_string();
+    // #1258 — zeroize the intermediate `raw` buffer so the secret bytes
+    // do not linger on the heap after we hand the trimmed copy to the
+    // caller. The caller is responsible for zeroizing the returned
+    // `passphrase` when it falls out of scope (typically passed
+    // straight into `AI_MEMORY_DB_PASSPHRASE`).
+    {
+        use zeroize::Zeroize;
+        raw.zeroize();
+    }
     if passphrase.is_empty() {
         anyhow::bail!("passphrase file {} is empty", path.display());
     }
@@ -1039,15 +2013,138 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
 pub fn apply_anonymize_default(app_config: &AppConfig) {
     // #198: config → env mapping for agent_id anonymization. Env var already
     // set by the caller wins; config is only applied when the env is unset.
-    if app_config.effective_anonymize_default() && std::env::var("AI_MEMORY_ANONYMIZE").is_err() {
+    if app_config.effective_anonymize_default()
+        && std::env::var(crate::identity::ENV_ANONYMIZE).is_err()
+    {
         // SAFETY: single-threaded startup before any worker threads spawn.
-        unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "1") };
+        unsafe { std::env::set_var(crate::identity::ENV_ANONYMIZE, "1") };
     }
+}
+
+/// #976 (2026-05-20) — resolve the admin-allowlist with env-var
+/// precedence over the config-file `[admin].agent_ids` block.
+///
+/// `AI_MEMORY_ADMIN_AGENT_IDS` is a comma-separated list of agent_ids.
+/// The wildcard `*` is honoured (every authenticated caller becomes
+/// admin — appropriate for test daemons + container deploys that
+/// receive the admin allowlist from orchestration secrets instead of a
+/// shipped config.toml). Same `validate_agent_id` filter as the config
+/// path; malformed entries are dropped with a `warn` log so a single
+/// typo cannot lock the operator out.
+///
+/// Returns the config-file allowlist when the env var is absent or
+/// empty; returns an empty Vec when neither source provides agent_ids
+/// (closes every admin-class endpoint by default — the secure
+/// posture per the post-#946 NHI contract).
+#[must_use]
+pub fn resolve_admin_agent_ids(admin_cfg: Option<&crate::config::AdminConfig>) -> Vec<String> {
+    if let Ok(raw) = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS")
+        && !raw.trim().is_empty()
+    {
+        let mut out = Vec::new();
+        for entry in raw.split(',') {
+            let id = entry.trim();
+            if id.is_empty() {
+                continue;
+            }
+            // #980 (2026-05-20) — the `AI_MEMORY_ADMIN_AGENT_IDS=*`
+            // wildcard carve-out is REMOVED. Pre-#980 the env var
+            // accepted `"*"` as an explicit "admit every caller"
+            // sentinel; combined with the `is_admin_caller` wildcard
+            // arm (also closed in #980), an operator who set the
+            // env var (intentionally or via a copy-paste mishap)
+            // opened every admin endpoint. Operators wanting a
+            // permissive admin posture must now enumerate the agent
+            // ids explicitly (e.g. comma-separated list of NHI
+            // principals); the wildcard entry is rejected by
+            // `validate_agent_id` (shape: `*` is not in the allowed
+            // char class) and dropped with a WARN. The previous
+            // explicit-test-only path lives behind `#[cfg(test)]` in
+            // `is_admin_caller`; production deployments cannot reach
+            // it regardless of how the allowlist is populated.
+            match crate::validate::validate_agent_id(id) {
+                Ok(()) => out.push(id.to_string()),
+                Err(e) => {
+                    tracing::warn!(
+                        "AI_MEMORY_ADMIN_AGENT_IDS entry '{id}' rejected: {e}; dropping"
+                    );
+                }
+            }
+        }
+        return out;
+    }
+    admin_cfg
+        .map(crate::config::AdminConfig::validated_agent_ids)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
 // Embedder / vector-index canonical builders
 // ---------------------------------------------------------------------------
+
+/// #1521 — resolve the daemon embedder model under the canonical
+/// precedence ladder, mirroring the [`AppConfig::resolve_embeddings`]
+/// layering for the model dimension:
+///
+///   1. `[embeddings].model` (sectioned v2 config, #1146)
+///   2. legacy flat `embedding_model` (deprecated)
+///   3. tier-preset `embedding_model`
+///   4. `None` (keyword-only / embeddings disabled)
+///
+/// The model is read from the explicit section/flat fields rather than
+/// `ResolvedEmbeddings.model` (which defaults to nomic whenever ANY
+/// `[embeddings]` key is present), so a url-only section on the semantic
+/// tier still keeps the tier-preset MiniLM model. A configured id the
+/// 2-model daemon embedder cannot construct (or an unparseable one)
+/// degrades to the tier preset — the operator picked a pin, not
+/// keyword-only. Pure: no network I/O, so the precedence is unit-testable
+/// without an HF-Hub fetch (`build_embedder` does the construction).
+#[allow(deprecated)]
+pub(crate) fn resolve_embedder_model(
+    tier_config: &crate::config::TierConfig,
+    app_config: &AppConfig,
+) -> Option<crate::config::EmbeddingModel> {
+    let preset = tier_config.embedding_model;
+    let preset_label = preset
+        .map(|m| m.hf_model_id().to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    let configured = app_config
+        .embeddings
+        .as_ref()
+        .and_then(|section| section.model.clone())
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| (raw, "[embeddings].model"))
+        .or_else(|| {
+            app_config
+                .embedding_model
+                .clone()
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| (raw, "legacy embedding_model"))
+        });
+
+    let Some((raw, origin)) = configured else {
+        return preset;
+    };
+    match crate::config::EmbeddingModel::from_canonical_id(&raw) {
+        Some(model) => {
+            tracing::info!(
+                "embedder: using configured model {} from {origin} (tier-preset would have been {})",
+                model.hf_model_id(),
+                preset_label
+            );
+            Some(model)
+        }
+        None => {
+            tracing::warn!(
+                "embedder: configured model {raw:?} (from {origin}) is not constructible by the \
+                 daemon embedder (supported: nomic-embed-text-v1.5, all-MiniLM-L6-v2); \
+                 falling back to tier-preset {preset_label}"
+            );
+            preset
+        }
+    }
+}
 
 /// Construct the [`Embedder`] for a given tier. Returns `None` for the
 /// keyword tier (no embedder requested) and on load failure (caller
@@ -1058,26 +2155,42 @@ pub fn apply_anonymize_default(app_config: &AppConfig) {
 /// (HTTP daemon) and `cli::recall::run` (offline recall). Prior to W6
 /// each call site had its own copy, with subtly different fallback
 /// shapes — the bug at issue #322 was a direct consequence.
+#[allow(deprecated)]
 pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -> Option<Embedder> {
     let tier_config = feature_tier.config();
-    let Some(emb_model) = tier_config.embedding_model else {
+    // #1521: consume the canonical embeddings resolver so the sectioned
+    // `[embeddings]` block (#1146) drives the daemon embedder, not just
+    // the deprecated flat fields.
+    //
+    // #1598 — construction is delegated to the single shared boot
+    // entry `Embedder::from_resolved` (also used by the MCP stdio
+    // init). For the local/ollama backend the model is resolved by
+    // the pure `resolve_embedder_model` helper (precedence:
+    // `[embeddings].model` section > legacy flat `embedding_model` >
+    // tier preset); for API backends the operator's `model` id is
+    // wired verbatim by the resolver and the tier preset only gates
+    // whether embeddings are enabled at all (Some vs None).
+    let resolved_embeddings = app_config.resolve_embeddings();
+    let tier_model = if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
+        tier_config.embedding_model
+    } else {
+        resolve_embedder_model(&tier_config, app_config)
+    };
+    let Some(emb_model) = tier_model else {
         tracing::info!(
             "embedder disabled — tier={} keyword-only (FTS5); semantic recall not wired",
             feature_tier.as_str()
         );
         return None;
     };
-    let embed_url = app_config.effective_embed_url().to_string();
     // The HF-Hub sync API and candle model-load are blocking CPU work that
     // internally spin their own tokio runtime. Running them directly in this
     // async context panics with "Cannot drop a runtime in a context where
     // blocking is not allowed." Move the whole construction onto the blocking
     // pool so the inner runtime is owned by a dedicated thread.
+    let resolved_for_build = resolved_embeddings.clone();
     let build = match tokio::task::spawn_blocking(move || {
-        let embed_client = llm::OllamaClient::new_with_url(&embed_url, "nomic-embed-text")
-            .ok()
-            .map(Arc::new);
-        embeddings::Embedder::for_model(emb_model, embed_client)
+        embeddings::Embedder::from_resolved(&resolved_for_build, Some(emb_model))
     })
     .await
     {
@@ -1088,7 +2201,7 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
         }
     };
     match build {
-        Ok(emb) => {
+        Ok(Some(emb)) => {
             tracing::info!(
                 "embedder loaded ({}) — tier={} semantic recall enabled",
                 emb.model_description(),
@@ -1096,6 +2209,10 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
             );
             Some(emb)
         }
+        // Unreachable with `Some(emb_model)` threaded above; kept
+        // explicit so the keyword-tier contract of `from_resolved`
+        // stays loud here (#1598).
+        Ok(None) => None,
         Err(e) => {
             // v0.6.2 (#327): make embedder load failures loud. The
             // prior WARN level was easy to miss in DO droplet logs,
@@ -1106,12 +2223,124 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
             // or tail -f /var/log/ai-memory-serve.log.
             tracing::error!(
                 "EMBEDDER LOAD FAILED — tier={} requested semantic features, \
-                 but embedder init errored: {e}. Daemon falls back to keyword-only. \
-                 Semantic recall, sync_push embedding refresh (#322), and HNSW index \
-                 will be NO-OPS. Check network egress to HuggingFace Hub + available \
-                 memory for model weights. To force keyword-only explicitly (silences \
-                 this error), set `tier = \"keyword\"` in config.toml.",
+                 but embedder init errored: {e:#}. Semantic recall DEGRADED to \
+                 keyword (#1593/#1598 fail-closed; the chat LLM client is NEVER \
+                 reused for embeddings). Semantic recall, sync_push embedding \
+                 refresh (#322), and HNSW index will be NO-OPS. For local \
+                 backends check network egress to HuggingFace Hub + available \
+                 memory for model weights; for API backends check the resolved \
+                 base URL / API key (`ai-memory doctor`). To force keyword-only \
+                 explicitly (silences this error), set `tier = \"keyword\"` in \
+                 config.toml.",
                 feature_tier.as_str()
+            );
+            None
+        }
+    }
+}
+
+/// v0.7.0 L5 — construct the LLM [`OllamaClient`] for autonomy-hook
+/// capable feature tiers (`smart` / `autonomous`). Returns `None` for
+/// the `keyword` / `semantic` tiers (no `llm_model` declared in the
+/// [`TierConfig`]) and on Ollama unreachability (caller degrades to
+/// non-LLM behaviour). On failure the diagnostic is emitted via
+/// `tracing::warn!` so operators see it in `journalctl` without
+/// killing the daemon — autonomy hooks are best-effort and the
+/// store path must keep working when Ollama is offline.
+///
+/// **FX-D1 (v0.7.0, 2026-05-27).** Pre-FX-D1 this function wrapped
+/// the sync [`llm::OllamaClient::build_from_resolved`] in
+/// `tokio::task::spawn_blocking`. The sync constructor went through
+/// `block_on_local`, whose FX-C1 design panicked on the current-thread
+/// arm. Production tests that defaulted to `#[tokio::test]`
+/// (current-thread) hit the panic — `spawn_blocking`'s blocking-pool
+/// thread inherits the outer runtime handle, so `Handle::try_current()`
+/// resolved to a `CurrentThread` flavor and tripped the panic. The
+/// log line was: `task 294 panicked with message "OllamaClient sync
+/// wrapper called from inside a current-thread tokio runtime."`.
+///
+/// The surgical fix is to call the async constructor
+/// [`llm::OllamaClient::build_from_resolved_async`] directly — no
+/// `spawn_blocking`, no `block_on_local`, no sync→async bridge — so
+/// the construction runs on whichever tokio runtime the caller
+/// brought. The defensive fix in `block_on_local` (replace the panic
+/// with a fresh-OS-thread bridge) catches every other unknown
+/// callsite that might hit the same shape; this surgical fix is the
+/// optimal path at this known callsite.
+pub async fn build_llm_client(
+    feature_tier: FeatureTier,
+    app_config: &AppConfig,
+) -> Option<llm::OllamaClient> {
+    // v0.7.x (#1146) — single canonical entry through the resolver.
+    // The resolver folds CLI flags (none here — `ai-memory serve`
+    // exposes no CLI LLM override), AI_MEMORY_LLM_* env vars, the
+    // [llm] config section, the legacy llm_model/ollama_url flat
+    // fields, and the compiled tier preset. The provenance fields
+    // surface via the tracing log line so RUST_LOG=ai_memory=debug
+    // shows which precedence layer won.
+    let resolved = app_config.resolve_llm(None, None, None);
+
+    // No-preset-tier short-circuit: when the tier has no compiled
+    // `llm_model` preset (Keyword + Semantic at v0.7.0) AND there is
+    // no explicit operator intent (resolver `source == CompiledDefault`),
+    // the resolver's Ollama-default-fallback should NOT pull a client
+    // into existence. This matches pre-#1146 v0.6.x behaviour and
+    // avoids paying a blocking reqwest call to a (likely-absent)
+    // Ollama under tokio test contexts. Operators who explicitly
+    // want an LLM on Keyword/Semantic set AI_MEMORY_LLM_BACKEND or
+    // write a [llm] section, which moves `source` off the
+    // CompiledDefault arm.
+    if feature_tier.config().llm_model.is_none()
+        && matches!(
+            resolved.source,
+            crate::config::ConfigSource::CompiledDefault
+        )
+    {
+        tracing::debug!(
+            "L5: llm client disabled — tier={} has no llm_model preset AND no \
+             operator LLM config; set AI_MEMORY_LLM_BACKEND or [llm] section to enable",
+            feature_tier.as_str()
+        );
+        return None;
+    }
+
+    let backend = resolved.backend.clone();
+    let model = resolved.model.clone();
+    let source = resolved.source.as_str().to_string();
+    let key_source = resolved.api_key_source.as_str().to_string();
+    let tier_str = feature_tier.as_str().to_string();
+
+    // FX-D1 (2026-05-27): call the async constructor directly. The
+    // pre-FX-D1 `spawn_blocking` wrapper drove the sync constructor
+    // through `block_on_local`, which panicked on the current-thread
+    // tokio arm (the default `#[tokio::test]` flavor). The async
+    // path skips the sync→async bridge entirely so the construction
+    // runs on whichever tokio runtime the caller brought, with no
+    // re-entry hazard.
+    let build = llm::OllamaClient::build_from_resolved_async(&resolved).await;
+
+    match build {
+        Ok(Some(client)) => {
+            tracing::info!(
+                "L5: llm client ready — tier={tier_str} backend={backend} \
+                 model={model} source={source} key_source={key_source} \
+                 — auto_tag/expand_query/contradiction-detection/reflection \
+                 hooks armed (#1146 resolver path)"
+            );
+            Some(client)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "L5: llm client disabled — resolver returned no client \
+                 (tier={tier_str} backend={backend} source={source}); \
+                 LLM-powered hooks are no-ops"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "L5: llm client init failed (tier={tier_str} backend={backend} \
+                 source={source}); LLM-powered hooks are no-ops: {e}"
             );
             None
         }
@@ -1134,95 +2363,242 @@ pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<V
     }
 }
 
+/// #1579 B3 — read the boot warm-up entry set (every stored
+/// embedding) over a private connection. Opened fresh so the boot
+/// loader thread never touches the request-serving connection;
+/// failures degrade to "no warm-up" with a WARN (the daemon keeps
+/// serving keyword/FTS recall — the pre-#1579 failure posture).
+pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec<f32>)>> {
+    let conn = match db::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                err = %e,
+                "HNSW boot warm-up: could not open DB; semantic index stays cold (#1579 B3)"
+            );
+            return None;
+        }
+    };
+    match db::get_all_embeddings(&conn) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "HNSW boot warm-up: get_all_embeddings failed; semantic index stays cold (#1579 B3)"
+            );
+            None
+        }
+    }
+}
+
+/// #1579 B3 — async boot HNSW warm-up for `serve`.
+///
+/// Pre-#1579 the daemon built the HNSW graph SYNCHRONOUSLY at boot
+/// (`get_all_embeddings` + `VectorIndex::build` on the startup path):
+/// P1 measured spawn→initialize at 40 s for a 10k-vector corpus and
+/// >28 min at 100k. This loader moves the whole load+build off the
+/// startup path onto a background thread, reusing the #968
+/// double-buffer rebuild machinery: the daemon binds and answers
+/// immediately with an EMPTY index; semantic recall degrades to its
+/// keyword/FTS blend until the warmed graph swaps in (the #519
+/// proactive conflict check routes to its bounded-scan fallback for
+/// the same window via [`hnsw::VectorIndex::is_fully_searchable`]).
+///
+/// Locking discipline: the `AppState.vector_index` outer mutex is
+/// held only for microsecond-scale steps (seed-extend, schedule,
+/// swap) — NEVER across the graph build, which runs detached on the
+/// #968 rebuild thread. Request handlers therefore keep making
+/// progress throughout the warm-up.
+///
+/// Emits one INFO line when the swap lands so operators can see
+/// time-to-semantic-ready in the daemon log.
+pub fn spawn_vector_index_boot_load(
+    db_path: std::path::PathBuf,
+    vector_index: Arc<tokio::sync::Mutex<Option<VectorIndex>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let Some(entries) = load_boot_index_entries(&db_path) else {
+            return;
+        };
+        if entries.is_empty() {
+            tracing::info!(
+                "HNSW boot warm-up: no stored embeddings — index starts empty (#1579 B3)"
+            );
+            return;
+        }
+        let total = entries.len();
+        // Step 1 — seed + schedule the background build under a BRIEF
+        // outer lock. The returned handle is detached from the borrow
+        // (the rebuild thread captures Arc'd internals, not `&self`),
+        // so we can join it after dropping the guard.
+        let build_handle = {
+            let guard = vector_index.blocking_lock();
+            let Some(idx) = guard.as_ref() else {
+                return;
+            };
+            idx.seed_and_rebuild_async(entries)
+        };
+        let _ = build_handle.join();
+        // Step 2 — swap the warmed graph in; loop covers the
+        // rebuild-CAS race with any routine 200-overflow rebuild that
+        // was scheduled by boot-window writes (see
+        // `VectorIndex::warm_boot` for the same contract).
+        loop {
+            let pending = {
+                let guard = vector_index.blocking_lock();
+                let Some(idx) = guard.as_ref() else {
+                    return;
+                };
+                if idx.is_fully_searchable() {
+                    None
+                } else {
+                    Some(idx.rebuild_async())
+                }
+            };
+            match pending {
+                None => break,
+                Some(handle) => {
+                    let _ = handle.join();
+                    // A no-op handle (rebuild CAS busy) joins
+                    // instantly — pace the retry so the loop doesn't
+                    // spin while the in-flight build finishes.
+                    std::thread::sleep(crate::hnsw::REBUILD_WAIT_POLL_INTERVAL);
+                }
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            entries = total,
+            elapsed_ms,
+            "HNSW index warm (#1579 B3): async boot build swapped in; \
+             semantic recall is now index-backed"
+        );
+    })
+}
+
 // ---------------------------------------------------------------------------
 // v0.7 Track H — H2 active keypair loading
 // ---------------------------------------------------------------------------
 
-/// Best-effort load of the daemon's active Ed25519 signing keypair.
+// Round-3 F12 — the daemon's fixed signing-key label. Canonical const
+// (with the full F12 rationale) now lives at
+// `crate::identity::keypair::DAEMON_KEYPAIR_LABEL` (#1558).
+use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
+
+/// Round-3 F12 — ensure the daemon's signing keypair exists on disk and
+/// load it for the serve [`AppState`]. Returns the in-memory keypair
+/// (if any) plus the lifecycle outcome (Generated/AlreadyExists/
+/// SkippedDisabled/None) so the startup banner can surface the
+/// auto-gen line.
 ///
-/// Resolution order:
-///   1. `AI_MEMORY_AGENT_ID` environment variable (set explicitly by
-///      operators who want a specific identity at serve time).
-///   2. Otherwise, `crate::identity::resolve_agent_id(None, None)` —
-///      same NHI-default an HTTP request without `X-Agent-Id` would
-///      resolve to. This produces the `host:` / `anonymous:` shape;
-///      that file is rarely on disk, which is fine — we simply degrade
-///      to unsigned.
+/// Resolution:
+///   1. Resolve the default key directory
+///      ([`crate::identity::keypair::default_key_dir`]).
+///   2. Call [`crate::identity::keypair::ensure_keypair`] under the
+///      stable [`DAEMON_KEYPAIR_LABEL`]. Idempotent: a daemon restart
+///      never overwrites an existing keypair (which would silently
+///      invalidate every prior signed link).
+///   3. Load the keypair from disk and return it.
 ///
-/// Errors at every step are swallowed (logged at INFO/WARN). Missing
-/// keypairs are the common first-run state — we don't want a failed
-/// `keypair::load` to make the daemon refuse to start. Malformed key
-/// files DO log at `WARN` so an operator with a corrupt
-/// `~/.config/ai-memory/keys/<id>.priv` notices.
-fn load_active_keypair_for_serve() -> Option<crate::identity::keypair::AgentKeypair> {
+/// Failure at any step degrades the daemon to unsigned-link mode (the
+/// pre-v0.7 posture) without aborting startup. Log lines describe
+/// which path was taken so an operator inspecting daemon logs sees
+/// the cause.
+fn ensure_and_load_daemon_keypair() -> (
+    Option<crate::identity::keypair::AgentKeypair>,
+    Option<crate::identity::keypair::EnsureOutcome>,
+) {
     let dir = match crate::identity::keypair::default_key_dir() {
         Ok(d) => d,
         Err(e) => {
             tracing::info!("identity: no default key dir available, link signing disabled: {e}");
-            return None;
+            return (None, None);
         }
     };
-    let agent_id = match crate::identity::resolve_agent_id(None, None) {
-        Ok(id) => id,
+    // The `[identity].disabled` config field is not yet wired in
+    // v0.7.0; pass `false` so the helper auto-generates unless the
+    // operator pre-staged a keypair. A future config field can opt
+    // out without changing this call site.
+    let outcome = match crate::identity::keypair::ensure_keypair(DAEMON_KEYPAIR_LABEL, &dir, false)
+    {
+        Ok(o) => o,
         Err(e) => {
-            tracing::info!("identity: agent_id resolution failed, link signing disabled: {e}");
-            return None;
+            tracing::warn!("identity: keypair auto-gen failed: {e:#}");
+            return (None, None);
         }
     };
-    // Common first-run state: directory doesn't exist yet because the
-    // operator hasn't run `ai-memory identity generate`. Silent skip.
-    if !dir.exists() {
-        tracing::info!(
-            "identity: key dir {} not present, link signing disabled (run \
-             `ai-memory identity generate --agent-id {agent_id}` to enable)",
-            dir.display()
-        );
-        return None;
+    if matches!(
+        outcome,
+        crate::identity::keypair::EnsureOutcome::SkippedDisabled
+    ) {
+        return (None, Some(outcome));
     }
-    match crate::identity::keypair::load(&agent_id, &dir) {
+    let kp = match crate::identity::keypair::load(DAEMON_KEYPAIR_LABEL, &dir) {
         Ok(kp) if kp.can_sign() => {
             tracing::info!(
-                "identity: loaded signing keypair for {agent_id} from {}",
+                "identity: loaded signing keypair for {DAEMON_KEYPAIR_LABEL} from {}",
                 dir.display()
             );
             Some(kp)
         }
         Ok(_) => {
             tracing::info!(
-                "identity: only public key on disk for {agent_id}; link signing disabled"
+                "identity: only public key on disk for {DAEMON_KEYPAIR_LABEL}; link signing disabled"
             );
             None
         }
         Err(e) => {
-            // File-not-found for the .pub file produces an Err; treat it
-            // the same as missing dir (common first-run). For other
-            // failures (malformed bytes, priv/pub mismatch) WARN so the
-            // operator notices.
-            let msg = format!("{e:#}");
-            if msg.contains("No such file") || msg.contains("not found") {
-                tracing::info!(
-                    "identity: no keypair on disk for {agent_id}; link signing disabled"
-                );
-            } else {
-                tracing::warn!("identity: keypair load failed for {agent_id}: {msg}");
-            }
+            tracing::warn!(
+                "identity: keypair load failed for {DAEMON_KEYPAIR_LABEL}: {e:#}; link signing disabled"
+            );
             None
         }
-    }
+    };
+    (kp, Some(outcome))
 }
 
 // ---------------------------------------------------------------------------
 // Background tasks (GC, WAL checkpoint)
 // ---------------------------------------------------------------------------
 
-/// Spawn the periodic GC loop. Sleeps `interval`, then runs `db::gc` and
-/// `db::auto_purge_archive` against the daemon's shared connection. The
-/// returned [`JoinHandle`] is owned by the caller; `serve()` aborts it on
-/// shutdown.
+/// Spawn the periodic GC loop. Sleeps `interval`, then runs `db::gc`,
+/// `db::auto_purge_archive`, and (Cluster G, #767) the shadow-
+/// observation retention sweep against the daemon's shared connection.
+/// The returned [`JoinHandle`] is owned by the caller; `serve()` aborts
+/// it on shutdown.
+///
+/// `shadow_retention_days` honors the operator-tunable
+/// `[confidence] shadow_retention_days` from `config.toml`, falling
+/// back to [`crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS`]
+/// (30) when unset. `<= 0` disables the sweep (matches the
+/// `archive_max_days` convention).
 #[must_use]
 pub fn spawn_gc_loop(
     state: Db,
     archive_max_days: Option<i64>,
+    interval: Duration,
+) -> JoinHandle<()> {
+    spawn_gc_loop_with_shadow_retention(
+        state,
+        archive_max_days,
+        crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS,
+        interval,
+    )
+}
+
+/// Cluster G (#767) — `spawn_gc_loop` variant that takes an explicit
+/// shadow-observation retention window. Used by `bootstrap_serve` so
+/// the operator-tunable `[confidence] shadow_retention_days` from
+/// `config.toml` flows through. `spawn_gc_loop` is the no-arg wrapper
+/// that picks the compiled default for legacy call sites (tests).
+#[must_use]
+pub fn spawn_gc_loop_with_shadow_retention(
+    state: Db,
+    archive_max_days: Option<i64>,
+    shadow_retention_days: i64,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1237,6 +2613,15 @@ pub fn spawn_gc_loop(
             match db::auto_purge_archive(&lock.0, archive_max_days) {
                 Ok(n) if n > 0 => tracing::info!("gc: purged {n} old archived memories"),
                 _ => {}
+            }
+            // Cluster G (#767, PERF-4) — shadow-mode observation
+            // retention sweep. `<= 0` is a no-op (operator opt-out).
+            match crate::confidence::shadow::gc_observations(&lock.0, shadow_retention_days) {
+                Ok(n) if n > 0 => tracing::info!(
+                    "gc: purged {n} shadow observations older than {shadow_retention_days}d"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("shadow observation gc failed: {e}"),
             }
         }
     })
@@ -1439,18 +2824,917 @@ pub struct ServeBootstrap {
     pub db_state: Db,
     pub archive_max_days: Option<i64>,
     pub task_handles: Vec<JoinHandle<()>>,
+    /// Round-3 F12 — lifecycle outcome of the daemon's signing-keypair
+    /// auto-gen path, captured by [`ensure_and_load_daemon_keypair`].
+    /// Read by [`serve`] when composing the F8/F12 startup banner so
+    /// operators see whether a fresh key was created on first boot.
+    pub daemon_keypair_outcome: Option<crate::identity::keypair::EnsureOutcome>,
+    /// v0.7.0 H7 (round-2) — resolved per-request HTTP timeout. The
+    /// `serve` path passes this to [`crate::build_router_with_timeout`]
+    /// so the timeout middleware is wired with the operator's
+    /// `request_timeout_secs` (default 60 s).
+    pub request_timeout: std::time::Duration,
+    /// v0.7.0 Policy-Engine Item 3 — shared atomic metrics handle for the
+    /// deferred-audit drainer. `serve` polls these on the shutdown path
+    /// (after the HTTP server has quiesced) to wait for every submitted
+    /// refusal to flush into `signed_events` before the WAL checkpoint +
+    /// process exit. The producer-side queue itself lives on `AppState`
+    /// and inside the process-wide governance-hook `OnceLock`s, so this
+    /// metrics handle is the only drain-observability surface `serve`
+    /// retains after the queue is moved into `AppState`.
+    pub deferred_audit_metrics: crate::governance::deferred_audit::DeferredAuditMetrics,
+}
+
+/// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
+/// `--store-url` (when set) or fall back to a [`SqliteStore`] wrapping
+/// the on-disk database `--db` already opened.
+///
+/// Returns the resolved [`StorageBackend`] tag plus the polymorphic
+/// `Arc<dyn MemoryStore>` so the caller can wire both fields onto
+/// `AppState` and have downstream handlers branch on the tag without
+/// dynamic-dispatch probes.
+///
+/// URL precedence:
+///
+/// - `Some("postgres://...")` or `Some("postgresql://...")` →
+///   [`PostgresStore::connect`]; resolves to
+///   [`StorageBackend::Postgres`]. Requires `--features sal-postgres`
+///   at build time; the URL is rejected at runtime under a sal-only
+///   build with a clear error.
+/// - `Some("sqlite:///path")` → [`SqliteStore::open`]; resolves to
+///   [`StorageBackend::Sqlite`]. The on-disk path may or may not be
+///   the same file `--db` already opened — both views see the same
+///   rows when they coincide; the SQLite file-locking layer arbitrates
+///   any cross-connection contention.
+/// - `None` → [`SqliteStore::open`] against `db_path`; resolves to
+///   [`StorageBackend::Sqlite`]. The default behaviour preserved
+///   for every operator who has not opted in to `--store-url`.
+///
+/// Anything else exits non-zero with the same "unrecognised store URL"
+/// diagnostic [`crate::migrate::open_store`] returns, keeping the
+/// surface area consistent across `serve`, `migrate`, and
+/// `schema-init`.
+///
+/// [`MemoryStore`]: crate::store::MemoryStore
+/// [`SqliteStore`]: crate::store::sqlite::SqliteStore
+/// [`PostgresStore::connect`]: crate::store::postgres::PostgresStore::connect
+/// [`SqliteStore::open`]: crate::store::sqlite::SqliteStore::open
+/// [`StorageBackend`]: crate::handlers::StorageBackend
+/// [`StorageBackend::Postgres`]: crate::handlers::StorageBackend::Postgres
+/// [`StorageBackend::Sqlite`]: crate::handlers::StorageBackend::Sqlite
+#[cfg(feature = "sal")]
+/// v0.7.x (issue #1169) — resolve the configured embedder dim for the
+/// postgres-schema bootstrap (used by [`build_store_handle`]).
+///
+/// Resolution ladder (first arm wins):
+///
+/// 1. [`crate::config::AppConfig::resolve_embeddings`] returns
+///    `ResolvedEmbeddings.embedding_dim` populated by the canonical
+///    [`crate::config::canonical_embedding_dim`] lookup table when the
+///    operator-picked model id is in [`crate::config::KNOWN_EMBEDDING_DIMS`].
+/// 2. Legacy flat-field path: parse `app_config.embedding_model` as the
+///    2-family [`crate::config::EmbeddingModel`] enum and pull its
+///    compile-time `dim()` (`nomic_embed_v15` / `mini_lm_l6_v2`).
+/// 3. Tier-preset fallback when neither resolver nor legacy parses
+///    yields a dim — the historical pre-#1169 behaviour, retained as
+///    the last-resort default.
+///
+/// Returns `None` only when no embedder is configured at all
+/// (`tier_config.embedding_model.is_none()` AND no operator override) —
+/// i.e. the keyword-only tier. The postgres bootstrap then falls back
+/// to `DEFAULT_EMBEDDING_DIM` per `build_store_handle`'s
+/// `configured_embedding_dim` doc comment.
+#[cfg(feature = "sal")]
+#[must_use]
+#[allow(deprecated)]
+fn resolve_configured_embedding_dim(
+    app_config: &crate::config::AppConfig,
+    tier_config: &crate::config::TierConfig,
+) -> Option<u32> {
+    let preset = tier_config.embedding_model;
+    let resolved = app_config.resolve_embeddings();
+    resolved
+        .embedding_dim
+        .or_else(|| {
+            app_config
+                .embedding_model
+                .as_deref()
+                .and_then(|raw| raw.parse::<crate::config::EmbeddingModel>().ok())
+                .map(|m| u32::try_from(m.dim()).unwrap_or(384))
+        })
+        .or_else(|| preset.map(|m| u32::try_from(m.dim()).unwrap_or(384)))
+}
+
+/// v0.7.0 #1548 — resolve the curator's SAL store handle from the same
+/// URL-scheme dispatch the HTTP `serve` path uses. When `store_url` is
+/// `Some`, the adapter is bound to the URL-resolved backend (SQLite *or*
+/// Postgres); when `None`, it falls through to a SQLite store at the
+/// `--db` path. The embedder dim + Postgres pool sizing are resolved
+/// from `app_config` exactly as in `serve` so a postgres-backed curator
+/// bootstraps an identically-shaped schema/pool to the HTTP daemon
+/// pointed at the same federated store.
+///
+/// Returns only the `Arc<dyn MemoryStore>` — the curator passes do not
+/// need the [`crate::handlers::StorageBackend`] tag the HTTP daemon
+/// threads into its `AppState`.
+#[cfg(feature = "sal")]
+pub(crate) async fn build_curator_store(
+    store_url: Option<&str>,
+    db_path: &Path,
+    app_config: &crate::config::AppConfig,
+) -> Result<Arc<dyn crate::store::MemoryStore>> {
+    let tier_config = app_config.effective_tier(None).config();
+    let configured_embedding_dim = resolve_configured_embedding_dim(app_config, &tier_config);
+    let (_backend, store) = build_store_handle(
+        store_url,
+        db_path,
+        app_config.postgres_statement_timeout_secs,
+        configured_embedding_dim,
+        app_config.resolve_pg_pool(),
+    )
+    .await
+    .context("build SAL store handle for curator")?;
+    Ok(store)
+}
+
+#[cfg(feature = "sal")]
+async fn build_store_handle(
+    store_url: Option<&str>,
+    db_path: &Path,
+    postgres_statement_timeout_secs: Option<u64>,
+    // Issue #877: configured embedder dim. `None` keeps the legacy
+    // `DEFAULT_EMBEDDING_DIM` (384, MiniLM) behaviour for callers that
+    // explicitly do not load an embedder (keyword-only deployments).
+    // When `Some(dim)` is passed, the postgres adapter takes the
+    // auto-migrate path so a fresh-container schema bootstrapped at the
+    // default 384 is converted in-place to match the configured
+    // embedder's actual dimension (e.g. 768 for `nomic_embed_v15`).
+    configured_embedding_dim: Option<u32>,
+    // Resolved Postgres connection-pool sizing (`AI_MEMORY_PG_POOL_MAX` /
+    // `_MIN` / `_ACQUIRE_TIMEOUT_SECS` > config.toml > compiled default),
+    // produced by `AppConfig::resolve_pg_pool`. Threaded into the sqlx
+    // `PgPoolOptions` build; inert on the sqlite path.
+    pool: crate::store::PoolConfig,
+) -> Result<(
+    crate::handlers::StorageBackend,
+    Arc<dyn crate::store::MemoryStore>,
+)> {
+    use crate::handlers::StorageBackend;
+
+    match store_url {
+        Some(url) => {
+            let lowered = url.to_ascii_lowercase();
+            if crate::migrate::is_postgres_url(&lowered) {
+                #[cfg(feature = "sal-postgres")]
+                {
+                    let timeout = postgres_statement_timeout_secs
+                        .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
+                    // Issue #877: route through the auto-migrate entry
+                    // point when the daemon resolved a configured
+                    // embedder dim. Bootstrap goes via `connect_with_dim`
+                    // so the *fresh* schema lands `vector(<dim>)` from
+                    // the very first INIT; the auto-migrate then handles
+                    // the pre-existing-schema-at-wrong-dim case.
+                    // #1579 A3 (SECURITY) — log the password-redacted
+                    // URL. Pre-fix this line shipped the full
+                    // `--store-url` (credential included) to journald
+                    // at INFO.
+                    let display_url = crate::logging::redact_url_password(url);
+                    let store = if let Some(dim) = configured_embedding_dim {
+                        tracing::info!(
+                            "Wave-3 (issue #877): opening Postgres SAL store at {display_url} \
+                             (statement_timeout={timeout}s, embedding_dim={dim}, auto_migrate=on, \
+                             pool_max={}, pool_min={}, acquire_timeout={}s)",
+                            pool.max_connections,
+                            pool.min_connections,
+                            pool.acquire_timeout_secs
+                        );
+                        crate::store::postgres::PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+                            url, dim, timeout, pool,
+                        )
+                        .await
+                        .context("connect postgres adapter (auto-migrate dim)")?
+                    } else {
+                        tracing::info!(
+                            "Wave-3: opening Postgres SAL store at {display_url} \
+                             (statement_timeout={timeout}s, no embedder configured, \
+                             pool_max={}, pool_min={}, acquire_timeout={}s)",
+                            pool.max_connections,
+                            pool.min_connections,
+                            pool.acquire_timeout_secs
+                        );
+                        crate::store::postgres::PostgresStore::connect_with_dim_and_timeout(
+                            url,
+                            crate::store::postgres::DEFAULT_EMBEDDING_DIM,
+                            timeout,
+                            pool,
+                        )
+                        .await
+                        .context("connect postgres adapter")?
+                    };
+                    Ok((StorageBackend::Postgres, Arc::new(store)))
+                }
+                #[cfg(not(feature = "sal-postgres"))]
+                {
+                    let _ = url;
+                    let _ = postgres_statement_timeout_secs;
+                    let _ = configured_embedding_dim;
+                    let _ = pool;
+                    anyhow::bail!(
+                        "--store-url postgres:// requires the binary to be built with \
+                         --features sal-postgres; this binary was built with --features sal only"
+                    );
+                }
+            } else if let Some(path) = url
+                .strip_prefix("sqlite://")
+                .or_else(|| url.strip_prefix("SQLITE://"))
+            {
+                let clean = path
+                    .strip_prefix('/')
+                    .map_or(path, |p| if p.starts_with('/') { p } else { path });
+                tracing::info!("Wave-3: opening SQLite SAL store at {clean} (--store-url)");
+                let store = crate::store::sqlite::SqliteStore::open(clean)
+                    .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
+                Ok((StorageBackend::Sqlite, Arc::new(store)))
+            } else {
+                // #1579 A3 (SECURITY) — a mistyped scheme can still
+                // carry credentials; redact before echoing.
+                anyhow::bail!(
+                    "unrecognised --store-url: {} (expected sqlite:///path or postgres://...)",
+                    crate::logging::redact_url_password(url)
+                )
+            }
+        }
+        None => {
+            let _ = postgres_statement_timeout_secs;
+            let _ = configured_embedding_dim;
+            let _ = pool;
+            tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
+            let store = crate::store::sqlite::SqliteStore::open(db_path)
+                .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
+            Ok((StorageBackend::Sqlite, Arc::new(store)))
+        }
+    }
+}
+
+/// v0.7.0 #1455 — `true` when the operator opted into the legacy
+/// permissive governance posture via
+/// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (`1` / `true`). Default
+/// `false` keeps the fail-CLOSED secure default. Shared by the storage
+/// pre-write hook and the wire-check hook so the two read the same
+/// override identically.
+/// Actor/queue label for wire-action governance consultations.
+const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
+
+fn governance_fail_open_on_error() -> bool {
+    std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// #1455 legacy fail-open opt-out env var — one spelling shared by the
+/// reader above and the operator-facing log hints below (#1558).
+const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR";
+
+/// #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
+/// storage hook (the L1-6 agent-action `memory_write` gate). Extracted
+/// from `bootstrap_serve` so every LONG-LIVED write surface installs
+/// the SAME closure: the HTTP daemon (`serve`) AND the MCP stdio server
+/// (`run_mcp_server`). Pre-#1583 only `serve` installed it, so
+/// operator-configured agent-action rules were silently bypassed for
+/// every MCP-driven write — the primary NHI agent interface.
+///
+/// CLI one-shot binaries (`ai-memory store …`) intentionally do NOT
+/// call this (the L1-6 E operator-as-actor exemption — see
+/// `src/storage/mod.rs` §hook doc + `cli_one_shot_does_not_install_hook`);
+/// the operator's direct substrate ops stay unimpeded by design.
+///
+/// `hook_consultation_conn` MUST be a connection distinct from the
+/// caller's main write connection (the hook fires synchronously from
+/// inside `storage::insert`, which holds the main connection). When it
+/// is `None` (open failed at install time) the hook fails CLOSED per
+/// #1455.
+pub(crate) fn install_governance_pre_write_hook(
+    db_path: &Path,
+    deferred_audit_queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    rule_cache: &Arc<crate::governance::rule_cache::RuleCache>,
+    hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+) {
+    use crate::governance::agent_action::{
+        AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
+    };
+    let rules_db_path = db_path.to_path_buf();
+    let queue_for_hook = deferred_audit_queue.clone();
+    let cache_for_hook = Arc::clone(rule_cache);
+    let conn_for_hook = hook_consultation_conn;
+    let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
+        move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
+            let action = AgentAction::Custom {
+                custom_kind: "memory_write".to_string(),
+                payload: serde_json::json!({
+                    "namespace": mem.namespace,
+                    "tier": mem.tier.as_str(),
+                    (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
+                    "title": mem.title,
+                }),
+            };
+            // Resolve the agent_id from the memory's metadata
+            // (every substrate-written memory carries it under
+            // `metadata.agent_id` — see CLAUDE.md §"Agent
+            // Identity"). Fall back to a stable hook-source tag
+            // when the metadata key is missing so the audit row
+            // still attributes the refusal.
+            let agent_id = mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("substrate:pre_write_hook")
+                .to_string();
+            let Some(conn_arc) = conn_for_hook.as_ref() else {
+                // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the hook
+                // consultation connection could not be opened at
+                // install time. The pre-#1455 posture degraded to
+                // ALLOW, which meant a daemon that lost its rules DB
+                // at boot (permissions flip, disk pressure, an
+                // attacker who can make `db::open` fail) silently
+                // disabled the entire substrate write-gate while
+                // continuing to accept writes. That is the same
+                // bypass class #1054 closed for consultation ERRORS;
+                // an unavailable connection is just a permanent
+                // consultation failure and gets the same secure
+                // default + the same operator escape hatch.
+                return governance_consultation_unavailable(
+                    &queue_for_hook,
+                    &agent_id,
+                    &action,
+                    &rules_db_path,
+                    "L1-6 governance pre-write",
+                );
+            };
+            let conn_guard = match conn_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "L1-6 governance pre-write: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let conn_for_check: &rusqlite::Connection = &conn_guard;
+            match check_agent_action_deferred_cached(
+                conn_for_check,
+                Some(&cache_for_hook),
+                &agent_id,
+                &action,
+                &queue_for_hook,
+            ) {
+                Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                    tracing::info!(
+                        "L1-6 governance pre-write refused namespace={:?} rule_id={} \
+                             reason={} (chain-logged via deferred audit queue)",
+                        mem.namespace,
+                        rule_id,
+                        reason
+                    );
+                    Err(reason)
+                }
+                Err(e) => {
+                    // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
+                    // rule-consultation error and chain-log the
+                    // refusal so an attacker who can induce
+                    // consultation errors (concurrent PRAGMA
+                    // wal_checkpoint, ATTACH-as-readonly
+                    // contention, etc.) cannot race a refused
+                    // write through the gate. The pre-#1054
+                    // posture degraded to ALLOW, which made the
+                    // gate dependent on the rule consultation
+                    // never erroring — a fragile invariant.
+                    //
+                    // Operators with a legitimate need for the
+                    // legacy fail-open posture (e.g. during a
+                    // chaos-test window where transient SQL
+                    // pressure is expected) can opt back in via
+                    // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+                    // The unsafe override is logged at WARN on
+                    // every fire and counts toward the
+                    // governance posture surface so an audit can
+                    // detect the legacy-permissive mode.
+                    let reason = format!("governance:consultation_failed: {e}");
+                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    // Emit a governance.refusal-shaped row to the
+                    // deferred audit queue regardless of the
+                    // open/closed decision so the audit chain
+                    // captures the consultation failure either
+                    // way. The synthetic Decision::Refuse uses
+                    // rule_id=`governance:consultation_failed` so
+                    // a downstream auditor can distinguish
+                    // "no rule fired" from "consultation broke".
+                    let synthetic_refusal = RuleDecision::Refuse {
+                        rule_id: "governance:consultation_failed".to_string(),
+                        reason: reason.clone(),
+                    };
+                    queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
+                    if fail_open {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: rule consultation failed: {}; \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                                 degrading to ALLOW (UNSAFE, legacy posture)",
+                            e
+                        );
+                        Ok(())
+                    } else {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: rule consultation failed: {}; \
+                                 failing CLOSED (post-#1054 secure default — \
+                                 set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                            e
+                        );
+                        Err(reason)
+                    }
+                }
+            }
+        },
+    ));
+    if install_result.is_err() {
+        // Already installed — happens if the same process boots a
+        // write surface twice (test reuse via `bootstrap_serve`, or a
+        // process that runs both `serve` and `mcp`). The OnceLock
+        // contract guarantees the FIRST installed closure wins; we log
+        // and proceed rather than abort.
+        tracing::debug!(
+            "L1-6 governance pre-write hook already installed (process-wide OnceLock); \
+             the existing hook remains active for this process"
+        );
+    } else {
+        tracing::info!(
+            "L1-6 governance pre-write hook installed (substrate-authoritative \
+             memory_write gate active + deferred chain-log on refusal)"
+        );
+    }
+}
+
+/// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
+/// where a governance hook's rule-consultation connection could not be
+/// opened at install time. Chain-logs a synthetic
+/// `governance:consultation_unavailable` refusal, then returns the
+/// fail-CLOSED verdict (`Err`) unless the operator opted into the
+/// legacy permissive posture. Reads the env override exactly once and
+/// delegates the verdict to [`governance_consultation_unavailable_inner`]
+/// so the decision is unit-testable without env mutation.
+fn governance_consultation_unavailable(
+    queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    agent_id: &str,
+    action: &crate::governance::agent_action::AgentAction,
+    rules_db_path: &Path,
+    surface: &str,
+) -> std::result::Result<(), String> {
+    governance_consultation_unavailable_inner(
+        queue,
+        agent_id,
+        action,
+        rules_db_path,
+        surface,
+        governance_fail_open_on_error(),
+    )
+}
+
+/// Pure inner of [`governance_consultation_unavailable`] — `fail_open`
+/// is passed explicitly so tests can pin both the secure default
+/// (`fail_open = false` ⇒ `Err`, the security contract) and the
+/// operator-override path (`fail_open = true` ⇒ `Ok`) without touching
+/// process env.
+fn governance_consultation_unavailable_inner(
+    queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    agent_id: &str,
+    action: &crate::governance::agent_action::AgentAction,
+    rules_db_path: &Path,
+    surface: &str,
+    fail_open: bool,
+) -> std::result::Result<(), String> {
+    use crate::governance::agent_action::Decision as RuleDecision;
+    let reason = format!(
+        "governance:consultation_unavailable: rules DB at {} could not be opened at hook install",
+        rules_db_path.display(),
+    );
+    // Chain-log the consultation failure regardless of the open/closed
+    // decision so an audit can detect that the gate ran degraded.
+    let synthetic_refusal = RuleDecision::Refuse {
+        rule_id: "governance:consultation_unavailable".to_string(),
+        reason: reason.clone(),
+    };
+    queue.submit_refusal(agent_id, action, &synthetic_refusal);
+    if fail_open {
+        tracing::warn!(
+            "{surface}: hook consultation connection unavailable (rules DB at {}); \
+             {ENV_GOVERNANCE_FAIL_OPEN}=1 — degrading to ALLOW (UNSAFE, legacy posture)",
+            rules_db_path.display(),
+        );
+        Ok(())
+    } else {
+        tracing::warn!(
+            "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
+             (#1455 secure default — set {ENV_GOVERNANCE_FAIL_OPEN}=1 to revert)",
+            rules_db_path.display(),
+        );
+        Err(reason)
+    }
+}
+
+/// #1458 (SEC, MED) — operator opt-in: when `AI_MEMORY_REQUIRE_API_KEY`
+/// is truthy, the daemon hard-refuses to start without an `api_key` on
+/// ANY bind host (including loopback). This is the hardened posture for
+/// deployments that front the daemon with a reverse proxy /
+/// `--network=host` container / `socat` forward — the loopback host
+/// string the daemon sees does not reflect off-host reachability, so the
+/// string-match loopback guard alone cannot protect them.
+fn require_api_key_strict() -> bool {
+    std::env::var("AI_MEMORY_REQUIRE_API_KEY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// #1458 (SEC, MED) — decide whether the daemon may bind given the
+/// configured api_key, the bind `host`, and the `strict` opt-in.
+///
+/// Returns:
+///   - `Ok(None)` — safe to bind silently (api_key is set);
+///   - `Ok(Some(warning))` — bind permitted but emit `warning` (keyless
+///     loopback, default single-tenant posture);
+///   - `Err(reason)` — refuse to bind (keyless non-loopback, or keyless
+///     under the `strict` opt-in).
+///
+/// Pulled out of `bootstrap_serve` so all three outcomes are unit
+/// testable without standing up a daemon.
+fn api_key_bind_guard(
+    api_key_present: bool,
+    host: &str,
+    strict: bool,
+) -> std::result::Result<Option<String>, String> {
+    if api_key_present {
+        return Ok(None);
+    }
+    if strict {
+        return Err(format!(
+            "refusing to start without an API key: AI_MEMORY_REQUIRE_API_KEY is set, which \
+             mandates `api_key` on every bind (requested host {host:?}). A reverse proxy, \
+             --network=host container, or socat forward can present loopback to the daemon \
+             while exposing it off-host, so the loopback guard alone is insufficient. \
+             Set top-level `api_key = \"...\"` in config (or --api-key on the CLI), or unset \
+             AI_MEMORY_REQUIRE_API_KEY to fall back to the loopback-only default. (#1458)"
+        ));
+    }
+    let is_loopback = host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host == "0:0:0:0:0:0:0:1"
+        || host == "[::1]";
+    if !is_loopback {
+        return Err(format!(
+            "refusing to bind to non-loopback address {host:?} without an API key: \
+             the daemon's api_key is unset (default-off auth would expose every \
+             privileged endpoint to any caller that can reach the bind address). \
+             Either set top-level `api_key = \"...\"` in config (or --api-key on the CLI) and rebind, \
+             or rebind to 127.0.0.1 / ::1 / localhost for a single-tenant deployment. \
+             (v0.7.0 fix campaign S5-C1, 2026-05-13. Note: api_key is a TOP-LEVEL \
+             AppConfig field per src/config.rs:2283; [api] subsection is silently ignored by serde.)"
+        ));
+    }
+    Ok(Some(format!(
+        "API key NOT configured — daemon bound to loopback {host:?}. \
+         Privileged endpoints (POST /memories, /links, /agents, /subscriptions) \
+         accept any caller that reaches this listener. #1458: a reverse proxy, \
+         --network=host container, or socat forward presents loopback to the daemon \
+         while exposing it off-host, re-opening this keyless write surface — set \
+         top-level `api_key = \"...\"` (or AI_MEMORY_REQUIRE_API_KEY=1 to hard-require it) \
+         for any deployment that is not strictly single-tenant on this host. \
+         /approve and /reject remain HMAC-gated regardless."
+    )))
 }
 
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
+///
+/// DOC-6: this function reads several legacy `AppConfig` fields
+/// (`auto_tag_model`, `llm_model`, `ollama_url`) directly for v0.7.x
+/// backward compat; the `#[allow(deprecated)]` carves out the legacy
+/// reads while keeping the deprecation warning live for external
+/// consumers.
+#[allow(deprecated)]
 pub async fn bootstrap_serve(
     db_path: &Path,
     args: &ServeArgs,
     app_config: &AppConfig,
 ) -> Result<ServeBootstrap> {
+    // S5-C1 (v0.7.0 fix campaign 2026-05-13): refuse default-off auth
+    // on non-loopback binds. When `api_key` is unset, the `api_key_auth`
+    // middleware is a pass-through — every privileged endpoint (write,
+    // approve, reject, governance state) is reachable by any caller
+    // that can open a TCP connection. The K10 SSE/approval path is
+    // HMAC-gated and the legacy /approve + /reject paths are now also
+    // HMAC-gated (see `handlers::approve_pending` and
+    // `handlers::reject_pending`), but the broader write surface
+    // (POST /api/v1/memories, /links, /agents, /subscriptions, …)
+    // still rides on `api_key_auth`. Refusing to bind to a routable
+    // address with no API key configured is the safe default;
+    // operators who *intentionally* run a public daemon must set
+    // `[api] api_key` (or `--api-key` on the CLI) explicitly.
+    match api_key_bind_guard(
+        app_config.api_key.is_some(),
+        args.host.as_str(),
+        require_api_key_strict(),
+    ) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Err(reason) => anyhow::bail!("{reason}"),
+    }
+
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
+
+    // v0.7.0 SEC-2 (Cluster D, issue #767) — fail-OPEN diagnostic + the
+    // operator-opt-in fail-CLOSED knob. When `governance_rules` has any
+    // `enabled = 1` row AND no operator pubkey is resolved, the L1-6
+    // loader honours every enabled row without signature verification
+    // (pre-L1-6 compat mode). A SQL-write gadget that mutates
+    // `governance_rules` can therefore install / flip rules without
+    // operator consent.
+    //
+    // Default: surface a once-per-process `tracing::error!` so the
+    // operator sees the fail-OPEN posture on every daemon start.
+    //
+    // Operator opt-in: `[governance] require_operator_pubkey = true`
+    // promotes the diagnostic to a hard refusal — `bootstrap_serve`
+    // returns an `anyhow::Error` and the daemon does NOT start. This
+    // is the right posture for hardened deployments that want strict
+    // enforcement BEFORE the pubkey lands.
+    let enabled_rule_count =
+        crate::governance::rules_store::count_enabled_rules(&conn).unwrap_or(0);
+    let pubkey_resolved = crate::governance::rules_store::resolve_operator_pubkey().is_some();
+    if enabled_rule_count > 0 && !pubkey_resolved {
+        crate::governance::rules_store::log_missing_operator_pubkey_once(enabled_rule_count);
+        if app_config
+            .governance
+            .as_ref()
+            .is_some_and(|g| g.require_operator_pubkey)
+        {
+            anyhow::bail!(
+                "SEC-2 fail-closed: `[governance] require_operator_pubkey = true` is set but \
+                 `governance_rules` contains {enabled_rule_count} enabled row(s) AND no \
+                 operator pubkey is resolved (AI_MEMORY_OPERATOR_PUBKEY unset AND \
+                 ~/.config/ai-memory/operator.key.pub absent). Refusing to start: a fail-OPEN \
+                 L1-6 loader would honour every enabled rule without signature verification. \
+                 Run `ai-memory rules keygen` + `ai-memory rules sign-seed` to activate L1-6, \
+                 or unset `require_operator_pubkey` to accept the pre-L1-6 posture."
+            );
+        }
+    }
+
+    // v0.7.0 L1-6 Deliverable E (issue #691) — install the substrate
+    // governance pre-write hook BEFORE any write paths come live. The
+    // hook consults the operator-signed `governance_rules` table for
+    // a refusal verdict at every `storage::insert*` callsite; a
+    // refusal short-circuits the SQL `INSERT` cleanly (no row
+    // written, MemoryError::RefusedByGovernance bubbled).
+    //
+    // Layering: the hook is a `OnceLock<Box<Fn>>` in `src/storage/mod.rs`
+    // — installation is one-shot for the process lifetime. CLI
+    // one-shot binaries (`ai-memory store`, `ai-memory mine`, …)
+    // never reach this codepath and so leave the hook empty by
+    // design (operator standing directive: rules gate AGENT writes,
+    // not the operator's direct CLI ops).
+    //
+    // The closure opens a fresh `Connection` per call (via
+    // `db::open` against the same db_path) so it does NOT contend
+    // with the substrate writer's lock held during `storage::insert`.
+    // SQLite WAL mode allows the rule-read to proceed in parallel.
+    // Failure to open the rule-consultation connection degrades to
+    // ALLOW with a WARN: a transient FS issue must not wedge the
+    // write surface, and the operator can detect the degradation
+    // from the log surface.
+    //
+    // v0.7.0 Policy-Engine Item 3 (2026-05-14) — the hook now also
+    // submits every refusal to the process-wide deferred-audit
+    // queue via `check_agent_action_deferred`. The queue's
+    // background drainer task chain-logs each refusal as a
+    // `governance.refusal` row in `signed_events` AFTER the
+    // in-flight `storage::insert` transaction has released its
+    // lock. This closes the cryptographic-log gap that the prior
+    // `_no_audit` variant left open (refusals were typed but not
+    // chain-logged; the deadlock-avoidance came at the cost of
+    // breaking the bypass-impossibility audit story for storage
+    // writes).
+    let (deferred_audit_queue, deferred_audit_supervisor) =
+        crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+    // Capture the shared atomic metrics handle BEFORE the queue is cloned
+    // into the governance hooks + moved onto `AppState`. `serve` polls
+    // these on shutdown to drain the queue before the WAL checkpoint.
+    let deferred_audit_metrics = deferred_audit_queue.metrics();
+    tracing::info!(
+        "policy-engine item 3: deferred-audit drainer spawned (chain-logs \
+         storage refusals as `governance.refusal` rows in signed_events)"
+    );
+
+    // v0.7.0 #991 — per-instance rule cache shared by the substrate
+    // `GOVERNANCE_PRE_WRITE` storage hook (below), the
+    // `wire_check::GOVERNANCE_PRE_ACTION` action hook (below), and the
+    // `AppState.rule_cache` field (HTTP handler call sites). Cloning
+    // the `Arc<RuleCache>` into each captures-by-reference; the cache
+    // is dropped when the last reference (AppState + the two hooks)
+    // goes away on daemon shutdown. Per-instance means multi-daemon
+    // test fixtures don't cross-pollute (the contract that the #990
+    // revert restored after #983 shipped a process-wide singleton).
+    let rule_cache: Arc<crate::governance::rule_cache::RuleCache> =
+        Arc::new(crate::governance::rule_cache::RuleCache::new());
+
+    // v0.7.0 #1017 (Agent-1 #3) — long-lived consultation connection
+    // shared between the storage `GOVERNANCE_PRE_WRITE` hook and the
+    // `wire_check::GOVERNANCE_PRE_ACTION` action hook. Pre-#1017 each
+    // hook invocation called `db::open(&rules_db_path)` which runs
+    // 4 PRAGMAs + SCHEMA execute_batch + migrate() + trigger probe —
+    // ~1-2ms per write that paid the cost unconditionally even on
+    // RuleCache hits. The #991 rule cache made the OPEN overhead the
+    // dominant remaining hot-path cost; #1017 closes the gap by
+    // opening the connection ONCE at install time and reusing it
+    // across all hook invocations. The connection is wrapped in
+    // `std::sync::Mutex` because hooks fire from both sync paths
+    // (`storage::insert` is sync; wire-check is consulted from sync
+    // `governance::wire_check::check` regardless of caller context).
+    //
+    // If `db::open` fails at install time, we install hooks that
+    // degrade to ALLOW on every call with a WARN — same posture as
+    // the pre-#1017 per-call open-failure leg. The operator sees the
+    // diagnostic in daemon logs and can re-attempt.
+    let hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>> =
+        match db::open(db_path) {
+            Ok(c) => Some(Arc::new(std::sync::Mutex::new(c))),
+            Err(e) => {
+                tracing::warn!(
+                    target: "ai_memory::daemon_runtime",
+                    "v0.7.0 #1017: failed to open hook consultation connection at {}: {}; \
+                     governance hooks will degrade to ALLOW on every invocation",
+                    db_path.display(),
+                    e,
+                );
+                None
+            }
+        };
+
+    // #1582/#1583 (SEC) — the substrate pre-write gate is installed via
+    // the shared helper so EVERY long-lived write surface installs the
+    // SAME closure. `serve` (here) and `mcp` (`run_mcp_server`) both call
+    // it; CLI one-shot binaries intentionally do NOT (the L1-6 E
+    // operator-as-actor exemption — see the helper's doc).
+    install_governance_pre_write_hook(
+        db_path,
+        &deferred_audit_queue,
+        &rule_cache,
+        hook_consultation_conn.clone(),
+    );
+
+    // v0.7.0 (issue #691 fold-1) — install the universal AgentAction
+    // wire-point hook BEFORE any daemon-side write/network/spawn paths
+    // come live. Mirrors the L1-6 E pattern above but covers the FOUR
+    // agent-EXTERNAL action variants (Bash, FilesystemWrite,
+    // NetworkRequest, ProcessSpawn) consulted by skill_export,
+    // federation::sync, hooks::executor, and the LLM client. CLI
+    // one-shot binaries never reach this path so the hook stays empty
+    // for direct operator ops (L1-6 E operator-as-actor exemption).
+    //
+    // v0.7.0 #1034 (Agent-6 #2) — wire-check refusals now flow into the
+    // SAME deferred-audit queue the substrate pre-write hook uses, so
+    // every refusal — storage AND wire — chain-logs a `governance.refusal`
+    // row in `signed_events`. Pre-#1034 the wire-check refusals only
+    // emitted to the forensic JSONL log; the cryptographic-audit chain
+    // missed them, breaking the bypass-impossibility audit story for the
+    // four agent-EXTERNAL action variants. The closure uses the stable
+    // `daemon:wire_action` tag for `agent_id` attribution because the
+    // wire-check fires inside daemon-internal subsystems (federation,
+    // hooks, LLM, skill_export) where there is no per-request agent
+    // identity bound to the action; the storage hook's
+    // `substrate:pre_write_hook` fallback uses the same shape.
+    {
+        use crate::governance::agent_action::{
+            AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
+        };
+        let rules_db_path = db_path.to_path_buf();
+        let cache_for_wire_check = Arc::clone(&rule_cache);
+        let queue_for_wire_check = deferred_audit_queue.clone();
+        // v0.7.0 #1017 — share the same long-lived consultation
+        // connection introduced above. Hook installs are serial so
+        // there's no race on the Arc clone.
+        let conn_for_wire_check = hook_consultation_conn.clone();
+        let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
+            move |action: &AgentAction| -> std::result::Result<(), String> {
+                let Some(conn_arc) = conn_for_wire_check.as_ref() else {
+                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the
+                    // consultation connection is unavailable, mirroring
+                    // the storage hook above. A daemon-internal wire
+                    // action (federation push, hooks spawn, LLM call,
+                    // skill_export filesystem write) is HIGHER-stakes
+                    // than a storage write, so degrading to ALLOW on a
+                    // missing rules DB would be the worst place to fail
+                    // open. Same secure default + escape hatch.
+                    return governance_consultation_unavailable(
+                        &queue_for_wire_check,
+                        WIRE_ACTION_ACTOR,
+                        action,
+                        &rules_db_path,
+                        "wire_check",
+                    );
+                };
+                let conn_guard = match conn_arc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        tracing::warn!(
+                            "wire_check: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
+                        );
+                        poisoned.into_inner()
+                    }
+                };
+                let conn_for_check: &rusqlite::Connection = &conn_guard;
+                match check_agent_action_deferred_cached(
+                    conn_for_check,
+                    Some(&cache_for_wire_check),
+                    WIRE_ACTION_ACTOR,
+                    action,
+                    &queue_for_wire_check,
+                ) {
+                    Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                    Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                        tracing::info!(
+                            "wire_check refused action kind={} rule_id={} reason={} \
+                             (chain-logged via deferred audit queue)",
+                            action.kind(),
+                            rule_id,
+                            reason,
+                        );
+                        Err(reason)
+                    }
+                    Err(e) => {
+                        // v0.7.0 #1054 (Agent-2 #4) — same fail-CLOSED
+                        // posture as the storage hook above. Wire-check
+                        // refusals for daemon-internal actions
+                        // (federation push, hooks spawn, LLM call,
+                        // skill_export) are higher-stakes than storage
+                        // refusals — fail-open here would let a
+                        // consultation race smuggle a refused
+                        // network/filesystem/process action through
+                        // the gate. Same env-var escape hatch:
+                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+                        let reason = format!("governance:consultation_failed: {e}");
+                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        let synthetic_refusal = RuleDecision::Refuse {
+                            rule_id: "governance:consultation_failed".to_string(),
+                            reason: reason.clone(),
+                        };
+                        queue_for_wire_check.submit_refusal(
+                            WIRE_ACTION_ACTOR,
+                            action,
+                            &synthetic_refusal,
+                        );
+                        if fail_open {
+                            tracing::warn!(
+                                "wire_check: rule consultation failed: {}; \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                                 degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
+                                e,
+                                action.kind(),
+                            );
+                            Ok(())
+                        } else {
+                            tracing::warn!(
+                                "wire_check: rule consultation failed: {}; failing CLOSED \
+                                 for this action ({}) (post-#1054 secure default — set \
+                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                                e,
+                                action.kind(),
+                            );
+                            Err(reason)
+                        }
+                    }
+                }
+            },
+        ));
+        if install_result.is_err() {
+            tracing::debug!(
+                "wire_check pre-action hook already installed (process-wide OnceLock); \
+                 the existing hook remains active for this daemon"
+            );
+        } else {
+            tracing::info!(
+                "wire_check pre-action hook installed (agent-action gate active for \
+                 FilesystemWrite/NetworkRequest/ProcessSpawn/Bash/Custom)"
+            );
+        }
+    }
 
     // Issue #219: build the embedder + HNSW index up front so HTTP write
     // paths can populate them. Previously the daemon never constructed an
@@ -1461,7 +3745,31 @@ pub async fn bootstrap_serve(
     let feature_tier = app_config.effective_tier(None);
     let tier_config = feature_tier.config();
     let embedder = build_embedder(feature_tier, app_config).await;
-    let vector_index = build_vector_index(&conn, embedder.is_some());
+    // #1579 B3 — async boot HNSW. The daemon binds with an EMPTY
+    // index and becomes ready immediately; a background loader
+    // (`spawn_vector_index_boot_load`) reads the stored embeddings
+    // over its own connection, builds the graph on the #968 rebuild
+    // thread, and swaps it in (INFO line on swap). Until then,
+    // semantic recall serves its keyword/FTS blend and the #519
+    // proactive conflict check uses its bounded-scan fallback. The
+    // pre-#1579 synchronous build held boot for 40 s at 10k vectors
+    // and >28 min at 100k (P1 audit).
+    let vector_index_state: Arc<Mutex<Option<VectorIndex>>> = Arc::new(Mutex::new(
+        embedder.is_some().then(hnsw::VectorIndex::empty),
+    ));
+    if embedder.is_some() {
+        let _boot_index_loader =
+            spawn_vector_index_boot_load(db_path.to_path_buf(), Arc::clone(&vector_index_state));
+    }
+
+    // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
+    // (smart/autonomous). The HTTP `create_memory` handler reaches for
+    // `app.llm` to call `auto_tag` (mirroring MCP `handle_store` at
+    // `crate::mcp::handle_store` (auto-tag block)). When the configured tier has no
+    // `llm_model` (keyword/semantic) or the Ollama endpoint is
+    // unreachable, the client stays `None` and the hook silently
+    // degrades to operator-supplied tags only.
+    let llm = build_llm_client(feature_tier, app_config).await;
 
     let db_state: Db = Arc::new(Mutex::new((
         conn,
@@ -1473,14 +3781,28 @@ pub async fn bootstrap_serve(
     // Federation: parsed from --quorum-writes / --quorum-peers. Disabled
     // entirely when either is absent — daemon behaves exactly like
     // v0.6.0 in that case.
-    let federation = federation::FederationConfig::build(
+    // #[cfg_attr] keeps the `mut` only when DLQ wire-up below is
+    // active — under default-features the binding is read-only.
+    #[cfg_attr(not(feature = "sal"), allow(unused_mut))]
+    let mut federation = federation::FederationConfig::build(
         args.quorum_writes,
         &args.quorum_peers,
         std::time::Duration::from_millis(args.quorum_timeout_ms),
         args.quorum_client_cert.as_deref(),
         args.quorum_client_key.as_deref(),
         args.quorum_ca_cert.as_deref(),
-        format!("host:{}", gethostname::gethostname().to_string_lossy()),
+        // v0.7.0 epic (ADR-001) — federation identity is resolved, not
+        // hardcoded. Precedence: AI_MEMORY_FED_IDENTITY env >
+        // `--federation-identity` operator config > the historical
+        // `host:<hostname>` default. A blank flag is skipped by the
+        // resolver, so it can never collapse the identity to empty.
+        federation::identity::resolve_federation_identity(args.federation_identity.as_deref()),
+        // v0.7.0 fold-A2A1.4 (#702) — thread the operator-configured
+        // `[api] api_key` into federation outbound so peer POSTs carry
+        // `x-api-key`. Without this, cross-host federation BREAKS when
+        // any peer runs with api-key auth (peer returns 401 → quorum
+        // never converges). `None` keeps the prior behaviour unchanged.
+        app_config.api_key.clone(),
     )
     .context("federation config")?;
 
@@ -1495,14 +3817,18 @@ pub async fn bootstrap_serve(
         );
         // v0.6.0.1 (#320) — post-partition catchup poller. Closes the gap
         // where a rejoining node only sees post-resume writes.
+        //
+        // v0.7.0 M3 — the catchup loop now plumbs the SAL store handle
+        // through (instead of `db::insert_if_newer`) so postgres-backed
+        // daemons route peer pushes to postgres. The actual spawn is
+        // deferred until after `build_store_handle` resolves the
+        // `Arc<dyn MemoryStore>` — see the post-store-build block below.
         if args.catchup_interval_secs > 0 {
-            let interval = std::time::Duration::from_secs(args.catchup_interval_secs);
             tracing::info!(
                 "catchup loop enabled: polling {} peer(s) every {}s",
                 fed.peer_count(),
                 args.catchup_interval_secs,
             );
-            federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
         } else {
             tracing::info!("catchup loop disabled (--catchup-interval-secs=0)");
         }
@@ -1517,14 +3843,15 @@ pub async fn bootstrap_serve(
         .effective_profile(None)
         .unwrap_or_else(|_| crate::profile::Profile::core());
     let mcp_config_for_http = app_config.mcp.clone();
-    // v0.7 Track H — H2: load the active agent's Ed25519 keypair so
-    // outbound link writes can sign. Best-effort: if the keypair file
-    // doesn't exist (operator hasn't run `ai-memory identity generate`
-    // yet) we leave `active_keypair = None` and links go in unsigned —
-    // preserving v0.6.4 behaviour for unmigrated deployments. Errors
-    // other than "file not found" are logged and degraded the same way
-    // so a malformed keypair file doesn't take down the daemon.
-    let active_keypair = load_active_keypair_for_serve();
+    // v0.7 Track H — H2 + Round-3 F12: ensure-and-load the daemon's
+    // outbound-link signing keypair. The helper auto-generates the
+    // well-known `daemon` keypair under `~/.config/ai-memory/keys/` on
+    // first start (idempotent — a restart never overwrites an existing
+    // keypair) and returns it for the AppState. The lifecycle outcome
+    // is captured separately so the startup banner can surface the
+    // auto-gen path. Failure at any step degrades to unsigned-link
+    // mode without aborting startup.
+    let (active_keypair, daemon_keypair_outcome) = ensure_and_load_daemon_keypair();
 
     // v0.7.0 B3-fix2 — gate the family-descriptor embedding precompute
     // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1`, default OFF.
@@ -1570,8 +3897,39 @@ pub async fn bootstrap_serve(
         let cache = family_embeddings.clone();
         let embedder_for_task = embedder_arc.clone();
         task_handles.push(tokio::spawn(async move {
+            // ----------------------------------------------------------------
+            // H1 (v0.7.0 round-2) — lock-discipline for the family-embedding
+            // precompute:
+            //
+            //   1. The slow `Embedder::embed(descriptor)` calls run inside a
+            //      `spawn_blocking` closure that holds NO lock on
+            //      `family_embeddings`. Each (Family, Vec<f32>) pair is
+            //      collected into a local `Vec` owned by the blocking task.
+            //   2. Only AFTER the entire batch is computed do we take
+            //      `family_embeddings.write().await` exactly ONCE to swap
+            //      the populated `Some(Vec)` into the cache.
+            //
+            // Why: the prior shape that acquired the write lock before each
+            // embed call would have parked every concurrent `try_read()`
+            // reader for the duration of an ML inference round trip — up
+            // to seconds on a cold runner. Concurrent recall handlers that
+            // call `AppState::best_family_match` would be forced into the
+            // no-cache fallback even when the embedder was fully operational.
+            //
+            // The two-phase shape below is the canonical "compute outside,
+            // commit inside" lock pattern: readers see either `None`
+            // (precompute not yet finished) or the fully-populated
+            // `Some(Vec)` — never a half-built vector.
+            // ----------------------------------------------------------------
             let computed = tokio::task::spawn_blocking(move || {
-                AppState::precompute_family_embeddings(embedder_for_task.as_ref().as_ref())
+                // No lock held during embed calls — pairs are accumulated
+                // into a local Vec returned to the async caller below.
+                AppState::precompute_family_embeddings(
+                    embedder_for_task
+                        .as_ref()
+                        .as_ref()
+                        .map(|e| e as &dyn crate::embeddings::Embed),
+                )
             })
             .await
             .unwrap_or_else(|e| {
@@ -1588,6 +3946,9 @@ pub async fn bootstrap_serve(
                     computed.len(),
                 );
             }
+            // Single-shot commit: write lock acquired ONCE here and
+            // released immediately after the swap. No embedder calls run
+            // under this lock.
             *cache.write().await = Some(computed);
         }));
     } else {
@@ -1599,10 +3960,225 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // v0.7.0 Wave-3 — resolve the polymorphic `MemoryStore` handle from
+    // the operator's `--store-url` (when set) or build a `SqliteStore`
+    // wrapping the same on-disk database `--db` already opened. Both
+    // branches end with a populated `Arc<dyn MemoryStore>` so handlers
+    // can dispatch through the SAL unconditionally on `--features sal`
+    // builds. The `storage_backend` flag below records which adapter
+    // resolved so handlers can branch + the `/capabilities` payload can
+    // surface it for operators.
+    //
+    // Standard builds (no `--features sal`) skip the trait wiring
+    // entirely — the daemon stays a pure SQLite-on-disk deployment with
+    // zero behavioural drift versus pre-Wave-3.
+    // Issue #877: resolve the configured embedder dim from the same
+    // resolution ladder `build_embedder` uses — app_config override wins,
+    // then tier preset, then None. We re-derive it here (instead of
+    // pulling from the materialised `embedder` handle) because the
+    // embedder load itself can fail (network egress to HF Hub, OOM,
+    // etc.) and we still need the *configured* dim to inform the
+    // postgres bootstrap, otherwise a transient embedder load failure
+    // would leave the schema mis-dimensioned silently. Falls back to
+    // `None` only when no embedder model is configured at all
+    // (keyword-only).
+    //
+    // v0.7.x (issue #1169): the resolution ladder now prefers the
+    // resolver-side canonical dim lookup
+    // ([`crate::config::canonical_embedding_dim`]) so an operator
+    // pick of `[embeddings].model = "bge-large-en"` (or any other
+    // model id outside the 2-family [`EmbeddingModel`] enum) bootstraps
+    // the postgres schema at the live 1024-dim instead of silently
+    // dropping to the tier-preset's 768-dim. The enum-parse arm
+    // remains as the back-compat path for legacy flat-field configs
+    // (`embedding_model = "nomic_embed_v15"`), and the tier preset is
+    // the last-resort fallback. The pre-#1169 path lost the resolver
+    // signal entirely — schema dim wrong on every non-enum operator
+    // pick, with no log signal because the parse arm silently fell
+    // through to the preset.
+    #[cfg(feature = "sal")]
+    let configured_embedding_dim: Option<u32> =
+        resolve_configured_embedding_dim(app_config, &tier_config);
+    #[cfg(feature = "sal")]
+    let (storage_backend, store_handle) = build_store_handle(
+        args.store_url.as_deref(),
+        db_path,
+        app_config.postgres_statement_timeout_secs,
+        configured_embedding_dim,
+        app_config.resolve_pg_pool(),
+    )
+    .await
+    .context("build SAL store handle")?;
+    #[cfg(not(feature = "sal"))]
+    let storage_backend = crate::handlers::StorageBackend::Sqlite;
+
+    // v0.7.0 Track D #933 — federation push DLQ sink. Resolved here
+    // (after `build_store_handle` returns the typed store) so the
+    // `broadcast_store_quorum` fanout can land DLQ rows on per-peer
+    // failure. Sqlite-backed daemons get the shared `Db` mutex sink;
+    // postgres-backed daemons get the pool-backed sink. The chosen
+    // sink is also handed to the `replay_federation_push_dlq` worker
+    // spawned below so the same DLQ rows the broadcast wrote are the
+    // ones the worker drains.
+    //
+    // Feature-gated to `--features sal` — the DLQ trait surface
+    // requires `async-trait` which is a SAL-only dep. Default
+    // (sqlite-only) builds preserve pre-#933 behaviour.
+    #[cfg(feature = "sal")]
+    if let Some(ref mut fed) = federation {
+        let sink: std::sync::Arc<dyn federation::FederationDlqSink> = match storage_backend {
+            #[cfg(feature = "sal-postgres")]
+            crate::handlers::StorageBackend::Postgres => {
+                // Recover the typed PostgresStore via the generic
+                // `as_any` downcast hatch (renamed from
+                // `as_any_for_postgres` per ARCH-15, FX-C4-batch2) so
+                // the sink can issue raw SQL through
+                // `PostgresStore::pool()`. Falls back to the sqlite
+                // sink (which would error on every INSERT because the
+                // postgres DB has no sqlite connection) when the
+                // downcast fails — unreachable in practice because the
+                // only backend returning `StorageBackend::Postgres` IS
+                // PostgresStore.
+                if let Some(pg) = store_handle
+                    .as_any()
+                    .downcast_ref::<crate::store::postgres::PostgresStore>()
+                {
+                    std::sync::Arc::new(federation::push_dlq::PostgresDlqSink::new(
+                        std::sync::Arc::new(pg.clone()),
+                    ))
+                } else {
+                    tracing::warn!(
+                        "federation push DLQ: PostgresStore downcast failed; \
+                             falling back to sqlite sink (DLQ writes WILL error \
+                             on postgres-backed daemons until the cast is restored)"
+                    );
+                    std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone()))
+                }
+            }
+            _ => std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone())),
+        };
+        fed.dlq_sink = Some(sink);
+    }
+
+    // v0.7.0 M3 — spawn the federation catchup loop now that the SAL
+    // store handle has resolved. The loop dispatches each peer-pulled
+    // memory through `store.apply_remote_memory` (postgres-aware) on
+    // `--features sal` builds; legacy builds fall back to the
+    // `db::insert_if_newer` sqlite path.
+    if let Some(ref fed) = federation
+        && args.catchup_interval_secs > 0
+    {
+        let interval = std::time::Duration::from_secs(args.catchup_interval_secs);
+        #[cfg(feature = "sal")]
+        {
+            federation::spawn_catchup_loop_with_store(
+                fed.clone(),
+                db_state.clone(),
+                Some(store_handle.clone()),
+                interval,
+            );
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
+        }
+
+        // v0.7.0 Track D #933 — federation push DLQ replay worker.
+        // Polls the DLQ at the same cadence as the catchup loop and
+        // re-attempts `post_once` against each peer until the row
+        // Acks. The worker maintains the
+        // `ai_memory_federation_push_dlq_depth` Prometheus gauge.
+        #[cfg(feature = "sal")]
+        if let Some(sink) = fed.dlq_sink.clone() {
+            let _replay_handle =
+                federation::spawn_replay_federation_push_dlq(fed.clone(), sink, interval);
+            tracing::info!(
+                "federation push DLQ replay worker enabled: polling every {}s",
+                args.catchup_interval_secs,
+            );
+        }
+    }
+
+    // #1579 A4 — serve-boot embedding-backfill sweep over the SAL
+    // store. The legacy backfill (`crate::mcp::run_embedding_backfill*`)
+    // is rusqlite-`Connection`-bound and runs ONLY at MCP stdio boot,
+    // so postgres-backed daemons (which exist exclusively behind
+    // `serve --store-url postgres://…`) never re-embedded the rows the
+    // v29 embedding-dim migration NULLed — fleet semantic recall was
+    // dead (P3 audit: 37/7,994 rows embedded, 0 backfill journal
+    // lines). This sweep drains `MemoryStore::list_unembedded` in
+    // bounded `[embeddings].backfill_batch` chunks through the daemon
+    // embedder. SQLite-backed serve daemons are a structural no-op
+    // (the sqlite adapter inherits the empty `list_unembedded`
+    // default — its side-table embeddings are backfilled by the MCP
+    // boot path), so this changes nothing for them. Detached task:
+    // boot readiness never blocks on the sweep.
+    #[cfg(feature = "sal")]
+    if embedder_arc.is_some() {
+        let backfill_store = store_handle.clone();
+        let backfill_embedder = embedder_arc.clone();
+        let backfill_batch = usize::try_from(app_config.resolve_embeddings().backfill_batch)
+            .unwrap_or(crate::mcp::DEFAULT_EMBED_BACKFILL_BATCH_SIZE);
+        task_handles.push(tokio::spawn(async move {
+            let Some(emb) = backfill_embedder.as_ref() else {
+                return;
+            };
+            // Operator-level maintenance path: must see (and re-embed)
+            // every row regardless of metadata.scope — same posture as
+            // the federation catchup loop. Sentinel principal, not a
+            // literal, per the #1558 identity-sentinel SSOT.
+            let ctx = crate::store::CallerContext::for_admin(
+                crate::identity::sentinels::EMBEDDING_BACKFILL,
+            );
+            let written = crate::store::run_embedding_backfill_on_store(
+                backfill_store.as_ref(),
+                &ctx,
+                emb,
+                backfill_batch,
+            )
+            .await;
+            if written > 0 {
+                tracing::info!(
+                    "embedding backfill (serve boot, #1579 A4): {written} row(s) embedded"
+                );
+            }
+        }));
+    }
+
+    // FED-P3b — outbound credential renewal worker. When this node holds a
+    // CA-issued credential file (`AI_MEMORY_FED_CRED_PATH`), keep it fresh:
+    // an external issuer rewrites the short-lived credential on renewal and
+    // this worker swaps it into the live send path without a daemon
+    // restart. Independent of the catchup interval; a no-op (not spawned)
+    // when no credential path is configured.
+    if federation.is_some()
+        && std::env::var(federation::identity::credential::FED_CREDENTIAL_PATH_ENV).is_ok()
+    {
+        let renewal_interval = Duration::from_secs(
+            federation::identity::renewal::DEFAULT_RENEWAL_INTERVAL_SECS.unsigned_abs(),
+        );
+        let _renewal_handle = federation::identity::renewal::spawn_refresh_outbound_credential(
+            db_state.clone(),
+            renewal_interval,
+        );
+        tracing::info!(
+            "federation outbound credential renewal worker enabled: refreshing every {}s",
+            renewal_interval.as_secs(),
+        );
+    }
+
+    if matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
+        tracing::warn!(
+            "v0.7.0 Wave-3: postgres-backed daemon — handlers that have not \
+             yet migrated to the SAL trait surface 501 Not Implemented. See \
+             docs/postgres-age-guide.md for the supported endpoint inventory."
+        );
+    }
+
     let app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
-        vector_index: Arc::new(Mutex::new(vector_index)),
+        vector_index: vector_index_state,
         federation: Arc::new(federation),
         tier_config: Arc::new(tier_config),
         scoring: Arc::new(app_config.effective_scoring()),
@@ -1610,12 +4186,115 @@ pub async fn bootstrap_serve(
         mcp_config: Arc::new(mcp_config_for_http),
         active_keypair: Arc::new(active_keypair),
         family_embeddings,
+        storage_backend,
+        #[cfg(feature = "sal")]
+        store: store_handle,
+        llm: Arc::new(llm),
+        // v0.7.0 L15 — dedicated auto_tag model from config.toml.
+        auto_tag_model: Arc::new(app_config.auto_tag_model.clone()),
+        // v0.7.0 H8 (round-2) — per-LLM-call timeout (default 30s).
+        llm_call_timeout: Duration::from_secs(app_config.effective_llm_call_timeout_secs()),
+        // v0.7.0 H5 (round-2) — fresh per-process replay cache + the
+        // resolved `[verify] require_nonce` toggle. Default `false`
+        // preserves verify-anytime semantics for unmigrated clients;
+        // operators opt into strict mode via `config.toml`.
+        replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
+        verify_require_nonce: app_config.verify.as_ref().is_some_and(|v| v.require_nonce),
+        // #1255 (MED, 2026-05-25) — persistence-enabled federation
+        // nonce cache. Rehydrates from disk on boot so a daemon
+        // restart does NOT re-open the replay window for any
+        // captured `(body, sig, nonce)` tuple. Falls back to the
+        // in-memory-only constructor with a WARN log if persistence
+        // open fails (e.g. disk pressure, locked file) — the daemon
+        // continues to boot at the pre-#1255 posture rather than
+        // crash-looping on a transient sqlite issue.
+        federation_nonce_cache: Arc::new(
+            match crate::identity::replay::FederationNonceCache::new_with_db_persistence(db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ai_memory::identity::replay",
+                        db_path = %db_path.display(),
+                        err = %e,
+                        "#1255: FederationNonceCache persistence open failed; falling back to \
+                         in-memory cache. Daemon restarts will reopen the replay window until \
+                         operators resolve the underlying sqlite issue."
+                    );
+                    crate::identity::replay::FederationNonceCache::new()
+                }
+            },
+        ),
+        // v0.7.0 (issue #519) — resolved autonomous_hooks flag for the
+        // HTTP create_memory path's proactive conflict-detection
+        // helper. Falls back to false when unset (preserves v0.6.x
+        // post-hoc-only contradiction surface).
+        autonomous_hooks: app_config.effective_autonomous_hooks(),
+        // v0.7.0 (issue #518) — resolved recall_scope defaults from
+        // `[agents.defaults.recall_scope]`. None preserves v0.6.x
+        // recall semantics (no splice on session_default=true).
+        recall_scope: Arc::new(app_config.effective_recall_scope().cloned()),
+        // v0.7.0 Policy-Engine Item 3 — deferred-audit producer handle.
+        // Always Some on bootstrap_serve (the drainer was spawned
+        // above before the storage hook installed). Wrapped in
+        // Arc<Option<...>> per the AppState clone-cheap idiom.
+        deferred_audit_queue: Arc::new(Some(deferred_audit_queue)),
+        // v0.7.0 SHIP cluster (#946 / #957 / #960 / #961, 2026-05-20)
+        // — operator-configured `[admin] agent_ids = [...]` allowlist.
+        // `validated_agent_ids()` drops malformed entries with a
+        // `warn` log so a single typo cannot lock the operator out;
+        // an absent `[admin]` block resolves to an empty Vec which
+        // closes every admin-class endpoint by default.
+        //
+        // #976 (2026-05-20): `AI_MEMORY_ADMIN_AGENT_IDS` env var
+        // overrides the config-file allowlist. Comma-separated list of
+        // agent_ids; `*` is the wildcard (everyone is admin —
+        // appropriate for test daemons + container deploys where the
+        // allowlist comes from orchestration secrets, not config.toml).
+        // Same `validate_agent_id` filter applies; malformed entries
+        // warn + drop. Precedence: env var > `[admin]` config block.
+        admin_agent_ids: Arc::new(resolve_admin_agent_ids(app_config.admin.as_ref())),
+        // v0.7.0 #991 — share the per-instance rule cache constructed
+        // above (and already wired into both hook closures) with the
+        // HTTP handler entry points. One cache per daemon lifetime.
+        rule_cache: Arc::clone(&rule_cache),
+        // v0.7.x (issue #1168) — operator-resolved LLM / embeddings /
+        // reranker triple. Threaded into the HTTP `/api/v1/capabilities`
+        // handler so the wire-reported `models.*` block mirrors the
+        // running daemon's actual model wiring (matching the boot
+        // banner + the live LLM client), NOT the compiled tier preset.
+        // The resolver folds CLI / env / `[llm]` / legacy / compiled-
+        // default precedence and the resulting triple is process-stable.
+        resolved_models: Arc::new(app_config.resolve_models()),
+        runtime: crate::runtime_context::RuntimeContext::global_arc(),
+        // Operator-resolved `[limits].max_page_size` (env
+        // `AI_MEMORY_MAX_PAGE_SIZE`) — per-request page / bulk
+        // materialization bound for list / search / bulk-create /
+        // federation-sync handlers. Falls back to the compiled
+        // `MAX_BULK_SIZE` default when unset.
+        max_page_size: app_config.resolve_limits().max_page_size,
     };
 
-    // Automatic GC.
-    task_handles.push(spawn_gc_loop(
+    // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
+    // supervisor task with the task_handles vec so `serve()` aborts
+    // it on shutdown. The supervisor wraps the drainer with panic
+    // recovery + graceful drain of buffered events when the queue is
+    // closed. This MUST be in `task_handles` so the test assertion in
+    // `test_bootstrap_serve_keyword_tier_no_embedder` updates its
+    // expected count accordingly.
+    task_handles.push(deferred_audit_supervisor);
+
+    // Automatic GC. Cluster G (#767) — pass through the operator-
+    // tunable `[confidence] shadow_retention_days` so the periodic
+    // sweep on `confidence_shadow_observations` runs at the configured
+    // window (default 30 days).
+    let shadow_retention_days = app_config.confidence.as_ref().map_or(
+        crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS,
+        crate::config::ConfidenceConfig::effective_shadow_retention_days,
+    );
+    task_handles.push(spawn_gc_loop_with_shadow_retention(
         db_state.clone(),
         app_config.archive_max_days,
+        shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
     ));
 
@@ -1671,11 +4350,49 @@ pub async fn bootstrap_serve(
         Duration::from_secs(AGENT_QUOTA_RESET_INTERVAL_SECS),
     ));
 
+    // v0.7.0 fold-A2A1.4 (#702) — mtls_enforced is true when the
+    // operator configured the full TLS+mTLS stack (cert+key+allowlist).
+    // The api_key_auth middleware uses this to bypass the `x-api-key`
+    // requirement on `/api/v1/sync/*` paths, because rustls has already
+    // verified the client cert against the operator-pinned allowlist
+    // — adding a shared-secret check on top is redundant and breaks
+    // cross-host federation when the peer doesn't carry the secret.
+    let mtls_enforced =
+        args.tls_cert.is_some() && args.tls_key.is_some() && args.mtls_allowlist.is_some();
     let api_key_state = ApiKeyState {
         key: app_config.api_key.clone(),
+        mtls_enforced,
     };
     if api_key_state.key.is_some() {
-        tracing::info!("API key authentication enabled");
+        if mtls_enforced {
+            tracing::info!(
+                "API key authentication enabled — federation endpoints (/api/v1/sync/*) \
+                 bypass api-key check because mTLS allowlist is configured"
+            );
+        } else {
+            tracing::info!("API key authentication enabled");
+        }
+    }
+
+    // #1570 (H6) — record whether request authentication is configured
+    // so the shared admin-role gate can refuse to mint admin from a
+    // bare self-asserted `X-Agent-Id` header on unauthenticated
+    // deployments. Boot-time WARN when the operator configured admin
+    // ids but the gate will refuse them all (no api_key, trust flag
+    // off) — names the escape hatch so the remediation is one search
+    // away. Mirrors the #1455 fail-closed convention.
+    crate::handlers::admin_role::mark_request_authn_configured(api_key_state.key.is_some());
+    if !app_state.admin_agent_ids.is_empty()
+        && api_key_state.key.is_none()
+        && !crate::handlers::admin_role::admin_header_trust_enabled()
+    {
+        tracing::warn!(
+            "[admin].agent_ids is configured but no api_key is set: the X-Agent-Id header is \
+             self-asserted, so admin-role requests will be REFUSED (403) until you either \
+             configure an api_key or explicitly opt into the legacy header-trust posture with \
+             {}=1 (#1570 secure default)",
+            crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
+        );
     }
 
     Ok(ServeBootstrap {
@@ -1684,6 +4401,10 @@ pub async fn bootstrap_serve(
         db_state,
         archive_max_days: app_config.archive_max_days,
         task_handles,
+        daemon_keypair_outcome,
+        // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
+        request_timeout: Duration::from_secs(app_config.effective_request_timeout_secs()),
+        deferred_audit_metrics,
     })
 }
 
@@ -1694,7 +4415,7 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("ai_memory=info".parse().unwrap())
+                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse().unwrap())
                 .add_directive("tower_http=info".parse().unwrap()),
         )
         .try_init();
@@ -1711,16 +4432,58 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 
     let bootstrap = bootstrap_serve(&db_path, &args, app_config).await?;
 
+    // Round-2 F8 + Round-3 F12 — startup banner. Surfaces the effective
+    // permissions mode (and the v0.7.0 enforce-default migration warning
+    // when the operator has no `[permissions]` block in config) plus the
+    // F12 keypair-autogen result captured by `ensure_and_load_daemon_keypair`
+    // earlier in this fn.
+    let banner_inputs = crate::cli::serve_banner::BannerInputs {
+        // B4 (S5-M3) — `.and_then` (not `.map`) so a partial
+        // `[permissions]` block without `mode = ` collapses to `None`
+        // and the banner's migration WARN fires, matching
+        // `AppConfig::effective_permissions_mode` semantics.
+        configured_permissions_mode: app_config.permissions.as_ref().and_then(|p| p.mode),
+        auto_generated_keypair_path: bootstrap.daemon_keypair_outcome.as_ref().and_then(
+            |o| match o {
+                crate::identity::keypair::EnsureOutcome::Generated { pub_path } => {
+                    Some(pub_path.display().to_string())
+                }
+                _ => None,
+            },
+        ),
+        identity_disabled: matches!(
+            bootstrap.daemon_keypair_outcome,
+            Some(crate::identity::keypair::EnsureOutcome::SkippedDisabled)
+        ),
+    };
+    for line in crate::cli::serve_banner::compose_banner(&banner_inputs) {
+        if line.is_warn() {
+            tracing::warn!("{}", line.message());
+        } else {
+            tracing::info!("{}", line.message());
+        }
+    }
+
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
 
-    // Graceful shutdown with WAL checkpoint
-    let shutdown_state = bootstrap.db_state.clone();
+    // Graceful shutdown. The signal future only waits for ctrl_c and
+    // then resolves, which tells axum to begin graceful shutdown of
+    // in-flight requests. The deferred-audit drain + WAL checkpoint run
+    // AFTER the server has fully quiesced (below `serve`), so:
+    //   1. no refusal submitted by an in-flight request is lost, and
+    //   2. the final checkpoint captures every write — including the
+    //      drainer's `signed_events` appends, which share the same WAL
+    //      file even though the drainer holds its own connection.
+    // v0.7.0 Policy-Engine Item 3 (audit-log-loss-on-shutdown fix): the
+    // checkpoint used to live inside this future, firing at signal time
+    // before in-flight requests (and the audit drainer) had quiesced —
+    // so refusal rows submitted during graceful shutdown could be lost.
+    let checkpoint_state = bootstrap.db_state.clone();
+    let drain_metrics = bootstrap.deferred_audit_metrics.clone();
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutting down — checkpointing WAL");
-        let lock = shutdown_state.lock().await;
-        let _ = db::checkpoint(&lock.0);
+        tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
 
     // Native TLS (Layer 1): if both --tls-cert and --tls-key are provided,
@@ -1750,7 +4513,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             );
             tls::load_rustls_config(cert, key).await?
         };
-        let app = build_router(bootstrap.app_state, bootstrap.api_key_state);
+        let app = crate::build_router_with_timeout(
+            bootstrap.api_key_state,
+            bootstrap.app_state,
+            bootstrap.request_timeout,
+        );
         tracing::info!("ai-memory listening on https://{addr}");
         let socket_addr: std::net::SocketAddr = addr.parse()?;
         // axum-server doesn't have a direct graceful-shutdown on the
@@ -1765,7 +4532,15 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             shutdown.await;
             handle_clone.graceful_shutdown(Some(grace));
         });
-        axum_server::bind_rustls(socket_addr, tls_config)
+        // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
+        // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
+        // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
+        // timer added a fixed ~40 ms to the FIRST request of every fresh
+        // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
+        // and accept/reject semantics are unchanged; see
+        // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
+        axum_server::bind(socket_addr)
+            .acceptor(tls::serve_rustls_acceptor(&tls_config))
             .handle(handle)
             .serve(app.into_make_service())
             .await?;
@@ -1783,14 +4558,58 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         // the integration tests drive in-process. Production threads its
         // WAL-checkpoint-on-shutdown future in directly so the cleanup
         // semantic is preserved verbatim.
-        serve_http_with_shutdown_future(
+        serve_http_with_shutdown_future_and_timeout(
             &addr,
             bootstrap.api_key_state,
             bootstrap.app_state,
+            bootstrap.request_timeout,
             shutdown,
         )
         .await?;
     }
+
+    // v0.7.0 Policy-Engine Item 3 — the HTTP server has now fully
+    // quiesced (graceful shutdown complete; no in-flight request can
+    // submit another refusal), so `submitted` is final. Drain the
+    // deferred-audit queue before exit so every refusal captured during
+    // the daemon's life lands in `signed_events`. We can NOT use
+    // `close_and_flush` here: the governance hooks
+    // (`storage::GOVERNANCE_PRE_WRITE`, `wire_check::GOVERNANCE_PRE_ACTION`)
+    // hold sender clones inside process-wide `OnceLock`s that never drop,
+    // so the channel never closes and awaiting the supervisor would block
+    // forever. `drain_pending` instead polls the shared atomic metrics
+    // until the drainer has caught up to the submitted count.
+    let drained = crate::governance::deferred_audit::drain_pending(
+        &drain_metrics,
+        crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await;
+    if drained {
+        tracing::info!(
+            "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
+            drain_metrics.submitted_count()
+        );
+    } else {
+        tracing::warn!(
+            "deferred-audit drain timed out after {:?}: {} submitted but only {} accounted — \
+             some refusal audit rows may not have flushed before exit",
+            crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+            drain_metrics.submitted_count(),
+            drain_metrics.appended_count()
+                + drain_metrics.append_failure_count()
+                + drain_metrics.send_failure_count(),
+        );
+    }
+
+    // Final WAL checkpoint now that every writer (HTTP handlers + the
+    // deferred-audit drainer) has quiesced. The drainer's appends share
+    // this database's WAL file, so this single checkpoint folds them in
+    // even though the drainer holds its own connection.
+    {
+        let lock = checkpoint_state.lock().await;
+        let _ = db::checkpoint(&lock.0);
+    }
+
     Ok(())
 }
 
@@ -1799,17 +4618,22 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 // ---------------------------------------------------------------------------
 
 fn cmd_bench(args: &BenchArgs) -> Result<()> {
-    let iterations = args.iterations.clamp(1, 100_000);
-    let warmup = args.warmup.min(10_000);
-    let regression_threshold = args.regression_threshold.clamp(0.0, 1000.0);
+    let iterations = args.iterations.clamp(1, crate::bench::MAX_ITERATIONS);
+    let warmup = args.warmup.min(crate::bench::MAX_WARMUP);
+    let regression_threshold = args
+        .regression_threshold
+        .clamp(0.0, crate::bench::MAX_REGRESSION_THRESHOLD_PCT);
     // Bench always seeds a disposable in-memory DB so the operator's
     // main DB (and disk) are untouched. SQLite's `:memory:` URL and
     // WAL-less mode keep the workload bounded by RAM and CPU.
     let conn = db::open(Path::new(":memory:"))?;
+    // #1579 B8 — corpus scale (None = legacy default workload).
+    let scale = args.scale.map(|s| s.clamp(1, crate::bench::MAX_SCALE));
     let config = bench::BenchConfig {
         iterations,
         warmup,
         namespace: bench::BENCH_NAMESPACE.to_string(),
+        scale,
     };
     let results = bench::run(&conn, &config)?;
 
@@ -1830,6 +4654,7 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "iterations": iterations,
                 "warmup": warmup,
+                "scale": scale,
                 "results": results,
                 "regressions": regressions,
             }))?
@@ -1844,7 +4669,14 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
 
     if let Some(history_path) = &args.history {
         let captured_at = chrono::Utc::now().to_rfc3339();
-        bench::append_history(history_path, &captured_at, iterations, warmup, &results)?;
+        bench::append_history(
+            history_path,
+            &captured_at,
+            iterations,
+            warmup,
+            scale,
+            &results,
+        )?;
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
             stderr,
@@ -1892,10 +4724,15 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         args.dry_run,
     )
     .await;
+    // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
+    // mask the userinfo password so credentials never land in stdout /
+    // captured CI logs.
+    let from_display = crate::logging::redact_url_password(&args.from);
+    let to_display = crate::logging::redact_url_password(&args.to);
     if args.json {
         let value = serde_json::json!({
-            "from_url": args.from,
-            "to_url": args.to,
+            "from_url": from_display,
+            "to_url": to_display,
             "memories_read": report.memories_read,
             "memories_written": report.memories_written,
             "batches": report.batches,
@@ -1905,8 +4742,8 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("migration report");
-        println!("  from:              {}", args.from);
-        println!("  to:                {}", args.to);
+        println!("  from:              {from_display}");
+        println!("  to:                {to_display}");
         println!("  memories_read:     {}", report.memories_read);
         println!("  memories_written:  {}", report.memories_written);
         println!("  batches:           {}", report.batches);
@@ -1964,7 +4801,30 @@ pub async fn serve_http_with_shutdown_future<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let app = crate::build_router(api_key_state, app_state);
+    serve_http_with_shutdown_future_and_timeout(
+        addr,
+        api_key_state,
+        app_state,
+        Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS),
+        shutdown,
+    )
+    .await
+}
+
+/// v0.7.0 H7 (round-2) — variant of [`serve_http_with_shutdown_future`]
+/// that accepts an explicit per-request timeout. Used by tests to
+/// drive the slow-POST edge directly.
+pub async fn serve_http_with_shutdown_future_and_timeout<F>(
+    addr: &str,
+    api_key_state: ApiKeyState,
+    app_state: AppState,
+    request_timeout: Duration,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -2009,9 +4869,17 @@ pub async fn sync_cycle_once(
         pull_url.push_str(&urlencoding_minimal(s));
     }
 
-    let mut req = client.get(&pull_url).header("x-agent-id", local_agent_id);
+    // v0.7.0 #238/#239 — attach `x-peer-id` so the peer's
+    // attestation + scope-allowlist substrate sees our self-claim.
+    let mut req = client
+        .get(&pull_url)
+        .header(crate::HEADER_AGENT_ID, local_agent_id)
+        .header(
+            crate::federation::peer_attestation::PEER_ID_HEADER,
+            local_agent_id,
+        );
     if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
+        req = req.header(crate::HEADER_API_KEY, key);
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -2024,7 +4892,7 @@ pub async fn sync_cycle_once(
     {
         let conn = db::open(db_path)?;
         for mem in &pulled.memories {
-            if crate::validate::validate_memory(mem).is_ok() {
+            if crate::validate::RequestValidator::validate_memory(mem).is_ok() {
                 let _ = db::insert_if_newer(&conn, mem);
             }
         }
@@ -2047,18 +4915,24 @@ pub async fn sync_cycle_once(
 
     if !outgoing.is_empty() {
         let body = serde_json::json!({
-            "sender_agent_id": local_agent_id,
+            (field_names::SENDER_AGENT_ID): local_agent_id,
             "sender_clock": { "entries": {} },
             "memories": outgoing,
             "dry_run": false,
         });
+        // v0.7.0 #238 — attach `x-peer-id` so the receiver attests
+        // body.sender_agent_id against our wire-level peer identity.
         let mut req = client
             .post(format!("{peer_url}/api/v1/sync/push"))
-            .header("x-agent-id", local_agent_id)
-            .header("content-type", "application/json")
+            .header(crate::HEADER_AGENT_ID, local_agent_id)
+            .header(
+                crate::federation::peer_attestation::PEER_ID_HEADER,
+                local_agent_id,
+            )
+            .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
             .json(&body);
         if let Some(key) = api_key {
-            req = req.header("x-api-key", key);
+            req = req.header(crate::HEADER_API_KEY, key);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -2184,9 +5058,15 @@ pub async fn run_curator_daemon_with_shutdown(
     });
 
     let llm_arc: Option<Arc<crate::llm::OllamaClient>> = None;
+    // Issue #816 — load the daemon signing keypair so the curator's
+    // auto-persona sweep can produce signed persona rows. `None`
+    // (no key on disk + auto-gen disabled) leaves the sweep no-op,
+    // matching the pre-#816 behaviour.
+    let (kp_opt, _outcome) = ensure_and_load_daemon_keypair();
+    let active_keypair = kp_opt.map(Arc::new);
     let db_owned = db_path;
     tokio::task::spawn_blocking(move || {
-        crate::curator::run_daemon(db_owned, llm_arc, cfg, shutdown_flag);
+        crate::curator::run_daemon(db_owned, llm_arc, cfg, shutdown_flag, active_keypair);
     })
     .await
     .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
@@ -2195,8 +5075,10 @@ pub async fn run_curator_daemon_with_shutdown(
 
 /// Curator-daemon loop body, primitive-arg flavour for the binary.
 ///
-/// `ollama_model` of `None` disables the LLM (matching the pre-tiered
-/// keyword-only path in `build_curator_llm`).
+/// The caller supplies the already-resolved LLM client (built via
+/// `build_curator_llm` so the `--daemon` path shares the identical
+/// #1146-resolver result with the `--once` path — see #1440). `None`
+/// disables the LLM, leaving keyword-only curation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_curator_daemon_with_primitives(
     db_path: PathBuf,
@@ -2205,7 +5087,7 @@ pub async fn run_curator_daemon_with_primitives(
     dry_run: bool,
     include_namespaces: Vec<String>,
     exclude_namespaces: Vec<String>,
-    ollama_model: Option<String>,
+    llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let cfg = crate::curator::CuratorConfig {
@@ -2214,9 +5096,8 @@ pub async fn run_curator_daemon_with_primitives(
         dry_run,
         include_namespaces,
         exclude_namespaces,
+        compaction: crate::curator::CompactionConfig::default(),
     };
-    let llm: Option<Arc<crate::llm::OllamaClient>> =
-        ollama_model.and_then(|m| crate::llm::OllamaClient::new(&m).ok().map(Arc::new));
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_for_signal = shutdown_flag.clone();
@@ -2225,8 +5106,16 @@ pub async fn run_curator_daemon_with_primitives(
         shutdown_flag_for_signal.store(true, Ordering::Relaxed);
     });
 
+    // Issue #816 — load the daemon signing keypair for the auto-persona
+    // sweep. Mirrors the load in `run_curator_daemon_with_shutdown`;
+    // both daemon entry-points need the same keypair resolution so the
+    // CLI (`ai-memory curator --daemon`) and the test-driven shutdown
+    // flow both honour the same on-disk state.
+    let (kp_opt, _outcome) = ensure_and_load_daemon_keypair();
+    let active_keypair = kp_opt.map(Arc::new);
+
     tokio::task::spawn_blocking(move || {
-        crate::curator::run_daemon(db_path, llm, cfg, shutdown_flag);
+        crate::curator::run_daemon(db_path, llm, cfg, shutdown_flag, active_keypair);
     })
     .await
     .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
@@ -2280,6 +5169,7 @@ fn _imports_in_use(_: Instant, _: Duration) {}
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields
 mod tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;
@@ -2287,6 +5177,198 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
+    /// path must log the REDACTED store URL. Pre-fix,
+    /// `build_store_handle` interpolated the raw `--store-url`
+    /// (password included) into the INFO boot line, shipping the
+    /// credential to journald / any log sink. The INFO line fires
+    /// before the connect attempt, so an unreachable port (`:1`)
+    /// still exercises the log site; the connect error itself is
+    /// expected and asserted as `Err`.
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn issue_1579_a3_boot_log_redacts_store_url_password() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buf lock").extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let writer_buf = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer_buf.clone())
+            .finish();
+        // Thread-local default — `#[tokio::test]` runs the future on
+        // the current thread, so every log the boot path emits during
+        // the await lands in `buf`.
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let secret = "sup3r-s3cret-pw";
+        let url = format!("postgres://ai_memory:{secret}@127.0.0.1:1/ai_memory");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("unused.db");
+        let res = build_store_handle(
+            Some(&url),
+            &db_path,
+            None,
+            Some(384),
+            crate::store::PoolConfig::default(),
+        )
+        .await;
+        assert!(res.is_err(), "port 1 must refuse the connection");
+
+        let logs = String::from_utf8_lossy(&buf.0.lock().expect("buf lock")).to_string();
+        assert!(
+            logs.contains("opening Postgres SAL store at postgres://ai_memory:****@127.0.0.1:1"),
+            "boot line must log the redacted URL; got:\n{logs}"
+        );
+        assert!(
+            !logs.contains(secret),
+            "store-URL password leaked into the boot log:\n{logs}"
+        );
+    }
+
+    /// #1455 (SEC, MED) — when a governance hook's rule-consultation
+    /// connection could not be opened at install time, the gate MUST
+    /// fail CLOSED by default (return `Err`), and only degrade to ALLOW
+    /// when the operator explicitly opts into the legacy permissive
+    /// posture. The pre-#1455 behaviour silently degraded to ALLOW,
+    /// disabling the entire substrate write-gate whenever `db::open`
+    /// failed at boot.
+    #[test]
+    fn governance_consultation_unavailable_fails_closed_by_default_1455() {
+        use crate::governance::agent_action::AgentAction;
+        use crate::governance::deferred_audit::DeferredAuditQueue;
+
+        // Keep the receiver alive so the audit submit doesn't trip the
+        // closed-receiver WARN path (cosmetic; not under test here).
+        let (queue, _rx) = DeferredAuditQueue::new();
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".to_string(),
+            payload: serde_json::json!({ "namespace": "ns", "tier": "long" }),
+        };
+        let path = Path::new("/nonexistent/rules.db");
+
+        // Secure default: no operator override ⇒ fail CLOSED.
+        let closed = governance_consultation_unavailable_inner(
+            &queue,
+            "agent:test",
+            &action,
+            path,
+            "test-surface",
+            false,
+        );
+        let reason = closed.expect_err("missing consultation conn MUST fail CLOSED");
+        assert!(
+            reason.contains("consultation_unavailable"),
+            "fail-closed reason must name the cause: {reason}"
+        );
+
+        // Operator override ⇒ legacy permissive ALLOW.
+        let opened = governance_consultation_unavailable_inner(
+            &queue,
+            "agent:test",
+            &action,
+            path,
+            "test-surface",
+            true,
+        );
+        assert!(
+            opened.is_ok(),
+            "fail_open override MUST degrade to ALLOW (legacy posture)"
+        );
+    }
+
+    /// #1455 — the env-reading wrapper honours the documented
+    /// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` truthy values and
+    /// defaults to `false` (fail-closed) when unset.
+    #[test]
+    fn governance_fail_open_on_error_env_parse_1455() {
+        // Unset → secure default.
+        unsafe { std::env::remove_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR") };
+        assert!(!governance_fail_open_on_error());
+        // Truthy forms → permissive.
+        unsafe { std::env::set_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR", "1") };
+        assert!(governance_fail_open_on_error());
+        unsafe { std::env::set_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR", "TRUE") };
+        assert!(governance_fail_open_on_error());
+        // Falsy / junk → secure default.
+        unsafe { std::env::set_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR", "0") };
+        assert!(!governance_fail_open_on_error());
+        unsafe { std::env::remove_var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR") };
+    }
+
+    // ---- #1458 (SEC, MED): api_key bind guard ------------------------------
+
+    /// With an api_key configured the guard permits any bind silently.
+    #[test]
+    fn api_key_bind_guard_present_binds_silently_1458() {
+        assert_eq!(api_key_bind_guard(true, "0.0.0.0", false).unwrap(), None);
+        assert_eq!(api_key_bind_guard(true, "127.0.0.1", true).unwrap(), None);
+    }
+
+    /// Keyless loopback bind is permitted but MUST warn about the
+    /// reverse-proxy/host-network re-exposure hazard.
+    #[test]
+    fn api_key_bind_guard_keyless_loopback_warns_1458() {
+        for host in ["127.0.0.1", "::1", "localhost", "[::1]", "0:0:0:0:0:0:0:1"] {
+            let warning = api_key_bind_guard(false, host, false)
+                .unwrap()
+                .unwrap_or_else(|| panic!("keyless loopback {host} must warn, not bind silently"));
+            assert!(
+                warning.contains("reverse proxy") && warning.contains("off-host"),
+                "warning must name the proxy hazard for {host}: {warning}"
+            );
+        }
+    }
+
+    /// Keyless non-loopback bind is refused outright.
+    #[test]
+    fn api_key_bind_guard_keyless_non_loopback_refuses_1458() {
+        let err = api_key_bind_guard(false, "0.0.0.0", false)
+            .expect_err("keyless non-loopback bind MUST be refused");
+        assert!(err.contains("refusing to bind to non-loopback"), "{err}");
+    }
+
+    /// The strict opt-in refuses a keyless start even on loopback,
+    /// because the loopback host string cannot see a fronting proxy.
+    #[test]
+    fn api_key_bind_guard_strict_refuses_keyless_loopback_1458() {
+        let err = api_key_bind_guard(false, "127.0.0.1", true)
+            .expect_err("strict mode MUST refuse keyless loopback bind");
+        assert!(
+            err.contains("AI_MEMORY_REQUIRE_API_KEY"),
+            "strict refusal must name the knob: {err}"
+        );
+        // Strict is moot when a key IS present.
+        assert_eq!(api_key_bind_guard(true, "127.0.0.1", true).unwrap(), None);
+    }
+
+    /// The strict-mode env parser honours truthy forms and defaults off.
+    #[test]
+    fn require_api_key_strict_env_parse_1458() {
+        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
+        assert!(!require_api_key_strict());
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "1") };
+        assert!(require_api_key_strict());
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "TRUE") };
+        assert!(require_api_key_strict());
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "0") };
+        assert!(!require_api_key_strict());
+        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
+    }
 
     // ----- helpers -------------------------------------------------------
 
@@ -2305,6 +5387,9 @@ mod tests {
             quorum_client_key: None,
             quorum_ca_cert: None,
             catchup_interval_secs: 0,
+            federation_identity: None,
+            #[cfg(feature = "sal")]
+            store_url: None,
         }
     }
 
@@ -2327,6 +5412,31 @@ mod tests {
             mcp_config: Arc::new(None),
             active_keypair: Arc::new(None),
             family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+            storage_backend: crate::handlers::StorageBackend::Sqlite,
+            #[cfg(feature = "sal")]
+            store: {
+                let s = crate::store::sqlite::SqliteStore::open(db_path)
+                    .expect("open SqliteStore for keyword_app_state");
+                Arc::new(s)
+            },
+            llm: Arc::new(None),
+            auto_tag_model: Arc::new(None),
+            llm_call_timeout: Duration::from_secs(crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS),
+            replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
+            verify_require_nonce: false,
+            federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
+            autonomous_hooks: false,
+            recall_scope: Arc::new(None),
+            deferred_audit_queue: Arc::new(None),
+            admin_agent_ids: Arc::new(Vec::new()),
+            // v0.7.0 #991 — fresh per-test cache. No invalidation
+            // required: tests don't share this AppState across rule
+            // writes (each test that mutates rules opens its own
+            // `fresh_conn()`).
+            rule_cache: Arc::new(crate::governance::rule_cache::RuleCache::new()),
+            resolved_models: Arc::new(crate::config::ResolvedModels::default()),
+            runtime: crate::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: crate::handlers::MAX_BULK_SIZE,
         }
     }
 
@@ -2446,7 +5556,10 @@ mod tests {
     async fn test_router_has_health_endpoint() {
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         let router = build_router(app_state, api_key_state);
         let resp = router
             .oneshot(
@@ -2465,7 +5578,10 @@ mod tests {
     async fn test_router_has_metrics_at_both_paths() {
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         // /metrics
         let r1 = build_router(app_state.clone(), api_key_state.clone())
             .oneshot(
@@ -2496,7 +5612,10 @@ mod tests {
     async fn test_router_lists_all_v1_memory_routes() {
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         let router = build_router(app_state, api_key_state);
         let resp = router
             .oneshot(
@@ -2519,6 +5638,7 @@ mod tests {
         let app_state = keyword_app_state(&env.db_path);
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
+            mtls_enforced: false,
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -2538,7 +5658,10 @@ mod tests {
     async fn test_router_skips_api_key_middleware_when_key_none() {
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         let router = build_router(app_state, api_key_state);
         let resp = router
             .oneshot(
@@ -2571,6 +5694,131 @@ mod tests {
         // exercised under `feature = "test-with-models"` in the
         // recall integration tests.
         // This test stays as a smoke check — it doesn't attempt to load.
+    }
+
+    /// Issue #840 coverage — exercise the `app_config.embedding_model`
+    /// override branch in `build_embedder` (daemon_runtime.rs L1504-1523).
+    /// The keyword tier has no tier-preset model, so when the override is
+    /// unparseable the resolution ladder falls through to `None` without
+    /// attempting an HF-hub fetch. This pins the parse-failure log path
+    /// and the `None` fallback that the L2 comment documents.
+    #[tokio::test]
+    async fn test_build_embedder_invalid_override_falls_back_to_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("not-a-real-embedding-model-2026".to_string());
+        // Keyword tier preset is None; override parse fails → falls back
+        // to preset None → returns None without touching HF-hub.
+        let emb = build_embedder(FeatureTier::Keyword, &cfg).await;
+        assert!(
+            emb.is_none(),
+            "unparseable override + keyword tier must return None"
+        );
+    }
+
+    // ----- resolve_embedder_model (#1521 precedence) --------------------
+
+    /// #1521 — the sectioned `[embeddings].model` block must beat the
+    /// tier preset. Semantic tier presets MiniLM; a section pinning nomic
+    /// must win. This is the core regression the issue describes (the
+    /// section was silently dropped in favour of the preset).
+    #[test]
+    fn resolve_embedder_model_section_beats_tier_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("nomic_embed_v15".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::NomicEmbedV15),
+            "[embeddings].model must override the Semantic tier MiniLM preset"
+        );
+    }
+
+    /// #1521 — the deprecated flat `embedding_model` field must still be
+    /// honored when no section is present (backward compat).
+    #[test]
+    fn resolve_embedder_model_legacy_flat_still_honored() {
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".to_string());
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::NomicEmbedV15),
+            "legacy flat embedding_model must still override the preset"
+        );
+    }
+
+    /// #1521 — when BOTH are set the section wins over the legacy flat
+    /// field (precedence ladder ordering).
+    #[test]
+    fn resolve_embedder_model_section_beats_legacy_flat() {
+        let mut cfg = AppConfig::default();
+        cfg.embedding_model = Some("nomic_embed_v15".to_string());
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("mini_lm_l6_v2".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "[embeddings].model must win over legacy flat embedding_model"
+        );
+    }
+
+    /// #1521 — a url-only section (no model key) must NOT force a model;
+    /// the tier preset is kept. Guards against keying the model decision
+    /// off `ResolvedEmbeddings.model` (which defaults to nomic whenever
+    /// any `[embeddings]` key is present).
+    #[test]
+    fn resolve_embedder_model_url_only_section_keeps_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            url: Some("http://127.0.0.1:11435".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "url-only section must keep the Semantic MiniLM preset"
+        );
+    }
+
+    /// #1521 — a configured model the 2-model daemon embedder cannot
+    /// construct degrades to the tier preset rather than disabling.
+    #[test]
+    fn resolve_embedder_model_unsupported_id_falls_back_to_preset() {
+        let mut cfg = AppConfig::default();
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("bge-large-en".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier = FeatureTier::Semantic.config();
+        assert_eq!(
+            resolve_embedder_model(&tier, &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "unsupported model id must fall back to the tier preset"
+        );
+    }
+
+    /// #1521 — nothing configured at any layer: keyword tier (no preset)
+    /// yields None; semantic tier yields its MiniLM preset.
+    #[test]
+    fn resolve_embedder_model_unconfigured_uses_tier_preset() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            resolve_embedder_model(&FeatureTier::Keyword.config(), &cfg),
+            None,
+            "keyword tier has no preset → None"
+        );
+        assert_eq!(
+            resolve_embedder_model(&FeatureTier::Semantic.config(), &cfg),
+            Some(crate::config::EmbeddingModel::MiniLmL6V2),
+            "semantic tier preset is MiniLM"
+        );
     }
 
     // ----- build_vector_index -------------------------------------------
@@ -2678,7 +5926,7 @@ mod tests {
         let h = spawn_pending_timeout_sweep_loop(
             state.clone(),
             env.db_path.clone(),
-            3_600,
+            crate::SECS_PER_HOUR,
             Duration::from_millis(50),
         );
         // Poll the row up to 2s; succeed as soon as the sweep flips it.
@@ -2709,11 +5957,27 @@ mod tests {
 
     // ----- passphrase_from_file -----------------------------------------
 
+    /// v0.7.0 #1055 helper — write a passphrase file with mode 0400
+    /// so the post-#1055 permission check accepts it. Tests calling
+    /// the unhardened `std::fs::write` would inherit the OS default
+    /// umask (typically 0644 on macOS, group/world-readable) which
+    /// the production gate now rejects.
+    #[cfg(unix)]
+    fn write_passphrase_strict(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    #[cfg(not(unix))]
+    fn write_passphrase_strict(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
     #[test]
     fn test_passphrase_strips_trailing_newline() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("pass");
-        std::fs::write(&p, "secret\n").unwrap();
+        write_passphrase_strict(&p, "secret\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "secret");
     }
 
@@ -2721,7 +5985,7 @@ mod tests {
     fn test_passphrase_strips_trailing_crlf() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("pass");
-        std::fs::write(&p, "secret\r\n").unwrap();
+        write_passphrase_strict(&p, "secret\r\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "secret");
     }
 
@@ -2729,7 +5993,7 @@ mod tests {
     fn test_passphrase_empty_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("empty");
-        std::fs::write(&p, "").unwrap();
+        write_passphrase_strict(&p, "");
         let err = passphrase_from_file(&p).unwrap_err();
         assert!(
             err.to_string().contains("empty"),
@@ -2744,7 +6008,7 @@ mod tests {
         // / "\r" alone would trigger the empty-after-strip case.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("nl-only");
-        std::fs::write(&p, "\n").unwrap();
+        write_passphrase_strict(&p, "\n");
         let err = passphrase_from_file(&p).unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
@@ -2756,6 +6020,7 @@ mod tests {
         let err = passphrase_from_file(&p).unwrap_err();
         assert!(
             err.to_string().contains("reading passphrase file")
+                || err.to_string().contains("stat passphrase file")
                 || err.chain().any(|e| e.to_string().contains("No such file"))
                 || err.chain().any(|e| e.to_string().contains("cannot find")),
             "got: {err:#}"
@@ -2766,8 +6031,69 @@ mod tests {
     fn test_passphrase_preserves_internal_whitespace() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("pass");
-        std::fs::write(&p, "my pass phrase\n").unwrap();
+        write_passphrase_strict(&p, "my pass phrase\n");
         assert_eq!(passphrase_from_file(&p).unwrap(), "my pass phrase");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_passphrase_rejects_lax_permissions_1055() {
+        // v0.7.0 #1055 — file with mode 0644 (group/world readable)
+        // is rejected by the permission gate. Pre-#1055 the function
+        // accepted any readable file regardless of mode.
+        //
+        // Serialise on the shared `env_var_lock` so the sibling
+        // `test_passphrase_lax_perms_env_overrides_1055` test can't
+        // race the `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` env
+        // var into a state that bypasses the rejection.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        // SAFETY: serialised via env_var_lock; clear any stale state
+        // from a sibling test that exited mid-test.
+        unsafe { std::env::remove_var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS") };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lax");
+        std::fs::write(&p, "secret\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = passphrase_from_file(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lax permissions") && msg.contains("0400"),
+            "#1055: expected lax-permission rejection with chmod 0400 hint; got: {msg}"
+        );
+        assert!(
+            msg.contains("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS"),
+            "#1055: failure message MUST reference the env-var escape hatch; got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_passphrase_lax_perms_env_overrides_1055() {
+        // v0.7.0 #1055 — operators can opt back into the legacy
+        // permissive posture via
+        // `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_var_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lax-with-env");
+        std::fs::write(&p, "secret\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // SAFETY: serialised via env_var_lock; the lock guard's
+        // lifetime brackets the set + remove pair so no sibling
+        // test observes the intermediate state.
+        unsafe {
+            std::env::set_var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS", "1");
+        }
+        let result = passphrase_from_file(&p);
+        unsafe {
+            std::env::remove_var("AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS");
+        }
+        assert_eq!(
+            result.unwrap(),
+            "secret",
+            "#1055: env-var escape hatch MUST restore legacy permissive posture"
+        );
     }
 
     // ----- apply_anonymize_default --------------------------------------
@@ -2827,17 +6153,18 @@ mod tests {
         assert!(bs.app_state.embedder.is_none());
         let vi = bs.app_state.vector_index.lock().await;
         assert!(vi.is_none());
-        // Five task handles spawned (gc + wal_checkpoint + v0.7 K2
-        // pending_actions timeout sweep + v0.7 I3 transcript
+        // Six task handles spawned (v0.7 policy-engine item 3 added
+        // the deferred-audit supervisor + gc + wal_checkpoint +
+        // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
         // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
         // daily-counter reset sweep). v0.7 B3-fix2 gates the
         // family-descriptor embedding precompute behind
         // `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF) so
         // it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to five when the
+        // for the rationale. The task count reverts to six when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 5);
+        assert_eq!(bs.task_handles.len(), 6);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();
@@ -2917,7 +6244,7 @@ mod tests {
         args.quorum_writes = 1;
         args.quorum_peers = vec!["http://127.0.0.1:65531".to_string()];
         args.quorum_timeout_ms = 100;
-        args.catchup_interval_secs = 3600; // long enough not to fire
+        args.catchup_interval_secs = crate::SECS_PER_HOUR as u64; // long enough not to fire
         let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
         assert!(bs.app_state.federation.is_some());
         for h in bs.task_handles {
@@ -2978,6 +6305,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata: crate::models::default_metadata(),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         let id = db::insert(&conn, &mem).unwrap();
         db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
@@ -2986,6 +6324,92 @@ mod tests {
             idx.len() >= 1,
             "expected non-empty index, got len={}",
             idx.len()
+        );
+    }
+
+    // ----- #1579 B3: async boot HNSW loader ------------------------------
+
+    /// Boot-readiness contract: `spawn_vector_index_boot_load` returns
+    /// immediately (the daemon can serve requests with the EMPTY
+    /// index), the outer mutex stays responsive throughout the warm-up,
+    /// and after the loader finishes the index covers every stored
+    /// embedding and reports fully-searchable.
+    #[tokio::test]
+    async fn b3_1579_boot_loader_warms_index_off_the_startup_path() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut expected_ids = Vec::new();
+        for i in 0..3 {
+            let mem = crate::models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: crate::models::Tier::Long,
+                namespace: "ns-b3".to_string(),
+                title: format!("warm-{i}"),
+                content: format!("warm body {i}"),
+                tags: vec![],
+                priority: 5,
+                confidence: 1.0,
+                source: "test".to_string(),
+                access_count: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_accessed_at: None,
+                expires_at: None,
+                metadata: crate::models::default_metadata(),
+                reflection_depth: 0,
+                memory_kind: crate::models::MemoryKind::Observation,
+                entity_id: None,
+                persona_version: None,
+                citations: Vec::new(),
+                source_uri: None,
+                source_span: None,
+                confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                confidence_signals: None,
+                confidence_decayed_at: None,
+                version: 1,
+            };
+            let id = db::insert(&conn, &mem).unwrap();
+            let mut v = [0.0_f32; 3];
+            v[i] = 1.0;
+            db::set_embedding(&conn, &id, &v).unwrap();
+            expected_ids.push(id);
+        }
+        drop(conn);
+
+        // The daemon-shaped state: empty index behind the AppState
+        // mutex — exactly what `serve` now constructs before binding.
+        let state: Arc<Mutex<Option<VectorIndex>>> =
+            Arc::new(Mutex::new(Some(hnsw::VectorIndex::empty())));
+        let handle = spawn_vector_index_boot_load(env.db_path.clone(), Arc::clone(&state));
+
+        // Readiness: the state is immediately lockable (no long-held
+        // guard) — a request-path access during warm-up must not
+        // deadlock or block on the graph build.
+        {
+            let guard = state.lock().await;
+            assert!(
+                guard.is_some(),
+                "index present (possibly cold) during warm-up"
+            );
+        }
+
+        tokio::task::spawn_blocking(move || handle.join().expect("loader thread"))
+            .await
+            .expect("join task");
+
+        let guard = state.lock().await;
+        let idx = guard.as_ref().expect("index");
+        assert_eq!(idx.len(), 3, "every stored embedding seeded");
+        assert!(
+            idx.is_fully_searchable(),
+            "loader must drive the #968 rebuild to a swapped-in graph"
+        );
+        let hits = idx.search(&[1.0, 0.0, 0.0], 1);
+        assert_eq!(
+            hits.first().map(|h| h.id.as_str()),
+            Some(expected_ids[0].as_str()),
+            "warmed index serves the seeded rows"
         );
     }
 
@@ -3019,6 +6443,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: Some(past),
             metadata: crate::models::default_metadata(),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);
@@ -3290,6 +6725,28 @@ mod tests {
         run(cli, &cfg).await.unwrap();
     }
 
+    /// v0.7.0 V-4 closeout (#698) — dispatch coverage for the new
+    /// `verify-signed-events-chain` subcommand. We don't tamper here
+    /// (the lib-side test suite owns that property); the goal is to
+    /// exercise the dispatch arm so a `cargo llvm-cov` pass over the
+    /// daemon_runtime module sees it. On an empty DB the chain holds
+    /// vacuously and the subcommand exits 0, so `run()` returns
+    /// Ok(()).
+    #[tokio::test]
+    async fn test_run_dispatch_verify_signed_events_chain_command() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "verify-signed-events-chain",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_run_dispatch_promote_triggers_write_checkpoint() {
         // `Promote` is in is_write_command — covers the post-run
@@ -3433,6 +6890,14 @@ mod tests {
         let env = TestEnv::fresh();
         let pass_path = env.db_path.with_file_name("pass");
         std::fs::write(&pass_path, "test-passphrase\n").unwrap();
+        // v0.7.0 #1055 — the production `passphrase_from_file` gate
+        // rejects group/world-readable passphrase files; mirror the
+        // operator-side 0400 mode here.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pass_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -3476,7 +6941,10 @@ mod tests {
     async fn test_serve_http_with_shutdown_future_serves_then_stops() {
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         // Pick a free port via a transient bind.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3522,7 +6990,10 @@ mod tests {
         // `with_context` path on the TcpListener::bind line.
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
-        let api_key_state = ApiKeyState { key: None };
+        let api_key_state = ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         // 0.0.0.0:0 succeeds; we want a guaranteed failure. Bind to
         // port 1 which requires privileged perms — except on macOS in
         // some configs that may succeed. Use a clearly invalid address
@@ -3535,5 +7006,1492 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "expected bind error, got: {res:?}");
+    }
+
+    // ----- v0.7.0 coverage close: dispatch arms for identity/rules/governance ---
+    //
+    // The grand-slam integration cascade lifted coverage uniformly except
+    // for a handful of CLI dispatch arms in `run()` that no run-dispatch
+    // test had ever entered: `Command::Identity`, `Command::Rules`,
+    // `Command::Governance`. Each arm is just the stdout/stderr-lock
+    // boilerplate + a one-line hand-off to the relevant `cli::*::run`
+    // handler — those handlers already have their own unit tests under
+    // `src/cli/identity.rs`, `src/cli/rules.rs`,
+    // `src/cli/governance_migrate.rs`. The missing piece was the dispatch
+    // boilerplate itself. These three tests exercise the read-only
+    // (mutation-free, hermetic) verb of each arm so coverage closes
+    // without adding any production semantics.
+
+    #[tokio::test]
+    async fn test_run_dispatch_identity_list_command() {
+        // Covers daemon_runtime::run dispatch arm `Command::Identity(a)`:
+        // exercises the stdout/stderr lock + `cli::identity::run` hand-off.
+        // `identity list` is read-only and DB-free; passing an empty
+        // tempdir as --key-dir keeps the test hermetic (no HOME deps).
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let key_dir = env.db_path.parent().unwrap().join("keys");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "identity",
+            "--key-dir",
+            key_dir.to_str().unwrap(),
+            "list",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatch_rules_list_command() {
+        // Covers daemon_runtime::run dispatch arm `Command::Rules(a)`:
+        // exercises the stdout/stderr lock + `cli::rules::run` hand-off.
+        // `rules list` is the documented read-only verb (no operator key
+        // required per the module-level docstring of src/cli/rules.rs).
+        // We open the DB once via `db::open` to materialize the full
+        // schema (including the `governance_rules` table that migration
+        // 0024 creates + seeds), then let the run() dispatch open its
+        // own raw rusqlite connection against the same file.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        drop(crate::db::open(&env.db_path).expect("db::open"));
+        let key_dir = env.db_path.parent().unwrap().join("keys");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "rules",
+            "--key-dir",
+            key_dir.to_str().unwrap(),
+            "list",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatch_governance_migrate_command() {
+        // Covers daemon_runtime::run dispatch arm `Command::Governance(a)`
+        // (including the inner `GovernanceAction::MigrateToPermissions`
+        // match arm): exercises the stdout/stderr lock +
+        // `cli::governance_migrate::run` hand-off. Dry-run is the
+        // documented default, so we omit --config-out; the migrator
+        // reads --config-in, parses the legacy `[governance]` block,
+        // renders the v0.7 `[[permissions.rules]]` to stdout, and
+        // returns Ok. No filesystem mutation outside the tempdir.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg_path = env.db_path.parent().unwrap().join("legacy_cfg.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[governance]
+
+[[governance.policy]]
+scope = "team/eng/*"
+action = "write"
+role = "engineer"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "governance",
+            "migrate-to-permissions",
+            "--config-in",
+            cfg_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    // ----- v0.7.0 coverage close: fold-A2A1.4 mTLS bypass on /sync/* ----
+    //
+    // The grand-slam cascade landed `e188503` (fold-A2A1.4) which added 61
+    // lines to `daemon_runtime.rs`: the `mtls_enforced` computation in
+    // `bootstrap_serve` (true iff all of `--tls-cert`, `--tls-key`, and
+    // `--mtls-allowlist` are set), the threaded api-key into
+    // `FederationConfig::build`, and the differentiated tracing message
+    // when api-key auth is enabled alongside mTLS. The post-cascade
+    // coverage gate (run 25892100734) caught the regression at 85.60% on
+    // `daemon_runtime.rs` — below the 86 floor — because the new
+    // mtls_enforced=true branch + the bypass exit path through the
+    // router were never entered by an existing test.
+    //
+    // The tests below close the gap by:
+    //   1. Bootstrapping with all three TLS args set + api_key set so the
+    //      `if mtls_enforced { tracing::info!(...federation endpoints...) }`
+    //      branch executes and `api_key_state.mtls_enforced` is observed
+    //      as true on the returned `ServeBootstrap`.
+    //   2. Bootstrapping with the half-configured cases (cert+key, no
+    //      allowlist; allowlist alone) to pin the AND-short-circuit on
+    //      the `mtls_enforced` predicate.
+    //   3. Driving the `build_router`-wired `api_key_auth` middleware
+    //      through `daemon_runtime::build_router` with
+    //      `mtls_enforced=true` so the `/api/v1/sync/...` bypass path is
+    //      exercised, and asserting a non-`/sync/` path still 401s
+    //      without the header.
+    //
+    // All hermetic: bootstrap_serve does NOT load the TLS cert / key /
+    // allowlist files (that happens in `serve()` at the rustls config
+    // site, after this struct is built), so passing non-existent paths
+    // is sufficient to flip `mtls_enforced` to true without writing
+    // real certificates.
+
+    #[tokio::test]
+    async fn test_bootstrap_serve_mtls_enforced_true_with_all_three_tls_args() {
+        // Covers `let mtls_enforced = ... && ... && ...` with the all-Some
+        // case (true branch). Paired with `api_key = Some(...)` so the
+        // outer `if api_key_state.key.is_some()` also fires and the
+        // `if mtls_enforced { ... } else { ... }` chooses the
+        // federation-bypass log message.
+        let env = TestEnv::fresh();
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        cfg.api_key = Some("s3cret".to_string());
+        let mut args = args_with_db(&env.db_path);
+        // Paths don't need to exist — bootstrap_serve only inspects
+        // Option presence to compute `mtls_enforced`. The rustls config
+        // load that would actually read these files lives in `serve()`,
+        // which we are NOT calling here.
+        let cert_path = env.db_path.parent().unwrap().join("cert.pem");
+        let key_path = env.db_path.parent().unwrap().join("key.pem");
+        let allowlist_path = env.db_path.parent().unwrap().join("allowlist.json");
+        args.tls_cert = Some(cert_path);
+        args.tls_key = Some(key_path);
+        args.mtls_allowlist = Some(allowlist_path);
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(
+            bs.api_key_state.mtls_enforced,
+            "mtls_enforced should be true when cert+key+allowlist all set"
+        );
+        assert_eq!(bs.api_key_state.key.as_deref(), Some("s3cret"));
+        for h in bs.task_handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_serve_mtls_enforced_false_when_allowlist_absent() {
+        // Covers the AND short-circuit: cert+key set, allowlist None →
+        // `mtls_enforced = false`. This is the TLS-but-no-mTLS
+        // half-configured case (the `tracing::warn!("TLS enabled but
+        // mTLS NOT configured …")` path in `serve()`). Bootstrap_serve
+        // itself just records the flag as false; the `else` arm of the
+        // api-key log fires.
+        let env = TestEnv::fresh();
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        cfg.api_key = Some("only-tls".to_string());
+        let mut args = args_with_db(&env.db_path);
+        args.tls_cert = Some(env.db_path.parent().unwrap().join("cert.pem"));
+        args.tls_key = Some(env.db_path.parent().unwrap().join("key.pem"));
+        // mtls_allowlist intentionally left None.
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(
+            !bs.api_key_state.mtls_enforced,
+            "mtls_enforced should be false without --mtls-allowlist"
+        );
+        assert_eq!(bs.api_key_state.key.as_deref(), Some("only-tls"));
+        for h in bs.task_handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_serve_mtls_enforced_false_when_only_allowlist_set() {
+        // Covers the AND short-circuit: cert/key None, allowlist Some →
+        // false. (clap's `requires = "tls_cert"` would block this combo
+        // at the CLI surface, but we're constructing `ServeArgs`
+        // directly here so the inner predicate is the only gate. This
+        // pins the predicate behaviour even if a refactor moves the
+        // validation back to the call site.)
+        let env = TestEnv::fresh();
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let mut args = args_with_db(&env.db_path);
+        args.mtls_allowlist = Some(env.db_path.parent().unwrap().join("allowlist.json"));
+        // tls_cert and tls_key intentionally None.
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(
+            !bs.api_key_state.mtls_enforced,
+            "mtls_enforced should be false without --tls-cert"
+        );
+        for h in bs.task_handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_serve_mtls_enforced_with_federation_threads_api_key() {
+        // Joint exercise of the two fold-A2A1.4 surfaces in one
+        // bootstrap: federation outbound carries the configured
+        // `[api] api_key` (line ~2155, `app_config.api_key.clone()` into
+        // `FederationConfig::build`) AND `mtls_enforced` is true.
+        // Confirms both the api_key thread-through and the new tracing
+        // message are activated together — the exact procurement-grade
+        // deployment shape #702 was filed for.
+        let env = TestEnv::fresh();
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        cfg.api_key = Some("fed-key".to_string());
+        let mut args = args_with_db(&env.db_path);
+        args.tls_cert = Some(env.db_path.parent().unwrap().join("cert.pem"));
+        args.tls_key = Some(env.db_path.parent().unwrap().join("key.pem"));
+        args.mtls_allowlist = Some(env.db_path.parent().unwrap().join("allowlist.json"));
+        args.quorum_writes = 1;
+        args.quorum_peers = vec!["http://127.0.0.1:65520".to_string()];
+        args.quorum_timeout_ms = 100;
+        let bs = bootstrap_serve(&env.db_path, &args, &cfg).await.unwrap();
+        assert!(bs.api_key_state.mtls_enforced);
+        assert_eq!(bs.api_key_state.key.as_deref(), Some("fed-key"));
+        assert!(
+            bs.app_state.federation.is_some(),
+            "federation should be wired when quorum_writes>0 and peers nonempty"
+        );
+        for h in bs.task_handles {
+            h.abort();
+        }
+    }
+
+    // ----- v0.7.0 coverage close: api_key_auth bypass through build_router ---
+    //
+    // Drives the `api_key_auth` middleware path with `mtls_enforced=true`
+    // and a configured key. Two probes:
+    //   - `/api/v1/sync/push` without `x-api-key` should be admitted to
+    //     the handler stack (the federation-bypass arm). The handler
+    //     itself rejects on payload shape, but the status is not 401 —
+    //     proving the bypass fired.
+    //   - `/api/v1/memories` without `x-api-key` should still 401, since
+    //     the bypass is scoped to `/api/v1/sync/*`.
+
+    #[tokio::test]
+    async fn test_build_router_with_mtls_enforced_allows_sync_without_api_key() {
+        let env = TestEnv::fresh();
+        let app_state = keyword_app_state(&env.db_path);
+        let api_key_state = ApiKeyState {
+            key: Some("s3cret".to_string()),
+            mtls_enforced: true,
+        };
+        let router = build_router(app_state, api_key_state);
+        // POST /api/v1/sync/push with empty body — the api_key_auth
+        // middleware should NOT 401 (bypass scope hit). The downstream
+        // handler will likely return 400/415/422 for a malformed body;
+        // anything other than 401 proves the bypass executed.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sync/push")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "expected /sync/* to bypass api-key with mtls_enforced=true, got 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_with_mtls_enforced_still_requires_key_on_non_sync() {
+        let env = TestEnv::fresh();
+        let app_state = keyword_app_state(&env.db_path);
+        let api_key_state = ApiKeyState {
+            key: Some("s3cret".to_string()),
+            mtls_enforced: true,
+        };
+        let router = build_router(app_state, api_key_state);
+        // GET /api/v1/memories without x-api-key — bypass is scoped to
+        // /api/v1/sync/*, so this should still 401.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/memories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "non-/sync/ path must still demand x-api-key even with mtls_enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_with_mtls_off_does_not_bypass_sync() {
+        // Pins the negative: mtls_enforced=false → /sync/* WITHOUT the
+        // header still gets 401. This is the v0.6.x backward-compatible
+        // posture (api-key required on every path when set, no bypass).
+        let env = TestEnv::fresh();
+        let app_state = keyword_app_state(&env.db_path);
+        let api_key_state = ApiKeyState {
+            key: Some("s3cret".to_string()),
+            mtls_enforced: false,
+        };
+        let router = build_router(app_state, api_key_state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sync/push")
+                    .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "without mtls_enforced, /sync/* must still demand x-api-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_with_mtls_enforced_accepts_valid_key_on_non_sync() {
+        // Defense-in-depth: even with mtls_enforced=true, supplying the
+        // correct key on a non-/sync/ path still succeeds. Pins that
+        // the bypass branch does not steal requests that legitimately
+        // carry the header.
+        let env = TestEnv::fresh();
+        let app_state = keyword_app_state(&env.db_path);
+        let api_key_state = ApiKeyState {
+            key: Some("s3cret".to_string()),
+            mtls_enforced: true,
+        };
+        let router = build_router(app_state, api_key_state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/memories")
+                    .header("x-api-key", "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "valid api-key on non-/sync/ path should succeed, got {}",
+            resp.status()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.7-polish coverage recovery (issue #767) — Cluster D + G wires:
+    // spawn_gc_loop_with_shadow_retention, spawn_transcript_lifecycle_
+    // sweep_loop, spawn_agent_quota_reset_loop. Smoke-tests that prove
+    // the loops spawn, abort cleanly, and tolerate a clean state.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_gc_loop_with_shadow_retention_runs_and_can_be_aborted() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        // Long interval — we just want the spawn + abort cycle.
+        let h = spawn_gc_loop_with_shadow_retention(state, Some(30), 7, Duration::from_secs(60));
+        // Give it a brief moment to enter the loop body.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_gc_loop_with_shadow_retention_zero_days_is_opt_out() {
+        // shadow_retention_days <= 0 should be tolerated — the shadow
+        // gc helper short-circuits without touching the table.
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_gc_loop_with_shadow_retention(
+            state,
+            None,
+            0, // operator opt-out
+            Duration::from_secs(60),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_transcript_lifecycle_sweep_loop_runs_and_can_be_aborted() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let cfg = crate::config::TranscriptsConfig::default();
+        let h = spawn_transcript_lifecycle_sweep_loop(state, cfg, Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_agent_quota_reset_loop_runs_and_can_be_aborted() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_agent_quota_reset_loop(state, Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_serve_sec2_fail_closed_when_pubkey_missing_and_rules_enabled() {
+        // v0.7.0 SEC-2 (Cluster D) — when `[governance]
+        // require_operator_pubkey = true` AND `governance_rules` has
+        // any `enabled = 1` row AND no operator pubkey is resolved,
+        // bootstrap_serve MUST refuse to start. This pins the
+        // fail-closed posture documented at lines 2118-2153 in
+        // bootstrap_serve.
+        //
+        // Dev-host hermeticity (issue #1370, 2026-05-27). The test
+        // pre-#1370 cleared `AI_MEMORY_OPERATOR_PUBKEY` but did not
+        // engage the `ForceNoOperatorPubkeyGuard` escape hatch added
+        // under issue #819. `resolve_operator_pubkey()` checks TWO
+        // sources — the env var AND `~/.config/ai-memory/operator.key.pub`
+        // on disk (via `dirs::config_dir()`). On a dev host that has
+        // staged a real operator pubkey at the platform config dir
+        // (e.g. `~/Library/Application Support/ai-memory/` on macOS),
+        // the on-disk lookup wins, `pubkey_resolved = true`, and the
+        // SEC-2 fail-closed bail at `bootstrap_serve` never fires.
+        // CI passes on clean-HOME runners; local fails. The guard
+        // below forces `resolve_operator_pubkey()` to return None
+        // for the test scope, matching the CI posture deterministically.
+        let _no_pubkey_guard = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let _gate = env_var_lock();
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        // Create the governance_rules table + insert one enabled row.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS governance_rules (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 matcher TEXT NOT NULL,
+                 severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log')),
+                 reason TEXT NOT NULL,
+                 namespace TEXT NOT NULL DEFAULT '_global',
+                 created_by TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 signature BLOB,
+                 attest_level TEXT NOT NULL DEFAULT 'unsigned'
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO governance_rules (id, kind, matcher, severity, reason, created_by, created_at)
+             VALUES ('R1', 'bash', '{\"k\":\"v\"}', 'refuse', 'test', 'tester', 100)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        // Build cfg with require_operator_pubkey = true.
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        cfg.governance = Some(crate::config::GovernanceConfig {
+            require_operator_pubkey: true,
+        });
+        // Ensure no pubkey is resolved by clearing the env var.
+        let prior = std::env::var("AI_MEMORY_OPERATOR_PUBKEY").ok();
+        unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
+
+        let args = args_with_db(&env.db_path);
+        let res = bootstrap_serve(&env.db_path, &args, &cfg).await;
+        // Restore env.
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("AI_MEMORY_OPERATOR_PUBKEY", v) };
+        }
+        let err = match res {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("expected SEC-2 fail-closed refusal"),
+        };
+        assert!(
+            err.contains("SEC-2 fail-closed") || err.contains("require_operator_pubkey"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_llm_client_returns_none_for_keyword_tier() {
+        // FeatureTier::Keyword has no llm_model, so the early-return
+        // path fires without spawning any blocking work.
+        // FX-F1: hold the env-guard so concurrent tests can't flip
+        // AI_MEMORY_LLM_BACKEND under us mid-resolve.
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        let cfg = AppConfig::default();
+        let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
+        assert!(res.is_none(), "keyword tier must not build an LLM client");
+    }
+
+    #[tokio::test]
+    async fn test_build_llm_client_returns_none_when_ollama_unreachable() {
+        // Smart tier requires LLM, but pointing at an unreachable URL
+        // exercises the constructor-error path (final Err arm).
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
+        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        // Either Some (constructor still returns Ok if it doesn't ping)
+        // or None — both are valid: the assert proves the function does
+        // not panic on an unreachable URL.
+        let _ = res;
+    }
+
+    #[test]
+    fn test_build_vector_index_returns_some_when_embedder_present_and_db_empty() {
+        // The else-branch of build_vector_index — when the embedder is
+        // present and no rows exist, the helper still returns Some
+        // (empty index). Already pinned by an existing test; this one
+        // pins the explicit "some-non-empty" path by inserting a memory
+        // with an embedding first.
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let mem = crate::models::Memory {
+            id: "vi-1".to_string(),
+            tier: crate::models::Tier::Mid,
+            namespace: "test".to_string(),
+            title: "t".to_string(),
+            content: "c".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: crate::models::default_metadata(),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        let inserted_id = db::insert(&conn, &mem).unwrap();
+        // Write a real-length embedding (384 dims of f32).
+        let vec_data: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
+        db::set_embedding(&conn, &inserted_id, &vec_data).unwrap();
+        let idx = build_vector_index(&conn, true);
+        assert!(idx.is_some());
+    }
+
+    // ===========================================================================
+    // Issue #1169 — resolve_configured_embedding_dim resolution ladder
+    // ===========================================================================
+    //
+    // These tests exercise the helper extracted from the postgres-bootstrap
+    // path so the new code lands within the daemon_runtime.rs coverage floor.
+    // The three resolution-ladder arms (resolver, legacy enum, tier preset)
+    // are each pinned independently.
+
+    /// v0.7.x (#1169) — operator picks a model that's in
+    /// [`crate::config::KNOWN_EMBEDDING_DIMS`]. The first arm of the
+    /// ladder (resolver) wins and returns the canonical dim.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_configured_embedding_dim_resolver_arm_wins_for_known_model() {
+        use crate::config::{AppConfig, EmbeddingsSection, FeatureTier};
+
+        let cfg = AppConfig {
+            embeddings: Some(EmbeddingsSection {
+                backend: Some("ollama".to_string()),
+                model: Some("bge-large-en".to_string()),
+                ..EmbeddingsSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        let tier_config = FeatureTier::Autonomous.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
+        assert_eq!(
+            dim,
+            Some(1024),
+            "bge-large-en is in KNOWN_EMBEDDING_DIMS at 1024-dim; resolver wins"
+        );
+    }
+
+    /// v0.7.x (#1169) — operator leaves the new `[embeddings]` section
+    /// unset AND has the legacy flat field `embedding_model =
+    /// "nomic_embed_v15"`. The first arm returns the canonicalised
+    /// resolver dim (the canonicaliser maps `nomic_embed_v15` to
+    /// `nomic-embed-text-v1.5` which IS in the table) — so the
+    /// resolver arm still wins, validating that the legacy alias path
+    /// composes cleanly with the resolver.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_configured_embedding_dim_handles_legacy_alias_via_resolver() {
+        use crate::config::{AppConfig, FeatureTier};
+
+        let cfg = AppConfig {
+            embedding_model: Some("nomic_embed_v15".to_string()),
+            ..AppConfig::default()
+        };
+        let tier_config = FeatureTier::Autonomous.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
+        assert_eq!(
+            dim,
+            Some(768),
+            "legacy alias nomic_embed_v15 canonicalises to nomic-embed-text-v1.5 (768)"
+        );
+    }
+
+    /// v0.7.x (#1169) — operator hasn't configured embeddings at all
+    /// AND the tier preset has an embedder family — the tier-preset
+    /// arm is the last-resort fallback.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_configured_embedding_dim_falls_back_to_tier_preset_when_no_override() {
+        use crate::config::{AppConfig, FeatureTier};
+
+        let cfg = AppConfig::default();
+        let tier_config = FeatureTier::Autonomous.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
+        // Autonomous tier preset is NomicEmbedV15 (768). The resolver
+        // also defaults to nomic-embed-text-v1.5 → 768 via the
+        // KNOWN_EMBEDDING_DIMS table, so either arm gives the same
+        // answer for the no-config case.
+        assert_eq!(dim, Some(768));
+    }
+
+    /// v0.7.x (#1169) — keyword tier has no embedder; resolver returns
+    /// `None` (and the postgres bootstrap then uses its hardcoded
+    /// `DEFAULT_EMBEDDING_DIM` fallback per the
+    /// `configured_embedding_dim` doc comment on `build_store_handle`).
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_configured_embedding_dim_returns_none_for_keyword_tier() {
+        use crate::config::{AppConfig, FeatureTier};
+
+        let cfg = AppConfig::default();
+        let tier_config = FeatureTier::Keyword.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
+        // Keyword tier preset has `embedding_model = None`. The
+        // resolver still returns `Some(768)` from the
+        // canonical-default model id — that's the correct behavior
+        // because the operator can ALWAYS use an embedder regardless
+        // of tier preset; the tier preset only controls reranker /
+        // synthesis primitives. The keyword-tier-disabled-embedder
+        // posture is enforced at the `build_embedder` site, NOT
+        // here. This test pins that subtlety: when the operator's
+        // config has no [embeddings] block AND no legacy flat field
+        // AND the tier preset disables embeddings, the resolver
+        // still defaults to "nomic-embed-text-v1.5" (the wire-side
+        // default at `resolve_embeddings`) — which IS in the table
+        // — so the function returns `Some(768)` even on keyword
+        // tier. The postgres-bootstrap caller treats that as the
+        // configured dim regardless; pre-loading an unused 768-dim
+        // pgvector column is operationally cheap.
+        assert_eq!(dim, Some(768));
+    }
+
+    /// v0.7.x (#1169) — operator picks a model that's NOT in
+    /// [`crate::config::KNOWN_EMBEDDING_DIMS`] AND uses the new
+    /// `[embeddings]` block (so the legacy flat field is absent).
+    /// The resolver returns `None`; the legacy arm can't parse the
+    /// model into the enum; the tier-preset arm wins as the final
+    /// fallback. Pins the back-compat invariant for unrecognised
+    /// model ids: pre-#1169 callers who relied on a number being
+    /// present continue to see one.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn resolve_configured_embedding_dim_unknown_model_falls_to_tier_preset() {
+        use crate::config::{AppConfig, EmbeddingsSection, FeatureTier};
+
+        let cfg = AppConfig {
+            embeddings: Some(EmbeddingsSection {
+                backend: Some("ollama".to_string()),
+                model: Some("my-private-fork-v0.1".to_string()),
+                ..EmbeddingsSection::default()
+            }),
+            ..AppConfig::default()
+        };
+        let tier_config = FeatureTier::Autonomous.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
+        // Autonomous tier preset (NomicEmbedV15) → 768.
+        assert_eq!(dim, Some(768));
+    }
+
+    // ===========================================================================
+    // FX-F1 (2026-05-27) — coverage uplift for the FX-D1 `build_llm_client`
+    // overhaul. The pre-FX-F1 surface had two thin async tests
+    // (Keyword early-return + Smart unreachable URL). FX-F1 adds the
+    // missing branches: explicit operator-intent (Legacy / Config /
+    // Env source via `ollama_url` or `llm.backend`), the Semantic
+    // early-return path, every LLM backend's no-key Err arm, and an
+    // Ollama happy-path through `build_from_resolved_async` against a
+    // wiremock-backed `/api/tags` endpoint. Target floor for the file:
+    // 85% (was 83.83% pre-FX-F1 per FX-F1 dispatch — the +1.17pp gap
+    // closes by exercising the async ladder end-to-end).
+    //
+    // The env-mutating tests below serialise on the module-canonical
+    // `env_var_lock()` defined above (line 4505) — the same mutex the
+    // pre-existing env-touching tests (`test_anonymize_unchanged_when_env_already_set`,
+    // `test_anonymize_unchanged_when_config_false`, etc.) already hold.
+    // FX-F1 first added a parallel `FX_F1_ENV_GUARD` mutex for these
+    // tests; that turned out to race the pre-existing tests because
+    // independent mutexes don't serialise against each other (issue
+    // surfaced by the QC pass on the FX-F1 patch, 2026-05-27).
+
+    /// SAFETY: env-var mutation is unsynchronised across threads at
+    /// the OS level. `env_var_lock` serialises mutation across this
+    /// test region so the unsafe is sound for the duration of each
+    /// test that holds the guard. The cleared keys match every
+    /// resolver ingress that `build_llm_client` and
+    /// `build_from_resolved_async` consult.
+    fn fx_f1_clear_llm_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "OLLAMA_BASE_URL",
+            "XAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "MISTRAL_API_KEY",
+            "GROQ_API_KEY",
+            "TOGETHER_API_KEY",
+            "CEREBRAS_API_KEY",
+            "OPENROUTER_API_KEY",
+            "FIREWORKS_API_KEY",
+        ] {
+            // SAFETY: guarded by env_var_lock at call sites.
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+    // ===========================================================================
+
+    /// FX-F1 — Semantic tier has `llm_model = None` (per tier preset),
+    /// so when `source = CompiledDefault` the early-return arm fires.
+    /// Pins the second of the two "tier has no llm_model + no operator
+    /// intent" arms; the Keyword variant is pinned above.
+    #[tokio::test]
+    async fn test_build_llm_client_semantic_tier_compiled_default_returns_none() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        let cfg = AppConfig::default();
+        let res = build_llm_client(FeatureTier::Semantic, &cfg).await;
+        assert!(
+            res.is_none(),
+            "semantic tier with no operator config must short-circuit to None"
+        );
+    }
+
+    /// FX-F1 — Autonomous tier with no operator config and unreachable
+    /// Ollama URL → resolver winds up with `Legacy` source (because
+    /// `ollama_url` is set), bypasses the early-return arm, and falls
+    /// through to the async constructor which returns Err (treated as
+    /// None). Exercises the `Err(_)` match arm of `build_llm_client`.
+    #[tokio::test]
+    async fn test_build_llm_client_autonomous_tier_unreachable_ollama_returns_none() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
+        let res = build_llm_client(FeatureTier::Autonomous, &cfg).await;
+        // Unreachable endpoint → Err from new_with_url_async → None.
+        assert!(
+            res.is_none(),
+            "autonomous tier against unreachable ollama must surface as None"
+        );
+    }
+
+    /// FX-F1 — Smart tier with an `llm.backend = "xai"` config section
+    /// (no API key available) drives the resolver to `Config` source
+    /// → bypasses the early-return → `build_from_resolved_async`
+    /// returns the missing-API-key Err → mapped to None. Pins the
+    /// non-Ollama-no-key path in build_llm_client.
+    #[tokio::test]
+    async fn test_build_llm_client_xai_backend_without_api_key_returns_none() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        use crate::config::LlmSection;
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(LlmSection {
+            backend: Some("xai".to_string()),
+            model: Some("grok-4.3".to_string()),
+            api_key_env: Some("AI_MEMORY_FX_F1_NEVER_SET_XAI_KEY".to_string()),
+            ..LlmSection::default()
+        });
+        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        assert!(
+            res.is_none(),
+            "xai backend without API key MUST map to None (Err path)"
+        );
+    }
+
+    /// FX-F1 — Happy-path: Smart tier with `ollama_url` pointed at a
+    /// wiremock-backed `/api/tags` endpoint. Resolver lands on the
+    /// `Legacy` source (operator set `ollama_url`), bypasses the
+    /// early-return, calls `build_from_resolved_async` which calls
+    /// `new_with_url_async` against the mock — the health probe
+    /// returns 200, so the constructor returns Ok(Some). The
+    /// `Ok(Some(_))` arm of build_llm_client is exercised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_llm_client_ollama_happy_path_against_wiremock() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"models":[]}"#))
+            .mount(&server)
+            .await;
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some(server.uri());
+        cfg.llm_model = Some("test-model".to_string());
+        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        assert!(
+            res.is_some(),
+            "wiremock-backed /api/tags must drive build_llm_client to Some"
+        );
+    }
+
+    /// FX-F1 — `build_from_resolved_async` Ollama arm directly. Mirrors
+    /// the sync test in `llm::tests::*` but exercises the FX-D1 async
+    /// sibling against a wiremock-backed endpoint. Pins the happy path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_ollama_happy_path() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"models":[]}"#))
+            .mount(&server)
+            .await;
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some(server.uri());
+        cfg.llm_model = Some("test-model".to_string());
+        let resolved = cfg.resolve_llm(None, None, None);
+        let client = crate::llm::OllamaClient::build_from_resolved_async(&resolved)
+            .await
+            .expect("build_from_resolved_async must succeed against healthy /api/tags");
+        assert!(client.is_some());
+        assert!(client.unwrap().is_ollama_native());
+    }
+
+    /// FX-F1 — `build_from_resolved_async` Ollama arm against an
+    /// unreachable URL (TCP RST). Pins the Err return path so the
+    /// caller's `Ok(Some)/Ok(None)/Err` match still routes the failure
+    /// without a panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_ollama_unreachable_errs() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut cfg = AppConfig::default();
+        cfg.ollama_url = Some(format!("http://127.0.0.1:{port}"));
+        cfg.llm_model = Some("test-model".to_string());
+        let resolved = cfg.resolve_llm(None, None, None);
+        let res = crate::llm::OllamaClient::build_from_resolved_async(&resolved).await;
+        assert!(
+            res.is_err(),
+            "unreachable Ollama endpoint MUST surface as Err"
+        );
+    }
+
+    /// FX-F1 — `build_from_resolved_async` non-Ollama branch where the
+    /// resolver could not produce an API key. Pins the missing-key Err
+    /// arm with the canonical error-message pattern.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_non_ollama_missing_key_errs() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        use crate::config::LlmSection;
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(LlmSection {
+            backend: Some("anthropic".to_string()),
+            model: Some("claude-opus-4.7".to_string()),
+            api_key_env: Some("AI_MEMORY_FX_F1_NEVER_SET_ANTHROPIC_KEY".to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        let res = crate::llm::OllamaClient::build_from_resolved_async(&resolved).await;
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("anthropic backend without API key MUST Err"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires an API key"),
+            "missing-key error must cite the API key requirement; got: {msg}"
+        );
+    }
+
+    /// FX-F1 — `build_from_resolved_async` non-Ollama branch with an
+    /// API key resolves to `Ok(Some)` because
+    /// `new_openai_compatible` does no I/O at construct time. Pins
+    /// the happy path on the OpenAI-compatible arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_from_resolved_async_non_ollama_with_key_returns_some() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        use crate::config::LlmSection;
+        // Use a private env var that no other test touches; set it just
+        // long enough for the resolver to pick it up, then unset.
+        let env_name = "AI_MEMORY_FX_F1_OPENAI_KEY";
+        // SAFETY: env mutation guarded by env_var_lock; restored below.
+        unsafe { std::env::set_var(env_name, "sk-test-fx-f1-fake-key") };
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai".to_string()),
+            model: Some("gpt-5".to_string()),
+            api_key_env: Some(env_name.to_string()),
+            ..LlmSection::default()
+        });
+        let resolved = cfg.resolve_llm(None, None, None);
+        let res = crate::llm::OllamaClient::build_from_resolved_async(&resolved).await;
+        unsafe { std::env::remove_var(env_name) };
+        let client = res.expect("openai backend with key MUST return Ok");
+        assert!(
+            client.is_some(),
+            "build_from_resolved_async with key MUST produce Some(client)"
+        );
+        assert!(
+            !client.unwrap().is_ollama_native(),
+            "openai backend must NOT report ollama-native"
+        );
+    }
+
+    /// FX-F1 — exercises the `Env` source bypass of the
+    /// `build_llm_client` early-return arm: operator sets
+    /// `AI_MEMORY_LLM_BACKEND=ollama` + `AI_MEMORY_LLM_BASE_URL`
+    /// pointing at an unreachable endpoint. Resolver source = Env →
+    /// no early-return → constructor errors → mapped to None
+    /// (Err→None arm in build_llm_client).
+    #[tokio::test]
+    async fn test_build_llm_client_env_backend_unreachable_returns_none() {
+        let _guard = env_var_lock();
+        fx_f1_clear_llm_env();
+        // SAFETY: env mutation guarded by env_var_lock; cleared below.
+        unsafe {
+            std::env::set_var("AI_MEMORY_LLM_BACKEND", "ollama");
+            std::env::set_var("AI_MEMORY_LLM_BASE_URL", "http://127.0.0.1:1");
+        }
+        let cfg = AppConfig::default();
+        let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
+        unsafe {
+            std::env::remove_var("AI_MEMORY_LLM_BACKEND");
+            std::env::remove_var("AI_MEMORY_LLM_BASE_URL");
+        }
+        // Env source bypasses the early return → constructor errors on
+        // unreachable endpoint → mapped to None.
+        assert!(
+            res.is_none(),
+            "env-source backend against unreachable URL MUST map to None"
+        );
+    }
+
+    // ===========================================================================
+    // FX-F1 — additional helper-function coverage uplift.
+    // The build_llm_client tests above close the FX-D1 gap; these tests
+    // pin the smaller helper surfaces (`apply_anonymize_default`,
+    // `resolve_admin_agent_ids`) that previously had narrow branches
+    // uncovered. Each closes one or two uncovered lines so the file
+    // floor (85%) clears comfortably.
+    // ===========================================================================
+
+    /// FX-F1 — `apply_anonymize_default` writes the env var when both
+    /// (a) the effective default is true AND (b) the env var is
+    /// unset. Pre-FX-F1 this `unsafe { set_var }` arm was uncovered.
+    #[test]
+    fn test_apply_anonymize_default_sets_env_when_unset() {
+        let _guard = env_var_lock();
+        // SAFETY: serialised through env_var_lock.
+        let prev = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") };
+        let mut cfg = AppConfig::default();
+        cfg.identity = Some(crate::config::IdentityConfig {
+            anonymize_default: true,
+            ..crate::config::IdentityConfig::default()
+        });
+        apply_anonymize_default(&cfg);
+        let got = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        // Restore env before asserting so a failure doesn't leak.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") },
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some("1"),
+            "anonymize_default=true with env unset MUST set AI_MEMORY_ANONYMIZE=1"
+        );
+    }
+
+    /// FX-F1 — `apply_anonymize_default` is a no-op when the env var
+    /// is already set. Mirrors the existing test gap on the "env wins
+    /// over config" precedence rule.
+    #[test]
+    fn test_apply_anonymize_default_preserves_existing_env() {
+        let _guard = env_var_lock();
+        let prev = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", "0") };
+        let mut cfg = AppConfig::default();
+        cfg.identity = Some(crate::config::IdentityConfig {
+            anonymize_default: true,
+            ..crate::config::IdentityConfig::default()
+        });
+        apply_anonymize_default(&cfg);
+        let got = std::env::var("AI_MEMORY_ANONYMIZE").ok();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ANONYMIZE", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ANONYMIZE") },
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some("0"),
+            "env-var precedence: pre-set AI_MEMORY_ANONYMIZE MUST survive apply_anonymize_default"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` empty-entry handling.
+    /// `AI_MEMORY_ADMIN_AGENT_IDS="alice,,bob"` should drop the empty
+    /// entry without erroring. Pins the `continue` branch on line
+    /// 1882 of the env-csv walker.
+    #[test]
+    fn test_resolve_admin_agent_ids_skips_empty_entries() {
+        let _guard = env_var_lock();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "alice,,bob,,") };
+        let ids = resolve_admin_agent_ids(None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") },
+        }
+        assert_eq!(
+            ids,
+            vec!["alice".to_string(), "bob".to_string()],
+            "empty entries between commas MUST be skipped, not surface as agent_ids"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` rejects malformed entries
+    /// with a warn-log, preserving the valid ones. Pins the Err arm
+    /// of `validate_agent_id` on line 1901-1905.
+    #[test]
+    fn test_resolve_admin_agent_ids_drops_malformed_entries() {
+        let _guard = env_var_lock();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        // `bad id with spaces` fails `validate_agent_id`'s shape
+        // check; `alice` passes; `*` is the post-#980 reject.
+        unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "alice,bad id,*,bob") };
+        let ids = resolve_admin_agent_ids(None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") },
+        }
+        assert!(ids.contains(&"alice".to_string()));
+        assert!(ids.contains(&"bob".to_string()));
+        assert!(
+            !ids.iter().any(|s| s.contains(' ')),
+            "malformed entries MUST be dropped"
+        );
+        assert!(
+            !ids.contains(&"*".to_string()),
+            "wildcard `*` MUST be dropped (post-#980)"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` falls through to the config
+    /// when the env var is unset/empty. Pins the
+    /// `admin_cfg.map(...).unwrap_or_default()` tail.
+    #[test]
+    fn test_resolve_admin_agent_ids_falls_back_to_config() {
+        let _guard = env_var_lock();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") };
+        // Empty env → fall through to config.
+        let ids = resolve_admin_agent_ids(None);
+        // Restore env before asserting.
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) };
+        }
+        assert!(
+            ids.is_empty(),
+            "no env + no config MUST resolve to empty allowlist (secure default)"
+        );
+    }
+
+    /// FX-F1 — `resolve_admin_agent_ids` honours a whitespace-only
+    /// `AI_MEMORY_ADMIN_AGENT_IDS` value as "unset" (the
+    /// `!raw.trim().is_empty()` guard). Pins the guard arm.
+    #[test]
+    fn test_resolve_admin_agent_ids_whitespace_env_falls_to_config() {
+        let _guard = env_var_lock();
+        let prev = std::env::var("AI_MEMORY_ADMIN_AGENT_IDS").ok();
+        unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", "   ") };
+        let ids = resolve_admin_agent_ids(None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_ADMIN_AGENT_IDS", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_ADMIN_AGENT_IDS") },
+        }
+        assert!(
+            ids.is_empty(),
+            "whitespace-only env MUST be treated as unset"
+        );
+    }
+
+    // ===========================================================================
+    // FX-F2 (coverage, #1432) — close the daemon_runtime.rs floor regression
+    // observed on the Per-Module Coverage Thresholds CI gate after the
+    // post-FX-F1 churn (HEADER_AGENT_ID SSOT migration #19eddac9, L1-L4
+    // capture-turn #49e04daf, etc.) shifted branch-hit counts and dropped
+    // measured coverage from 85.00% (pinned by 197640745) to 84.89% (-0.11pp).
+    // These tests cover the `build_store_handle` URL-scheme dispatch arms
+    // and `resolve_configured_embedding_dim` resolution-ladder arms — every
+    // branch in both helpers is exercised under `cfg(feature = "sal")` test
+    // builds with no live Postgres needed.
+    // ===========================================================================
+
+    /// FX-F2 — `build_store_handle` accepts a `sqlite:///path` URL and
+    /// routes through the SqliteStore adapter (not the `--db` fallback).
+    /// Pins the `strip_prefix("sqlite://")` arm + the SqliteStore
+    /// `Ok(...)` tail at lines 2691-2701.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn fx_f2_build_store_handle_sqlite_url_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("scheme.db");
+        let url = format!("sqlite:///{}", db.display());
+        let (backend, store) = build_store_handle(
+            Some(&url),
+            &db,
+            None,
+            None,
+            crate::store::PoolConfig::default(),
+        )
+        .await
+        .expect("sqlite:// URL must dispatch to SqliteStore");
+        // Backend tag must reflect the SQLite path.
+        assert!(
+            matches!(backend, crate::handlers::StorageBackend::Sqlite),
+            "sqlite:// URL MUST resolve to StorageBackend::Sqlite"
+        );
+        // Smoke-check that the store is usable (the SAL trait `Arc` is live).
+        drop(store);
+    }
+
+    /// FX-F2 — `build_store_handle` rejects an unrecognised URL scheme
+    /// with the canonical bail message. Pins the `else { bail!(...) }`
+    /// arm at lines 2702-2706 — the lone uncovered Err path on the
+    /// sal-feature build.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn fx_f2_build_store_handle_unknown_scheme_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ignored.db");
+        let result = build_store_handle(
+            Some("mysql://host/db"),
+            &db,
+            None,
+            None,
+            crate::store::PoolConfig::default(),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("unrecognised scheme MUST bail; got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unrecognised --store-url"),
+            "bail message MUST include the canonical prefix; got: {msg}"
+        );
+    }
+
+    /// FX-F2 — `build_store_handle` defaults to SqliteStore at the
+    /// `--db` path when `--store-url` is absent. Pins the `None` arm
+    /// at lines 2708-2715.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn fx_f2_build_store_handle_no_url_falls_through_to_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fallthrough.db");
+        let (backend, _store) =
+            build_store_handle(None, &db, None, None, crate::store::PoolConfig::default())
+                .await
+                .expect("absent --store-url MUST resolve to SqliteStore via --db");
+        assert!(matches!(backend, crate::handlers::StorageBackend::Sqlite));
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` returns the canonical
+    /// dim from the resolver when the model id is in
+    /// `KNOWN_EMBEDDING_DIMS`. Pins the first arm of the resolution
+    /// ladder (line 2615-2616).
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_canonical_lookup_wins() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        // `nomic-embed-text-v1.5` is in KNOWN_EMBEDDING_DIMS at 768.
+        cfg.embeddings = Some(crate::config::EmbeddingsSection {
+            model: Some("nomic-embed-text-v1.5".to_string()),
+            ..crate::config::EmbeddingsSection::default()
+        });
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        assert!(
+            matches!(dim, Some(d) if d == 768),
+            "canonical lookup MUST return 768 for nomic-embed-text-v1.5; got: {dim:?}"
+        );
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` falls through to the
+    /// legacy flat-field arm when the resolver yields no dim. Pins the
+    /// `or_else(|| app_config.embedding_model...)` arm (line 2617-2623).
+    /// The legacy `EmbeddingModel::from_str` accepts the underscore
+    /// variant `mini_lm_l6_v2`; canonical lookup goes through the
+    /// `[embeddings]` section, which we omit here so the resolver
+    /// returns `embedding_dim = None` and the legacy parse arm fires.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_legacy_flat_field_path() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        // No [embeddings] section → resolver returns None for dim.
+        // Legacy flat-field `embedding_model` parses as the 2-family enum.
+        cfg.embedding_model = Some("mini_lm_l6_v2".to_string());
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        assert!(
+            matches!(dim, Some(d) if d == 384),
+            "legacy flat-field path MUST resolve mini_lm_l6_v2 to 384; got: {dim:?}"
+        );
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` falls all the way
+    /// through to the tier-preset arm when neither resolver nor legacy
+    /// flat-field yields a dim. Pins the final `or_else(|| preset...)`
+    /// arm (line 2624).
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_preset_fallback() {
+        let _g = env_var_lock();
+        let cfg = AppConfig::default();
+        // Default config: no [embeddings] section + no legacy
+        // embedding_model field. Semantic tier preset HAS an embedding
+        // model so the preset arm fires (Some(_)). Keyword tier preset
+        // is None so we'd get None — but Semantic is the load-bearing
+        // case for the postgres-schema-bootstrap path documented at the
+        // function comment.
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        assert!(
+            dim.is_some(),
+            "Semantic tier preset MUST yield a dim via the fallback arm"
+        );
+    }
+
+    /// FX-F2 — `resolve_configured_embedding_dim` passes a parse-error
+    /// in the legacy flat-field arm through to the next arm
+    /// (`.and_then(|raw| raw.parse(...).ok())`). The function returns
+    /// the resolver-supplied dim (whatever
+    /// `AppConfig::resolve_embeddings()` produced from defaults) when
+    /// the operator's malformed flat-field is dropped. Pins the
+    /// `.and_then(..., .ok())` None-on-parse-fail arm at line 2621.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn fx_f2_resolve_configured_embedding_dim_malformed_legacy_drops_silently() {
+        let _g = env_var_lock();
+        let mut cfg = AppConfig::default();
+        // Unparseable value — `EmbeddingModel::from_str` rejects it
+        // and the `.ok()` swallows the error, falling through to the
+        // preset arm.
+        cfg.embedding_model = Some("not-a-real-model".to_string());
+        let tier_cfg = FeatureTier::Semantic.config();
+        let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
+        // The resolver+preset combination still yields a Some (default
+        // semantic tier has an embedding model preset). The test pins
+        // the silent-drop behaviour: the function does NOT panic /
+        // bail on an unparseable legacy override.
+        assert!(
+            dim.is_some(),
+            "unparseable legacy embedding_model MUST be dropped silently \
+             (the .ok() arm), preset fallback fires"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // FUPC — body-exercising sweep-loop tests. The pre-existing
+    // spawn-and-abort smoke tests use a 60s interval, so the loop body
+    // (the actual db::gc / sweep / checkpoint calls + their info-log
+    // branches) never fires inside the 20ms abort window. These drive a
+    // 1ms interval against seeded state so the body runs at least once.
+    // -----------------------------------------------------------------
+
+    /// `spawn_gc_loop` body actually runs and archives an expired memory
+    /// (the `Ok(n) if n > 0` info-log arm fires).
+    #[tokio::test]
+    async fn fupc_spawn_gc_loop_body_archives_expired() {
+        use crate::models::{Memory, MemoryKind, Tier};
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        // Seed a memory already past its expiry so the gc sweep archives it.
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Short,
+            namespace: "gc-ns".to_string(),
+            title: "expired".to_string(),
+            content: "stale".to_string(),
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            created_at: "2000-01-01T00:00:00Z".to_string(),
+            updated_at: "2000-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2000-01-01T01:00:00Z".to_string()),
+            memory_kind: MemoryKind::Observation,
+            ..Memory::default()
+        };
+        db::insert(&conn, &mem).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true, // archive_on_gc
+        )));
+        let h = spawn_gc_loop(state.clone(), Some(30), Duration::from_millis(1));
+        // Let several sweep ticks fire.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        h.abort();
+        let _ = h.await;
+        // The expired row must be gone from `memories` (archived + deleted).
+        let lock = state.lock().await;
+        let remaining: i64 = lock
+            .0
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'gc-ns'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "gc loop body must have archived the expired row"
+        );
+    }
+
+    /// `spawn_wal_checkpoint_loop` body actually runs (no panic, clean
+    /// abort) against a live WAL-mode db.
+    #[tokio::test]
+    async fn fupc_spawn_wal_checkpoint_loop_body_runs() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_wal_checkpoint_loop(state, Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    /// `spawn_transcript_lifecycle_sweep_loop` body runs at a 1ms cadence
+    /// against a clean db (the `Ok(r)` arm with a zero-count report — no
+    /// info-log, no panic, clean abort).
+    #[tokio::test]
+    async fn fupc_spawn_transcript_lifecycle_sweep_body_runs_clean() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_transcript_lifecycle_sweep_loop(
+            state,
+            crate::config::TranscriptsConfig::default(),
+            Duration::from_millis(1),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.abort();
+        let _ = h.await;
+    }
+
+    /// `spawn_agent_quota_reset_loop` body runs at a 1ms cadence against
+    /// a clean db (the reset SQL touches zero rows, no panic, clean
+    /// abort).
+    #[tokio::test]
+    async fn fupc_spawn_agent_quota_reset_body_runs_clean() {
+        let env = TestEnv::fresh();
+        let conn = db::open(&env.db_path).unwrap();
+        let state: Db = Arc::new(Mutex::new((
+            conn,
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let h = spawn_agent_quota_reset_loop(state, Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.abort();
+        let _ = h.await;
     }
 }

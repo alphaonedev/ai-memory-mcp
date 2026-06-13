@@ -1,10 +1,10 @@
 # Admin Guide
 
-> **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 20-event hook pipeline, sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.
+> **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 25-event hook pipeline (20 baseline lifecycle events + 5 v0.7.0 additions: PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback), sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous with local LLMs via Ollama), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). 1,886 lib tests + 49+ integration tests at 93.84% line coverage (v0.6.3.1). v0.6.3 baseline numbers (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.3.1 and v0.7.0 deltas are documented in `CHANGELOG.md` and the per-release notes.
+**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
 
 > **Maturity framing (v0.7).** The single-machine primitive (T1/T2 in the [architectures matrix](https://alphaonedev.github.io/ai-memory-mcp/architectures.html)) is **production-ready**. Federation (T3 multi-node quorum cluster) is **beta** — the code is shipped and tested but not recommended for unattended production fleets. The Postgres+pgvector backend reaches **GA in v0.7** (with optional **Apache AGE acceleration** for KG ops behind a bench gate). Ed25519 attestation, the hook pipeline, sidechain transcripts, and the permissions/A2A surfaces are all **opt-in** — a v0.7.0 install with no `hooks.toml`, no keypair, and no `[transcripts]` config behaves identically to v0.6.4 at the lifecycle layer. Multi-region distributed consensus (T5 "global hive") is **vision** at v1.0+. See the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) for the canonical maturity labels — use those labels in all customer-facing materials.
 
@@ -45,7 +45,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 42 HTTP endpoints (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 88 HTTP route registrations (75 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -138,28 +138,155 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 |------|-------|----------------|--------------|----------------|
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
-| `smart` | smart subset (LLM tools enabled) | Yes | Yes (Ollama) | ~1 GB |
-| `autonomous` | full 43-tool surface | Yes | Yes (Ollama) | ~4 GB |
+| `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
+| `autonomous` | full 74-entry surface (v0.7.0) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
-Set the tier when starting the MCP server or HTTP daemon:
+Set the tier when starting the MCP server or running per-invocation
+subcommands (`mcp`, `store`, `recall`, etc.):
 
 ```bash
 ai-memory mcp --tier semantic        # default
 ai-memory mcp --tier smart           # enables LLM-powered tools
-ai-memory serve --tier autonomous    # full feature set
+ai-memory mcp --tier autonomous      # full feature set
 ```
 
-### Ollama Setup (Smart & Autonomous Tiers)
+The HTTP daemon (`ai-memory serve`) does **not** accept a `--tier`
+flag — see issue #703. The daemon's effective tier is resolved from
+the `tier = "<keyword|semantic|smart|autonomous>"` field at the top
+level of `config.toml`, falling back to the compiled-in default
+(`semantic`) when the field is absent.
 
-The `smart` and `autonomous` tiers require a running [Ollama](https://ollama.com) instance for LLM inference (Gemma 4 models).
+Rationale: a long-running daemon owns embedder / reranker / LLM
+resources that are expensive to swap mid-run, so tier is fixed at
+startup via configuration rather than per-invocation flag.
+
+```bash
+# Run the daemon in autonomous mode by setting the tier in
+# config.toml, then starting the daemon:
+echo 'tier = "autonomous"' >> ~/.config/ai-memory/config.toml
+ai-memory serve --host 127.0.0.1 --port 9077
+```
+
+### LLM Backend Setup (Smart & Autonomous Tiers)
+
+The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
+
+#### Recommended path — `[llm]` section in `config.toml` (#1146)
+
+`~/.config/ai-memory/config.toml` is the **single source of truth**. Every surface (MCP stdio, HTTP daemon, `ai-memory atomise`, `ai-memory curator`, the boot banner, the `ai-memory doctor` reachability probe) consumes the same `AppConfig::resolve_llm` resolver output, so the boot banner and the live MCP server are guaranteed to agree on the backend.
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+tier = "autonomous"
+db   = "/Users/<you>/.claude/ai-memory.db"
+
+[llm]
+backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
+                                       # deepseek | kimi | qwen | mistral | groq |
+                                       # together | cerebras | openrouter |
+                                       # fireworks | lmstudio | openai-compatible
+model       = "grok-4.3"               # vendor-specific identifier
+base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+# api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced; alt to api_key_env
+
+[llm.auto_tag]                         # fast structured-output sibling
+backend = "ollama"
+model   = "gemma3:4b"
+
+[embeddings]
+backend = "ollama"                     # #1598: also any #1067 alias (openrouter,
+                                       # openai, gemini, ...) or "openai-compatible"
+                                       # (self-hosted TEI / vLLM / llama.cpp server)
+url     = "http://localhost:11434"     # synonym of base_url; base_url wins
+model   = "nomic-embed-text-v1.5"      # e.g. "google/gemini-embedding-2" (3072d)
+# api_key_env  = "OPENROUTER_API_KEY"  # API backends; XOR api_key_file (0400)
+# dim          = 3072                  # only for models outside KNOWN_EMBEDDING_DIMS
+
+[reranker]
+enabled = true
+model   = "ms-marco-MiniLM-L-6-v2"
+max_seq_tokens = 256                   # rerank input-sequence cap (#1604);
+                                       # 1..=512, env: AI_MEMORY_RERANK_MAX_SEQ
+```
+
+**API-key resolution chain.** For non-Ollama backends, the resolver consults (in order):
+
+1. `AI_MEMORY_LLM_API_KEY` (process env) — universal escape hatch.
+2. Per-vendor process env-var fallback: `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
+3. `[llm].api_key_env = "<NAME>"` — config-pointed env var.
+4. `[llm].api_key_file = "/path/to/key"` — file (mode 0400 enforced via `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` escape hatch per [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
+
+If all four return empty, the resolver returns `KeySource::None` (correct for `backend = "ollama"`; a misconfiguration for any OpenAI-compatible backend — `ai-memory doctor` surfaces this).
+
+**Secret-handling discipline.** `[llm].api_key = "<literal>"` is **rejected at parse time** with a clear stderr error — `config.toml` is typically world-readable, so literal keys would be a credential leak. `api_key_env` and `api_key_file` are mutually exclusive.
+
+**Precedence ladder (uniform across all four resolvers — LLM / embeddings / reranker / storage; the embeddings env layer is `AI_MEMORY_EMBED_*` per #1598):**
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+**Migration tool — `ai-memory config migrate`.** Rewrites a legacy v0.6.x flat-field `config.toml` in place (with a timestamped `.bak`) to the v2 sectioned shape. Idempotent. `--dry-run` prints the diff; `--also-clean-claude-json` additionally strips redundant `mcpServers.<*>.env` blocks whose `command` resolves to `ai-memory` from `~/.claude.json`.
+
+**Reachability probe — `ai-memory doctor`.** A `LLM Reachability (#1146)` section resolves the canonical config and probes the endpoint with the resolved Bearer key (`/api/tags` for Ollama, `/models` for OpenAI-compatible). Reports PASS / WARN (401/403/429/5xx) / CRIT (4xx other, network, DNS, TLS) plus the resolved provenance facts (`backend`, `model`, `base_url`, `config_source`, `key_source`). #1598 added the sibling `Embeddings Reachability (#1598)` section: same severity mapping against the resolved *embeddings* endpoint (ollama `GET /api/tags`; API backends `POST /embeddings` with a 1-char input + resolved Bearer key), plus an operator GPU-policy WARN when `backend = ollama` resolves on a host with no detectable NVIDIA GPU (policy: local Ollama embeddings only on GPU-equipped nodes — see the [enterprise reference architectures](reference-architecture/enterprise-cpu-memory.md)).
+
+Canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+
+#### Override path — `AI_MEMORY_LLM_*` env vars
+
+Env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-session tweaks and the only path that doesn't require editing a file.
+
+> **MCP clients do NOT inherit your interactive shell** ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). The shell-level `export AI_MEMORY_LLM_BACKEND=…` setup documented below is sufficient for:
+>
+> - the standalone `ai-memory` CLI (`ai-memory store / recall / search / list / …`)
+> - the standalone HTTP daemon (`ai-memory serve …`)
+> - any process you launch yourself from an interactive shell that inherits the exports
+>
+> It is **NOT sufficient** for MCP usage — Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, etc. spawn the MCP server as a **fresh subprocess** with only the `env:` keys explicitly declared in the MCP server config. Shell exports from `.zshrc` / `.bashrc` / `.profile` are invisible to that subprocess. The recommended path above (a `[llm]` section in `config.toml` with `api_key_env`) avoids this paper-cut by letting every surface read the same file. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146).
+>
+> If you DO use the env-block override, the same `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL` variables must live inside the MCP server config's `env:` block. Copy-pasteable per-backend recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
+
+**Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
+
+```bash
+# Example 1: xAI Grok 4.3 (remote, no GPU required) — v0.7.0 compiled default for xai backend
+export AI_MEMORY_LLM_BACKEND=xai
+export AI_MEMORY_LLM_MODEL=grok-4.3
+export XAI_API_KEY=xai-…
+
+# Example 2: OpenAI gpt-5
+export AI_MEMORY_LLM_BACKEND=openai
+export AI_MEMORY_LLM_MODEL=gpt-5
+export OPENAI_API_KEY=sk-…
+
+# Example 3: Anthropic Claude (via OpenAI shim)
+export AI_MEMORY_LLM_BACKEND=anthropic
+export AI_MEMORY_LLM_MODEL=claude-opus-4.7
+export ANTHROPIC_API_KEY=sk-ant-…
+
+# Example 4: Generic OpenAI-compatible (vLLM, llama.cpp server, LMStudio at custom port)
+export AI_MEMORY_LLM_BACKEND=openai-compatible
+export AI_MEMORY_LLM_BASE_URL=http://your-host:8000/v1   # REQUIRED
+export AI_MEMORY_LLM_MODEL=your-model
+export AI_MEMORY_LLM_API_KEY=…
+```
+
+**Per-vendor fallback API-key env vars** are honoured (so the operator doesn't need to set `AI_MEMORY_LLM_API_KEY` separately if they're already using the vendor's canonical env var): `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`), `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
+
+### Ollama Setup (local LLM, v0.6.4 default — still supported)
+
+If you want a fully local LLM, install [Ollama](https://ollama.com) and pull a model.
 
 #### macOS
 ```bash
 brew install ollama
 # Or download from https://ollama.com/download/mac
 ollama serve &
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) — smart + autonomous LLM
+ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
 #### Linux
@@ -167,25 +294,25 @@ ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
 curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl enable ollama
 sudo systemctl start ollama
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) — smart + autonomous LLM
+ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
 #### Windows
 ```powershell
 # Download from https://ollama.com/download/windows, or:
 winget install Ollama.Ollama
-ollama pull gemma4:e2b    # Smart tier (~1GB)
-ollama pull gemma4:e4b    # Autonomous tier (~2.3GB)
+ollama pull gemma3:4b     # v0.7.0 compiled default for Ollama backend (~3 GB) — smart + autonomous LLM
+ollama pull nomic-embed-text:v1.5  # Default embedder for semantic + autonomous tiers (~280 MB)
 ```
 
 #### Verify
 ```bash
 curl http://localhost:11434/api/tags
-ollama run gemma4:e2b "Hello, world"
+ollama run gemma3:4b "Hello, world"
 ```
 
-ai-memory connects to Ollama at `http://localhost:11434` by default. Set `OLLAMA_HOST` to override. If Ollama is not running, ai-memory gracefully falls back to the semantic tier.
+ai-memory connects to Ollama at `http://localhost:11434` by default when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Set `OLLAMA_BASE_URL` (legacy) or `AI_MEMORY_LLM_BASE_URL` (post-#1067) to override. If the LLM endpoint is unreachable, ai-memory gracefully falls back to the semantic tier and the circuit breaker pins fast-fail behaviour after 3 consecutive failures within a 30s window.
 
 ### Embedding Model (semantic tier and above)
 
@@ -202,8 +329,8 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |------|----------------|-------|
 | `keyword` | Minimal (~10 MB) | SQLite + FTS5 only |
 | `semantic` | ~256 MB | Embedding model loaded in memory |
-| `smart` | ~1 GB | Embedding model + Ollama with smaller LLM |
-| `autonomous` | ~4 GB | Embedding model + Ollama with larger LLM |
+| `smart` | ~1 GB (local Ollama) / ~256 MB (remote LLM endpoint) | Embedding model + LLM client |
+| `autonomous` | ~4 GB (local Ollama + cross-encoder) / ~3 GB (remote LLM + local cross-encoder) | Embedding model + LLM client + cross-encoder |
 
 ### Environment Variables
 
@@ -211,6 +338,15 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |----------|---------|-------------|
 | `AI_MEMORY_DB` | `ai-memory.db` | Database path (overridden by `--db`) |
 | `AI_MEMORY_AGENT_ID` | (auto) | Default `agent_id` stamped on memories this process writes. Used when no `--agent-id` flag is passed. See §Agent Identity below. |
+| `AI_MEMORY_LLM_BACKEND` | `ollama` (legacy default) | **[#1067, v0.7.0]** LLM backend selector. Accepts `ollama`, `openai-compatible`, or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`/`moonshot`, `qwen`/`dashscope`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`). When set, the LLM client is tier-independent. |
+| `AI_MEMORY_LLM_BASE_URL` | per-alias default; `http://localhost:11434` for `ollama` | **[#1067, v0.7.0]** Overrides default per-backend URL. REQUIRED with `AI_MEMORY_LLM_BACKEND=openai-compatible`. Legacy `OLLAMA_BASE_URL` still honoured when `BACKEND=ollama`. |
+| `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` or `KIMI_API_KEY`, `DASHSCOPE_API_KEY` or `QWEN_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
+| `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI, `deepseek-chat` for DeepSeek, `gemma3:4b` for Ollama). |
+| `OLLAMA_BASE_URL` | unset | Legacy escape hatch honoured ONLY when `AI_MEMORY_LLM_BACKEND` is unset or `ollama`. Pre-#1067 callers using the old env var keep working. |
+| `AI_MEMORY_MAX_MEMORIES_PER_DAY` | `1000` | **[#1156 follow-up, v0.7.x]** Per-agent daily memory-write quota seeded into fresh `agent_quotas` rows. Precedence: env > `[limits].max_memories_per_day` > compiled default. Non-positive / unparseable falls through. |
+| `AI_MEMORY_MAX_STORAGE_BYTES` | `104857600` (100 MiB) | **[#1156 follow-up, v0.7.x]** Per-agent storage-byte quota seeded into fresh `agent_quotas` rows. Same ladder as above (`[limits].max_storage_bytes`). |
+| `AI_MEMORY_MAX_LINKS_PER_DAY` | `5000` | **[#1156 follow-up, v0.7.x]** Per-agent daily link-write quota seeded into fresh `agent_quotas` rows. Same ladder as above (`[limits].max_links_per_day`). |
+| `AI_MEMORY_MAX_PAGE_SIZE` | `1000` | **[#1156 follow-up, v0.7.x]** Cap on list / bulk-write / federation-sync page size — bounds per-request in-memory materialization (OOM guard). Precedence: env > `[limits].max_page_size` > compiled `MAX_BULK_SIZE`. Non-positive / unparseable falls through. |
 | `RUST_LOG` | (none) | Logging filter (e.g., `ai_memory=info,tower_http=debug`) |
 | `AI_MEMORY_NO_CONFIG` | (none) | Set to `1` to skip config file loading (useful for testing) |
 
@@ -224,24 +360,34 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |-----|------|---------|--------------|-------------|
 | `tier` | String | `"semantic"` | `"keyword"`, `"semantic"`, `"smart"`, `"autonomous"` | Feature tier controlling which AI capabilities are active |
 | `db` | String | `"ai-memory.db"` | Any valid file path | Path to the SQLite database file |
-| `ollama_url` | String | `"http://localhost:11434"` | Any URL | Ollama base URL for LLM generation (smart/autonomous tiers) |
-| `embed_url` | String | Value of `ollama_url` | Any URL | Separate URL for the embedding service; falls back to `ollama_url` if unset |
-| `embedding_model` | String | Tier-dependent | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic_embed_v15"` (768-dim, ~270 MB) | HuggingFace sentence-transformer model for semantic search |
-| `llm_model` | String | Tier-dependent | `"gemma4:e2b"` (~1 GB Q4), `"gemma4:e4b"` (~2.3 GB Q4) | Ollama LLM model tag for smart/autonomous features |
-| `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | Enable neural cross-encoder reranking (not a string -- must be bare `true`/`false` without quotes) |
-| `default_namespace` | String | `"global"` | Any valid namespace (max 128 bytes, no slashes/spaces/nulls) | Default namespace applied to new memories |
+
+> **Note (#1146, v0.7.x):** The fields below — `ollama_url`, `embed_url`, `embedding_model`, `llm_model`, `cross_encoder`, `default_namespace`, `max_memory_mb`, `archive_on_gc` — are the **legacy v0.6.x flat-field shape**. They continue to parse and emit a `Once`-gated deprecation WARN. The canonical v0.7.x shape is the sectioned `[llm]` / `[llm.auto_tag]` / `[embeddings]` / `[reranker]` / `[storage]` form documented in [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). Run `ai-memory config migrate` to rewrite a legacy config in the v2 shape (with a `.bak` backup). Legacy fields will be removed in v0.8.0.
+
+| `ollama_url` | String | `"http://localhost:11434"` | Any URL | **[LEGACY]** Ollama base URL for LLM generation. Canonical v2: `[llm].base_url`. |
+| `embed_url` | String | Value of `ollama_url` | Any URL | **[LEGACY]** Separate embedder URL. Canonical v2: `[embeddings].url`. |
+| `embedding_model` | String | `"nomic-embed-text-v1.5"` | `"mini_lm_l6_v2"` (384-dim, ~90 MB), `"nomic-embed-text-v1.5"` (768-dim, ~280 MB) | **[LEGACY]** Sentence-transformer / Ollama embedder model. Canonical v2: `[embeddings].model`. |
+| `llm_model` | String | Backend-dependent | `"gemma3:4b"` (Ollama default), `"grok-4.3"` (xai), `"gpt-5"` (openai), `"claude-opus-4.7"` (anthropic), `"deepseek-chat"`, `"qwen-max"`, … | **[LEGACY]** LLM model tag. Canonical v2: `[llm].model`. Default resolution lives in `src/config.rs::backend_default_model`. |
+| `cross_encoder` | **Bool** | `false` (`true` for autonomous tier) | `true`, `false` | **[LEGACY]** Enable neural cross-encoder reranking. Canonical v2: `[reranker].enabled`. |
+| `default_namespace` | String | `"global"` | Any valid namespace (max 512 chars; `/` hierarchy delimiter allowed; no spaces/nulls) | **[LEGACY]** Default namespace applied to new memories. Canonical v2: `[storage].default_namespace`. |
 | `max_memory_mb` | Integer | Tier-dependent | Any positive integer | Maximum memory budget in MB; used for automatic tier selection via `from_memory_budget()` |
-| `archive_on_gc` | Bool | `true` | `true`, `false` | Archive expired memories instead of permanently deleting them during GC |
+| `archive_on_gc` | Bool | `true` | `true`, `false` | **[LEGACY]** Archive expired memories on GC. Canonical v2: `[storage].archive_on_gc`. |
 | `[ttl]` | Section | -- | -- | Per-tier TTL overrides (all sub-fields are integers in seconds) |
 | `ttl.short_ttl_secs` | Integer | `21600` (6 hours) | `0` = never expires, or positive integer | TTL for short-tier memories in seconds |
 | `ttl.mid_ttl_secs` | Integer | `604800` (7 days) | `0` = never expires, or positive integer | TTL for mid-tier memories in seconds |
 | `ttl.long_ttl_secs` | Integer | `0` (never expires) | `0` = never expires, or positive integer | TTL for long-tier memories in seconds |
-| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | TTL extension on access for short-tier memories |
-| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | TTL extension on access for mid-tier memories |
+| `ttl.short_extend_secs` | Integer | `3600` (1 hour) | Non-negative integer | Per-access TTL window for short-tier memories. **Extension-FLOOR semantic ([#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596))**: on every access, `expires_at = MAX(current expires_at, now + short_extend_secs)` — an access can extend a memory's life but can never move its expiry EARLIER. The create-time `short_ttl_secs` (6h default) is preserved when it is later than the per-access window. |
+| `ttl.mid_extend_secs` | Integer | `86400` (1 day) | Non-negative integer | Per-access TTL window for mid-tier memories. **Extension-FLOOR semantic ([#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596))**: on every access, `expires_at = MAX(current expires_at, now + mid_extend_secs)`. The create-time `mid_ttl_secs` (7d default) is preserved when it is later than the per-access window. |
+| `[limits]` | Section | -- | -- | **[#1156 follow-up, v0.7.x]** Operator-tunable resource caps. Per-field precedence: `AI_MEMORY_MAX_* env > [limits] > compiled default`; non-positive / unparseable values fall through. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). |
+| `limits.max_memories_per_day` | Integer (>0) | `1000` | Any positive integer | Per-agent daily memory-write quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_MEMORIES_PER_DAY`. |
+| `limits.max_storage_bytes` | Integer (>0) | `104857600` (100 MiB) | Any positive integer | Per-agent storage-byte quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_STORAGE_BYTES`. |
+| `limits.max_links_per_day` | Integer (>0) | `5000` | Any positive integer | Per-agent daily link-write quota seeded into fresh `agent_quotas` rows. Env override: `AI_MEMORY_MAX_LINKS_PER_DAY`. |
+| `limits.max_page_size` | Integer (>0) | `1000` | Any positive integer | Cap on list / bulk-write / federation-sync page size (OOM guard). Lands on `AppState.max_page_size`. Env override: `AI_MEMORY_MAX_PAGE_SIZE`. |
 
 > **Note:** Set any TTL to `0` to disable expiry for that tier. Values are clamped to a 10-year maximum (315,360,000 seconds). Negative extension values are clamped to 0.
 
-> **Note:** Restored memories have their `expires_at` cleared (set to NULL) and become permanent.
+> **Extension FLOOR, not replacement ([#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596), supersedes the [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830) replacement contract):** the touch path takes `MAX(current expires_at, now + per-tier-extend_secs)` (`src/storage/mod.rs::touch`). An access can only extend a memory's life, never shorten it — the pre-#1596 behavior, where recalling a mid-tier row with a week of remaining life REPLACED its expiry with `now + 1 day`, was a lived dogfood defect (a recall moved an expiry from 06-18 to 06-12). A short memory accessed every 30 minutes still never expires (each access keeps pushing the floor forward); what changed is that an access can no longer move an expiry EARLIER than it already was.
+
+> **Note:** Archive-restored memories re-apply the archived row's `original_tier` / `original_expires_at` where present; legacy archive rows (pre-v49) restore as `long` with no expiry.
 
 #### Complete Annotated config.toml
 
@@ -263,8 +409,8 @@ Below is a complete example showing every supported field with explanatory comme
 # Valid values: "keyword", "semantic", "smart", "autonomous"
 #   keyword    — FTS5 keyword search only, no models, minimal RAM
 #   semantic   — adds embedding-based hybrid recall (~256 MB)
-#   smart      — adds query expansion, auto-tagging, contradiction detection (~1 GB, requires Ollama)
-#   autonomous — full feature set with cross-encoder reranking (~4 GB, requires Ollama)
+#   smart      — adds query expansion, auto-tagging, contradiction detection (~1 GB local Ollama; or ~256 MB with a remote LLM backend per #1067)
+#   autonomous — full feature set with cross-encoder reranking (~4 GB local Ollama + cross-encoder; or ~3 GB with remote LLM + local cross-encoder per #1067)
 # Default: "semantic"
 # tier = "semantic"
 
@@ -276,59 +422,154 @@ Below is a complete example showing every supported field with explanatory comme
 # db = "~/.claude/ai-memory.db"
 
 # ---------------------------------------------------------------------------
-# Ollama URLs (smart and autonomous tiers only)
+# v0.7.x (#1146) — schema_version + sectioned config (CANONICAL)
 # ---------------------------------------------------------------------------
-# Base URL for Ollama LLM generation.
+# As of v0.7.x, config.toml uses the sectioned schema-v2 shape below.
+# See docs/CONFIG_SCHEMA.md for the full reference. Upgrading from
+# v0.6.x flat fields? Run `ai-memory config migrate --dry-run` to
+# preview, then `ai-memory config migrate --also-clean-claude-json` to
+# rewrite in place with a timestamped .bak. The legacy flat-field
+# shape (shown LOWER in this file as commented-out defaults) continues
+# to work in v0.7.x with a one-line deprecation WARN at load time and
+# will be removed in v0.8.0.
+#
+#   schema_version = 2
+#
+#   [llm]
+#   backend     = "xai"          # ollama | openai | xai | anthropic | gemini | …
+#   model       = "grok-4.3"
+#   base_url    = "https://api.x.ai/v1"      # optional; vendor-default if unset
+#   api_key_env = "XAI_API_KEY"              # mutually exclusive with api_key_file
+#   # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
+#
+#   [llm.auto_tag]                            # fast structured-output sibling
+#   backend = "ollama"
+#   model   = "gemma3:4b"
+#
+#   [embeddings]
+#   backend        = "ollama"     # #1598: or any #1067 alias (openrouter,
+#                                 # openai, gemini, ...) or
+#                                 # "openai-compatible" (self-hosted
+#                                 # TEI / vLLM / llama.cpp server)
+#   url            = "http://localhost:11434"  # synonym of base_url;
+#                                 # base_url wins when both are set
+#   model          = "nomic-embed-text-v1.5"
+#   # api_key_env  = "OPENROUTER_API_KEY"   # API backends; XOR
+#   # api_key_file = "/etc/ai-memory/keys/embed.key"  # mode 0400 enforced
+#   # dim          = 3072         # override for models outside
+#                                 # KNOWN_EMBEDDING_DIMS
+#   backfill_batch = 100
+#
+#   [reranker]
+#   enabled = true
+#   model   = "ms-marco-MiniLM-L-6-v2"
+#   max_seq_tokens = 256        # rerank input-sequence cap (#1604);
+#                               # 1..=512 (model ceiling), default 256.
+#                               # Env override: AI_MEMORY_RERANK_MAX_SEQ.
+#
+#   [storage]
+#   default_namespace = "global"
+#   archive_on_gc     = true
+#   archive_max_days  = 90
+#   max_memory_mb     = 4096
+#   db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7);
+#                                   # 256 MiB default, 0 disables mmap.
+#                                   # Env override: AI_MEMORY_DB_MMAP_SIZE.
+#
+# Inline `[llm].api_key = "<literal>"` is REJECTED at parse time — use
+# api_key_env (process env var reference) or api_key_file (mode 0400
+# enforced) instead — the same rule applies to [embeddings].api_key
+# (#1598). Verify wiring with `ai-memory doctor` (the
+# "LLM Reachability (#1146)" and "Embeddings Reachability (#1598)"
+# sections probe the resolved endpoints).
+#
+# ---------------------------------------------------------------------------
+# LEGACY v0.6.x flat fields (deprecated, removed in v0.8.0)
+# ---------------------------------------------------------------------------
+# The fields below are honored at v0.7.x but emit a single-line
+# deprecation WARN on config load. Run `ai-memory config migrate` to
+# upgrade in place. Each field's v2 sectioned equivalent is noted.
+# ---------------------------------------------------------------------------
+
+# LEGACY → v2: [llm].base_url (when backend = "ollama")
+# Honored only when AI_MEMORY_LLM_BACKEND is unset or set to "ollama".
 # Default: "http://localhost:11434"
 # ollama_url = "http://localhost:11434"
 
-# Separate URL for embedding requests. Falls back to ollama_url if unset.
+# LEGACY → v2: [embeddings].url / [embeddings].base_url
+# Falls back to ollama_url if unset. Post-#1598 the embedder is
+# provider-agnostic: [embeddings].backend accepts any #1067 vendor
+# alias or "openai-compatible" (self-hosted TEI / vLLM / llama.cpp
+# server) in addition to the default "ollama"; env overrides are
+# AI_MEMORY_EMBED_BACKEND / _BASE_URL / _MODEL / _API_KEY.
 # Default: same as ollama_url
 # embed_url = "http://localhost:11434"
 
+# Provider-agnostic LLM (post-#1067, v0.7.0) — preferred over ollama_url.
+# These settings are typically supplied via env vars at process start,
+# not via config.toml. See the §"LLM Backend Setup" section above for
+# the full env-var matrix.
+#
+#   AI_MEMORY_LLM_BACKEND   — selector: ollama | openai-compatible |
+#                             openai | xai | anthropic | gemini | deepseek |
+#                             kimi | qwen | mistral | groq | together |
+#                             cerebras | openrouter | fireworks | lmstudio
+#   AI_MEMORY_LLM_BASE_URL  — override per-alias default URL
+#   AI_MEMORY_LLM_API_KEY   — Bearer secret (or per-vendor fallback env var)
+#   AI_MEMORY_LLM_MODEL     — vendor-specific model identifier
+
 # ---------------------------------------------------------------------------
-# Model selection
+# LEGACY → v2 mapping (model selection)
 # ---------------------------------------------------------------------------
-# Embedding model for semantic search (semantic tier and above).
-# Valid values:
-#   "mini_lm_l6_v2"   — sentence-transformers/all-MiniLM-L6-v2, 384-dim, ~90 MB
-#   "nomic_embed_v15"  — nomic-ai/nomic-embed-text-v1.5, 768-dim, ~270 MB
+# LEGACY → v2: [embeddings].model (legacy aliases auto-canonicalised:
+#   "nomic_embed_v15" → "nomic-embed-text-v1.5",
+#   "mini_lm_l6_v2" → "sentence-transformers/all-MiniLM-L6-v2").
 # Default: tier-dependent (mini_lm_l6_v2 for semantic, nomic_embed_v15 for smart/autonomous)
 # embedding_model = "mini_lm_l6_v2"
 
-# LLM model served via Ollama (smart and autonomous tiers).
-# Valid values:
-#   "gemma4:e2b"  — Google Gemma 4 Effective 2B, ~1 GB Q4 (smart tier default)
-#   "gemma4:e4b"  — Google Gemma 4 Effective 4B, ~2.3 GB Q4 (autonomous tier default)
-# Default: tier-dependent (gemma4:e2b for smart, gemma4:e4b for autonomous)
-# llm_model = "gemma4:e2b"
+# LEGACY → v2: [llm].model
+# LLM model identifier (smart and autonomous tiers).
+# v0.7.0 compiled defaults per backend (resolved by src/config.rs::backend_default_model):
+#   "gemma3:4b"         — Ollama (default fallback when backend is unset or "ollama")
+#   "grok-4.3"          — xAI
+#   "gpt-5"             — OpenAI
+#   "claude-opus-4.7"   — Anthropic (via OpenAI shim)
+#   "gemini-2.0-flash"  — Google Gemini
+#   "deepseek-chat"     — DeepSeek
+#   "moonshot-v1-8k"    — Kimi / Moonshot
+#   "qwen-max"          — Qwen / Dashscope
+#   "mistral-large-latest" — Mistral
+#   "llama-3.3-70b-versatile" — Groq
+#   "meta-llama/Llama-3.3-70B-Instruct-Turbo" — Together AI
+#   "llama-3.3-70b"     — Cerebras
+#   "openai/gpt-5"      — OpenRouter
+#   "accounts/fireworks/models/llama-v3p3-70b-instruct" — Fireworks
+#   "local-model"       — LMStudio
+# Prefer AI_MEMORY_LLM_MODEL env var over this config field at v0.7.0.
+# llm_model = "gemma3:4b"
 
 # ---------------------------------------------------------------------------
-# Cross-encoder reranking
+# LEGACY → v2: [reranker].enabled
 # ---------------------------------------------------------------------------
 # Enable neural cross-encoder reranking for improved recall precision.
-# NOTE: This is a boolean, NOT a string. Use bare true/false without quotes.
 # Default: false (true for autonomous tier)
 # cross_encoder = true
 
 # ---------------------------------------------------------------------------
-# Namespace and memory limits
+# LEGACY → v2: [storage].default_namespace + [storage].max_memory_mb
 # ---------------------------------------------------------------------------
 # Default namespace applied to new memories when none is specified.
 # Default: "global"
 # default_namespace = "global"
 
-# Maximum memory budget in MB. Used for automatic tier selection when tier
-# is not explicitly set — the highest tier that fits within this budget is chosen.
+# Maximum memory budget in MB for the automatic tier selector.
 # Default: tier-dependent (0/256/1024/4096 for keyword/semantic/smart/autonomous)
 # max_memory_mb = 4096
 
 # ---------------------------------------------------------------------------
-# Garbage collection
+# LEGACY → v2: [storage].archive_on_gc
 # ---------------------------------------------------------------------------
 # Archive expired memories before GC permanently deletes them.
-# When true, expired memories are moved to the archive table and can be
-# restored later. When false, GC permanently deletes expired memories.
 # Default: true
 # archive_on_gc = true
 
@@ -345,9 +586,22 @@ Below is a complete example showing every supported field with explanatory comme
 # long_ttl_secs = 0             # 0 = never expires (default)
 # short_extend_secs = 3600      # +1 hour on access (default)
 # mid_extend_secs = 86400       # +1 day on access (default)
+
+# ---------------------------------------------------------------------------
+# [limits] — operator-tunable resource caps (#1156 follow-up, v0.7.x)
+# ---------------------------------------------------------------------------
+# All four fall back to the compiled default when absent, non-positive, or
+# unparseable. Per-field precedence: AI_MEMORY_MAX_* env > [limits] > default.
+# The three quota fields seed fresh agent_quotas rows (existing rows are not
+# rewritten); max_page_size bounds list/bulk/sync page size as an OOM guard.
+# [limits]
+# max_memories_per_day = 1000        # per-agent daily memory-write quota
+# max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
+# max_links_per_day    = 5000        # per-agent daily link-write quota
+# max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
 ```
 
-**Precedence:** CLI flags and MCP args take precedence over `config.toml` values. When the MCP server is launched by an AI client, the `--tier` flag in the MCP args is used, not the `config.toml` `tier` setting.
+**Precedence:** For per-invocation subcommands (`mcp`, `store`, `recall`, etc.), CLI flags and MCP args take precedence over `config.toml` values. When the MCP server is launched by an AI client, the `--tier` flag in the MCP args is used, not the `config.toml` `tier` setting. The `serve` daemon is a special case: it has no `--tier` flag, so tier is resolved from `config.toml` (`tier = "..."`) with the compiled-in default (`semantic`) as the only fallback. See issue #703.
 
 ### Compile-Time Constants
 
@@ -361,20 +615,30 @@ These are set in the source code and require recompilation to change:
 | `PROMOTION_THRESHOLD` | 5 accesses | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
 | `MID_TTL_EXTEND_SECS` | 86400 (1 day) | `models.rs` |
+| `DEFAULT_MAX_MEMORIES_PER_DAY` | 1000 | `quotas.rs` (compiled fallback for `[limits].max_memories_per_day` / `AI_MEMORY_MAX_MEMORIES_PER_DAY`) |
+| `DEFAULT_MAX_STORAGE_BYTES` | 104857600 (100 MiB) | `quotas.rs` (compiled fallback for `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES`) |
+| `DEFAULT_MAX_LINKS_PER_DAY` | 5000 | `quotas.rs` (compiled fallback for `[limits].max_links_per_day` / `AI_MEMORY_MAX_LINKS_PER_DAY`) |
+| `MAX_BULK_SIZE` | 1000 | `handlers/transport.rs` (compiled fallback for `[limits].max_page_size` / `AI_MEMORY_MAX_PAGE_SIZE`) |
 
 ## Profiles (v0.6.4+)
 
-The MCP server's tool surface is selected by `--profile`. Profiles compose tool **families** — `core`, `graph`, `admin`, `power`, `full` — and the always-on bootstrap (`memory_capabilities`) is unioned in regardless of which profile is active.
+The MCP server's tool surface is selected by `--profile`. The named
+profiles — `core`, `graph`, `admin`, `power`, `full` (or a
+comma-separated custom family list) — compose tool **families** (the
+eight-variant `Family` enum in `src/profile.rs`: Core, Lifecycle,
+Graph, Governance, Power, Meta, Archive, Other), and the always-on
+bootstrap (`memory_capabilities`) is unioned in regardless of which
+profile is active.
 
 | Profile | Advertised tools | Use when |
 |---|---|---|
-| `core` (default) | 5 + bootstrap | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
-| `graph` | core + KG family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths`. |
-| `admin` | core + governance + audit | Operator sessions doing `memory_governance_*`, `memory_audit_*`, archive purges. |
-| `power` | core + smart-tier LLM tools | Smart/autonomous tier deployments that want `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction` always available. |
-| `full` | every family — 43 tools | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. |
+| `core` (default) | **7 + bootstrap at v0.7.0** (the original 5 + `memory_load_family` + `memory_smart_load`) | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
+| `graph` | core + Graph family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths` / `memory_verify` / `memory_replay` / the entity + taxonomy tools. |
+| `admin` | core + Lifecycle + Governance families | Operator sessions doing `memory_pending_*`, `memory_check_agent_action`, `memory_rule_list`, agent registration, lifecycle ops. |
+| `power` | core + Power family | Smart/autonomous tier deployments that want `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_check_duplicate`, `memory_inbox`, the subscription-reliability tools, etc. always available. |
+| `full` | every family — **74 advertised entries at v0.7.0** (73 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
-**v0.7 always-on additions:** `memory_load_family(family)` and `memory_smart_load(intent)` are advertised under every profile. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
+**v0.7 core additions:** `memory_load_family(family)` and `memory_smart_load(intent)` live in the Core family, so every named profile (all of which include core) advertises them. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
 
 ```bash
 ai-memory mcp                       # --profile core (default)
@@ -386,7 +650,7 @@ The `--profile` flag **must** be passed in the MCP args — `config.toml` has no
 
 ## Hooks (v0.7+)
 
-The hook pipeline (Track G of `attested-cortex`) adds **20 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
+The hook pipeline (Track G of `attested-cortex`) adds **25 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback). Authoritative enum: `src/hooks/events.rs::HookEvent`. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
 
 ```toml
 # ~/.config/ai-memory/hooks.toml
@@ -414,19 +678,25 @@ Per-agent Ed25519 keypairs sign every outbound `memory_links` write. Inbound wri
 ai-memory identity generate --agent-id "ai:claude-code@host:pid-12345"
 ai-memory identity list
 ai-memory identity export-pub --agent-id "ai:claude-code@host:pid-12345"
-ai-memory identity suggest-id                # prints a sensible default for $HOSTNAME / current process
+ai-memory identity import --agent-id peer-1 --pub ./peer-1.pub   # enrol a peer's public key
 ```
 
 Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode `0644` / `0600`. The private key never leaves the host; only the `.pub` is exchanged with peers (via `identity export-pub`, by hand or out-of-band).
 
-**`attest_level` enum** stamped on every link:
+**`attest_level` enum** (five variants at v0.7.0 — `src/models/link.rs::AttestLevel`):
 - `unsigned` — no keypair present for the writer; preserves v0.6.4 backward compat
 - `self_signed` — active agent has a keypair; outbound writes are signed
-- `peer_attested` — federated link verified against the peer's pinned public key
+- `peer_attested` — federated link verified against the peer's pinned public key (H3 inbound)
+- `signed_by_peer` — L4 `memory_capture_turn` host-signed memory, verified against `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST` (#1389/RFC-0001)
+- `daemon_signed` — the substrate's own signature on its governance-audit emissions
 
-The `memory_verify(link_id)` MCP tool returns `{signature_verified, attest_level, signed_by, signed_at}` for any link on demand. Use it as a verification gate in any decision path that previously trusted `metadata.agent_id` alone.
+The `memory_verify` MCP tool (and `POST /api/v1/links/verify` /
+`POST /api/v1/memory_verify`) returns
+`{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`
+for any link on demand. Use it as a verification gate in any decision
+path that previously trusted `metadata.agent_id` alone.
 
-**Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP2 — available only in the AgenticMem commercial layer. Software-only Ed25519 with file-mode 0600 is the OSS contract. See [MIGRATION § Ed25519 attestation](MIGRATION_v0.7.md#ed25519-attestation-opt-in) and the [`attested-cortex` RFC § Decision 1](v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20) for the threat model and the X25519 / ChaCha20 deferral rationale.
+**Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP — available only in the AgenticMem commercial layer. Software-only Ed25519 with file-mode 0600 is the OSS contract. See [MIGRATION § Ed25519 attestation](MIGRATION_v0.7.md#ed25519-attestation-opt-in) and the [`attested-cortex` RFC § Decision 1](v0.7/rfc-attested-cortex.md#decision-1--why-ed25519-over-x25519--chacha20) for the threat model and the X25519 / ChaCha20 deferral rationale.
 
 ## Transcripts & Replay (v0.7+)
 
@@ -456,9 +726,10 @@ CREATE EXTENSION IF NOT EXISTS age;
 ```
 
 ```bash
-ai-memory doctor --kg-backend
-# kg_backend = "age"   ← AGE detected, Cypher path active
-# kg_backend = "cte"   ← AGE not detected, recursive-CTE fallback
+# schema-init enumerates the target store's catalog, including
+# installed extensions — AGE present ⇒ Cypher path; absent ⇒ the
+# recursive-CTE fallback stays in place (see docs/kg-backend-fallback.md).
+ai-memory schema-init --store-url postgres://… 
 ```
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship in a given build — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your Postgres + hardware combination, stay on the CTE path; the substrate is happy with either. See [MIGRATION § Apache AGE acceleration](MIGRATION_v0.7.md#apache-age-acceleration-opt-in) and the [`attested-cortex` RFC § Decision 3](v0.7/rfc-attested-cortex.md#decision-3--why-age-behind-a-feature-flag-vs-hard-dependency) for why AGE ships behind a feature flag instead of as a hard dependency.
@@ -524,37 +795,45 @@ ai-memory governance migrate-to-permissions --apply       # commit
 
 Re-running is safe — already-migrated rows are skipped. The dry-run output is the authoritative diff to review before `--apply`.
 
-**A2A approval API** (Track K10) — three surfaces, all HMAC-signed (mandatory, non-optional per ROADMAP2 §7.3):
+**A2A approval API** (Track K10) — three surfaces; the HTTP decide
+path is HMAC-gated (`X-AI-Memory-Signature: sha256=<hex>` over the
+body):
 
 | Surface | Endpoint / tool |
 |---|---|
-| HTTP | `GET /api/v1/approvals/pending`, `POST /api/v1/approvals/:id/decide` |
-| SSE | `GET /api/v1/approvals/stream` (live updates for human-in-the-loop UIs) |
-| MCP | `memory_approval_pending`, `memory_approval_decide(id, decision, remember=forever?)` |
+| HTTP | `GET /api/v1/pending` (list), `POST /api/v1/approvals/{pending_id}` (decide — body `{"decision":"approve\|deny","remember":"once\|session\|forever"}`), plus the per-id `POST /api/v1/pending/{id}/approve` / `…/reject` pair |
+| SSE | `GET /api/v1/approvals/stream` (live `approval_requested` / `approval_decided` events for human-in-the-loop UIs) |
+| MCP | `memory_pending_list`, `memory_pending_approve(id)`, `memory_pending_reject(id)` (the v0.7-alpha draft names `memory_approval_pending` / `memory_approval_decide` did not ship) |
 
-Set `remember=forever` on a `decide` call to enable **progressive trust** — subsequent identical requests auto-approve. Use sparingly; an over-eager `remember=forever` on a sensitive rule effectively turns enforcement off for that request shape.
+Set `remember: "forever"` on a decide call to enable **progressive trust** — subsequent identical requests auto-approve. Use sparingly; an over-eager `remember=forever` on a sensitive rule effectively turns enforcement off for that request shape.
 
 **G1 inheritance fix (behavior change for pre-v0.6.3.1 v0.6.x users):** `resolve_governance_policy(namespace)` now walks the full namespace chain and honors the first non-null policy encountered, instead of stopping at the leaf. A parent `Approve` policy now blocks child writes that previously slipped through. To preserve pre-v0.6.3.1 behavior on a specific child, set `inherit = false` on its policy. See [MIGRATION § G1 inheritance fix](MIGRATION_v0.7.md#g1-inheritance-fix-behavior-change) for the worked example.
 
 ## Subscriptions & Webhooks
 
-The HTTP daemon exposes **HMAC-signed webhook subscriptions** that turn the memory store into a message bus. Subscribers register a URL + filter (namespace, agent_id, event type), the daemon POSTs JSON payloads on matching events, and every payload carries an `X-Memory-Signature` header (HMAC-SHA256 over the body using the shared secret).
+The HTTP daemon exposes **HMAC-signed webhook subscriptions** that turn the memory store into a message bus. Subscribers register a URL + filter (namespace, agent_id, event type), the daemon POSTs JSON payloads on matching events, and every payload carries an `X-AI-Memory-Signature: sha256=<hex>` header (HMAC-SHA256 over the body using the shared secret).
 
 ```bash
-# Register a subscription
+# Register a subscription (`events` is a comma-separated string;
+# default "*" = every event type)
 curl -X POST http://127.0.0.1:9077/api/v1/subscriptions \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://my-app.local/webhook",
     "secret": "shared-hmac-secret",
-    "events": ["memory_stored", "approval_requested"],
-    "namespace": "team/*"
+    "events": "memory_store,approval_requested",
+    "namespace_filter": "team/project-x"
   }'
 ```
 
 **SSRF hardening:** the subscription dispatcher refuses URLs resolving to private/loopback ranges (RFC1918, link-local, loopback) unless explicitly allowlisted at daemon startup. Webhook URLs that fail the resolution check at registration time are rejected with `400 Bad Request`.
 
-**v0.7 event additions:** `transcript_stored`, `transcript_archived`, `signed_event_appended`, `permission_decision`, `approval_requested`, `approval_decided` join the v0.6.x event set. Subscribe to `approval_requested` to feed the human-in-the-loop UI; subscribe to `signed_event_appended` to feed an external audit pipeline.
+**Canonical event types** (`WEBHOOK_EVENT_TYPES` in
+`src/subscriptions.rs`): `memory_store`, `memory_promote`,
+`memory_delete`, `memory_link_created`, `memory_link_invalidated`,
+`memory_consolidated`, and the v0.7 addition `approval_requested`
+(subscribe to it to feed a human-in-the-loop UI; the paired
+`approval_decided` event rides the K10 SSE stream).
 
 For the full event catalog, payload shapes, and the retry / backoff contract, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) and the relevant [V0.7-EPIC](v0.7/V0.7-EPIC.md) tracks once they merge.
 
@@ -563,7 +842,7 @@ For the full event catalog, payload shapes, and the retry / backoff contract, se
 See [Database Management → Backup](#backup) and [Database Management → Restore](#restore) below for the canonical procedures (live `sqlite3 .backup`, JSON export, file copy with WAL checkpoint). v0.7-specific notes:
 
 - The `signed_events` table (schema v21) is **append-only through the application layer** but is a regular SQLite table at the storage layer — `.backup` and `VACUUM` work normally. Do not `DELETE` from it manually unless you're rebuilding the audit chain from a known-good source.
-- The `memory_transcripts` and `memory_transcript_links` tables (schema v22) carry the zstd-3 BLOBs. They can be large — size the backup destination accordingly. To exclude transcripts from a JSON export, pass `--exclude transcripts` to `ai-memory export`.
+- The `memory_transcripts` and `memory_transcript_links` tables (schema v22) carry the zstd-3 BLOBs. They can be large — size the backup destination accordingly. `ai-memory export` covers memories + links only; transcripts ride along in file-level backups (`sqlite3 .backup` / `VACUUM INTO`).
 - Ed25519 private keys at `~/.config/ai-memory/keys/*.priv` are **NOT** part of the database backup. Back them up separately, with the same care you'd give an SSH private key — losing them means losing the ability to sign as that agent. Public keys (`.pub`) are recoverable from peers via `identity export-pub`.
 
 ## Graceful Shutdown
@@ -633,13 +912,32 @@ systemctl start ai-memory
 
 ### Migration
 
-The schema is auto-migrated on startup. The `schema_version` table tracks the current version (currently 4). Migrations are forward-only and non-destructive.
-
-- v1 -> v2: Added `confidence` (REAL) and `source` (TEXT) columns
-- v2 -> v3: Added `embedding` (BLOB) column for storing dense vector embeddings
-- v3 -> v4: Added `archived_memories` table for GC archival
+The schema is auto-migrated on startup. The `schema_version` table tracks the current version; the canonical tip is the `CURRENT_SCHEMA_VERSION` constant in `src/storage/migrations.rs`, whose doc-comments carry the full per-version ladder. Migrations are forward-only and non-destructive.
 
 Migration error handling: only expected errors (e.g., "duplicate column" when re-running a migration) are silently ignored. Real failures are propagated and will prevent startup, ensuring data integrity.
+
+#### Rollback — snapshot-restore ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576))
+
+There is **no migration downgrade path — forward-only is by design**; the supported rollback is restoring the automatic pre-migration snapshot.
+
+Before any schema-mutating upgrade runs, the binary snapshots the live SQLite file as a **sibling of the database** (never a temp dir), named:
+
+```
+<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak
+# e.g. ai-memory.db.pre-migration-v54-to-v55-1765300000000000000.bak
+```
+
+(`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`; `<token>` is a monotonic nanosecond timestamp so repeated upgrades never collide.) The snapshot is produced with `VACUUM INTO`, so it is a transactionally-consistent, openable database — pending WAL frames are folded in and the source connection's SQLCipher keying is inherited. The migration **refuses to mutate the schema if the snapshot fails**.
+
+Supported rollback procedure:
+
+1. Stop the daemon: `sudo systemctl stop ai-memory`
+2. Reinstall the previous binary (package downgrade, or restore the saved binary)
+3. Restore the snapshot over the live file: `cp /var/lib/ai-memory/ai-memory.db.pre-migration-v<FROM>-to-v<TO>-<token>.bak /var/lib/ai-memory/ai-memory.db`
+4. Remove stale WAL siblings: `rm -f /var/lib/ai-memory/ai-memory.db-wal /var/lib/ai-memory/ai-memory.db-shm`
+5. Start the daemon: `sudo systemctl start ai-memory`
+
+A missed step fails loudly rather than corrupting data: the substrate refuses to start a binary against a database newer than the schema it expects. Writes that landed between the migration and the rollback are lost with the snapshot restore — that is the rollback contract; drain traffic first if those writes matter. Postgres deployments roll back with their standard `pg_dump`/`pg_restore` discipline (see [`production-deployment.md` §4](production-deployment.md)).
 
 ### Upgrade Procedure
 
@@ -700,11 +998,23 @@ context and the threat model are tracked on issue [#148](https://github.com/alph
 
 ### Trust model
 
-**`metadata.agent_id` is a *claimed* identity, not an *attested* one.** Any
+**By default `metadata.agent_id` is a *claimed* identity, not an *attested* one.** Any
 caller able to invoke the CLI / MCP / HTTP API can set any well-formed
-`agent_id`. Use it for provenance, audit, and filter scoping — **never as an
-authorization gate on its own.** True attestation arrives with agent
-registration (Task 1.3).
+`agent_id` on an *unsigned* write. Use such an id for provenance, audit, and
+filter scoping — **never as an authorization gate on its own.**
+
+**Store-path attestation (#626 Layer-3, v0.7.0).** A caller holding the agent's
+keypair can upgrade a write from claimed to attested by presenting a detached
+Ed25519 `signature` over the canonical `SignableWrite` envelope (`agent_id` +
+`namespace` + `title` + `kind` + `created_at` + `sha256(content)`) on any store
+surface — CLI (`ai-memory store --sign`), MCP (`memory_store`), or HTTP
+(`POST /api/v1/memories`). The daemon verifies it against the agent's bound
+public key (registered via `memory_agent_register` + bind-key) and stamps
+`metadata.attest_level = "agent_attested"`; a forged signature is rejected with
+`403 ATTESTATION_FAILED`. Set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy) to
+**require** attestation — unsigned writes are then rejected rather than landing
+claimed (default is permissive, preserving the v0.6.x posture). Agent
+registration itself landed earlier as Task 1.3.
 
 ### Resolution precedence
 
@@ -722,6 +1032,31 @@ registration (Task 1.3).
 1. `agent_id` field in `POST /api/v1/memories` body
 2. `X-Agent-Id` request header
 3. `anonymous:req-<uuid8>` (synthesized per-request, logged at WARN)
+
+### Read-path visibility caller (v0.7.0 #1468 / #1469)
+
+The precedence ladders above resolve the **write-path** identity that gets
+stamped into `metadata.agent_id`. The MCP **read** tools that enforce
+per-row `scope=private` ownership — `memory_session_start`, `memory_list`,
+`memory_search`, `memory_recall` — resolve their *visibility caller*
+through a **separate, narrower** ladder:
+
+1. `AI_MEMORY_AGENT_ID` environment variable (when set + shape-valid)
+2. `None` — trust-all, single-tenant read posture
+
+The pid-synthesized `ai:<client>@<host>:pid-<pid>` clientInfo identity is
+**deliberately NOT** used for the read-path visibility caller: it embeds
+the live PID, so it can never equal the `metadata.agent_id` an *earlier*
+process wrote, which would make every prior-session private row invisible
+to its own owner. When `AI_MEMORY_AGENT_ID` is set, the read tools drop
+cross-agent `scope=private` rows (rows owned by a different agent and not
+shared/targeted at the caller) before they reach the wire; collective and
+caller-owned rows always pass. When it is unset, the read path keeps the
+v0.6.x trust-all behavior and returns every matching row.
+
+Operators running a multi-tenant MCP host therefore MUST set
+`AI_MEMORY_AGENT_ID` per tenant to get private-row isolation on reads;
+leaving it unset is a single-tenant deployment choice, not a leak.
 
 ### Validation
 
@@ -832,14 +1167,14 @@ All ID path parameters (e.g., `/memories/{id}`, `/links/{id}`) are validated bef
 ### Input Validation
 
 All write paths go through the validation layer (`validate.rs`):
-- Title: max 512 bytes, no null bytes
+- Title: max 512 chars, no control chars
 - Content: max 64KB, no null bytes
-- Namespace: max 128 bytes, no slashes/spaces/nulls
-- Source: whitelist (user, claude, hook, api, cli, import, consolidation, system)
+- Namespace: max 512 chars; `/` allowed as hierarchy delimiter (no leading/trailing/empty segments); no backslashes/spaces/nulls
+- Source: whitelist (user, nhi, claude [deprecated], hook, api, cli, import, consolidation, system, chaos, notify)
 - Tags: max 50 tags, each max 128 bytes
 - Priority: 1-10
 - Confidence: 0.0-1.0, finite
-- Relations: whitelist (related_to, supersedes, contradicts, derived_from)
+- Relations: whitelist — six at v0.7.0 (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from)
 - IDs: max 128 bytes, no null bytes
 - Timestamps: valid RFC3339
 - TTL: positive, max 1 year
@@ -856,7 +1191,25 @@ The HTTP server uses `CorsLayer::new()` (deny-by-default) since v0.5.4-patch.6. 
 
 ### Authentication
 
-There is no API-key or token authentication mechanism for the standard MCP / HTTP / CLI surface. This is by design — the daemon is intended for localhost access only by your AI client.
+The HTTP daemon takes an optional shared API key — the top-level `api_key = "…"` field in `config.toml` (there is no `--api-key` serve flag; the Plan-C container entrypoint injects it via `AI_MEMORY_API_KEY`). When configured, every endpoint except `/api/v1/health` requires it. **The supported credential channel is the `x-api-key` request header**; the `?api_key=` query-parameter form is **deprecated** ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — URL-embedded credentials leak into access logs, `Referer` headers, and proxy logs. The query form is still accepted at v0.7.0 for back-compat (once-per-process WARN on first use) and is slated for rejection at v0.8 behind a temporary escape hatch. `AI_MEMORY_REQUIRE_API_KEY=1` hard-refuses keyless daemon start on any bind host ([#1458](https://github.com/alphaonedev/ai-memory-mcp/issues/1458)).
+
+With no `api_key` configured the standard HTTP surface is unauthenticated — acceptable only for the default localhost-bound, single-user posture. The MCP (stdio) and CLI surfaces have no key mechanism by design; they are local-process interfaces.
+
+**Admin-role gate (v0.7.0 #943/#945/#946 cluster + #1570).**
+Corpus-scale endpoints (`/stats`, `/gc`, `/export`, `/import`,
+`/agents` list, `/forget`, `/namespaces` list, `/taxonomy`,
+`/archive` list + stats, `/skill/*`) additionally require an **admin**
+caller. The allowlist is `[admin] agent_ids = [...]` in `config.toml`
+plus the `AI_MEMORY_ADMIN_AGENT_IDS` env var; when empty (the default)
+these endpoints return 403 to every caller. Per
+[#1570](https://github.com/alphaonedev/ai-memory-mcp/issues/1570), the
+secure default is `AI_MEMORY_ADMIN_HEADER_TRUST` **OFF**: on a
+deployment with admin ids configured but NO `api_key`, a bare
+self-asserted `X-Agent-Id` naming an admin id is REFUSED admin-role
+resolution, and the daemon emits a boot WARN naming the flag. Set
+`AI_MEMORY_ADMIN_HEADER_TRUST=1` only on isolated / mTLS-fronted
+deployments that need the legacy trust-the-header posture. Every
+admin-role decision (allow or deny) lands in the forensic audit chain.
 
 For the **peer-to-peer sync mesh** (v0.6.0+), authentication is provided by mTLS fingerprint pinning — see "Peer-mesh security" above. Sync endpoints WITHOUT mTLS are unauthenticated and MUST NOT be exposed to untrusted networks.
 
@@ -892,9 +1245,58 @@ When `sync-daemon` is invoked without `--client-cert`, the underlying reqwest cl
 
 #### Any valid mTLS peer can dump the full database (issue #239)
 
-`GET /api/v1/sync/since?since=<old-ts>` paginates the entire database. By design — the trust boundary IS the mTLS cert — but the implication is that **a compromised peer cert grants access to every memory**, including `scope: private` memories from other agents' namespaces. Sync endpoints bypass the per-memory visibility filtering used by `/recall`.
+> **OPERATOR ADVISORY — mTLS certificates are full trust anchors.**
+> A compromised peer cert grants access to **every memory in the
+> database**. The sync substrate's threat model trusts the cert and
+> stops there. There is no per-memory authorization layer behind it.
 
-**Allowlist only peers you fully trust.** Per-namespace / per-scope sync filtering is a Phase 5 feature (post-v0.6.0).
+`GET /api/v1/sync/since?since=<old-ts>` (or omit `since` to start from
+the epoch) paginates the **entire database**, including:
+
+- `scope: private` memories from other agents' namespaces
+- Memories that `/recall` would have filtered for visibility
+- Memories with `agent_id` belonging to other principals
+- Operator-signed governance rules (the `governance_rules` table is
+  exposed for federation parity)
+- Reflection chains and persona artifacts
+
+This is **documented and intentional** — the trust boundary IS the
+mTLS cert. Sync endpoints deliberately bypass the per-memory
+visibility filtering used by `/recall` because federation needs the
+full row to merge correctly (CRDT-style). The implication is the
+operator must treat every entry on the `--mtls-allowlist` as a
+full-database read principal.
+
+**Required operator discipline:**
+
+1. **Allowlist only peers you fully trust at the database level.**
+   Treat each fingerprint as "this principal can read everything".
+   Do not allowlist peers operated by other tenants, other security
+   zones, or other regulatory contexts.
+2. **Compromise model: a peer cert leak == full DB leak.** Plan for
+   cert rotation if a peer host is compromised. SHA-256 fingerprints
+   are easy to rotate (`openssl x509 -outform DER | sha256sum` →
+   replace the line in the allowlist file → SIGHUP `serve`).
+3. **Per-host cert separation.** Issue a distinct client cert per
+   peer host (not a wildcard CA-signed cert that any host could
+   reissue from). This narrows the blast radius of a single host
+   compromise to that host's fingerprint.
+4. **Audit the allowlist on every deployment.** The fingerprint set
+   is the security perimeter — review it the same way you'd review a
+   firewall rule.
+5. **Cross-tenant separation requires separate databases.** If two
+   tenants need isolated memory but want federation within each
+   tenant, run two `ai-memory serve` processes on different ports
+   with non-overlapping `--mtls-allowlist` files. The sync substrate
+   does not enforce namespace-level tenancy across mTLS peers.
+
+**Roadmap to per-namespace / per-scope sync filtering.** Per-memory
+visibility filtering on `/sync/since` is a Phase 5 hub feature
+(post-v0.7.0, tracked under [#311](https://github.com/alphaonedev/ai-memory-mcp/issues/311)
+for the targeted-share variant and under [#717](https://github.com/alphaonedev/ai-memory-mcp/issues/717)
+for cert-SAN agent-id attestation). v0.7.0 ships the mTLS full-trust
+model documented above as the canonical disposition for the
+`alphaonedev/ai-memory-mcp` v0.7.0 release line.
 
 #### Body-claimed sender_agent_id is not yet attested (issue #238)
 
@@ -954,9 +1356,9 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 ## HTTP API Endpoints
 
-Maximum request body size: 50 MB.
+Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **50 endpoints** under `/api/v1`:
+The HTTP daemon exposes **89 production `.route(...)` registrations / 75 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1012,18 +1414,18 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
 **Required fields:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `title` | string | Memory title (max 512 bytes) |
+| `title` | string | Memory title (max 512 chars) |
 | `content` | string | Memory content (max 64 KB) |
 
 **Optional fields:**
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tier` | string | `"mid"` | `"short"`, `"mid"`, or `"long"` |
-| `namespace` | string | `"global"` | Namespace for grouping (max 128 bytes, no slashes/spaces) |
+| `namespace` | string | `"global"` | Namespace for grouping (max 512 chars; `/` hierarchy delimiter allowed; no spaces) |
 | `tags` | array | `[]` | String tags (max 50 tags, each max 128 bytes) |
 | `priority` | integer | `5` | 1-10 (clamped) |
 | `confidence` | float | `1.0` | 0.0-1.0 (clamped) |
-| `source` | string | `"api"` | One of: `user`, `claude`, `hook`, `api`, `cli`, `import`, `consolidation`, `system` |
+| `source` | string | `"api"` | One of `VALID_SOURCES`: `user`, `nhi`, `claude` (deprecated), `hook`, `api`, `cli`, `import`, `consolidation`, `system`, `chaos`, `notify` |
 | `expires_at` | string | (none) | Explicit expiry timestamp (RFC3339) |
 | `ttl_secs` | integer | (none) | TTL in seconds (overrides tier default) |
 
@@ -1034,9 +1436,13 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "tier": "long",
   "namespace": "infra",
-  "title": "Project uses PostgreSQL 16"
+  "title": "Project uses PostgreSQL 16",
+  "agent_id": "alice"
 }
 ```
+
+(`agent_id` echoes the resolved caller identity per #196; `null` when
+the write landed anonymously.)
 
 If potential contradictions are found (memories with similar titles in the same namespace), the response includes:
 
@@ -1060,7 +1466,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   -d '{"title": "Quick note", "content": "Something to remember."}'
 ```
 
-Response: `{"id": "...", "tier": "mid", "namespace": "global", "title": "Quick note"}`
+Response: `{"id": "...", "tier": "mid", "namespace": "global", "title": "Quick note", "agent_id": null}`
 
 #### GET /memories/{id} (Get)
 
@@ -1120,8 +1526,8 @@ curl "http://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&na
 | `namespace` | string | (none) | Filter by namespace |
 | `limit` | integer | `10` | Max results (capped at 50) |
 | `tags` | string | (none) | Comma-separated tag filter |
-| `since` | string | (none) | Only memories updated after this RFC3339 timestamp |
-| `until` | string | (none) | Only memories updated before this RFC3339 timestamp |
+| `since` | string | (none) | Only memories created after this RFC3339 timestamp |
+| `until` | string | (none) | Only memories created before this RFC3339 timestamp |
 
 **Response (200 OK):**
 
@@ -1258,7 +1664,7 @@ curl "http://127.0.0.1:9077/api/v1/archive?namespace=infra&limit=20&offset=0"
 
 #### POST /archive/{id}/restore (Restore)
 
-Restore an archived memory back to the active memories table. The restored memory has its `expires_at` cleared (becomes permanent).
+Restore an archived memory back to the active memories table. The archived row's `original_tier` and `original_expires_at` are re-applied where present (legacy archive rows restore as `long` with no expiry).
 
 ```bash
 curl -X POST http://127.0.0.1:9077/api/v1/archive/expired-memory-id/restore
@@ -1360,11 +1766,15 @@ The project uses GitHub Actions for continuous integration and release automatio
 Runs on `ubuntu-latest` and `macos-latest`:
 
 1. **Formatting** -- `cargo fmt --check`
-2. **Linting** -- `cargo clippy -- -D warnings`
-3. **Tests** -- `cargo test` (1,600 lib tests; canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html))
-4. **Build** -- `cargo build --release`
+2. **Linting** -- `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`
+3. **Tests** -- `AI_MEMORY_NO_CONFIG=1 cargo test` (canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html))
+4. **Dependency audit** -- `cargo audit`
 
-Uses `Swatinem/rust-cache@v2` for build caching.
+Plus the script-based gates in `c8-precheck.yml` (caller-context
+allowlist, vendor-literal lint, hardcoded-literal ratchet,
+docs-vs-SSOT drift) and per-module coverage floors from
+`coverage/thresholds.toml`. Uses `Swatinem/rust-cache@v2` for build
+caching.
 
 ### Release (On Tag Push)
 

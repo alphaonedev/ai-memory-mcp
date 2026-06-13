@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Architectures — five tiers from laptop to global hive</title>
-<meta name="description" content="Five reference architectures for ai-memory — from a single agent on a laptop to a globally federated hive of millions. With honest 'today vs roadmap' markers per v0.6.3.">
+<meta name="description" content="Five reference architectures for ai-memory — from a single agent on a laptop to a globally federated hive of millions. With honest 'today vs roadmap' markers per v0.7.0.">
 <meta property="og:title" content="ai-memory · Architectures">
 <meta property="og:description" content="Five reference architectures for ai-memory — from one agent to a global hive.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures.html">
@@ -86,6 +86,17 @@ ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 
 ul li,ol li{margin-bottom:.35rem}
 section h2{font-family:var(--font-sans);font-size:1.75rem;margin-bottom:.6rem}
 section p{margin-bottom:.85rem}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -95,11 +106,14 @@ section p{margin-bottom:.85rem}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -122,6 +136,7 @@ section p{margin-bottom:.85rem}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -133,6 +148,9 @@ section p{margin-bottom:.85rem}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -142,33 +160,101 @@ section p{margin-bottom:.85rem}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>ai-memory architectures</h1>
-  <p class="tagline">A primitive that scales from <strong>one agent</strong> on a laptop to a <strong>global hive</strong> of millions. Every tier ships either today, or sits behind a documented gap with a known roadmap. Nothing on this page is marketing fiction — every "today" claim cites code in the v0.6.3 source tree.</p>
+  <p class="tagline">A primitive that scales from <strong>one agent</strong> on a laptop to a <strong>global hive</strong> of millions. Every tier ships either today, or sits behind a documented gap with a known roadmap. Nothing on this page is marketing fiction — every "today" claim cites code in the v0.7.0 source tree.</p>
   <div class="pills">
     <span class="pill">5 tiers</span>
     <span class="pill">T1–T3 ship today</span>
-    <span class="pill">T4 partial · v0.7 GA</span>
+    <span class="pill">T4 SHIPPED v0.7.0 GA</span>
     <span class="pill">T5 vision · v1.0+</span>
   </div>
 </section>
@@ -208,10 +294,10 @@ section p{margin-bottom:.85rem}
       <a href="architectures-t4.html" class="arch-tier-card">
         <span class="tier-id">TIER 4</span>
         <h3>Data-center swarm</h3>
-        <p>Multi-rack deployment with quorum writes shipping today; <strong>Postgres+pgvector backbone</strong> behind <code>sal-postgres</code> feature flag, GA targeted v0.7.</p>
+        <p>Multi-rack deployment with quorum writes shipping today; <strong>Postgres+pgvector backbone</strong> behind the <code>sal-postgres</code> feature flag, GA at v0.7.0.</p>
         <span class="tier-scale">SCALE: 100s nodes · 1000s agents · racked &amp; zoned</span>
         <span class="cap-badge cap-today">CORE TODAY</span>
-        <span class="cap-badge cap-roadmap">PG GA · v0.7</span>
+        <span class="cap-badge cap-today">PG GA · v0.7.0</span>
       </a>
 
       <a href="architectures-t5.html" class="arch-tier-card">
@@ -220,6 +306,30 @@ section p{margin-bottom:.85rem}
         <p>Multi-region cloud, attested agent identity, federated governance, hundreds of thousands to millions of agents acting as a unified collective.</p>
         <span class="tier-scale">SCALE: multi-region · 10⁵–10⁶ agents · attested</span>
         <span class="cap-badge cap-future">VISION v1.0+</span>
+      </a>
+
+      <a href="reference-architecture/" class="arch-tier-card">
+        <span class="tier-id">GRAND SLAM</span>
+        <h3>3-region federated hive — proven live</h3>
+        <p>The reference proof behind the T3–T5 claims: 15 nodes, 9 federated peers, W=2 quorum, three encryption legs each proven positive + negative, Batman MAXIMUM-SECURE posture (do-1461).</p>
+        <span class="tier-scale">SCALE: 3 regions · 15 nodes · 119/119 verify ×2 clean-room rounds</span>
+        <span class="cap-badge cap-today">PROVEN LIVE</span>
+      </a>
+
+      <a href="reference-architecture/enterprise-cpu-memory.md" class="arch-tier-card">
+        <span class="tier-id">ENTERPRISE</span>
+        <h3>CPU + Memory federated nodes</h3>
+        <p>API embeddings (#1598) on commodity CPU nodes — OpenRouter gemini-embedding-2 cloud shape or self-hosted TEI/vLLM airgapped shape. No Ollama anywhere; full semantic/autonomous tier on GPU-free fleets.</p>
+        <span class="tier-scale">SHAPE: federated mesh · API embeddings 80–300 ms · no GPU</span>
+        <span class="cap-badge cap-today">CORE TODAY · #1598</span>
+      </a>
+
+      <a href="reference-architecture/enterprise-cpu-memory-gpu.md" class="arch-tier-card">
+        <span class="tier-id">ENTERPRISE</span>
+        <h3>CPU + Memory + GPU federated nodes</h3>
+        <p>Local Ollama embeddings on GPU-equipped nodes (operator GPU policy), same hardened federation skeleton. Lowest embed latency, zero per-token cost, no embedding egress — includes the when-to-choose-which table.</p>
+        <span class="tier-scale">SHAPE: federated mesh · localhost GPU embed 5–30 ms</span>
+        <span class="cap-badge cap-today">CORE TODAY · #1598</span>
       </a>
 
     </div>
@@ -345,16 +455,16 @@ section p{margin-bottom:.85rem}
           <td><span class="cap-badge cap-partial">feature flag</span></td>
           <td><span class="cap-badge cap-partial">feature flag</span></td>
           <td><span class="cap-badge cap-partial">feature flag</span></td>
-          <td><span class="cap-badge cap-roadmap">GA · v0.7</span></td>
-          <td><span class="cap-badge cap-roadmap">GA · v0.7</span></td>
+          <td><span class="cap-badge cap-today">GA · v0.7.0</span></td>
+          <td><span class="cap-badge cap-today">GA · v0.7.0</span></td>
         </tr>
         <tr>
-          <td>Cryptographic agent attestation (<code>signature</code> field)</td>
-          <td>—</td>
-          <td>—</td>
-          <td><span class="cap-badge cap-roadmap">field reserved</span></td>
-          <td><span class="cap-badge cap-roadmap">v0.7</span></td>
-          <td><span class="cap-badge cap-future">v1.0+</span></td>
+          <td>Cryptographic agent attestation (Ed25519 <code>signature</code>, #626 Layer-3)</td>
+          <td><span class="cap-badge cap-today">YES</span></td>
+          <td><span class="cap-badge cap-today">YES</span></td>
+          <td><span class="cap-badge cap-today">YES</span></td>
+          <td><span class="cap-badge cap-today">YES</span></td>
+          <td><span class="cap-badge cap-future">hive scale · v1.0+</span></td>
         </tr>
         <tr>
           <td>Distributed consensus (Raft / Paxos)</td>
@@ -389,7 +499,7 @@ section p{margin-bottom:.85rem}
     </ul>
     <p>What stays the same:</p>
     <ul>
-      <li>The 43 MCP tools and 50 HTTP endpoints.</li>
+      <li>The MCP tools (74 advertised at <code>--profile full</code>, 7 at <code>--profile core</code>) and 88 HTTP routes (75 unique paths) at <code>/api/v1/</code>.</li>
       <li>The recall pipeline (FTS5 + HNSW + adaptive blending).</li>
       <li>The tier model (<code>short</code> / <code>mid</code> / <code>long</code>).</li>
       <li>The namespace hierarchy and scope visibility filter.</li>
@@ -403,16 +513,16 @@ section p{margin-bottom:.85rem}
   <div class="container">
     <span class="eyebrow">Federation primitives</span>
     <h2>What lives in the codebase today.</h2>
-    <p class="lede">These are the building blocks every multi-node tier composes. All shipped, all in v0.6.3:</p>
+    <p class="lede">These are the building blocks every multi-node tier composes. All shipped, all in v0.7.0:</p>
     <ul>
-      <li><code>src/main.rs:405-447</code> — quorum-write CLI surface: <code>--quorum-writes N</code>, <code>--quorum-peers &lt;comma-list&gt;</code>, <code>--quorum-timeout-ms</code>, <code>--quorum-client-cert/-key/-ca-cert</code>, <code>--catchup-interval-secs</code>.</li>
-      <li><code>src/main.rs:380-393</code> — TLS / mTLS allowlist: <code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls-allowlist &lt;SHA-256 fingerprint file&gt;</code>. Allowlist presence enforces mTLS.</li>
-      <li><code>src/handlers.rs:442-454</code> — <code>broadcast_store_quorum</code> + <code>finalise_quorum</code> wired into the write path; returns <code>200 OK</code> with <code>quorum_acks</code> on success, <code>503 quorum_not_met</code> on timeout.</li>
-      <li><code>src/federation.rs</code> — <strong>10 broadcast functions</strong>: <code>broadcast_store_quorum</code>, <code>broadcast_delete_quorum</code>, <code>broadcast_archive_quorum</code>, <code>broadcast_restore_quorum</code>, <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>, <code>broadcast_namespace_meta_clear_quorum</code>.</li>
-      <li><code>src/handlers.rs</code> — <code>POST /api/v1/sync/push</code> accepts memories, deletions, archives, links, pending actions, pending decisions, namespace metadata, and (v0.6.3) entity registrations. <code>GET /api/v1/sync/since?peer=&lt;id&gt;&amp;clock=&lt;n&gt;</code> returns causally-correct deltas for a rejoining peer.</li>
-      <li><code>src/db.rs</code> — <code>compute_visibility_prefixes()</code> + <code>visibility_clause()</code> enforce scope-based recall filtering at the SQL level using the indexed <code>scope_idx</code> generated column.</li>
-      <li><code>src/models.rs</code> — <code>GovernancePolicy</code> per-namespace, <code>PendingAction</code> queue, <code>namespace_ancestors()</code> for visibility hierarchy.</li>
-      <li><code>src/replication.rs</code> (422 lines) — <code>QuorumWriter</code> + <code>AckTracker</code>, <strong>functional</strong>, wired into the write path.</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI surface: <code>--quorum-writes N</code>, <code>--quorum-peers &lt;comma-list&gt;</code>, <code>--quorum-timeout-ms</code>, <code>--quorum-client-cert/-key/-ca-cert</code>, <code>--catchup-interval-secs</code>.</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist: <code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls-allowlist &lt;SHA-256 fingerprint file&gt;</code>. Allowlist presence enforces mTLS.</li>
+      <li><code>src/federation/{sync,quorum}.rs</code> — <code>broadcast_store_quorum</code> + <code>finalise_quorum</code> wired into the handler write path; returns <code>200 OK</code> with <code>quorum_acks</code> on success, <code>503 quorum_not_met</code> on timeout.</li>
+      <li><code>src/federation/sync.rs</code> — <strong>10 broadcast functions</strong>: <code>broadcast_store_quorum</code>, <code>broadcast_delete_quorum</code>, <code>broadcast_archive_quorum</code>, <code>broadcast_restore_quorum</code>, <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>, <code>broadcast_namespace_meta_clear_quorum</code>.</li>
+      <li><code>src/handlers/</code> — <code>POST /api/v1/sync/push</code> accepts memories, deletions, archives, links, pending actions, pending decisions, namespace metadata, and (v0.6.3) entity registrations. <code>GET /api/v1/sync/since?peer=&lt;id&gt;&amp;since=&lt;ts&gt;</code> returns the rows updated after the peer's last-seen point for a rejoining peer.</li>
+      <li><code>src/storage/</code> — <code>compute_visibility_prefixes()</code> + <code>visibility_clause()</code> enforce scope-based recall filtering at the SQL level using the indexed <code>scope_idx</code> generated column.</li>
+      <li><code>src/models/</code> — <code>GovernancePolicy</code> per-namespace, <code>PendingAction</code> queue, <code>namespace_ancestors()</code> for visibility hierarchy.</li>
+      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code>, <strong>functional</strong>, wired into the write path.</li>
       <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature flag for the v0.7 GA Postgres+pgvector backbone (<code>sqlx</code> + <code>pgvector</code> deps, schema parity fixes shipped #294-#297).</li>
     </ul>
   </div>
@@ -433,13 +543,13 @@ section p{margin-bottom:.85rem}
     <p>Start at <a href="architectures-t1.html" style="color:var(--p1)">Tier 1</a> and walk forward, or jump straight to the tier that matches your fleet.</p>
 
     <div class="honesty-notice">
-      <strong>Engineering honesty.</strong> Every "ships today" claim cites a file path and behavior in the v0.6.3 source tree. Roadmap items reference ADRs and tracked work. The vision tier (T5) is the north star — we'll get there, but it's not shipping in v0.7. If a diagram shows something the code doesn't do, that's a documentation bug — please file an issue.
+      <strong>Engineering honesty.</strong> Every "ships today" claim cites a file path and behavior in the v0.7.0 source tree. Roadmap items reference ADRs and tracked work. The vision tier (T5) is the north star — we'll get there, but it's not shipping in v0.7.0. If a diagram shows something the code doesn't do, that's a documentation bug — please file an issue.
     </div>
   </div>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

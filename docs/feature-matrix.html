@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Feature Matrix — every tool, endpoint, command</title>
-<meta name="description" content="Complete surface-area atlas: 43 MCP tools, 50 HTTP endpoints, 40 CLI commands (canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
+<meta name="description" content="Complete surface-area atlas: 74 MCP tools at --profile full (7 at --profile core), 88 HTTP routes (75 unique paths) at /api/v1/, 80 CLI subcommands (default build) / 82 with --features sal; canonical counts on the evidence page). Every operation cross-referenced across the three protocol fronts.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/feature-matrix.html">
 <style>
@@ -163,6 +163,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -172,11 +183,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Feature Matrix</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html" class="current">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -199,6 +213,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -210,6 +225,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -219,35 +237,103 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>The complete surface area.</h1>
   <p class="tagline">
-    Every MCP tool, every HTTP endpoint, every CLI command — categorized, cross-referenced, signed off. <strong>43 + 50 + 40 = 133 operations</strong> exposed across three protocol fronts. One implementation underneath, three ways to call it.
+    Every MCP tool, every HTTP route, every CLI subcommand — categorized, cross-referenced, signed off. <strong>74 + 89 + 80 = 243 operations</strong> exposed across three protocol fronts at v0.7.x (#1598 added <code>reembed</code>; #1539 added the agent-pubkey bind route). One implementation underneath, three ways to call it.
   </p>
   <div class="pill-row">
-    <span class="pill"><strong>43</strong>MCP tools</span>
-    <span class="pill"><strong>50</strong>HTTP endpoints</span>
-    <span class="pill"><strong>40</strong>CLI commands</span>
+    <span class="pill"><strong>74</strong>MCP tools (<code>--profile full</code>)</span>
+    <span class="pill"><strong>88</strong>HTTP routes (75 unique paths)</span>
+    <span class="pill"><strong>80</strong>CLI subcommands (82 w/ <code>--features sal</code>)</span>
     <span class="pill"><strong>4</strong>operational modes</span>
   </div>
 </section>
@@ -271,7 +357,7 @@ footer a{color:var(--text-muted)}
         <div class="mode-icon">🌐</div>
         <div class="mode-spec">MODE 2 · Background daemon</div>
         <div class="mode-name">HTTP daemon</div>
-        <div class="mode-cmd">ai-memory serve --port 9077 --mtls-cert ...</div>
+        <div class="mode-cmd">ai-memory serve --port 9077 --tls-cert … --tls-key … --mtls-allowlist …</div>
         <div class="mode-desc">REST + SSE on TCP. mTLS-aware with fingerprint allowlist. Federation peers reach this surface. Shared multi-client server.</div>
       </div>
       <div class="mode-card m3">
@@ -285,7 +371,7 @@ footer a{color:var(--text-muted)}
         <div class="mode-icon">🤖</div>
         <div class="mode-spec">MODE 4 · Background daemon</div>
         <div class="mode-name">Curator daemon</div>
-        <div class="mode-cmd">ai-memory curator --daemon --interval-secs 1800 --tier autonomous</div>
+        <div class="mode-cmd">ai-memory curator --daemon --interval-secs 1800 --max-ops 100</div>
         <div class="mode-desc">Auto-tag, contradiction detection, consolidation. Tier-gated: smart adds LLM tagging, autonomous adds rerank + auto-merge.</div>
       </div>
     </div>
@@ -295,7 +381,7 @@ footer a{color:var(--text-muted)}
 <!-- =============== MCP TOOLS =============== -->
 <section id="mcp-tools">
   <div class="container">
-    <span class="eyebrow">43 MCP Tools</span>
+    <span class="eyebrow">74 MCP Tools (--profile full)</span>
     <h2>Every tool a host AI can call.</h2>
     <p class="lede">Auto-discovered by Claude Code, Cursor, Codex, Continue, Gemini CLI, Windsurf, and any MCP-compliant client. Tool names follow <code>memory_&lt;verb&gt;</code> convention.</p>
 
@@ -355,8 +441,8 @@ footer a{color:var(--text-muted)}
       <div class="tool-card cat-read">
         <span class="tcat read">▸ READ</span>
         <div class="tname">memory_inbox</div>
-        <div class="tdesc">Pending notifications addressed to this agent. Marks-as-read on read.</div>
-        <div class="tparams">since_cursor?, namespace?, limit?</div>
+        <div class="tdesc">Messages addressed to this agent (sent via memory_notify). access_count==0 is the unread marker.</div>
+        <div class="tparams">agent_id?, unread_only?, limit?</div>
       </div>
 
       <!-- WRITE tools -->
@@ -381,8 +467,8 @@ footer a{color:var(--text-muted)}
       <div class="tool-card cat-write">
         <span class="tcat write">▸ WRITE</span>
         <div class="tname">memory_promote</div>
-        <div class="tdesc">Tier promotion: short → mid → long, or hierarchical-vertical (clone into ancestor namespace).</div>
-        <div class="tparams">id, to_namespace?</div>
+        <div class="tdesc">Tier promotion (default: straight to long; optional target_tier stops at mid), or hierarchical-vertical clone into an ancestor namespace.</div>
+        <div class="tparams">id, target_tier?, to_namespace?</div>
       </div>
       <div class="tool-card cat-write">
         <span class="tcat write">▸ WRITE</span>
@@ -399,7 +485,7 @@ footer a{color:var(--text-muted)}
       <div class="tool-card cat-write">
         <span class="tcat write">▸ WRITE</span>
         <div class="tname">memory_link</div>
-        <div class="tdesc">Create typed link. Relation: related_to / supersedes / refines / contradicts / derived_from / etc.</div>
+        <div class="tdesc">Create typed link. Relation: related_to / supersedes / contradicts / derived_from / reflects_on / derives_from.</div>
         <div class="tparams">source_id, target_id, relation?</div>
       </div>
       <div class="tool-card cat-write">
@@ -445,8 +531,8 @@ footer a{color:var(--text-muted)}
       <div class="tool-card cat-admin">
         <span class="tcat admin">▸ ADMIN</span>
         <div class="tname">memory_capabilities</div>
-        <div class="tdesc">Self-describing introspection. Schema v2 reports tier, models, tools, hooks (planned), permissions.</div>
-        <div class="tparams">— (no parameters)</div>
+        <div class="tdesc">Self-describing introspection. Envelope schema v3 at v0.7.0 (v1/v2 negotiable via accept=) — tier, models, tools, hooks, permissions, approval.</div>
+        <div class="tparams">accept?, family?, include_schema?, verbose?</div>
       </div>
       <div class="tool-card cat-admin">
         <span class="tcat admin">▸ ADMIN</span>
@@ -457,8 +543,8 @@ footer a{color:var(--text-muted)}
       <div class="tool-card cat-admin">
         <span class="tcat admin">▸ ADMIN</span>
         <div class="tname">memory_session_start</div>
-        <div class="tdesc">Returns recent context + session_id. The Claude Code hook critical path. Sub-100ms p95.</div>
-        <div class="tparams">agent_id?, namespace?, limit?</div>
+        <div class="tdesc">Returns recent + high-priority context. The Claude Code hook critical path. Sub-100ms p95.</div>
+        <div class="tparams">namespace?, limit?, format?</div>
       </div>
       <div class="tool-card cat-admin">
         <span class="tcat admin">▸ ADMIN</span>
@@ -470,15 +556,15 @@ footer a{color:var(--text-muted)}
         <span class="tcat admin">▸ ADMIN</span>
         <div class="tname">memory_namespace_*</div>
         <div class="tdesc">3 tools: get_standard / set_standard / clear_standard. Per-namespace policy + governance hooks.</div>
-        <div class="tparams">namespace, standard?</div>
+        <div class="tparams">namespace, id (standard memory), parent?, governance?</div>
       </div>
 
       <!-- FED tools -->
       <div class="tool-card cat-fed">
         <span class="tcat fed">▸ FED</span>
         <div class="tname">memory_subscribe</div>
-        <div class="tdesc">Register webhook for events. HMAC-signed bodies. Glob-pattern namespace filter.</div>
-        <div class="tparams">url, events?[], namespace_filter?, secret?</div>
+        <div class="tdesc">Register webhook for events. HMAC-signed bodies (mandatory at v0.7.0). Glob-pattern namespace filter.</div>
+        <div class="tparams">url, secret, event_types?[], namespace_filter?, agent_filter?</div>
       </div>
       <div class="tool-card cat-fed">
         <span class="tcat fed">▸ FED</span>
@@ -498,7 +584,7 @@ footer a{color:var(--text-muted)}
         <span class="tcat gov">▸ GOV</span>
         <div class="tname">memory_pending_list</div>
         <div class="tdesc">List pending governance-gated actions awaiting human approval. Filter by status.</div>
-        <div class="tparams">status?, namespace?</div>
+        <div class="tparams">status?, limit?</div>
       </div>
       <div class="tool-card cat-gov">
         <span class="tcat gov">▸ GOV</span>
@@ -527,14 +613,14 @@ footer a{color:var(--text-muted)}
       <div class="tool-card cat-gov">
         <span class="tcat gov">▸ GOV</span>
         <div class="tname">memory_detect_contradiction</div>
-        <div class="tdesc">LLM-powered contradiction detection across recent memories. Smart+ tier only.</div>
-        <div class="tparams">topic?, namespace?, limit?</div>
+        <div class="tdesc">LLM-powered contradiction check between two memories. Smart+ tier only.</div>
+        <div class="tparams">id_a, id_b</div>
       </div>
       <div class="tool-card cat-gov">
         <span class="tcat gov">▸ GOV</span>
         <div class="tname">memory_auto_tag</div>
-        <div class="tdesc">Suggest tags for a memory via local LLM. Smart+ tier only. Returns tag list.</div>
-        <div class="tparams">memory_id</div>
+        <div class="tdesc">Suggest tags for a memory via the configured LLM. Smart+ tier only. Merges into existing tags.</div>
+        <div class="tparams">id</div>
       </div>
       <div class="tool-card cat-gov">
         <span class="tcat gov">▸ GOV</span>
@@ -549,7 +635,7 @@ footer a{color:var(--text-muted)}
 <!-- =============== HTTP ENDPOINTS =============== -->
 <section id="http-endpoints">
   <div class="container">
-    <span class="eyebrow">50 HTTP Endpoints</span>
+    <span class="eyebrow">88 HTTP Routes</span>
     <h2>REST surface for services + federation peers.</h2>
     <p class="lede">Axum-served. mTLS-aware. CORS layer. Prometheus metrics at <code>/metrics</code>. Body limit 2 MiB. Trace spans on every request. The same operations as MCP, plus federation-private peer endpoints.</p>
 
@@ -581,7 +667,7 @@ footer a{color:var(--text-muted)}
           <tr><td><span class="method POST">POST</span></td><td>/api/v1/forget</td><td>Bulk delete by query.</td></tr>
           <tr><td><span class="method POST">POST</span></td><td>/api/v1/consolidate</td><td>Merge N memories into 1.</td></tr>
           <tr><td><span class="method GET">GET</span></td><td>/api/v1/contradictions</td><td>List detected contradiction pairs.</td></tr>
-          <tr><td><span class="method GET">GET</span></td><td>/api/v1/check_duplicate</td><td>Pre-write similarity check.</td></tr>
+          <tr><td><span class="method POST">POST</span></td><td>/api/v1/check_duplicate</td><td>Pre-write similarity check.</td></tr>
 
           <tr><td colspan="3" style="background:var(--bg-raised);font-size:.75rem;letter-spacing:.1em;color:var(--text-muted);text-transform:uppercase;text-align:center;padding:.5rem">— Knowledge graph —</td></tr>
           <tr><td><span class="method POST">POST</span></td><td>/api/v1/links</td><td>Create typed link.</td></tr>
@@ -641,7 +727,7 @@ footer a{color:var(--text-muted)}
 <!-- =============== CLI =============== -->
 <section id="cli-commands">
   <div class="container">
-    <span class="eyebrow">40 CLI Commands</span>
+    <span class="eyebrow">82 CLI Subcommands (sal/sal-postgres) · 80 default-build</span>
     <h2>For humans, scripts, and CI.</h2>
     <p class="lede">Direct subcommands of the <code>ai-memory</code> binary. No daemon required for read/write commands. Run against any database file via <code>--db &lt;path&gt;</code>.</p>
 
@@ -667,17 +753,17 @@ footer a{color:var(--text-muted)}
 
       <!-- Admin -->
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">gc</span><div class="desc">Manual GC sweep.</div></div>
-      <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">archive</span> <span style="color:var(--text-dim)">[list --restore id --purge --older-than 90]</span><div class="desc">Manage archived memories.</div></div>
+      <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">archive</span> <span style="color:var(--text-dim)">[list | restore &lt;id&gt; | purge --older-than-days 90]</span><div class="desc">Manage archived memories.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">backup</span> <span style="color:var(--text-dim)">[--out path/]</span><div class="desc">SQLite VACUUM INTO + manifest.json.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">restore</span> <span style="color:var(--text-dim)">--from path/file.db [--skip-verify]</span><div class="desc">Restore from backup with sha256 verify.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">export</span><div class="desc">JSON dump to stdout (memories + links).</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">import</span> <span style="color:var(--text-dim)">[--trust-source]</span><div class="desc">JSON import from stdin.</div></div>
-      <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">mine</span> <span style="color:var(--text-dim)">--input claude-export.zip [--dry-run]</span><div class="desc">Import from Claude/ChatGPT/Slack export.</div></div>
+      <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">mine</span> <span style="color:var(--text-dim)">&lt;path&gt; --format claude [--dry-run]</span><div class="desc">Import from Claude/ChatGPT/Slack export.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-a">bench</span> <span style="color:var(--text-dim)">[--baseline path.json]</span><div class="desc">Canonical workload + p50/p95/p99 vs PERFORMANCE.md.</div></div>
 
       <!-- Daemon modes -->
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-f">mcp</span> <span style="color:var(--text-dim)">--tier semantic</span><div class="desc">Start MCP stdio server.</div></div>
-      <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-f">serve</span> <span style="color:var(--text-dim)">--port 9077 [--tls-cert ... --quorum-w 2]</span><div class="desc">Start HTTP daemon.</div></div>
+      <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-f">serve</span> <span style="color:var(--text-dim)">--port 9077 [--tls-cert ... --quorum-writes 2]</span><div class="desc">Start HTTP daemon.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-f">sync</span> <span style="color:var(--text-dim)">--peers https://... [--dry-run]</span><div class="desc">One-shot sync against peers.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-f">sync-daemon</span> <span style="color:var(--text-dim)">--peers https://... --interval-secs 60</span><div class="desc">Continuous sync loop.</div></div>
       <div class="cli-cmd"><span class="prefix">$ ai-memory </span><span class="verb-f">curator</span> <span style="color:var(--text-dim)">[--once | --daemon] [--dry-run]</span><div class="desc">Curator pass: tag/contradict/consolidate.</div></div>
@@ -699,7 +785,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Cross-reference</span>
     <h2>One operation, three protocol fronts.</h2>
-    <p class="lede">For each logical operation, here's the MCP tool, the HTTP endpoint, and the CLI command. Every row maps to the same underlying handler in <code>src/db.rs</code> — three protocol fronts, one source of truth.</p>
+    <p class="lede">For each logical operation, here's the MCP tool, the HTTP endpoint, and the CLI command. Every row maps to the same underlying handler in <code>src/storage/</code> — three protocol fronts, one source of truth.</p>
 
     <div style="overflow-x:auto;">
       <table class="xref-table">
@@ -719,29 +805,29 @@ footer a{color:var(--text-muted)}
           <tr><td class="op">Bulk forget</td><td class="tool">memory_forget</td><td class="endpoint">POST /api/v1/forget</td><td class="cli">forget --pattern</td></tr>
           <tr><td class="op">Consolidate</td><td class="tool">memory_consolidate</td><td class="endpoint">POST /api/v1/consolidate</td><td class="cli">consolidate --ids</td></tr>
           <tr><td class="op">Detect contradiction</td><td class="tool">memory_detect_contradiction</td><td class="endpoint">GET /api/v1/contradictions</td><td class="cli"><span class="none">via curator</span></td></tr>
-          <tr><td class="op">Check duplicate</td><td class="tool">memory_check_duplicate</td><td class="endpoint">GET /api/v1/check_duplicate</td><td class="cli"><span class="none">via store --check</span></td></tr>
+          <tr><td class="op">Check duplicate</td><td class="tool">memory_check_duplicate</td><td class="endpoint">POST /api/v1/check_duplicate</td><td class="cli">check-duplicate</td></tr>
           <tr><td class="op">Create link</td><td class="tool">memory_link</td><td class="endpoint">POST /api/v1/links</td><td class="cli">link &lt;src&gt; &lt;tgt&gt;</td></tr>
           <tr><td class="op">Get links</td><td class="tool">memory_get_links</td><td class="endpoint">GET /api/v1/links/{id}</td><td class="cli"><span class="none">via get (auto-includes)</span></td></tr>
           <tr><td class="op">Taxonomy</td><td class="tool">memory_get_taxonomy</td><td class="endpoint">GET /api/v1/taxonomy</td><td class="cli"><span class="none">via stats</span></td></tr>
-          <tr><td class="op">KG query</td><td class="tool">memory_kg_query</td><td class="endpoint">POST /api/v1/kg/query</td><td class="cli"><span class="none">via shell</span></td></tr>
-          <tr><td class="op">KG timeline</td><td class="tool">memory_kg_timeline</td><td class="endpoint">GET /api/v1/kg/timeline</td><td class="cli"><span class="none">via shell</span></td></tr>
-          <tr><td class="op">KG invalidate</td><td class="tool">memory_kg_invalidate</td><td class="endpoint">POST /api/v1/kg/invalidate</td><td class="cli">resolve &lt;winner&gt; &lt;loser&gt;</td></tr>
-          <tr><td class="op">Register entity</td><td class="tool">memory_entity_register</td><td class="endpoint">POST /api/v1/entities</td><td class="cli"><span class="none">via store + tag</span></td></tr>
-          <tr><td class="op">Resolve alias</td><td class="tool">memory_entity_get_by_alias</td><td class="endpoint">GET /api/v1/entities/by_alias</td><td class="cli"><span class="none">via search</span></td></tr>
+          <tr><td class="op">KG query</td><td class="tool">memory_kg_query</td><td class="endpoint">POST /api/v1/kg/query</td><td class="cli">kg-query (FX-12)</td></tr>
+          <tr><td class="op">KG timeline</td><td class="tool">memory_kg_timeline</td><td class="endpoint">GET /api/v1/kg/timeline</td><td class="cli">kg-timeline (FX-C3)</td></tr>
+          <tr><td class="op">KG invalidate</td><td class="tool">memory_kg_invalidate</td><td class="endpoint">POST /api/v1/kg/invalidate</td><td class="cli">kg-invalidate · resolve &lt;winner&gt; &lt;loser&gt;</td></tr>
+          <tr><td class="op">Register entity</td><td class="tool">memory_entity_register</td><td class="endpoint">POST /api/v1/entities</td><td class="cli">entity-register (FX-C3)</td></tr>
+          <tr><td class="op">Resolve alias</td><td class="tool">memory_entity_get_by_alias</td><td class="endpoint">GET /api/v1/entities/by_alias</td><td class="cli">entity-get-by-alias (FX-C3)</td></tr>
           <tr><td class="op">Stats</td><td class="tool">memory_stats</td><td class="endpoint">GET /api/v1/stats</td><td class="cli">stats</td></tr>
-          <tr><td class="op">Capabilities</td><td class="tool">memory_capabilities</td><td class="endpoint">GET /api/v1/capabilities</td><td class="cli"><span class="none">via stats --json</span></td></tr>
+          <tr><td class="op">Capabilities</td><td class="tool">memory_capabilities</td><td class="endpoint">GET /api/v1/capabilities</td><td class="cli"><span class="none">via doctor</span></td></tr>
           <tr><td class="op">Session start</td><td class="tool">memory_session_start</td><td class="endpoint">POST /api/v1/session/start</td><td class="cli"><span class="none">N/A</span></td></tr>
           <tr><td class="op">GC</td><td class="tool">memory_gc</td><td class="endpoint">POST /api/v1/gc</td><td class="cli">gc</td></tr>
-          <tr><td class="op">Archive list</td><td class="tool"><span class="none">via list + filter</span></td><td class="endpoint">GET /api/v1/archive</td><td class="cli">archive list</td></tr>
-          <tr><td class="op">Archive restore</td><td class="tool"><span class="none">via promote</span></td><td class="endpoint">POST /api/v1/archive/{id}/restore</td><td class="cli">archive restore --id</td></tr>
-          <tr><td class="op">Archive purge</td><td class="tool"><span class="none">via forget</span></td><td class="endpoint">DELETE /api/v1/archive</td><td class="cli">archive purge --older-than</td></tr>
+          <tr><td class="op">Archive list</td><td class="tool">memory_archive_list</td><td class="endpoint">GET /api/v1/archive</td><td class="cli">archive list</td></tr>
+          <tr><td class="op">Archive restore</td><td class="tool">memory_archive_restore</td><td class="endpoint">POST /api/v1/archive/{id}/restore</td><td class="cli">archive restore &lt;id&gt;</td></tr>
+          <tr><td class="op">Archive purge</td><td class="tool">memory_archive_purge</td><td class="endpoint">DELETE /api/v1/archive</td><td class="cli">archive purge --older-than-days</td></tr>
           <tr><td class="op">Export</td><td class="tool"><span class="none">via list bulk</span></td><td class="endpoint">GET /api/v1/export</td><td class="cli">export</td></tr>
           <tr><td class="op">Import</td><td class="tool"><span class="none">via store batch</span></td><td class="endpoint">POST /api/v1/import</td><td class="cli">import</td></tr>
-          <tr><td class="op">Subscribe</td><td class="tool">memory_subscribe</td><td class="endpoint">POST /api/v1/subscriptions</td><td class="cli"><span class="none">via shell</span></td></tr>
-          <tr><td class="op">Unsubscribe</td><td class="tool">memory_unsubscribe</td><td class="endpoint">DELETE /api/v1/subscriptions</td><td class="cli"><span class="none">via shell</span></td></tr>
-          <tr><td class="op">List subs</td><td class="tool">memory_list_subscriptions</td><td class="endpoint">GET /api/v1/subscriptions</td><td class="cli"><span class="none">via shell</span></td></tr>
-          <tr><td class="op">Notify</td><td class="tool">memory_notify</td><td class="endpoint">POST /api/v1/notify</td><td class="cli"><span class="none">via shell</span></td></tr>
-          <tr><td class="op">Inbox</td><td class="tool">memory_inbox</td><td class="endpoint">GET /api/v1/inbox</td><td class="cli"><span class="none">via shell</span></td></tr>
+          <tr><td class="op">Subscribe</td><td class="tool">memory_subscribe</td><td class="endpoint">POST /api/v1/subscriptions</td><td class="cli">subscribe (FX-C3)</td></tr>
+          <tr><td class="op">Unsubscribe</td><td class="tool">memory_unsubscribe</td><td class="endpoint">DELETE /api/v1/subscriptions</td><td class="cli">unsubscribe (FX-C3)</td></tr>
+          <tr><td class="op">List subs</td><td class="tool">memory_list_subscriptions</td><td class="endpoint">GET /api/v1/subscriptions</td><td class="cli">list-subscriptions (FX-C3)</td></tr>
+          <tr><td class="op">Notify</td><td class="tool">memory_notify</td><td class="endpoint">POST /api/v1/notify</td><td class="cli">notify (FX-C3)</td></tr>
+          <tr><td class="op">Inbox</td><td class="tool">memory_inbox</td><td class="endpoint">GET /api/v1/inbox</td><td class="cli">inbox (FX-C3)</td></tr>
           <tr><td class="op">Register agent</td><td class="tool">memory_agent_register</td><td class="endpoint">POST /api/v1/agents</td><td class="cli">agents register</td></tr>
           <tr><td class="op">List agents</td><td class="tool">memory_agent_list</td><td class="endpoint">GET /api/v1/agents</td><td class="cli">agents list</td></tr>
           <tr><td class="op">Pending list</td><td class="tool">memory_pending_list</td><td class="endpoint">GET /api/v1/pending</td><td class="cli">pending list</td></tr>
@@ -757,7 +843,7 @@ footer a{color:var(--text-muted)}
 
 <footer>
   <div class="container">
-    <p style="color:var(--text-dim)">ai-memory-mcp · Apache 2.0 · v0.6.3.1 · <a href="./" style="color:var(--text-muted)">main</a> · <a href="at-a-glance.html" style="color:var(--text-muted)">At a Glance</a> · <a href="data-flow.html" style="color:var(--text-muted)">Data Flow</a> · <a href="integrations.html" style="color:var(--text-muted)">Integrations</a></p>
+    <p style="color:var(--text-dim)">ai-memory-mcp · Apache 2.0 · v0.7.0 · <a href="./" style="color:var(--text-muted)">main</a> · <a href="at-a-glance.html" style="color:var(--text-muted)">At a Glance</a> · <a href="data-flow.html" style="color:var(--text-muted)">Data Flow</a> · <a href="integrations.html" style="color:var(--text-muted)">Integrations</a></p>
   </div>
 </footer>
 

@@ -1,0 +1,27 @@
+{
+  "campaign": "docker-1461",
+  "timestamp": "20260606T105137Z",
+  "expected": {"version": "0.7.0", "schema": 55},
+  "checks": [
+    {"node": "docker-1461-peer-1", "check": "binary.version", "expected": "*0.7.0*", "got": "ai-memory 0.7.0", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "container.health", "expected": "healthy", "got": "healthy", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "single_instance", "expected": "1", "got": "1", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "binary.version", "expected": "*0.7.0*", "got": "ai-memory 0.7.0", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "container.health", "expected": "healthy", "got": "healthy", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "single_instance", "expected": "1", "got": "1", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "health.status", "expected": "ok", "got": "ok", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "health.version", "expected": "0.7.0", "got": "0.7.0", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "health.embedder_ready", "expected": "true", "got": "true", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "health.federation_enabled", "expected": "true", "got": "true", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "caps.storage_backend", "expected": "postgres", "got": "postgres", "status": "PASS"},
+    {"node": "docker-1461-peer-1", "check": "caps.db_schema_version", "expected": "55", "got": "55", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "health.status", "expected": "ok", "got": "ok", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "health.version", "expected": "0.7.0", "got": "0.7.0", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "health.embedder_ready", "expected": "true", "got": "true", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "health.federation_enabled", "expected": "true", "got": "true", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "caps.storage_backend", "expected": "postgres", "got": "postgres", "status": "PASS"},
+    {"node": "docker-1461-peer-2", "check": "caps.db_schema_version", "expected": "55", "got": "55", "status": "PASS"},
+    {"node": "fleet", "check": "federation.write", "expected": "memory id", "got": "d07a6eea-410f-49e3-9b3a-8c8bad4b1fc8", "status": "PASS"},
+    {"node": "fleet", "check": "federation.convergence", "expected": "d07a6eea-410f-49e3-9b3a-8c8bad4b1fc8 on docker-1461-peer-2", "got": "d07a6eea-410f-49e3-9b3a-8c8bad4b1fc8 present on docker-1461-peer-2", "status": "PASS"}
+  ]
+}

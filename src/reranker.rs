@@ -12,7 +12,7 @@
 //! - `CrossEncoder::Neural` — BERT-based cross-encoder loaded via candle
 //!   from `cross-encoder/ms-marco-MiniLM-L-6-v2` (~80 MB, ONNX-free).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Sender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -27,22 +27,455 @@ use tokenizers::Tokenizer;
 
 use crate::models::Memory;
 
+// ---------------------------------------------------------------------------
+// v0.7.0 (issue #518) — session-aware recall recency boost
+// ---------------------------------------------------------------------------
+
+/// Additive boost applied to a recall candidate that appears in the
+/// session's recently-accessed set. Sits at +0.05 — small enough that
+/// a low-relevance candidate cannot leapfrog a substantially-better
+/// match, large enough to break ties in favour of memories the agent
+/// just touched in the same session.
+pub const SESSION_RECENCY_BOOST: f64 = 0.05;
+
+/// Per-session cap on the recently-accessed ring buffer. When the
+/// buffer is at the cap, the oldest entry is evicted (FIFO) before the
+/// newest entry is appended. Keeps the substrate memory cost bounded
+/// at `O(SESSIONS * 50)` ids regardless of recall traffic.
+pub const SESSION_RECENT_CAP: usize = 50;
+
+/// v0.7.0 (issue #518) — process-global tracker mapping `session_id`
+/// to its FIFO ring buffer of recently-accessed memory ids.
+///
+/// The tracker is consulted by [`apply_session_recency_boost`] after
+/// the rerank stage of `handle_recall` (MCP) and `recall_response`
+/// (HTTP). Each call:
+///
+/// 1. Reads the per-session set BEFORE assembling the boost so the
+///    candidates already touched in this session lift in rank.
+/// 2. Appends every recall hit's id INTO the per-session ring (FIFO
+///    eviction past [`SESSION_RECENT_CAP`]) so subsequent recalls in
+///    the same session reuse the new context.
+///
+/// The tracker uses a single `Mutex` because contention is dominated
+/// by the per-recall work itself (FTS + semantic + rerank), making
+/// the lock-acquire/-release cost noise; the implementation can swap
+/// to per-shard locking if a future profile shows otherwise.
+#[derive(Debug, Default)]
+pub struct SessionRecallTracker {
+    inner: Mutex<HashMap<String, VecDeque<String>>>,
+}
+
+impl SessionRecallTracker {
+    /// Construct an empty tracker. Test code uses this directly; the
+    /// production code path goes through the process-global
+    /// [`global_session_recall_tracker`] accessor below.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the set of recently-accessed memory ids for `session_id`,
+    /// or an empty set if the session is unknown. Used by the rerank
+    /// boost to decide which candidates to lift.
+    ///
+    /// v0.7.0 #1091 — kept for the public API contract (test code +
+    /// callers outside the hot path use it). The boost site
+    /// [`apply_session_recency_boost`] now uses
+    /// [`SessionRecallTracker::with_recent_ids`] to avoid the
+    /// per-recall HashSet allocation.
+    #[must_use]
+    pub fn recent_ids(&self, session_id: &str) -> HashSet<String> {
+        let Ok(guard) = self.inner.lock() else {
+            // Poisoned mutex (a panic happened while the lock was
+            // held by another thread). Surface an empty set so the
+            // recall path stays infallible — the boost just doesn't
+            // fire this call.
+            return HashSet::new();
+        };
+        guard
+            .get(session_id)
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// v0.7.0 #1091 — allocation-free per-id membership lookup against
+    /// the per-session ring. Used by [`apply_session_recency_boost`]
+    /// to apply the +0.05 boost without cloning the 50-deep ring into
+    /// a fresh `HashSet<String>` on every recall.
+    ///
+    /// The callback is invoked once with a membership predicate that
+    /// owns the inner mutex guard for its lifetime. Returns the
+    /// closure's result (typically a `Vec<(Memory, f64)>` of boosted
+    /// candidates). The membership predicate is O(N) per id over the
+    /// ring (capped at [`SESSION_RECENT_CAP`] = 50); the closure is
+    /// expected to call it K times for a K-result recall, giving
+    /// O(K*N) total — same complexity as the pre-#1091 path that
+    /// also did a HashSet build (O(N) construct) + K lookups
+    /// (O(1) each = O(K)).
+    pub fn with_recent_ids<R>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&dyn Fn(&str) -> bool) -> R,
+    ) -> R {
+        let Ok(guard) = self.inner.lock() else {
+            // Poisoned mutex: every id misses the boost. Same
+            // posture as the empty-set fallback above.
+            return f(&|_id: &str| false);
+        };
+        match guard.get(session_id) {
+            None => f(&|_id: &str| false),
+            Some(ring) => f(&|id: &str| ring.iter().any(|existing| existing == id)),
+        }
+    }
+
+    /// Record the ids of memories returned by the just-completed
+    /// recall into the per-session ring. FIFO eviction past
+    /// [`SESSION_RECENT_CAP`] keeps the per-session set bounded.
+    ///
+    /// Duplicate ids (a memory recalled twice in the same session)
+    /// move to the front of the ring so the eviction rule keeps the
+    /// most-recently-touched ids in the set.
+    pub fn record(&self, session_id: &str, ids: impl IntoIterator<Item = String>) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        let ring = guard.entry(session_id.to_string()).or_default();
+        for id in ids {
+            // De-dupe by removing any existing occurrence so the
+            // newest landing position wins.
+            ring.retain(|existing| existing != &id);
+            ring.push_back(id);
+            while ring.len() > SESSION_RECENT_CAP {
+                ring.pop_front();
+            }
+        }
+    }
+
+    /// Diagnostic: number of tracked sessions. Used by tests and the
+    /// `/metrics` surface (future).
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.inner.lock().map(|g| g.len()).unwrap_or(0)
+    }
+}
+
+/// Process-global [`SessionRecallTracker`] used by every recall hot
+/// path. Lazily initialised on first access; never reset within a
+/// process lifetime (per-process state by design — operator restart
+/// clears every session's recent set).
+///
+/// v0.7.x (issue #1174 follow-up #1196) — the tracker lives on
+/// [`crate::runtime_context::RuntimeContext::recall_tracker`]. The
+/// returned `&'static` reference is stable because
+/// `RuntimeContext::global()` itself is a `OnceLock`-backed
+/// process-wide singleton; the `Arc<SessionRecallTracker>` inside it
+/// is allocated once and outlives every caller.
+#[must_use]
+pub fn global_session_recall_tracker() -> &'static SessionRecallTracker {
+    &crate::runtime_context::RuntimeContext::global().recall_tracker
+}
+
+/// v0.7.0 (issue #518) — apply the per-session recently-accessed boost
+/// to a scored recall result vector AND record the post-boost hit set
+/// back into the session's ring buffer.
+///
+/// `session_id` is the caller-supplied per-session identifier. When
+/// `None` or empty, the function is a no-op (returns the input
+/// unchanged). When set:
+///
+/// 1. Every candidate whose id is in the tracker's per-session set
+///    gets `SESSION_RECENCY_BOOST` ADDED to its score.
+/// 2. The vector is re-sorted descending by the boosted score.
+/// 3. The post-boost id list is appended into the session ring (FIFO
+///    eviction past [`SESSION_RECENT_CAP`]).
+///
+/// The boost is *additive* (not multiplicative) so its effect is
+/// independent of the absolute score magnitude — the +0.05 always
+/// breaks ties at the same delta regardless of whether scores are on
+/// the 0..1 cosine band or the 0..2 blended hybrid band.
+pub fn apply_session_recency_boost(
+    results: Vec<(Memory, f64)>,
+    session_id: Option<&str>,
+    tracker: &SessionRecallTracker,
+) -> Vec<(Memory, f64)> {
+    let Some(sid) = session_id else {
+        return results;
+    };
+    if sid.is_empty() {
+        return results;
+    }
+    // v0.7.0 #1091 — drop the per-recall `HashSet<String>` allocation
+    // (50 clones at the cap) by using the membership-callback variant.
+    // The closure owns the inner mutex for the boost-apply pass; the
+    // membership predicate runs O(N) per id against the (≤ 50 entry)
+    // ring, giving the same overall complexity as the pre-#1091
+    // (HashSet-build + lookup) path without the allocation.
+    let mut boosted: Vec<(Memory, f64)> = tracker.with_recent_ids(sid, |is_recent| {
+        results
+            .into_iter()
+            .map(|(mem, score)| {
+                let bumped = if is_recent(&mem.id) {
+                    score + SESSION_RECENCY_BOOST
+                } else {
+                    score
+                };
+                (mem, bumped)
+            })
+            .collect()
+    });
+    // Re-sort descending — boosted candidates may move past their
+    // pre-boost neighbours.
+    boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // v0.7.0 #1091 — record the post-boost id list into the session
+    // ring via an iterator clone-on-demand path so we don't allocate
+    // a Vec<String> just to hand to `record` (which itself iterates).
+    tracker.record(sid, boosted.iter().map(|(m, _)| m.id.clone()));
+    boosted
+}
+
 /// Blend weight applied to the original (embedding/FTS) score.
 const ORIGINAL_WEIGHT: f64 = 0.6;
 /// Blend weight applied to the cross-encoder score.
 const CROSS_ENCODER_WEIGHT: f64 = 0.4;
 
+/// #1531 M13 — clamp a non-finite blended score to the ranking floor.
+///
+/// The rerank sort uses `partial_cmp(..).unwrap_or(Equal)`; a NaN
+/// final score (poisoned caller `original_score`, or a corrupt model
+/// weights file producing a NaN logit) compares `Equal` to EVERYTHING,
+/// so the stable sort left the NaN-scored candidate wherever it sat in
+/// the input — a corrupt candidate could nondeterministically hold the
+/// top rank. Mapping non-finite scores to `f64::MIN` deterministically
+/// sinks them to the bottom of the ranking instead. Finite scores pass
+/// through untouched, so ordinary ranking is byte-identical.
+fn finite_or_floor(score: f64) -> f64 {
+    if score.is_finite() { score } else { f64::MIN }
+}
+
+/// #1597 — split a candidate pool into `(head, tail)` at
+/// [`RERANK_POOL_MAX`].
+///
+/// Pools at or under the cap come back whole (`tail` empty, input order
+/// preserved — the degenerate full-rerank case). Larger pools are
+/// sorted by the incoming blended score descending (total order via
+/// [`f64::total_cmp`] so a NaN-poisoned score cannot destabilise the
+/// sort; NaN sorts into the head, is cross-encoded, and then sinks via
+/// [`finite_or_floor`] exactly as pre-#1597) and split after the cap,
+/// so both halves come back internally sorted descending.
+fn split_rerank_pool(
+    mut candidates: Vec<(Memory, f64)>,
+) -> (Vec<(Memory, f64)>, Vec<(Memory, f64)>) {
+    let tail = if candidates.len() > RERANK_POOL_MAX {
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.split_off(RERANK_POOL_MAX)
+    } else {
+        Vec::new()
+    };
+    (candidates, tail)
+}
+
+/// #1597 — hard cap on how many candidates receive a cross-encoder
+/// score per rerank call.
+///
+/// The Phase-3 dogfood run measured autonomous-tier recall at
+/// 2823-7737 ms/call on CPU vs 14-32 ms at the semantic tier: the
+/// pre-#1597 [`CrossEncoder::rerank`] ran one full BERT forward pass
+/// per (query, candidate) pair, sequentially, over the entire
+/// post-blend candidate pool (up to 50 rows from the recall SQL cap).
+/// Only the strongest `RERANK_POOL_MAX` candidates by incoming blended
+/// score are cross-encoded (in ONE batched forward pass); the
+/// remainder keep their blended scores and sort below the reranked
+/// head. 20 keeps the cross-encoder's precision win where it matters
+/// (the head the caller actually reads) while bounding the worst-case
+/// forward-pass cost at ~40% of the pre-fix pool.
+pub const RERANK_POOL_MAX: usize = 20;
+
 const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
-const CROSS_ENCODER_MAX_SEQ: usize = 512;
+/// Bare configured-model spelling for the default reranker — shared with
+/// the `ai-memory config migrate` template (#1558 batch 6).
+pub(crate) const DEFAULT_RERANKER_MODEL: &str = "ms-marco-MiniLM-L-6-v2";
+/// Model-architecture ceiling on the cross-encoder input sequence.
+/// Per-consumer truncation (e.g. the #1604 rerank cap below) may go
+/// tighter, never looser — the resolver clamps against this value.
+pub const CROSS_ENCODER_MAX_SEQ: usize = 512;
 const CROSS_ENCODER_HIDDEN_DIM: usize = 384;
+
+/// #1604 — compiled default for the tokenized length of **rerank**
+/// inputs, applied in [`CrossEncoder::neural_score_pairs`] (the #1597
+/// batched-forward path) instead of the architecture-ceiling
+/// [`CROSS_ENCODER_MAX_SEQ`].
+///
+/// The #1588 dogfood RE-RUN measured the residual #1597 latency:
+/// warm autonomous-tier recall was ~4,013 ms on a real (long-content)
+/// corpus vs ~533 ms on short-content rows — the [batch=20, seq=512]
+/// candle CPU forward, not pool size or batching, was the cost. BERT
+/// attention is O(n²) in sequence length, so halving the cap to 256
+/// cuts the forward ~4× while keeping the title + lead content that
+/// carries the relevance signal for memory rows. Other cross-encoder
+/// consumers (the single-pair [`CrossEncoder::score`]) keep the full
+/// [`CROSS_ENCODER_MAX_SEQ`].
+///
+/// Operator override ladder (resolved by
+/// `AppConfig::resolve_reranker()` at boot and seeded here via
+/// [`set_rerank_max_seq`]): `AI_MEMORY_RERANK_MAX_SEQ` env >
+/// `[reranker].max_seq_tokens` config > this compiled default. Values
+/// that are zero, unparseable, or above [`CROSS_ENCODER_MAX_SEQ`]
+/// fall through to the next ladder layer.
+pub const RERANK_MAX_SEQ_DEFAULT: usize = 256;
+
+/// Process-wide resolved rerank sequence cap, seeded once at boot from
+/// `AppConfig::resolve_reranker()` (the `crate::storage::set_db_mmap_size`
+/// OnceLock precedent — the scoring paths run deep in the recall
+/// pipeline where no `AppConfig` is in scope). Unseeded processes
+/// (unit tests, library embedders that bypass the CLI boot path) fall
+/// through to [`RERANK_MAX_SEQ_DEFAULT`].
+static RERANK_MAX_SEQ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Seed the process-wide rerank sequence cap for every subsequent
+/// batched rerank forward. Idempotent — first writer wins; later calls
+/// are no-ops (matches `crate::storage::set_db_mmap_size`).
+pub fn set_rerank_max_seq(tokens: usize) {
+    let _ = RERANK_MAX_SEQ.set(tokens);
+}
+
+/// The effective rerank sequence cap for this process.
+fn rerank_max_seq() -> usize {
+    *RERANK_MAX_SEQ.get().unwrap_or(&RERANK_MAX_SEQ_DEFAULT)
+}
+
+/// v0.7.0 L2-8 — default multiplicative boost applied to `Reflection`-kind
+/// memories AFTER cross-encoder reranking. Reflections summarise multiple
+/// observations, so abstraction-shaped queries ("what patterns...",
+/// "what are recurring themes...") should preferentially surface them.
+/// Default value `1.2` sits in the band where a reflection with a base
+/// score equal to its source observations consistently lifts into the
+/// top-5 without dragging mediocre reflections above well-matched
+/// observations.
+pub const DEFAULT_REFLECTION_BOOST: f32 = 1.2;
+
+/// v0.7.0 L2-8 — default per-depth additional multiplier increment.
+/// `per_depth_factor = 1.0 + per_depth_increment * reflection_depth`.
+/// Deeper reflections (reflections-on-reflections) compress more
+/// observations, so a small per-depth bump is justified.
+pub const DEFAULT_REFLECTION_PER_DEPTH_INCREMENT: f32 = 0.05;
+
+/// v0.7.0 L2-8 — default depth cap mirrored from
+/// [`GovernancePolicy::effective_max_reflection_depth`]. Past this depth
+/// the per-depth multiplier stops growing; reflections deeper than the
+/// cap still receive the cap-evaluated boost (operator policy may refuse
+/// the write entirely, but the reranker side never produces an unbounded
+/// multiplier).
+pub const DEFAULT_REFLECTION_MAX_DEPTH_CAP: u32 = 3;
+
+/// v0.7.0 L2-8 — configuration for the reflection-aware reranker boost.
+///
+/// The boost is applied AFTER the cross-encoder blend (i.e. it does NOT
+/// participate in the `0.6 * original + 0.4 * cross_encoder` scoring
+/// formula). Boost shape:
+///
+/// ```text
+/// per_depth_factor = 1.0 + per_depth_increment * min(reflection_depth, max_depth_cap)
+/// final_score      = base_score * (kind == Reflection ? boost * per_depth_factor : 1.0)
+/// ```
+///
+/// Default factor = `1.2` (see [`DEFAULT_REFLECTION_BOOST`]). Setting
+/// `boost = 1.0` makes the reranker reproduce its pre-L2-8 behavior
+/// exactly — a deliberate kill-switch for the recall regression suite.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReflectionBoostConfig {
+    /// Multiplicative boost applied to `Reflection`-kind memories.
+    /// Default `1.2`. `1.0` disables the boost.
+    pub boost: f32,
+    /// Per-depth additional multiplier increment. Default `0.05`.
+    pub per_depth_increment: f32,
+    /// Depth cap for the per-depth multiplier. Default `3` (mirrors
+    /// the compiled-in default of
+    /// `GovernancePolicy::effective_max_reflection_depth`). Larger
+    /// `reflection_depth` values are clamped to this cap so the
+    /// reranker never produces an unbounded multiplier.
+    pub max_depth_cap: u32,
+}
+
+impl Default for ReflectionBoostConfig {
+    fn default() -> Self {
+        Self {
+            boost: DEFAULT_REFLECTION_BOOST,
+            per_depth_increment: DEFAULT_REFLECTION_PER_DEPTH_INCREMENT,
+            max_depth_cap: DEFAULT_REFLECTION_MAX_DEPTH_CAP,
+        }
+    }
+}
+
+impl ReflectionBoostConfig {
+    /// Pin to pre-L2-8 behavior: `boost = 1.0` ⇒ multiplier is always
+    /// `1.0` regardless of memory kind or depth. Used by the regression
+    /// test that proves the new pathway is a *pure addition* over the RC
+    /// behavior.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            boost: 1.0,
+            per_depth_increment: 0.0,
+            max_depth_cap: 0,
+        }
+    }
+
+    /// Compute the multiplicative factor for a given memory. Returns
+    /// `1.0` for non-reflections; `boost * per_depth_factor` for
+    /// reflections (with `reflection_depth` clamped to `max_depth_cap`).
+    ///
+    /// Pulled out so the same arithmetic is shared by both the per-query
+    /// `rerank` and the G9 batched `rerank_batch` codepaths — there is
+    /// exactly one place to audit the multiplier shape.
+    #[must_use]
+    pub fn factor_for(&self, mem: &Memory) -> f64 {
+        if !matches!(mem.memory_kind, crate::models::MemoryKind::Reflection) {
+            return 1.0;
+        }
+        // `reflection_depth` is stored as i32 (SQL signed) but the
+        // governance accessor returns u32; the column DEFAULT is 0 and
+        // negative values would already have been rejected by the
+        // `memory_reflect` write path. Clamp to non-negative defensively
+        // so a bad write upstream can't produce a negative multiplier.
+        let depth = u32::try_from(mem.reflection_depth.max(0)).unwrap_or(0);
+        let depth_clamped = depth.min(self.max_depth_cap);
+        let per_depth_factor =
+            f64::from(self.per_depth_increment).mul_add(f64::from(depth_clamped), 1.0);
+        f64::from(self.boost) * per_depth_factor
+    }
+}
 
 /// Cross-encoder for (query, document) relevance scoring.
 pub enum CrossEncoder {
     /// Lightweight lexical cross-encoder using term overlap signals.
-    Lexical,
+    ///
+    /// `degraded` is `true` when this variant exists because a
+    /// configured neural cross-encoder failed to initialise (HF Hub
+    /// unreachable, model checksum mismatch, etc.) and the runtime
+    /// fell back. `false` is the originally-configured lexical tier
+    /// (operator opted in to keyword-tier or smart-tier without
+    /// cross-encoder reranking).
+    ///
+    /// v0.7.0 R3-S2 — the distinction surfaces in the recall
+    /// response's `meta.reranker_used` field as
+    /// `"degraded_lexical"` vs `"lexical"`, so an in-band signal
+    /// tells clients (MCP + HTTP) when their reranker downgraded.
+    /// The original G8 fix landed `tracing::warn!` only; G8 closure
+    /// per the playbook required an in-response field, which the
+    /// prior implementation overstated.
+    Lexical { degraded: bool },
     /// Neural BERT-based cross-encoder (ms-marco-MiniLM-L-6-v2).
+    ///
+    /// v0.7.0 #1084 — `model` is `Arc<BertModel>` (no mutex), same
+    /// pattern as `Embedder::Local`. The pre-#1084 design held an
+    /// `Arc<Mutex<BertModel>>` and locked across the full neural
+    /// rerank forward pass, serialising every rerank-tier recall on
+    /// a single global mutex. Candle's `BertModel::forward` takes
+    /// `&self` (inference-only; weights are read-only) so the
+    /// mutex was unnecessary.
     Neural {
-        model: Arc<Mutex<BertModel>>,
+        model: Arc<BertModel>,
         tokenizer: Arc<Tokenizer>,
         classifier_weight: Tensor,
         classifier_bias: Tensor,
@@ -52,13 +485,24 @@ pub enum CrossEncoder {
 
 impl CrossEncoder {
     /// Create a new lexical cross-encoder (no model download required).
+    ///
+    /// This is the "originally lexical" path — the operator either
+    /// chose keyword-/semantic-tier (no cross-encoder reranking) or
+    /// explicitly opted into the lexical variant. Use
+    /// [`Self::new_neural`] to attempt the neural path with
+    /// fall-back-to-lexical semantics.
     pub fn new() -> Self {
-        Self::Lexical
+        Self::Lexical { degraded: false }
     }
 
     /// Create a neural cross-encoder by downloading ms-marco-MiniLM-L-6-v2.
     ///
-    /// Falls back to lexical if download or loading fails.
+    /// Falls back to lexical if download or loading fails. The
+    /// fallback is marked `degraded: true` so the recall response
+    /// surfaces `reranker_used = "degraded_lexical"` per R3-S2 — an
+    /// in-band signal that v0.7.0 promises but pre-R3 only emitted
+    /// as a `tracing::warn!` (a tracing-event-only fallback is not
+    /// the same as a per-response field operators can branch on).
     ///
     /// v0.6.3.1 (P3, G8): when the neural path fails (e.g. HF Hub
     /// unreachable, model checksum mismatch), emit a structured tracing
@@ -77,7 +521,7 @@ impl CrossEncoder {
                     "cross-encoder fell back to lexical: neural init failed"
                 );
                 eprintln!("ai-memory: neural cross-encoder failed ({e}), using lexical fallback");
-                Self::Lexical
+                Self::Lexical { degraded: true }
             }
         }
     }
@@ -92,13 +536,13 @@ impl CrossEncoder {
         ));
 
         let config_path = repo
-            .get("config.json")
+            .get(crate::embeddings::HF_CONFIG_FILE)
             .context("failed to download config.json")?;
         let tokenizer_path = repo
-            .get("tokenizer.json")
+            .get(crate::embeddings::HF_TOKENIZER_FILE)
             .context("failed to download tokenizer.json")?;
         let weights_path = repo
-            .get("model.safetensors")
+            .get(crate::embeddings::HF_WEIGHTS_FILE)
             .context("failed to download model.safetensors")?;
 
         // Load BERT config
@@ -119,7 +563,16 @@ impl CrossEncoder {
             .map_err(|e| anyhow::anyhow!("failed to set truncation: {e}"))?;
         tokenizer.with_padding(None);
 
-        // Load model weights
+        // Load model weights.
+        //
+        // SAFETY (#1456): `from_mmaped_safetensors` memory-maps the
+        // weights file. The mmap is unsound only if the backing file is
+        // mutated or truncated by another process while it is mapped.
+        // `weights_path` resolves to a trusted, immutable safetensors
+        // artifact in the daemon-owned HuggingFace cache (downloaded and
+        // not subsequently written by us); it is never a caller-supplied
+        // path at request time. The mapping lives only for the duration
+        // of weight loading below.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
                 .context("failed to load cross-encoder weights")?
@@ -137,7 +590,7 @@ impl CrossEncoder {
             .context("failed to load classifier.bias")?;
 
         Ok(Self::Neural {
-            model: Arc::new(Mutex::new(model)),
+            model: Arc::new(model),
             tokenizer: Arc::new(tokenizer),
             classifier_weight,
             classifier_bias,
@@ -150,7 +603,7 @@ impl CrossEncoder {
     /// Returns a relevance score in `0.0..=1.0`.
     pub fn score(&self, query: &str, title: &str, content: &str) -> f32 {
         match self {
-            Self::Lexical => lexical_score(query, title, content),
+            Self::Lexical { .. } => lexical_score(query, title, content),
             Self::Neural {
                 model,
                 tokenizer,
@@ -158,15 +611,11 @@ impl CrossEncoder {
                 classifier_bias,
                 device,
             } => {
-                let model_guard = match model.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!("cross-encoder model lock poisoned: {e}");
-                        return lexical_score(query, title, content);
-                    }
-                };
+                // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
+                // shared across threads; `BertModel::forward(&self, ...)`
+                // is inference-only and safe to call concurrently.
                 match Self::neural_score(
-                    &model_guard,
+                    model,
                     tokenizer,
                     classifier_weight,
                     classifier_bias,
@@ -199,7 +648,7 @@ impl CrossEncoder {
         content: &str,
     ) -> Result<f32> {
         // Cross-encoder input: "[CLS] query [SEP] title content [SEP]"
-        let document = format!("{title} {content}");
+        let document = crate::embeddings::embedding_document(title, content);
 
         let encoding = tokenizer
             .encode((query, document.as_str()), true)
@@ -237,25 +686,154 @@ impl CrossEncoder {
         matches!(self, Self::Neural { .. })
     }
 
+    /// v0.7.0 R3-S2 — whether this cross-encoder is a *degraded*
+    /// lexical fallback (i.e., a neural variant was attempted at
+    /// startup or mid-flight and the runtime fell back). `false` for
+    /// `Neural` and for the originally-configured `Lexical` (operator
+    /// opted into keyword-/semantic-tier without cross-encoder
+    /// reranking). The recall response surfaces this distinction as
+    /// `meta.reranker_used = "degraded_lexical"` so clients can
+    /// detect the silent downgrade in-band — closing the G8 closure
+    /// claim that tracing-event-only signalling had overstated.
+    #[must_use]
+    pub fn is_degraded_lexical(&self) -> bool {
+        matches!(self, Self::Lexical { degraded: true })
+    }
+
     /// Rerank a set of candidates by blending their original scores with
     /// cross-encoder scores.
     ///
     /// **Blend formula:** `final = 0.6 * original + 0.4 * cross_encoder`
     ///
-    /// Results are returned sorted by `final_score` descending.
-    pub fn rerank(&self, query: &str, mut candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
-        let mut scored: Vec<(Memory, f64)> = candidates
-            .drain(..)
-            .map(|(mem, original_score)| {
-                let ce_score = f64::from(self.score(query, &mem.title, &mem.content));
-                let final_score =
-                    ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * ce_score;
-                (mem, final_score)
+    /// **#1597 pool cap:** only the strongest [`RERANK_POOL_MAX`]
+    /// candidates by incoming blended score are cross-encoded; the
+    /// remainder keep their blended scores and rank below the reranked
+    /// head (head sorted by `final_score` descending, tail sorted by
+    /// blended score descending — no candidate is dropped). A pool at
+    /// or under the cap is fully reranked and returned sorted by
+    /// `final_score` descending, as before.
+    ///
+    /// **v0.7.0 L2-8 contract:** the bare `rerank` is the *pre-L2-8*
+    /// behavior — no reflection boost is applied. Daemons that want
+    /// the reflection-aware boost must call
+    /// [`Self::rerank_with_reflection_boost`] (which is what
+    /// [`BatchedReranker`] does by default with
+    /// [`ReflectionBoostConfig::default`]). Keeping the bare method
+    /// boost-free is a deliberate regression-pin discipline: the L2-8
+    /// recall test for `boost = 1.0` uses
+    /// `rerank_with_reflection_boost(.., &ReflectionBoostConfig::disabled())`
+    /// and asserts byte-identical output to `rerank(..)`.
+    pub fn rerank(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        // #1597 — delegate so the pool cap + batched forward pass live in
+        // exactly one place. `ReflectionBoostConfig::disabled()` yields a
+        // multiplier of exactly 1.0 for every candidate, so the output is
+        // byte-identical to the historical boost-free blend (the L2-8
+        // regression pin below asserts this equivalence directly).
+        self.rerank_with_reflection_boost(query, candidates, &ReflectionBoostConfig::disabled())
+    }
+
+    /// v0.7.0 L2-8 — rerank with a post-step reflection-aware boost.
+    ///
+    /// 1. Same blend as [`Self::rerank`] (`0.6 * original + 0.4 * ce`).
+    /// 2. **After** the blend, multiply each candidate's `final_score`
+    ///    by [`ReflectionBoostConfig::factor_for`]. Observations get a
+    ///    multiplier of `1.0` (unchanged); reflections get
+    ///    `boost * (1.0 + per_depth_increment * clamp(depth, 0..=cap))`.
+    /// 3. Sort descending after the boost so the output ordering
+    ///    reflects the post-boost ranking.
+    ///
+    /// Operationally this means: a reflection that the cross-encoder
+    /// scored at parity with its source observations *moves up*; the
+    /// movement is bounded (capped per-depth multiplier, single global
+    /// `boost` factor) so a mediocre reflection cannot leapfrog a
+    /// well-matched observation — the boost is a thumb-on-the-scale,
+    /// not a free pass.
+    /// **#1597 pool cap + batched forward pass.** Only the strongest
+    /// [`RERANK_POOL_MAX`] candidates by incoming blended score receive a
+    /// cross-encoder score (in one batched forward pass on the Neural
+    /// variant); the remainder keep their blended scores, internally
+    /// sorted descending, appended after the reranked head. No candidate
+    /// is ever dropped. A pool at or under the cap degenerates to the
+    /// historical full rerank.
+    pub fn rerank_with_reflection_boost(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+        boost_config: &ReflectionBoostConfig,
+    ) -> Vec<(Memory, f64)> {
+        let (head, tail) = split_rerank_pool(candidates);
+
+        let ce_scores = self.pair_scores(query, &head);
+        let mut scored: Vec<(Memory, f64)> = head
+            .into_iter()
+            .zip(ce_scores)
+            .map(|((mem, original_score), ce_score)| {
+                let blended =
+                    ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * f64::from(ce_score);
+                let factor = boost_config.factor_for(&mem);
+                (mem, finite_or_floor(blended * factor))
             })
             .collect();
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // #1597 — uncapped remainder: blended scores untouched, already
+        // sorted descending by `split_rerank_pool`, ranked below the
+        // cross-encoded head.
+        scored.extend(tail);
         scored
+    }
+
+    /// #1597 — cross-encoder scores for an (already capped) candidate
+    /// slice, one score per candidate in input order.
+    ///
+    /// Neural variant: ONE batched tokenize + forward pass via
+    /// [`Self::neural_score_pairs`] (the same machinery the G9
+    /// [`Self::rerank_batch`] path uses) instead of a sequential
+    /// per-pair forward — the second half of the #1597 fix. Falls back
+    /// to per-pair lexical scoring if the batched forward fails.
+    fn pair_scores(&self, query: &str, candidates: &[(Memory, f64)]) -> Vec<f32> {
+        let lexical_fallback = |candidates: &[(Memory, f64)]| -> Vec<f32> {
+            candidates
+                .iter()
+                .map(|(mem, _)| lexical_score(query, &mem.title, &mem.content))
+                .collect()
+        };
+        match self {
+            Self::Lexical { .. } => lexical_fallback(candidates),
+            Self::Neural {
+                model,
+                tokenizer,
+                classifier_weight,
+                classifier_bias,
+                device,
+            } => {
+                let pairs: Vec<(&str, String)> = candidates
+                    .iter()
+                    .map(|(mem, _)| {
+                        (
+                            query,
+                            crate::embeddings::embedding_document(&mem.title, &mem.content),
+                        )
+                    })
+                    .collect();
+                match Self::neural_score_pairs(
+                    model,
+                    tokenizer,
+                    classifier_weight,
+                    classifier_bias,
+                    device,
+                    pairs,
+                ) {
+                    Ok(scores) => scores,
+                    Err(e) => {
+                        tracing::warn!(
+                            "neural cross-encoder batch score failed: {e}, using lexical fallback"
+                        );
+                        lexical_fallback(candidates)
+                    }
+                }
+            }
+        }
     }
 
     /// v0.7 G9 — batched rerank for concurrent recall.
@@ -275,17 +853,34 @@ impl CrossEncoder {
         &self,
         queries: Vec<(String, Vec<(Memory, f64)>)>,
     ) -> Vec<Vec<(Memory, f64)>> {
+        // Boost-free legacy entry point — preserves the pre-L2-8 wire
+        // shape for callers that haven't migrated to the boost-aware
+        // variant.  See `rerank_batch_with_reflection_boost` for the
+        // L2-8 path; here we delegate to it with the `disabled()`
+        // config so the implementation lives in one place.
+        self.rerank_batch_with_reflection_boost(queries, &ReflectionBoostConfig::disabled())
+    }
+
+    /// v0.7.0 L2-8 — batched rerank with a post-step reflection-aware
+    /// boost applied per candidate. Same boost arithmetic as
+    /// [`Self::rerank_with_reflection_boost`], factored so the boost
+    /// shape lives in a single helper.
+    pub fn rerank_batch_with_reflection_boost(
+        &self,
+        queries: Vec<(String, Vec<(Memory, f64)>)>,
+        boost_config: &ReflectionBoostConfig,
+    ) -> Vec<Vec<(Memory, f64)>> {
         // Single-query short-circuit: avoid any batching overhead.
         if queries.len() == 1 {
             let mut iter = queries.into_iter();
             let (q, cands) = iter.next().expect("len == 1");
-            return vec![self.rerank(&q, cands)];
+            return vec![self.rerank_with_reflection_boost(&q, cands, boost_config)];
         }
 
         match self {
-            Self::Lexical => queries
+            Self::Lexical { .. } => queries
                 .into_iter()
-                .map(|(q, cands)| self.rerank(&q, cands))
+                .map(|(q, cands)| self.rerank_with_reflection_boost(&q, cands, boost_config))
                 .collect(),
             Self::Neural {
                 model,
@@ -294,24 +889,28 @@ impl CrossEncoder {
                 classifier_bias,
                 device,
             } => {
-                let model_guard = match model.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!(
-                            "cross-encoder model lock poisoned in rerank_batch: {e}, falling back to lexical per-query"
-                        );
-                        return queries
-                            .into_iter()
-                            .map(|(q, cands)| {
-                                let lex = Self::Lexical;
-                                lex.rerank(&q, cands)
-                            })
-                            .collect();
-                    }
-                };
-
+                // #1597 — apply the per-query pool cap BEFORE the batched
+                // forward pass so a coalesced flush pays for at most
+                // `RERANK_POOL_MAX` forwards per job; each tail is
+                // reattached below its reranked head afterwards.
+                let mut tails: Vec<Vec<(Memory, f64)>> = Vec::with_capacity(queries.len());
+                let queries: Vec<(String, Vec<(Memory, f64)>)> = queries
+                    .into_iter()
+                    .map(|(q, cands)| {
+                        let (head, tail) = split_rerank_pool(cands);
+                        tails.push(tail);
+                        (q, head)
+                    })
+                    .collect();
+                // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
+                // shared across threads; `BertModel::forward(&self, ...)`
+                // is inference-only and safe to call concurrently. The
+                // pre-#1084 poisoned-lock fallback is now unreachable
+                // (no lock to poison); a runtime error in
+                // `neural_rerank_batch` still falls through to the
+                // lexical degrade via the `Err(_)` arm below.
                 match Self::neural_rerank_batch(
-                    &model_guard,
+                    model,
                     tokenizer,
                     classifier_weight,
                     classifier_bias,
@@ -324,22 +923,26 @@ impl CrossEncoder {
                         // queries.iter().flat_map(|(_, cs)| cs).
                         let mut out = Vec::with_capacity(queries.len());
                         let mut cursor = 0usize;
-                        for (_query, cands) in queries {
+                        for ((_query, cands), tail) in queries.into_iter().zip(tails) {
                             let n = cands.len();
                             let mut scored: Vec<(Memory, f64)> = cands
                                 .into_iter()
                                 .enumerate()
                                 .map(|(i, (mem, original))| {
                                     let ce = f64::from(scores[cursor + i]);
-                                    let final_score =
+                                    let blended =
                                         ORIGINAL_WEIGHT * original + CROSS_ENCODER_WEIGHT * ce;
-                                    (mem, final_score)
+                                    let factor = boost_config.factor_for(&mem);
+                                    (mem, finite_or_floor(blended * factor))
                                 })
                                 .collect();
                             cursor += n;
                             scored.sort_by(|a, b| {
                                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                             });
+                            // #1597 — uncapped remainder ranks below the
+                            // cross-encoded head, blended scores untouched.
+                            scored.extend(tail);
                             out.push(scored);
                         }
                         out
@@ -348,12 +951,18 @@ impl CrossEncoder {
                         tracing::warn!(
                             "neural rerank_batch failed: {e}, falling back to lexical per-query"
                         );
-                        drop(model_guard);
                         queries
                             .into_iter()
-                            .map(|(q, cands)| {
-                                let lex = Self::Lexical;
-                                lex.rerank(&q, cands)
+                            .zip(tails)
+                            .map(|((q, cands), tail)| {
+                                // Runtime degrade (forward-pass failure) —
+                                // mark the variant degraded so the recall
+                                // response can surface `degraded_lexical`.
+                                let lex = Self::Lexical { degraded: true };
+                                let mut scored =
+                                    lex.rerank_with_reflection_boost(&q, cands, boost_config);
+                                scored.extend(tail);
+                                scored
                             })
                             .collect()
                     }
@@ -377,10 +986,33 @@ impl CrossEncoder {
         let mut pairs: Vec<(&str, String)> = Vec::new();
         for (q, cands) in queries {
             for (mem, _) in cands {
-                let document = format!("{} {}", mem.title, mem.content);
+                let document = crate::embeddings::embedding_document(&mem.title, &mem.content);
                 pairs.push((q.as_str(), document));
             }
         }
+        Self::neural_score_pairs(
+            model,
+            tokenizer,
+            classifier_weight,
+            classifier_bias,
+            device,
+            pairs,
+        )
+    }
+
+    /// One tokenize + one forward pass over a flat list of
+    /// (query, document) pairs — the shared batched-inference chokepoint
+    /// (#1597) used by BOTH the G9 multi-query [`Self::neural_rerank_batch`]
+    /// path and the per-call [`Self::pair_scores`] path. Returns one
+    /// sigmoided logit per pair, in input order.
+    fn neural_score_pairs(
+        model: &BertModel,
+        tokenizer: &Tokenizer,
+        classifier_weight: &Tensor,
+        classifier_bias: &Tensor,
+        device: &Device,
+        pairs: Vec<(&str, String)>,
+    ) -> Result<Vec<f32>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -398,6 +1030,19 @@ impl CrossEncoder {
             ..Default::default()
         };
         batch_tokenizer.with_padding(Some(padding));
+        // #1604 — rerank inputs truncate at the resolved rerank cap
+        // (default RERANK_MAX_SEQ_DEFAULT), tighter than the
+        // architecture-ceiling CROSS_ENCODER_MAX_SEQ the shared
+        // tokenizer carries: long-content rows otherwise pad the whole
+        // batch to 512 tokens and the candle CPU forward dominates
+        // recall latency (~3.2 s/recall measured on the #1588 re-run).
+        let truncation = tokenizers::TruncationParams {
+            max_length: rerank_max_seq(),
+            ..Default::default()
+        };
+        batch_tokenizer
+            .with_truncation(Some(truncation))
+            .map_err(|e| anyhow::anyhow!("failed to set rerank truncation: {e}"))?;
 
         let encodings = batch_tokenizer
             .encode_batch(
@@ -590,6 +1235,35 @@ pub const DEFAULT_MAX_BATCH: usize = 32;
 /// negligible while still benefiting parallel callers.
 pub const DEFAULT_MAX_WAIT_MS: u64 = 5;
 
+/// #1579 B10 — minimum number of in-flight rerank requests (including
+/// the current one) before [`BatchedReranker::rerank`] routes through
+/// the coalescing worker on a *neural* encoder. Below this threshold
+/// there is nothing to coalesce WITH: the lone caller pays the worker
+/// channel round-trip plus up to [`DEFAULT_MAX_WAIT_MS`] of flush-window
+/// wait for zero amortisation gain.
+///
+/// **Criterion evidence (perf-audit P1, 2026-06, `cargo bench --bench
+/// reranker_throughput`, lexical default):** at N=8 concurrent queries
+/// × 10 candidates the batched path measured ~7.6 ms vs ~0.65 ms direct
+/// — 12× SLOWER, because the per-batch flush window (5 ms) dwarfs the
+/// sub-millisecond lexical compute. The lexical variant therefore NEVER
+/// routes through the worker (it holds no shared-model mutex, so
+/// coalescing has nothing to amortise at ANY N — see
+/// [`BatchedReranker::rerank`]); the neural variant keeps the batched
+/// path at concurrency ≥ this threshold, where the G9 measurement
+/// showed ~3× throughput gain from holding the BERT mutex once per
+/// batch instead of once per (query, candidate).
+pub const BATCHED_RERANK_MIN_CONCURRENCY: usize = 2;
+
+/// #1579 B10 — the auto-select predicate, extracted as a free function
+/// so the threshold arithmetic is unit-testable without standing up a
+/// worker thread or downloading model weights. `true` ⇒ route through
+/// the coalescing worker; `false` ⇒ direct encoder call.
+#[must_use]
+pub const fn use_batched_rerank_path(encoder_is_neural: bool, inflight_now: usize) -> bool {
+    encoder_is_neural && inflight_now >= BATCHED_RERANK_MIN_CONCURRENCY
+}
+
 /// Job submitted to the coalescer worker.
 struct RerankJob {
     query: String,
@@ -611,11 +1285,140 @@ struct RerankJob {
 /// pays one `recv_timeout(0)` round-trip — no artificial waiting.
 pub struct BatchedReranker {
     sender: Option<Sender<RerankJob>>,
+    /// H2 (v0.7.0 round-2) — explicit one-shot shutdown signal. The
+    /// worker thread selects on BOTH the work channel and this
+    /// shutdown channel; receiving on the shutdown channel makes the
+    /// worker exit its loop deterministically, even if a holder of
+    /// `sender` happens to outlive `Drop` (e.g. the test harness
+    /// stashed a `Sender` clone). `Drop` triggers this BEFORE dropping
+    /// `sender`, so a worker that is currently blocked in
+    /// `rx.recv()` wakes up via the shutdown channel without waiting
+    /// for the work-channel disconnect.
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
     worker: Option<JoinHandle<()>>,
     /// Direct handle to the underlying encoder, used for the single-query
     /// short-circuit and for callers that explicitly want non-batched
     /// behavior (tests, benchmarks).
     encoder: Arc<CrossEncoder>,
+    /// v0.7.0 L2-8 — reflection-aware boost config the worker hands
+    /// down to every batched `rerank` call.  Defaults to
+    /// [`ReflectionBoostConfig::default`] (boost = 1.2) so the daemon
+    /// flow ships the boost; explicit configuration goes through
+    /// [`Self::with_reflection_boost`] before the worker starts taking
+    /// jobs.
+    reflection_boost: ReflectionBoostConfig,
+    /// v0.7.0 #1319 — opt-in noise floor applied AFTER the blend
+    /// (`0.6 * original + 0.4 * ce_score`) and AFTER the reflection
+    /// boost. Default is [`RerankerScoreFloor::Off`] so existing
+    /// callers see byte-identical output to pre-#1319. Operators that
+    /// observed the cross-encoder false-positive ordering on
+    /// disjoint-vocab paraphrase queries (the v1 P5 probe — an Apollo
+    /// 11 row at 0.479 surfacing above a substantively-relevant hit at
+    /// 0.363) opt in via [`Self::with_score_floor`] to drop the
+    /// low-confidence tail entirely.
+    score_floor: RerankerScoreFloor,
+    /// #1579 B10 — number of rerank requests currently inside
+    /// [`Self::rerank`] (incremented on entry, decremented on exit).
+    /// Drives the auto-select between the direct encoder call and the
+    /// coalescing worker; see [`use_batched_rerank_path`].
+    inflight: std::sync::atomic::AtomicUsize,
+    /// #1579 B10 — observability counter: how many jobs this wrapper
+    /// has submitted to the coalescing worker over its lifetime. The
+    /// auto-select regression tests pin "lexical / lone-caller traffic
+    /// never reaches the worker" on this counter.
+    worker_submissions: std::sync::atomic::AtomicUsize,
+}
+
+/// v0.7.0 #1319 — post-blend score floor applied by [`BatchedReranker`].
+///
+/// **Default is [`Self::Off`]** — every existing caller observes
+/// byte-identical pre-#1319 output. Operators who hit the
+/// paraphrase / disjoint-vocab noise band turn it on via
+/// [`BatchedReranker::with_score_floor`] (constructor knob) or
+/// through the resolver-side `[reranker].score_floor*` config fields
+/// once they land.
+///
+/// **Why two shapes.** [`Self::Absolute`] is the literal "drop
+/// anything below 0.5" handle the recall caller's documentation
+/// suggests. [`Self::RelativeToTop`] keeps the top-of-list always
+/// available — useful when the corpus is small (a 3-row recall
+/// shouldn't return zero results just because every row scored
+/// `0.42`) and the operator just wants a "tail cleaner".
+///
+/// Both variants compare the **final blended score** (after the L2-8
+/// reflection boost), not the raw cross-encoder logit, so the floor
+/// is comparable to the values an operator reads off `recall.memories[].score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RerankerScoreFloor {
+    /// No floor — pre-#1319 behavior. Every blended candidate is kept,
+    /// regardless of score. Default.
+    Off,
+    /// Drop every candidate whose final blended score falls strictly
+    /// below the supplied absolute value. Clamped at runtime to
+    /// `[0.0, 1.0]`.
+    Absolute(f64),
+    /// Drop every candidate whose final blended score falls strictly
+    /// below `top_score * ratio` (where `top_score` is the first row
+    /// after sorting). Clamped at runtime to `[0.0, 1.0]`. The top
+    /// row itself is never dropped — operators get at least one
+    /// result even when the entire ranked set is in the noise band.
+    RelativeToTop(f64),
+}
+
+impl Default for RerankerScoreFloor {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl RerankerScoreFloor {
+    /// Apply the floor in-place to a pre-sorted (descending) vector
+    /// of `(Memory, blended_score)` candidates. The implementation is
+    /// extracted as a free helper so unit tests can pin the cutoff
+    /// arithmetic without spinning up a [`BatchedReranker`].
+    ///
+    /// The top row is always preserved (so a tiny corpus never
+    /// returns zero results) — see [`RerankerScoreFloor::RelativeToTop`]
+    /// documentation for the rationale.
+    fn apply(&self, scored: &mut Vec<(Memory, f64)>) {
+        if scored.is_empty() {
+            return;
+        }
+        let cutoff: f64 = match *self {
+            Self::Off => return,
+            Self::Absolute(v) => v.clamp(0.0, 1.0),
+            Self::RelativeToTop(ratio) => {
+                let top = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
+                top * ratio.clamp(0.0, 1.0)
+            }
+        };
+        // Walk index-first so we can preserve the top row even when
+        // its score sits below `cutoff` (small-corpus invariant: the
+        // floor is a tail cleaner, not a "return nothing" knob).
+        let mut keep = Vec::with_capacity(scored.len());
+        for (idx, (_, score)) in scored.iter().enumerate() {
+            if idx == 0 || *score >= cutoff {
+                keep.push(idx);
+            }
+        }
+        // `keep` is monotonically increasing; iterate in reverse and
+        // remove dropped indices so the Vec retains the descending
+        // sort order from the upstream rerank.
+        let mut next_keep = keep.iter().rev().copied();
+        let mut want = next_keep.next();
+        let mut idx = scored.len();
+        while idx > 0 {
+            idx -= 1;
+            match want {
+                Some(k) if k == idx => {
+                    want = next_keep.next();
+                }
+                _ => {
+                    scored.remove(idx);
+                }
+            }
+        }
+    }
 }
 
 impl BatchedReranker {
@@ -627,19 +1430,98 @@ impl BatchedReranker {
 
     /// Wrap an existing `CrossEncoder` with custom batching parameters.
     pub fn with_params(encoder: CrossEncoder, max_batch: usize, max_wait_ms: u64) -> Self {
+        Self::with_full_params(
+            encoder,
+            max_batch,
+            max_wait_ms,
+            ReflectionBoostConfig::default(),
+            RerankerScoreFloor::Off,
+        )
+    }
+
+    /// v0.7.0 L2-8 — wrap an existing `CrossEncoder` with a custom
+    /// reflection-boost config alongside default batching parameters.
+    /// Used by the recall integration tests to pin specific boost shapes
+    /// (e.g. `disabled()` for the regression test).
+    pub fn with_reflection_boost(encoder: CrossEncoder, boost: ReflectionBoostConfig) -> Self {
+        Self::with_full_params(
+            encoder,
+            DEFAULT_MAX_BATCH,
+            DEFAULT_MAX_WAIT_MS,
+            boost,
+            RerankerScoreFloor::Off,
+        )
+    }
+
+    /// v0.7.0 #1319 — wrap a `CrossEncoder` with a post-blend score
+    /// floor. The reflection-boost knob is left at the daemon default
+    /// (`1.2`); use [`Self::with_full_params`] to set both at once.
+    /// **Default constructors leave the floor `Off`** — flipping it on
+    /// here is an explicit operator-opt-in.
+    #[must_use]
+    pub fn with_score_floor(encoder: CrossEncoder, floor: RerankerScoreFloor) -> Self {
+        Self::with_full_params(
+            encoder,
+            DEFAULT_MAX_BATCH,
+            DEFAULT_MAX_WAIT_MS,
+            ReflectionBoostConfig::default(),
+            floor,
+        )
+    }
+
+    /// Internal constructor — all knobs visible.
+    fn with_full_params(
+        encoder: CrossEncoder,
+        max_batch: usize,
+        max_wait_ms: u64,
+        reflection_boost: ReflectionBoostConfig,
+        score_floor: RerankerScoreFloor,
+    ) -> Self {
         let encoder = Arc::new(encoder);
         let (tx, rx) = std::sync::mpsc::channel::<RerankJob>();
+        // H2 (v0.7.0 round-2) — one-shot shutdown channel. The std
+        // mpsc channel is used as a "oneshot": we never send more
+        // than one value, and the worker exits on the first
+        // `try_recv()` success OR on disconnect (Drop of the holder
+        // closes the sender side, which also surfaces as a recv
+        // outcome the worker can branch on).
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
         let worker_encoder = Arc::clone(&encoder);
+        let worker_boost = reflection_boost;
         let max_wait = Duration::from_millis(max_wait_ms);
 
         let worker = thread::Builder::new()
             .name("ai-memory-reranker-batcher".into())
             .spawn(move || {
-                loop {
-                    // Block until the first job arrives — no busy wait.
-                    let first = match rx.recv() {
-                        Ok(job) => job,
-                        Err(_) => return, // sender dropped → shut down
+                // H2 polling cadence: when waiting for the first job
+                // of a batch, fall back to `recv_timeout` so the worker
+                // wakes up periodically to check the shutdown signal.
+                // 100ms keeps the test in `test_drop_terminates_worker`
+                // comfortably inside its 500ms budget while staying
+                // well below the 5ms intra-batch coalescing window
+                // (no cost to the hot path).
+                const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+                'outer: loop {
+                    // Block until the first job arrives OR the
+                    // shutdown signal fires OR the sender drops.
+                    let first = loop {
+                        // Cheap non-blocking shutdown check first so a
+                        // signal that arrived between iterations is
+                        // observed even if the work channel had a job
+                        // queued before the signal landed.
+                        match shutdown_rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                break 'outer;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        match rx.recv_timeout(SHUTDOWN_POLL) {
+                            Ok(job) => break job,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                break 'outer;
+                            }
+                        }
                     };
 
                     let mut batch: Vec<RerankJob> = Vec::with_capacity(max_batch);
@@ -658,32 +1540,121 @@ impl BatchedReranker {
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                                 // Drain the current batch then exit.
-                                break;
+                                process_batch(&worker_encoder, batch, &worker_boost);
+                                break 'outer;
                             }
                         }
                     }
 
-                    process_batch(&worker_encoder, batch);
+                    process_batch(&worker_encoder, batch, &worker_boost);
                 }
             })
             .expect("failed to spawn rerank batcher worker");
 
         Self {
             sender: Some(tx),
+            shutdown: Some(shutdown_tx),
             worker: Some(worker),
             encoder,
+            reflection_boost,
+            score_floor,
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            worker_submissions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Submit a single rerank request. Blocks until the batcher returns
-    /// the result. Concurrent callers are coalesced into a single
-    /// `rerank_batch` call inside the worker thread.
+    /// Submit a single rerank request. Blocks until the result is
+    /// available.
+    ///
+    /// #1579 B10 — **auto-select.** The wrapper keeps BOTH execution
+    /// paths and picks per call via [`use_batched_rerank_path`]:
+    ///
+    /// - **Direct** (no worker round-trip) when the encoder is
+    ///   lexical / degraded-lexical (no shared-model mutex to
+    ///   amortise — criterion proved the coalescing flush window made
+    ///   the batched path 12× slower at N=8: ~7.6 ms vs ~0.65 ms), or
+    ///   when fewer than [`BATCHED_RERANK_MIN_CONCURRENCY`] requests
+    ///   are in flight (nothing to coalesce with).
+    /// - **Coalesced** (worker thread, one `rerank_batch` per flush)
+    ///   for neural encoders under real concurrency — the G9 win
+    ///   (~3× at N=8 neural) is preserved.
     ///
     /// If the worker is unavailable for any reason (channel closed),
-    /// falls back to a direct `rerank` call on the underlying encoder.
+    /// falls back to a direct `rerank` call on the underlying encoder
+    /// (with the wrapper's configured reflection boost applied).
     pub fn rerank(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        let mut scored = self.rerank_unfloored(query, candidates);
+        // v0.7.0 #1319 — post-blend score floor (default Off; opt-in
+        // via `with_score_floor`). Applies to the already-sorted
+        // descending vector returned by the encoder/worker.
+        self.score_floor.apply(&mut scored);
+        scored
+    }
+
+    /// #1579 B10 — force the COALESCED (worker) path regardless of the
+    /// auto-select. Kept public so the throughput bench
+    /// (`benches/reranker_throughput.rs`) and regression tests can keep
+    /// measuring the raw batched machinery after `rerank` started
+    /// auto-selecting away from it at small N. Applies the same
+    /// post-blend score floor as [`Self::rerank`].
+    #[must_use]
+    pub fn rerank_coalesced(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+    ) -> Vec<(Memory, f64)> {
+        let mut scored = self.rerank_coalesced_unfloored(query, candidates);
+        self.score_floor.apply(&mut scored);
+        scored
+    }
+
+    /// Internal — same shape as [`Self::rerank`] but skips the
+    /// post-blend score floor. Pre-#1319 callsites that explicitly
+    /// want the raw blended output (regression tests, the byte-equal
+    /// pin in `g9_batched_reranker_serial_calls_match_rerank`) call
+    /// this directly.
+    fn rerank_unfloored(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        use std::sync::atomic::Ordering;
+        // #1579 B10 — RAII in-flight guard so a panicking encoder call
+        // can't leak the counter and wedge the auto-select high.
+        struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let inflight_now = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = InflightGuard(&self.inflight);
+
+        if use_batched_rerank_path(self.encoder.is_neural(), inflight_now) {
+            self.rerank_coalesced_unfloored(query, candidates)
+        } else {
+            self.rerank_direct_unfloored(query, candidates)
+        }
+    }
+
+    /// #1579 B10 — the DIRECT path: one synchronous encoder call on the
+    /// caller's thread, no worker round-trip, no flush-window wait.
+    fn rerank_direct_unfloored(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+    ) -> Vec<(Memory, f64)> {
+        self.encoder
+            .rerank_with_reflection_boost(query, candidates, &self.reflection_boost)
+    }
+
+    /// The COALESCED path: submit to the worker thread and block for
+    /// the reply. Concurrent callers are coalesced into a single
+    /// `rerank_batch` call inside the worker. (Pre-#1579-B10 this was
+    /// the body of `rerank_unfloored`.)
+    fn rerank_coalesced_unfloored(
+        &self,
+        query: &str,
+        candidates: Vec<(Memory, f64)>,
+    ) -> Vec<(Memory, f64)> {
         let Some(sender) = self.sender.as_ref() else {
-            return self.encoder.rerank(query, candidates);
+            return self.rerank_direct_unfloored(query, candidates);
         };
         let (reply_tx, reply_rx) = sync_channel::<Vec<(Memory, f64)>>(1);
         let job = RerankJob {
@@ -692,11 +1663,43 @@ impl BatchedReranker {
             reply: reply_tx,
         };
         if sender.send(job).is_err() {
-            return self.encoder.rerank(query, Vec::new());
+            return self.encoder.rerank_with_reflection_boost(
+                query,
+                Vec::new(),
+                &self.reflection_boost,
+            );
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| self.encoder.rerank(query, Vec::new()))
+        self.worker_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        reply_rx.recv().unwrap_or_else(|_| {
+            self.encoder
+                .rerank_with_reflection_boost(query, Vec::new(), &self.reflection_boost)
+        })
+    }
+
+    /// #1579 B10 — lifetime count of jobs submitted to the coalescing
+    /// worker. Observability hook for the auto-select regression tests
+    /// ("lexical traffic never reaches the worker") and operator
+    /// diagnostics.
+    #[must_use]
+    pub fn worker_submissions(&self) -> usize {
+        self.worker_submissions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// v0.7.0 #1319 — expose the configured score floor for the
+    /// `memory_capabilities` reporter and for operator-facing
+    /// diagnostics.
+    #[must_use]
+    pub fn score_floor(&self) -> RerankerScoreFloor {
+        self.score_floor
+    }
+
+    /// v0.7.0 L2-8 — expose the configured boost for the
+    /// `memory_capabilities` reporter.
+    #[must_use]
+    pub fn reflection_boost(&self) -> &ReflectionBoostConfig {
+        &self.reflection_boost
     }
 
     /// Direct access to the wrapped encoder. Useful for callers that
@@ -711,12 +1714,36 @@ impl BatchedReranker {
     pub fn is_neural(&self) -> bool {
         self.encoder.is_neural()
     }
+
+    /// v0.7.0 R3-S2 — shortcut for `self.encoder().is_degraded_lexical()`.
+    /// The recall path reads this to drive the in-band `reranker_used`
+    /// signal exposed via `RecallMeta`.
+    #[must_use]
+    pub fn is_degraded_lexical(&self) -> bool {
+        self.encoder.is_degraded_lexical()
+    }
 }
 
 impl Drop for BatchedReranker {
     fn drop(&mut self) {
-        // Drop the sender so the worker observes a disconnected channel
-        // and exits its loop cleanly.
+        // H2 (v0.7.0 round-2): two-step termination.
+        //
+        //   1. Fire the explicit shutdown signal FIRST so the worker
+        //      observes it even when another holder of `Sender`
+        //      (e.g. a test that cloned the work channel) would
+        //      otherwise keep the work channel alive.
+        //   2. Then drop the work-channel sender — a worker that was
+        //      blocked in `rx.recv_timeout(...)` wakes up either via
+        //      the shutdown poll OR the disconnect, whichever
+        //      happens first.
+        //
+        // Joining the worker after BOTH signals fire bounds shutdown
+        // by the SHUTDOWN_POLL cadence (100ms) in the absolute worst
+        // case, well inside the 500ms budget exercised by
+        // `test_drop_terminates_worker`.
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         self.sender.take();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
@@ -724,7 +1751,11 @@ impl Drop for BatchedReranker {
     }
 }
 
-fn process_batch(encoder: &CrossEncoder, batch: Vec<RerankJob>) {
+fn process_batch(
+    encoder: &CrossEncoder,
+    batch: Vec<RerankJob>,
+    boost_config: &ReflectionBoostConfig,
+) {
     if batch.is_empty() {
         return;
     }
@@ -734,7 +1765,7 @@ fn process_batch(encoder: &CrossEncoder, batch: Vec<RerankJob>) {
     if batch.len() == 1 {
         let mut iter = batch.into_iter();
         let job = iter.next().expect("len == 1");
-        let result = encoder.rerank(&job.query, job.candidates);
+        let result = encoder.rerank_with_reflection_boost(&job.query, job.candidates, boost_config);
         let _ = job.reply.send(result);
         return;
     }
@@ -749,7 +1780,7 @@ fn process_batch(encoder: &CrossEncoder, batch: Vec<RerankJob>) {
         replies.push(job.reply);
     }
 
-    let outputs = encoder.rerank_batch(queries);
+    let outputs = encoder.rerank_batch_with_reflection_boost(queries, boost_config);
     for (out, reply) in outputs.into_iter().zip(replies.into_iter()) {
         let _ = reply.send(out);
     }
@@ -763,6 +1794,35 @@ fn process_batch(encoder: &CrossEncoder, batch: Vec<RerankJob>) {
 mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
+
+    /// #1604 — process-wide rerank sequence-cap seeding: the first
+    /// [`set_rerank_max_seq`] writer wins and later writes are no-ops.
+    ///
+    /// Order-independent by construction: other tests in this binary
+    /// may legitimately seed the process-wide `OnceLock` first (any
+    /// test that walks the `daemon_runtime` boot ladder does), so this
+    /// test asserts only the post-seed immutability contract — it
+    /// seeds (or observes the earlier seed), then proves a second
+    /// write cannot change the value. The unseeded-default fallback
+    /// is pinned by `resolve_reranker_1604_max_seq_ladder` (resolver
+    /// layer, no OnceLock) instead. The pre-fix form asserted the
+    /// unseeded default first and was order-dependent — green locally,
+    /// red under CI's impact-aware test ordering.
+    #[test]
+    fn rerank_max_seq_1604_seed_once_semantics() {
+        set_rerank_max_seq(192);
+        let settled = rerank_max_seq();
+        assert!(
+            settled > 0,
+            "settled value must be a real cap (ours or an earlier boot seed), got {settled}"
+        );
+        set_rerank_max_seq(64);
+        assert_eq!(
+            rerank_max_seq(),
+            settled,
+            "first writer must win — a later set_rerank_max_seq call must be a no-op"
+        );
+    }
 
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {
@@ -781,7 +1841,56 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         }
+    }
+
+    /// #1531 M13 — a NaN original score must not nondeterministically
+    /// hold the top rank. Pre-fix, the blended NaN compared `Equal` to
+    /// every finite score under `partial_cmp(..).unwrap_or(Equal)`, so
+    /// the stable sort left the poisoned candidate in its input
+    /// position (here: first). Post-fix non-finite scores clamp to
+    /// `f64::MIN` and sink to the bottom.
+    #[test]
+    fn nan_scored_candidate_sinks_to_bottom_m13() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let poisoned = make_memory("poisoned", "irrelevant body");
+        let good = make_memory("network configuration", "network configuration body");
+        let out = ce.rerank(
+            "network configuration",
+            vec![(poisoned, f64::NAN), (good, 0.9)],
+        );
+        assert_eq!(
+            out[0].0.title, "network configuration",
+            "finite-scored candidate must outrank the NaN-poisoned one"
+        );
+        assert_eq!(out[1].0.title, "poisoned");
+        assert_eq!(
+            out[1].1,
+            f64::MIN,
+            "non-finite blended score must clamp to the ranking floor"
+        );
+
+        // Boost-aware path takes the same clamp.
+        let poisoned = make_memory("poisoned", "irrelevant body");
+        let good = make_memory("network configuration", "network configuration body");
+        let out = ce.rerank_with_reflection_boost(
+            "network configuration",
+            vec![(poisoned, f64::NAN), (good, 0.9)],
+            &ReflectionBoostConfig::disabled(),
+        );
+        assert_eq!(out[0].0.title, "network configuration");
+        assert_eq!(out[1].1, f64::MIN);
     }
 
     #[test]
@@ -1302,6 +2411,95 @@ mod tests {
         }
     }
 
+    /// #1579 B10 — the auto-select predicate: lexical NEVER batches
+    /// (criterion: batched 7.6 ms vs direct 0.65 ms at N=8 — 12×
+    /// inversion from the flush window); neural batches only at
+    /// concurrency ≥ `BATCHED_RERANK_MIN_CONCURRENCY`.
+    #[test]
+    fn issue_1579_b10_auto_select_predicate() {
+        use super::{BATCHED_RERANK_MIN_CONCURRENCY, use_batched_rerank_path};
+        // Lexical: direct at every concurrency level.
+        assert!(!use_batched_rerank_path(false, 1));
+        assert!(!use_batched_rerank_path(false, 8));
+        assert!(!use_batched_rerank_path(false, 1024));
+        // Neural: lone caller goes direct (nothing to coalesce with)…
+        assert!(!use_batched_rerank_path(true, 1));
+        // …real concurrency keeps the G9 batched win.
+        assert!(use_batched_rerank_path(
+            true,
+            BATCHED_RERANK_MIN_CONCURRENCY
+        ));
+        assert!(use_batched_rerank_path(true, 8));
+    }
+
+    /// #1579 B10 — behavioral pin: a lexical `BatchedReranker` routes
+    /// every call (serial AND concurrent) down the DIRECT path; the
+    /// coalescing worker never sees a job. Pre-fix, all 8 concurrent
+    /// lexical calls funneled through the worker and paid the 5 ms
+    /// flush window per batch.
+    #[test]
+    fn issue_1579_b10_lexical_rerank_never_reaches_worker() {
+        use super::BatchedReranker;
+        use std::sync::Arc;
+        let batched = Arc::new(BatchedReranker::new(CrossEncoder::new()));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let b = Arc::clone(&batched);
+            handles.push(std::thread::spawn(move || {
+                let cands: Vec<(Memory, f64)> = (0..5)
+                    .map(|j| {
+                        (
+                            make_memory(&format!("b10-{i}-{j}"), &format!("body {j} alpha gamma")),
+                            0.5,
+                        )
+                    })
+                    .collect();
+                let out = b.rerank(&format!("alpha {i}"), cands);
+                assert_eq!(out.len(), 5);
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        assert_eq!(
+            batched.worker_submissions(),
+            0,
+            "lexical rerank must auto-select the direct path (no worker jobs)"
+        );
+    }
+
+    /// #1579 B10 — the forced coalesced path stays alive (both paths
+    /// are kept per the remediation contract) and produces output
+    /// byte-equal to the direct path on a lexical encoder.
+    #[test]
+    fn issue_1579_b10_forced_coalesced_path_matches_direct() {
+        use super::BatchedReranker;
+        let batched = BatchedReranker::new(CrossEncoder::new());
+        let cands: Vec<(Memory, f64)> = (0..4)
+            .map(|i| {
+                (
+                    make_memory(
+                        &format!("b10-forced-{i}"),
+                        &format!("alpha gamma body {i} content words"),
+                    ),
+                    f64::from(i) * 0.1,
+                )
+            })
+            .collect();
+        let direct = batched.rerank("alpha", cands.clone());
+        let coalesced = batched.rerank_coalesced("alpha", cands);
+        assert_eq!(
+            batched.worker_submissions(),
+            1,
+            "rerank_coalesced must route through the worker"
+        );
+        assert_eq!(coalesced.len(), direct.len());
+        for (a, b) in coalesced.iter().zip(direct.iter()) {
+            assert_eq!(a.0.id, b.0.id);
+            assert!((a.1 - b.1).abs() < 1e-12);
+        }
+    }
+
     #[test]
     fn pr9i_rerank_via_score_returns_blend() {
         // Even when new_neural() falls back to lexical, rerank() must
@@ -1326,6 +2524,17 @@ mod tests {
                     last_accessed_at: None,
                     expires_at: None,
                     metadata: serde_json::json!({}),
+                    reflection_depth: 0,
+                    memory_kind: crate::models::MemoryKind::Observation,
+                    entity_id: None,
+                    persona_version: None,
+                    citations: Vec::new(),
+                    source_uri: None,
+                    source_span: None,
+                    confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                    confidence_signals: None,
+                    confidence_decayed_at: None,
+                    version: 1,
                 },
                 0.6,
             ),
@@ -1346,6 +2555,17 @@ mod tests {
                     last_accessed_at: None,
                     expires_at: None,
                     metadata: serde_json::json!({}),
+                    reflection_depth: 0,
+                    memory_kind: crate::models::MemoryKind::Observation,
+                    entity_id: None,
+                    persona_version: None,
+                    citations: Vec::new(),
+                    source_uri: None,
+                    source_span: None,
+                    confidence_source: crate::models::ConfidenceSource::CallerProvided,
+                    confidence_signals: None,
+                    confidence_decayed_at: None,
+                    version: 1,
                 },
                 0.4,
             ),
@@ -1357,6 +2577,193 @@ mod tests {
         }
         // First entry's blended score >= second by sort contract.
         assert!(out[0].1 >= out[1].1);
+    }
+
+    // ---------- Issue #1319 — reranker score floor (calibration) -----------
+
+    /// Issue #1319 — `RerankerScoreFloor::Off` is the default and a
+    /// no-op. Pre-#1319 callers see byte-identical output through the
+    /// new `apply` helper.
+    #[test]
+    fn reranker_score_floor_default_is_off_1319() {
+        let floor = RerankerScoreFloor::default();
+        assert_eq!(floor, RerankerScoreFloor::Off);
+        let mut scored = vec![
+            (make_memory("a", "x"), 0.9_f64),
+            (make_memory("b", "y"), 0.4_f64),
+            (make_memory("c", "z"), 0.1_f64),
+        ];
+        let before = scored.clone();
+        floor.apply(&mut scored);
+        assert_eq!(scored.len(), before.len());
+        for (i, (mem, s)) in scored.iter().enumerate() {
+            assert_eq!(mem.title, before[i].0.title);
+            assert!((s - before[i].1).abs() < f64::EPSILON);
+        }
+    }
+
+    /// Issue #1319 — absolute floor drops the tail. Top row is
+    /// preserved even when its score happens to fall below the floor
+    /// (small-corpus safety so a 1-row recall never returns nothing).
+    #[test]
+    fn reranker_score_floor_absolute_drops_tail_1319() {
+        let floor = RerankerScoreFloor::Absolute(0.5);
+        let mut scored = vec![
+            (make_memory("top", "x"), 0.90_f64),
+            (make_memory("mid", "y"), 0.60_f64),
+            (make_memory("low", "z"), 0.30_f64),
+            (make_memory("noise", "n"), 0.10_f64),
+        ];
+        floor.apply(&mut scored);
+        // top + mid kept; low + noise dropped.
+        let titles: Vec<&str> = scored.iter().map(|(m, _)| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["top", "mid"]);
+    }
+
+    /// Issue #1319 — relative floor preserves the head and drops
+    /// candidates below `top_score * ratio`.
+    #[test]
+    fn reranker_score_floor_relative_drops_tail_1319() {
+        let floor = RerankerScoreFloor::RelativeToTop(0.5);
+        // top_score = 0.80, cutoff = 0.40.
+        let mut scored = vec![
+            (make_memory("top", "x"), 0.80_f64),
+            (make_memory("kept", "y"), 0.50_f64),
+            (make_memory("dropped_1", "z"), 0.35_f64),
+            (make_memory("dropped_2", "z"), 0.20_f64),
+        ];
+        floor.apply(&mut scored);
+        let titles: Vec<&str> = scored.iter().map(|(m, _)| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["top", "kept"]);
+    }
+
+    /// Issue #1319 — top row is preserved even when the absolute
+    /// floor sits above every blended score. A tiny corpus that all
+    /// scored at 0.20 must still surface its top hit, not return
+    /// empty.
+    #[test]
+    fn reranker_score_floor_preserves_top_row_when_everything_below_1319() {
+        let floor = RerankerScoreFloor::Absolute(0.5);
+        let mut scored = vec![
+            (make_memory("apollo", "moon landing"), 0.20_f64),
+            (make_memory("recall", "blends fts and semantic"), 0.10_f64),
+        ];
+        floor.apply(&mut scored);
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].0.title, "apollo");
+    }
+
+    /// Issue #1319 — empty input is a no-op (no panic on `.first()`).
+    #[test]
+    fn reranker_score_floor_handles_empty_1319() {
+        let floor = RerankerScoreFloor::Absolute(0.5);
+        let mut scored: Vec<(Memory, f64)> = vec![];
+        floor.apply(&mut scored);
+        assert!(scored.is_empty());
+    }
+
+    /// Issue #1319 — v1 P5 probe surfaced a paraphrase-aware corpus
+    /// where an Apollo-11 row scored 0.479 above a
+    /// substantively-relevant recall-mechanics row at 0.363 with
+    /// nothing visible to the operator that would have explained the
+    /// ordering. This regression test reconstructs the empirical
+    /// situation (disjoint-vocab paraphrase query — query terms appear
+    /// in neither candidate's title or content) and asserts that, with
+    /// an operator-opt-in `RerankerScoreFloor::Absolute(0.40)`, the
+    /// Apollo-11 false positive is dropped while the head ranking is
+    /// preserved.
+    ///
+    /// **Why the floor matters here.** With the lexical CE, both
+    /// candidates score 0.0 on the paraphrase query (disjoint vocab).
+    /// The blend `0.6 * original + 0.4 * 0.0` reduces to `0.6 * original`,
+    /// so the empirical ordering is set entirely by the upstream
+    /// `original` score. The substrate cannot reorder them away from
+    /// the noise — but it CAN expose an operator handle that drops
+    /// the entire tail below a threshold the operator chose. That's
+    /// what `RerankerScoreFloor` provides.
+    #[test]
+    fn reranker_v1_p5_paraphrase_noise_dropped_by_floor_1319() {
+        let ce = CrossEncoder::new(); // lexical, deterministic.
+        let apollo = make_memory(
+            "Apollo 11 moon landing",
+            "Neil Armstrong walked on the moon in 1969.",
+        );
+        let recall_b = make_memory(
+            "Recall blends FTS and semantic scores",
+            "The hybrid pipeline weighs cosine vs BM25 then reranks the top-k.",
+        );
+
+        // Empirical pre-#1319 shape: upstream hybrid retrieval scored
+        // Apollo above recall_b. The exact numbers mirror the v1 P5
+        // probe (Apollo 0.479, recall_b 0.363) so the test reads as
+        // the operator-observed evidence on the issue.
+        let candidates = vec![(apollo.clone(), 0.479_f64), (recall_b.clone(), 0.363_f64)];
+
+        // Operator query: a paraphrase that lexically misses both
+        // candidates ("what makes a recall implementation good?").
+        // Lexical CE produces 0 for both, so the blend reduces to
+        // `0.6 * original`.
+        let query = "what makes a recall implementation good?";
+
+        // Sanity: pre-floor, Apollo still sits on top — the
+        // substrate has no way to reorder paraphrase-disjoint
+        // candidates without semantic input from upstream.
+        let pre = ce.rerank(query, candidates.clone());
+        assert_eq!(pre[0].0.title, "Apollo 11 moon landing");
+        // Blended top score = 0.6 * 0.479 = 0.2874 (paraphrase noise band).
+        assert!(pre[0].1 < 0.30, "top score in noise band: {}", pre[0].1);
+
+        // Post-#1319 with absolute floor at 0.40: the entire tail is
+        // dropped EXCEPT the top row (preserved per the small-corpus
+        // safety rule). The operator now sees a single result and can
+        // judge "noise" vs "this is genuinely the best the substrate
+        // has" without an Apollo-11 false positive sitting beneath it
+        // at 0.218.
+        let mut post = pre.clone();
+        RerankerScoreFloor::Absolute(0.40).apply(&mut post);
+        assert_eq!(
+            post.len(),
+            1,
+            "floor at 0.40 must drop tail when blended scores in noise band: {post:?}"
+        );
+        // Top preserved.
+        assert_eq!(post[0].0.title, "Apollo 11 moon landing");
+    }
+
+    /// Issue #1319 — `BatchedReranker::with_score_floor` plumbs the
+    /// operator-opt-in floor end-to-end through the batched worker.
+    /// Pinned via the wrapper so future refactors of the worker
+    /// pipeline can't silently bypass the floor.
+    #[test]
+    fn batched_reranker_score_floor_plumbed_end_to_end_1319() {
+        use super::BatchedReranker;
+        let batched = BatchedReranker::with_score_floor(
+            CrossEncoder::new(),
+            RerankerScoreFloor::Absolute(0.40),
+        );
+        assert_eq!(batched.score_floor(), RerankerScoreFloor::Absolute(0.40));
+
+        let apollo = make_memory("Apollo 11 moon landing", "Armstrong, 1969");
+        let recall_b = make_memory(
+            "Recall blends FTS and semantic scores",
+            "hybrid pipeline weighs cosine vs BM25",
+        );
+        let candidates = vec![(apollo, 0.479_f64), (recall_b, 0.363_f64)];
+        let out = batched.rerank("paraphrase miss query", candidates);
+        // Default daemon path uses `BatchedReranker::new` (floor Off),
+        // so existing behavior is preserved — only the opt-in
+        // constructor plumbs the floor.
+        assert_eq!(out.len(), 1, "score floor must drop tail: {out:?}");
+    }
+
+    /// Issue #1319 — the existing `BatchedReranker::new` path leaves
+    /// the floor at `Off`, preserving pre-#1319 byte-equality for
+    /// every daemon that has not opted in.
+    #[test]
+    fn batched_reranker_default_constructor_leaves_floor_off_1319() {
+        use super::BatchedReranker;
+        let batched = BatchedReranker::new(CrossEncoder::new());
+        assert_eq!(batched.score_floor(), RerankerScoreFloor::Off);
     }
 }
 
@@ -1445,7 +2852,9 @@ pub mod test_support {
 #[cfg(test)]
 mod mock_tests {
     use super::test_support::*;
+    use super::{BatchedReranker, CrossEncoder};
     use crate::models::{Memory, Tier};
+    use std::time::Duration;
 
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {
@@ -1464,6 +2873,17 @@ mod mock_tests {
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         }
     }
 
@@ -1552,6 +2972,53 @@ mod mock_tests {
         // They should use different scoring formulas
         assert_ne!(s_lex, s_neu);
     }
+
+    // -----------------------------------------------------------------
+    // H2 (v0.7.0 round-2) — worker-thread shutdown discipline.
+    //
+    // Contract: spawning a `BatchedReranker` and dropping it
+    // immediately must terminate the worker thread within a bounded
+    // wall-clock window. Without an explicit shutdown channel, a
+    // worker that was blocked in `rx.recv()` would only exit on
+    // sender disconnect; the explicit signal closes the worst-case
+    // (e.g. a stashed `Sender` clone) and bounds the shutdown
+    // latency by the worker's SHUTDOWN_POLL cadence.
+    // -----------------------------------------------------------------
+    #[test]
+    fn h2_drop_terminates_worker_within_500ms() {
+        use std::time::Instant;
+        let reranker = BatchedReranker::new(CrossEncoder::new());
+        // Capture the JoinHandle by exfiltrating it BEFORE drop so we
+        // can observe thread termination from the outside. We
+        // re-implement the Drop body inline for the assertion: fire
+        // shutdown, drop sender, join with a wall-clock budget.
+        let mut r = reranker;
+        let shutdown = r.shutdown.take().expect("shutdown sender present");
+        let worker = r.worker.take().expect("worker handle present");
+        // Drop the work-channel sender first to mimic the same
+        // disconnect semantics the production Drop sequence
+        // produces.
+        r.sender.take();
+        let start = Instant::now();
+        let _ = shutdown.send(());
+        // Spawn the join on a side thread so we can apply a hard
+        // wall-clock budget. `JoinHandle::join` does not take a
+        // timeout, so the side-thread + park-with-deadline form is
+        // the idiomatic Rust pattern.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = worker.join();
+            let _ = done_tx.send(());
+        });
+        let observed = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .map(|()| Instant::now().duration_since(start));
+        assert!(
+            observed.is_ok(),
+            "BatchedReranker worker did not terminate within 500ms after \
+             explicit shutdown — observed: {observed:?}"
+        );
+    }
 }
 
 #[test]
@@ -1583,4 +3050,247 @@ fn bigram_score_with_single_token_query() {
     // Query with only one token — bigrams should be empty, no crash
     let s = lexical_score("query", "Single Token Title", "single token content");
     assert!((0.0..=1.0).contains(&s));
+}
+
+#[cfg(test)]
+mod issue_1597_tests {
+    //! #1597 — rerank pool cap + batched cross-encoder forward pass.
+    //!
+    //! The counting-mock route is unavailable: `MockCrossEncoder` is a
+    //! standalone test struct, not a pluggable `CrossEncoder` variant,
+    //! so call counts cannot be observed through the production enum.
+    //! Instead the cap is pinned via score mutation: with a query that
+    //! shares zero tokens with every candidate, the lexical
+    //! cross-encoder scores every scored pair `0.0`, so a cross-encoded
+    //! candidate's final score becomes EXACTLY `ORIGINAL_WEIGHT * orig`
+    //! while an uncapped candidate keeps `orig` bit-for-bit — making
+    //! "exactly RERANK_POOL_MAX candidates were cross-encoded"
+    //! observable from the output alone.
+
+    use super::*;
+    use crate::models::Memory;
+
+    /// Query with zero token overlap against [`pool_memory`] docs —
+    /// lexical cross-encoder score is exactly 0.0 for every pair.
+    const NO_OVERLAP_QUERY: &str = "zzz qqq www";
+
+    fn pool_memory(i: i32) -> Memory {
+        Memory {
+            id: format!("cand-{i}"),
+            title: format!("alpha {i}"),
+            content: format!("beta gamma {i}"),
+            ..Memory::default()
+        }
+    }
+
+    /// `n` candidates with distinct ascending original scores
+    /// `0.01 * (i + 1)`, supplied in ASCENDING order so the cap's
+    /// pre-sort is load-bearing (not a pass-through of input order).
+    fn pool(n: i32) -> Vec<(Memory, f64)> {
+        (0..n)
+            .map(|i| (pool_memory(i), f64::from(i + 1) * 0.01))
+            .collect()
+    }
+
+    fn orig_score(i: i32) -> f64 {
+        f64::from(i + 1) * 0.01
+    }
+
+    /// Pool of 50 → exactly [`RERANK_POOL_MAX`] candidates get
+    /// cross-encoder scores (their final scores move to
+    /// `ORIGINAL_WEIGHT * orig`); the other 30 keep their blended
+    /// scores bit-for-bit and sort below the reranked head. No
+    /// candidate is lost.
+    #[test]
+    fn rerank_pool_cap_honored_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let n = 50;
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(n));
+
+        assert_eq!(out.len(), 50, "no candidate may be lost");
+        let ids: std::collections::HashSet<&str> = out.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 50, "no duplicate / dropped ids");
+
+        // Head: the top RERANK_POOL_MAX by original score (i = 30..49,
+        // descending), each cross-encoded → ORIGINAL_WEIGHT * orig.
+        for (rank, (mem, score)) in out.iter().take(RERANK_POOL_MAX).enumerate() {
+            let i = 49 - i32::try_from(rank).expect("rank fits i32");
+            assert_eq!(mem.id, format!("cand-{i}"), "head rank {rank}");
+            assert!(
+                (score - ORIGINAL_WEIGHT * orig_score(i)).abs() < f64::EPSILON,
+                "head rank {rank} must carry the cross-encoded blend"
+            );
+        }
+
+        // Tail: the remaining 30 (i = 29..0, descending), blended
+        // scores untouched (bit-for-bit the input score).
+        for (off, (mem, score)) in out.iter().skip(RERANK_POOL_MAX).enumerate() {
+            let i = 29 - i32::try_from(off).expect("offset fits i32");
+            assert_eq!(mem.id, format!("cand-{i}"), "tail offset {off}");
+            assert_eq!(
+                *score,
+                orig_score(i),
+                "tail offset {off} must keep its blended score untouched"
+            );
+        }
+    }
+
+    /// Order correctness: reranked head internally sorted descending,
+    /// tail internally sorted descending, tail strictly after the head.
+    #[test]
+    fn rerank_pool_cap_order_correctness_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(50));
+        let head = &out[..RERANK_POOL_MAX];
+        let tail = &out[RERANK_POOL_MAX..];
+        assert!(
+            head.windows(2).all(|w| w[0].1 >= w[1].1),
+            "reranked head must be sorted descending"
+        );
+        assert!(
+            tail.windows(2).all(|w| w[0].1 >= w[1].1),
+            "uncapped tail must be sorted descending"
+        );
+        // Every tail member's ORIGINAL score is below every head
+        // member's original score (the cap kept the strongest pool).
+        let min_head_orig = orig_score(30);
+        assert!(
+            tail.iter().all(|(_, s)| *s < min_head_orig),
+            "tail must hold only candidates the cap excluded"
+        );
+    }
+
+    /// Pool exactly at the cap → full rerank (tail empty): every
+    /// candidate is cross-encoded.
+    #[test]
+    fn rerank_pool_at_cap_fully_cross_encoded_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let n = i32::try_from(RERANK_POOL_MAX).expect("cap fits i32");
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(n));
+        assert_eq!(out.len(), RERANK_POOL_MAX);
+        for (rank, (_, score)) in out.iter().enumerate() {
+            let i = n - 1 - i32::try_from(rank).expect("rank fits i32");
+            assert!(
+                (score - ORIGINAL_WEIGHT * orig_score(i)).abs() < f64::EPSILON,
+                "at-cap pool: rank {rank} must be cross-encoded"
+            );
+        }
+    }
+
+    /// Cap > pool size degenerates to the historical full rerank.
+    #[test]
+    fn rerank_cap_gt_pool_degenerates_to_full_rerank_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let out = ce.rerank(NO_OVERLAP_QUERY, pool(5));
+        assert_eq!(out.len(), 5);
+        for (rank, (_, score)) in out.iter().enumerate() {
+            let i = 4 - i32::try_from(rank).expect("rank fits i32");
+            assert!(
+                (score - ORIGINAL_WEIGHT * orig_score(i)).abs() < f64::EPSILON,
+                "small pool: rank {rank} must be cross-encoded (no tail)"
+            );
+        }
+    }
+
+    /// The G9 multi-query batch path applies the cap per query job.
+    #[test]
+    fn rerank_batch_applies_pool_cap_per_query_1597() {
+        let ce = CrossEncoder::Lexical { degraded: false };
+        let jobs = vec![
+            (NO_OVERLAP_QUERY.to_string(), pool(50)),
+            (NO_OVERLAP_QUERY.to_string(), pool(50)),
+        ];
+        let outs = ce.rerank_batch(jobs);
+        assert_eq!(outs.len(), 2);
+        for out in &outs {
+            assert_eq!(out.len(), 50, "per-job candidate count preserved");
+            for (off, (_, score)) in out.iter().skip(RERANK_POOL_MAX).enumerate() {
+                let i = 29 - i32::try_from(off).expect("offset fits i32");
+                assert_eq!(
+                    *score,
+                    orig_score(i),
+                    "per-job tail must keep blended scores untouched"
+                );
+            }
+        }
+    }
+
+    /// The `BatchedReranker` production wrapper inherits the cap via
+    /// the direct encoder path (lexical traffic never reaches the
+    /// coalescing worker per #1579 B10).
+    #[test]
+    fn batched_reranker_inherits_pool_cap_1597() {
+        let br = BatchedReranker::with_reflection_boost(
+            CrossEncoder::Lexical { degraded: false },
+            ReflectionBoostConfig::disabled(),
+        );
+        let out = br.rerank(NO_OVERLAP_QUERY, pool(50));
+        assert_eq!(out.len(), 50);
+        for (off, (_, score)) in out.iter().skip(RERANK_POOL_MAX).enumerate() {
+            let i = 29 - i32::try_from(off).expect("offset fits i32");
+            assert_eq!(*score, orig_score(i), "wrapper tail untouched");
+        }
+    }
+
+    /// #1597 bench evidence — manual run against the REAL neural
+    /// cross-encoder (resolves from the local HF cache; downloads
+    /// ~80 MB on a cold host):
+    ///
+    /// ```bash
+    /// AI_MEMORY_NO_CONFIG=1 cargo test --release --lib \
+    ///     issue_1597_neural_rerank_timing_evidence -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints BEFORE (sequential per-pair forward over the full
+    /// 50-candidate pool — the pre-#1597 `rerank` shape) vs AFTER
+    /// (capped pool + one batched forward — the shipped path).
+    #[test]
+    #[ignore = "#1597 manual bench evidence: loads the real neural cross-encoder"]
+    fn issue_1597_neural_rerank_timing_evidence() {
+        let ce = CrossEncoder::new_neural();
+        assert!(
+            ce.is_neural(),
+            "neural encoder failed to load; timing evidence invalid"
+        );
+        let bench_pool: Vec<(Memory, f64)> = (0..50)
+            .map(|i| {
+                let m = Memory {
+                    id: format!("bench-{i}"),
+                    title: format!("benchmark candidate number {i} recall pipeline"),
+                    content: format!(
+                        "long-form benchmark document body number {i} with enough \
+                         material to exercise the cross-encoder, covering recall \
+                         pipeline reranking, cross encoder scoring, candidate \
+                         blending and ordering semantics for run {i}"
+                    ),
+                    ..Memory::default()
+                };
+                (m, f64::from(i) * 0.01)
+            })
+            .collect();
+        let query = "how does the recall pipeline rerank candidates";
+
+        // Warm-up (first forward pays one-time allocation cost).
+        let _ = ce.score(query, "warmup", "warmup body");
+
+        // BEFORE shape: one full forward per (query, candidate) pair,
+        // sequentially, over the entire 50-candidate pool.
+        let t0 = Instant::now();
+        for (m, _) in &bench_pool {
+            let _ = ce.score(query, &m.title, &m.content);
+        }
+        let before = t0.elapsed();
+
+        // AFTER: shipped path — cap at RERANK_POOL_MAX + single
+        // batched forward.
+        let t1 = Instant::now();
+        let out = ce.rerank(query, bench_pool.clone());
+        let after = t1.elapsed();
+
+        assert_eq!(out.len(), 50, "no candidate lost on the neural path");
+        eprintln!(
+            "#1597 timing (50-candidate pool, CPU): BEFORE sequential-full = {before:?}; \
+             AFTER capped+batched = {after:?}"
+        );
+    }
 }

@@ -1,0 +1,271 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  hive-1461 peer-reproducible federated DigitalOcean baseline — landing page.
+  deploy/hive-1461/README.md is the source of truth; this page surfaces the
+  baseline + 100% of its results from the GitHub Pages site nav. Dark-theme
+  CSS variables mirror docs/index.html and the 2026-05-28 ship-campaign page.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>hive-1461 &mdash; peer-reproducible federated DO baseline (40/40 &middot; 22/22)</title>
+<meta name="description" content="hive-1461: a deterministic, idempotent 0&rarr;60 build of the ai-memory v0.7.0 federated test fleet on DigitalOcean. 7 nodes across 2 regions (3 peers W=2-of-N=3 quorum mesh + 3 grok NHI agents + 1 ctrl), all traffic TLS+mTLS. Verification harness: 40/40 PASS. Full-spectrum P3 suite: 22/22 PASS across regression/crypto/federation/a2a/ai_nhi. Everything peer-reproducible — environment AND results ship inside release/v0.7.0 under deploy/hive-1461/.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/v0.7.0/hive-1461-baseline/">
+<style>
+:root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--good:#7cd992;--warn:#f5d77c;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:840px;--w-wide:1080px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.88rem;background:var(--code-bg);padding:.1em .35em;border-radius:3px;color:#d4d4d4}
+.wrap-mid{max-width:var(--w-mid);margin:0 auto;padding:0 1.5rem}
+.topnav{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,10,10,.92);backdrop-filter:blur(8px);z-index:50}
+.topnav .row{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;max-width:var(--w-wide);margin:0 auto;font-size:.9rem}
+.topnav .brand{color:var(--text);font-weight:600}
+.topnav .links{display:flex;gap:1.5rem}
+.topnav .links a{color:var(--muted)}
+.topnav .links a:hover{color:var(--text);text-decoration:none}
+.crumb{padding:1.25rem 1.5rem 0;max-width:var(--w-mid);margin:0 auto;color:var(--dim);font-size:.82rem;font-family:var(--font-mono)}
+.crumb a{color:var(--muted)}
+.hero{padding:3rem 0 2rem}
+.hero .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase;margin-bottom:1rem}
+.hero h1{font-size:2rem;font-weight:700;letter-spacing:-.025em;line-height:1.15;margin-bottom:1.25rem}
+.hero .lede{font-size:1.05rem;color:var(--muted);max-width:680px;line-height:1.6}
+.hero .verdict{display:inline-block;margin-top:1.25rem;font-family:var(--font-mono);font-size:.85rem;padding:.4rem .9rem;border-radius:5px;font-weight:700;letter-spacing:.08em}
+.v-ship{background:rgba(124,217,146,.1);color:var(--good);border:1px solid rgba(124,217,146,.35)}
+.v-warn{background:rgba(245,215,124,.1);color:var(--warn);border:1px solid rgba(245,215,124,.35)}
+section{padding:2.5rem 0;border-top:1px solid var(--border)}
+.eyebrow-h2{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
+h2{font-size:1.4rem;font-weight:700;letter-spacing:-.015em;margin-bottom:1rem}
+p{color:var(--muted);margin-bottom:1rem;max-width:680px}
+ul{color:var(--muted);margin:0 0 1rem 1.5rem}
+li{margin-bottom:.4rem}
+.docs{display:grid;grid-template-columns:1fr;gap:.6rem;margin:1.25rem 0}
+.docs a{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.95rem;transition:border-color .15s;gap:1rem}
+.docs a:hover{border-color:var(--accent);text-decoration:none}
+.docs .info{flex:1;min-width:0}
+.docs .info strong{display:block;color:var(--text);font-weight:600;margin-bottom:.15rem}
+.docs .info span{display:block;color:var(--muted);font-size:.82rem;font-weight:400}
+.docs .arrow{color:var(--accent);flex-shrink:0}
+.fact{display:grid;grid-template-columns:max-content 1fr;gap:.5rem 1rem;margin:1rem 0;padding:1rem 1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;font-size:.88rem}
+.fact dt{color:var(--accent);font-family:var(--font-mono);font-weight:600;white-space:nowrap}
+.fact dd{color:var(--muted)}
+.bignums{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:.75rem;margin:1.5rem 0}
+.bignum{padding:1rem 1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;text-align:center}
+.bignum .n{font-family:var(--font-mono);font-size:1.65rem;font-weight:700;color:var(--good);display:block;letter-spacing:-.02em}
+.bignum .l{color:var(--muted);font-size:.72rem;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.1em;margin-top:.25rem;display:block}
+.tracks{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.65rem;margin:1.25rem 0}
+.track{padding:1rem 1.15rem;background:var(--panel);border:1px solid var(--border);border-radius:6px}
+.track strong{display:block;color:var(--accent);font-family:var(--font-mono);font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.3rem}
+.track .name{display:block;color:var(--text);font-size:.95rem;font-weight:600;margin-bottom:.3rem}
+.track .desc{display:block;color:var(--muted);font-size:.82rem;line-height:1.5}
+.track .status{display:inline-block;margin-top:.5rem;font-family:var(--font-mono);font-size:.7rem;padding:.2rem .55rem;border-radius:4px;font-weight:600;letter-spacing:.05em}
+.s-green{background:rgba(124,217,146,.1);color:var(--good);border:1px solid rgba(124,217,146,.3)}
+.s-warn{background:rgba(245,215,124,.1);color:var(--warn);border:1px solid rgba(245,215,124,.3)}
+.tbl{width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:.82rem}
+.tbl th,.tbl td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--border)}
+.tbl th{color:var(--dim);font-family:var(--font-mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;font-weight:600}
+.tbl td{color:var(--muted)}
+.tbl td code{font-size:.8rem}
+.tbl .pass{color:var(--good);font-family:var(--font-mono);font-size:.72rem;font-weight:700}
+.tbl .role{color:var(--accent);font-family:var(--font-mono);font-size:.78rem}
+.scroll{overflow-x:auto}
+footer{padding:3rem 0;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;text-align:center}
+footer a{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="row">
+    <a class="brand" href="../../">ai-memory</a>
+    <div class="links">
+      <a href="../../#install">Install</a>
+      <a href="../../#campaigns">Campaigns</a>
+      <a href="../release-notes.md">v0.7.0 notes</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="crumb"><a href="../../">ai-memory</a> &nbsp;/&nbsp; <a href="../../#campaigns">v0.7.0</a> &nbsp;/&nbsp; hive-1461-baseline</div>
+
+<header class="hero wrap-mid">
+  <div class="eyebrow">Peer-reproducible baseline &middot; #1461</div>
+  <h1>hive-1461 &mdash; federated DigitalOcean baseline.</h1>
+  <p class="lede">A deterministic, idempotent <strong>0&rarr;60</strong> build of the <code>ai-memory</code> v0.7.0 federated test fleet on DigitalOcean. Terraform stands the infrastructure up; a push-based SSH toolkit brings every node to a verified federated state; a verification harness proves it. Everything a reviewer needs to reproduce <em>both the environment and the results</em> ships inside <code>release/v0.7.0</code> under <code>deploy/hive-1461/</code>. Seven nodes across two regions, all traffic TLS+mTLS, every step re-runnable.</p>
+  <div class="verdict v-ship">VERIFIED &middot; 40/40 validate &middot; 22/22 full-spectrum &middot; ZERO FAIL</div>
+</header>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Headline</div>
+  <h2>The numbers.</h2>
+  <div class="bignums">
+    <div class="bignum"><span class="n">40/40</span><span class="l">validate PASS</span></div>
+    <div class="bignum"><span class="n">22/22</span><span class="l">full-spectrum PASS</span></div>
+    <div class="bignum"><span class="n">7</span><span class="l">droplets</span></div>
+    <div class="bignum"><span class="n">2</span><span class="l">regions (nyc3+sfo2)</span></div>
+    <div class="bignum"><span class="n">3</span><span class="l">peer quorum mesh</span></div>
+    <div class="bignum"><span class="n">W=2/N=3</span><span class="l">write quorum</span></div>
+    <div class="bignum"><span class="n">5</span><span class="l">test groups</span></div>
+    <div class="bignum"><span class="n">0</span><span class="l">FAIL across 62 checks</span></div>
+  </div>
+  <p>One entrypoint reproduces the whole thing: <code>make seed up provision validate test</code> builds the fleet, brings every node to a verified federated state, runs the verification harness, then runs the full-spectrum P3 suite. <code>make down</code> tears it all back down. Every probe in both harnesses goes over the <strong>real TLS+mTLS path</strong>; the canonical green reports are committed at <code>deploy/hive-1461/results/</code>.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Topology</div>
+  <h2>7 nodes, function-encoded hostnames.</h2>
+  <p>Hostnames encode each node's function: <code>hive-&lt;function&gt;-&lt;region&gt;-&lt;NN&gt;</code>. The 3 peers form a <code>W=2</code>-of-<code>N=3</code> write-quorum mesh; agents and ctrl are pure mTLS <strong>clients</strong> of that mesh &mdash; they hold a client cert only, never a server cert, and run no inbound HTTPS daemon.</p>
+  <div class="scroll">
+  <table class="tbl">
+    <thead><tr><th>Host</th><th>Role</th><th>Region</th><th>Size</th><th>Runs</th></tr></thead>
+    <tbody>
+      <tr><td><code>hive-peer-nyc3-01</code></td><td class="role">peer</td><td>nyc3</td><td><code>s-4vcpu-8gb</code></td><td>federated <code>serve</code> + PG16/AGE + Ollama embedder</td></tr>
+      <tr><td><code>hive-peer-nyc3-02</code></td><td class="role">peer</td><td>nyc3</td><td><code>s-4vcpu-8gb</code></td><td>federated <code>serve</code> + PG16/AGE + Ollama embedder</td></tr>
+      <tr><td><code>hive-peer-sfo2-01</code></td><td class="role">peer</td><td>sfo2</td><td><code>s-4vcpu-8gb</code></td><td>federated <code>serve</code> + PG16/AGE + Ollama embedder</td></tr>
+      <tr><td><code>hive-agent-nyc3-01</code></td><td class="role">agent</td><td>nyc3</td><td><code>s-1vcpu-2gb</code></td><td>xAI grok-4.3 NHI client (mTLS API client)</td></tr>
+      <tr><td><code>hive-agent-nyc3-02</code></td><td class="role">agent</td><td>nyc3</td><td><code>s-1vcpu-2gb</code></td><td>xAI grok-4.3 NHI client</td></tr>
+      <tr><td><code>hive-agent-nyc3-03</code></td><td class="role">agent</td><td>nyc3</td><td><code>s-1vcpu-2gb</code></td><td>xAI grok-4.3 NHI client</td></tr>
+      <tr><td><code>hive-ctrl-nyc3-01</code></td><td class="role">ctrl</td><td>nyc3</td><td><code>s-8vcpu-16gb</code></td><td>loadgen / chaos / orchestration (mTLS client)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Account stays well within the 15-droplet cap (7 in use). All fleet traffic is <strong>TLS + mTLS</strong>: the peer HTTPS port enforces <code>client_auth_mandatory</code> &mdash; a connection is accepted only if the SHA-256 of the client cert's DER bytes is on the <code>mtls-allowlist.txt</code> (fingerprint pinning, the SSH <code>known_hosts</code> model). Outbound quorum/API clients verify peer <strong>server</strong> certs against the campaign CA, whose SAN pins each peer's public IP.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">0&rarr;60 flow</div>
+  <h2>Five make targets, eight provision steps.</h2>
+  <p>Every target is idempotent and re-runnable. Provisioning is push-based over SSH; nothing is installed on the operator host beyond the CLI prereqs (<code>terraform jq openssl ssh scp curl</code>). The provision steps run in this exact deterministic order:</p>
+  <div class="scroll">
+  <table class="tbl">
+    <thead><tr><th>Step</th><th>Script</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>00</code></td><td><code>00_render_inventory.sh</code></td><td>project <code>terraform output fleet</code> &rarr; <code>inventory.json</code></td></tr>
+      <tr><td><code>05</code></td><td><code>05_wait_ssh.sh</code></td><td>block until every node accepts SSH</td></tr>
+      <tr><td><code>10</code></td><td><code>10_binary.sh</code></td><td>fan out the golden binary; assert version + sha256</td></tr>
+      <tr><td><code>20</code></td><td><code>20_pg_age.sh</code></td><td>per-peer PG16/AGE/pgvector container + schema-init (v55)</td></tr>
+      <tr><td><code>25</code></td><td><code>25_ollama_embed.sh</code></td><td>per-peer CPU Ollama sidecar serving <code>nomic-embed-text</code> (768-dim)</td></tr>
+      <tr><td><code>30</code></td><td><code>30_config.sh</code></td><td>render + push per-role <code>config.toml</code> + secret EnvironmentFile</td></tr>
+      <tr><td><code>40</code></td><td><code>40_tls.sh</code></td><td>campaign CA + per-node leaf certs + mTLS allowlist fan-out</td></tr>
+      <tr><td><code>50</code></td><td><code>50_federation.sh</code></td><td>per-peer systemd unit; start the quorum mesh; health-gate</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Verification harness</div>
+  <h2>make validate &mdash; 40/40 PASS.</h2>
+  <p>The verification harness exercises the live fleet over the real TLS+mTLS path and emits a JSON + tabular report. Exit status is <code>0</code> iff every check is green. Per node it asserts binary <code>sha256</code> + <code>--version</code>; per peer it asserts <code>/api/v1/health</code>, <code>storage_backend == postgres</code>, <code>db_schema_version == 55</code>, single-instance, and systemd-active; and a fleet <strong>federation-convergence</strong> probe writes a collective-scope marker to one peer and reads it back by id on another over the encrypted path.</p>
+  <p>Canonical green baseline committed at <code>results/verify-baseline.{json,tsv}</code>: <strong>TOTAL=40 PASS=40 FAIL=0</strong>.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Full-spectrum testing</div>
+  <h2>make test &mdash; 22/22 across 5 groups.</h2>
+  <p>The P3 suite runs against the live fleet, gated behind a green <code>make validate</code>. Every probe goes over the real TLS+mTLS path and authenticates with <code>x-api-key</code>; throwaway markers land in the <code>_test</code> / <code>_verify</code> namespaces and are best-effort deleted, so the baseline corpus is never mutated. Canonical green report committed at <code>results/test-full-spectrum.{json,tsv}</code>: <strong>TOTAL=22 PASS=22 FAIL=0</strong>.</p>
+  <div class="tracks">
+    <div class="track">
+      <strong>Group 1 &middot; 6 checks</strong>
+      <span class="name">regression</span>
+      <span class="desc">CRUD roundtrip; semantic search (exercises the nomic embedder end-to-end); namespace isolation; private-scope owner visibility (a private memory is invisible to a different caller).</span>
+      <span class="status s-green">6/6 PASS</span>
+    </div>
+    <div class="track">
+      <strong>Group 2 &middot; 7 checks</strong>
+      <span class="name">crypto</span>
+      <span class="desc">Negative TLS/mTLS + authz: no client cert refused (<code>000</code>); non-allowlisted client cert refused (<code>000</code>); wrong server CA refused (<code>000</code>); privileged endpoint without <code>x-api-key</code> &rarr; <code>401</code>; with key &rarr; <code>200</code>; <code>/health</code> exempt &rarr; <code>200</code>; admin endpoint as non-admin &rarr; <code>403</code>.</span>
+      <span class="status s-green">7/7 PASS</span>
+    </div>
+    <div class="track">
+      <strong>Group 3 &middot; 3 checks</strong>
+      <span class="name">federation</span>
+      <span class="desc">Write to peer-1; converge on peer-2 (same region) <strong>and</strong> peer-3 (cross-region nyc3&rarr;sfo2) within the catch-up window.</span>
+      <span class="status s-green">3/3 PASS</span>
+    </div>
+    <div class="track">
+      <strong>Group 4 &middot; 3 checks</strong>
+      <span class="name">a2a</span>
+      <span class="desc">Agent-to-agent E2E: <code>agent-alpha</code> (an mTLS client node) writes a collective memory to a peer over the network; <code>agent-beta</code> (a different client identity on a different node) reads it back on the write peer <strong>and</strong> on a federated peer.</span>
+      <span class="status s-green">3/3 PASS</span>
+    </div>
+    <div class="track">
+      <strong>Group 5 &middot; 3 checks</strong>
+      <span class="name">ai_nhi</span>
+      <span class="desc">The grok-driven NHI loop: <code>agent-alpha</code> drives a live xAI/grok <code>expand_query</code> decision over the mesh, commits the LLM-derived term as a collective memory, and the decision converges on a federated peer &mdash; a full NHI decision &rarr; commit &rarr; federate loop.</span>
+      <span class="status s-green">3/3 PASS</span>
+    </div>
+  </div>
+  <p>The live AI-NHI loop is the capstone: in the canonical run, grok returned the term <code>paxos algorithm</code>, the harness committed it as a collective memory on <code>hive-peer-nyc3-01</code>, and it converged on <code>hive-peer-nyc3-02</code> &mdash; a real LLM decision crossing the encrypted mesh and federating cross-node.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">What "reproducible" means here</div>
+  <h2>Pinned, deterministic, idempotent, verifiable.</h2>
+  <ul>
+    <li><strong>Pinned artifacts</strong> (<code>provision/lib.sh</code>): binary <code>sha256</code>, version <code>0.7.0</code>, schema <code>v55</code>, <code>ollama/ollama:0.6.8</code>, <code>apache/age:release_PG16_1.6.0</code>, embedder/LLM model ids &mdash; all single-source constants, overridable by env for forks.</li>
+    <li><strong>Deterministic inventory.</strong> <code>inventory.json</code> is a pure projection of Terraform state; the whole toolkit drives off it.</li>
+    <li><strong>Idempotent.</strong> Every step is safe to re-run. The campaign CA and per-node keys are generated once and reused on re-runs for stable trust.</li>
+    <li><strong>Verifiable.</strong> <code>make validate</code> + <code>make test</code> exercise the live fleet over the real TLS+mTLS path and emit JSON + tabular reports; exit <code>0</code> iff every check is green.</li>
+    <li><strong>Secret hygiene.</strong> <code>OPENROUTER_API_KEY</code> (peer chat LLM) + <code>XAI_API_KEY</code> (agent grok NHI driver) are written only into the gitignored run dir (mode 0600) and pushed to mode-0400 EnvironmentFiles. Never committed, never echoed, never placed on an SSH command line.</li>
+  </ul>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Reproduce it</div>
+  <h2>Build, prove, full-spectrum test.</h2>
+  <div class="docs">
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/deploy/hive-1461/README.md"><span class="info"><strong>deploy/hive-1461/README.md</strong><span>The runbook &mdash; prerequisites, secrets, 0&rarr;60 flow, security model, verification report</span></span><span class="arrow">&rarr;</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/deploy/hive-1461/Makefile"><span class="info"><strong>deploy/hive-1461/Makefile</strong><span>Single entrypoint: <code>make seed up provision validate test</code> (teardown: <code>make down</code>)</span></span><span class="arrow">&rarr;</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/tree/release/v0.7.0/deploy/hive-1461/provision"><span class="info"><strong>deploy/hive-1461/provision/</strong><span>Push-based 0&rarr;60 toolkit: steps 00&ndash;50 + <code>lib.sh</code> pinned-constant source + <code>pg-age/</code></span></span><span class="arrow">&rarr;</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/deploy/hive-1461/results/verify-baseline.tsv"><span class="info"><strong>results/verify-baseline.tsv</strong><span>Canonical green verification report &mdash; TOTAL=40 PASS=40 FAIL=0</span></span><span class="arrow">&rarr;</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/deploy/hive-1461/results/test-full-spectrum.tsv"><span class="info"><strong>results/test-full-spectrum.tsv</strong><span>Canonical green full-spectrum report &mdash; TOTAL=22 PASS=22 FAIL=0</span></span><span class="arrow">&rarr;</span></a>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Provenance</div>
+  <h2>Reproducibility contract.</h2>
+  <dl class="fact">
+    <dt>Campaign</dt><dd>#1461 &mdash; hive-fleet peer-reproducible baseline</dd>
+    <dt>Operator</dt><dd>justin@alpha-one.mobi</dd>
+    <dt>Authoring agent</dt><dd>Claude (Opus 4.7), AI NHI under operator authority</dd>
+    <dt>Cloud</dt><dd>DigitalOcean &mdash; nyc3 + sfo2 (7 droplets, 15-droplet cap)</dd>
+    <dt>Binary</dt><dd>golden <code>ai-memory</code> v0.7.0, features <code>sal,sal-postgres,sqlite-bundled</code></dd>
+    <dt>Binary sha256</dt><dd><code>5e86de3ab0be6a19e02f760390651d9c425ba7ca73b9b8c7db0ce3b6f25a0aa7</code></dd>
+    <dt>Schema</dt><dd>v55 (PG16 + Apache AGE 1.6.0 + pgvector)</dd>
+    <dt>Embedder</dt><dd><code>nomic-embed-text</code> (768-dim) via CPU Ollama sidecar per peer</dd>
+    <dt>NHI driver LLM</dt><dd>xAI <code>grok-4.3</code> (agents); peer chat LLM via OpenRouter</dd>
+    <dt>Quorum</dt><dd>W=2-of-N=3 write-quorum mesh across 3 peers</dd>
+    <dt>Transport</dt><dd>TLS + mTLS everywhere; <code>client_auth_mandatory</code> fingerprint-pinned allowlist</dd>
+    <dt>Branch</dt><dd><code>release/v0.7.0</code></dd>
+    <dt>Build commits</dt><dd><code>219a0e39a</code> (P3 harness) &middot; <code>10a9d97eb</code> (docs + canonical results)</dd>
+    <dt>Verification</dt><dd>40/40 PASS &middot; full-spectrum 22/22 PASS &middot; zero FAIL</dd>
+    <dt>Tracking issue</dt><dd><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1461">#1461 &mdash; hive-fleet install campaign</a></dd>
+  </dl>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Related</div>
+  <h2>Other v0.7.0 campaigns.</h2>
+  <div class="docs">
+    <a href="../test-campaign-2026-05-28-ship-campaign/"><span class="info"><strong>2026-05-28 &mdash; Ship campaign (SHIP-CLEARED)</strong><span>Integration sweep + dogfood + postgres+AGE 8,028 + docs/Pages drift + CoALA + AI-NHI v3</span></span><span class="arrow">&rarr;</span></a>
+    <a href="../test-campaign-2026-05-22-release-gate-final/"><span class="info"><strong>2026-05-22 &mdash; Release-gate final (7,321 / 0 / 0)</strong><span>22 release-gate defects closed; SHIP-RECOMMENDED</span></span><span class="arrow">&rarr;</span></a>
+    <a href="../heterogeneous-ai-nhi-assessment/"><span class="info"><strong>Heterogeneous AI-NHI assessment</strong><span>The independent fresh-agent assessment series</span></span><span class="arrow">&rarr;</span></a>
+    <a href="../release-notes.md"><span class="info"><strong>v0.7.0 release notes</strong><span>What changed since v0.6.4</span></span><span class="arrow">&rarr;</span></a>
+  </div>
+</section>
+
+<footer>
+  <a href="../../">&larr; back to ai-memory</a> &middot;
+  <a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> &middot;
+  Apache-2.0 &middot; &copy; 2026 AlphaOne LLC
+</footer>
+
+</body>
+</html>

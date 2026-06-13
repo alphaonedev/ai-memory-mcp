@@ -34,12 +34,18 @@ agents and humans always know exactly what's loaded and what's configured.
 
 ```text
 # ai-memory boot: ok
-#   version:    0.6.3+patch.1
-#   db:         /home/u/.claude/ai-memory.db (schema=v19, 161 memories)
-#   tier:       autonomous (embedder=nomic-ai/nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=gemma4:e4b)
+#   version:    0.7.0
+#   db:         /home/u/.claude/ai-memory.db (schema=v55, 161 memories)
+#   tier:       autonomous (embedder=nomic-ai/nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=gemma3:4b)
 #   latency:    12ms
-#   namespace:  ai-memory-mcp/v0631-release (loaded 3 memories)
+#   namespace:  ai-memory-mcp/v0.7.0-release (loaded 3 memories)
 ```
+
+> DOC-4 (med/low review batch) — example version + schema bumped to
+> match the v0.7.0 substrate (`CURRENT_SCHEMA_VERSION = 57`). The
+> pre-v0.7.0 example showed v0.6.3 / schema v19, which was 32
+> migrations behind the substrate and 2+ major releases behind the
+> daemon binary integrators land on today.
 
 The four status variants share the same manifest shape; only the first
 line's status word and the `namespace:` line's parenthetical change:
@@ -161,8 +167,11 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 | [`grok-and-xai.md`](grok-and-xai.md) | xAI Grok | 3 (programmatic) | n/a (programmatic) | recipe |
 | [`local-models.md`](local-models.md) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | n/a (programmatic) | recipe |
 | [`platforms.md`](platforms.md) | macOS / Linux / Windows / WSL / Docker / Kubernetes / ARM Linux / commercial Unix / embedded Linux / BSD platform notes | n/a | n/a | reference |
+| [`networking.md`](networking.md) | macOS + Tailscale / VPN per-app intercept gotchas (#704) and tailnet-IP workarounds | n/a | n/a | reference |
 | [`global-claude-md-template.md`](global-claude-md-template.md) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | n/a | reference |
 | [`v0.6.4-system-prompt-snippet.md`](v0.6.4-system-prompt-snippet.md) | v0.6.4 discovery-aware NHI bootstrap (drop-in for any harness) | n/a | n/a | reference |
+| [`llm-backends.md`](llm-backends.md) | Per-backend MCP `env:` block recipes (Ollama, LMStudio, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, vLLM, llama.cpp). Closes #1144 (operator paper-cut: shell env doesn't reach MCP subprocesses). | n/a | n/a | reference |
+| [`mobile.md`](mobile.md) | Consumer-signs-at-integration discipline for iOS + Android release artifacts (#1247 / PR #1283); xcframework + jniLibs layout, code-signing handoff to the consuming app, mobile-runtime CI subset. | n/a | n/a | reference |
 
 ## Failure modes (any recipe)
 

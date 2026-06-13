@@ -45,7 +45,7 @@
   <!-- Speed -->
   <g class="stat4">
     <text x="580" y="105" text-anchor="middle" class="num-blue">232 q/s</text>
-    <text x="580" y="128" text-anchor="middle" class="lbl">2.2s for 500 queries</text>
+    <text x="580" y="128" text-anchor="middle" class="lbl">keyword FTS5 recall (2.2s/500)</text>
   </g>
 
   <!-- Cost -->
@@ -54,5 +54,5 @@
     <text x="720" y="128" text-anchor="middle" class="lbl">Cloud API costs</text>
   </g>
 
-  <text x="410" y="170" text-anchor="middle" class="footer">Pure SQLite FTS5 + BM25 — zero cloud dependencies — local-only inference</text>
+  <text x="410" y="170" text-anchor="middle" class="footer">SQLite FTS5 BM25 + local LLM query-expansion (Ollama gemma3:4b) — zero cloud API costs — local-only inference</text>
 </svg>

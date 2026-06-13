@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Issue #487 PR-3 — boot lifecycle tests.
 //!
 //! These tests prove `ai-memory boot` survives the failure modes that
@@ -20,6 +22,7 @@
 //! Cross-platform: every path uses `tempfile`, every assertion is over
 //! text. Windows-runner-safe.
 
+use ai_memory::models::ConfidenceSource;
 use ai_memory::{db, models};
 use assert_cmd::Command;
 use chrono::Utc;
@@ -60,6 +63,18 @@ fn seed_one(db: &Path, namespace: &str, title: &str, content: &str) -> String {
         last_accessed_at: None,
         expires_at: None,
         metadata,
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..ai_memory::models::Memory::default()
     };
     db::insert(&conn, &mem).expect("db::insert")
 }

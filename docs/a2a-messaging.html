@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · A2A Messaging — agent-to-agent</title>
-<meta name="description" content="ai-memory v0.6.3.1 agent-to-agent messaging. memory_notify pushes to inbox, memory_subscribe webhooks fan out events, federation propagates messages across peers, HMAC-SHA256 signs every dispatch.">
+<meta name="description" content="ai-memory v0.7.0 agent-to-agent messaging. memory_notify pushes to inbox, memory_subscribe webhooks fan out events, federation propagates messages across peers, HMAC-SHA256 signs every dispatch.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/a2a-messaging.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -79,6 +79,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -88,11 +99,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ A2A Messaging</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -115,6 +129,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -126,6 +141,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -135,23 +153,91 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -202,23 +288,23 @@ footer a{color:var(--text-muted)}
   <span class="key">"tier"</span>:            <span class="val">"short"</span>            <span class="cm">// expires in 6h by default — match urgency</span>
 }
 
-<span class="ok">→ {"notification_id": "550e8400-…", "delivered_to": "alphaone/eng/platform/team-a/bob"}</span></div>
+<span class="ok">→ {"id": "550e8400-…", "from": "…", "to": "alphaone/eng/platform/team-a/bob",
+   "namespace": "…", "tier": "short", "delivered_at": "…"}</span></div>
     </div>
 
     <div class="tool notify">
       <div class="tool-head"><span class="tool-name">memory_inbox</span><span class="tool-tag">since v0.6.0</span></div>
-      <div class="tool-desc">Recipient drains their inbox. Returns unread notifications, optionally marks them read. Filter by since/tier/priority for triage workflows.</div>
+      <div class="tool-desc">Recipient drains their inbox. Returns messages sent via <code>memory_notify</code> — <code>access_count == 0</code> is the unread marker. Filter with <code>unread_only</code> and cap with <code>limit</code> (default 50, max 500).</div>
       <div class="snip"><span class="cm">// MCP — memory_inbox</span>
 {
-  <span class="key">"as_agent"</span>:        <span class="val">"alphaone/eng/platform/team-a/bob"</span>,
+  <span class="key">"agent_id"</span>:        <span class="val">"alphaone/eng/platform/team-a/bob"</span>,    <span class="cm">// optional · defaults to caller</span>
   <span class="key">"unread_only"</span>:     <span class="ok">true</span>,
-  <span class="key">"limit"</span>:           <span class="num">50</span>,
-  <span class="key">"min_priority"</span>:    <span class="num">5</span>,
-  <span class="key">"mark_read"</span>:       <span class="ok">true</span>          <span class="cm">// optional · auto-mark on read</span>
+  <span class="key">"limit"</span>:           <span class="num">50</span>
 }
 
-<span class="ok">→ {"notifications": [{"id": "…", "from": "…", "title": "OKR review — your input needed",
-                       "payload": "…", "priority": 7, "received_at": "…"}, …], "count": 3}</span></div>
+<span class="ok">→ {"messages": [{"id": "…", "from": "…", "title": "OKR review — your input needed",
+                  "payload": "…", "priority": 7, "tier": "short", "created_at": "…",
+                  "read": false, "access_count": 0}, …], "count": 3, "unread_only": true}</span></div>
     </div>
   </div>
 </section>
@@ -235,7 +321,7 @@ footer a{color:var(--text-muted)}
 {
   <span class="key">"url"</span>:               <span class="val">"https://hooks.example.com/ai-memory"</span>,
   <span class="key">"secret"</span>:            <span class="val">"32+ random bytes (you generate)"</span>,
-  <span class="key">"events"</span>:            [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>, <span class="val">"memory_consolidate"</span>],
+  <span class="key">"event_types"</span>:       [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>, <span class="val">"memory_consolidate"</span>],   <span class="cm">// v0.7.0 #912 typed array; legacy `events` field still accepted as comma-list/`*`</span>
   <span class="key">"namespace_filter"</span>:  <span class="val">"alphaone/eng/platform/*"</span>,    <span class="cm">// optional</span>
   <span class="key">"agent_filter"</span>:      <span class="val">"alphaone/eng/platform/*"</span>     <span class="cm">// optional</span>
 }
@@ -267,12 +353,13 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4e5f6…</span>
   <span class="key">"event"</span>:        <span class="val">"memory_store"</span>,
   <span class="key">"memory_id"</span>:    <span class="val">"550e8400-…"</span>,
   <span class="key">"namespace"</span>:    <span class="val">"alphaone/eng/platform"</span>,
-  <span class="key">"tier"</span>:         <span class="val">"mid"</span>,
   <span class="key">"agent_id"</span>:     <span class="val">"alphaone/eng/platform/alice"</span>,
-  <span class="key">"timestamp"</span>:    <span class="val">"2026-04-27T05:30:00Z"</span>
+  <span class="key">"delivered_at"</span>: <span class="val">"2026-04-27T05:30:00Z"</span>,
+  <span class="key">"correlation_id"</span>: <span class="val">"0190…-uuidv7"</span>
 }
 
-<span class="cm">// Receiver verifies: HMAC-SHA256(secret, "{timestamp}.{rawBody}") == signature</span></div>
+<span class="cm">// Receiver verifies: HMAC-SHA256(SHA256(secret), "{timestamp}.{rawBody}") == signature
+// — the HMAC key is the SHA-256 hash of the plaintext secret (the stored form).</span></div>
   </div>
 </section>
 
@@ -355,7 +442,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4e5f6…</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Patterns operators ship.</h2>
     <div class="snip" style="font-family:var(--font-sans);white-space:normal;line-height:1.7">
       <div><strong style="color:var(--good)">AI-supervisor pattern</strong> — Junior agent <code>memory_notify</code>'s the supervisor on every store. Supervisor reads <code>memory_inbox</code> at start of each turn, decides if intervention needed.</div>
-      <div style="margin-top:.7rem"><strong style="color:var(--good)">Slack ops integration</strong> — <code>memory_subscribe</code> a Slack-bot URL with <code>events: ["memory_promote", "memory_consolidate"]</code>. Bot posts "Alice promoted X to Long" to a #memories channel.</div>
+      <div style="margin-top:.7rem"><strong style="color:var(--good)">Slack ops integration</strong> — <code>memory_subscribe</code> a Slack-bot URL with <code>event_types: ["memory_promote", "memory_consolidate"]</code> (v0.7.0 #912 typed array form). Bot posts "Alice promoted X to Long" to a #memories channel.</div>
       <div style="margin-top:.7rem"><strong style="color:var(--good)">Cross-team coordination</strong> — Team-A's PM <code>memory_notify</code>'s Team-B's PM when a shared OKR memory is updated. Federation propagates so it works whichever node either PM is on.</div>
       <div style="margin-top:.7rem"><strong style="color:var(--good)">Approval queue alerts</strong> — Subscribe to events that produce <code>Pending(id)</code> verdicts. Webhook routes to ops dashboard or pager so approvers don't sit on requests.</div>
       <div style="margin-top:.7rem"><strong style="color:var(--good)">Memory-driven workflows</strong> — Webhook triggers downstream automation (CI, deployment, ticket creation) when a specific memory pattern matches.</div>
@@ -364,7 +451,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4e5f6…</span>
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · A2A flows in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers.rs">handlers.rs</a> (notify/inbox) + <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/subscriptions.rs">subscriptions.rs</a> (webhooks)</p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · A2A flows in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/">src/handlers/</a> (notify/inbox) + <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/subscriptions.rs">subscriptions.rs</a> (webhooks)</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="data-flow.html">Data flow</a> · <a href="encryption.html">Encryption</a></p>
 </footer>
 

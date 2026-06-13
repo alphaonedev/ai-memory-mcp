@@ -2,18 +2,58 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ANSI color output for CLI — zero dependencies.
+//!
+//! pm-v3.1 PR8 (issue #1174) — color enablement is determined ONCE at
+//! process boot from `std::io::stdout().is_terminal()` and frozen for
+//! the lifetime of the process via `OnceLock<bool>`. The pre-PR8
+//! shape used a mutable `AtomicBool` which gave production callers no
+//! protection against accidental late mutation. Tests that need to
+//! force colour off route through a thread-local override consulted
+//! by `enabled()` (compiled out of non-test builds).
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-static COLOR_ENABLED: AtomicBool = AtomicBool::new(true);
+/// One-shot snapshot of the boot-time `stdout` is-a-terminal probe.
+/// Set exactly once by [`init`]; subsequent calls are no-ops thanks
+/// to `OnceLock::set` semantics (first-writer-wins). Production code
+/// SHOULD call [`init`] exactly once at process start (see
+/// `src/main.rs`).
+static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub fn init() {
-    COLOR_ENABLED.store(std::io::stdout().is_terminal(), Ordering::Relaxed);
+    // `OnceLock::set` returns `Err` if already initialised; benign
+    // for double-init paths (tests, repeat embedder bootstrap), so
+    // the return value is intentionally discarded.
+    let _ = COLOR_ENABLED.set(std::io::stdout().is_terminal());
 }
 
 fn enabled() -> bool {
-    COLOR_ENABLED.load(Ordering::Relaxed)
+    #[cfg(test)]
+    if let Some(forced) = test_override::get() {
+        return forced;
+    }
+    // Default true matches the pre-PR8 `AtomicBool::new(true)` posture
+    // — if production code reads colour state before `init` runs the
+    // colourised path stays on (the prior behaviour).
+    *COLOR_ENABLED.get().unwrap_or(&true)
+}
+
+#[cfg(test)]
+mod test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<bool> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    pub(super) fn set(value: Option<bool>) {
+        OVERRIDE.with(|cell| cell.set(value));
+    }
 }
 
 fn wrap(code: &str, text: &str) -> String {
@@ -46,6 +86,17 @@ pub fn cyan(text: &str) -> String {
     wrap("96", text)
 }
 
+/// Colorize `text` according to the caller-supplied tier wire string.
+///
+/// The string literals in the match arms below are the **canonical
+/// deserializer** for the `Tier` enum's wire form — they pair with
+/// `crate::models::Tier::as_str` (Short → "short" / Mid → "mid" /
+/// Long → "long"). They MUST stay as raw literals here because this
+/// is the boundary where a caller-supplied `&str` (config, CLI flag,
+/// JSON value) gets dispatched; the enum has nothing to plug in at
+/// this point. Anywhere else that constructs a tier wire value should
+/// route through `Tier::<X>.as_str()`. See pm-v3.1 PR6 (#1174) for the
+/// sweep that pinned this invariant.
 pub fn tier_color(tier: &str, text: &str) -> String {
     match tier {
         "short" => short(text),
@@ -57,7 +108,10 @@ pub fn tier_color(tier: &str, text: &str) -> String {
 
 /// Priority as a colored bar: ████░░░░░░
 pub fn priority_bar(p: i32) -> String {
-    let filled = usize::try_from(p.clamp(1, 10)).expect("i32 as usize");
+    // B4 (R2-LOW) — clamp range is 1..=10 so try_from is infallible;
+    // use `unwrap_or` to align with the campaign's no-panic discipline
+    // (defensive against future refactors that drop the `clamp` call).
+    let filled = usize::try_from(p.clamp(1, 10)).unwrap_or(1);
     let empty = 10 - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
     if p >= 8 {
@@ -73,14 +127,15 @@ pub fn priority_bar(p: i32) -> String {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// pm-v3.1 PR8 (issue #1174) — thread-local override removes the
+    /// need for a process-wide `Mutex<()>` to serialise tests. Each
+    /// `cargo test` worker gets its own override slot, so the
+    /// previously-required `--test-threads=1` style of serialisation
+    /// is gone.
     fn with_color_off<F: FnOnce()>(f: F) {
-        let _guard = TEST_LOCK.lock().unwrap();
-        COLOR_ENABLED.store(false, Ordering::Relaxed);
+        test_override::set(Some(false));
         f();
-        COLOR_ENABLED.store(true, Ordering::Relaxed);
+        test_override::set(None);
     }
 
     #[test]
@@ -103,10 +158,11 @@ mod tests {
 
     #[test]
     fn tier_color_dispatch() {
+        use crate::models::Tier;
         with_color_off(|| {
-            assert_eq!(tier_color("short", "x"), "x");
-            assert_eq!(tier_color("mid", "x"), "x");
-            assert_eq!(tier_color("long", "x"), "x");
+            assert_eq!(tier_color(Tier::Short.as_str(), "x"), "x");
+            assert_eq!(tier_color(Tier::Mid.as_str(), "x"), "x");
+            assert_eq!(tier_color(Tier::Long.as_str(), "x"), "x");
             assert_eq!(tier_color("unknown", "x"), "x");
         });
     }
@@ -133,11 +189,11 @@ mod tests {
 
     #[test]
     fn wrap_with_color_enabled() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        COLOR_ENABLED.store(true, Ordering::Relaxed);
+        test_override::set(Some(true));
         let result = wrap("91", "red");
         assert!(result.contains("\x1b[91m"));
         assert!(result.contains("\x1b[0m"));
         assert!(result.contains("red"));
+        test_override::set(None);
     }
 }

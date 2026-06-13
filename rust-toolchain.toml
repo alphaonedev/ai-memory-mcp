@@ -1,0 +1,8 @@
+# Project-standard Rust toolchain. ai-memory standardizes on 1.96 — this
+# pins local + rustup-driven builds to the same compiler the declared MSRV
+# (Cargo.toml `rust-version`) and CI build on, so "works on my machine"
+# matches CI. CI's dtolnay/rust-toolchain steps set RUSTUP_TOOLCHAIN
+# explicitly and therefore take precedence over this file.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"

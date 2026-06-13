@@ -34,7 +34,12 @@ Every AI session that will touch this repository begins by loading shared contex
 
 Load these files into context before proposing any change:
 
-- [`CLAUDE.md`](../CLAUDE.md) — Claude Code integration and tool surface
+- [`CLAUDE.md`](../CLAUDE.md) — Claude Code integration and tool surface; includes
+  §"CodeGraph setup" (the L1 structural-safety MCP server adopted under issue #923).
+  CodeGraph is complementary to rust-analyzer LSP and ai-memory: LSP answers "where is
+  this exact symbol used right now"; CodeGraph answers "what is the shape — what calls
+  what, what would break"; ai-memory answers "what did prior sessions learn". All three
+  should be loaded for cross-cutting work.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — contributor procedures
 - [`docs/ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) — code, test, security,
   release standards
@@ -180,7 +185,7 @@ this repo. Highlights:
   `// SPDX-License-Identifier: Apache-2.0`)
 - No new production `unwrap()` calls
 - All SQL via parameterized queries (`params![]`)
-- FTS5 input via `sanitize_fts5_query()`
+- FTS5 input via `sanitize_fts_query()`
 
 ### 5.4 Tests alongside code
 
@@ -256,20 +261,26 @@ human approval.
 
 ---
 
-## 7. Self-Review (the four gates)
+## 7. Self-Review (the six gates)
 
-Before requesting human review, run all four gates locally and paste the results into
-the PR description.
+Before requesting human review, run all six gates locally and paste the results into
+the PR description. The set is **four cargo gates** + **two script gates** introduced
+by [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200) for the substrate-
+canonical-discipline campaign (CLAUDE.md §"Lint gates (issue #1174 PR10)" is the
+canonical contract).
 
 ```bash
 cargo fmt --check
 cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
+scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* magic-number HARD-BLOCK (#1200)
+scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
 ```
 
-All four must be clean. If clippy pedantic requires `#[allow(clippy::...)]`, justify it
-in the PR description.
+All six must be clean. If clippy pedantic requires `#[allow(clippy::...)]`, justify it
+in the PR description. Both script gates are wired into
+`.github/workflows/c8-precheck.yml` and will block any PR that fails them.
 
 In addition, walk the **manual security checklist** in
 [`ENGINEERING_STANDARDS.md` §3.2](ENGINEERING_STANDARDS.md) and confirm zero new
@@ -277,7 +288,7 @@ findings in the 10 areas (SQL injection, `validate_id()` coverage, command injec
 path traversal, `unwrap()`, error message leakage, race conditions, auth/authz, data in
 logs, CORS).
 
-For documentation-only PRs the four gates are still required (they should pass without
+For documentation-only PRs the six gates are still required (they should pass without
 changes), but the security checklist may be skipped if no source files changed.
 
 ---
@@ -305,6 +316,8 @@ PRs target `develop`. **Never** target `main`.
 - [ ] cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 - [ ] AI_MEMORY_NO_CONFIG=1 cargo test
 - [ ] cargo audit
+- [ ] scripts/check-vendor-literals.sh (vendor-monoculture + SECS_PER_* — #1200)
+- [ ] scripts/qc-codegraph-precheck.sh (C8 caller-context allowlist + structural drift — #923)
 - [ ] Manual security checklist (Engineering Standards §3.2) reviewed
 - [ ] Documentation sync (test counts, tool counts) where applicable
 
@@ -423,7 +436,7 @@ Quick reference: which `ai-memory` tools and external commands you use at each p
 | 4 Branching | — | `git checkout -b <type>/<slug> origin/develop` |
 | 5 Implementation | `memory_store` (debug, decision) | `git add`, `git commit` (with Co-Authored-By trailer) |
 | 6 Memory hygiene | `memory_store`, `memory_link`, `memory_detect_contradiction`, `memory_consolidate` | — |
-| 7 Self-review | — | `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo audit` |
+| 7 Self-review | — | `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo audit`, `scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh` (6 gates) |
 | 8 PR submission | `memory_store` (followup) | `git push -u origin <branch>`, `gh pr create --base develop` |
 | 9 Handoff | `memory_promote`, `memory_store` (outcome), `memory_link` | `gh pr view`, `gh issue close` (only if necessary) |
 

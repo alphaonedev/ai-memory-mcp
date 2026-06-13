@@ -749,6 +749,7 @@ footer.site-foot a { color: var(--text-muted); }
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 </style>
 </head>
 <body>
@@ -761,11 +762,14 @@ footer.site-foot a { color: var(--text-muted); }
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ At a Glance</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
-        <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
+        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
-          <a href="for-everyone.html" class="current">For Everyone</a>
+          <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -788,6 +792,7 @@ footer.site-foot a { color: var(--text-muted); }
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -799,6 +804,9 @@ footer.site-foot a { color: var(--text-muted); }
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -808,6 +816,7 @@ footer.site-foot a { color: var(--text-muted); }
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
           <a href="spec/v1.html">Portability Spec v1</a>
         </div>
@@ -816,8 +825,10 @@ footer.site-foot a { color: var(--text-muted); }
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
@@ -897,8 +908,8 @@ footer.site-foot a { color: var(--text-muted); }
   </div>
 
   <div class="pillars-icons" aria-hidden="true" style="margin-top:2.5rem;">
-    <span class="pillar-icon"><span class="dot p1"></span> 93.84% test coverage</span>
-    <span class="pillar-icon"><span class="dot p2"></span> 1,886 tests passing</span>
+    <span class="pillar-icon"><span class="dot p1"></span> 92.59% test coverage (v0.7.0)</span>
+    <span class="pillar-icon"><span class="dot p2"></span> 15,951 / 0 final-baseline regression</span>
     <span class="pillar-icon"><span class="dot p3"></span> Apache-2.0 licensed</span>
   </div>
 </section>
@@ -908,12 +919,13 @@ footer.site-foot a { color: var(--text-muted); }
      ============================================================= -->
 <div class="stats-strip">
   <div class="container" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1.5rem;">
-    <div class="stat-item"><span class="stat-num">26</span><span class="stat-label">MCP tools</span></div>
-    <div class="stat-item"><span class="stat-num">39</span><span class="stat-label">HTTP endpoints</span></div>
-    <div class="stat-item"><span class="stat-num">28</span><span class="stat-label">CLI commands</span></div>
-    <div class="stat-item"><span class="stat-num">5</span><span class="stat-label">Platforms</span></div>
-    <div class="stat-item"><span class="stat-num">13</span><span class="stat-label">AI clients tested</span></div>
-    <div class="stat-item"><span class="stat-num">0</span><span class="stat-label">Cloud deps</span></div>
+    <div class="stat-item"><span class="stat-num">74</span><span class="stat-label">MCP tools (--profile full)</span></div>
+    <div class="stat-item"><span class="stat-num">88</span><span class="stat-label">HTTP routes (75 unique paths)</span></div>
+    <div class="stat-item"><span class="stat-num">79</span><span class="stat-label">CLI commands</span></div>
+    <div class="stat-item"><span class="stat-num">5</span><span class="stat-label">Platforms (macOS·Linux·Windows·iOS·Android)</span></div>
+    <div class="stat-item"><span class="stat-num">15+</span><span class="stat-label">LLM vendors (Ollama + cloud)</span></div>
+    <div class="stat-item"><span class="stat-num">v55</span><span class="stat-label">Schema version (v0.7.0)</span></div>
+    <div class="stat-item"><span class="stat-num">10/10</span><span class="stat-label"><a href="compliance/nsa-csi-mcp.html">NSA CSI MCP concerns</a> structurally addressed</span></div>
   </div>
 </div>
 
@@ -1048,7 +1060,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="tier-deps">+ Candle MiniLM (80 MB) · 200 MB RAM</div>
         <ul class="tier-features">
           <li>Everything in keyword, plus:</li>
-          <li>Local nomic-embed-text vectors</li>
+          <li>nomic-embed-text vectors &mdash; local, or any API embedding backend (#1598)</li>
           <li>HNSW approximate-nearest-neighbor</li>
           <li>Hybrid FTS5 + vector recall</li>
           <li>memory_check_duplicate</li>
@@ -1057,7 +1069,7 @@ footer.site-foot a { color: var(--text-muted); }
       <div class="tier tier-smart">
         <div class="tier-bar"></div>
         <div class="tier-name">smart</div>
-        <div class="tier-deps">+ Ollama (gemma4:e2b) · 4 GB RAM</div>
+        <div class="tier-deps">+ any LLM provider · Ollama (gemma3:4b) local OR xAI / OpenAI / Anthropic / Gemini / 11 more cloud vendors (#1067) · 4 GB RAM local / ~256 MB cloud-LLM</div>
         <ul class="tier-features">
           <li>Everything in semantic, plus:</li>
           <li>Auto-tagging on store</li>
@@ -1103,7 +1115,7 @@ footer.site-foot a { color: var(--text-muted); }
         <rect class="stage-box" x="10"   y="80"  width="160" height="60" rx="8"/>
         <text class="stage-text" x="90"  y="105" text-anchor="middle">memory_store</text>
         <text class="stage-label" x="90" y="125" text-anchor="middle">CREATED</text>
-        <text x="90" y="160" fill="#999" font-size="11" text-anchor="middle">tier=short</text>
+        <text x="90" y="160" fill="#999" font-size="11" text-anchor="middle">tier=mid (default)</text>
         <text x="90" y="173" fill="#666" font-size="10" text-anchor="middle">access_count=0</text>
       </g>
 
@@ -1112,15 +1124,15 @@ footer.site-foot a { color: var(--text-muted); }
         <text class="stage-text" x="280" y="105" text-anchor="middle">memory_recall</text>
         <text class="stage-label" x="280" y="125" text-anchor="middle">USED</text>
         <text x="280" y="160" fill="#999" font-size="11" text-anchor="middle">access_count++</text>
-        <text x="280" y="173" fill="#666" font-size="10" text-anchor="middle">extends TTL</text>
+        <text x="280" y="173" fill="#666" font-size="10" text-anchor="middle">resets TTL window</text>
       </g>
 
       <g>
         <rect class="stage-box" x="390" y="80"  width="160" height="60" rx="8" stroke="#ffb86b"/>
         <text class="stage-text" x="470" y="105" text-anchor="middle" fill="#ffb86b">auto_promote</text>
         <text class="stage-label" x="470" y="125" text-anchor="middle">PROMOTED</text>
-        <text x="470" y="160" fill="#999" font-size="11" text-anchor="middle">tier: short → mid</text>
-        <text x="470" y="173" fill="#666" font-size="10" text-anchor="middle">5 accesses + recent</text>
+        <text x="470" y="160" fill="#999" font-size="11" text-anchor="middle">tier: mid → long</text>
+        <text x="470" y="173" fill="#666" font-size="10" text-anchor="middle">at 5 accesses</text>
       </g>
 
       <g>
@@ -1150,10 +1162,10 @@ footer.site-foot a { color: var(--text-muted); }
       <!-- Bottom path: contradictions -->
       <g>
         <rect class="stage-box" x="200" y="240" width="160" height="60" rx="8" stroke="#ff6b9d"/>
-        <text class="stage-text" x="280" y="265" text-anchor="middle" fill="#ff6b9d">on_contradiction</text>
+        <text class="stage-text" x="280" y="265" text-anchor="middle" fill="#ff6b9d">detect_contradiction</text>
         <text class="stage-label" x="280" y="285" text-anchor="middle">FLAGGED</text>
-        <text x="280" y="320" fill="#999" font-size="11" text-anchor="middle">webhook fires</text>
-        <text x="280" y="333" fill="#666" font-size="10" text-anchor="middle">human picks winner</text>
+        <text x="280" y="320" fill="#999" font-size="11" text-anchor="middle">potential_contradictions</text>
+        <text x="280" y="333" fill="#666" font-size="10" text-anchor="middle">caller picks winner</text>
       </g>
 
       <g>
@@ -1168,8 +1180,8 @@ footer.site-foot a { color: var(--text-muted); }
         <rect class="stage-box" x="580" y="240" width="160" height="60" rx="8"/>
         <text class="stage-text" x="660" y="265" text-anchor="middle">memory_forget</text>
         <text class="stage-label" x="660" y="285" text-anchor="middle">USER-DELETED</text>
-        <text x="660" y="320" fill="#999" font-size="11" text-anchor="middle">explicit op</text>
-        <text x="660" y="333" fill="#666" font-size="10" text-anchor="middle">requires approval</text>
+        <text x="660" y="320" fill="#999" font-size="11" text-anchor="middle">explicit op · archives first</text>
+        <text x="660" y="333" fill="#666" font-size="10" text-anchor="middle">governance-gated</text>
       </g>
 
       <!-- Arrows -->
@@ -1195,7 +1207,7 @@ footer.site-foot a { color: var(--text-muted); }
     </svg>
 
     <div class="callout">
-      <strong>Reversibility is the rule, not the exception.</strong> Every destructive operation has an undo path. Archive instead of delete. Supersede instead of overwrite. The only hard delete is <code>memory_archive_purge --older-than-days &lt;N&gt;</code>, and that fires governance approval.
+      <strong>Reversibility is the rule, not the exception.</strong> Every destructive operation has an undo path. Archive instead of delete. Supersede instead of overwrite. The only hard delete is <code>memory_archive_purge</code> (CLI: <code>ai-memory archive purge --older-than-days &lt;N&gt;</code>) — scoped by the <code>older_than_days</code> safety knob and audit-logged.
     </div>
   </div>
 </section>
@@ -1361,7 +1373,7 @@ footer.site-foot a { color: var(--text-muted); }
         <span class="cov-mod">daemon_runtime.rs</span><div class="cov-bar-bg"><div class="cov-bar-fill" style="width:93.43%"></div></div><span class="cov-pct">93.43%</span>
       </div>
       <div class="cov-row">
-        <span class="cov-mod">handlers.rs</span><div class="cov-bar-bg"><div class="cov-bar-fill" style="width:92.85%"></div></div><span class="cov-pct">92.85%</span>
+        <span class="cov-mod">src/handlers/</span><div class="cov-bar-bg"><div class="cov-bar-fill" style="width:92.85%"></div></div><span class="cov-pct">92.85%</span>
       </div>
       <div class="cov-row">
         <span class="cov-mod">federation.rs</span><div class="cov-bar-bg"><div class="cov-bar-fill" style="width:92.63%"></div></div><span class="cov-pct">92.63%</span>
@@ -1433,7 +1445,7 @@ footer.site-foot a { color: var(--text-muted); }
       <path class="ack-line" d="M 440 200 L 440 120"/>
 
       <!-- Quorum threshold indicator -->
-      <text x="440" y="340" fill="#999" font-family="monospace" font-size="13" text-anchor="middle">W=2 of N=3 reached → write committed</text>
+      <text x="440" y="340" fill="#999" font-family="monospace" font-size="13" text-anchor="middle">W=2 met (local commit + peer acks) → write committed</text>
       <text x="440" y="360" fill="#666" font-size="11" text-anchor="middle">node-4 catches up via /api/v1/sync/since when reachable</text>
 
       <defs>
@@ -1568,7 +1580,7 @@ footer.site-foot a { color: var(--text-muted); }
 <section id="roadmap">
   <div class="container">
     <span class="eyebrow">Roadmap</span>
-    <h2>From v0.6.3 today to v1.0 federation maturity.</h2>
+    <h2>From v0.7.0 today to v1.0 federation maturity.</h2>
     <p class="lede">
       Public release sequence. Each release ships one demoable headline plus operational substrate the next release builds on. No version skipping. No quiet feature drift. <a href="https://github.com/alphaonedev/ai-memory-mcp-dev/blob/develop/ROADMAP.md" style="color:var(--pillar-1)">Public ROADMAP.md →</a>
     </p>
@@ -1587,7 +1599,7 @@ footer.site-foot a { color: var(--text-muted); }
             <li>Hierarchical namespace paths (<code>projects/alpha/decisions</code>)</li>
             <li>Temporal-validity knowledge graph (recursive CTE today, AGE-ready for v0.7)</li>
             <li>Published p95/p99 budgets + CI guard (<code>bench.yml</code>)</li>
-            <li>93.84% test coverage (1,886 lib tests + 49+ integration, across the ubuntu/macos/windows CI matrix; v0.6.3.1)</li>
+            <li>92.59% test coverage (4,699 lib + integration tests, across the ubuntu/macos/windows CI matrix; v0.7.0)</li>
             <li>Two SSRF defects discovered during campaign — fixed before tag</li>
           </ul>
         </div>
@@ -1783,23 +1795,23 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile good">
         <div class="dash-label">Tests passing</div>
-        <div class="dash-num">1,809</div>
-        <div class="dash-sub">1,600 lib + 209 integration · 0 failed · 0 ignored</div>
+        <div class="dash-num">4,699</div>
+        <div class="dash-sub">v0.7.0 lib + integration suite · 0 failed · 0 ignored</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">MCP tools</div>
-        <div class="dash-num">26</div>
-        <div class="dash-sub">Claude / Cursor / Codex / Continue</div>
+        <div class="dash-num">74</div>
+        <div class="dash-sub">--profile full (7 core / 74 full) · Claude / Cursor / Codex / Continue</div>
       </div>
       <div class="dash-tile p2">
-        <div class="dash-label">HTTP endpoints</div>
-        <div class="dash-num">39</div>
-        <div class="dash-sub">REST + SSE + mTLS</div>
+        <div class="dash-label">HTTP routes</div>
+        <div class="dash-num">88</div>
+        <div class="dash-sub">89 production .route(…) bindings · 75 unique URL paths · REST + SSE + mTLS + HMAC-signed webhooks</div>
       </div>
       <div class="dash-tile p2">
         <div class="dash-label">CLI commands</div>
-        <div class="dash-num">28</div>
-        <div class="dash-sub">store, recall, sync, ...</div>
+        <div class="dash-num">79</div>
+        <div class="dash-sub">store, recall, sync, config migrate, doctor, ...</div>
       </div>
       <div class="dash-tile p3">
         <div class="dash-label">Session-start p95</div>
@@ -1818,8 +1830,8 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile">
         <div class="dash-label">main.rs lines</div>
-        <div class="dash-num">75</div>
-        <div class="dash-sub">down from 4,511 · 98.3% reduction</div>
+        <div class="dash-num">218</div>
+        <div class="dash-sub">down from 4,511 · ~95% reduction (W6 thin-shim refactor)</div>
       </div>
       <div class="dash-tile">
         <div class="dash-label">Modules at 100%</div>
@@ -1833,13 +1845,18 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="dash-tile">
         <div class="dash-label">Distribution targets</div>
-        <div class="dash-num">5</div>
-        <div class="dash-sub">macOS arm64/x64 · Linux arm64/x64 · Win x64</div>
+        <div class="dash-num">7</div>
+        <div class="dash-sub">macOS arm64/x64 · Linux arm64/x64 · Win x64 · iOS arm64 · Android arm64 (#1068)</div>
       </div>
       <div class="dash-tile">
         <div class="dash-label">Package channels</div>
-        <div class="dash-num">5</div>
-        <div class="dash-sub">Homebrew · APT · COPR · GHCR · crates.io</div>
+        <div class="dash-num">7</div>
+        <div class="dash-sub">Homebrew · APT · COPR · GHCR · crates.io · iOS xcframework · Android jniLibs tarball</div>
+      </div>
+      <div class="dash-tile">
+        <div class="dash-label">LLM vendors supported</div>
+        <div class="dash-num">15+</div>
+        <div class="dash-sub">Ollama local · xAI · OpenAI · Anthropic · Gemini · DeepSeek · Kimi · Qwen · Mistral · Groq · Together · Cerebras · OpenRouter · Fireworks · LMStudio · vLLM (#1067)</div>
       </div>
       <div class="dash-tile">
         <div class="dash-label">SSRF defects fixed</div>
@@ -1898,7 +1915,7 @@ footer.site-foot a { color: var(--text-muted); }
         <p style="color:var(--text-muted); margin-bottom:.75rem">
           AI mandates are real. Cloud bans are real. Foreign-vendor concerns are real. <strong>An OSS Rust binary that runs entirely on your hardware, requires zero outbound traffic, and ships with auditable source code is the only AI-memory primitive that works for federal, state, local, and municipal deployments.</strong>
         </p>
-        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.6.3 already runs air-gapped with no compromise.</p>
+        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.7.0 already runs air-gapped with no compromise.</p>
       </div>
     </div>
   </div>
@@ -1914,12 +1931,21 @@ footer.site-foot a { color: var(--text-muted); }
     <p class="lede">This page is the hub. Three concentric rings: <strong>six audience-facing</strong> pages (release spotlight, feature matrix, data flow, integrations, audiences, release pipeline), <strong>twelve feature deep-dives</strong> (tiers, rules, TTLs, archival, encryption, hierarchies, KG, autonomous, A2A, lifecycle, performance, credits), and <strong>five SME-detail references</strong> (schema, types, validators, governance, tracing). <strong>Pick what your audience needs.</strong></p>
 
     <div class="grid-3" style="gap:1rem">
-      <a href="whats-new-v063.html" style="text-decoration:none">
+      <a href="compliance/nsa-csi-mcp.html" style="text-decoration:none">
+        <div class="card p1" style="height:100%;display:flex;flex-direction:column;border:2px solid rgba(110,231,255,0.4)">
+          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ PROCUREMENT-GRADE · COMPLIANCE</div>
+          <div class="card-title">NSA CSI MCP Security Compliance</div>
+          <p class="card-body">v0.7.x substrate-level coverage of the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26, May 2026). <strong>10 of 10 NSA concerns structurally addressed + 7 of 7 NSA recommendations implemented.</strong> Every claim codegraph-verified, file-anchored, independently reproducible by federal procurement reviewers. 47 dedicated tests pin the #1154 daemon-serverInfo signing contract.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">compliance/nsa-csi-mcp.html →</div>
+        </div>
+      </a>
+
+      <a href="whats-new-v07.html" style="text-decoration:none">
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ NEW · RELEASE SPOTLIGHT</div>
-          <div class="card-title">What's New in v0.6.3</div>
-          <p class="card-body">The 6 streams shipped, the 9 coverage waves, the 2 SSRF defects fixed, the upgrade path. Animated coverage timeline + before/after security diff.</p>
-          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">whats-new-v063.html →</div>
+          <div class="card-title">What's New in v0.7.0 — attested-cortex</div>
+          <p class="card-body"> 74 MCP tools at full / 7 at core, schema v33 → v57, Ed25519 link attestation with V-4 cross-row hash chain, 25-event hook pipeline, sidechain transcripts + memory_replay, postgres + Apache AGE first-class backend, schema-v2 sectioned config (#1146), per-namespace K8 quota dimension (#1156), federation_nonces persistence (#1255), transcript_line_dedup idempotency (#1389), tier-default expiry backfill (#1466), sargable federation-catchup (#1476), 7-level provenance framework. The release for substrate-native attested cortex.</p>
+          <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">whats-new-v07.html →</div>
         </div>
       </a>
 
@@ -1927,7 +1953,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ COMPLETE SURFACE AREA</div>
           <div class="card-title">Feature Matrix</div>
-          <p class="card-body">Every MCP tool, every HTTP endpoint, every CLI command — categorized, cross-referenced. 26 + 39 + 28 = 93 operations. The SME's full reference.</p>
+          <p class="card-body">Every MCP tool, every HTTP route, every CLI command — categorized, cross-referenced. <strong> 74 MCP tools + 88 HTTP routes (75 unique paths) + 80 CLI subcommands</strong> at v0.7.x. The SME's full reference.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">feature-matrix.html →</div>
         </div>
       </a>
@@ -1936,7 +1962,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p3" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ ENGINEERING DEEP DIVE</div>
           <div class="card-title">Data Flow</div>
-          <p class="card-body">Animated write path, read path with hybrid 70/30 fusion, federation W=2 of N=3 quorum diagram. Where every byte goes.</p>
+          <p class="card-body">Animated write path, read path with adaptive hybrid fusion + 70/30 context blend, federation W=2 quorum diagram. Where every byte goes.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">data-flow.html →</div>
         </div>
       </a>
@@ -1945,7 +1971,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ EVERY AI HOST</div>
           <div class="card-title">Integrations</div>
-          <p class="card-body">13 AI clients tested with one-block setup snippets each. Claude · ChatGPT · Cursor · Windsurf · Continue · Codex · Gemini · Grok · OpenClaw · Hermes · Llama.</p>
+          <p class="card-body">14 AI clients tested with one-block setup snippets each. Claude · ChatGPT · Cursor · Windsurf · Continue · Codex · Gemini · Grok · OpenClaw · Hermes · Llama.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">integrations.html →</div>
         </div>
       </a>
@@ -1972,7 +1998,7 @@ footer.site-foot a { color: var(--text-muted); }
     <div style="margin-top:3rem;padding-top:2rem;border-top:1px solid var(--border)">
       <span class="eyebrow">Feature Deep-Dive Atlas</span>
       <h2 style="margin-top:.5rem">Eleven big-sell features, one page each.</h2>
-      <p class="lede">The grand-slam features. Tiers + TTLs (the retention story). Rules (per-namespace policy stack). Archival (two-stage soft-then-hard delete). Encryption (SQLCipher, mTLS, HMAC). Hierarchies (8-level memory trees). Knowledge Graph (4 relations + temporal validity). Autonomous (Gemma 4-powered). A2A messaging. Full lifecycle. Performance + bench tool. Credits (Google Gemma 4, Nomic, Hugging Face, Ollama, SQLite, Rust ecosystem).</p>
+      <p class="lede">The grand-slam features. Tiers + TTLs (the retention story). Rules (per-namespace policy stack). Archival (two-stage soft-then-hard delete). Encryption (SQLCipher, mTLS, HMAC-mandatory webhooks). Hierarchies (8-level memory trees). Knowledge Graph (<strong>6 relation variants</strong> incl. reflects_on + derives_from + temporal validity). Autonomous (provider-agnostic LLM substrate &mdash; Ollama local OR 15+ cloud vendors via #1067). A2A messaging. Full lifecycle. Performance + bench tool. Credits (Google for Gemma, Nomic, Hugging Face, Ollama, xAI / OpenAI / Anthropic / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio, SQLite, Rust ecosystem).</p>
     </div>
 
     <div class="grid-3" style="gap:1rem;margin-top:1.5rem">
@@ -2034,16 +2060,16 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ STRUCTURED COGNITION</div>
           <div class="card-title">Knowledge Graph</div>
-          <p class="card-body">4 relation types. Entity registry with alias resolution. Temporal validity columns. memory_kg_query / kg_timeline / kg_invalidate. v0.6.3 Streams B + C.</p>
+          <p class="card-body">6 relation variants (related_to / supersedes / contradicts / derived_from / reflects_on / derives_from). Entity registry with alias resolution. Temporal validity columns + Ed25519 signature column populated. <strong>11 graph-family MCP tools</strong>: memory_kg_query / memory_kg_timeline / memory_kg_invalidate / memory_find_paths / memory_link / memory_get_links / memory_entity_register / memory_entity_get_by_alias / memory_get_taxonomy / memory_replay / memory_verify. Apache AGE acceleration on Postgres backend.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">knowledge-graph.html →</div>
         </div>
       </a>
 
       <a href="autonomous.html" style="text-decoration:none">
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
-          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ POWERED BY GEMMA 4</div>
+          <div class="card-eyebrow" style="color:var(--pillar-1)">▸ PROVIDER-AGNOSTIC LLM (#1067 + #1146)</div>
           <div class="card-title">Autonomous</div>
-          <p class="card-body">Auto-tag, consolidate, expand-query, contradiction detection, memory reflection, session-start. All powered by Google's open-source Gemma 4 via Ollama. Local-first.</p>
+          <p class="card-body">Auto-tag, consolidate, expand-query, contradiction detection, memory reflection, session-start. Backed by any LLM via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code> (recommended, post-<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1146">#1146</a>) or <code>AI_MEMORY_LLM_BACKEND</code> env override &mdash; Ollama (default; Gemma local) or xAI Grok / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp-server. Local-first by default, cloud-flexible by config. <strong>Canonical schema:</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>. <strong>Per-vendor recipes:</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/llm-backends.md">integrations/llm-backends.md</a>.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">autonomous.html →</div>
         </div>
       </a>
@@ -2079,7 +2105,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p3" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ THANKS</div>
           <div class="card-title">Credits</div>
-          <p class="card-body">Open-source acknowledgements. Google for Gemma 4. Nomic AI for embeddings. Hugging Face for tokenizers + reranker. Ollama, SQLite, the Rust ecosystem.</p>
+          <p class="card-body">Open-source acknowledgements. Google for Gemma. Nomic AI for embeddings. Hugging Face for tokenizers + reranker. Ollama for the local-LLM runtime; xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM for the cloud + self-hosted LLM substrate (#1067). SQLite. Rust ecosystem.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">credits.html →</div>
         </div>
       </a>
@@ -2096,7 +2122,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p1" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ SQL ATLAS</div>
           <div class="card-title">Schema</div>
-          <p class="card-body">Every SQLite table column-by-column. 9 tables, 15+ indexes, 6 foreign keys, v15 migration timeline. Postgres mirror via SAL. The persistence contract.</p>
+          <p class="card-body">Every SQLite table column-by-column. <strong>Schema v57</strong> (was v33 at v0.6.4). <strong>26-field Memory struct</strong> (was 15) incl. reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, version. <strong>6 MemoryLink variants</strong> with Ed25519 attestation columns. v55 current (#1476 sargable list_memories_updated_since federation-catchup rewrite + idx_memories_updated_at); v54 (#1466) backfilled tier-default expiry onto legacy NULL-expiry rows; v53 (#1418) scoped the memories_au FTS5 trigger; v52 (#1389) added the transcript_line_dedup idempotency table; v51 (#1255) added federation_nonces persistence; v50 (#1156) added per-namespace K8 quota dimension on <code>agent_quotas</code>. Postgres mirror via SAL with Apache AGE Cypher graph backend. The persistence contract.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">schema.html →</div>
         </div>
       </a>
@@ -2105,7 +2131,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ RUST TYPE REFERENCE</div>
           <div class="card-title">Types</div>
-          <p class="card-body">Every public struct and enum from <code>src/models.rs</code>. 5 enums, 22 structs, 5 consts. Field-level types, defaults, serde tags. The wire-format contract.</p>
+          <p class="card-body">Every public struct and enum from <code>src/models/</code>. 16 enums, 50 structs at v0.7.0. Field-level types, defaults, serde tags. The wire-format contract.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">types.html →</div>
         </div>
       </a>
@@ -2114,7 +2140,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p3" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ INPUT-CHECK ATLAS</div>
           <div class="card-title">Validators</div>
-          <p class="card-body">23 validate_* functions, every limit explicit, every closed set enumerated. Defense in depth — same checks on HTTP, MCP, CLI, federation receive.</p>
+          <p class="card-body">42 validate_* functions, every limit explicit, every closed set enumerated. Defense in depth — same checks on HTTP, MCP, CLI, federation receive.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">validators.html →</div>
         </div>
       </a>
@@ -2132,7 +2158,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ OBSERVABILITY ATLAS</div>
           <div class="card-title">Tracing</div>
-          <p class="card-body">176 log call sites across 11 modules. Setup, level taxonomy, canonical phrases AI clients can grep for. Incident-review recipes.</p>
+          <p class="card-body">600+ tracing call sites across the codebase. Setup, level taxonomy, canonical phrases AI clients can grep for (incl. the #1562 <code>store::postgres</code> targets). Incident-review recipes.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">tracing.html →</div>
         </div>
       </a>
@@ -2161,10 +2187,13 @@ footer.site-foot a { color: var(--text-muted); }
 
 <footer class="site-foot">
   <div>
-    Apache 2.0 · <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a> · ai-memory-mcp <strong style="color:var(--text)">v0.6.3.1</strong> · Built with the AI NHI by <a href="https://alphaonedev.com">AlphaOne LLC</a>
+    ai-memory&trade; &middot; Apache 2.0 &middot; <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a> &middot; ai-memory-mcp <strong style="color:var(--text)">v0.7.0</strong> &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a>
   </div>
   <div style="margin-top:.5rem; font-size:.75rem;">
     All measurements on Apple M4 / 32 GB / NVMe SSD · numbers from <code>cargo llvm-cov --features sal --no-fail-fast --json</code>
+  </div>
+  <div style="margin-top:.75rem; font-size:.72rem; color:var(--text-dim); max-width:60rem;">
+    <strong>NSA non-endorsement:</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The National Security Agency, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. See <a href="compliance/nsa-csi-mcp.html">the full NSA CSI MCP compliance page</a> for the complete mapping + citation.
   </div>
 </footer>
 

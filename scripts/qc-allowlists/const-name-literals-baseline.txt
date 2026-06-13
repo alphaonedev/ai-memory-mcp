@@ -1,0 +1,4 @@
+# const-name-literals grandfathered baseline — burned down to EMPTY
+# at #1579 merge-train close (2026-06-10): all 9 grandfathered
+# value-encoding names renamed semantically. Entries: relpath:identifier.
+# Regenerate ONLY via --update-baseline (operator-gated).

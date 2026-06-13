@@ -6,11 +6,37 @@
 // Integration tests — all run through the CLI binary
 //
 // AI_MEMORY_NO_CONFIG=1 prevents loading ~/.config/ai-memory/config.toml
-// which may set tier=autonomous and trigger embedder/LLM initialization.
+// which may set tier=autonomous and trigger LLM initialization. NOTE
+// (#1487): it does NOT disable the embedder — with no config file
+// `effective_tier` still defaults to `semantic` (config.rs), so CLI
+// `recall` builds a MiniLM embedder and may download its weights from
+// the HuggingFace Hub. That download is now bounded by a watchdog
+// (embeddings::Embedder::download_within) so a stalled HF connection
+// degrades to keyword-only instead of hanging the test process.
+
+mod common;
+use common::free_port;
+
+/// #998 (2026-05-21) — concrete admin id seeded into
+/// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
+/// Replaces the pre-#980 `"*"` wildcard which now fails
+/// `validate_agent_id`. Threaded through admin-gated GETs by
+/// [`curl_get_as_admin`] / [`curl_post_as_admin`].
+const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // #1501 — the CLI `recall`/`store` subprocesses default to the semantic
+    // tier, which lazily downloads the MiniLM weights from HuggingFace Hub on
+    // first touch. Spawned once per test, many of these race on the shared
+    // hf-hub cache lock on a cold CI cache and stack into a multi-minute hang
+    // (caught by the #1492 watchdog). These tests assert budget/ranking/wire
+    // behavior, not embedding quality, and already tolerate the keyword
+    // fallback — so force the embedder offline to keep the suite hermetic and
+    // deterministic. The model-load path itself is covered by the embeddings
+    // unit tests.
+    c.env("AI_MEMORY_EMBED_OFFLINE", "1");
     // v0.7.0 K3 — the integration suite asserts the gate's strict
     // semantics (Pending/Deny on policy violation). The v0.7.0
     // process default for `permissions.mode` is `advisory` (log +
@@ -25,6 +51,49 @@ fn cmd(binary: &str) -> std::process::Command {
     // exercises the production happy path without permanently
     // relaxing the production default.
     c.env("AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS", "1");
+    // v0.7.0 #238/#239 — the integration suite drives /sync/push
+    // and /sync/since directly via curl_post / curl_get without the
+    // new wire-level `x-peer-id` header. Opt these subprocess
+    // daemons into the legacy posture so the existing assertions
+    // hold; per-issue regression tests at `tests/g_issue_238_*` and
+    // `tests/g_issue_239_*` exercise the default-enforce posture in
+    // their own test binaries.
+    c.env("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
+    c.env("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
+    // #976 (2026-05-20) — the integration suite's federation tests
+    // pre-date #791 (Ed25519 signed sync) + #922 (per-message nonce
+    // replay protection). The test daemons drive /sync/push and
+    // /sync/since over plain HTTP bodies without minting per-message
+    // signatures or nonces; turn off both requirements at the suite
+    // level so the existing assertions hold. Per-issue regression
+    // tests in `tests/g_issue_*` exercise the default-enforce posture
+    // in their own test binaries.
+    c.env("AI_MEMORY_FED_REQUIRE_SIG", "0");
+    c.env("AI_MEMORY_FED_REQUIRE_NONCE", "0");
+    // #976 (2026-05-20) — every integration-test daemon needs admin
+    // role for the test caller. The admin-gate tightening cluster
+    // (#943 / #946 / #949 / #957 / #960) added `require_admin` to
+    // archive / pending / phase4 / sync_push / smoke / forget /
+    // import routes; pre-#976 the test fixtures had no way to set
+    // up the allowlist (no env-var, no CLI flag), so every test
+    // crashing on 403.
+    //
+    // #998 (2026-05-21) — the original #976 fix used the `"*"`
+    // wildcard sentinel, but #980 (2026-05-20 night) tightened
+    // `daemon_runtime::resolve_admin_agent_ids` to validate each
+    // env-var entry through `validate_agent_id` — `"*"` fails the
+    // shape check and gets dropped. Integration tests need a
+    // concrete admin id; use `ai:integration-test-admin` and thread
+    // it through admin-gated GETs via `curl_get_as_admin` /
+    // `curl_post_as_admin`. Per-test overrides still win.
+    c.env("AI_MEMORY_ADMIN_AGENT_IDS", INTEGRATION_TEST_ADMIN);
+    // #1570 — spawned daemons here run with admin ids configured but
+    // NO api_key, so the post-#1570 secure default would refuse every
+    // header-asserted admin claim with 403. These tests model the
+    // legacy header-trust posture explicitly via the documented
+    // operator escape hatch; the #1570 secure default itself is
+    // pinned by tests/admin_header_trust_1570.rs.
+    c.env("AI_MEMORY_ADMIN_HEADER_TRUST", "1");
     c
 }
 /// Spawn a command and collect its output, panicking with a descriptive
@@ -39,6 +108,129 @@ fn cmd_output_or_panic(bin: &str, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {bin} {args:?}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// #1522 — bounded-deadline subprocess drivers for governance CLI tests
+// ---------------------------------------------------------------------------
+//
+// `cargo test` has no per-test timeout, so a single subprocess-spawn stall
+// under parallel load (shared cargo target dir + heavy sibling daemons) can
+// wedge the entire integration binary until an external kill — the failure
+// mode #1522 documents on `test_enforce_promote_with_approve_policy`. The
+// governance enforce tests below route every CLI / MCP subprocess wait
+// through these drivers, which spawn the child with piped stdio, drain
+// stdout/stderr on dedicated reader threads (so a full pipe buffer can never
+// wedge the child while we poll), and poll for exit against a deadline. On
+// expiry the driver kills the child and panics with the partial captured
+// output, converting a silent hang into a fast, loud, diagnosable failure.
+
+/// Per-subprocess wall-clock deadline. Generous relative to the ~0.4s
+/// isolated runtime of these tests so legitimate slow runs under heavy
+/// parallel load never trip it, while still bounding the pathological
+/// spawn-stall to a finite window.
+const GOVERNANCE_CLI_DEADLINE_SECS: u64 = 60;
+/// Poll cadence while waiting for the child to exit.
+const GOVERNANCE_CLI_POLL_INTERVAL_MS: u64 = 25;
+
+/// Spawn `command`, drain its stdio, and wait for exit against the
+/// [`GOVERNANCE_CLI_DEADLINE_SECS`] deadline. Kills the child and panics
+/// with partial output on expiry. `stdin` is closed (`null`), matching the
+/// semantics of [`std::process::Command::output`] for these non-interactive
+/// CLI calls.
+fn output_bounded(command: &mut std::process::Command, ctx: &str) -> std::process::Output {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn subprocess for {ctx}: {e}"));
+    wait_child_bounded(child, ctx, "CLI")
+}
+
+/// Spawn an `ai-memory mcp` subprocess, write the JSON-RPC `requests` to its
+/// stdin, close stdin (EOF), then wait for exit against the deadline. Same
+/// kill-and-panic-on-expiry contract as [`output_bounded`].
+fn drive_mcp_bounded(
+    command: &mut std::process::Command,
+    requests: &[String],
+    ctx: &str,
+) -> std::process::Output {
+    use std::io::Write;
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn mcp subprocess for {ctx}: {e}"));
+    {
+        let mut stdin = child.stdin.take().expect("piped mcp stdin");
+        for line in requests {
+            writeln!(stdin, "{line}")
+                .unwrap_or_else(|e| panic!("failed to write mcp stdin for {ctx}: {e}"));
+        }
+        stdin
+            .flush()
+            .unwrap_or_else(|e| panic!("failed to flush mcp stdin for {ctx}: {e}"));
+    } // stdin dropped here → child sees EOF and can exit
+    wait_child_bounded(child, ctx, "MCP")
+}
+
+/// Shared exit-wait core: drains stdout/stderr on reader threads, polls
+/// `try_wait` against the deadline, kills + panics on expiry. `kind` labels
+/// the subprocess class in the diagnostic.
+fn wait_child_bounded(
+    mut child: std::process::Child,
+    ctx: &str,
+    kind: &str,
+) -> std::process::Output {
+    use std::io::Read;
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Duration::from_secs(GOVERNANCE_CLI_DEADLINE_SECS);
+    let poll = std::time::Duration::from_millis(GOVERNANCE_CLI_POLL_INTERVAL_MS);
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let so = stdout_reader.join().unwrap_or_default();
+                    let se = stderr_reader.join().unwrap_or_default();
+                    panic!(
+                        "#1522 governance {kind}-subprocess deadline \
+                         ({GOVERNANCE_CLI_DEADLINE_SECS}s) exceeded for {ctx}; killed. \
+                         partial stdout={:?} stderr={:?}",
+                        String::from_utf8_lossy(&so),
+                        String::from_utf8_lossy(&se),
+                    );
+                }
+                std::thread::sleep(poll);
+            }
+            Err(e) => panic!("try_wait failed for {ctx}: {e}"),
+        }
+    };
+    let stdout = stdout_reader.join().expect("stdout reader thread panicked");
+    let stderr = stderr_reader.join().expect("stderr reader thread panicked");
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 #[test]
@@ -1864,8 +2056,10 @@ fn test_mcp_tools_list() {
         .expect("tools should be array");
     assert_eq!(
         tools.len(),
-        51,
-        "expected 51 MCP tools (v0.6.3 baseline 43 + v0.7.0 I4 memory_replay + v0.7 H4 memory_verify + v0.7 B1 memory_load_family + v0.7 B2 memory_smart_load + v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list + v0.7 J7 memory_find_paths + v0.7 K8 memory_quota_status)"
+        ai_memory::profile::Profile::full().expected_tool_count(),
+        "expected the canonical full-profile tool count from \
+         `Profile::full().expected_tool_count()` (SSOT-derived from the \
+         per-family tool_names slices; no hardcoded literal)"
     );
 
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -1897,6 +2091,19 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"memory_unsubscribe"));
     assert!(tool_names.contains(&"memory_list_subscriptions"));
     assert!(tool_names.contains(&"memory_find_paths"));
+    // v0.7.0 Task 4/8 (recursive learning, issue #655) — `memory_reflect`
+    // joins the full surface as the substrate-native reflection primitive.
+    assert!(tool_names.contains(&"memory_reflect"));
+    // v0.7.0 QW-2 — Persona-as-artifact substrate. Both tools must be
+    // registered under the full profile.
+    assert!(
+        tool_names.contains(&"memory_persona"),
+        "memory_persona must be registered under full profile; got {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"memory_persona_generate"),
+        "memory_persona_generate must be registered under full profile; got {tool_names:?}"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
@@ -3797,6 +4004,68 @@ fn test_import_trust_source_preserves_agent_id() {
 /// merged metadata). Fix: consolidator's `agent_id` becomes authoritative;
 /// original authors preserved in `metadata.consolidated_from_agents`.
 #[test]
+fn test_consolidate_stamps_curator_derived_provenance_1633() {
+    // #1633 — the engine pins confidence=1.0 on consolidated rows, so
+    // the honest provenance is curator_derived (the #1242 audit-
+    // honesty invariant: 'caller_provided' rows are invisible to the
+    // calibration sweep's derived-row index).
+    let db_path = fresh_db();
+    let binary = env!("CARGO_BIN_EXE_ai-memory");
+    let mut ids = Vec::new();
+    for title in ["pv-1", "pv-2"] {
+        let out = cmd(binary)
+            .args([
+                "--db",
+                db_path.to_str().unwrap(),
+                "--agent-id",
+                "alice",
+                "--json",
+                "store",
+                "-T",
+                title,
+                "-n",
+                "pv1633",
+                "-c",
+                "body",
+            ])
+            .output()
+            .unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ids.push(j["id"].as_str().unwrap().to_string());
+    }
+    let out = cmd(binary)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            "curator",
+            "consolidate",
+            "--title",
+            "pv-merged",
+            "--summary",
+            "merged body",
+            "--namespace",
+            "pv1633",
+            &ids.join(","),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let cs: String = conn
+        .query_row(
+            "SELECT confidence_source FROM memories WHERE title = 'pv-merged'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cs, "curator_derived",
+        "#1633: consolidated rows must carry honest engine provenance"
+    );
+}
+
+#[test]
 fn test_consolidate_attributes_to_consolidator() {
     let db_path = fresh_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
@@ -3899,6 +4168,12 @@ fn test_mine_stamps_caller_agent_id() {
     });
     std::fs::write(&conv_path, format!("{conv}\n")).unwrap();
 
+    // NOTE (#1174 PR9): `--format claude` is the canonical CLI selector
+    // for the `Format::Claude` mine-conversation parser variant, which
+    // exists specifically to ingest Anthropic's Claude `conversations.json`
+    // export format. This is legitimately vendor-named integration code
+    // (not vendor-monoculture substrate) per the PR #1184 reasoning, so
+    // the literal is preserved here.
     let out = cmd(binary)
         .args([
             "--db",
@@ -6097,11 +6372,8 @@ fn set_governance(
     governance: &serde_json::Value,
     owner_agent_id: &str,
 ) {
-    use std::io::Write;
-
-    let out = cmd(binary)
-        .env_remove("AI_MEMORY_AGENT_ID")
-        .args([
+    let out = output_bounded(
+        cmd(binary).env_remove("AI_MEMORY_AGENT_ID").args([
             "--db",
             db_path.to_str().unwrap(),
             "--agent-id",
@@ -6116,38 +6388,15 @@ fn set_governance(
             "policy",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "set_governance store",
+    );
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let sid = v["id"].as_str().unwrap().to_string();
 
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_namespace_set_standard","arguments":{
@@ -6156,11 +6405,21 @@ fn set_governance(
                 "governance": governance,
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let _ = child.wait_with_output();
+        .to_string(),
+    ];
+    let _ = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "set_governance set_standard",
+    );
 }
 
 #[test]
@@ -6174,8 +6433,8 @@ fn test_enforce_any_allows_store() {
         &serde_json::json!({"write":"any","promote":"any","delete":"any","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6190,9 +6449,9 @@ fn test_enforce_any_allows_store() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "any_allows_store",
+    );
     assert!(
         out.status.success(),
         "any-write must allow: {}",
@@ -6212,8 +6471,8 @@ fn test_enforce_registered_blocks_unregistered() {
         &serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6227,9 +6486,9 @@ fn test_enforce_registered_blocks_unregistered() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "registered_blocks_unregistered",
+    );
     assert!(!out.status.success(), "unregistered must be blocked");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not a registered agent"), "got: {err}");
@@ -6240,8 +6499,8 @@ fn test_enforce_registered_blocks_unregistered() {
 fn test_enforce_registered_allows_registered() {
     let db = fresh_enforce_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let _ = cmd(bin)
-        .args([
+    let _ = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "agents",
@@ -6250,9 +6509,9 @@ fn test_enforce_registered_allows_registered() {
             "alice",
             "--agent-type",
             "human",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "registered_allows register",
+    );
     set_governance(
         bin,
         &db,
@@ -6260,8 +6519,8 @@ fn test_enforce_registered_allows_registered() {
         &serde_json::json!({"write":"registered","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6275,9 +6534,9 @@ fn test_enforce_registered_allows_registered() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "registered_allows store",
+    );
     assert!(out.status.success());
     let _ = std::fs::remove_file(&db);
 }
@@ -6293,8 +6552,8 @@ fn test_enforce_owner_blocks_non_owner_delete() {
         &serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let store = cmd(bin)
-        .args([
+    let store = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6309,24 +6568,24 @@ fn test_enforce_owner_blocks_non_owner_delete() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_blocks_delete store",
+    );
     let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let del = cmd(bin)
-        .args([
+    let del = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
             "bob",
             "delete",
             &id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_blocks_delete delete",
+    );
     assert!(!del.status.success());
     let err = String::from_utf8_lossy(&del.stderr);
     assert!(err.contains("not the owner"), "got: {err}");
@@ -6344,8 +6603,8 @@ fn test_enforce_owner_allows_self_delete() {
         &serde_json::json!({"write":"any","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let store = cmd(bin)
-        .args([
+    let store = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6360,24 +6619,24 @@ fn test_enforce_owner_allows_self_delete() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_allows_self_delete store",
+    );
     let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let del = cmd(bin)
-        .args([
+    let del = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
             "alice",
             "delete",
             &id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "owner_allows_self_delete delete",
+    );
     assert!(del.status.success());
     let _ = std::fs::remove_file(&db);
 }
@@ -6393,8 +6652,8 @@ fn test_enforce_approve_queues_pending() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6409,9 +6668,9 @@ fn test_enforce_approve_queues_pending() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "approve_queues_pending store",
+    );
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["status"], "pending");
@@ -6430,8 +6689,8 @@ fn test_enforce_pending_list_and_approve() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let queued = cmd(bin)
-        .args([
+    let queued = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6446,25 +6705,25 @@ fn test_enforce_pending_list_and_approve() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_list_and_approve store",
+    );
     let pending_id =
         serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-    let list = cmd(bin)
-        .args(["--db", db.to_str().unwrap(), "--json", "pending", "list"])
-        .output()
-        .unwrap();
+    let list = output_bounded(
+        cmd(bin).args(["--db", db.to_str().unwrap(), "--json", "pending", "list"]),
+        "pending_list_and_approve list",
+    );
     assert!(list.status.success());
     let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(lv["count"], 1);
 
-    let ap = cmd(bin)
-        .args([
+    let ap = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6473,16 +6732,16 @@ fn test_enforce_pending_list_and_approve() {
             "pending",
             "approve",
             &pending_id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_list_and_approve approve",
+    );
     assert!(ap.status.success());
     let av: serde_json::Value = serde_json::from_slice(&ap.stdout).unwrap();
     assert_eq!(av["approved"], true);
     assert_eq!(av["decided_by"], "approver");
 
-    let ap2 = cmd(bin)
-        .args([
+    let ap2 = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6490,9 +6749,9 @@ fn test_enforce_pending_list_and_approve() {
             "pending",
             "approve",
             &pending_id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_list_and_approve double-approve",
+    );
     assert!(!ap2.status.success());
     let _ = std::fs::remove_file(&db);
 }
@@ -6508,8 +6767,8 @@ fn test_enforce_pending_reject_status() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let queued = cmd(bin)
-        .args([
+    let queued = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6524,17 +6783,17 @@ fn test_enforce_pending_reject_status() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_reject_status store",
+    );
     let pending_id =
         serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-    let rj = cmd(bin)
-        .args([
+    let rj = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6543,15 +6802,15 @@ fn test_enforce_pending_reject_status() {
             "pending",
             "reject",
             &pending_id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_reject_status reject",
+    );
     assert!(rj.status.success());
     let rv: serde_json::Value = serde_json::from_slice(&rj.stdout).unwrap();
     assert_eq!(rv["rejected"], true);
 
-    let list = cmd(bin)
-        .args([
+    let list = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--json",
@@ -6559,9 +6818,9 @@ fn test_enforce_pending_reject_status() {
             "list",
             "--status",
             "rejected",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "pending_reject_status list",
+    );
     let lv: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(lv["count"], 1);
     let _ = std::fs::remove_file(&db);
@@ -6572,8 +6831,8 @@ fn test_enforce_unset_falls_back_to_default_policy() {
     // Default: { write: Any, promote: Any, delete: Owner, approver: Human }
     let db = fresh_enforce_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let out = cmd(bin)
-        .args([
+    let out = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6588,9 +6847,9 @@ fn test_enforce_unset_falls_back_to_default_policy() {
             "hi",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "unset_falls_back_to_default_policy store",
+    );
     assert!(out.status.success(), "default write policy is Any");
     let _ = std::fs::remove_file(&db);
 }
@@ -6606,8 +6865,8 @@ fn test_enforce_promote_with_approve_policy() {
         &serde_json::json!({"write":"any","promote":"approve","delete":"any","approver":"human"}),
         "owner",
     );
-    let store = cmd(bin)
-        .args([
+    let store = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6622,15 +6881,15 @@ fn test_enforce_promote_with_approve_policy() {
             "hi",
             "-t",
             "mid",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "promote_with_approve_policy store",
+    );
     let id = serde_json::from_slice::<serde_json::Value>(&store.stdout).unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let pr = cmd(bin)
-        .args([
+    let pr = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6638,9 +6897,9 @@ fn test_enforce_promote_with_approve_policy() {
             "--json",
             "promote",
             &id,
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "promote_with_approve_policy promote",
+    );
     assert!(pr.status.success());
     let v: serde_json::Value = serde_json::from_slice(&pr.stdout).unwrap();
     assert_eq!(v["status"], "pending");
@@ -6650,8 +6909,6 @@ fn test_enforce_promote_with_approve_policy() {
 
 #[test]
 fn test_enforce_mcp_pending_tools() {
-    use std::io::Write;
-
     let db = fresh_enforce_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     set_governance(
@@ -6661,8 +6918,8 @@ fn test_enforce_mcp_pending_tools() {
         &serde_json::json!({"write":"approve","promote":"any","delete":"owner","approver":"human"}),
         "owner",
     );
-    let queued = cmd(bin)
-        .args([
+    let queued = output_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "--agent-id",
@@ -6677,17 +6934,31 @@ fn test_enforce_mcp_pending_tools() {
             "x",
             "-t",
             "long",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        "mcp_pending_tools store",
+    );
     let pending_id =
         serde_json::from_slice::<serde_json::Value>(&queued.stdout).unwrap()["pending_id"]
             .as_str()
             .unwrap()
             .to_string();
 
-    let mut child = cmd(bin)
-        .args([
+    let requests = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+            .to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_pending_list","arguments":{}}
+        })
+        .to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_pending_approve","arguments":{"id": pending_id, "agent_id": "approver-mcp"}}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "mcp",
@@ -6695,36 +6966,10 @@ fn test_enforce_mcp_pending_tools() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_pending_list","arguments":{}}
-        })
-    )
-    .unwrap();
-    writeln!(stdin, "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"memory_pending_approve","arguments":{"id": pending_id, "agent_id": "approver-mcp"}}
-        })).unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "mcp_pending_tools mcp",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
 
@@ -7568,17 +7813,44 @@ fn test_budget_mcp_tool_schema_and_response() {
         .iter()
         .find(|t| t["name"] == "memory_recall")
         .unwrap();
-    // v0.7 C4 — `budget_tokens` is an OPTIONAL param and is hidden
-    // from the default `tools/list` payload (verbose=false). The
-    // contract changed from "must be advertised" to "must NOT be
-    // advertised by default; runtime call still works". Verbose
-    // discovery is exercised below via memory_capabilities.
+    // v0.7 C4 + #859 — `budget_tokens` is an OPTIONAL param. **Pre-#859**
+    // the C4 trim dropped every optional from the default `tools/list`
+    // payload, hiding the call surface from MCP clients. **Post-#859**
+    // every property entry is preserved on the wire (with per-property
+    // `description` prose stripped) so NHI agents can DISCOVER the
+    // call surface from `tools/list` directly. The runtime call still
+    // works either way — this assertion just pins the wire shape.
+    let recall_props = recall_tool["inputSchema"]["properties"]
+        .as_object()
+        .expect("memory_recall must declare properties");
     assert!(
-        recall_tool["inputSchema"]["properties"]
-            .get("budget_tokens")
-            .is_none(),
-        "v0.7 C4: memory_recall must NOT advertise optional `budget_tokens` in the \
-         default tools/list payload. Pass verbose=true to memory_capabilities to opt in."
+        recall_props.contains_key("budget_tokens"),
+        "#859: memory_recall.inputSchema.properties must expose `budget_tokens` \
+         on the default tools/list payload for client-side discovery."
+    );
+    // Per-property prose is stripped on the wire (verbose path keeps it).
+    let budget_tokens = recall_props
+        .get("budget_tokens")
+        .and_then(serde_json::Value::as_object)
+        .unwrap();
+    assert!(
+        !budget_tokens.contains_key("description"),
+        "#859: per-property `description` prose must be stripped on the wire"
+    );
+    // Structural metadata stays so clients can construct valid args.
+    // **v0.7.0 #987 update.** D1.6 schemars derives Option<i64> as
+    // `type: ["integer","null"]` (no longer a bare "integer" string).
+    // Accept either legacy bare-type OR the schemars nullable array.
+    let type_field = budget_tokens
+        .get("type")
+        .expect("budget_tokens must have `type`");
+    let is_integer = type_field == "integer"
+        || type_field
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "integer"));
+    assert!(
+        is_integer,
+        "budget_tokens must be integer (legacy bare or schemars [\"integer\",\"null\"]); got {type_field}"
     );
     // The required param `context` survives the trim.
     assert!(
@@ -8032,17 +8304,16 @@ fn test_cli_sync_dry_run_writes_nothing() {
 // within a couple of daemon cycles, no cloud, no login, no manual sync.
 // ---------------------------------------------------------------------------
 
-/// Find a free localhost TCP port by binding to :0 and dropping.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
-}
-
-/// Wait for the `/api/v1/health` endpoint to respond 200 — up to ~5s.
+/// Wait for the `/api/v1/health` endpoint to respond 200 — up to ~10s.
+///
+/// Extended from 5s to 10s in the v0.7.0 v0.7.1-fold (2026-05-13) after
+/// the §16 12-gate sweep and L1 wave coordinator both observed
+/// `http_notify_fans_out_to_peers_so_target_inbox_sees_it` flaking on
+/// "leader serve never came up" under high parallel test load. Combined
+/// with `spawn_leader`'s bind-retry the cross-binary readiness race
+/// becomes recoverable rather than fatal.
 fn wait_for_health(port: u16) -> bool {
-    for _ in 0..50 {
+    for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Ok(out) = std::process::Command::new("curl")
             .args([
@@ -8103,6 +8374,14 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     );
 
     // 2. Seed memory into db_B via HTTP.
+    //
+    // #976 (2026-05-20) — post-#948 the federation `/sync/since`
+    // endpoint applies the SAL visibility filter: scope=private rows
+    // are only visible to their owner / inbox target. The mesh test
+    // exercises cross-peer propagation of a SHARED row, so the seed
+    // must mark `scope=collective` in metadata. Pre-#976 the seed
+    // defaulted to scope=private and post-#948 the sync-daemon
+    // received `count=0` every cycle, never meshing the memory.
     let seed_body = serde_json::json!({
         "tier": "long",
         "namespace": "mesh-demo",
@@ -8112,7 +8391,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
         "priority": 7,
         "confidence": 1.0,
         "source": "api",
-        "metadata": {},
+        "metadata": {"scope": "collective"},
     });
     let seed_out = std::process::Command::new("curl")
         .args([
@@ -8301,16 +8580,25 @@ fn build_mtls_probe_client(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> reqwest::blocking::Client {
-    // Transitive deps pull reqwest's native-tls backend via hf-hub's
-    // default-tls feature, so the test uses `from_pkcs8_pem` (native-tls
-    // variant) for maximum cross-platform consistency. The daemon in
-    // production goes through `use_preconfigured_tls` with a rustls
-    // ClientConfig (see src/main.rs).
+    // M5 (2026-05-11): reqwest's native-tls feature was removed from
+    // [dependencies] in favor of rustls-tls only (dropped dual-TLS-stack
+    // attack surface). `from_pkcs8_pem` is native-tls-only — switched to
+    // `from_pem` which is rustls-compatible and takes cert + key concatenated.
     let cert = std::fs::read(cert_path).expect("read client cert");
     let key = std::fs::read(key_path).expect("read client key");
+    let mut pem = Vec::with_capacity(cert.len() + key.len() + 1);
+    pem.extend_from_slice(&cert);
+    if !cert.ends_with(b"\n") {
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(&key);
     let identity =
-        reqwest::Identity::from_pkcs8_pem(&cert, &key).expect("parse mTLS identity (PKCS#8 PEM)");
+        reqwest::Identity::from_pem(&pem).expect("parse mTLS identity (concatenated PEM)");
+    // M5: explicit rustls backend (the only one we link now that native-tls
+    // was dropped). Without this the Identity-vs-backend type check fails
+    // with "incompatible TLS identity type" on some platforms.
     reqwest::blocking::Client::builder()
+        .use_rustls_tls()
         .identity(identity)
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
@@ -8440,6 +8728,13 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     assert!(ready, "mTLS serve never accepted peer A's cert for health");
 
     // Seed a memory via mTLS POST.
+    //
+    // #976 (2026-05-20) — post-#948 `/sync/since` applies the SAL
+    // visibility gate; mark `scope=collective` so the federation
+    // pull surfaces this row to peer A (different agent_id than
+    // peer-b). The mTLS layer is orthogonal to the visibility gate —
+    // mTLS authenticates the peer connection; scope governs which
+    // rows that authenticated peer can read.
     let seed = serde_json::json!({
         "tier": "long",
         "namespace": "mtls-demo",
@@ -8449,7 +8744,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         "priority": 7,
         "confidence": 1.0,
         "source": "api",
-        "metadata": {},
+        "metadata": {"scope": "collective"},
     });
     let seed_resp = client_a
         .post(format!("https://127.0.0.1:{port_b}/api/v1/memories"))
@@ -8664,6 +8959,53 @@ fn curl_get(port: u16, path: &str) -> (String, serde_json::Value) {
     (code.trim().to_string(), v)
 }
 
+/// #910 SAL-level — same shape as `curl_get` but threads `X-Agent-Id`
+/// so the request lands at the SAL with a stable principal. Use this
+/// for any test that creates rows via `curl_post(.., Some(agent))`
+/// and reads them back — the round-trip needs a matching principal
+/// so the scope=private filter doesn't drop the rows.
+fn curl_get_as(port: u16, path: &str, agent_id: &str) -> (String, serde_json::Value) {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "-H",
+            &format!("x-agent-id: {agent_id}"),
+            &format!("http://127.0.0.1:{port}{path}"),
+        ])
+        .output()
+        .unwrap();
+    let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (body, code) = raw.rsplit_once('\n').unwrap_or(("", ""));
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    (code.trim().to_string(), v)
+}
+
+/// #998 — admin-flavored shortcut over [`curl_get_as`]. Threads the
+/// [`INTEGRATION_TEST_ADMIN`] id so the spawned daemon's admin allowlist
+/// (seeded by [`cmd`]) admits the call. Use on any GET that hits an
+/// admin-gated endpoint (`/api/v1/stats`, `/api/v1/archive*`,
+/// `/api/v1/pending`, `/api/v1/agents`, `/api/v1/taxonomy`,
+/// `/api/v1/namespaces`, `/api/v1/quota/status` list path, etc.).
+fn curl_get_as_admin(port: u16, path: &str) -> (String, serde_json::Value) {
+    curl_get_as(port, path, INTEGRATION_TEST_ADMIN)
+}
+
+/// #998 — admin-flavored shortcut over [`curl_post`]. Threads
+/// [`INTEGRATION_TEST_ADMIN`] for admin-gated POSTs
+/// (`/api/v1/import`, etc.). Kept as a forward-looking helper alongside
+/// [`curl_get_as_admin`]; today's callers all go through the in-process
+/// `route_*` path.
+#[allow(dead_code)]
+fn curl_post_as_admin(
+    port: u16,
+    path: &str,
+    body: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    curl_post(port, path, body, Some(INTEGRATION_TEST_ADMIN))
+}
+
 fn curl_post(
     port: u16,
     path: &str,
@@ -8750,6 +9092,24 @@ struct OneshotDaemon {
     router: axum::Router,
 }
 
+/// v0.7.0 #238/#239 — set the federation legacy-bypass env vars
+/// once per test process so the integration suite's in-process and
+/// subprocess daemon spawns see the pre-v0.7.0 posture. The
+/// per-issue regression tests at `tests/g_issue_238_*` and
+/// `tests/g_issue_239_*` run in their own test binaries (no env
+/// contamination there) and exercise the default-enforce posture.
+static FED_LEGACY_BYPASS_INIT: std::sync::Once = std::sync::Once::new();
+fn install_federation_legacy_bypass() {
+    FED_LEGACY_BYPASS_INIT.call_once(|| {
+        // SAFETY: serial-by-Once init; the env vars are read by
+        // handler code only (no concurrent writer).
+        unsafe {
+            std::env::set_var("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
+            std::env::set_var("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
+        }
+    });
+}
+
 impl OneshotDaemon {
     fn new() -> Self {
         Self::with_federation(None)
@@ -8761,6 +9121,12 @@ impl OneshotDaemon {
     /// against in-process mock peers (see `spawn_inproc_mock_peer`).
     #[allow(dead_code)]
     fn with_federation(federation: Option<ai_memory::federation::FederationConfig>) -> Self {
+        // #1570 — these tests model an AUTHENTICATED deployment (api_key
+        // configured at boot), the pre-#1570 implicit posture, so the admin
+        // header role-claims they assert keep working. The #1570 secure
+        // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
+        // is pinned by tests/admin_header_trust_1570.rs in its own process.
+        ai_memory::handlers::admin_role::mark_request_authn_configured(true);
         // v0.7.0 H11 (#628 blocker) — webhook-subscriber tests POST
         // loopback URLs (`http://localhost/...`, `127.0.0.1:0`) into
         // `/api/v1/subscriptions`. The H11 SSRF guard rejects loopback
@@ -8769,6 +9135,7 @@ impl OneshotDaemon {
         // tests in `cmd()`) so the production happy path is exercised
         // without permanently relaxing the production default.
         ai_memory::config::set_allow_loopback_webhooks(true);
+        install_federation_legacy_bypass();
         let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
         let path = std::path::PathBuf::from(":memory:");
         let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
@@ -8777,6 +9144,15 @@ impl OneshotDaemon {
             ai_memory::config::ResolvedTtl::default(),
             true,
         )));
+        #[cfg(feature = "sal")]
+        let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+            let p = tmp.path().to_path_buf();
+            std::mem::forget(tmp);
+            std::sync::Arc::new(
+                ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
+            )
+        };
         let app_state = ai_memory::handlers::AppState {
             db,
             embedder: std::sync::Arc::new(None),
@@ -8788,8 +9164,47 @@ impl OneshotDaemon {
             mcp_config: std::sync::Arc::new(None),
             active_keypair: std::sync::Arc::new(None),
             family_embeddings: std::sync::Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+            storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+            #[cfg(feature = "sal")]
+            store,
+            llm: std::sync::Arc::new(None),
+            auto_tag_model: std::sync::Arc::new(None),
+            llm_call_timeout: std::time::Duration::from_secs(30),
+            replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+            verify_require_nonce: false,
+            federation_nonce_cache: std::sync::Arc::new(
+                ai_memory::identity::replay::FederationNonceCache::default(),
+            ),
+            autonomous_hooks: false,
+            recall_scope: std::sync::Arc::new(None),
+            deferred_audit_queue: std::sync::Arc::new(None),
+            // #976 (2026-05-20) — every admin-gated endpoint
+            // (`/api/v1/import`, `/api/v1/export`, `/api/v1/archive*`,
+            // `/api/v1/forget`, `/api/v1/skills/*`, sync push/since,
+            // pending governance flows) requires the test caller to be
+            // in the admin allowlist.
+            //
+            // #998 (2026-05-21) — the original #976 fix used the `"*"`
+            // wildcard, but #980 closed the wildcard arm in
+            // `is_admin_caller` to a `#[cfg(test)]`-only path. The lib
+            // crate (where `is_admin_caller` lives) is compiled WITHOUT
+            // `cfg(test)` when the integration-test crate links against
+            // it, so the wildcard arm is dead code on this path. Use a
+            // concrete id (`INTEGRATION_TEST_ADMIN`) and thread it
+            // through admin-gated GETs via `route_get_as_admin` /
+            // `curl_get_as_admin`. Negative-admin tests build their own
+            // AppState with a restricted allowlist.
+            admin_agent_ids: std::sync::Arc::new(vec![INTEGRATION_TEST_ADMIN.to_string()]),
+            rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+            resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+            runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+            max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         };
-        let api_key_state = ai_memory::handlers::ApiKeyState { key: None };
+        let api_key_state = ai_memory::handlers::ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+        };
         let router = ai_memory::build_router(api_key_state, app_state);
         Self { router }
     }
@@ -8842,6 +9257,26 @@ async fn route_get_with_agent(
 ) -> (String, serde_json::Value) {
     let (status, body) = d.request("GET", path, None, Some(agent_id)).await;
     (status.as_u16().to_string(), body)
+}
+
+/// #998 — admin-flavored shortcut over [`route_get_with_agent`]. Threads
+/// [`INTEGRATION_TEST_ADMIN`] so the in-process daemon's admin
+/// allowlist admits the call.
+#[allow(dead_code)]
+async fn route_get_as_admin(d: &OneshotDaemon, path: &str) -> (String, serde_json::Value) {
+    route_get_with_agent(d, path, INTEGRATION_TEST_ADMIN).await
+}
+
+/// #998 — admin-flavored shortcut over [`route_post`]. Threads
+/// [`INTEGRATION_TEST_ADMIN`] so admin-gated POSTs (e.g. `/api/v1/import`)
+/// land on the admin happy path.
+#[allow(dead_code)]
+async fn route_post_as_admin(
+    d: &OneshotDaemon,
+    path: &str,
+    body: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    route_post(d, path, body, Some(INTEGRATION_TEST_ADMIN)).await
 }
 
 #[allow(dead_code)]
@@ -8935,6 +9370,10 @@ impl DaemonGuard {
         let dir = std::env::temp_dir();
         let db = dir.join(format!("ai-memory-http-parity-{}.db", uuid::Uuid::new_v4()));
         let port = free_port();
+        // `cmd()` already injects `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`
+        // and `AI_MEMORY_FED_SYNC_TRUST_PEER=1` so the legacy posture
+        // applies to /sync/push and /sync/since here too. See `cmd()`
+        // for the per-test rationale.
         let child = cmd(bin)
             .args([
                 "--db",
@@ -9009,7 +9448,12 @@ async fn http_notify_and_inbox_round_trip() {
     .await;
     assert_eq!(code, "201");
 
-    let (code, body) = route_get(&d, "/api/v1/inbox?agent_id=ai:bob&limit=50").await;
+    // #910 SAL — bob reads his own inbox. The handler now requires
+    // X-Agent-Id to match the ?agent_id= owner per #901; the SAL
+    // visibility filter recognises bob as the inbox owner via
+    // `metadata.target_agent_id`.
+    let (code, body) =
+        route_get_with_agent(&d, "/api/v1/inbox?agent_id=ai:bob&limit=50", "ai:bob").await;
     assert_eq!(code, "200");
     let messages = body["messages"].as_array().expect("messages array");
     assert!(
@@ -9020,7 +9464,12 @@ async fn http_notify_and_inbox_round_trip() {
     );
 
     // charlie must NOT see bob's notification.
-    let (_code, body2) = route_get(&d, "/api/v1/inbox?agent_id=ai:charlie&limit=50").await;
+    let (_code, body2) = route_get_with_agent(
+        &d,
+        "/api/v1/inbox?agent_id=ai:charlie&limit=50",
+        "ai:charlie",
+    )
+    .await;
     let messages2 = body2["messages"].as_array().cloned().unwrap_or_default();
     assert!(
         !messages2
@@ -9065,8 +9514,10 @@ fn http_inbox_cross_source_agent_id_body_vs_query_vs_header() {
         Some("ai:alice"),
     );
 
-    // Query string path.
-    let (code_q, body_q) = curl_get(d.port, "/api/v1/inbox?agent_id=ai:bob&limit=5");
+    // Query string path. #901 requires the X-Agent-Id header to
+    // match the ?agent_id= query owner; #910 SAL needs the same
+    // principal so the inbox filter sees bob's `target_agent_id`.
+    let (code_q, body_q) = curl_get_as(d.port, "/api/v1/inbox?agent_id=ai:bob&limit=5", "ai:bob");
     assert_eq!(code_q, "200");
     assert_eq!(body_q["agent_id"], "ai:bob", "query-string owner mismatch");
 
@@ -9102,16 +9553,19 @@ async fn http_subscriptions_s33_shape_round_trip() {
         "scenario33-pubsub-{}",
         &uuid::Uuid::new_v4().to_string()[..6]
     );
+    // R3-S1.HMAC (2026-05-13): subscribe requires per-sub or
+    // server-wide HMAC secret. Supply a per-sub `secret` field.
     let (code, _body) = route_post(
         &d,
         "/api/v1/subscriptions",
-        &serde_json::json!({"agent_id": "ai:bob", "namespace": ns}),
+        &serde_json::json!({"agent_id": "ai:bob", "namespace": ns, "secret": "integration-test-secret"}),
         Some("ai:bob"),
     )
     .await;
     assert!(code == "201" || code == "200", "subscribe code={code}");
 
-    let (code_g, body_g) = route_get(&d, "/api/v1/subscriptions?agent_id=ai:bob").await;
+    let (code_g, body_g) =
+        route_get_with_agent(&d, "/api/v1/subscriptions?agent_id=ai:bob", "ai:bob").await;
     assert_eq!(code_g, "200");
     let rows = body_g["subscriptions"]
         .as_array()
@@ -9132,7 +9586,8 @@ async fn http_subscriptions_s33_shape_round_trip() {
         "delete code={del_code}"
     );
 
-    let (_code_g2, body_g2) = route_get(&d, "/api/v1/subscriptions?agent_id=ai:bob").await;
+    let (_code_g2, body_g2) =
+        route_get_with_agent(&d, "/api/v1/subscriptions?agent_id=ai:bob", "ai:bob").await;
     let rows_after = body_g2["subscriptions"]
         .as_array()
         .cloned()
@@ -9331,7 +9786,10 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
     assert_eq!(code, "404", "archived memory must no longer be active");
 
     // Archive list contains the entry with the supplied reason.
-    let (code, listing) = curl_get(d.port, "/api/v1/archive?namespace=s29-e2e");
+    // #998 — /api/v1/archive is admin-gated per #943; thread the
+    // INTEGRATION_TEST_ADMIN id so the empty-allowlist no-op'd post-#980
+    // doesn't 403.
+    let (code, listing) = curl_get_as_admin(d.port, "/api/v1/archive?namespace=s29-e2e");
     assert_eq!(code, "200");
     let items = listing["archived"].as_array().unwrap();
     assert_eq!(items.len(), 1);
@@ -9367,53 +9825,94 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
 
 /// Spawn a leader serve daemon with `--quorum-writes W --quorum-peers url…`.
 /// Extends `DaemonGuard` without modifying the existing helper.
+///
+/// Retries up to 3 times on "leader never came up" — the only known
+/// failure mode is a cross-binary port grab between `free_port`'s
+/// listener-drop and the child's bind (§16 12-gate sweep + L1 wave
+/// observation, 2026-05-13, v0.7.1-fold). Each retry gets a fresh
+/// port + DB path so a leaked listener from a stuck child can't
+/// chain-fail subsequent attempts.
 fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-http-parity-leader-{}.db",
-        uuid::Uuid::new_v4()
-    ));
-    let port = free_port();
-    let mut args: Vec<String> = vec![
-        "--db".into(),
-        db.to_str().unwrap().into(),
-        "serve".into(),
-        "--port".into(),
-        port.to_string(),
-    ];
-    if quorum_writes > 0 && !peer_urls.is_empty() {
-        args.push("--quorum-writes".into());
-        args.push(quorum_writes.to_string());
-        args.push("--quorum-peers".into());
-        args.push(peer_urls.join(","));
-        // 15s ack window keeps tests green under parallel `cargo test`
-        // load (SQLite Mutex contention on peer serialises incoming
-        // sync_push POSTs under a burst).
-        args.push("--quorum-timeout-ms".into());
-        args.push("15000".into());
+    for attempt in 1..=3u8 {
+        let dir = std::env::temp_dir();
+        let db = dir.join(format!(
+            "ai-memory-http-parity-leader-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let port = free_port();
+        let mut args: Vec<String> = vec![
+            "--db".into(),
+            db.to_str().unwrap().into(),
+            "serve".into(),
+            "--port".into(),
+            port.to_string(),
+        ];
+        if quorum_writes > 0 && !peer_urls.is_empty() {
+            args.push("--quorum-writes".into());
+            args.push(quorum_writes.to_string());
+            args.push("--quorum-peers".into());
+            args.push(peer_urls.join(","));
+            // 15s ack window keeps tests green under parallel `cargo test`
+            // load (SQLite Mutex contention on peer serialises incoming
+            // sync_push POSTs under a burst).
+            args.push("--quorum-timeout-ms".into());
+            args.push("15000".into());
+        }
+        let mut child = cmd(bin)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        if wait_for_health(port) {
+            return DaemonGuard { child, port, db };
+        }
+        // Kill the stuck child and try again. The most common cause is a
+        // cross-binary port grab between free_port and the child's bind.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&db);
+        eprintln!(
+            "spawn_leader attempt {attempt}/3 failed on port {port}; retrying with fresh port"
+        );
     }
-    let child = cmd(bin)
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    assert!(wait_for_health(port), "leader serve never came up");
-    DaemonGuard { child, port, db }
+    panic!("leader serve never came up after 3 attempts");
 }
 
 /// Poll GET `/api/v1/memories` on `peer_port` filtered by `namespace`
 /// until `expected` rows appear OR the deadline lapses. Returns observed
 /// count.
+#[allow(dead_code)] // anonymous fallback retained for tests that don't write
 fn wait_for_peer_rows(peer_port: u16, namespace: &str, expected: usize, timeout_ms: u64) -> usize {
+    wait_for_peer_rows_as(peer_port, namespace, expected, timeout_ms, None)
+}
+
+/// #910 SAL-level variant — pass the caller principal so the
+/// `list_memories` handler resolves a known agent and the SAL
+/// visibility filter doesn't drop rows authored by the same id.
+/// Caller `None` is anonymous (sees only scope=collective rows).
+fn wait_for_peer_rows_as(
+    peer_port: u16,
+    namespace: &str,
+    expected: usize,
+    timeout_ms: u64,
+    caller: Option<&str>,
+) -> usize {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut seen = 0;
     while std::time::Instant::now() < deadline {
-        let (code, body) = curl_get(
-            peer_port,
-            &format!("/api/v1/memories?namespace={namespace}&limit=200"),
-        );
+        let (code, body) = match caller {
+            Some(c) => curl_get_as(
+                peer_port,
+                &format!("/api/v1/memories?namespace={namespace}&limit=200"),
+                c,
+            ),
+            None => curl_get(
+                peer_port,
+                &format!("/api/v1/memories?namespace={namespace}&limit=200"),
+            ),
+        };
         if code == "200"
             && let Some(arr) = body["memories"].as_array()
         {
@@ -9495,7 +9994,8 @@ fn http_bulk_create_fans_out_concurrently() {
     // Give the peer generous slack under parallel-test load (20s) — a
     // regression to sequential fanout would stall far beyond this on
     // realistic scenario burst sizes.
-    let seen = wait_for_peer_rows(peer.port, "s40-fanout", n, 20_000);
+    // #910 SAL — read as the same principal that wrote.
+    let seen = wait_for_peer_rows_as(peer.port, "s40-fanout", n, 20_000, Some("ai:s40"));
     assert_eq!(seen, n, "peer missed rows: saw {seen}/{n}");
     // Sanity: the leader call itself should return in well under a full
     // n×quorum-window. Concurrent-bounded fanout completes ≪ sequential
@@ -9539,10 +10039,12 @@ fn http_notify_fans_out_to_peers_so_target_inbox_sees_it() {
 
     // Poll peer's /api/v1/inbox?agent_id=bob until we see the message or
     // timeout. 10s is generous; concurrent fanout normally completes <1s.
+    // #910 SAL — read the inbox AS bob so the visibility filter
+    // recognises the target_agent_id stamp.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut found = false;
     while std::time::Instant::now() < deadline {
-        let (code, body) = curl_get(peer.port, "/api/v1/inbox?agent_id=bob");
+        let (code, body) = curl_get_as(peer.port, "/api/v1/inbox?agent_id=bob", "bob");
         if code == "200"
             && let Some(msgs) = body["messages"].as_array()
             && msgs.iter().any(|m| m["title"] == "S32 hello")
@@ -9615,7 +10117,18 @@ fn http_sync_push_applies_restores() {
     assert_eq!(resp["restored"].as_u64().unwrap_or(0), 1);
 
     // 4. Active GET succeeds again.
-    let (code, body) = curl_get(peer.port, &format!("/api/v1/memories/{id}"));
+    // #927 (Track A P4, 2026-05-20) extended scope=private filter to
+    // the sqlite GET-by-id path; use `curl_get_as` with the row's
+    // recorded owner principal so the gate admits the read. The
+    // restored row retains its original `metadata.agent_id =
+    // "ai:restore-sync"` (provenance immutability — preserved across
+    // archive + federation restore), NOT the sync sender's id.
+    // Pre-#927 the bare `curl_get` worked because GET was unfiltered.
+    let (code, body) = curl_get_as(
+        peer.port,
+        &format!("/api/v1/memories/{id}"),
+        "ai:restore-sync",
+    );
     assert_eq!(code, "200", "restored row must be live again: {body}");
 }
 
@@ -9651,7 +10164,7 @@ fn http_archive_restore_fans_out() {
 
     // Let the fanout settle.
     assert!(
-        wait_for_peer_rows(peer.port, "s29-restore", 1, 10_000) >= 1,
+        wait_for_peer_rows_as(peer.port, "s29-restore", 1, 10_000, Some("ai:s29")) >= 1,
         "peer never saw initial create"
     );
 
@@ -9665,10 +10178,11 @@ fn http_archive_restore_fans_out() {
     assert_eq!(code, "200");
 
     // Peer should no longer show the row in active.
+    // #910 SAL — read as the same principal that wrote.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut archived_on_peer = false;
     while std::time::Instant::now() < deadline {
-        let (code, _) = curl_get(peer.port, &format!("/api/v1/memories/{id}"));
+        let (code, _) = curl_get_as(peer.port, &format!("/api/v1/memories/{id}"), "ai:s29");
         if code == "404" {
             archived_on_peer = true;
             break;
@@ -9690,7 +10204,7 @@ fn http_archive_restore_fans_out() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut restored_on_peer = false;
     while std::time::Instant::now() < deadline {
-        let (code, _) = curl_get(peer.port, &format!("/api/v1/memories/{id}"));
+        let (code, _) = curl_get_as(peer.port, &format!("/api/v1/memories/{id}"), "ai:s29");
         if code == "200" {
             restored_on_peer = true;
             break;
@@ -9791,7 +10305,14 @@ fn http_list_memories_cap_raised_to_max_bulk_size() {
     assert_eq!(code, "200", "bulk_create: {resp}");
 
     // Explicit limit > 200 must now return all 300 rows.
-    let (code, body) = curl_get(d.port, "/api/v1/memories?namespace=list-cap&limit=500");
+    // #910 — read back as the same principal that wrote so the
+    // SAL-level scope=private filter doesn't drop the (private-by-
+    // default) seed rows.
+    let (code, body) = curl_get_as(
+        d.port,
+        "/api/v1/memories?namespace=list-cap&limit=500",
+        "ai:list-cap",
+    );
     assert_eq!(code, "200", "list_memories: {body}");
     let mems = body["memories"].as_array().expect("memories array");
     assert_eq!(
@@ -9804,7 +10325,11 @@ fn http_list_memories_cap_raised_to_max_bulk_size() {
     // limit=1000 is still the ceiling — a request for 2000 clamps to 1000.
     // We already have 300 rows, so asking for 2000 returns 300 (not capped
     // by the ceiling but proves the request parses + executes).
-    let (code, body) = curl_get(d.port, "/api/v1/memories?namespace=list-cap&limit=2000");
+    let (code, body) = curl_get_as(
+        d.port,
+        "/api/v1/memories?namespace=list-cap&limit=2000",
+        "ai:list-cap",
+    );
     assert_eq!(code, "200");
     let mems = body["memories"].as_array().expect("memories array");
     assert_eq!(mems.len(), n);
@@ -9842,7 +10367,7 @@ fn http_sync_push_applies_pendings() {
     assert_eq!(code, "200", "sync_push: {resp}");
     assert_eq!(resp["pendings_applied"].as_u64().unwrap_or(0), 1);
 
-    let (code, list) = curl_get(peer.port, "/api/v1/pending?limit=100");
+    let (code, list) = curl_get_as_admin(peer.port, "/api/v1/pending?limit=100");
     assert_eq!(code, "200", "list_pending: {list}");
     let rows = list["pending"].as_array().expect("pending array");
     assert!(
@@ -9901,7 +10426,7 @@ fn http_sync_push_applies_pending_decisions() {
     assert_eq!(code, "200", "sync_push decisions: {resp}");
     assert_eq!(resp["pending_decisions_applied"].as_u64().unwrap_or(0), 1);
 
-    let (_, list) = curl_get(peer.port, "/api/v1/pending?limit=100");
+    let (_, list) = curl_get_as_admin(peer.port, "/api/v1/pending?limit=100");
     let rows = list["pending"].as_array().expect("pending array");
     let row = rows
         .iter()
@@ -10269,7 +10794,7 @@ fn http_pending_governance_approve_rejects_cross_peer() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut found = false;
     while std::time::Instant::now() < deadline {
-        let (code, body) = curl_get(peer.port, "/api/v1/pending?limit=100");
+        let (code, body) = curl_get_as_admin(peer.port, "/api/v1/pending?limit=100");
         if code == "200"
             && let Some(rows) = body["pending"].as_array()
             && rows.iter().any(|r| r["id"].as_str() == Some(&pending_id))
@@ -10534,6 +11059,10 @@ fn federation_cfg_for_test(
         peers,
         client,
         sender_agent_id: "ai:fed-test".to_string(),
+        api_key: None,
+        signing_key: None,
+        #[cfg(feature = "sal")]
+        dlq_sink: None,
     }
 }
 
@@ -10692,12 +11221,14 @@ async fn test_subscription_webhook_namespace_filter() {
     // Create a namespace filter subscription.
     let filter_ns = "webhook-test-foo";
 
+    // R3-S1.HMAC (2026-05-13): subscribe requires HMAC secret.
     let (code, resp) = route_post(
         &d,
         "/api/v1/subscriptions",
         &serde_json::json!({
             "agent_id": "webhook-receiver",
-            "namespace": filter_ns
+            "namespace": filter_ns,
+            "secret": "integration-test-secret",
         }),
         Some("webhook-receiver"),
     )
@@ -10708,8 +11239,12 @@ async fn test_subscription_webhook_namespace_filter() {
     );
 
     // Immediately verify the subscription was created.
-    let (code_subs, body_subs) =
-        route_get(&d, "/api/v1/subscriptions?agent_id=webhook-receiver").await;
+    let (code_subs, body_subs) = route_get_with_agent(
+        &d,
+        "/api/v1/subscriptions?agent_id=webhook-receiver",
+        "webhook-receiver",
+    )
+    .await;
     assert_eq!(code_subs, "200");
     let subs = body_subs["subscriptions"]
         .as_array()
@@ -10766,8 +11301,12 @@ async fn test_subscription_webhook_namespace_filter() {
     assert_eq!(code_other_ns, "201", "store non-matching memory");
 
     // Verify the subscription is still active after storing memories.
-    let (code_subs_final, body_subs_final) =
-        route_get(&d, "/api/v1/subscriptions?agent_id=webhook-receiver").await;
+    let (code_subs_final, body_subs_final) = route_get_with_agent(
+        &d,
+        "/api/v1/subscriptions?agent_id=webhook-receiver",
+        "webhook-receiver",
+    )
+    .await;
     assert_eq!(code_subs_final, "200");
     let subs_final = body_subs_final["subscriptions"]
         .as_array()
@@ -10902,7 +11441,7 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/stats — GET, must return 200 with stats object
     {
-        let (code, body) = route_get(&d, "/api/v1/stats").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/stats").await;
         assert_eq!(code, "200", "stats: {body}");
         assert!(body.get("total").is_some(), "stats.total: {body}");
         assert!(
@@ -10911,9 +11450,12 @@ async fn http_smoke_matrix_phases_1_3() {
         );
     }
 
-    // /api/v1/gc — POST, must return 200 with gc result
+    // /api/v1/gc — POST, must return 200 with gc result.
+    // #1027 (2026-05-21): the route is now admin-gated via
+    // require_admin; anonymous callers correctly receive 403. The
+    // test must call as an admin to exercise the success path.
     {
-        let (code, body) = route_post(&d, "/api/v1/gc", &serde_json::json!({}), None).await;
+        let (code, body) = route_post_as_admin(&d, "/api/v1/gc", &serde_json::json!({})).await;
         assert_eq!(code, "200", "gc: {body}");
         assert!(
             body.get("expired_deleted").is_some(),
@@ -10923,7 +11465,7 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/archive/stats — GET, must return 200 with archive stats
     {
-        let (code, body) = route_get(&d, "/api/v1/archive/stats").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/archive/stats").await;
         assert_eq!(code, "200", "archive_stats: {body}");
         assert!(
             body.get("archived_total").is_some(),
@@ -10933,28 +11475,28 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/agents — GET, must return 200 with agents list
     {
-        let (code, body) = route_get(&d, "/api/v1/agents").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/agents").await;
         assert_eq!(code, "200", "agents: {body}");
         assert!(body.get("agents").is_some(), "agents.agents: {body}");
     }
 
     // /api/v1/pending — GET, must return 200 with pending list
     {
-        let (code, body) = route_get(&d, "/api/v1/pending").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/pending").await;
         assert_eq!(code, "200", "pending: {body}");
         assert!(body.get("pending").is_some(), "pending.pending: {body}");
     }
 
     // /api/v1/inbox — GET, must return 200 with inbox list
     {
-        let (code, body) = route_get(&d, "/api/v1/inbox").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/inbox").await;
         assert_eq!(code, "200", "inbox: {body}");
         assert!(body.get("messages").is_some(), "inbox.messages: {body}");
     }
 
     // /api/v1/capabilities — GET, must return 200 with capabilities object
     {
-        let (code, body) = route_get(&d, "/api/v1/capabilities").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/capabilities").await;
         assert_eq!(code, "200", "capabilities: {body}");
         assert!(body.get("tier").is_some(), "capabilities.tier: {body}");
         assert!(
@@ -10982,19 +11524,19 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // /api/v1/namespaces — GET (query-string form)
     {
-        let (code, _body) = route_get(&d, "/api/v1/namespaces?namespace=test").await;
+        let (code, _body) = route_get_as_admin(&d, "/api/v1/namespaces?namespace=test").await;
         assert!(code == "200" || code == "404", "namespaces GET");
     }
 
     // /api/v1/namespaces/{ns}/standard — GET (path form)
     {
-        let (code, _body) = route_get(&d, "/api/v1/namespaces/test-smoke/standard").await;
+        let (code, _body) = route_get_as_admin(&d, "/api/v1/namespaces/test-smoke/standard").await;
         assert!(code == "200" || code == "404", "namespaces path form GET");
     }
 
     // /api/v1/taxonomy — GET
     {
-        let (code, body) = route_get(&d, "/api/v1/taxonomy").await;
+        let (code, body) = route_get_as_admin(&d, "/api/v1/taxonomy").await;
         assert_eq!(code, "200", "taxonomy: {body}");
     }
 
@@ -11043,7 +11585,19 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // GET /api/v1/memories/{id} — get_memory, must return 200
     {
-        let (code, body) = route_get(&d, &format!("/api/v1/memories/{memory_id}")).await;
+        // #927 (Track A P4, 2026-05-20) extended the scope=private
+        // visibility filter to the sqlite GET-by-id path. The default
+        // `route_get` doesn't set X-Agent-Id so the read gets a
+        // unique `anonymous:req-<uuid>` principal that doesn't match
+        // the row owner ("ai:smoke-agent" from the POST above). Use
+        // the explicit-principal variant so reader == writer
+        // principal and the gate admits the read.
+        let (code, body) = route_get_with_agent(
+            &d,
+            &format!("/api/v1/memories/{memory_id}"),
+            "ai:smoke-agent",
+        )
+        .await;
         assert_eq!(code, "200", "get_memory: {body}");
         assert_eq!(
             body["memory"]["id"].as_str(),
@@ -11157,13 +11711,15 @@ async fn http_smoke_matrix_phases_1_3() {
     }
 
     // POST /api/v1/subscriptions — subscribe
+    // R3-S1.HMAC (2026-05-13): supply per-sub secret.
     {
         let (code, body) = route_post(
             &d,
             "/api/v1/subscriptions",
             &serde_json::json!({
                 "url": "https://example.com/webhook",
-                "events": "*"
+                "events": "*",
+                "secret": "smoke-secret",
             }),
             None,
         )
@@ -11178,7 +11734,10 @@ async fn http_smoke_matrix_phases_1_3() {
         }
     }
 
-    // POST /api/v1/pending/{id}/approve — test with nonexistent id (expect 404)
+    // POST /api/v1/pending/{id}/approve — test with nonexistent id.
+    // S5-C1 (2026-05-13): /approve is HMAC-gated; an unsigned request
+    // refuses with 401 (the new correct response). Without HMAC the
+    // endpoint never reaches the row-lookup arm.
     {
         let (code, _body) = route_post(
             &d,
@@ -11187,13 +11746,13 @@ async fn http_smoke_matrix_phases_1_3() {
             None,
         )
         .await;
-        assert!(
-            code == "403" || code == "404",
-            "approve_pending on nonexistent"
+        assert_eq!(
+            code, "401",
+            "approve_pending without HMAC must refuse (S5-C1)"
         );
     }
 
-    // POST /api/v1/pending/{id}/reject — test with nonexistent id (expect 404)
+    // POST /api/v1/pending/{id}/reject — same as above.
     {
         let (code, _body) = route_post(
             &d,
@@ -11202,9 +11761,9 @@ async fn http_smoke_matrix_phases_1_3() {
             None,
         )
         .await;
-        assert!(
-            code == "403" || code == "404",
-            "reject_pending on nonexistent"
+        assert_eq!(
+            code, "401",
+            "reject_pending without HMAC must refuse (S5-C1)"
         );
     }
 }
@@ -11443,7 +12002,7 @@ async fn http_phase4_archive_list() {
     let d = OneshotDaemon::new();
 
     // Test GET /api/v1/archive (list archived)
-    let (code, body) = route_get(&d, "/api/v1/archive").await;
+    let (code, body) = route_get_as_admin(&d, "/api/v1/archive").await;
     assert_eq!(code, "200", "archive list status code: {body}");
     assert!(body.get("archived").is_some(), "archive.archived: {body}");
     assert!(body.get("count").is_some(), "archive.count: {body}");
@@ -11475,7 +12034,9 @@ async fn http_phase4_archive_by_ids() {
     assert_eq!(code, "201");
     let mem_id = mem_body["id"].as_str().unwrap().to_string();
 
-    // Archive by IDs (POST /api/v1/archive)
+    // #976 (2026-05-20) — archive caller must own the memory under the
+    // post-#940 caller-vs-row-owner gate. Threading `ai:phase4-agent`
+    // matches the create-time owner (above).
     let (code, body) = route_post(
         &d,
         "/api/v1/archive",
@@ -11483,7 +12044,7 @@ async fn http_phase4_archive_by_ids() {
             "ids": [mem_id.clone()],
             "reason": "test archive"
         }),
-        None,
+        Some("ai:phase4-agent"),
     )
     .await;
     assert_eq!(code, "200", "archive status code: {body}");
@@ -11493,7 +12054,7 @@ async fn http_phase4_archive_by_ids() {
     assert_eq!(body["count"], 1, "should archive 1 memory: {body}");
 
     // Verify it's in the archive list
-    let (code, list_body) = route_get(&d, "/api/v1/archive").await;
+    let (code, list_body) = route_get_as_admin(&d, "/api/v1/archive").await;
     assert_eq!(code, "200");
     assert!(
         !list_body["archived"].as_array().unwrap().is_empty(),
@@ -11526,14 +12087,20 @@ async fn http_phase4_restore_archive() {
     assert_eq!(code, "201");
     let mem_id = mem_body["id"].as_str().unwrap().to_string();
 
-    // Archive it
+    // #976 (2026-05-20) — archive + restore must use the same caller
+    // identity as the memory's owner so the post-#940 caller-vs-row-owner
+    // gate in `db::restore_archived_for_caller` matches the row. Pre-#976
+    // the test posted with `None` (synthetic `anonymous:req-<uuid>`),
+    // and the restore-caller's `anonymous:req-<DIFFERENT uuid>` failed
+    // the owner check → 404. Threading `ai:phase4-agent` through both
+    // calls aligns the visibility principal with the memory's owner.
     let (code, _arch_body) = route_post(
         &d,
         "/api/v1/archive",
         &serde_json::json!({
             "ids": [mem_id.clone()]
         }),
-        None,
+        Some("ai:phase4-agent"),
     )
     .await;
     assert_eq!(code, "200");
@@ -11543,7 +12110,7 @@ async fn http_phase4_restore_archive() {
         &d,
         &format!("/api/v1/archive/{mem_id}/restore"),
         &serde_json::json!({}),
-        None,
+        Some("ai:phase4-agent"),
     )
     .await;
     assert_eq!(code, "200", "restore status code: {body}");
@@ -11590,14 +12157,16 @@ async fn http_phase4_import_memories() {
         }),
     ];
 
-    let (code, body) = route_post(
+    // #956 — `/api/v1/import` admin-gated; OneshotDaemon seeds
+    // INTEGRATION_TEST_ADMIN into the allowlist (#998 swap from
+    // pre-#980 "*" wildcard).
+    let (code, body) = route_post_as_admin(
         &d,
         "/api/v1/import",
         &serde_json::json!({
             "memories": memories_to_import,
             "links": []
         }),
-        None,
     )
     .await;
     assert_eq!(code, "200", "import status code: {body}");
@@ -11894,9 +12463,23 @@ fn test_cli_smoke_canonical_paths() {
     assert!(link_output.status.success(), "link failed");
 
     // 13. forget: dry-run delete by pattern
+    //
+    // Round-2 F11: `forget --pattern X` without `--namespace` is a
+    // GLOBAL scope delete and now requires `--confirm-global` to
+    // proceed. The smoke test exercises the CLI shape (not actual
+    // deletion — `nomatch` deliberately matches nothing), so we opt
+    // into the global confirmation.
     let forget_output = cmd_output_or_panic(
         binary,
-        &["--db", db_str, "--json", "forget", "--pattern", "nomatch"],
+        &[
+            "--db",
+            db_str,
+            "--json",
+            "forget",
+            "--pattern",
+            "nomatch",
+            "--confirm-global",
+        ],
     );
     assert!(forget_output.status.success(), "forget failed");
 
@@ -12419,6 +13002,15 @@ fn build_serve_state(
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
+    // v0.7.0 Wave-3 — populate the SAL trait handle alongside `db`.
+    // Tests in this module exercise the SQLite path; the trait handle
+    // wraps a SqliteStore opened against the same on-disk file so any
+    // future trait-routed assertion sees identical rows.
+    #[cfg(feature = "sal")]
+    let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = std::sync::Arc::new(
+        ai_memory::store::sqlite::SqliteStore::open(db_path)
+            .expect("open SqliteStore for build_serve_state"),
+    );
     let app_state = ai_memory::handlers::AppState {
         db,
         embedder: std::sync::Arc::new(None),
@@ -12430,8 +13022,31 @@ fn build_serve_state(
         mcp_config: std::sync::Arc::new(None),
         active_keypair: std::sync::Arc::new(None),
         family_embeddings: std::sync::Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+        #[cfg(feature = "sal")]
+        store,
+        llm: std::sync::Arc::new(None),
+        auto_tag_model: std::sync::Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+
+        verify_require_nonce: false,
+        federation_nonce_cache: std::sync::Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        recall_scope: std::sync::Arc::new(None),
+        deferred_audit_queue: std::sync::Arc::new(None),
+        admin_agent_ids: std::sync::Arc::new(Vec::new()),
+        rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
     };
-    let api_key_state = ai_memory::handlers::ApiKeyState { key: None };
+    let api_key_state = ai_memory::handlers::ApiKeyState {
+        key: None,
+        mtls_enforced: false,
+    };
     (api_key_state, app_state)
 }
 
@@ -12628,6 +13243,7 @@ async fn test_daemon_cmd_curator_daemon_cycles_then_terminates() {
         dry_run: true,
         include_namespaces: Vec::new(),
         exclude_namespaces: Vec::new(),
+        ..ai_memory::curator::CuratorConfig::default()
     };
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_daemon = shutdown.clone();
@@ -12875,6 +13491,21 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
     // and was fully dark prior to this test. Production
     // main.rs::cmd_curator uses this variant to sidestep a bin/lib
     // CuratorConfig type-mismatch.
+    //
+    // FX-C6 env-discipline (mirrors FX-1 / TEST-5+TEST-6 closure for
+    // lib tests). `run_curator_daemon_with_primitives` calls
+    // `AppConfig::load()` at `src/daemon_runtime.rs:4119`. Without
+    // pinning `AI_MEMORY_NO_CONFIG=1` for this test process the load
+    // reads the developer host's `~/.config/ai-memory/config.toml`;
+    // when that config resolves to a non-Ollama `[llm]` backend,
+    // `build_from_resolved` builds a `reqwest::blocking::Client`
+    // whose inner tokio current-thread runtime panics on drop inside
+    // this `#[tokio::test]` body with "Cannot drop a runtime in a
+    // context where blocking is not allowed". Calling
+    // `common::ensure_no_config_env()` at test entry pins the env
+    // var once per binary so the resolver lands on `CompiledDefault`
+    // and the no-construct short-circuit (lines 4121-4127) fires.
+    common::ensure_no_config_env();
     let dir = std::env::temp_dir();
     let db = dir.join(format!(
         "ai-memory-curator-prim-test-{}.db",
@@ -12895,7 +13526,7 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
             true, // dry_run
             Vec::new(),
             Vec::new(),
-            None, // ollama_model — keyword-only path, no LLM
+            None, // llm — keyword-only path, no LLM (#1440)
             shutdown_for_daemon,
         )
         .await

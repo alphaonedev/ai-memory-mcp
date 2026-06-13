@@ -87,7 +87,7 @@ Chroma has no FTS at all.
 **Impact:** the keyword recall path is not portable today.
 **v0.7 SAL:** `MemoryStore::keyword_search` is trait-level; each backend
 implements it natively. Chroma's missing FTS is handled by the
-`Capabilities::NATIVE_FTS` bit and a Rust-side fallback in the core
+`Capabilities::FULLTEXT` bit and a Rust-side fallback in the core
 layer.
 
 ### 7. No CDC / audit stream — **Structural**
@@ -117,7 +117,8 @@ large.
 
 **Impact:** noticeable after ~50k rows per namespace.
 **Workaround:** keyset pagination (`WHERE created_at < ?`) — not yet
-implemented. Tracked as part of v0.7 `Capabilities::CURSOR_PAGINATION`.
+implemented, and no cursor-pagination bit exists in `Capabilities`
+yet (future work).
 
 ### 10. HNSW vector index is in-process — **Structural (within SQLite)**
 

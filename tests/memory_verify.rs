@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7 Track H4 — `memory_verify` MCP tool integration tests.
 //!
 //! H4 formalises the `attest_level` enum (Unsigned / `SelfSigned` /
@@ -32,6 +34,7 @@
 //! gate through a single `Mutex` so the suite runs serially even
 //! when `cargo test` parallelises across test fns.
 
+use ai_memory::models::ConfidenceSource;
 use std::sync::Mutex;
 
 use ai_memory::db;
@@ -107,6 +110,18 @@ fn seed(conn: &rusqlite::Connection, title: &str) -> String {
         last_accessed_at: None,
         expires_at: None,
         metadata: models::default_metadata(),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..ai_memory::models::Memory::default()
     };
     db::insert(conn, &mem).expect("db::insert")
 }
@@ -315,12 +330,13 @@ fn peer_attested_link_verifies_and_reports_peer_attested() {
     let inbound = MemoryLink {
         source_id: f.src_id.clone(),
         target_id: f.dst_id.clone(),
-        relation: "related_to".to_string(),
+        relation: ai_memory::models::MemoryLinkRelation::RelatedTo,
         created_at: Utc::now().to_rfc3339(),
         signature: Some(sig),
         observed_by: Some("bob".to_string()),
         valid_from: Some(valid_from.clone()),
         valid_until: None,
+        attest_level: None,
     };
     db::create_link_inbound(&f.conn, &inbound, "peer_attested").expect("create_link_inbound");
     assert_eq!(

@@ -234,7 +234,7 @@ fn enumerate_log_files(dir: &Path) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+    for entry in fs::read_dir(dir).with_context(|| crate::errors::msg::reading(dir.display()))? {
         let entry = entry?;
         let p = entry.path();
         if p.is_file()
@@ -257,7 +257,7 @@ fn run_cat(dir: &Path, filters: &Filters, out: &mut CliOutput<'_>) -> Result<()>
 }
 
 fn emit_file(path: &Path, filters: &Filters, out: &mut CliOutput<'_>) -> Result<()> {
-    let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     for line in BufReader::new(f).lines() {
         let line = line?;
         if !line_matches(&line, filters) {
@@ -319,7 +319,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
 }
 
 fn read_tail_n(path: &Path, n: usize, filters: &Filters) -> Result<Vec<String>> {
-    let f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     let buf = BufReader::new(f);
     let mut keep: Vec<String> = Vec::with_capacity(n);
     for line in buf.lines() {
@@ -338,7 +338,8 @@ fn read_tail_n(path: &Path, n: usize, filters: &Filters) -> Result<Vec<String>> 
 fn read_lines_after_offset(path: &Path, offset: u64) -> Result<Vec<String>> {
     use std::io::Seek as _;
     use std::io::SeekFrom;
-    let mut f = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut f =
+        fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     f.seek(SeekFrom::Start(offset))?;
     let buf = BufReader::new(f);
     let mut out = Vec::new();
@@ -367,7 +368,7 @@ fn run_archive(dir: &Path, cfg: &LoggingConfig, out: &mut CliOutput<'_>) -> Resu
         if mtime >= cutoff {
             continue;
         }
-        let in_bytes = fs::read(&f).with_context(|| format!("reading {}", f.display()))?;
+        let in_bytes = fs::read(&f).with_context(|| crate::errors::msg::reading(f.display()))?;
         let in_size = in_bytes.len() as u64;
         let out_path = f.with_extension(format!(
             "{}.zst",
@@ -376,7 +377,7 @@ fn run_archive(dir: &Path, cfg: &LoggingConfig, out: &mut CliOutput<'_>) -> Resu
         let compressed_bytes = zstd_compress(&in_bytes)?;
         let out_size = compressed_bytes.len() as u64;
         fs::write(&out_path, &compressed_bytes)
-            .with_context(|| format!("writing {}", out_path.display()))?;
+            .with_context(|| crate::errors::msg::writing(out_path.display()))?;
         fs::remove_file(&f).with_context(|| format!("removing {}", f.display()))?;
         compressed += 1;
         total_in += in_size;

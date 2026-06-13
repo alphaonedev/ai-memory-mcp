@@ -1,0 +1,731 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! v0.7.0 WT-1-F — `ai-memory atomise` CLI subcommand.
+//!
+//! Operator-side wrapper over [`crate::atomisation::Atomiser`]. Wraps
+//! tier gating, curator construction, keypair loading, and result /
+//! error rendering (human-readable by default, structured JSON with
+//! `--json`). Exit codes are stable wire and documented in the
+//! [`exit_code`] mapper below.
+//!
+//! ## Wire shape
+//!
+//! ```bash
+//! ai-memory atomise <memory_id> \
+//!     --max-atom-tokens 200 \
+//!     --force \
+//!     --json \
+//!     --quiet
+//! ```
+//!
+//! ## Exit codes
+//!
+//! | Code | Variant                  | Meaning                                       |
+//! |-----:|--------------------------|-----------------------------------------------|
+//! |   0  | success                  | atoms minted, archived_at stamped             |
+//! |   1  | informational            | `AlreadyAtomised` / `SourceTooSmall`          |
+//! |   2  | not_found                | source memory id does not exist               |
+//! |   3  | tier_locked              | daemon tier is `keyword`                      |
+//! |   4  | curator_failed           | LLM round-trip exhausted retries              |
+//! |   5  | GOVERNANCE_REFUSED       | pre_store hook refused atom mid-batch         |
+//! |   6  | db_error                 | DB / signer / I/O failure                     |
+//!
+//! ## Test injection
+//!
+//! [`run`] accepts an optional `curator_override` so the integration
+//! tests can plug in a deterministic [`MockCurator`]. Production paths
+//! pass `None` and the runner constructs an [`LlmCurator`] backed by
+//! `OllamaClient` from the resolved tier.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Result;
+use clap::Args;
+use serde::Serialize;
+
+use crate::atomisation::curator::{Curator, LlmCurator};
+use crate::atomisation::{AtomiseError, Atomiser, AtomiserConfig};
+use crate::cli::CliOutput;
+use crate::config::{AppConfig, FeatureTier};
+use crate::db;
+use crate::identity::keypair as identity_keypair;
+use crate::llm::OllamaClient;
+
+/// Args for `ai-memory atomise`.
+#[derive(Args, Debug, Clone)]
+pub struct AtomiseArgs {
+    /// Source memory id (UUID string). ai-memory uses UUID strings for
+    /// memory ids, never integer rowids — accept the wire shape verbatim.
+    pub memory_id: String,
+
+    /// Per-atom token budget (cl100k). Defaults to 200, matching the
+    /// substrate's [`AtomiserConfig::default_max_atom_tokens`]. Pass
+    /// 0 to defer to the substrate default explicitly.
+    #[arg(long, default_value_t = 200)]
+    pub max_atom_tokens: u32,
+
+    /// Re-atomise even if the source already carries an atom set.
+    /// Old atoms are NOT deleted — their `atom_of` pointer remains
+    /// valid, and `atomised_into` is bumped to the new fresh count.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
+    /// Emit the result as a JSON envelope on stdout instead of the
+    /// human-readable summary. Errors land on stderr verbatim.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+
+    /// Suppress per-step progress output. The final success / error
+    /// summary still prints — `--quiet` only silences interstitial
+    /// progress lines (currently a no-op; reserved for future stretch).
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
+}
+
+/// JSON envelope emitted on success when `--json` is passed.
+///
+/// Field order is stable and mirrors the [`AtomiseResult`] struct so a
+/// downstream consumer can deserialise into it without aliasing.
+#[derive(Debug, Serialize)]
+struct SuccessEnvelope<'a> {
+    source_id: &'a str,
+    atom_ids: &'a [String],
+    atom_count: usize,
+    archived_at: &'a str,
+}
+
+/// JSON envelope emitted on error when `--json` is passed.
+#[derive(Debug, Serialize)]
+struct ErrorEnvelope<'a> {
+    /// Stable error code (matches the variant slug under [`exit_code`]).
+    error: &'static str,
+    /// Human-readable message — identical to the stderr line in the
+    /// non-`--json` path.
+    message: String,
+    /// Exit code the process will terminate with.
+    exit_code: i32,
+    /// Per-variant structured payload. Only populated for variants
+    /// that carry side data (existing atom ids, atom index, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
+    /// Source id we attempted to atomise — useful for log post-processing.
+    source_id: &'a str,
+}
+
+/// Map an [`AtomiseError`] variant to its stable exit code.
+///
+/// Visible-for-test so the unit suite below can assert on the mapping
+/// without round-tripping through `run`.
+#[must_use]
+pub fn exit_code(err: &AtomiseError) -> i32 {
+    match err {
+        AtomiseError::AlreadyAtomised { .. } | AtomiseError::SourceTooSmall => 1,
+        AtomiseError::NotFound => 2,
+        AtomiseError::TierLocked => 3,
+        AtomiseError::CuratorFailed(_) => 4,
+        AtomiseError::GovernanceRefused(_) => 5,
+        AtomiseError::DbError(_) | AtomiseError::SignerError(_) => 6,
+        // ARCH-5 (FX-6) — recursive-primitive refusal. Distinct exit
+        // code (7) so operators wrapping the CLI can distinguish a
+        // depth-cap refusal from a curator / governance / DB failure.
+        AtomiseError::DepthExceeded { .. } => 7,
+    }
+}
+
+/// Stable error-code slug for the `--json` envelope. Mirrors the variant
+/// names lower-snake-cased so downstream consumers can switch on a
+/// fixed string set without parsing the prose message.
+#[must_use]
+pub fn error_slug(err: &AtomiseError) -> &'static str {
+    match err {
+        AtomiseError::AlreadyAtomised { .. } => "already_atomised",
+        AtomiseError::SourceTooSmall => "source_too_small",
+        AtomiseError::NotFound => "not_found",
+        AtomiseError::TierLocked => "tier_locked",
+        AtomiseError::CuratorFailed(_) => "curator_failed",
+        // v0.7.0 #1103 — case-standardisation: MCP wire uses
+        // `GOVERNANCE_REFUSED` and HTTP envelope's `code` field uses
+        // `GOVERNANCE_REFUSED` so the CLI slug now matches. Pre-#1103
+        // this site emitted lowercase `governance_refused` which
+        // diverged from the two other surfaces; operators parsing
+        // `--json` output couldn't grep `GOVERNANCE_REFUSED` uniformly.
+        AtomiseError::GovernanceRefused(_) => crate::errors::error_codes::GOVERNANCE_REFUSED,
+        AtomiseError::DbError(_) => "db_error",
+        AtomiseError::SignerError(_) => "signer_error",
+        // ARCH-5 (FX-6) — stable slug matches the
+        // `REFLECTION_DEPTH_EXCEEDED` / `SYNTHESIS_DEPTH_EXCEEDED`
+        // family casing (SCREAMING_SNAKE) used by the rest of the
+        // recursive-primitive refusal taxonomy.
+        AtomiseError::DepthExceeded { .. } => "ATOMISATION_DEPTH_EXCEEDED",
+    }
+}
+
+/// Render a human-readable error message for a given variant. Matches
+/// the [`AtomiseError::Display`] prose where the wire is stable, and
+/// enriches it with extra operator-facing context (e.g. existing atom
+/// ids, upgrade hint for the tier-locked path).
+#[must_use]
+pub fn human_error_message(err: &AtomiseError, source_id: &str) -> String {
+    match err {
+        AtomiseError::NotFound => format!("Memory ID {source_id} not found"),
+        AtomiseError::AlreadyAtomised {
+            source_id: sid,
+            existing_atom_ids,
+        } => {
+            let ids = existing_atom_ids.join(", ");
+            format!(
+                "Memory {sid} already atomised into {n} atoms. Use --force to re-atomise. \
+                 Existing atom IDs: {ids}",
+                n = existing_atom_ids.len()
+            )
+        }
+        AtomiseError::TierLocked => {
+            "memory_atomise requires smart tier or higher. Current tier: keyword. \
+             Upgrade your deployment or use --tier semantic when running ai-memory mcp."
+                .to_string()
+        }
+        AtomiseError::CuratorFailed(detail) => {
+            format!("Curator pass failed: {detail}. Check Ollama availability or retry.")
+        }
+        AtomiseError::SourceTooSmall => format!(
+            "Memory {source_id} body already at or under max_atom_tokens. \
+             No atomisation needed."
+        ),
+        AtomiseError::GovernanceRefused(detail) => {
+            format!("Atomisation refused: {detail}")
+        }
+        AtomiseError::SignerError(detail) => format!("Signer error: {detail}"),
+        AtomiseError::DbError(detail) => format!("Database error: {detail}"),
+        AtomiseError::DepthExceeded { attempted, cap } => format!(
+            "Atomisation refused: depth {attempted} would exceed compiled \
+             max_atomisation_depth {cap}. A recursive atomisation chain hit \
+             the cycle-depth cap — inspect the curator / pre_store hook stack \
+             that re-entered atomise."
+        ),
+    }
+}
+
+/// Render structured per-variant `details` for the `--json` envelope.
+///
+/// Returns `None` when the variant carries no side payload beyond the
+/// human message (the envelope's `details` field is then omitted).
+#[must_use]
+fn error_details(err: &AtomiseError) -> Option<serde_json::Value> {
+    match err {
+        AtomiseError::AlreadyAtomised {
+            existing_atom_ids, ..
+        } => Some(serde_json::json!({
+            "existing_atom_ids": existing_atom_ids,
+            "existing_atom_count": existing_atom_ids.len(),
+        })),
+        _ => None,
+    }
+}
+
+/// Dispatch entry-point for `ai-memory atomise`.
+///
+/// `curator_override` is only set by the integration tests — production
+/// passes `None` and we synthesise an [`LlmCurator`] from the resolved
+/// tier. Returns the process exit code so the caller (the
+/// `daemon_runtime::run` dispatcher) can `std::process::exit` cleanly
+/// without panicking through `Err` propagation and skipping the post-run
+/// WAL checkpoint.
+///
+/// # Errors
+///
+/// Propagates only fatal I/O errors (writing to stdout/stderr). Every
+/// atomisation failure is mapped to an exit code via [`exit_code`] and
+/// returned as `Ok(code)`.
+pub fn run(
+    db_path: &Path,
+    args: &AtomiseArgs,
+    app_config: &AppConfig,
+    cli_agent_id: Option<&str>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    run_with_curator(db_path, args, app_config, cli_agent_id, out, None)
+}
+
+/// Visible-for-test entry point. Production passes
+/// `curator_override = None`; the integration suite injects a mock.
+///
+/// # Errors
+///
+/// Propagates only fatal I/O errors. See [`run`] for the full contract.
+pub fn run_with_curator(
+    db_path: &Path,
+    args: &AtomiseArgs,
+    app_config: &AppConfig,
+    cli_agent_id: Option<&str>,
+    out: &mut CliOutput<'_>,
+    curator_override: Option<Box<dyn Curator>>,
+) -> Result<i32> {
+    // Resolve the effective tier from config (no per-call --tier flag
+    // on the atomise subcommand — daemon-level resolution is the
+    // source of truth, mirroring the `mcp --tier <x>` discipline).
+    let tier = app_config.effective_tier(None);
+
+    // Tier check at CLI layer: surface a clear operator-facing message
+    // before we even open the DB. Substrate also enforces this, but
+    // catching it here yields a better diagnostic.
+    if tier == FeatureTier::Keyword {
+        let err = AtomiseError::TierLocked;
+        return emit_error(&err, &args.memory_id, args.json, out);
+    }
+
+    // Resolve calling agent_id — same precedence as the rest of the
+    // CLI surface (explicit flag / env / synthesised host fallback).
+    let calling_agent_id = match crate::identity::resolve_agent_id(cli_agent_id, None) {
+        Ok(id) => id,
+        Err(e) => {
+            let err = AtomiseError::DbError(format!("agent_id resolution failed: {e}"));
+            return emit_error(&err, &args.memory_id, args.json, out);
+        }
+    };
+
+    // Open the DB. Failure here lands on the db_error track.
+    let conn = match db::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let err = AtomiseError::DbError(format!("open {}: {e}", db_path.display()));
+            return emit_error(&err, &args.memory_id, args.json, out);
+        }
+    };
+
+    // Build the curator. Tests inject; production constructs an
+    // LlmCurator backed by the tier-resolved Ollama model.
+    //
+    // v0.7.0 (#1244) — also resolve the curator model name so the
+    // signed-event payload's `curator_model` field reflects what
+    // actually ran on this deployment.
+    let (curator, curator_model): (Box<dyn Curator>, String) = if let Some(c) = curator_override {
+        // Test path: caller injected a mock curator; we don't have a
+        // model name handy. Atomiser's "unknown" fallback applies.
+        (c, "unknown".to_string())
+    } else {
+        match build_llm_curator(tier) {
+            Ok((c, model)) => (c, model),
+            Err(e) => {
+                let err = AtomiseError::CuratorFailed(e);
+                return emit_error(&err, &args.memory_id, args.json, out);
+            }
+        }
+    };
+
+    // Best-effort keypair load — atoms can land unsigned if no key on
+    // disk, matching the curator-pass / reflection-pass discipline.
+    let keypair = load_keypair_best_effort(&calling_agent_id);
+
+    let atomiser = Atomiser::new(curator, keypair, AtomiserConfig::default(), tier)
+        .with_curator_model(curator_model);
+
+    match atomiser.atomise_sync(
+        &conn,
+        &args.memory_id,
+        args.max_atom_tokens,
+        args.force,
+        &calling_agent_id,
+    ) {
+        Ok(result) => emit_success(&result, args.json, out),
+        Err(e) => emit_error(&e, &args.memory_id, args.json, out),
+    }
+}
+
+/// Build an [`LlmCurator`] backed by the configured LLM for the
+/// supplied tier.
+///
+/// #1143: honors `AI_MEMORY_LLM_BACKEND` like the MCP / daemon
+/// paths. Resolution order matches
+/// [`OllamaClient::build_for_init`]:
+///   1. `AI_MEMORY_LLM_BACKEND` set → route via
+///      [`OllamaClient::from_env`] (xAI Grok, OpenAI, Anthropic,
+///      Gemini, …).
+///   2. Else → tier-default Ollama model at the default URL,
+///      preserving v0.6.x behavior.
+///
+/// Returns an error string when the env arm is configured but invalid
+/// (unknown alias, missing API key, missing base URL for the generic
+/// `openai-compatible` backend), when the legacy tier has no curator
+/// LLM configured (only `Keyword`, which the caller has already
+/// gated), or when the underlying client construction fails.
+fn build_llm_curator(tier: FeatureTier) -> std::result::Result<(Box<dyn Curator>, String), String> {
+    // v0.7.x (#1146) — route through the canonical resolver. The
+    // resolver folds CLI flags (none here), AI_MEMORY_LLM_* env vars,
+    // the [llm] config section, the legacy `llm_model`/`ollama_url`
+    // fields, and the compiled tier preset through the uniform
+    // precedence ladder. Atomise's tier gate already refused
+    // `Keyword`; for the other three tiers the resolver always
+    // produces a usable backend/model pair.
+    //
+    // v0.7.0 (#1244) — also return the resolved model id so the caller
+    // can thread it into the atomiser's `curator_model` provenance.
+    let _ = tier;
+    let app_config = AppConfig::load();
+    let resolved = app_config.resolve_llm(None, None, None);
+    match OllamaClient::build_from_resolved(&resolved) {
+        Ok(Some(client)) => {
+            let model = client.model_name().to_string();
+            Ok((Box::new(LlmCurator::new(client)), model))
+        }
+        Ok(None) => Err(format!(
+            "atomise: LLM resolver returned no client \
+             (backend={}, source={}); atomise requires a curator LLM",
+            resolved.backend,
+            resolved.source.as_str()
+        )),
+        Err(e) => Err(format!(
+            "atomise: LLM init failed (backend={}, source={}): {e}",
+            resolved.backend,
+            resolved.source.as_str()
+        )),
+    }
+}
+
+/// Best-effort keypair load — returns `None` if no key exists or the
+/// load fails. Atoms then land unsigned. The CLI never refuses to run
+/// solely because a keypair is missing; operators who want strict
+/// signing can run `ai-memory identity generate <agent_id>` first and
+/// re-invoke.
+fn load_keypair_best_effort(agent_id: &str) -> Option<Arc<crate::identity::keypair::AgentKeypair>> {
+    let dir = identity_keypair::default_key_dir().ok()?;
+    identity_keypair::load(agent_id, &dir).ok().map(Arc::new)
+}
+
+/// Emit a success result (human or JSON), return exit code 0.
+fn emit_success(
+    result: &crate::atomisation::AtomiseResult,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    if json {
+        let env = SuccessEnvelope {
+            source_id: &result.source_id,
+            atom_ids: &result.atom_ids,
+            atom_count: result.atom_count,
+            archived_at: &result.archived_at,
+        };
+        writeln!(out.stdout, "{}", serde_json::to_string(&env)?)?;
+    } else {
+        let ids = result.atom_ids.join(", ");
+        writeln!(
+            out.stdout,
+            "Atomised memory {src} into {n} atoms. Source archived at {ts}. Atom IDs: {ids}",
+            src = result.source_id,
+            n = result.atom_count,
+            ts = result.archived_at,
+        )?;
+    }
+    Ok(0)
+}
+
+/// Emit an error variant (human or JSON), return the variant's exit code.
+fn emit_error(
+    err: &AtomiseError,
+    source_id: &str,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let code = exit_code(err);
+    let message = human_error_message(err, source_id);
+    if json {
+        let env = ErrorEnvelope {
+            error: error_slug(err),
+            message: message.clone(),
+            exit_code: code,
+            details: error_details(err),
+            source_id,
+        };
+        writeln!(out.stderr, "{}", serde_json::to_string(&env)?)?;
+    } else {
+        writeln!(out.stderr, "{message}")?;
+    }
+    Ok(code)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — pure-logic surface that doesn't require a live DB / Ollama.
+// Full integration tests live at `tests/cli/atomise.rs`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_maps_every_variant() {
+        assert_eq!(exit_code(&AtomiseError::NotFound), 2);
+        assert_eq!(exit_code(&AtomiseError::TierLocked), 3);
+        assert_eq!(exit_code(&AtomiseError::CuratorFailed("x".into())), 4);
+        assert_eq!(exit_code(&AtomiseError::GovernanceRefused("x".into())), 5);
+        assert_eq!(exit_code(&AtomiseError::SourceTooSmall), 1);
+        assert_eq!(exit_code(&AtomiseError::DbError("x".into())), 6);
+        assert_eq!(exit_code(&AtomiseError::SignerError("x".into())), 6);
+        assert_eq!(
+            exit_code(&AtomiseError::AlreadyAtomised {
+                source_id: "s".into(),
+                existing_atom_ids: vec!["a".into()]
+            }),
+            1
+        );
+        // ARCH-5 (FX-6) — distinct exit code so operators wrapping the
+        // CLI can disambiguate the recursive-primitive refusal from
+        // curator / governance / DB failures.
+        assert_eq!(
+            exit_code(&AtomiseError::DepthExceeded {
+                attempted: 4,
+                cap: crate::atomisation::MAX_ATOMISATION_DEPTH,
+            }),
+            7
+        );
+    }
+
+    #[test]
+    fn error_slug_maps_every_variant() {
+        assert_eq!(error_slug(&AtomiseError::NotFound), "not_found");
+        assert_eq!(error_slug(&AtomiseError::TierLocked), "tier_locked");
+        assert_eq!(
+            error_slug(&AtomiseError::CuratorFailed("x".into())),
+            "curator_failed"
+        );
+        // v0.7.0 #1103 — uppercase tag matches the MCP wire shape
+        // (`GOVERNANCE_REFUSED: <reason>` per
+        // `src/mcp/tools/store/mod.rs`) + the HTTP `code` field
+        // (`{"code":"GOVERNANCE_REFUSED",...}` per
+        // `src/handlers/create.rs`). Pre-#1103 the CLI slug was
+        // lowercase and diverged from the other two surfaces.
+        assert_eq!(
+            error_slug(&AtomiseError::GovernanceRefused("x".into())),
+            "GOVERNANCE_REFUSED"
+        );
+        assert_eq!(
+            error_slug(&AtomiseError::SourceTooSmall),
+            "source_too_small"
+        );
+        assert_eq!(error_slug(&AtomiseError::DbError("x".into())), "db_error");
+        assert_eq!(
+            error_slug(&AtomiseError::SignerError("x".into())),
+            "signer_error"
+        );
+        assert_eq!(
+            error_slug(&AtomiseError::AlreadyAtomised {
+                source_id: "s".into(),
+                existing_atom_ids: vec!["a".into()]
+            }),
+            "already_atomised"
+        );
+        // ARCH-5 (FX-6) — SCREAMING_SNAKE_CASE slug to match the
+        // existing `REFLECTION_DEPTH_EXCEEDED` / `SYNTHESIS_DEPTH_EXCEEDED`
+        // family. Stable wire shape pinned across MCP / HTTP / CLI.
+        assert_eq!(
+            error_slug(&AtomiseError::DepthExceeded {
+                attempted: 4,
+                cap: crate::atomisation::MAX_ATOMISATION_DEPTH,
+            }),
+            "ATOMISATION_DEPTH_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn human_error_message_tier_locked_carries_upgrade_hint() {
+        let msg = human_error_message(&AtomiseError::TierLocked, "src");
+        assert!(msg.contains("requires smart tier"));
+        assert!(msg.contains("keyword"));
+        assert!(msg.contains("Upgrade your deployment"));
+    }
+
+    #[test]
+    fn human_error_message_not_found_carries_source_id() {
+        let msg = human_error_message(&AtomiseError::NotFound, "src-123");
+        assert!(msg.contains("src-123"), "got: {msg}");
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn human_error_message_already_atomised_lists_existing_ids() {
+        let err = AtomiseError::AlreadyAtomised {
+            source_id: "src-9".into(),
+            existing_atom_ids: vec!["a1".into(), "a2".into(), "a3".into()],
+        };
+        let msg = human_error_message(&err, "src-9");
+        assert!(msg.contains("src-9"));
+        assert!(msg.contains("3 atoms"));
+        assert!(msg.contains("--force"));
+        assert!(msg.contains("a1, a2, a3"));
+    }
+
+    #[test]
+    fn human_error_message_source_too_small_carries_source_id() {
+        let msg = human_error_message(&AtomiseError::SourceTooSmall, "src-x");
+        assert!(msg.contains("src-x"));
+        assert!(msg.contains("max_atom_tokens"));
+    }
+
+    #[test]
+    fn human_error_message_curator_failed_carries_detail() {
+        let msg = human_error_message(&AtomiseError::CuratorFailed("ollama down".into()), "src");
+        assert!(msg.contains("ollama down"));
+        assert!(msg.contains("Ollama"));
+    }
+
+    #[test]
+    fn human_error_message_governance_refused_carries_detail() {
+        let msg = human_error_message(
+            &AtomiseError::GovernanceRefused("atom[2]: policy".into()),
+            "src",
+        );
+        assert!(msg.contains("policy"));
+        assert!(msg.contains("atom[2]"));
+    }
+
+    #[test]
+    fn human_error_message_signer_error_and_db_error_carry_detail() {
+        // Drives uncovered lines 184-185 in `human_error_message`.
+        let sig = human_error_message(&AtomiseError::SignerError("key revoked".into()), "src");
+        assert!(sig.starts_with("Signer error:"));
+        assert!(sig.contains("key revoked"));
+        let db = human_error_message(&AtomiseError::DbError("disk full".into()), "src");
+        assert!(db.starts_with("Database error:"));
+        assert!(db.contains("disk full"));
+    }
+
+    #[test]
+    fn run_wrapper_delegates_to_run_with_curator_keyword_tier_short_circuits() {
+        // Drives the bare `run` function (line 220-228) plus the
+        // TierLocked early-out at the CLI layer (line 252-254) by
+        // passing an explicit `tier = "keyword"` config.
+        use crate::config::AppConfig;
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("keyword".to_string());
+        let args = AtomiseArgs {
+            memory_id: "src-id".to_string(),
+            max_atom_tokens: 100,
+            force: false,
+            json: false,
+            quiet: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise-cli.db");
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run(&db_path, &args, &cfg, None, &mut out).unwrap();
+        // TierLocked is exit_code 3.
+        assert_eq!(code, 3);
+        let s = String::from_utf8(stderr).unwrap();
+        assert!(
+            s.contains("requires smart tier") || s.contains("tier"),
+            "got stderr: {s}",
+        );
+    }
+
+    #[test]
+    fn error_details_already_atomised_carries_payload() {
+        let err = AtomiseError::AlreadyAtomised {
+            source_id: "s".into(),
+            existing_atom_ids: vec!["a".into(), "b".into()],
+        };
+        let det = error_details(&err).expect("details populated");
+        assert_eq!(det["existing_atom_ids"][0].as_str().unwrap(), "a");
+        assert_eq!(det["existing_atom_count"].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn error_details_other_variants_are_none() {
+        assert!(error_details(&AtomiseError::NotFound).is_none());
+        assert!(error_details(&AtomiseError::TierLocked).is_none());
+        assert!(error_details(&AtomiseError::SourceTooSmall).is_none());
+        assert!(error_details(&AtomiseError::CuratorFailed("x".into())).is_none());
+    }
+
+    #[test]
+    fn emit_error_writes_human_message_to_stderr() {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = emit_error(&AtomiseError::NotFound, "src-xyz", false, &mut out).unwrap();
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        let s = String::from_utf8(stderr).unwrap();
+        assert!(s.contains("src-xyz"));
+        assert!(s.contains("not found"));
+    }
+
+    #[test]
+    fn emit_error_writes_json_envelope_to_stderr() {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let err = AtomiseError::AlreadyAtomised {
+            source_id: "src-1".into(),
+            existing_atom_ids: vec!["a".into(), "b".into()],
+        };
+        let code = emit_error(&err, "src-1", true, &mut out).unwrap();
+        assert_eq!(code, 1);
+        let s = String::from_utf8(stderr).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["error"], "already_atomised");
+        assert_eq!(v["exit_code"], 1);
+        assert_eq!(v["source_id"], "src-1");
+        assert_eq!(v["details"]["existing_atom_count"], 2);
+    }
+
+    #[test]
+    fn emit_success_writes_human_summary_to_stdout() {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let r = crate::atomisation::AtomiseResult {
+            source_id: "src-1".into(),
+            atom_ids: vec!["a1".into(), "a2".into()],
+            atom_count: 2,
+            archived_at: "2026-05-14T00:00:00Z".into(),
+        };
+        let code = emit_success(&r, false, &mut out).unwrap();
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("src-1"));
+        assert!(s.contains("2 atoms"));
+        assert!(s.contains("2026-05-14T00:00:00Z"));
+        assert!(s.contains("a1, a2"));
+    }
+
+    #[test]
+    fn emit_success_writes_json_envelope_to_stdout() {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let r = crate::atomisation::AtomiseResult {
+            source_id: "src-1".into(),
+            atom_ids: vec!["a1".into(), "a2".into()],
+            atom_count: 2,
+            archived_at: "2026-05-14T00:00:00Z".into(),
+        };
+        let code = emit_success(&r, true, &mut out).unwrap();
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        let s = String::from_utf8(stdout).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["source_id"], "src-1");
+        assert_eq!(v["atom_count"], 2);
+        assert_eq!(v["atom_ids"][0], "a1");
+        assert_eq!(v["archived_at"], "2026-05-14T00:00:00Z");
+    }
+}

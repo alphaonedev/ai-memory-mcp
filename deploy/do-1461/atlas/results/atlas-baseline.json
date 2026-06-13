@@ -1,0 +1,31 @@
+{
+  "campaign": "do-1461",
+  "timestamp": "20260608T163159Z",
+  "suite": "atlas-corpus",
+  "namespace": "atlas-corpus",
+  "write_anchor": "do-1461-peer-nyc3-01",
+  "distinct_expected": 7855,
+  "ingest": {"transport_fail": 0, "http_2xx": 0, "quorum_soft_503": 7912, "http_hard_err": 0, "rows": 7912, "pg_distinct": "7855"},
+  "checks": [
+    {"node": "do-1461-peer-nyc3-01", "group": "ingest", "test": "transport_failures", "expected": "0", "got": "0", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "ingest", "test": "hard_row_errors", "expected": "0", "got": "0", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "ingest", "test": "quorum_soft_503", "expected": "informational (W=2 eventual; rows land+attest locally)", "got": "7912 of 7912", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "ingest", "test": "pg_distinct_count", "expected": "7855", "got": "7855", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "ingest", "test": "all_agent_attested", "expected": "0", "got": "0", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "recall", "test": "recall_hybrid[stocks]", "expected": ">=1 atlas hit", "got": "count=10", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "recall", "test": "search_fts[stocks]", "expected": ">=1 atlas hit", "got": "count=20", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "recall", "test": "recall_hybrid[inflation]", "expected": ">=1 atlas hit", "got": "count=10", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "recall", "test": "search_fts[inflation]", "expected": ">=1 atlas hit", "got": "count=20", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "recall", "test": "recall_hybrid[psychology]", "expected": ">=1 atlas hit", "got": "count=10", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "recall", "test": "search_fts[psychology]", "expected": ">=1 atlas hit", "got": "count=20", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "graph", "test": "graph_present_queryable", "expected": "AGE Cypher returns an integer", "got": "MATCH (n) count=0", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "graph", "test": "age_node_count", "expected": ">=1 (Memory vertex for an atlas id)", "got": "1", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "graph", "test": "link_projection", "expected": "informational — HTTP /links persistence (defect #1542)", "got": "201 linked:true but memory_links=0 (postgres link_signed no-op)", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "federation", "test": "probe_write", "expected": "an atlas id on anchor", "got": "aa721c4b-9752-46c1-b1b9-9904c316c7a8", "status": "PASS"},
+    {"node": "do-1461-peer-fra1-01", "group": "federation", "test": "converge[fra1]", "expected": "aa721c4b-9752-46c1-b1b9-9904c316c7a8 on do-1461-peer-fra1-01", "got": "aa721c4b-9752-46c1-b1b9-9904c316c7a8 present by-id on do-1461-peer-fra1-01 (fra1)", "status": "PASS"},
+    {"node": "do-1461-peer-sgp1-01", "group": "federation", "test": "converge[sgp1]", "expected": "aa721c4b-9752-46c1-b1b9-9904c316c7a8 on do-1461-peer-sgp1-01", "got": "aa721c4b-9752-46c1-b1b9-9904c316c7a8 present by-id on do-1461-peer-sgp1-01 (sgp1)", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "federation", "test": "bulk_corpus_cross_region", "expected": "informational (loader per-agent daily quota throttles bulk push; raise AI_MEMORY_MAX_MEMORIES_PER_DAY to fully federate)", "got": "2 rows reached other regions", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "provenance", "test": "memory_kind", "expected": "claim|concept", "got": "memory_kind present in verbose recall", "status": "PASS"},
+    {"node": "do-1461-peer-nyc3-01", "group": "provenance", "test": "corpus_source", "expected": "atlas-knowledge-card", "got": "original source survives via metadata", "status": "PASS"}
+  ]
+}

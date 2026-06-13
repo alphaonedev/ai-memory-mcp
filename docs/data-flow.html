@@ -82,6 +82,18 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -91,11 +103,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Data Flow</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html" class="current">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -118,6 +133,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -129,6 +145,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -138,29 +157,97 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>Where data flows.</h1>
-  <p class="tagline">Three end-to-end animated diagrams: write path (memory_store), read path (memory_recall with hybrid fusion), and federation (W-of-N quorum sync). Every box is a real function in <code>src/db.rs</code> or <code>src/handlers.rs</code>; every arrow is a real call.</p>
+  <p class="tagline">Three end-to-end animated diagrams: write path (memory_store), read path (memory_recall with hybrid fusion), and federation (W-of-N quorum sync). Every box is a real function in <code>src/storage/</code> or <code>src/handlers/</code>; every arrow is a real call.</p>
 </section>
 
 <!-- =============== WRITE PATH =============== -->
@@ -177,7 +264,7 @@ footer a{color:var(--text-muted)}
 
       <!-- Group: core write -->
       <rect class="group-bg" x="200" y="10" width="600" height="320"/>
-      <text class="group-label" x="210" y="30">▸ src/db.rs::store</text>
+      <text class="group-label" x="210" y="30">▸ src/storage/mod.rs::insert</text>
 
       <!-- Group: post-write -->
       <rect class="group-bg" x="810" y="10" width="360" height="320"/>
@@ -277,7 +364,7 @@ footer a{color:var(--text-muted)}
       <!-- Filters -->
       <g><rect class="stage-box" x="890" y="60" width="80" height="60" rx="10"/><text x="930" y="95" text-anchor="middle" style="font-size:11px">budget</text><text x="930" y="110" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">tokens</text></g>
       <g><rect class="stage-box" x="890" y="150" width="80" height="60" rx="10"/><text x="930" y="185" text-anchor="middle" style="font-size:11px">scope</text><text x="930" y="200" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">visibility</text></g>
-      <g><rect class="stage-box" x="890" y="240" width="80" height="60" rx="10"/><text x="930" y="275" text-anchor="middle" style="font-size:11px">TTL ext</text><text x="930" y="290" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">touch hits</text></g>
+      <g><rect class="stage-box" x="890" y="240" width="80" height="60" rx="10"/><text x="930" y="275" text-anchor="middle" style="font-size:11px">TTL reset</text><text x="930" y="290" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">touch hits</text></g>
 
       <!-- Result -->
       <g><rect class="stage-box hot" x="1010" y="150" width="140" height="80" rx="10"/><text x="1080" y="185" text-anchor="middle">top-K ranked</text><text x="1080" y="205" text-anchor="middle" class="label" style="fill:var(--good);font-size:9px">18ms p95 hot</text></g>
@@ -320,9 +407,9 @@ footer a{color:var(--text-muted)}
         <p><code>embed(context_tokens.join(" "))</code> — recent conversation tokens. Biases toward "what the agent is currently thinking about".</p>
       </div>
       <div class="fusion-card f3">
-        <h3>L2-renormalize</h3>
-        <div class="pct p3">unit</div>
-        <p>Final query vector = unit-norm(0.7·primary + 0.3·context). Same magnitude as either input — drop-in for HNSW search.</p>
+        <h3>weighted sum</h3>
+        <div class="pct p3">raw</div>
+        <p>Final query vector = 0.7·primary + 0.3·context, deliberately un-normalized — cosine similarity divides out magnitudes downstream, so only direction matters (<code>Embedder::fuse</code>).</p>
       </div>
     </div>
 
@@ -337,7 +424,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow p3">Federation · W-of-N Quorum</span>
     <h2>Multi-machine sync without a coordinator.</h2>
-    <p class="lede">Each node accepts writes locally and fans out to peers via mTLS. Quorum threshold W of N (default 2 of 3) must ack before commit. Eventual consistency. Per-peer cursors for catchup after partition. Federation private endpoints under <code>/api/v1/sync/*</code>.</p>
+    <p class="lede">Each node accepts writes locally and fans out to peers via mTLS. The local commit lands first; the quorum (default W=2, counting the local commit) is met once W−1 peers ack within the deadline. Eventual consistency. Per-peer cursors for catchup after partition. Federation private endpoints under <code>/api/v1/sync/*</code>.</p>
 
     <svg class="flow-svg" viewBox="0 0 1180 460" xmlns="http://www.w3.org/2000/svg">
       <!-- Three peers -->
@@ -379,12 +466,12 @@ footer a{color:var(--text-muted)}
       <path class="data-line" d="M 490 370 Q 350 370 210 280"/>
 
       <!-- Quorum threshold annotation -->
-      <text x="350" y="50" text-anchor="middle" style="fill:var(--good);font-family:monospace;font-size:14px;font-weight:700">W=2 of N=3 reached → COMMIT</text>
-      <text x="350" y="70" text-anchor="middle" class="label" style="fill:var(--text-muted)">leader returns 200 to caller after 410ms (slowest of 2 acks)</text>
+      <text x="350" y="50" text-anchor="middle" style="fill:var(--good);font-family:monospace;font-size:14px;font-weight:700">W=2 met (local commit + first peer ack) → COMMIT</text>
+      <text x="350" y="70" text-anchor="middle" class="label" style="fill:var(--text-muted)">leader returns 200 after 240ms (first ack; node-3's 410ms ack lands post-quorum)</text>
 
       <!-- Catchup annotation -->
       <text x="1025" y="330" text-anchor="middle" style="fill:var(--text-muted);font-family:monospace;font-size:11px">when node-4 returns:</text>
-      <text x="1025" y="345" text-anchor="middle" style="fill:var(--p1);font-family:monospace;font-size:11px">GET /api/v1/sync/since?cursor=...</text>
+      <text x="1025" y="345" text-anchor="middle" style="fill:var(--p1);font-family:monospace;font-size:11px">GET /api/v1/sync/since?peer=…&amp;since=…</text>
       <text x="1025" y="360" text-anchor="middle" style="fill:var(--text-muted);font-family:monospace;font-size:11px">advances local state</text>
 
       <defs>
@@ -401,7 +488,7 @@ footer a{color:var(--text-muted)}
       </div>
       <div class="fusion-card f2">
         <h3>quorum write</h3>
-        <p>Writes return 200 only after W peers ACK. Slowest ACK determines latency. Default W=2.</p>
+        <p>Local commit lands first; the write returns 200 once W is met — the local commit plus W−1 peer ACKs within the deadline. Default W=2 (majority).</p>
       </div>
       <div class="fusion-card f3">
         <h3>catchup loop</h3>
@@ -410,14 +497,14 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="callout">
-      <strong>What if quorum can't be reached?</strong> The leader returns <strong>503 with structured peer status</strong>: which peers responded, which timed out, when the deadline hit. No silent partial writes. Caller can retry or escalate to the operator. The <code>QuorumNotMetPayload</code> includes per-peer error classification (Unreachable / IdDrift / InFlight / InvalidPolicy / LocalWriteFailed).
+      <strong>What if quorum can't be reached?</strong> The leader returns <strong>503 with structured peer status</strong>: which peers responded, which timed out, when the deadline hit. No silent partial writes. Caller can retry or escalate to the operator. The failure payload includes error classification (<code>QuorumFailureReason</code>: Unreachable / Timeout / IdDrift / InFlight; <code>QuorumError</code>: InvalidPolicy / LocalWriteFailed).
     </div>
   </div>
 </section>
 
 <footer>
   <div class="container">
-    <p>ai-memory-mcp · Apache 2.0 · v0.6.3.1 · <a href="./">main</a> · <a href="at-a-glance.html">At a Glance</a> · <a href="feature-matrix.html">Feature Matrix</a> · <a href="integrations.html">Integrations</a></p>
+    <p>ai-memory-mcp · Apache 2.0 · v0.7.0 · <a href="./">main</a> · <a href="at-a-glance.html">At a Glance</a> · <a href="feature-matrix.html">Feature Matrix</a> · <a href="integrations.html">Integrations</a></p>
   </div>
 </footer>
 

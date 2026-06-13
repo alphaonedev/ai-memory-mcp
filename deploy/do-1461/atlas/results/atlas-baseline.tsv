@@ -1,0 +1,20 @@
+do-1461-peer-nyc3-01	ingest	transport_failures	0	0	PASS
+do-1461-peer-nyc3-01	ingest	hard_row_errors	0	0	PASS
+do-1461-peer-nyc3-01	ingest	quorum_soft_503	informational (W=2 eventual; rows land+attest locally)	7912 of 7912	PASS
+do-1461-peer-nyc3-01	ingest	pg_distinct_count	7855	7855	PASS
+do-1461-peer-nyc3-01	ingest	all_agent_attested	0	0	PASS
+do-1461-peer-nyc3-01	recall	recall_hybrid[stocks]	>=1 atlas hit	count=10	PASS
+do-1461-peer-nyc3-01	recall	search_fts[stocks]	>=1 atlas hit	count=20	PASS
+do-1461-peer-nyc3-01	recall	recall_hybrid[inflation]	>=1 atlas hit	count=10	PASS
+do-1461-peer-nyc3-01	recall	search_fts[inflation]	>=1 atlas hit	count=20	PASS
+do-1461-peer-nyc3-01	recall	recall_hybrid[psychology]	>=1 atlas hit	count=10	PASS
+do-1461-peer-nyc3-01	recall	search_fts[psychology]	>=1 atlas hit	count=20	PASS
+do-1461-peer-nyc3-01	graph	graph_present_queryable	AGE Cypher returns an integer	MATCH (n) count=0	PASS
+do-1461-peer-nyc3-01	graph	age_node_count	>=1 (Memory vertex for an atlas id)	1	PASS
+do-1461-peer-nyc3-01	graph	link_projection	informational — HTTP /links persistence (defect #1542)	201 linked:true but memory_links=0 (postgres link_signed no-op)	PASS
+do-1461-peer-nyc3-01	federation	probe_write	an atlas id on anchor	aa721c4b-9752-46c1-b1b9-9904c316c7a8	PASS
+do-1461-peer-fra1-01	federation	converge[fra1]	aa721c4b-9752-46c1-b1b9-9904c316c7a8 on do-1461-peer-fra1-01	aa721c4b-9752-46c1-b1b9-9904c316c7a8 present by-id on do-1461-peer-fra1-01 (fra1)	PASS
+do-1461-peer-sgp1-01	federation	converge[sgp1]	aa721c4b-9752-46c1-b1b9-9904c316c7a8 on do-1461-peer-sgp1-01	aa721c4b-9752-46c1-b1b9-9904c316c7a8 present by-id on do-1461-peer-sgp1-01 (sgp1)	PASS
+do-1461-peer-nyc3-01	federation	bulk_corpus_cross_region	informational (loader per-agent daily quota throttles bulk push; raise AI_MEMORY_MAX_MEMORIES_PER_DAY to fully federate)	2 rows reached other regions	PASS
+do-1461-peer-nyc3-01	provenance	memory_kind	claim|concept	memory_kind present in verbose recall	PASS
+do-1461-peer-nyc3-01	provenance	corpus_source	atlas-knowledge-card	original source survives via metadata	PASS

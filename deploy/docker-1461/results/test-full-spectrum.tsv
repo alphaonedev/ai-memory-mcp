@@ -1,0 +1,25 @@
+regression	create	memory id	f22466c6-ea70-4ca1-8953-8780a871572b	PASS
+regression	get_by_id	content present	d6-20260606T105643Z-3108 found	PASS
+regression	search_semantic	id in results (count=1)	f22466c6-ea70-4ca1-8953-8780a871572b	PASS
+regression	list_namespace	id listed in _test	f22466c6-ea70-4ca1-8953-8780a871572b	PASS
+regression	private_isolation	hidden from non-owner	not visible to ai:agent-beta@docker-1461	PASS
+regression	ns_cross_isolation	absent from other ns	isolated	PASS
+crypto	no_client_cert	000	000	PASS
+crypto	rogue_client_cert	000	000	PASS
+crypto	wrong_server_ca	000	000	PASS
+crypto	apikey_required	401	401	PASS
+crypto	apikey_accepted	200	200	PASS
+crypto	health_exempt	200	200	PASS
+crypto	admin_gated	403	403	PASS
+federation	write	memory id	d76878a5-3d02-483b-ba21-9aebfd974642	PASS
+federation	converge	d76878a5-3d02-483b-ba21-9aebfd974642 on docker-1461-peer-2	present on docker-1461-peer-2	PASS
+zerotouch	enrolled_write	memory id	327c5399-2c81-4e5b-a721-065387790382	PASS
+zerotouch	enrolled_converge	327c5399-2c81-4e5b-a721-065387790382 on docker-1461-peer-2 (credential-only trust)	present via CA credential	PASS
+zerotouch	unenrolled_status	401	401	PASS
+zerotouch	unenrolled_reason	peer_not_enrolled	fail-closed	PASS
+a2a	agent_write	memory id (alpha->peer1)	a3d8e39d-c505-4231-a986-5ce2892d2006	PASS
+a2a	beta_read_writepeer	visible cross-agent	a3d8e39d-c505-4231-a986-5ce2892d2006 present	PASS
+a2a	beta_read_fedpeer	visible on federated peer	a3d8e39d-c505-4231-a986-5ce2892d2006 present on docker-1461-peer-2	PASS
+ai_nhi	llm_decision	non-empty expanded_terms	term=Byzantine fault tolerance	PASS
+ai_nhi	nhi_commit	memory id (alpha decision->peer1)	0645fb81-bf2f-4128-bac5-ef0b1403253e	PASS
+ai_nhi	nhi_converge	decision visible on federated peer	0645fb81-bf2f-4128-bac5-ef0b1403253e present on docker-1461-peer-2	PASS

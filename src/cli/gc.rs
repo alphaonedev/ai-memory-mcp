@@ -22,7 +22,7 @@ pub fn run_gc(
         writeln!(
             out.stdout,
             "{}",
-            serde_json::json!({"expired_deleted": count})
+            serde_json::json!({(crate::models::field_names::EXPIRED_DELETED): count})
         )?;
     } else {
         writeln!(out.stdout, "expired memories deleted: {count}")?;
@@ -61,7 +61,9 @@ pub fn run_namespaces(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -
         writeln!(
             out.stdout,
             "{}",
-            serde_json::to_string(&serde_json::json!({"namespaces": ns}))?
+            serde_json::to_string(
+                &serde_json::json!({(crate::models::field_names::NAMESPACES): ns})
+            )?
         )?;
         return Ok(());
     }

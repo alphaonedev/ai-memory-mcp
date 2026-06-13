@@ -27,13 +27,21 @@ hard deletion. Can be listed, restored, or purged via `ai-memory
 archive`. Preserves operator history; lets you recover from
 mis-curation.
 
-## Attested identity (Layer 2b, v0.7)
+## Attested identity (v0.7.0)
 
-An `agent_id` that is **proven** — extracted from the peer's mTLS
-certificate (CN or SAN URI) rather than self-declared in a request
-body. Set via `--attest-mode reject|warn|off` on the HTTP daemon.
-Primitives shipped in #285; wiring into `sync_push` is a v0.7.1
-follow-up.
+An identity that is **cryptographically proven** rather than merely
+claimed. Two surfaces at v0.7.0: (1) **store-path attestation**
+(#626 Layer-3) — a write presenting a valid detached Ed25519
+`signature` over the `SignableWrite` envelope lands
+`metadata.attest_level = "agent_attested"` instead of `"claimed"`;
+`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` rejects unsigned writes.
+(2) **link/event attestation** — every `memory_links` row and signed
+event carries an `attest_level` from the five-variant enum
+(`src/models/link.rs::AttestLevel`): `unsigned`, `self_signed`,
+`peer_attested`, `signed_by_peer` (L4 `memory_capture_turn`
+host-signed), `daemon_signed` (substrate-signed audit rows).
+Cert-SAN agent-id attestation on the federation receive path is
+tracked under #717 for v0.8.
 
 ## Autonomy hooks (v0.6.0.0)
 
@@ -90,10 +98,14 @@ reversed, entries are tagged `_reversed` — audit trail preserved.
 ## Feature tier
 
 Controls which AI capabilities are active based on available memory
-budget. `keyword` (FTS5 only, 0 MB), `semantic` (MiniLM + HNSW,
-~256 MB), `smart` (+ nomic-embed + Gemma 4 E2B, ~1 GB), `autonomous`
-(+ Gemma 4 E4B + cross-encoder, ~4 GB). Set per-invocation
-(`--tier`) or as daemon default. See `docs/ADMIN_GUIDE.md`.
+budget. `keyword` (FTS5 only, minimal), `semantic` (MiniLM + HNSW,
+~256 MB), `smart` (+ LLM-backed expansion/auto-tag/contradiction,
+~1 GB with local Ollama or ~256 MB with a remote backend),
+`autonomous` (+ cross-encoder reranking, ~4 GB local). Post-#1067 the
+LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND` — Ollama, xAI,
+OpenAI, Anthropic, Gemini, etc.). Set per-invocation (`--tier` on
+`mcp`/`store`/`recall`) or via `config.toml` for the daemon. See
+`docs/ADMIN_GUIDE.md`.
 
 ## Federation
 
@@ -104,10 +116,10 @@ write fans out to peers; returns 201 only on `W-1` peer acks within
 
 ## FTS5
 
-SQLite's full-text search extension. Powers exact-phrase keyword
-search on `(title, content)`. Always enabled regardless of feature
-tier — it's the default recall mechanism for `keyword` and the first
-stage of hybrid recall for `semantic`+.
+SQLite's full-text search extension. Powers keyword search over
+`(title, content, tags)` (the `memories_fts` virtual table). Always
+enabled regardless of feature tier — it's the default recall mechanism
+for `keyword` and the first stage of hybrid recall for `semantic`+.
 
 ## Governance
 
@@ -135,23 +147,36 @@ embeddings lose information on long text.
 ## MCP (Model Context Protocol)
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
-an MCP server via `ai-memory mcp` exposing 43 tools (memory_store,
-memory_recall, etc.) + 2 prompts over stdio. Works with Claude Code,
-Claude Desktop, Cursor, Codex, Grok, Gemini, Llama Stack. See
-`docs/USER_GUIDE.md`.
+an MCP server via `ai-memory mcp` exposing **74 advertised entries at
+`--profile full` at v0.7.0** (73 callable "memory tools" + the always-on
+`memory_capabilities` bootstrap — both numbers are intentional; see
+issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
+plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the
+original 5 + `memory_load_family` + `memory_smart_load`) plus the
+always-on bootstrap. Works with Claude Code, Claude Desktop, Cursor,
+Codex, Grok, Gemini, Llama Stack. See `docs/USER_GUIDE.md`.
 
 ## Memory
 
-The core data unit. A 15-field record with `id`, `tier`, `namespace`,
-`title`, `content`, `tags`, `priority`, `confidence`, `source`,
-`access_count`, timestamps, `expires_at`, and `metadata`.
-`(title, namespace)` is a unique key — storing a duplicate upserts.
-See `docs/DEVELOPER_GUIDE.md` § "Data Model".
+The core data unit. **A 26-field record at v0.7.0** (was 15 at v0.6.x) —
+adds `reflection_depth` (Task 1/8 recursive-learning), `memory_kind`
+(Batman Form-6 vocabulary), `entity_id`/`persona_version` (QW-2 persona
+artefact), `citations`/`source_uri`/`source_span` (Form-4 fact
+provenance), `confidence_source`/`confidence_signals`/`confidence_decayed_at`
+(Form-5 calibration), and `version` (schema v45 Gap-1 optimistic
+concurrency). Original v0.6.x fields still present: `id`,
+`tier`, `namespace`, `title`, `content`, `tags`, `priority`,
+`confidence`, `source`, `access_count`, timestamps, `expires_at`,
+`metadata`. `(title, namespace)` is a unique key — storing a duplicate
+upserts. Canonical truth in `src/models/memory.rs`. See
+`docs/DEVELOPER_GUIDE.md` § "Data Model".
 
 ## Memory link
 
-A typed relationship between two memories. Kinds: `related_to`,
-`supersedes`, `contradicts`, `derived_from`. Used by consolidate (to
+A typed relationship between two memories. **Six kinds at v0.7.0** (was
+four at v0.6.x): `related_to`, `supersedes`, `contradicts`,
+`derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from`
+(WT-1-A atomisation). Used by consolidate (to
 track provenance) and the curator (to mark contradictions).
 
 ## Namespace
@@ -168,15 +193,16 @@ See **Autonomy hooks**.
 ## Priority
 
 Integer 1–10 on a memory. Default 5. Higher values rank higher on
-recall. The curator's priority-feedback pass nudges this: +1 for
-memories with `access_count ≥ 10` in the last 7 days; −1 for
-memories untouched for 30+ days.
+recall. The curator's priority-feedback pass nudges this: +1 (cap 10)
+for memories with `access_count ≥ 10` last accessed within 7 days;
+−1 (floor 1) for never-accessed memories older than 30 days.
 
 ## Quorum (W-of-N)
 
 Federation write contract from ADR-0001. `N` = peer count, `W` = how
-many peers must ack before the write returns OK. Default
-`W = ceil((N+1)/2)` (majority). Configurable via `--quorum-writes`.
+many peers must ack before the write returns OK. The operator sets `W`
+explicitly via `--quorum-writes` (default `0` = federation off); the
+`QuorumPolicy::majority` convenience targets a simple majority.
 
 ## Recall
 
@@ -187,11 +213,12 @@ promotes mid→long at 5 accesses, nudges priority every 10 accesses.
 
 ## SAL — Storage Abstraction Layer (v0.7)
 
-Trait-based storage boundary (`MemoryStore`). Adapters: `SqliteStore`
-(default), `PostgresStore` (pgvector-backed, under `--features
-sal-postgres`). Migration via `ai-memory migrate --from … --to …`.
-Running `serve` against Postgres needs v0.7.1's handlers refactor —
-see `docs/RUNBOOK-adapter-selection.md`.
+Trait-based storage boundary (`MemoryStore`, `src/store/`). Adapters:
+`SqliteStore` (default), `PostgresStore` (pgvector-backed, under
+`--features sal-postgres`; GA at v0.7.0). Migration via
+`ai-memory migrate --from … --to …`; run the daemon against Postgres
+with `ai-memory serve --store-url postgres://…`. See
+`docs/RUNBOOK-adapter-selection.md`.
 
 ## Scope (Task 1.5)
 
@@ -205,16 +232,19 @@ collective everywhere.
 
 ## Source
 
-String tag on a memory indicating where it came from. Values:
-`user`, `claude`, `hook`, `api`, `cli`, `sync`, `import`, `mine`,
-`consolidate`, `autonomous`. Used by admins for filtering and by the
+String tag on a memory indicating where it came from. Canonical
+allowlist (`VALID_SOURCES` in `src/validate.rs`): `user`, `nhi`
+(v0.7.x vendor-neutral NHI default), `claude` (deprecated back-compat,
+removal in v0.8.x), `hook`, `api`, `cli`, `import`, `consolidation`,
+`system`, `chaos`, `notify`. Used by admins for filtering and by the
 curator to avoid recursive tagging of its own outputs.
 
 ## Sync-daemon
 
-One-way peer-to-peer knowledge mesh (pre-v0.7). Configured via
-`ai-memory sync-daemon --peers URL,URL`. Pulls and pushes periodically;
-no quorum, no acks. For synchronous federation use `serve
+Background peer-to-peer knowledge mesh (pre-v0.7 primitive, still
+shipped). Configured via `ai-memory sync-daemon --peers URL,URL`.
+Pulls and pushes periodically (eventual consistency); no quorum, no
+synchronous acks. For synchronous quorum writes use `serve
 --quorum-writes` (v0.7).
 
 ## Tags

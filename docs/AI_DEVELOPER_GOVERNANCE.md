@@ -160,7 +160,7 @@ nominally consenting in chat:
    `require_code_owner_reviews`, and `require_last_push_approval` remain active and
    are satisfied by the admin-merge mechanism, not bypassed.
 8. Cut a release: tag `v*`, push to `main`, publish to crates.io, push images, or
-   update the Homebrew tap / PPA / COPR.
+   update the Homebrew tap / .deb / COPR.
 9. Commit secrets, tokens, private keys, or credentials of any kind.
 10. Upload repository code or memory contents to any third-party service (gist,
     pastebin, diagramming tool, hosted RAG, public LLM playground) without explicit

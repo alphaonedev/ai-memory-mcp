@@ -46,6 +46,12 @@ fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
     // H11 (#628 blocker): wiremock binds to 127.0.0.1; loopback
     // webhook URLs are rejected by default, so opt in here.
     ai_memory::config::set_allow_loopback_webhooks(true);
+    // Pay the one-time reqwest::blocking TLS-connector cold init here,
+    // synchronously in setup, so it lands BEFORE the timed
+    // `poll_for_first_request` window rather than inside the dispatch
+    // worker's ACK_TIMEOUT retry budget. See
+    // `ai_memory::subscriptions::prewarm_dispatch_tls`.
+    ai_memory::subscriptions::prewarm_dispatch_tls();
     let f = NamedTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
@@ -137,15 +143,22 @@ async fn k7_hmac_signature_header_present_when_global_secret_configured() {
     // carries a `x-ai-memory-signature: sha256=<hex>` header even
     // though the subscription itself was unsigned.
     // ----------------------------------------------------------------
-    let server = MockServer::start().await;
+    // #1201 — dedicated TcpListener + UUID-suffixed path keeps the
+    // mock server out of wiremock's MOCK_SERVER_POOL and ensures
+    // straggler dispatches from prior tests can't land on a
+    // recycled port + path collision.
+    let listener = fresh_mock_listener_1201();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/k7-hmac/{unique}");
     Mock::given(method("POST"))
-        .and(path("/k7-hmac"))
+        .and(path(path_str.clone()))
         .respond_with(AckEcho)
         .mount(&server)
         .await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/k7-hmac", server.uri());
+    let url = format!("{}{}", server.uri(), path_str);
     let _sub_id = {
         let conn = Connection::open(&db_path).unwrap();
         subscriptions::insert(
@@ -182,8 +195,9 @@ async fn k7_hmac_signature_header_present_when_global_secret_configured() {
         );
     }
 
-    // Poll the mock server for ~5s for the dispatch thread to land.
-    let req: Request = poll_for_first_request(&server).await;
+    // Poll the mock server for ~5s for the dispatch thread to land
+    // a request on OUR per-test path (#1201 — straggler-resilient).
+    let req: Request = poll_for_first_request(&server, &path_str).await;
 
     // The header must be present and shaped `sha256=<64-hex-chars>`.
     let sig_header = req
@@ -234,23 +248,33 @@ async fn k7_hmac_signature_header_present_when_global_secret_configured() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn k7_hmac_unset_means_unsigned_payload_when_no_per_sub_secret() {
+async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
+    // R3-S1.HMAC (v0.7.0 fix campaign 2026-05-13): the dispatcher
+    // refuses to deliver an unsigned payload. With no per-sub secret
+    // AND no server-wide override the dispatch must NOT reach the
+    // wiremock — instead it lands a DLQ row with an explicit
+    // "dispatch refused" error message.
+    //
+    // Replaces the legacy "unsigned dispatch is allowed" sanity
+    // counter-test that pinned the v0.6 posture pre-fix.
     let _guard = K7_HMAC_GLOBAL_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Sanity counter-test: when neither the per-subscription secret
-    // nor the K7 global override is set, the payload is unsigned
-    // (preserves pre-K7 behaviour).
-    let server = MockServer::start().await;
+    // #1201 — dedicated TcpListener + UUID-suffixed path keeps the
+    // mock server out of wiremock's MOCK_SERVER_POOL.
+    let listener = fresh_mock_listener_1201();
+    let server = MockServer::builder().listener(listener).start().await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/k7-unsigned/{unique}");
     Mock::given(method("POST"))
-        .and(path("/k7-unsigned"))
+        .and(path(path_str.clone()))
         .respond_with(AckEcho)
         .mount(&server)
         .await;
 
     let (_keep, db_path) = fresh_db();
-    let url = format!("{}/k7-unsigned", server.uri());
-    let _sub_id = {
+    let url = format!("{}{}", server.uri(), path_str);
+    let sub_id = {
         let conn = Connection::open(&db_path).unwrap();
         subscriptions::insert(
             &conn,
@@ -281,24 +305,83 @@ async fn k7_hmac_unset_means_unsigned_payload_when_no_per_sub_secret() {
         );
     }
 
-    let req: Request = poll_for_first_request(&server).await;
+    // Poll: the wiremock must NOT see any request, AND a DLQ row
+    // must materialise with the "dispatch refused" error.
+    let path_for_poll = db_path.clone();
+    let sub_for_poll = sub_id.clone();
+    let dlq_outcome = tokio::task::spawn_blocking(move || {
+        for _ in 0..40 {
+            let conn = Connection::open(&path_for_poll).unwrap();
+            let entries = subscriptions::list_dlq(&conn, Some(&sub_for_poll)).unwrap();
+            if !entries.is_empty() {
+                return Some(entries);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    })
+    .await
+    .unwrap();
+
+    // #1201 — filter by per-test path to be robust against any
+    // straggler from a sibling test landing on this server even if
+    // port reuse aligned (with the dedicated listener, this is now
+    // essentially impossible — the filter is defense in depth).
+    let received: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() == path_str)
+        .collect();
     assert!(
-        req.headers.get("x-ai-memory-signature").is_none(),
-        "signature header must be absent when no per-sub secret AND no global override"
+        received.is_empty(),
+        "dispatcher must NOT post an unsigned body — got {} request(s)",
+        received.len()
+    );
+    let dlq = dlq_outcome.expect("DLQ row must materialise for refused dispatch");
+    assert_eq!(dlq.len(), 1, "exactly one DLQ row");
+    assert!(
+        dlq[0].last_error.contains("dispatch refused")
+            || dlq[0].last_error.contains("R3-S1.HMAC")
+            || dlq[0].last_error.contains("hmac_secret"),
+        "DLQ row must carry an explicit refusal message: {}",
+        dlq[0].last_error
     );
 }
 
 /// Poll the wiremock server for ~5s waiting for at least one request to
-/// land. Panics on timeout so the failure mode is loud.
-async fn poll_for_first_request(server: &MockServer) -> Request {
+/// land on `expected_path`. Panics on timeout so the failure mode is
+/// loud. The path filter (#1201) makes the poll resilient to
+/// stragglers from concurrent webhook tests in the same binary.
+async fn poll_for_first_request(server: &MockServer, expected_path: &str) -> Request {
     for _ in 0..50 {
         let received = server.received_requests().await.unwrap_or_default();
-        if let Some(req) = received.into_iter().next() {
+        if let Some(req) = received.into_iter().find(|r| r.url.path() == expected_path) {
             return req;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("K7 dispatch thread never reached wiremock");
+}
+
+/// #1201 — bind a fresh `127.0.0.1:0` `TcpListener` for use with
+/// `MockServer::builder().listener(...)`. Bypasses wiremock's internal
+/// `MOCK_SERVER_POOL` so the ephemeral port the kernel hands us
+/// cannot be reassigned for the duration of the test. Retries on
+/// transient EADDRINUSE.
+fn fresh_mock_listener_1201() -> std::net::TcpListener {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => return l,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    panic!("#1201: failed to bind ephemeral port for mock after 5 attempts: {last_err:?}");
 }
 
 /// Independent reference implementation of the K7 canonical signature

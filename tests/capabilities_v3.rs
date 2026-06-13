@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! Integration tests for the **Capabilities v3 schema** — A1+A2 increments
 //! of the v0.7.0 `attested-cortex` epic (track A, issue #545).
 //!
@@ -30,16 +32,22 @@
 //!   so a miswired caller fails loud rather than serving a stale shape.
 //! - v2 callers see no behavior change (backward compat).
 
-use ai_memory::config::{Capabilities, CapabilitiesV3, FeatureTier, McpConfig, TierConfig};
+use ai_memory::config::{
+    Capabilities, CapabilitiesV3, FeatureTier, McpConfig, ResolvedModels, TierConfig,
+};
 use ai_memory::harness::Harness;
 use ai_memory::mcp::{
     CapabilitiesAccept, build_agent_permitted_families, build_capabilities_describe_to_user,
     build_capabilities_summary, build_capabilities_tools, handle_capabilities_with_conn,
     handle_capabilities_with_conn_v3,
 };
+use ai_memory::models::ConfidenceSource;
 use ai_memory::profile::Profile;
 use serde_json::Value;
 use std::collections::HashMap;
+
+mod common;
+use common::{describe_counts, fresh_conn};
 
 /// v0.7.0 A3 — build a minimal `[mcp.allowlist]` table for tests.
 fn allowlist(rows: &[(&str, &[&str])]) -> McpConfig {
@@ -53,13 +61,8 @@ fn allowlist(rows: &[(&str, &[&str])]) -> McpConfig {
     McpConfig {
         profile: None,
         allowlist: Some(map),
+        ..McpConfig::default()
     }
-}
-
-/// Build a fresh in-memory `rusqlite::Connection` so each test gets a
-/// clean DB state for the live-count overlays.
-fn fresh_conn() -> rusqlite::Connection {
-    ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 
 fn semantic_tier() -> TierConfig {
@@ -104,6 +107,7 @@ fn cap_v3_legacy_entry_point_refuses_v3() {
     let conn = fresh_conn();
     let err = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -127,6 +131,7 @@ fn cap_v3_response_carries_schema_version_and_summary() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -169,18 +174,26 @@ fn cap_v3_response_carries_schema_version_and_summary() {
 fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
     let summary = build_capabilities_summary(&Profile::core());
 
-    // Visible = 7 core (with v0.7 B1 memory_load_family + v0.7 B2
-    // memory_smart_load) + 1 always-on (`memory_capabilities` lives in
-    // Family::Meta which the core profile doesn't load, so the
-    // bootstrap injection adds it back).
+    // Round-2 F13 — summary now reports the substantive "memory tool"
+    // count (excluding the always-on `memory_capabilities` bootstrap)
+    // so it agrees with `build_capabilities_describe_to_user`'s
+    // "{n_loaded} memory tool{s}" phrasing. Core profile loads
+    // `Family::Core` (7 tools) and does NOT load `Family::Meta`, so
+    // visible memory tools = 7 (the bootstrap is plumbing, not a
+    // memory tool). Total memory tools = 61 - 1 = 60 (60 substantive;
+    // bumped via v0.7.0 L1-5 5×memory_skill_* + v0.7.0 L2-7
+    // memory_skill_compositional_context).
+    let (n_core, n_core_unloaded) = describe_counts(&Profile::core());
+    let (n_full, _) = describe_counts(&Profile::full());
     assert!(
-        summary.starts_with("8 of 51 tools"),
-        "core profile summary should open with \"8 of 51 tools\"; got: {summary}"
+        summary.starts_with(&format!("{n_core} of {n_full} memory tools")),
+        "core profile summary should open with \"{n_core} of {n_full} memory tools\" \
+         (Round-2 F13; counts SSOT-derived from Family::tool_names); got: {summary}"
     );
     assert!(summary.contains("(core)"), "must label the profile as core");
     assert!(
-        summary.contains("43 are listed in this manifest"),
-        "core profile must report 43 unloaded (51 - 8); got: {summary}"
+        summary.contains(&format!("{n_core_unloaded} are listed in this manifest")),
+        "core profile must report {n_core_unloaded} unloaded ({n_full} - {n_core}); got: {summary}"
     );
 
     // Three named recovery paths must all appear (verbatim names — these
@@ -209,9 +222,19 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
 fn cap_v3_summary_full_profile_reports_all_visible() {
     let summary = build_capabilities_summary(&Profile::full());
 
+    // Round-2 F13 — summary aligns with describe_to_user's "all 56
+    // memory tools" phrasing. Full profile loads every family
+    // (visible = 56 substantive memory tools; the
+    // `memory_capabilities` bootstrap is excluded from the count to
+    // match the user-facing string). v0.7.0 L1-5 added
+    // 5 memory_skill_* tools to Family::Other, bumping the substantive
+    // total from 51 to 56.
+    let (n_full, n_full_unloaded) = describe_counts(&Profile::full());
+    assert_eq!(n_full_unloaded, 0, "full profile must load every family");
     assert!(
-        summary.starts_with("51 of 51 tools"),
-        "full profile summary should open with \"51 of 51 tools\"; got: {summary}"
+        summary.starts_with(&format!("{n_full} of {n_full} memory tools")),
+        "full profile summary should open with \"{n_full} of {n_full} memory tools\" \
+         (Round-2 F13; counts SSOT-derived from Family::tool_names); got: {summary}"
     );
     assert!(summary.contains("(full)"));
     assert!(
@@ -233,12 +256,20 @@ fn cap_v3_summary_full_profile_reports_all_visible() {
 #[test]
 fn cap_v3_summary_graph_profile_counts() {
     let summary = build_capabilities_summary(&Profile::graph());
+    // Round-2 F13 — summary uses substantive "memory tool" count.
+    // Graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) = 18
+    // memory tools. Total = 55 (56 - bootstrap; v0.7.0 L1-5 added 5
+    // memory_skill_* tools to Family::Other, bumping total from 51 to 56).
+    let (n_graph, n_graph_unloaded) = describe_counts(&Profile::graph());
+    let (n_full, _) = describe_counts(&Profile::full());
     assert!(
-        summary.starts_with("19 of 51 tools"),
-        "graph profile = 7 core (v0.7 B1+B2) + 11 graph (v0.7 J7) + 1 always-on bootstrap = 19; got: {summary}"
+        summary.starts_with(&format!("{n_graph} of {n_full} memory tools")),
+        "graph profile summary should open with \"{n_graph} of {n_full} memory tools\" \
+         (Round-2 F13: bootstrap excluded; counts SSOT-derived from \
+         Family::tool_names); got: {summary}"
     );
     assert!(summary.contains("(graph)"));
-    assert!(summary.contains("32 are listed in this manifest"));
+    assert!(summary.contains(&format!("{n_graph_unloaded} are listed in this manifest")));
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +317,7 @@ fn cap_v3_response_carries_to_describe_to_user() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -319,34 +351,27 @@ fn cap_v3_response_carries_to_describe_to_user() {
 #[test]
 fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
     let describe = build_capabilities_describe_to_user(&Profile::core());
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::core());
 
     // Opens with the canonical "I can directly use N memory tool(s)"
-    // form. v0.7 B1 + B2 — Core gained memory_load_family +
-    // memory_smart_load so loaded count is now 7, and the preview
-    // overflows the 5-name cap (ends in ", ...").
+    // form. Core's loaded count (original 5 + B1 memory_load_family +
+    // B2 memory_smart_load) overflows the 5-name preview cap, so the
+    // preview ends in ", ...". The count is SSOT-derived, not literal.
     assert!(
-        describe.starts_with("I can directly use 7 memory tools right now ("),
+        describe.starts_with(&format!(
+            "I can directly use {n_loaded} memory tools right now ("
+        )),
         "core profile describe must open canonically; got: {describe}"
     );
     // Loaded preview lists the first 5 core tool names with the
     // memory_ prefix STRIPPED (no MCP jargon for end users), followed
-    // by ", ..." since core now ships 7 tools (v0.7 B1 + B2).
+    // by ", ..." since core ships more than the 5-name preview cap.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    // Reports the unloaded count. 43 = 50 user-relevant tools − 7
-    // core. (50 = 51 total tools − 1 always-on bootstrap.) The
-    // bootstrap (`memory_capabilities`) is excluded from both sides
-    // for honest user-facing counting. Total bumped to 44 in v0.7.0
-    // I4 (Family::Graph gained `memory_replay`), to 45 in v0.7 H4
-    // (Family::Graph gained `memory_verify`), to 46 in v0.7 B1
-    // (Family::Core gained `memory_load_family`), to 48 in v0.7
-    // K7 (Family::Power gained `memory_subscription_replay` +
-    // `memory_subscription_dlq_list`), to 49 in v0.7 J7 (Family::Graph
-    // gained `memory_find_paths`), to 50 in v0.7 B2 (Family::Core
-    // gained `memory_smart_load`), and to 51 in v0.7 K8 (Family::Power
-    // gained `memory_quota_status`).
+    // Reports the SSOT-derived unloaded count (every non-core family's
+    // tools minus the always-on bootstrap).
     assert!(
-        describe.contains("43 more"),
-        "core profile must report 43 unloaded; got: {describe}"
+        describe.contains(&format!("{n_unloaded} more")),
+        "core profile must report {n_unloaded} unloaded (SSOT total - loaded); got: {describe}"
     );
     // Sample of unloaded tools is plain (no memory_ prefix). The first
     // four unloaded under core are lifecycle's update/delete/forget/gc.
@@ -369,7 +394,7 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 }
 
 // ---------------------------------------------------------------------------
-// A2: to_describe_to_user on `full` profile reports all 50 tools loaded
+// A2: to_describe_to_user on `full` profile reports all 51 tools loaded
 // (ALWAYS_ON_TOOLS bootstrap is excluded from the user-facing count) and
 // uses the "nothing more to load" closing form rather than the recovery
 // hint. (Bumped from 42 to 43 in v0.7.0 I4 — Family::Graph gained
@@ -384,18 +409,15 @@ fn cap_v3_describe_core_profile_is_plain_english_with_loaded_names() {
 #[test]
 fn cap_v3_describe_full_profile_uses_nothing_more_form() {
     let describe = build_capabilities_describe_to_user(&Profile::full());
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::full());
 
-    // 50 = 51 total - 1 always-on bootstrap excluded from describe.
-    // Bumped from 42 to 43 in v0.7.0 I4 (Family::Graph gained
-    // `memory_replay`); 43 to 44 in v0.7 H4 (Family::Graph gained
-    // `memory_verify`); 44 to 45 in v0.7 B1 (Family::Core gained
-    // `memory_load_family`); 45 to 47 in v0.7 K7 (Family::Power
-    // gained `memory_subscription_replay` + `memory_subscription_dlq_list`);
-    // 47 to 48 in v0.7 J7 (Family::Graph gained `memory_find_paths`);
-    // 48 to 49 in v0.7 B2 (Family::Core gained `memory_smart_load`);
-    // 49 to 50 in v0.7 K8 (Family::Power gained `memory_quota_status`).
+    // "all N" = the full substantive surface (every family's tools
+    // minus the always-on bootstrap); SSOT-derived, not literal.
+    assert_eq!(n_unloaded, 0, "full profile must load every family");
     assert!(
-        describe.starts_with("I can directly use all 50 memory tools right now ("),
+        describe.starts_with(&format!(
+            "I can directly use all {n_loaded} memory tools right now ("
+        )),
         "full profile describe must open with all-loaded form; got: {describe}"
     );
     assert!(describe.contains("Nothing more to load"));
@@ -412,13 +434,17 @@ fn cap_v3_describe_full_profile_uses_nothing_more_form() {
 #[test]
 fn cap_v3_describe_graph_profile_uses_preview_ellipsis() {
     let describe = build_capabilities_describe_to_user(&Profile::graph());
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::graph());
     assert!(
-        describe.starts_with("I can directly use 18 memory tools right now ("),
-        "graph profile describe should open with 18 loaded; got: {describe}"
+        describe.starts_with(&format!(
+            "I can directly use {n_loaded} memory tools right now ("
+        )),
+        "graph profile describe should open with {n_loaded} loaded; got: {describe}"
     );
-    // Preview is the first 5 of the 18 loaded — the first 5 core tools.
+    // Preview is the first 5 of the loaded set — the first 5 core tools.
     assert!(describe.contains("(store, recall, list, get, search, ...)"));
-    assert!(describe.contains("32 more"));
+    // "N more" = SSOT substantive total - loaded.
+    assert!(describe.contains(&format!("{n_unloaded} more")));
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +457,7 @@ fn cap_v3_preserves_v2_sub_blocks() {
     let conn = fresh_conn();
     let val: Value = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true, // embedder loaded
         Some(&conn),
@@ -459,6 +486,7 @@ fn cap_v3_v2_callers_unaffected_by_a1() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -574,23 +602,20 @@ fn cap_v3_a3_allowlist_on_agent_denied_callable_now_false() {
 
 // ---------------------------------------------------------------------------
 // A3 — the v3 response surfaces the `tools` array at the top level
-// with one entry per registered tool (51 + always-on bootstrap counted
-// once = 51, since the bootstrap already lives in Family::Meta).
-// (Bumped from 43 to 44 in v0.7.0 I4 — Family::Graph gained
-// `memory_replay`; 44 to 45 in v0.7 H4 — Family::Graph gained
-// `memory_verify`; 45 to 46 in v0.7 B1 — Family::Core gained
-// `memory_load_family`; 46 to 48 in v0.7 K7 — Family::Power gained
-// `memory_subscription_replay` + `memory_subscription_dlq_list`;
-// 48 to 49 in v0.7 J7 — Family::Graph gained `memory_find_paths`;
-// 49 to 50 in v0.7 B2 — Family::Core gained `memory_smart_load`;
-// 50 to 51 in v0.7 K8 — Family::Power gained `memory_quota_status`.)
+// with one entry per registered tool (56 + always-on bootstrap counted
+// once = 57, since the bootstrap already lives in Family::Meta).
+// (Bumped from 51 to 52 in v0.7.0 Task 4/8 — Family::Power gained
+// `memory_reflect`; 52 to 57 in v0.7.0 L1-5 — Family::Other gained
+// 5 memory_skill_* tools: memory_skill_register, memory_skill_list,
+// memory_skill_get, memory_skill_resource, memory_skill_export.)
 // ---------------------------------------------------------------------------
 #[test]
-fn cap_v3_response_carries_tools_array_with_51_entries() {
+fn cap_v3_response_carries_tools_array_with_73_entries() {
     let tier_config = semantic_tier();
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -606,12 +631,10 @@ fn cap_v3_response_carries_tools_array_with_51_entries() {
         .expect("top-level tools must be present and an array under v3");
     assert_eq!(
         tools.len(),
-        51,
-        "v3 must surface all 51 tools regardless of profile (v0.7.0 I4 added \
-         memory_replay; v0.7 H4 added memory_verify; v0.7 B1 added \
-         memory_load_family; v0.7 B2 added memory_smart_load; v0.7 K7 added \
-         memory_subscription_replay + memory_subscription_dlq_list; v0.7 J7 \
-         added memory_find_paths; v0.7 K8 added memory_quota_status); got {}",
+        Profile::full().expected_tool_count(),
+        "v3 must surface every tool regardless of profile; canonical \
+         count is `Profile::full().expected_tool_count()` (SSOT-derived \
+         from the per-family tool_names slices); got {}",
         tools.len()
     );
 
@@ -651,6 +674,7 @@ fn cap_v3_a4_allowlist_disabled_omits_field() {
     let cfg = McpConfig {
         profile: None,
         allowlist: Some(HashMap::new()),
+        ..McpConfig::default()
     };
     assert_eq!(
         build_agent_permitted_families(Some(&cfg), Some("alice")),
@@ -664,6 +688,7 @@ fn cap_v3_a4_allowlist_disabled_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -707,6 +732,7 @@ fn cap_v3_a4_allowlist_with_agent_lists_families() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -738,6 +764,7 @@ fn cap_v3_a4_allowlist_no_agent_id_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -767,6 +794,7 @@ fn cap_v3_b4_claude_code_harness_advertises_deferred_true() {
     let harness = Harness::ClaudeCode;
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -797,6 +825,7 @@ fn cap_v3_b4_codex_harness_advertises_deferred_false() {
     let harness = Harness::Codex;
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -827,6 +856,7 @@ fn cap_v3_b4_no_harness_omits_field_from_wire() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -856,6 +886,7 @@ fn cap_v3_b4_generic_harness_defaults_deferred_false() {
     let harness = Harness::Generic("some-unknown-mcp-client".to_string());
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -884,6 +915,7 @@ fn cap_v3_b4_v2_callers_unaffected() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -945,6 +977,18 @@ fn seed_governance_policy(
         last_accessed_at: None,
         expires_at: None,
         metadata,
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
     };
     let standard_id = ai_memory::db::insert(conn, &standard).unwrap();
     ai_memory::db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();
@@ -960,6 +1004,7 @@ fn cap_v3_k5_rule_summary_empty_state_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -985,21 +1030,26 @@ fn cap_v3_k5_rule_summary_empty_state_omits_field() {
 /// format an LLM/operator can parse without an extra round-trip.
 #[test]
 fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
-    use ai_memory::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+    use ai_memory::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
 
     let tier_config = semantic_tier();
     let conn = fresh_conn();
     let policy = GovernancePolicy {
-        write: GovernanceLevel::Approve,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
+        core: CorePolicy {
+            write: GovernanceLevel::Approve,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     };
     seed_governance_policy(&conn, "team", &policy);
 
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1053,25 +1103,33 @@ fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
 /// builder.
 #[test]
 fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
-    use ai_memory::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+    use ai_memory::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
 
     let tier_config = semantic_tier();
     let conn = fresh_conn();
     // Seed in deliberately non-lex order so a buggy implementation
     // that preserves insertion order would fail this test.
     let zeta = GovernancePolicy {
-        write: GovernanceLevel::Owner,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Agent("maintainer".to_string()),
-        inherit: false,
+        core: CorePolicy {
+            write: GovernanceLevel::Owner,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Agent("maintainer".to_string()),
+            inherit: false,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     };
     let alpha = GovernancePolicy {
-        write: GovernanceLevel::Any,
-        promote: GovernanceLevel::Approve,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Consensus(3),
-        inherit: true,
+        core: CorePolicy {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Approve,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Consensus(3),
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     };
     let middle = GovernancePolicy::default();
     seed_governance_policy(&conn, "zeta", &zeta);
@@ -1080,6 +1138,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
 
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1146,6 +1205,7 @@ fn cap_v3_k5_v2_callers_see_omitted_field_when_empty() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -1157,4 +1217,86 @@ fn cap_v3_k5_v2_callers_see_omitted_field_when_empty() {
         "K5: v2 wire shape must keep the empty-state honesty disclosure \
          (rule_summary omitted when no policies); got: {val}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #545 verification — consolidated acceptance check.
+//
+// Issue #545 enumerated four ACs (all already pinned by the A1-A4 cells
+// above). This test consolidates them into a single response so a future
+// reader who lands on #545 can see the contract at a glance.
+//
+//   1. memory_capabilities(accept="v3") includes `summary`,
+//      `to_describe_to_user`, and (when allowlist applies)
+//      `agent_permitted_families` at the top level.
+//   2. Each tool object adds `callable_now: bool` alongside `loaded`.
+//   3. Schema bumped to "3" with v2 response shape preserved.
+//   4. Substrate-side calibration (loaded vs total counts) is
+//      pre-computed, not left for the LLM to infer.
+// ---------------------------------------------------------------------------
+#[test]
+fn issue_545_v3_response_carries_all_four_calibration_fields() {
+    let tier_config = semantic_tier();
+    let conn = fresh_conn();
+    let cfg = allowlist(&[("alice", &["core", "graph"])]);
+    let val = handle_capabilities_with_conn_v3(
+        &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
+        None,
+        false,
+        Some(&conn),
+        &Profile::core(),
+        Some(&cfg),
+        Some("alice"),
+        None,
+    )
+    .expect("v3 capabilities serialize for issue #545 acceptance");
+
+    // AC3 — schema_version is "3".
+    assert_eq!(
+        val["schema_version"], "3",
+        "#545 AC3: schema_version must be \"3\""
+    );
+
+    // AC1 — top-level summary present and non-empty.
+    let summary = val["summary"]
+        .as_str()
+        .expect("#545 AC1: top-level `summary` must be a string");
+    assert!(!summary.is_empty(), "#545 AC1: summary must be non-empty");
+    // AC4 — pre-computed counts in summary (substrate did the math).
+    assert!(
+        summary.contains(" of ") && summary.contains("memory tools"),
+        "#545 AC4: summary must pre-compute loaded vs total counts; got: {summary}"
+    );
+
+    // AC1 — to_describe_to_user present and non-empty.
+    let describe = val["to_describe_to_user"]
+        .as_str()
+        .expect("#545 AC1: `to_describe_to_user` must be a string");
+    assert!(!describe.is_empty(), "#545 AC1: describe must be non-empty");
+
+    // AC1 — agent_permitted_families surfaced when allowlist applies.
+    let permitted = val["agent_permitted_families"]
+        .as_array()
+        .expect("#545 AC1: agent_permitted_families must surface when allowlist applies");
+    assert!(
+        permitted.iter().any(|v| v == "core"),
+        "#545 AC1: alice should be permitted `core`; got: {permitted:?}"
+    );
+
+    // AC2 — every tool entry carries callable_now alongside loaded.
+    let tools = val["tools"]
+        .as_array()
+        .expect("#545 AC2: top-level `tools` array required");
+    assert!(!tools.is_empty(), "#545 AC2: tools array must be populated");
+    for tool in tools {
+        assert!(
+            tool["callable_now"].is_boolean(),
+            "#545 AC2: every tool entry must carry callable_now (bool); got: {tool:?}"
+        );
+        assert!(
+            tool["loaded"].is_boolean(),
+            "#545 AC2: every tool entry must keep `loaded` alongside callable_now"
+        );
+    }
 }

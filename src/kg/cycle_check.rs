@@ -1,0 +1,591 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Anti-self-reflection cycle detection for `reflects_on` edges.
+//!
+//! The `reflects_on` relation is directional: `A reflects_on B` means "A was
+//! derived from B". A cycle in this relation — e.g. `A → B → A` — is a
+//! logical contradiction (A derived from B which was derived from A) and must
+//! be refused before the edge is persisted.
+//!
+//! [`would_create_reflection_cycle`] performs a bounded backward walk from
+//! `target_id` following `reflects_on` edges, returning `true` when `source_id`
+//! is reachable (cycle detected) or `false` otherwise. The walk is bounded by
+//! `max_depth` to prevent runaway traversal in deep reflection graphs;
+//! [`cycle_path`] carries the walk log for the refusal audit row.
+
+use rusqlite::{Connection, params};
+
+/// Safety ceiling applied when a caller passes `max_depth = 0` (i.e. no
+/// explicit cap). The policy default for reflection depth lives elsewhere —
+/// see `GovernancePolicy::effective_max_reflection_depth()` for the runtime
+/// value the orchestration layer hands the cycle-check walk. This constant
+/// is intentionally larger than that policy default so it never silently
+/// truncates legitimate walks; it exists solely so an unset/zero cap can
+/// still bound a pathological reflection graph.
+const DEFAULT_MAX_DEPTH: u32 = 16;
+
+/// Headroom multiplier applied to the caller's `max_depth` to derive the
+/// walk's hard ceiling. A legal `reflects_on` graph is a DAG whose
+/// longest path is bounded by the namespace's
+/// `effective_max_reflection_depth` (the link-write path refuses edges
+/// that would exceed it), so doubling that depth gives a legitimate deep
+/// chain enough room to fully resolve (frontier empties) before the
+/// ceiling is reached. Only an already-over-deep / corrupt graph can
+/// reach `max_depth * CYCLE_DEPTH_SAFETY_FACTOR` with nodes still
+/// unexplored — and that case fails CLOSED (see
+/// [`would_create_reflection_cycle`]).
+const CYCLE_DEPTH_SAFETY_FACTOR: u32 = 2;
+
+/// Result of a cycle-check walk: whether a cycle would be created, and if so,
+/// the full path from `source_id` back to `source_id` via `target_id`.
+///
+/// `cycle_path` is ordered `source_id → target_id → … → source_id`.  When
+/// `would_cycle` is `false`, `cycle_path` is empty.
+pub struct CycleCheckResult {
+    pub would_cycle: bool,
+    pub cycle_path: Vec<String>,
+}
+
+/// Walk `reflects_on` edges **forward** from `target_id`, bounded by
+/// `max_depth` hops.  Returns `true` when `source_id` is reachable from
+/// `target_id` by following existing edges (i.e. adding edge
+/// `source_id → target_id` would close a cycle).
+///
+/// The forward walk direction: a `reflects_on` edge `(source=A, target=B)`
+/// means "A reflects on B".  In graph terms the directed arc goes A → B.
+/// To detect if adding `source → target` creates a cycle we walk forward from
+/// `target` via existing edges and check whether we can reach `source`.  If
+/// yes, the proposed edge would close the loop.
+///
+/// Example: existing edges A→B and B→C.  Proposed: C→A.  Walk forward from A:
+///   hop 1: {B}  hop 2: {C}  — found A is not in the visited set.  But wait,
+///   we walk from `target` (A in the proposed C→A), forward, and check if
+///   we find `source` (C).  Hop 1 from A: B.  Hop 2 from B: C.  C == source!
+///   Cycle detected.
+///
+/// Returns a [`CycleCheckResult`] with `would_cycle = true` and the full path
+/// when a cycle is found, or `would_cycle = false` with an empty path
+/// otherwise.
+///
+/// # Errors
+///
+/// v0.7.0 #1090 (SR-2 #5, MEDIUM): SQL failures during the walk now
+/// propagate as `Err` (fail-CLOSED) to match the #1053 / #1054
+/// policy. Pre-#1090 a transient `SQLITE_BUSY` during the walk was
+/// silently treated as "no cycle, continue" — letting the substrate
+/// land a `reflects_on` edge that closes a cycle when the DB was
+/// briefly stressed. The cycle check is a substrate-level governance
+/// gate; under load it MUST fail-CLOSED so an adversary cannot ride
+/// transient DB pressure to slip a logically-invalid edge past the
+/// gate. Callers wrap the err in a refusal envelope (`db::create_link`
+/// surfaces it directly via `?`).
+///
+/// # Depth-bound (fail-CLOSED on truncation)
+///
+/// v0.7.0 SR — the walk is bounded at
+/// `max_depth * `[`CYCLE_DEPTH_SAFETY_FACTOR`] hops. Pre-fix, reaching
+/// the bound with unexplored nodes still in the frontier returned
+/// `would_cycle = false` — a **false negative** that let a cycle which
+/// closes beyond the bound slip past the gate. A legal `reflects_on`
+/// DAG can never have a path longer than `max_depth`, and the safety
+/// factor gives a legitimate deep chain room to resolve fully before
+/// the ceiling, so a still-non-empty frontier at the ceiling means the
+/// existing graph is already over-deep (corrupt) — the walk now fails
+/// CLOSED (`would_cycle = true`) rather than silently allowing the
+/// edge. This trades a possible conservative refusal on an
+/// already-corrupt graph for the elimination of the silent-cycle
+/// false negative, matching the gate's fail-CLOSED posture.
+pub fn would_create_reflection_cycle(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    max_depth: u32,
+) -> rusqlite::Result<CycleCheckResult> {
+    would_create_reflection_cycle_with(source_id, target_id, max_depth, &mut |node| {
+        forward_neighbors(conn, node)
+    })
+}
+
+/// #1568 (H1 residual) — derive the walk's hard hop ceiling from the
+/// caller's `max_depth` (policy default applied on 0, then the
+/// [`CYCLE_DEPTH_SAFETY_FACTOR`] headroom). Exported so the postgres
+/// SAL adapter can pre-fetch exactly the bounded `reflects_on`
+/// subgraph the generic walker will explore.
+#[must_use]
+pub fn walk_bound(max_depth: u32) -> u32 {
+    let base = if max_depth == 0 {
+        DEFAULT_MAX_DEPTH
+    } else {
+        max_depth
+    };
+    base.saturating_mul(CYCLE_DEPTH_SAFETY_FACTOR)
+}
+
+/// #1568 (H1 residual) — backend-agnostic core of
+/// [`would_create_reflection_cycle`]. The BFS semantics (visited set,
+/// predecessor tracking, fail-CLOSED on depth-ceiling truncation, SQL
+/// errors propagated as `Err`) live HERE, once; backends supply only
+/// the `neighbors` lookup. The sqlite path passes a closure over
+/// `forward_neighbors(conn, _)`; the postgres SAL adapter pre-fetches
+/// the bounded `reflects_on` subgraph via a recursive CTE and passes a
+/// closure over the in-memory adjacency map — so the two adapters
+/// cannot drift on gate semantics.
+///
+/// # Errors
+///
+/// Propagates whatever error the `neighbors` lookup surfaces
+/// (fail-CLOSED — see [`would_create_reflection_cycle`]).
+pub fn would_create_reflection_cycle_with<E>(
+    source_id: &str,
+    target_id: &str,
+    max_depth: u32,
+    neighbors: &mut dyn FnMut(&str) -> Result<Vec<String>, E>,
+) -> Result<CycleCheckResult, E> {
+    // Direct self-link is already blocked by `validate_link`; handle it
+    // defensively here too so the audit path is always consistent.
+    if source_id == target_id {
+        return Ok(CycleCheckResult {
+            would_cycle: true,
+            cycle_path: vec![source_id.to_string(), target_id.to_string()],
+        });
+    }
+
+    let bound = walk_bound(max_depth);
+
+    // BFS / iterative DFS over the backward reflects_on graph.
+    // `visited` prevents revisiting nodes in diamond-shaped subgraphs.
+    // `path_map` tracks the predecessor for each visited node so we can
+    // reconstruct the cycle path if `source_id` is found.
+    let mut frontier: Vec<String> = vec![target_id.to_string()];
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // predecessor[node] = the node from which we first reached `node`
+    let mut predecessor: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    visited.insert(target_id.to_string());
+
+    let mut depth = 0u32;
+
+    while !frontier.is_empty() {
+        if depth >= bound {
+            // v0.7.0 SR — depth ceiling reached with nodes still
+            // unexplored. A legal DAG would have emptied the frontier
+            // by now (longest legal path <= max_depth, doubled for
+            // headroom), so the existing graph is over-deep / corrupt.
+            // Fail CLOSED: refuse rather than return the pre-fix
+            // false-negative `would_cycle = false`.
+            return Ok(CycleCheckResult {
+                would_cycle: true,
+                cycle_path: vec![source_id.to_string(), target_id.to_string()],
+            });
+        }
+        depth += 1;
+        let mut next_frontier: Vec<String> = Vec::new();
+
+        for current in &frontier {
+            // v0.7.0 #1090 — propagate lookup errors as Err. The forward
+            // walk is a substrate-level governance gate; a transient
+            // BUSY/LOCKED here MUST surface so the caller refuses the
+            // write rather than landing a logically-invalid edge.
+            let step = neighbors(current)?;
+
+            for neighbor in step {
+                if neighbor == source_id {
+                    // Cycle found: reconstruct path.
+                    let path = reconstruct_path(source_id, target_id, current, &predecessor);
+                    return Ok(CycleCheckResult {
+                        would_cycle: true,
+                        cycle_path: path,
+                    });
+                }
+                if visited.insert(neighbor.clone()) {
+                    predecessor.insert(neighbor.clone(), current.clone());
+                    next_frontier.push(neighbor);
+                }
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    Ok(CycleCheckResult {
+        would_cycle: false,
+        cycle_path: vec![],
+    })
+}
+
+/// Return the set of nodes reachable from `node` via `reflects_on` edges
+/// (i.e. the "targets" in rows where `source_id = node` and
+/// `relation = 'reflects_on'`).
+fn forward_neighbors(conn: &Connection, node: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT target_id FROM memory_links \
+         WHERE source_id = ?1 AND relation = 'reflects_on'",
+    )?;
+    let rows = stmt.query_map(params![node], |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Reconstruct the cycle path given the predecessor map.
+///
+/// The cycle is: `source_id → target_id → … → found_at → source_id`.
+/// We build the segment `target_id → … → found_at` by walking predecessors
+/// backward from `found_at` to `target_id`, then prepend `source_id` and
+/// append `source_id` again to close the loop.
+fn reconstruct_path(
+    source_id: &str,
+    target_id: &str,
+    found_at: &str,
+    predecessor: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    // Walk from `found_at` back to `target_id` using predecessor pointers.
+    let mut segment: Vec<String> = vec![found_at.to_string()];
+    let mut cur = found_at;
+    // Predecessor of `target_id` would be absent (it's the root of the
+    // backward walk), so this loop terminates.
+    while let Some(pred) = predecessor.get(cur) {
+        segment.push(pred.clone());
+        cur = pred;
+        if cur == target_id {
+            break;
+        }
+    }
+    segment.reverse();
+
+    // Full cycle: source → target → [middle] → found_at → source
+    let mut path = Vec::with_capacity(segment.len() + 2);
+    path.push(source_id.to_string());
+    path.extend(segment);
+    path.push(source_id.to_string());
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn open_db() -> Connection {
+        crate::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn insert_memory(conn: &Connection, id: &str) {
+        use crate::models::{Memory, Tier};
+        use chrono::Utc;
+        let now = Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: id.to_string(),
+            tier: Tier::Mid,
+            namespace: "test".to_string(),
+            title: format!("memory-{id}"),
+            content: "content".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"agent_id": "test-agent"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        };
+        crate::db::insert(conn, &mem).expect("insert memory");
+    }
+
+    fn add_reflects_on(conn: &Connection, source_id: &str, target_id: &str) {
+        crate::db::create_link(conn, source_id, target_id, "reflects_on")
+            .expect("create reflects_on link");
+    }
+
+    // ── #1568 (H1 residual) — backend-agnostic walker over an
+    // in-memory adjacency map, the exact shape the postgres SAL
+    // adapter feeds after its bounded recursive-CTE prefetch. Pins
+    // that the shared core detects cycles and fail-CLOSES on
+    // truncation independent of the rusqlite-bound wrapper.
+
+    fn map_neighbors<'a>(
+        adjacency: &'a std::collections::HashMap<&'static str, Vec<&'static str>>,
+    ) -> impl FnMut(&str) -> Result<Vec<String>, std::convert::Infallible> + 'a {
+        move |node: &str| {
+            Ok(adjacency
+                .get(node)
+                .map(|v| v.iter().map(ToString::to_string).collect())
+                .unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn generic_walker_detects_cycle_over_adjacency_map_1568() {
+        // Existing edges: a→b, b→c. Proposed c→a closes the loop.
+        let adjacency = std::collections::HashMap::from([("a", vec!["b"]), ("b", vec!["c"])]);
+        let mut neighbors = map_neighbors(&adjacency);
+        let hit = would_create_reflection_cycle_with("c", "a", 8, &mut neighbors).expect("ok");
+        assert!(hit.would_cycle, "c→a must close the a→b→c chain");
+        assert_eq!(hit.cycle_path, vec!["c", "a", "b", "c"]);
+
+        // Proposed x→a touches the chain but closes nothing.
+        let legal = would_create_reflection_cycle_with("x", "a", 8, &mut neighbors).expect("ok");
+        assert!(!legal.would_cycle);
+        assert!(legal.cycle_path.is_empty());
+    }
+
+    #[test]
+    fn generic_walker_fails_closed_on_truncation_1568() {
+        // Chain a→b→c→d→e→f→g; cap 2 → bound 4. The walk from g's
+        // perspective: proposed a→g, walk forward from g — frontier
+        // empties immediately (no out-edges from g), legal. Walk for
+        // proposed g→a: forward from a runs 6 hops > bound 4 with
+        // nodes still unexplored → fail CLOSED.
+        let adjacency = std::collections::HashMap::from([
+            ("a", vec!["b"]),
+            ("b", vec!["c"]),
+            ("c", vec!["d"]),
+            ("d", vec!["e"]),
+            ("e", vec!["f"]),
+            ("f", vec!["g"]),
+        ]);
+        let mut neighbors = map_neighbors(&adjacency);
+        let truncated =
+            would_create_reflection_cycle_with("g", "a", 2, &mut neighbors).expect("ok");
+        assert!(
+            truncated.would_cycle,
+            "ceiling reached with non-empty frontier must fail CLOSED"
+        );
+        // Same walk with a high cap resolves fully: g IS reachable
+        // from a, so the proposed g→a edge genuinely closes a cycle.
+        let resolved = would_create_reflection_cycle_with("g", "a", 8, &mut neighbors).expect("ok");
+        assert!(resolved.would_cycle);
+        // And a node OFF the chain with a high cap is legal.
+        let legal = would_create_reflection_cycle_with("zz", "a", 8, &mut neighbors).expect("ok");
+        assert!(!legal.would_cycle);
+    }
+
+    // ── Unit tests for the internal cycle-check machinery ─────────────
+
+    #[test]
+    fn no_edges_is_no_cycle() {
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        // No links yet — adding A→B is safe.
+        let result = would_create_reflection_cycle(&conn, "a", "b", 8).expect("ok");
+        assert!(!result.would_cycle);
+        assert!(result.cycle_path.is_empty());
+    }
+
+    #[test]
+    fn direct_cycle_detected() {
+        // Existing: B→A. Proposed: A→B. Would close A→B→A.
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        add_reflects_on(&conn, "b", "a"); // B reflects_on A
+
+        let result = would_create_reflection_cycle(&conn, "a", "b", 8).expect("ok");
+        assert!(
+            result.would_cycle,
+            "direct cycle A→B with B→A must be detected"
+        );
+        assert!(!result.cycle_path.is_empty());
+        // Path must start and end with source_id ("a")
+        assert_eq!(result.cycle_path.first().map(String::as_str), Some("a"));
+        assert_eq!(result.cycle_path.last().map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn indirect_cycle_detected() {
+        // Existing: A→B, B→C. Proposed: C→A. Would close C→A→B→C.
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        insert_memory(&conn, "c");
+        add_reflects_on(&conn, "a", "b"); // A reflects_on B
+        add_reflects_on(&conn, "b", "c"); // B reflects_on C
+
+        // Proposed: C reflects_on A
+        let result = would_create_reflection_cycle(&conn, "c", "a", 8).expect("ok");
+        assert!(
+            result.would_cycle,
+            "indirect cycle C→A with A→B→C must be detected"
+        );
+        assert!(!result.cycle_path.is_empty());
+        assert_eq!(result.cycle_path.first().map(String::as_str), Some("c"));
+        assert_eq!(result.cycle_path.last().map(String::as_str), Some("c"));
+    }
+
+    #[test]
+    fn non_cycle_succeeds() {
+        // Existing: A→B. Proposed: C→B. C is unrelated to A — no cycle.
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        insert_memory(&conn, "c");
+        add_reflects_on(&conn, "a", "b"); // A reflects_on B (existing)
+
+        // Adding C→B: walk backward from B finds A, not C. Safe.
+        let result = would_create_reflection_cycle(&conn, "c", "b", 8).expect("ok");
+        assert!(
+            !result.would_cycle,
+            "C→B with only A→B existing is not a cycle"
+        );
+        assert!(result.cycle_path.is_empty());
+    }
+
+    #[test]
+    fn legal_deep_chain_within_safety_headroom_resolves() {
+        // Chain: E→D→C→B→A (4 hops). Proposed: C→D is NOT a cycle (C already
+        // reflects_on B, and D is upstream of C). We pick a NON-cyclic deep
+        // probe to prove a legitimate chain whose longest path is within the
+        // caller's `max_depth` empties the frontier BEFORE the
+        // `max_depth * CYCLE_DEPTH_SAFETY_FACTOR` ceiling — i.e. the safety
+        // factor gives legal chains room to resolve without a false positive.
+        let conn = open_db();
+        for id in ["a", "b", "c", "d", "e"] {
+            insert_memory(&conn, id);
+        }
+        add_reflects_on(&conn, "e", "d");
+        add_reflects_on(&conn, "d", "c");
+        add_reflects_on(&conn, "c", "b");
+        add_reflects_on(&conn, "b", "a");
+
+        // Propose X→A where X is a fresh node unrelated to the chain. Walk
+        // forward from A finds nothing (A is the chain tail, no outgoing
+        // reflects_on), so the frontier empties immediately → no cycle, no
+        // ceiling hit, even at the smallest non-zero max_depth.
+        insert_memory(&conn, "x");
+        let legal = would_create_reflection_cycle(&conn, "x", "a", 1).expect("ok");
+        assert!(
+            !legal.would_cycle,
+            "a chain tail with no outgoing edges must resolve as no-cycle"
+        );
+        assert!(legal.cycle_path.is_empty());
+    }
+
+    // v0.7.0 SR — depth-bound false-negative fix. Pre-fix, a real cycle
+    // that closed BEYOND the bound returned `would_cycle = false` (a
+    // silent false negative that let the substrate land a cycle-creating
+    // `reflects_on` edge). Post-fix the walk fails CLOSED: reaching the
+    // `max_depth * CYCLE_DEPTH_SAFETY_FACTOR` ceiling with nodes still
+    // unexplored returns `would_cycle = true`.
+    #[test]
+    fn depth_bound_fails_closed_on_truncation() {
+        // Chain: G→F→E→D→C→B→A (6 hops). Proposed: A→G closes a 7-node cycle.
+        let conn = open_db();
+        for id in ["a", "b", "c", "d", "e", "f", "g"] {
+            insert_memory(&conn, id);
+        }
+        add_reflects_on(&conn, "g", "f");
+        add_reflects_on(&conn, "f", "e");
+        add_reflects_on(&conn, "e", "d");
+        add_reflects_on(&conn, "d", "c");
+        add_reflects_on(&conn, "c", "b");
+        add_reflects_on(&conn, "b", "a");
+
+        // max_depth=2 → ceiling = 2 * CYCLE_DEPTH_SAFETY_FACTOR = 4 hops.
+        // Walking forward from G reaches C at the ceiling with B, A still
+        // unexplored. Pre-fix this returned `would_cycle = false` (the real
+        // A→G…→A cycle slips past). Post-fix it fails CLOSED.
+        let truncated = would_create_reflection_cycle(&conn, "a", "g", 2).expect("ok");
+        assert!(
+            truncated.would_cycle,
+            "ceiling reached with unexplored frontier must fail CLOSED (would_cycle=true)"
+        );
+        assert!(
+            !truncated.cycle_path.is_empty(),
+            "fail-CLOSED result must carry a non-empty audit path"
+        );
+
+        // With max_depth=6 → ceiling = 12, the full chain resolves and the
+        // walk locates the actual cycle (not a ceiling fallback).
+        let resolved = would_create_reflection_cycle(&conn, "a", "g", 6).expect("ok");
+        assert!(
+            resolved.would_cycle,
+            "with adequate depth the real cycle must be detected"
+        );
+        assert_eq!(resolved.cycle_path.first().map(String::as_str), Some("a"));
+        assert_eq!(resolved.cycle_path.last().map(String::as_str), Some("a"));
+    }
+
+    // ---- C-5 (#699): close remaining gaps in cycle_check.rs.
+    // Targets: lines 70-73 (direct self-link defensive branch), line 77
+    // (`max_depth == 0` fallback to DEFAULT_MAX_DEPTH). ----
+
+    #[test]
+    fn direct_self_link_returns_cycle_with_two_node_path() {
+        // Lines 70-73: when source_id == target_id, the function bails
+        // immediately with would_cycle = true and a two-node path
+        // `[source, target]`. This is defensive coverage; the validator
+        // also blocks self-links upstream.
+        let conn = open_db();
+        insert_memory(&conn, "self");
+
+        let result = would_create_reflection_cycle(&conn, "self", "self", 8).expect("ok");
+        assert!(
+            result.would_cycle,
+            "direct self-link must be flagged as a cycle"
+        );
+        assert_eq!(
+            result.cycle_path,
+            vec!["self".to_string(), "self".to_string()]
+        );
+    }
+
+    #[test]
+    fn max_depth_zero_falls_back_to_default_bound() {
+        // Line 77: `max_depth == 0` triggers the `DEFAULT_MAX_DEPTH`
+        // fallback. We assert the function still detects a real cycle
+        // when the caller passes the sentinel `0` (i.e. "use default").
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        add_reflects_on(&conn, "b", "a"); // B reflects_on A
+
+        // Pass 0 to invoke the fallback branch.
+        let result = would_create_reflection_cycle(&conn, "a", "b", 0).expect("ok");
+        assert!(
+            result.would_cycle,
+            "max_depth=0 should fall back to DEFAULT_MAX_DEPTH and still detect the cycle"
+        );
+        assert!(!result.cycle_path.is_empty());
+    }
+
+    // v0.7.0 #1090 (SR-2 #5, MEDIUM) — fail-CLOSED: a forced SQL
+    // error during the forward walk propagates as Err rather than
+    // returning the misleading `would_cycle = false`.
+    //
+    // We seed a real cycle (B → A exists; proposed A → B) on a
+    // fresh DB so the walk WOULD detect it if it ran cleanly. Then
+    // we drop the `memory_links` table before the call so the
+    // walk's prepared SELECT hits a "no such table" rusqlite error
+    // — exactly the shape a transient corruption / BUSY / LOCKED
+    // would surface. Pre-#1090 the function would have logged
+    // `tracing::warn!` and returned `would_cycle = false` — letting
+    // the substrate land the cycle-creating edge under load. Post-
+    // #1090 the err propagates, the caller refuses the write.
+    #[test]
+    fn sql_error_fails_closed_1090() {
+        let conn = open_db();
+        insert_memory(&conn, "a");
+        insert_memory(&conn, "b");
+        // Drop the table the forward walk reads from. The next
+        // forward_neighbors call must surface the error.
+        conn.execute("DROP TABLE memory_links", []).expect("drop");
+        let result = would_create_reflection_cycle(&conn, "a", "b", 8);
+        assert!(
+            result.is_err(),
+            "SQL error during cycle walk must propagate as Err (#1090 fail-CLOSED)"
+        );
+    }
+}

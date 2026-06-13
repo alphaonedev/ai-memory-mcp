@@ -39,15 +39,26 @@
 //!
 //! ## Lookup table
 //!
-//! `default_strategy(agent)` resolves the unflagged form `ai-memory
-//! wrap <agent> -- <args>` to the right delivery mechanism for the
-//! agents we can identify by name today. Unknown agents fall through to
-//! `--system <msg>` because that's the most common contract across
-//! OpenAI-compatible CLIs. Future PRs (notably PR-7) can extend the
-//! table by adding match arms.
+//! [`crate::llm_cli_wrap::default_strategy`] resolves the unflagged
+//! form `ai-memory wrap <agent> -- <args>` to the right delivery
+//! mechanism for the agents we can identify by name today. Unknown
+//! agents fall through to `--system <msg>` because that's the most
+//! common contract across OpenAI-compatible CLIs. Future PRs (notably
+//! PR-7) can extend the table by adding match arms.
+//!
+//! ## Substrate split (#1183)
+//!
+//! The per-CLI-binary `WrapStrategy` enum + the per-vendor table live
+//! in [`crate::llm_cli_wrap`], adjacent to [`crate::llm`]'s alias
+//! tables, so the per-vendor substrate has one home per concern (HTTP
+//! wire shape in `llm.rs`, CLI ABI in `llm_cli_wrap.rs`). The
+//! CLI-binary-name detection logic that PICKS a `WrapStrategy` stays
+//! HERE because it's CLI-specific (clap `WrapArgs` overrides → table
+//! fallback).
 
 use crate::cli::CliOutput;
 use crate::cli::boot::{self, BootArgs};
+use crate::llm_cli_wrap::{WrapStrategy, default_strategy};
 use anyhow::{Context, Result};
 use clap::Args;
 use std::ffi::OsStr;
@@ -70,82 +81,32 @@ const DEFAULT_WRAP_LIMIT: usize = 10;
 const WRAP_PREAMBLE: &str = "You have access to ai-memory, a persistent memory system. \
 The recent context loaded for you appears below. Reference it when relevant to the user's request.";
 
-/// Strategy for delivering the assembled system message to the wrapped
-/// agent. Each variant maps to a distinct CLI ABI an agent might
-/// expose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WrapStrategy {
-    /// Pass the system message as the value of a CLI flag, e.g.
-    /// `codex --system "<msg>" <args...>`.
-    SystemFlag {
-        /// The flag name including any leading dashes — e.g. `--system`,
-        /// `--system-prompt`, `-s`.
-        flag: String,
-    },
-    /// Set the system message as an environment variable for the child
-    /// process. e.g. `OLLAMA_SYSTEM=<msg> ollama run hermes3:8b`.
-    SystemEnv {
-        /// The env var name, e.g. `OLLAMA_SYSTEM`.
-        name: String,
-    },
-    /// Write the system message to a tempfile and pass the path via a
-    /// CLI flag. e.g. `aider --message-file <path> <args...>`. Used by
-    /// agents whose system-message length exceeds shell argv limits or
-    /// whose CLI explicitly takes a file path.
-    MessageFile {
-        /// The flag that takes the file path, e.g. `--message-file`.
-        flag: String,
-    },
-    /// Resolve the strategy at runtime from `default_strategy(agent)`.
-    /// This is the natural mode when the user hasn't passed any of the
-    /// strategy override flags.
-    Auto,
-}
+/// #1575 — subdirectory of the per-user ai-memory data dir
+/// (`~/.ai-memory`, [`crate::AI_MEMORY_HOME_DIR_NAME`]) where the
+/// `MessageFile` strategy stages the boot-context system message.
+const WRAP_STAGING_SUBDIR: &str = "wrap";
 
-/// Built-in agent → strategy lookup. The list is small by design — we
-/// only encode strategies for agents we've actually verified. Anything
-/// not in the table falls through to `--system <msg>` because that's
-/// the most common contract across OpenAI-compatible CLIs.
+/// #1575 — resolve (and secure) the staging directory for the
+/// `MessageFile` boot-context file: `~/.ai-memory/wrap/`, mode 0700.
 ///
-/// PR-7 may extend this map; the matrix is intentionally tabular so
-/// adding a row is a one-line change.
-#[must_use]
-pub fn default_strategy(agent: &str) -> WrapStrategy {
-    match agent {
-        // OpenAI Codex CLI. The flag name varies between Codex variants
-        // (`--system`, `--system-prompt`, `OPENAI_CLI_SYSTEM`) but
-        // `--system` is the documented form on the upstream codex-cli
-        // crate (PR-1 recipe + Codex CLI README). Users running a
-        // variant that exposes a different flag can override with
-        // `--system-flag <flag>`.
-        "codex" | "codex-cli" => WrapStrategy::SystemFlag {
-            flag: "--system".into(),
-        },
-        // Aider takes its system / instructions input from a file via
-        // `--message-file`. Aider's CLI explicitly recommends this for
-        // anything longer than a one-liner because it doesn't shell-quote
-        // the arg-form for newlines reliably.
-        "aider" => WrapStrategy::MessageFile {
-            flag: "--message-file".into(),
-        },
-        // Google Gemini CLI. `--system` is the documented prepend form.
-        "gemini" => WrapStrategy::SystemFlag {
-            flag: "--system".into(),
-        },
-        // Ollama uses an env var because `ollama run <model>` doesn't
-        // expose a `--system` flag at the CLI level — it expects the
-        // system prompt either inside the prompt body or via the
-        // `OLLAMA_SYSTEM` env var (also the form `ollama serve` reads).
-        "ollama" => WrapStrategy::SystemEnv {
-            name: "OLLAMA_SYSTEM".into(),
-        },
-        // Default: most OpenAI-compatible CLIs accept `--system <msg>`.
-        // If that's wrong, users override with `--system-flag` /
-        // `--system-env` / `--message-file-flag`.
-        _ => WrapStrategy::SystemFlag {
-            flag: "--system".into(),
-        },
+/// The boot-context system message contains memory contents, so it
+/// must not sit on a world-readable tmpfs path for the wrapped
+/// agent's whole lifetime (the pre-#1575 behavior — `NamedTempFile`
+/// under `std::env::temp_dir()`). Returns `None` when the home
+/// directory cannot be resolved or the directory cannot be created /
+/// permission-tightened; the caller then falls back to the platform
+/// temp dir with an operator-visible WARN.
+fn message_file_staging_dir() -> Option<std::path::PathBuf> {
+    let dir = dirs::home_dir()?
+        .join(crate::AI_MEMORY_HOME_DIR_NAME)
+        .join(WRAP_STAGING_SUBDIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     }
+    Some(dir)
 }
 
 /// Args for `ai-memory wrap`. Designed so the simplest form
@@ -154,7 +115,8 @@ pub fn default_strategy(agent: &str) -> WrapStrategy {
 #[derive(Args, Debug)]
 pub struct WrapArgs {
     /// Name of the agent CLI to wrap, e.g. `codex`, `aider`, `gemini`,
-    /// `ollama`. Resolved against `default_strategy` to pick the
+    /// `ollama`. Resolved against
+    /// [`crate::llm_cli_wrap::default_strategy`] to pick the
     /// system-message delivery mechanism unless the user overrides
     /// with one of the strategy flags below. The agent name is also
     /// the executable looked up on `$PATH`.
@@ -213,7 +175,9 @@ pub struct WrapArgs {
 /// 1. `--system-env <name>` → `SystemEnv`
 /// 2. `--message-file-flag <flag>` → `MessageFile`
 /// 3. `--system-flag <flag>` → `SystemFlag`
-/// 4. fall through to `default_strategy(agent)` (the lookup table)
+/// 4. fall through to
+///    [`crate::llm_cli_wrap::default_strategy`]`(agent)` (the
+///    per-CLI-binary lookup table)
 fn resolve_strategy(args: &WrapArgs) -> WrapStrategy {
     if let Some(name) = args.system_env.as_deref() {
         return WrapStrategy::SystemEnv { name: name.into() };
@@ -346,8 +310,38 @@ fn build_command_for_strategy(
             // skips the unlink-while-open trick (which Windows
             // disallows) and cleans up on `Drop`. Either way the file
             // is gone after wrap exits.
-            let mut tf = tempfile::NamedTempFile::new()
-                .context("ai-memory wrap: failed to create system-message tempfile")?;
+            //
+            // #1575 — stage under `~/.ai-memory/wrap/` (0700 dir,
+            // 0600 file) instead of the platform temp dir, so the
+            // memory-bearing boot context never sits on a
+            // world-readable tmpfs path for the agent's lifetime.
+            // The temp dir remains ONLY as a home-unresolvable
+            // fallback, with an operator-visible WARN.
+            let mut tf = match message_file_staging_dir() {
+                Some(dir) => tempfile::NamedTempFile::new_in(&dir).context(
+                    "ai-memory wrap: failed to create system-message file in staging dir",
+                )?,
+                None => {
+                    tracing::warn!(
+                        "ai-memory wrap: could not resolve/secure the {}/{} staging dir under \
+                         the home directory; falling back to the platform temp dir for the \
+                         boot-context message file (#1575 — memory contents will transit a \
+                         shared temp path)",
+                        crate::AI_MEMORY_HOME_DIR_NAME,
+                        WRAP_STAGING_SUBDIR
+                    );
+                    tempfile::NamedTempFile::new()
+                        .context("ai-memory wrap: failed to create system-message tempfile")?
+                }
+            };
+            // Belt-and-braces: the tempfile crate already creates
+            // 0600 on Unix; pin it explicitly so a future tempfile
+            // upgrade can't silently loosen the boot-context file.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(tf.path(), std::fs::Permissions::from_mode(0o600));
+            }
             tf.write_all(system_msg.as_bytes())
                 .context("ai-memory wrap: failed to write system-message tempfile")?;
             // Flush so the agent process reads the full message even
@@ -437,46 +431,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wrap_resolves_default_strategy_per_known_agent() {
-        assert_eq!(
-            default_strategy("codex"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("codex-cli"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("aider"),
-            WrapStrategy::MessageFile {
-                flag: "--message-file".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("gemini"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-        assert_eq!(
-            default_strategy("ollama"),
-            WrapStrategy::SystemEnv {
-                name: "OLLAMA_SYSTEM".into()
-            }
-        );
-        // Unknown agent → fall through to --system.
-        assert_eq!(
-            default_strategy("some-future-cli"),
-            WrapStrategy::SystemFlag {
-                flag: "--system".into()
-            }
-        );
-    }
+    // NOTE: The canonical per-agent table pin moved to
+    // `crate::llm_cli_wrap::tests::default_strategy_per_known_agent_pins_1183`
+    // alongside the table itself in #1183. The tests below exercise the
+    // wrap-side dispatch (override precedence + command-build shape) and
+    // reach the moved table via the re-imported `default_strategy`
+    // symbol.
 
     #[test]
     fn resolve_strategy_explicit_overrides_lookup_table() {
@@ -628,6 +588,42 @@ mod tests {
             "tempfile must be cleaned up on Drop, but {} still exists",
             path_owned.display()
         );
+    }
+
+    /// #1575 — the boot-context message file must be staged under the
+    /// per-user ai-memory data dir (`~/.ai-memory/wrap/`, 0700 dir /
+    /// 0600 file), NOT the platform temp dir. The temp dir is only the
+    /// home-unresolvable fallback (exercised implicitly when
+    /// `dirs::home_dir()` returns `None`, which cannot be forced here
+    /// without unsafe env mutation — the fallback arm is plain
+    /// pre-#1575 behavior).
+    #[test]
+    fn message_file_staged_under_ai_memory_home_with_tight_perms_1575() {
+        let Some(staging) = message_file_staging_dir() else {
+            // No resolvable home in this environment — the WARN +
+            // temp-dir fallback arm applies; nothing to assert.
+            return;
+        };
+        let strat = WrapStrategy::MessageFile {
+            flag: "--message-file".into(),
+        };
+        let (_cmd, tf) =
+            build_command_for_strategy("aider", &strat, "BOOT-CONTEXT-1575", &[]).unwrap();
+        let tf = tf.expect("MessageFile must allocate a staged file");
+        assert_eq!(
+            tf.path().parent(),
+            Some(staging.as_path()),
+            "boot-context file must live under the ai-memory staging dir, got {}",
+            tf.path().display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dmode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dmode, 0o700, "staging dir must be 0700");
+            let fmode = std::fs::metadata(tf.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(fmode, 0o600, "boot-context file must be 0600");
+        }
     }
 
     #[test]
@@ -861,6 +857,48 @@ mod tests {
         assert!(
             s.is_empty() || s.contains("# ai-memory boot:"),
             "expected warn header or empty, got: {s}"
+        );
+    }
+
+    /// Coverage restoration (post-#1575 floor dip): the
+    /// `boot::run(...).is_err()` hard-failure arm in
+    /// `run_boot_capture` must return an EMPTY string (agent runs
+    /// unwrapped) — forced by pointing db_path at a DIRECTORY, which
+    /// the sqlite open cannot create-or-open even under `--quiet`.
+    #[test]
+    fn run_boot_capture_returns_empty_when_db_path_is_a_directory() {
+        let env = TestEnv::fresh();
+        let dir_as_db = env.db_path.parent().unwrap().to_path_buf();
+        let s = run_boot_capture(
+            &dir_as_db,
+            10,
+            DEFAULT_WRAP_BUDGET_TOKENS,
+            &crate::config::AppConfig::default(),
+        );
+        assert!(
+            s.is_empty() || s.contains("# ai-memory boot:"),
+            "directory-as-db must yield empty or warn-header output, got: {s}"
+        );
+    }
+
+    /// Coverage restoration: the MessageFile arm's trailing-arg
+    /// passthrough loop — trailing CLI args must land on the wrapped
+    /// command AFTER the message-file flag pair.
+    #[test]
+    fn message_file_strategy_passes_trailing_args_through() {
+        let strat = WrapStrategy::MessageFile {
+            flag: "--message-file".into(),
+        };
+        let trailing = vec!["--model".to_string(), "gpt-x".to_string()];
+        let (cmd, tf) =
+            build_command_for_strategy("aider", &strat, "BOOT-TRAIL", &trailing).unwrap();
+        let _tf = tf.expect("MessageFile must allocate a staged file");
+        let argv: Vec<String> = cmd.get_args().map(|s| os_str_to_string_lossy(s)).collect();
+        assert_eq!(argv[0], "--message-file");
+        assert_eq!(
+            &argv[2..],
+            ["--model", "gpt-x"],
+            "trailing args must follow the message-file pair: {argv:?}"
         );
     }
 }

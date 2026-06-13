@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Performance — bench tool, p95 budgets, regression gating</title>
-<meta name="description" content="ai-memory v0.6.3.1 performance surface. bench tool with --baseline, --history, --update-performance-md flags. p95 latency budgets in PERFORMANCE.md. CI bench job that fails on regressions. v0.6.3 Stream E + F.">
+<meta name="description" content="ai-memory v0.7.0 performance surface. bench tool with --baseline, --regression-threshold, --history, --json flags. p95 latency budgets in PERFORMANCE.md. CI bench job that fails on regressions. v0.6.3 Stream E + F.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/performance.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -77,6 +77,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -86,11 +97,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Performance</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -113,6 +127,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html" class="current">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -124,6 +139,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -133,29 +151,97 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
-          <a href="performance.html" class="current">Performance budgets</a>
+          <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>Performance — measured, gated, public.</h1>
-  <p class="tagline">v0.6.3 ships a <strong>bench tool</strong> with three operator-friendly flags: <code>--baseline</code> for regression detection, <code>--history</code> for JSONL accumulation, <code>--update-performance-md</code> for auto-spliced docs. CI runs the bench on every PR. Regressions &gt;N% fail the gate. The numbers in <code>PERFORMANCE.md</code> are the public contract.</p>
+  <p class="tagline">v0.6.3 ships a <strong>bench tool</strong> with three operator-friendly flags: <code>--baseline</code> for regression detection (with <code>--regression-threshold</code>, default 10%), <code>--history</code> for JSONL accumulation, <code>--json</code> for machine-readable output. CI runs the bench on every PR. Regressions &gt;N% fail the gate. The numbers in <code>PERFORMANCE.md</code> are the public contract.</p>
   <div class="pills">
     <span class="pill">bench tool (Stream E)</span>
     <span class="pill">PERFORMANCE.md (Stream F)</span>
@@ -168,7 +254,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Public p95 budgets</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">The numbers, committed to source.</h2>
-    <p class="lede">Every operation has a target p95 latency budget on a reference machine (Apple M2, 8GB free RAM, SQLite). PRs that regress beyond a configurable threshold fail the bench CI gate. v0.7's Apache AGE work will extend this with KG-query budgets; v0.8 adds task-queue p95.</p>
+    <p class="lede">Every operation has a target p95 latency budget on a reference machine (Apple M4, 32 GB unified memory, SQLite — per <code>PERFORMANCE.md</code>). PRs that regress beyond a configurable threshold fail the bench CI gate. v0.7's Apache AGE work will extend this with KG-query budgets; v0.8 adds task-queue p95.</p>
     <p class="lede" style="font-size:.95rem;color:var(--text-dim)">Rows tagged <em>[advisory]</em> are published targets without a matching bench in <code>src/bench.rs</code> yet (Stream E follow-up — embedder-bound, background-job, or federation paths). Unmarked rows are exercised by <code>ai-memory bench</code> on every PR. <code>PERFORMANCE.md</code> is the canonical budget contract.</p>
     <table class="budget-table">
       <thead><tr><th>Operation</th><th>Tier</th><th style="text-align:right">p95 budget</th><th>Notes</th></tr></thead>
@@ -178,11 +264,11 @@ footer a{color:var(--text-muted)}
         <tr><td class="op">memory_store</td><td>autonomous</td><td class="num">≤ 60 ms</td><td><em>[advisory]</em> + nomic embedding (768d)</td></tr>
         <tr><td class="op">memory_get</td><td>any</td><td class="num">≤ 2 ms</td><td><em>[advisory]</em> indexed PK lookup + access bump</td></tr>
         <tr><td class="op">memory_search</td><td>keyword</td><td class="num">≤ 8 ms</td><td>FTS5 query, top-20</td></tr>
-        <tr><td class="op">memory_recall</td><td>semantic</td><td class="num">≤ 35 ms</td><td><em>[advisory]</em> FTS5 70% + HNSW 30% fusion</td></tr>
+        <tr><td class="op">memory_recall</td><td>semantic</td><td class="num">≤ 35 ms</td><td><em>[advisory]</em> adaptive FTS5+HNSW fusion (semantic weight 0.50→0.15 by content length)</td></tr>
         <tr><td class="op">memory_recall</td><td>autonomous</td><td class="num">≤ 90 ms</td><td><em>[advisory]</em> + cross-encoder rerank (top-100→top-10)</td></tr>
         <tr><td class="op">memory_link</td><td>any</td><td class="num">≤ 4 ms</td><td><em>[advisory]</em> FK insert + idempotency check</td></tr>
         <tr><td class="op">memory_promote</td><td>any</td><td class="num">≤ 8 ms</td><td><em>[advisory]</em> + governance verdict</td></tr>
-        <tr><td class="op">memory_consolidate</td><td>smart</td><td class="num warn">≤ 1500 ms</td><td><em>[advisory]</em> LLM-bound · Gemma 4 E2B</td></tr>
+        <tr><td class="op">memory_consolidate</td><td>smart</td><td class="num warn">≤ 1500 ms</td><td><em>[advisory]</em> LLM-bound · <code>gemma4:e4b</code> reference</td></tr>
         <tr><td class="op">memory_kg_query</td><td>any</td><td class="num">≤ 50 ms</td><td>recursive CTE · depth 3 · &lt; 1k edges</td></tr>
         <tr><td class="op">memory_get_taxonomy</td><td>any</td><td class="num">≤ 30 ms</td><td><em>[advisory]</em> tree walk · default depth 8 · limit 1000</td></tr>
         <tr><td class="op">memory_archive_purge</td><td>any</td><td class="num">≤ 200 ms</td><td><em>[advisory]</em> per 1000 archived rows</td></tr>
@@ -190,7 +276,7 @@ footer a{color:var(--text-muted)}
         <tr><td class="op">bulk_create</td><td>any</td><td class="num">≤ 2000 ms</td><td><em>[advisory]</em> 100 rows + fanout · concurrent post W12</td></tr>
       </tbody>
     </table>
-    <p class="lede" style="margin-top:1rem"><em>Reference machine: Apple M2, 16GB RAM, macOS 14, SQLite default settings, single-process daemon. Numbers degrade gracefully on lower-spec hardware; budgets are headroom-aware. Live numbers under <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md" style="color:var(--p1)">PERFORMANCE.md</a>.</em></p>
+    <p class="lede" style="margin-top:1rem"><em>Reference machine: Apple M4, 32 GB unified memory, macOS, SQLite default settings, single-process daemon. Numbers degrade gracefully on lower-spec hardware; budgets are headroom-aware. Live numbers under <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md" style="color:var(--p1)">PERFORMANCE.md</a>.</em></p>
   </div>
 </section>
 
@@ -224,17 +310,16 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="flag update">
-      <div class="flag-head"><span class="flag-name">--update-performance-md</span></div>
-      <div class="flag-desc">Splice the latest measurements into the public <code>PERFORMANCE.md</code> file, in-place between the marker comments. The next git commit captures the doc update. Operators run this after a known-good release to keep the public numbers fresh.</div>
-      <div class="snip"><span class="ok">$</span> ai-memory bench --update-performance-md ./PERFORMANCE.md
-<span class="ok">→ Updated 12 budget rows · staged for commit · git diff PERFORMANCE.md</span>
+      <div class="flag-head"><span class="flag-name">--json</span></div>
+      <div class="flag-desc">Emit results as machine-readable JSON instead of the human table. A saved <code>--json</code> payload is exactly what <code>--baseline</code> consumes on the next run, so the release workflow is: bench on the reference machine, save the JSON, feed it back as the baseline for every PR. <code>PERFORMANCE.md</code> is updated by hand from a reviewed known-good run.</div>
+      <div class="snip"><span class="ok">$</span> ai-memory bench --json &gt; ./bench/baseline-v0.7.0.json
 
 <span class="cm"># Workflow:
 #   1. cut a release candidate
-#   2. run bench on the reference machine
-#   3. ai-memory bench --update-performance-md
-#   4. git diff to review the splice
-#   5. commit + ship</span></div>
+#   2. run bench on the reference machine with --json
+#   3. review + commit the baseline JSON
+#   4. CI feeds it back via --baseline on every PR
+#   5. update PERFORMANCE.md from the reviewed run</span></div>
     </div>
   </div>
 </section>
@@ -268,7 +353,7 @@ jobs:
   <div class="container">
     <span class="eyebrow">Tracing — span-level attribution</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Why was that one slow?</h2>
-    <p class="lede">Every MCP tool dispatch is wrapped in a <code>tracing::info_span!("mcp_tool_call")</code> with attributes including <code>tool</code>, <code>elapsed_ms</code>, <code>outcome</code>. Operators can chart per-tool p95/p99 against the public budgets — and when a single call regresses, the trace tree shows which sub-operation took the time. v0.7's tracing layer extends this with hook-pipeline spans.</p>
+    <p class="lede">Every MCP tool dispatch is wrapped in a <code>tracing::info_span!("mcp_tool_call")</code> with attributes including <code>tool</code>, <code>elapsed_ms</code>, <code>outcome</code>. Operators can chart per-tool p95/p99 against the public budgets — and when a single call regresses, the trace tree shows which sub-operation took the time (see the <a href="tracing.html" style="color:var(--p1)">tracing atlas</a> for the full target list).</p>
     <div class="snip"><span class="cm"># Example — find recall calls slower than 100ms in the last hour</span>
 <span class="ok">$</span> grep <span class="val">"mcp_tool_call"</span> daemon.log | jq <span class="val">'select(.tool=="memory_recall" and .elapsed_ms &gt; 100)'</span>
 
@@ -291,7 +376,7 @@ jobs:
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · bench tool in <code>src/bench.rs</code> · CI workflow in <code>.github/workflows/bench.yml</code> · public budgets in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md">PERFORMANCE.md</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · bench tool in <code>src/bench.rs</code> · CI workflow in <code>.github/workflows/bench.yml</code> · public budgets in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md">PERFORMANCE.md</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="data-flow.html">Data flow</a> · <a href="release-pipeline.html">Release pipeline</a></p>
 </footer>
 

@@ -2,7 +2,7 @@
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
 
-  Release Pipeline — visual atlas of the 5-platform signed-tag release flow,
+  Release Pipeline — visual atlas of the 7-platform signed-tag release flow,
   the bench-CI workflow, the coverage workflow, and the package channels.
   Targets procurement and operational readiness audiences.
 -->
@@ -12,7 +12,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Release Pipeline — 5 platforms, 5 channels, all signed</title>
-<meta name="description" content="ai-memory's release pipeline: 5-platform signed-tag matrix, bench-CI guard, llvm-cov coverage, 5 distribution channels (Homebrew, APT/deb, RPM/COPR, GHCR Docker, crates.io).">
+<meta name="description" content="ai-memory's release pipeline: 7-platform signed-tag matrix (Linux x64/arm64, macOS x64/arm64, Windows x64, iOS arm64, Android arm64 via #1068), bench-CI guard, llvm-cov coverage, 7 distribution channels (Homebrew, APT/deb, RPM/COPR, GHCR Docker, crates.io, iOS xcframework, Android jniLibs tarball).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/release-pipeline.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -104,6 +104,18 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -113,11 +125,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Release Pipeline</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn active">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -140,6 +155,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -151,6 +167,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -160,29 +179,97 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
-  <h1>Tag → 5 platforms → 5 channels → all signed.</h1>
-  <p class="tagline">One signed tag. Five platform binaries. Five package channels. All in &lt;10 minutes of CI wallclock. <strong>Procurement-ready operational maturity from day 1.</strong></p>
+  <h1>Tag → 7 platforms → 7 channels → all signed.</h1>
+  <p class="tagline">One signed tag. Seven platform binaries (incl. iOS xcframework + Android jniLibs tarball, #1068). Seven package channels. All in &lt;15 minutes of CI wallclock. <strong>Procurement-ready operational maturity from day 1.</strong></p>
 </section>
 
 <section>
@@ -207,7 +294,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The Pipeline</span>
     <h2>Tag a release. Watch the matrix go.</h2>
-    <p class="lede">Every tag matching <code>v*</code> triggers the full release matrix in <code>.github/workflows/ci.yml</code>. The <code>release</code> job depends on <code>check</code> passing first — so a tagged release that fails any platform's check (fmt, clippy, tests) never publishes.</p>
+    <p class="lede">Pushing a tag matching <code>v*</code> runs the full CI check matrix in <code>.github/workflows/ci.yml</code>. Publishing is a separate, operator-gated step at v0.7.0: <code>.github/workflows/release.yml</code> runs via <code>workflow_dispatch</code> against the already-pushed annotated tag, preflight-verifies it, and builds + publishes only from that verified SHA — so a release that fails checks never publishes.</p>
 
     <div class="pipeline">
       <svg viewBox="0 0 1200 480" xmlns="http://www.w3.org/2000/svg">
@@ -263,9 +350,9 @@ footer a{color:var(--text-muted)}
 
         <text x="40" y="350" fill="#999" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ trigger</text>
         <text x="220" y="430" fill="#ffb86b" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ check (must pass)</text>
-        <text x="440" y="370" fill="#6ee7ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ build matrix · 5 platforms</text>
+        <text x="440" y="370" fill="#6ee7ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ build matrix · 7 platforms (5 desktop + 2 mobile #1068)</text>
         <text x="690" y="370" fill="#6ee7ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ package + sign</text>
-        <text x="930" y="430" fill="#c8a2ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ publish · 5 channels</text>
+        <text x="930" y="430" fill="#c8a2ff" font-family="monospace" font-size="11" style="text-transform:uppercase;letter-spacing:.08em">▸ publish · 7 channels (+ iOS xcframework, Android jniLibs)</text>
       </svg>
     </div>
   </div>
@@ -275,8 +362,8 @@ footer a{color:var(--text-muted)}
 <section>
   <div class="container">
     <span class="eyebrow">Platform Targets</span>
-    <h2>5 binaries. Every mainstream OS + arch.</h2>
-    <p class="lede">Each tag produces five precompiled binaries. macOS Universal coming in v0.7. ARM64 first-class on Linux + macOS. No 32-bit, no big-endian, no exotic targets — by design.</p>
+    <h2>7 binaries. Every mainstream OS + arch.</h2>
+    <p class="lede">Each tag produces <strong>seven precompiled binaries at v0.7.0</strong>: 5 desktop (Linux x64/arm64, macOS x64/arm64, Windows x64) plus 2 mobile (iOS xcframework + Android jniLibs tarball — added via #1068). ARM64 first-class on Linux + macOS. No 32-bit, no big-endian, no exotic targets — by design.</p>
 
     <div class="platform-grid">
       <div class="platform">
@@ -305,7 +392,6 @@ footer a{color:var(--text-muted)}
         <div class="psize">tar.gz</div>
         <ul class="palist">
           <li>macOS 12 Monterey+</li>
-          <li>Codesigned (notarized v0.7)</li>
           <li>Homebrew bottle</li>
         </ul>
       </div>
@@ -362,7 +448,7 @@ sudo dnf install ai-memory</pre>
       <div class="channel docker">
         <div class="cname">🐳 Docker (GHCR)</div>
         <div class="csub">multi-arch · alpine + distroless variants</div>
-<pre>docker pull ghcr.io/alphaonedev/ai-memory:0.6.3
+<pre>docker pull ghcr.io/alphaonedev/ai-memory:latest
 docker run -p 9077:9077 ghcr.io/alphaonedev/ai-memory</pre>
       </div>
       <div class="channel crates">
@@ -371,6 +457,16 @@ docker run -p 9077:9077 ghcr.io/alphaonedev/ai-memory</pre>
 <pre>cargo install ai-memory --locked
 # or with sqlcipher feature:
 cargo install ai-memory --features sqlcipher</pre>
+      </div>
+      <div class="channel">
+        <div class="cname">📱 iOS xcframework</div>
+        <div class="csub">#1068 · device + sim arm64 + sim x86_64 slices</div>
+<pre>gh release download --pattern ai-memory-ios.xcframework.tar.gz</pre>
+      </div>
+      <div class="channel">
+        <div class="cname">🤖 Android jniLibs</div>
+        <div class="csub">#1068 · 4 ABIs in jniLibs/&lt;abi&gt;/ layout</div>
+<pre>gh release download --pattern ai-memory-android.tar.gz</pre>
       </div>
     </div>
   </div>
@@ -389,7 +485,7 @@ cargo install ai-memory --features sqlcipher</pre>
       <ul>
         <li><code>cargo fmt --check</code> — formatting must be exact</li>
         <li><code>cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic</code> — pedantic linting</li>
-        <li><code>cargo test --all-features</code> — full test suite, all platforms</li>
+        <li><code>cargo test</code> — test suite on all platforms (impact-scoped on PRs via <code>scripts/ci-test-impact.sh</code>; full suite otherwise)</li>
         <li><code>cargo audit</code> — dependency vulnerability check (Linux only)</li>
         <li><code>cargo build --release</code> — release-mode compile must succeed</li>
       </ul>
@@ -421,13 +517,14 @@ cargo install ai-memory --features sqlcipher</pre>
 
     <div class="workflow">
       <div class="wftrigger">.github/workflows/ci.yml · release matrix</div>
-      <h3>Release (5-platform fan-out)</h3>
+      <h3>Release (7-platform fan-out, v0.7.0 + #1068)</h3>
       <ul>
-        <li>Triggers on tags matching <code>v*</code></li>
+        <li>Triggers on tags matching <code>v*</code> via <code>workflow_dispatch</code> (operator-gated)</li>
         <li>Depends on <code>check</code> passing first — broken tags don't ship</li>
-        <li>Builds 5 platform targets in parallel</li>
-        <li>Packages tar.gz / .deb / .rpm / .zip</li>
-        <li>Publishes to GitHub Releases, then fans out to crates.io / Homebrew / PPA / COPR / GHCR</li>
+        <li>Builds 5 server platform targets in parallel (Linux x64/arm64, macOS x64/arm64, Windows x64)</li>
+        <li>Plus 2 mobile artifacts (#1068): iOS xcframework (3 slices) + Android jniLibs tarball (4 ABIs)</li>
+        <li>Packages tar.gz / .deb / .rpm / .zip + <code>ai-memory-ios.xcframework.tar.gz</code> + <code>ai-memory-android.tar.gz</code></li>
+        <li>Publishes to GitHub Releases, then fans out to crates.io / Homebrew / .deb / COPR / GHCR</li>
         <li>Pre-release tags (containing <code>-</code>) skip Homebrew + crates.io (RC binaries only)</li>
       </ul>
     </div>
@@ -464,7 +561,7 @@ cargo install ai-memory --features sqlcipher</pre>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--gold)">
         <h3 style="margin-bottom:.5rem">Public-source audit</h3>
-        <p style="font-size:.9rem">Apache 2.0. Single repo. ~30K lines of Rust. <strong>A security team can audit the entire codebase in a week.</strong></p>
+        <p style="font-size:.9rem">Apache 2.0. Single repo. ~295K lines of Rust under <code>src/</code> (tests included) at v0.7.0. <strong>The entire codebase is open to security-team audit.</strong></p>
       </div>
     </div>
   </div>
@@ -472,7 +569,7 @@ cargo install ai-memory --features sqlcipher</pre>
 
 <footer>
   <div class="container">
-    <p>ai-memory-mcp · Apache 2.0 · v0.6.3.1 · <a href="./">main</a> · <a href="at-a-glance.html">At a Glance</a> · <a href="feature-matrix.html">Feature Matrix</a> · <a href="data-flow.html">Data Flow</a> · <a href="integrations.html">Integrations</a> · <a href="for-everyone.html">For Everyone</a></p>
+    <p>ai-memory-mcp · Apache 2.0 · v0.7.0 · <a href="./">main</a> · <a href="at-a-glance.html">At a Glance</a> · <a href="feature-matrix.html">Feature Matrix</a> · <a href="data-flow.html">Data Flow</a> · <a href="integrations.html">Integrations</a> · <a href="for-everyone.html">For Everyone</a></p>
   </div>
 </footer>
 

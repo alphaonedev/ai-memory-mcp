@@ -1,5 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::needless_update)]
 //
 // v0.6.3.1 (P4, audit G1) — governance inheritance unit tests.
 //
@@ -14,8 +16,10 @@
 // test file ships green. Treat regressions here as release blockers.
 
 use ai_memory::db;
+use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{
-    self, ApproverType, GovernanceLevel, GovernancePolicy, Memory, Tier, default_metadata,
+    self, ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy, Memory, Tier,
+    default_metadata,
 };
 use rusqlite::Connection;
 
@@ -56,6 +60,18 @@ fn seed_policy(
         last_accessed_at: None,
         expires_at: None,
         metadata,
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
     };
     let standard_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();
@@ -63,11 +79,15 @@ fn seed_policy(
 
 fn approve_policy() -> GovernancePolicy {
     GovernancePolicy {
-        write: GovernanceLevel::Approve,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
+        core: CorePolicy {
+            write: GovernanceLevel::Approve,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     }
 }
 
@@ -92,7 +112,7 @@ fn inherit_default_governance_chain_5_deep_requires_approval_at_leaf() {
     let resolved = db::resolve_governance_policy(&conn, leaf)
         .expect("ancestor policy must inherit to leaf (G1)");
     assert_eq!(
-        resolved.write,
+        resolved.core.write,
         GovernanceLevel::Approve,
         "leaf inherits parent's Approve write level via the chain walk"
     );
@@ -106,15 +126,15 @@ fn inherit_false_at_child_blocks_parent_policy() {
     seed_policy(&conn, "alphaone/secure", &approve_policy(), "alice");
 
     let mut child = any_policy();
-    child.inherit = false;
+    child.core.inherit = false;
     seed_policy(&conn, "alphaone/secure/team-a", &child, "alice");
 
     let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
         .expect("child has its own policy, must be returned");
     // Most-specific wins — child's `Any` overrides parent's `Approve`.
-    assert_eq!(resolved.write, GovernanceLevel::Any);
+    assert_eq!(resolved.core.write, GovernanceLevel::Any);
     assert!(
-        !resolved.inherit,
+        !resolved.core.inherit,
         "inherit=false flag must round-trip through resolution"
     );
 }
@@ -131,7 +151,7 @@ fn most_specific_policy_wins_when_both_set() {
     let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
         .expect("child has its own policy");
     assert_eq!(
-        resolved.write,
+        resolved.core.write,
         GovernanceLevel::Any,
         "child's Any beats parent's Approve (most specific wins)"
     );
@@ -146,9 +166,9 @@ fn child_with_no_policy_inherits_parent_policy() {
     // NB: NO policy on "alphaone/secure/team-a".
     let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
         .expect("parent policy must inherit");
-    assert_eq!(resolved.write, GovernanceLevel::Approve);
+    assert_eq!(resolved.core.write, GovernanceLevel::Approve);
     assert!(
-        resolved.inherit,
+        resolved.core.inherit,
         "inherited policy preserves its own inherit=true"
     );
 }
@@ -206,6 +226,6 @@ fn chain_shape_top_down_with_global_first() {
 #[test]
 fn partial_policy_payload_defaults_inherit_true() {
     let p: GovernancePolicy = serde_json::from_str(r#"{"write":"approve"}"#).unwrap();
-    assert!(p.inherit, "missing inherit field deserializes as true");
+    assert!(p.core.inherit, "missing inherit field deserializes as true");
     let _ = models::namespace_ancestors("a/b"); // touch the symbol so unused-import lints stay quiet
 }

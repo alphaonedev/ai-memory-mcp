@@ -19,10 +19,13 @@ writers can't coexist.
 1. List any running ai-memory processes: `ps -ef | grep ai-memory`.
 2. If a daemon is running, route your operation through it (HTTP API
    or MCP) instead of the CLI.
-3. If you suspect a stale lock file, stop every process and check
-   `~/.ai-memory-wal` / `~/.ai-memory-shm` companion files.
-4. For long-running imports, the 5 s default `busy_timeout` may be
-   too short. Increase via `AI_MEMORY_BUSY_TIMEOUT_MS=30000`.
+3. If you suspect a stale lock, stop every process and check the WAL
+   companion files next to the database (`<db>.db-wal` /
+   `<db>.db-shm`); they are recovered automatically on the next open.
+4. The `busy_timeout` is a compiled 5 s PRAGMA
+   (`src/storage/connection.rs`) — it is not operator-tunable. For
+   long-running imports that keep hitting the lock, stop the competing
+   writer (or route the import through the daemon) instead.
 
 ### "could not find embedding model"
 
@@ -43,6 +46,50 @@ Network or disk issues interrupt the download.
    `huggingface-cli download sentence-transformers/all-MiniLM-L6-v2`.
 4. If you don't need semantic recall, run with `--tier keyword` —
    FTS5-only, zero model load.
+5. Post-#1598, CPU-only / egress-restricted hosts can skip the local
+   model entirely: point `[embeddings]` at an API backend (any #1067
+   alias, or `openai-compatible` for a self-hosted TEI/vLLM/llama.cpp
+   `/v1/embeddings` endpoint). See the
+   [enterprise reference architectures](reference-architecture/enterprise-cpu-memory.md).
+
+### Semantic recall degraded to keyword — "embedder init failed" / "EMBEDDER LOAD FAILED" (#1593 / #1598)
+
+**Symptom**: stderr shows
+`embedder init failed (backend=…, model=…, url=…, source=…): … —
+semantic recall DEGRADED to keyword (#1143, #1593, #1598)` (MCP
+stdio) or the ERROR-level `EMBEDDER LOAD FAILED` marker (daemon).
+`memory_capabilities` reports `embedder_loaded: false` and
+`recall_mode_active: "degraded"`.
+
+**Cause**: embedder construction failed — for API backends usually a
+wrong `base_url`, a missing/rejected API key, or no network egress;
+for local backends a HuggingFace download or memory issue. This is
+the **fail-closed** posture (#1593): the substrate keeps serving
+keyword/FTS recall and NEVER silently routes embeddings through the
+chat LLM client. #1594 makes the degradation truthful at request
+time too — a remote embedder whose endpoint starts failing flips
+`embedder_loaded` to `false` in live `memory_capabilities` output.
+
+**Fix**:
+
+1. **Run `ai-memory doctor` and inspect the `Embeddings Reachability
+   (#1598)` section.** It probes the resolved endpoint (ollama
+   `GET /api/tags`; API backends `POST /embeddings` with the
+   resolved Bearer key) and reports
+   `backend`/`model`/`base_url`/`config_source`/`key_source` plus
+   HTTP status — auth (401/403), rate-limit (429), vendor outage
+   (5xx), wrong base_url (4xx-other), or network/DNS.
+2. If `config_source = compiled-default`, no operator embeddings
+   config exists anywhere — set `AI_MEMORY_EMBED_BACKEND` or write
+   an `[embeddings]` section
+   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)).
+3. If `key_source = error(...)`, fix the referenced env var or key
+   file perms (mode 0400 required for `api_key_file`).
+4. If the section carries a `gpu_policy` WARN, you resolved
+   `backend = ollama` on a host with no compatible GPU — operator
+   policy is API embeddings on CPU-only nodes; switch the backend or
+   move the workload to a GPU node.
+5. To silence the degradation deliberately, set `tier = "keyword"`.
 
 ### "port 9077 already in use"
 
@@ -74,8 +121,8 @@ ai-memory serve --port 19077
 **Causes + fixes**:
 
 1. **Wrong config path**. Verify:
-   - Claude Code: `~/.claude/mcp_servers.json` or the project-local
-     `.claude/mcp_servers.json`.
+   - Claude Code: `mcpServers` in `~/.claude.json` (user scope) or
+     `.mcp.json` in the project root (NOT `settings.json`).
    - Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
    - Cursor: Settings → Features → MCP.
 
@@ -96,11 +143,14 @@ ai-memory serve --port 19077
 
 **Symptom**: Integration test fails on MCP tool count.
 
-**Cause**: A new tool landed in `src/mcp.rs` without updating the
-count assertion. Harmless — it's a test that locks the tool count to
-prevent accidental removal. Update the assertion to match the new
-count and ensure the new tool is in the `assert!(tool_names.contains())`
-block.
+**Cause**: A new tool landed in `src/mcp/tools/<name>.rs` + `registered_tools()`
+in `src/mcp/registry.rs` (#987 D1.6 recipe; pre-#1066 the source was the
+monolithic `src/mcp.rs`) without updating the tool-count assertion. Harmless
+— it's a test that locks the tool count to prevent accidental removal.
+The canonical post-#1187 source is `crate::mcp::tool_names::*` consts +
+`Profile::full().expected_tool_count()` in `src/profile.rs`. Update the
+assertion to match the new count and add the tool's `tool_names::*` const
+reference where the test enumerates expected tools.
 
 ### MCP tool returns "no memories found" but `ai-memory list` shows them
 
@@ -109,7 +159,7 @@ block.
 **Fix**: Every entry point reads `AI_MEMORY_DB`. Set it consistently:
 
 ```jsonc
-// Claude Code mcp_servers.json
+// Claude Code ~/.claude.json (user scope) or .mcp.json (project scope)
 {
   "mcpServers": {
     "ai-memory": {
@@ -128,15 +178,43 @@ block.
 **Symptom**: `ai-memory curator --once --json` report shows
 `"errors": ["no LLM client configured"]` and zero operations.
 
-**Cause**: The feature tier doesn't wire an LLM, or Ollama is
-unreachable.
+**Cause**: The feature tier doesn't wire an LLM, or the configured
+backend is unreachable.
 
-**Fix**:
+**Fix (v0.7.x — preferred)**:
 
-1. Check feature tier: `ai-memory curator --tier smart` or
-   `autonomous` (CLI flag reads the tier from config if unset).
-2. Verify Ollama is running: `curl http://localhost:11434/api/tags`.
-3. Pull the model: `ollama pull gemma4:e2b` (for `smart` tier).
+1. **Run `ai-memory doctor` and inspect the `LLM Reachability
+   (#1146)` section.** It probes the configured backend (Ollama,
+   xAI, OpenAI, Anthropic, etc.) and reports the resolved
+   `backend`/`model`/`base_url`/`config_source`/`key_source` plus
+   HTTP status. The severity tag (INFO / WARN / CRIT) tells you
+   whether the issue is auth (401), rate-limit (429), vendor
+   outage (5xx), wrong base_url (4xx-other), or network/DNS/TLS.
+2. If `config_source = compiled-default`, no operator LLM config is
+   present anywhere. Either set `AI_MEMORY_LLM_BACKEND` (env) or
+   write a `[llm]` section in `~/.config/ai-memory/config.toml`
+   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)).
+3. If `key_source = error(...)`, the resolved API key
+   (`api_key_env` / `api_key_file`) couldn't be read — fix the
+   referenced env var or file perms (0400 required for
+   `api_key_file` by default).
+4. Check the feature tier: `curator` has no `--tier` flag — it reads
+   the `tier` field from `config.toml`. Set `tier = "smart"` (or
+   `"autonomous"`) there and re-run.
+
+**Fix (legacy v0.6.x flat-field config)**:
+
+If you're still on v0.6.x flat fields (`llm_model`, `ollama_url`),
+the deprecation WARN at config-load tells you it's time to migrate:
+
+```bash
+ai-memory config migrate --dry-run    # preview the v2 shape
+ai-memory config migrate              # apply with timestamped .bak
+ai-memory doctor                      # verify LLM Reachability
+```
+
+The legacy fields continue to work in v0.7.x but will be removed in
+v0.8.0.
 
 ### Curator cycle times are long (> 10 min)
 
@@ -170,11 +248,13 @@ trail is preserved.
 
 ### "401 missing or invalid API key"
 
-**Cause**: Daemon started with `--api-key` set. Pass the key:
+**Cause**: The daemon has an `api_key` configured (the `api_key` field
+in `config.toml` — there is no `--api-key` serve flag). Pass the key:
 
 ```bash
 curl -H "X-API-Key: YOUR_KEY" http://127.0.0.1:9077/api/v1/stats
-# or
+# or (DEPRECATED #1574 — URL keys leak into access/proxy logs;
+# accepted with a WARN at v0.7.0, slated for v0.8 rejection)
 curl 'http://127.0.0.1:9077/api/v1/stats?api_key=YOUR_KEY'
 ```
 
@@ -206,7 +286,13 @@ but peers are unreachable or slow.
 3. Check peer mTLS allowlist — your fingerprint may not be listed.
 
 **Fix**: lower `--quorum-writes` temporarily, restore peer
-connectivity, restart with the original setting.
+connectivity, restart with the original setting. For `timeout` on a
+**cross-region** mesh, raise `--quorum-timeout-ms` — the 2000 ms
+default is same-DC-tuned; WAN meshes need 5000-10000 ms (the do-1461
+3-region reference deploy uses `FED_QUORUM_TIMEOUT_MS=8000`; see
+[#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)).
+The write commits locally first, so the longer wait affects only the
+synchronous-durability gate.
 
 ## Sync / federation
 
@@ -218,8 +304,10 @@ connectivity, restart with the original setting.
 
 1. On each peer: `ai-memory sync-daemon` must be running.
    `systemctl status ai-memory-sync` or check the log.
-2. Vector-clock skew: `ai-memory stats` on each peer, compare
-   `last_synced_at`.
+2. Divergence check: run `ai-memory stats` on each peer and compare
+   the `total` counts; the per-peer vector clock lives in the
+   `sync_state` table
+   (`sqlite3 <db> "SELECT * FROM sync_state"`).
 3. mTLS fingerprint drift: if you rotated certs, the allowlist must
    be regenerated on every receiver.
 4. `--batch-size 500` default may be too small for a backlog. Bump to
@@ -239,6 +327,52 @@ authoritative ones.
 Per-namespace conflict resolution is an open work item (sync-phase
 Layer 2b).
 
+### Federation push-DLQ backlog / quarantined rows {#federation-push-dlq}
+
+**Symptom**: the daemon logs
+`replay: row N quarantined after 100 attempts (ceiling 100)` and/or
+the `federation_push_dlq_depth` gauge stays high.
+
+Failed quorum pushes land in the `federation_push_dlq` table and a
+background worker replays them (oldest first, batches per tick). The
+per-tick batch is **adaptive** (#1579 B5): it scales with the live
+backlog up to a cap (`min(backlog, cap)`, floor 64; cap default 2048,
+operator-tunable via `AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH`), so a bulk
+backlog drains at thousands of rows/min instead of the historical
+fixed-64 ceiling of 128 rows/min/peer. Replays reuse the daemon's
+pooled federation connections (no per-row TLS handshake), and the
+captured payload ships the source embedding vector when one was
+available at enqueue time (#1566), so a healthy receiver applies a
+replayed row in milliseconds — receivers **no longer re-embed
+synchronously on receive** (the pre-#1566 ~1 s/row embed-on-receive
+that inflated replay latency and quorum deadlines is gone; rows
+without a usable shipped vector are embedded by a background task
+after the ack).
+Rows that fail `MAX_REPLAY_ATTEMPTS` (100) times are *quarantined*:
+the take query excludes them (#1578) and they wait for operator
+review. **No CLI drain surface ships at v0.7.0** — inspection and
+drain are direct SQL against the daemon's store:
+
+```sql
+-- Inspect (postgres-backed daemons: table lives in the daemon's
+-- schema, e.g. ic_peer_1.federation_push_dlq on shared fleets):
+SELECT attempt_count, count(*), max(left(last_error, 60))
+FROM federation_push_dlq WHERE replayed_at IS NULL GROUP BY 1;
+
+-- Drain quarantined rows after confirming the target memories
+-- already converged (compare distinct memory counts across peers, or
+-- GET each memory_id on the destination peer). Marking replayed
+-- retains the rows for audit; deleting is equivalent operationally:
+UPDATE federation_push_dlq SET replayed_at = now()
+WHERE replayed_at IS NULL AND attempt_count >= 100;
+```
+
+A large backlog of *replayable* (below-ceiling) rows whose memories
+already converged via async catch-up (e.g. a historical quota-429
+burst) can be drained the same way — drop the `attempt_count`
+predicate after verifying convergence. The replay worker handles
+everything else on its own.
+
 ## Performance
 
 ### `recall` is slow (> 2 s)
@@ -247,9 +381,18 @@ Layer 2b).
 
 1. **First semantic recall after startup** — model load is ~500 ms
    cold. Warm up with a throwaway recall call.
-2. **Large corpus + HNSW not yet built** — HNSW is built lazily on
-   first semantic query against a given DB. 100k memories takes
-   ~15 s to index once; subsequent queries are ms.
+2. **Async-boot HNSW warm window (#1579 B3)** — `serve` and `mcp`
+   become ready immediately and build the HNSW index in the
+   background; until the swap lands, semantic recall serves the
+   keyword/FTS blend (correct, but ranked without the vector phase)
+   and can look "worse" or slower on big corpora. Watch for the
+   readiness line: `serve` logs INFO `HNSW index warm (#1579 B3)`;
+   `mcp` prints `ai-memory: HNSW index ready (N entries, warmed in
+   X.Xs)` on stderr. One-shot `ai-memory recall` CLI invocations skip
+   the graph build entirely below 20k embedded rows
+   (`hnsw::CLI_HNSW_BUILD_MIN_ENTRIES`) and linear-scan instead —
+   that path is expected to answer in tens of ms, not to build an
+   index.
 3. **Disk I/O bottleneck** — `iostat 1` to confirm. Move DB to SSD.
 4. **SQLite contention under concurrent writes** — use `stats`
    output to see WAL size. If the daemon is doing a lot of writes,

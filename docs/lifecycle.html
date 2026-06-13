@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Lifecycle — store to purge, end to end</title>
-<meta name="description" content="ai-memory v0.6.3.1 memory lifecycle. The full journey of a memory from store → tier → access → promote → link → consolidate → expire → archive → restore or purge. With timeline visualization.">
+<meta name="description" content="ai-memory v0.7.0 memory lifecycle. The full journey of a memory from store → tier → access → promote → link → consolidate → expire → archive → restore or purge. With timeline visualization.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/lifecycle.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -75,6 +75,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -84,11 +95,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Lifecycle</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -111,6 +125,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html" class="current">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -122,6 +137,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -131,23 +149,91 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -166,7 +252,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Timeline</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">A memory through time.</h2>
-    <p class="lede">An illustrative example: a memory enters at Mid tier, gets accessed twice (each access bumps the TTL), gets linked to a related memory, gets consolidated with siblings into a Long-tier retro, the original ages into the archive, and finally gets purged after a 30-day compliance window.</p>
+    <p class="lede">An illustrative example: a memory enters at Mid tier, gets accessed twice (each access resets the expiry window to <code>now + 1d</code>), gets linked to a related memory, gets consolidated with siblings into a Long-tier retro, the original ages into the archive, and finally gets purged after a 30-day compliance window.</p>
     <svg class="timeline-svg" viewBox="0 0 1180 320" xmlns="http://www.w3.org/2000/svg">
       <style>
         .axis{stroke:#3d3d3d;stroke-width:1.2}
@@ -213,7 +299,7 @@ footer a{color:var(--text-muted)}
 
       <circle class="pt t2" cx="280" cy="240" r="6"/>
       <text class="ev t2" x="280" y="220" text-anchor="middle">access</text>
-      <text class="ev t2" x="280" y="205" text-anchor="middle">expires_at += 1d</text>
+      <text class="ev t2" x="280" y="205" text-anchor="middle">expires_at = now+1d</text>
 
       <circle class="pt t3" cx="460" cy="240" r="6"/>
       <text class="ev t3" x="460" y="220" text-anchor="middle">link added</text>
@@ -266,7 +352,7 @@ footer a{color:var(--text-muted)}
 
     <div class="stage s2">
       <div class="stage-head"><span class="stage-num">stage 2</span><span class="stage-name">Active — accessed, recalled, linked</span><span class="stage-when">days 0–N · while live</span></div>
-      <div class="stage-desc">Every <code>memory_get</code>, recall hit, and search hit bumps <code>access_count</code> and <code>last_accessed_at</code>. Mid-tier memories also get their <code>expires_at</code> bumped forward by <code>mid_extend_secs</code> (default 1 day). Memories that get used earn more time. Updates (<code>memory_update</code>) preserve <code>created_at</code> but bump <code>updated_at</code>. KG edges added via <code>memory_link</code> at any time.</div>
+      <div class="stage-desc">Every <code>memory_get</code>, recall hit, and search hit bumps <code>access_count</code> and <code>last_accessed_at</code>. Mid-tier memories also get their <code>expires_at</code> <strong>raised to <code>MAX(current expires_at, now + mid_extend_secs)</code></strong> (default 1 day; Short uses <code>short_extend_secs</code>, default 1h) — an extension floor (#1596): an access can never move an expiry earlier than it already was. At 5 accesses (<code>PROMOTION_THRESHOLD</code>) a Mid-tier memory auto-promotes to Long. Memories that get used earn more time. Updates (<code>memory_update</code>) preserve <code>created_at</code> but bump <code>updated_at</code>. KG edges added via <code>memory_link</code> at any time.</div>
       <div class="snip">{<span class="key">"event"</span>: <span class="val">"accessed"</span>,  <span class="key">"access_count"</span>: <span class="num">3</span>, <span class="key">"last_accessed_at"</span>: <span class="val">"day 3"</span>, <span class="key">"expires_at"</span>: <span class="val">"+1d"</span>}
 {<span class="key">"event"</span>: <span class="val">"link_added"</span>, <span class="key">"relation"</span>: <span class="val">"related_to"</span>, <span class="key">"target_id"</span>: <span class="val">"…"</span>}
 {<span class="key">"event"</span>: <span class="val">"updated"</span>,   <span class="key">"updated_at"</span>: <span class="val">"day 5"</span>, <span class="key">"changes"</span>: [<span class="val">"tags"</span>, <span class="val">"priority"</span>]}</div>
@@ -353,7 +439,7 @@ SELECT id, archived_at, reason, namespace, tier, original_metadata
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · lifecycle paths cross every module — primary entry points: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers.rs">handlers.rs</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/db.rs">db.rs</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/governance.rs">governance.rs</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/curator.rs">curator.rs</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · lifecycle paths cross every module — primary entry points: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/">src/handlers/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/">src/storage/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/governance/">src/governance/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/curator/">src/curator/</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="ttl-controls.html">TTLs</a> · <a href="archival.html">Archival</a> · <a href="schema.html">Schema</a></p>
 </footer>
 

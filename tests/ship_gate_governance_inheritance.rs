@@ -1,5 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::needless_update)]
 //
 // v0.6.3.1 (P4, audit G1) — SHIP-GATE Phase 1 functional scenarios.
 //
@@ -25,9 +27,10 @@ use ai_memory::config::{
     PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
 };
 use ai_memory::db;
+use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{
-    ApproverType, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction, Memory,
-    Tier, default_metadata,
+    ApproverType, CorePolicy, GovernanceDecision, GovernanceLevel, GovernancePolicy,
+    GovernedAction, Memory, Tier, default_metadata,
 };
 use rusqlite::Connection;
 
@@ -78,6 +81,18 @@ fn seed_policy(
         last_accessed_at: None,
         expires_at: None,
         metadata,
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
     };
     let standard_id = db::insert(conn, &standard).unwrap();
     db::set_namespace_standard(conn, namespace, &standard_id, None).unwrap();
@@ -85,21 +100,29 @@ fn seed_policy(
 
 fn approve_write_policy() -> GovernancePolicy {
     GovernancePolicy {
-        write: GovernanceLevel::Approve,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: true,
+        core: CorePolicy {
+            write: GovernanceLevel::Approve,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: true,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     }
 }
 
 fn any_policy_no_inherit() -> GovernancePolicy {
     GovernancePolicy {
-        write: GovernanceLevel::Any,
-        promote: GovernanceLevel::Any,
-        delete: GovernanceLevel::Owner,
-        approver: ApproverType::Human,
-        inherit: false,
+        core: CorePolicy {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Owner,
+            approver: ApproverType::Human,
+            inherit: false,
+            max_reflection_depth: None,
+        },
+        ..Default::default()
     }
 }
 

@@ -115,6 +115,41 @@ sections.
 - In local mode: `N/A` — the local doctor doesn't construct a
   TierConfig. Use `--remote http://localhost:9077` for the live read.
 
+### LLM Reachability (#1146)
+
+- Resolves the canonical LLM configuration via `AppConfig::resolve_llm`
+  (the same path MCP stdio, the HTTP daemon, `atomise`, `curator`, and
+  the boot banner consume) and probes the endpoint with the resolved
+  Bearer key: `GET <base_url>/api/tags` (Ollama) or
+  `GET <base_url>/models` (OpenAI-compatible).
+- Facts: `backend`, `model`, `base_url`, `config_source`,
+  `key_source` (never the key itself), `http_status`, `latency_ms`.
+- Severity: **INFO** on 2xx; **WARN** on 401/403 (auth), 429
+  (rate-limit), 5xx (vendor outage); **CRIT** on other 4xx (likely
+  wrong `base_url`), network / DNS / TLS errors.
+
+### Embeddings Reachability (#1598)
+
+- The embeddings sibling of the LLM section. Resolves the canonical
+  embeddings configuration via `AppConfig::resolve_embeddings` (the
+  same #1598 ladder the MCP stdio init + daemon `build_embedder`
+  consume) and probes: `GET <url>/api/tags` (ollama backend, no auth)
+  or `POST <url>/embeddings` with a 1-char input + the resolved
+  Bearer key (API backends).
+- Facts: `backend`, `model`, `base_url`, `config_source`,
+  `key_source`, `probe_url`, `http_status`, `latency_ms`; `key_error`
+  when key resolution failed (the probe still runs so reachability is
+  reported independently).
+- Severity mapping matches the LLM section. When NO operator
+  embeddings configuration exists anywhere (env / `[embeddings]` /
+  legacy flat all absent), the section is **INFO without probing** —
+  the tier preset governs, preserving the fresh-DB all-INFO invariant.
+- **Operator GPU-policy WARN** — fires when the resolved backend is
+  `ollama` on a host with no detectable NVIDIA GPU (`nvidia-smi -L`).
+  Operator policy: local Ollama embeddings only on GPU-equipped
+  nodes; CPU-only nodes use API backends. See the
+  [enterprise reference architectures](../reference-architecture/enterprise-cpu-memory.md).
+
 ## Severity rules (initial)
 
 | Severity | Trigger |

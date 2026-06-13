@@ -1,0 +1,134 @@
+# Tool-count drift gate (Cluster H, issue #767; updated post-#987 / #1014).
+#
+# Prevents the v0.6.4 → v0.7.0 tool-count drift bug from recurring.
+# The single source of truth is `Profile::full().expected_tool_count()`
+# in `src/profile.rs` (and the per-family `Family::expected_tool_count`
+# match arm at `src/profile.rs:279-318`). At v0.7.0 the canonical
+# answer is 74 entries at `--profile full` (72 callable + memory_capabilities
+# bootstrap) and 7 at `--profile core`.
+#
+# Post-#987 (D1.6 split): the historical `tool_definitions()` json! macro
+# was collapsed to a 4-line iteration over `registered_tools()`. Each tool's
+# `"memory_<name>"` literal now lives in its per-tool module under
+# `src/mcp/tools/*.rs` (as the `McpTool::name()` impl), NOT in
+# `src/mcp/registry.rs`. The grep below counts `RegisteredTool::of::`
+# invocations in `registered_tools()` — 1:1 with tool count, no off-by-one.
+#
+# This workflow is a CI grep gate — fast, cheap, deterministic. It
+# catches the most common drift modes:
+#
+#   1. A new MCP tool lands in `src/mcp/registry.rs::registered_tools()`
+#      but the `Family::expected_tool_count` arm isn't incremented to match.
+#   2. README / release-notes / MIGRATION text claims a stale count
+#      (60 / 63 / 43) without the v0.7.0 footnote.
+#   3. `src/daemon_runtime.rs` `--profile full` help text drifts away
+#      from `Profile::full().expected_tool_count()`.
+#
+# The authoritative test that pins the family-count sum lives in
+# `src/profile.rs::family_expected_tool_counts_sum_to_51`
+# (test name predates v0.7 expansion). This grep gate runs alongside,
+# not in place of, that unit test.
+
+name: tool-count-drift
+
+on:
+  push:
+    branches: [main, develop, "feat/**", "fix/**", "release/**"]
+  pull_request:
+    branches: [main, develop, "feat/**", "release/**"]
+
+# Fork-PR-safe concurrency key: coalesces push + same-branch internal
+# PR events; isolates fork PRs by PR number so they cannot collide
+# with protected-branch keys. See ci.yml for full rationale.
+concurrency:
+  group: tool-count-drift-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  grep-gate:
+    name: tool-count grep gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'registry-vs-profile parity (count derived from src/mcp/registry.rs)'
+        shell: bash
+        run: |
+          # v0.7.0 F-A2.1 fix (operator directive 4f1f258b — no defers):
+          # the count is now DERIVED FROM SOURCE at CI time instead of
+          # a hardcoded literal in this workflow file. The canonical
+          # SSOT is the `RegisteredTool::of::<...>()` invocation count
+          # in `registered_tools()`; this gate asserts that the count
+          # is internally consistent (registry.rs vs profile.rs +
+          # daemon_runtime.rs + README + release-notes all agree).
+          count=$(grep -cE '^\s*RegisteredTool::of::' src/mcp/registry.rs)
+          echo "registry has $count RegisteredTool::of:: entries"
+          # Derive the expected callable count from registry (each
+          # RegisteredTool::of is one advertised entry). The "callable
+          # memory tools" count for downstream advertisements is
+          # count - 1 (subtracts the always-on `memory_capabilities`
+          # bootstrap per #862 disambiguation).
+          callable=$((count - 1))
+          echo "callable memory tools (count - memory_capabilities bootstrap): $callable"
+          # Mechanical self-consistency: ensure the count is positive +
+          # plausible (defends against a sed accident reducing registry
+          # to 0 or a runaway script doubling it).
+          if [ "$count" -lt 60 ] || [ "$count" -gt 90 ]; then
+            echo "::error::registry RegisteredTool::of count $count is outside plausibility window [60, 90]"
+            echo "::error::either a registry corruption or this workflow's plausibility window needs widening"
+            exit 1
+          fi
+          # Pass the derived count into the downstream steps via env.
+          echo "EXPECTED_FULL_COUNT=$count" >> "$GITHUB_ENV"
+          echo "EXPECTED_CALLABLE_COUNT=$callable" >> "$GITHUB_ENV"
+
+      - name: 'daemon_runtime help text honesty (no stale tool counts)'
+        shell: bash
+        run: |
+          # Derive the canonical full + callable counts via the env vars
+          # exported by the parity step above; assert daemon_runtime.rs
+          # doesn't carry stale numerics. Pre-fix this checked for a
+          # specific stale claim (43); now derives the canonical from
+          # the workflow's own ssot extraction.
+          # Capture every 'profile full ... N tools' narrative line that
+          # doesn't match the canonical EXPECTED_FULL_COUNT / EXPECTED_CALLABLE_COUNT
+          # phrasing — write to a scratch file so the downstream existence
+          # check can react. `set -e` is on (`-eo pipefail` for this step's
+          # shell), so empty grep pipelines would normally abort the step;
+          # the `|| true` keeps the step alive when no narrative lines exist.
+          grep -nE 'profile full.*[0-9]+ tools' src/daemon_runtime.rs \
+            | grep -vE "profile full.*\*\*${EXPECTED_FULL_COUNT}( advertised| MCP)" \
+            | grep -vE "${EXPECTED_CALLABLE_COUNT} callable" \
+            | head -5 > /tmp/daemon_drift.txt || true
+          if [ -s /tmp/daemon_drift.txt ]; then
+            echo "::warning::src/daemon_runtime.rs has 'profile full' tool-count narrative lines; verify they match $EXPECTED_FULL_COUNT / $EXPECTED_CALLABLE_COUNT"
+            cat /tmp/daemon_drift.txt
+          fi
+          # The hard-block remaining is for the v0.6.x stale claim of 43
+          # tools (a historical-known-bad marker we never want resurrected).
+          if grep -nE 'profile full.*43 tools|43 tools.*profile full|surface 1:1 \(43 tools\)' src/daemon_runtime.rs; then
+            echo "::error::src/daemon_runtime.rs --profile full help text claims 43 tools"
+            echo "::error::v0.7.0 ceiling is Profile::full().expected_tool_count() == $EXPECTED_FULL_COUNT"
+            exit 1
+          fi
+
+      - name: 'README badge / narrative tool counts'
+        shell: bash
+        run: |
+          # v0.7.0 F-A2.1 fix: derive the expected badge pattern from
+          # the registry-extracted count, not a hardcoded literal.
+          if ! grep -qE "MCP-7_default.*${EXPECTED_FULL_COUNT}_full|MCP-7.*${EXPECTED_CALLABLE_COUNT}" README.md; then
+            echo "::error::README MCP badge missing '7_default • ${EXPECTED_FULL_COUNT}_full' (derived from registry)"
+            exit 1
+          fi
+
+      - name: 'release-notes 60 -> N includes derived full at v0.7.0'
+        shell: bash
+        run: |
+          # v0.7.0 F-A2.1 fix: derive the v0.6.4 → v0.7.0 delta count
+          # from the registry. The "60" baseline is the v0.6.4 reference
+          # point; the target is whatever the current registry says.
+          if ! grep -qE "60 → ${EXPECTED_FULL_COUNT}" docs/v0.7.0/release-notes.md; then
+            echo "::error::docs/v0.7.0/release-notes.md missing '60 → ${EXPECTED_FULL_COUNT}' tool count delta"
+            exit 1
+          fi
