@@ -108,9 +108,15 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust stable
+      - name: Install Rust 1.96.0 + target std
+        # Pin to the rust-toolchain.toml channel (1.96.0). The build below
+        # resolves the toolchain from rust-toolchain.toml, so the cross
+        # target std must be installed onto THAT toolchain — installing it
+        # onto `stable` left non-host targets (e.g. x86_64-apple-darwin on
+        # the arm64 macOS runner) without `core`, failing with E0463.
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -220,9 +226,12 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust stable + iOS targets
+      - name: Install Rust 1.96.0 + iOS targets
+        # Pin to rust-toolchain.toml (1.96.0) so the iOS cross-target std
+        # lands on the build toolchain (see release-matrix note above).
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.0
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
       - uses: Swatinem/rust-cache@v2
@@ -336,9 +345,12 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust stable + Android targets
+      - name: Install Rust 1.96.0 + Android targets
+        # Pin to rust-toolchain.toml (1.96.0) so the Android cross-target
+        # std lands on the build toolchain (see release-matrix note above).
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.0
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
       - uses: Swatinem/rust-cache@v2
