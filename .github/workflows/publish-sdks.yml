@@ -65,13 +65,15 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # NOTE: deliberately NOT passing registry-url here. setup-node's
+      # registry-url writes an .npmrc with `_authToken=${NODE_AUTH_TOKEN}`
+      # and a placeholder token, which npm sends as auth and the registry
+      # rejects with a disguised 404 — short-circuiting OIDC. Omitting it
+      # lets npm 11 perform a clean OIDC Trusted-Publishing exchange.
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          registry-url: "https://registry.npmjs.org/"
-      # npm's OIDC Trusted Publishing token exchange requires npm >= 11.5.1.
-      # Node 20 bundles npm 10.x, which publishes *unauthenticated* and the
-      # registry then returns a disguised 404 on PUT. Pin a modern npm.
+      # npm's OIDC Trusted Publishing requires npm >= 11.5.1 (Node 20 ships 10.x).
       - name: upgrade npm for OIDC trusted publishing
         run: npm install -g npm@latest
       - name: install + build
@@ -81,4 +83,6 @@ jobs:
           npm run build
       - name: publish via npm Trusted Publisher (OIDC + provenance)
         working-directory: sdk/typescript
-        run: npm publish --provenance --access public
+        run: |
+          echo "npm version: $(npm -v)"
+          npm publish --provenance --access public
