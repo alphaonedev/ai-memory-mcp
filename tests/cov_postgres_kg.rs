@@ -237,28 +237,31 @@ async fn entity_register_idempotent_then_resolve_by_alias() {
         .expect("entity_register idempotent");
     assert!(!second.created, "re-register is idempotent");
 
-    // `entity_get_by_alias` reads the `entity_aliases` join table, which
-    // the SAL `entity_register` path does NOT populate (it stamps
-    // `metadata.aliases` on the entity memory only — the `entity_aliases`
-    // table is written by the kg handler's register path, see
-    // FINDINGS in the cov4 handoff). Exercise the resolver's query path
-    // (both the namespace-scoped and namespace-wide arms) + the clean
-    // miss path; the registered entity is correctly NOT found via the
-    // alias table.
+    // #1654 — `entity_register` now ALSO populates the `entity_aliases`
+    // join table (it formerly stamped only `metadata.aliases`), so
+    // `entity_get_by_alias` — which resolves via that table — finds a
+    // SAL-trait-registered entity. Exercise the namespace-scoped arm
+    // (deterministic: this test's uid namespace), the namespace-wide arm,
+    // and the clean miss path.
     let scoped = store
         .entity_get_by_alias("acme", Some(&ns))
         .await
-        .expect("entity_get_by_alias ns arm");
-    assert!(
-        scoped.is_none(),
-        "SAL register does not write entity_aliases"
+        .expect("entity_get_by_alias ns arm")
+        .expect("#1654: 'acme' resolves to the SAL-registered entity (ns-scoped)");
+    assert_eq!(
+        scoped.entity_id, first.entity_id,
+        "alias resolves to the registered entity id"
     );
 
+    // Namespace-wide arm: resolves to some entity carrying the alias. (Not
+    // pinned to first.entity_id — on a shared/persistent CI DB other
+    // namespaces may also carry an 'acme' alias; the ns-scoped arm above
+    // is the deterministic identity check.)
     let wide = store
         .entity_get_by_alias("acme", None)
         .await
         .expect("entity_get_by_alias wide arm");
-    assert!(wide.is_none());
+    assert!(wide.is_some(), "#1654: 'acme' resolves namespace-wide");
 
     let missing = store
         .entity_get_by_alias("no-such-alias-cov4", Some(&ns))
