@@ -49,6 +49,9 @@ jobs:
         with:
           packages-dir: sdk/python/dist
           print-hash: true
+          # Re-runs (or a tag re-push) must not fail when the version is
+          # already on PyPI — the upload is idempotent, not an error.
+          skip-existing: true
 
   publish-npm:
     if: ${{ github.event_name == 'push' || github.event.inputs.target == 'both' || github.event.inputs.target == 'npm' }}
