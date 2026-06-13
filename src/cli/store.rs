@@ -6,7 +6,7 @@
 
 use crate::cli::CliOutput;
 use crate::cli::governance::{GovernanceOutcome, enforce as enforce_governance};
-use crate::cli::helpers::auto_namespace;
+use crate::models::ConfidenceSource;
 use crate::{config, db, identity, models, validate};
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -18,6 +18,11 @@ use std::path::Path;
 /// from main.rs verbatim in W5a — fields and attrs unchanged.
 #[derive(Args)]
 pub struct StoreArgs {
+    /// Memory tier. `default_value` must be a literal at attribute-parse
+    /// time, so the wire string is kept here verbatim; it is byte-equal
+    /// to `crate::models::Tier::Mid.as_str()` (pm-v3.1 PR6 #1174 sweep
+    /// — raw tier literals are confined to the deserializer + clap
+    /// `default_value` attrs that cannot accept const expressions).
     #[arg(long, short, default_value = "mid")]
     pub tier: String,
     #[arg(long, short)]
@@ -31,9 +36,11 @@ pub struct StoreArgs {
     pub tags: String,
     #[arg(long, short, default_value_t = 5)]
     pub priority: i32,
-    /// Confidence 0.0-1.0
-    #[arg(long, default_value_t = 1.0)]
-    pub confidence: f64,
+    /// Confidence 0.0-1.0. When omitted (#1591) the compiled default is
+    /// stamped with truthful `confidence_source = "default"` provenance
+    /// instead of falsely claiming `caller_provided`.
+    #[arg(long)]
+    pub confidence: Option<f64>,
     /// Source: user, claude, hook, api
     #[arg(long, short = 'S', default_value = "cli")]
     pub source: String,
@@ -48,6 +55,41 @@ pub struct StoreArgs {
     /// when queries use `--as-agent`.
     #[arg(long)]
     pub scope: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-6 typed memory kind. One of:
+    /// observation (default), reflection, persona, concept, entity,
+    /// claim, relation, event, conversation, decision. Maps to
+    /// `Memory::memory_kind` (canonical: `crate::models::MemoryKind`).
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-4 fact-provenance citations array.
+    /// JSON array of `{uri, accessed_at, hash?, span?}` entries. Maps
+    /// to `Memory::citations` (validated via `validate::validate_citation`).
+    /// Pass `--citations '[{"uri":"https://example.com","accessed_at":"2026-05-31T00:00:00Z"}]'`.
+    #[arg(long)]
+    pub citations: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-4 first-class source URI pointer.
+    /// Accepted schemes: `uri:` / `doc:` / `file:`. Maps to
+    /// `Memory::source_uri` (validated via `validate::validate_source_uri`).
+    #[arg(long)]
+    pub source_uri: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — Form-4 byte-range pin into the source body.
+    /// JSON `{start: <usize>, end: <usize>}`. Maps to `Memory::source_span`
+    /// (validated via `validate::validate_source_span`).
+    #[arg(long)]
+    pub source_span: Option<String>,
+    /// v0.7.0 F2.3 (#1427) — QW-2 persona artefact entity binding.
+    /// Required when `--kind persona`. Maps to `Memory::entity_id`.
+    #[arg(long)]
+    pub entity_id: Option<String>,
+    /// #626 Layer-3 (Task 1.3 / C5) — sign this write with the resolved
+    /// agent's local Ed25519 keypair so the stored row is *attested*
+    /// rather than merely *claimed*. Requires a `<agent_id>.priv` under
+    /// the key directory (`AI_MEMORY_KEY_DIR` or the platform default);
+    /// the bound public key must match (see `ai-memory agents bind-key`).
+    /// When unset, the write is *claimed* unless
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, which rejects it.
+    #[arg(long)]
+    pub sign: bool,
 }
 
 /// Resolve the content payload: literal `-` means read stdin via the
@@ -91,7 +133,11 @@ pub fn run(
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = Tier::from_str(&args.tier)
         .ok_or_else(|| anyhow::anyhow!("invalid tier: {} (use short, mid, long)", args.tier))?;
-    let namespace = args.namespace.unwrap_or_else(auto_namespace);
+    // #1590 — explicit --namespace > configured [storage].default_namespace
+    // > git remote > cwd basename > "global" (see `cli::helpers`).
+    let namespace = crate::cli::helpers::resolve_namespace(args.namespace);
+    // #1591 — keep caller-omission observable for truthful provenance.
+    let confidence = args.confidence.unwrap_or(models::DEFAULT_CONFIDENCE);
     let content = resolve_content(&args.content, read_stdin_to_string)?;
     let tags: Vec<String> = args
         .tags
@@ -107,7 +153,7 @@ pub fn run(
     validate::validate_source(&args.source)?;
     validate::validate_tags(&tags)?;
     validate::validate_priority(args.priority)?;
-    validate::validate_confidence(args.confidence)?;
+    validate::validate_confidence(confidence)?;
     validate::validate_expires_at(args.expires_at.as_deref())?;
     validate::validate_ttl_secs(args.ttl_secs)?;
 
@@ -132,7 +178,51 @@ pub fn run(
         }
     }
 
-    let mem = models::Memory {
+    // v0.7.0 F2.3 (#1427) — Form-4 + Form-6 caller-supplied fields.
+    // Validate each before constructing the Memory; clap-side validation
+    // is permissive (Option<String>) and the validator carries the
+    // canonical wire-shape error messages (see validate::validate_*).
+    let memory_kind = match args.kind.as_deref() {
+        None => crate::models::MemoryKind::Observation,
+        Some(s) => crate::models::MemoryKind::from_str(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --kind '{s}' (expected one of: observation, reflection, persona, \
+                 concept, entity, claim, relation, event, conversation, decision)"
+            )
+        })?,
+    };
+    let citations: Vec<crate::models::Citation> = match args.citations.as_deref() {
+        None => Vec::new(),
+        Some(s) => {
+            let parsed: Vec<crate::models::Citation> = serde_json::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid --citations JSON: {e}"))?;
+            for c in &parsed {
+                validate::validate_citation(c)
+                    .map_err(|e| anyhow::anyhow!("invalid --citations entry: {e}"))?;
+            }
+            parsed
+        }
+    };
+    let source_uri = match args.source_uri.as_deref() {
+        None => None,
+        Some(s) => {
+            validate::validate_source_uri(s)
+                .map_err(|e| anyhow::anyhow!("invalid --source-uri: {e}"))?;
+            Some(s.to_string())
+        }
+    };
+    let source_span: Option<crate::models::SourceSpan> = match args.source_span.as_deref() {
+        None => None,
+        Some(s) => {
+            let parsed: crate::models::SourceSpan = serde_json::from_str(s)
+                .map_err(|e| anyhow::anyhow!("invalid --source-span JSON: {e}"))?;
+            validate::validate_source_span(&parsed)
+                .map_err(|e| anyhow::anyhow!("invalid --source-span: {e}"))?;
+            Some(parsed)
+        }
+    };
+
+    let mut mem = models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace,
@@ -140,7 +230,7 @@ pub fn run(
         content,
         tags,
         priority: args.priority.clamp(1, 10),
-        confidence: args.confidence.clamp(0.0, 1.0),
+        confidence: confidence.clamp(0.0, 1.0),
         source: args.source,
         access_count: 0,
         created_at: now.to_rfc3339(),
@@ -148,7 +238,44 @@ pub fn run(
         last_accessed_at: None,
         expires_at,
         metadata,
+        reflection_depth: 0,
+        memory_kind,
+        entity_id: args.entity_id,
+        persona_version: None,
+        citations,
+        source_uri,
+        source_span,
+        // #1591 — truthful provenance: only an explicit --confidence
+        // is `caller_provided`; the compiled fallback is `default`.
+        confidence_source: if args.confidence.is_some() {
+            ConfidenceSource::CallerProvided
+        } else {
+            ConfidenceSource::Default
+        },
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
     };
+
+    // #626 Layer-3 (Task 1.3 / C5) — agent attestation gate. When
+    // `--sign` is set, load the agent's local keypair and sign the
+    // attestable surface; the gate then stamps `metadata.attest_level =
+    // "agent_attested"`. The gate is also invoked (with no signature) when
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, so an unsigned write is
+    // rejected under the strict posture. When neither applies the write
+    // path is byte-equal to the pre-Layer-3 behavior (no stamp).
+    let signature: Option<Vec<u8>> = if args.sign {
+        let dir = identity::keypair::default_key_dir()?;
+        let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
+            anyhow::anyhow!("--sign requires a local keypair for agent '{agent_id}': {e:#}")
+        })?;
+        Some(identity::attest::sign_memory_write(&kp, &mem, &agent_id)?)
+    } else {
+        None
+    };
+    if args.sign || identity::attest::require_agent_attestation_enabled() {
+        identity::attest::stamp_attestation_sync(&conn, &mut mem, &agent_id, signature.as_deref())?;
+    }
 
     // W5b/C5: governance enforcement routes through `cli::governance::enforce`
     // so the print-side of Pending/Deny is covered by `cli::governance::tests`.
@@ -185,7 +312,9 @@ pub fn run(
         crate::audit::AuditAction::Store,
         crate::audit::actor(
             agent_id.clone(),
-            cli_agent_id.map_or("default_fallback", |_| "explicit"),
+            cli_agent_id.map_or(crate::audit::synthesis_sources::DEFAULT_FALLBACK, |_| {
+                crate::audit::synthesis_sources::EXPLICIT
+            }),
             args.scope.clone(),
         ),
         crate::audit::target_memory(
@@ -237,17 +366,24 @@ mod tests {
 
     fn default_args() -> StoreArgs {
         StoreArgs {
-            tier: "mid".to_string(),
+            tier: Tier::Mid.as_str().to_string(),
             namespace: Some("test-ns".to_string()),
             title: "test title".to_string(),
             content: "test content".to_string(),
             tags: String::new(),
             priority: 5,
-            confidence: 1.0,
+            confidence: None,
             source: "cli".to_string(),
             expires_at: None,
             ttl_secs: None,
             scope: None,
+            // v0.7.0 F2.3 (#1427) — Form-4 + Form-6 CLI flag additions.
+            kind: None,
+            citations: None,
+            source_uri: None,
+            source_span: None,
+            entity_id: None,
+            sign: false,
         }
     }
 
@@ -265,6 +401,7 @@ mod tests {
 
     #[test]
     fn test_store_happy_path_text_output() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -281,6 +418,7 @@ mod tests {
 
     #[test]
     fn test_store_json_output() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -293,7 +431,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
         assert!(v["id"].is_string());
         assert_eq!(v["title"].as_str().unwrap(), "test title");
-        assert_eq!(v["tier"].as_str().unwrap(), "mid");
+        assert_eq!(v["tier"].as_str().unwrap(), Tier::Mid.as_str());
         assert_eq!(v["namespace"].as_str().unwrap(), "test-ns");
     }
 
@@ -308,6 +446,7 @@ mod tests {
 
     #[test]
     fn test_store_explicit_expires_at_overrides_tier() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -325,6 +464,7 @@ mod tests {
 
     #[test]
     fn test_store_ttl_secs_overrides_tier() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -341,6 +481,7 @@ mod tests {
 
     #[test]
     fn test_store_with_scope_in_metadata() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -356,6 +497,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_tier_validation_error() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -369,6 +511,7 @@ mod tests {
 
     #[test]
     fn test_store_invalid_priority_validation_error() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -382,29 +525,46 @@ mod tests {
 
     #[test]
     fn test_store_contradiction_warning_in_stderr() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
-        // Seed a memory with the SAME title in the SAME namespace; the
-        // contradiction-detect query should fire a warning on the
-        // second insert.
-        let _ =
-            crate::cli::test_utils::seed_memory(&db, "test-ns", "shared title", "first content");
+        // Seed a memory with a SIMILAR (not identical) title in the same
+        // namespace. A distinct title avoids the `(title, namespace)`
+        // upsert — if the titles matched exactly, `db::insert` would merge
+        // onto the seeded row, making `actual_id == seeded.id`, and the
+        // contradiction would be filtered out (line: `c.id != actual_id`)
+        // so the warning would never fire. The two titles share
+        // `{kubernetes, deployment}` of `{kubernetes, deployment, guide}` /
+        // `{kubernetes, deployment, notes}` → Jaccard 2/4 = 0.5 ≥ 0.30
+        // floor, so the seeded row surfaces as a potential contradiction.
+        let _ = crate::cli::test_utils::seed_memory(
+            &db,
+            "test-ns",
+            "kubernetes deployment guide",
+            "first content",
+        );
         let mut args = default_args();
-        args.title = "shared title".to_string();
+        args.title = "kubernetes deployment notes".to_string();
         args.content = "second content".to_string();
         {
             let mut out = env.output();
             run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap();
         }
-        // stderr may or may not contain the warning depending on the
-        // contradiction detector's heuristic; assert that at minimum
-        // the happy path stored the row without erroring.
+        // Happy path stored the new (distinct-title) row on stdout.
         assert!(env.stdout_str().contains("stored: "));
+        // And the similar seeded row fired the contradiction warning on
+        // stderr (exercises the non-json `if !filtered.is_empty()` branch).
+        let stderr = env.stderr_str();
+        assert!(
+            stderr.contains("potential contradictions"),
+            "expected contradiction warning on stderr, got: {stderr}"
+        );
     }
 
     #[test]
     fn test_store_governance_pending_writes_pending_status() {
+        let _lock = locked_env();
         // Covered indirectly by the happy-path test (no governance rules
         // configured -> Allow branch). The Pending/Deny branches require
         // governance-rule rows that aren't part of the default schema; a
@@ -425,6 +585,7 @@ mod tests {
 
     #[test]
     fn test_store_tag_parsing() {
+        let _lock = locked_env();
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
@@ -438,5 +599,287 @@ mod tests {
         let tags = v["tags"].as_array().unwrap();
         let strs: Vec<&str> = tags.iter().map(|t| t.as_str().unwrap()).collect();
         assert_eq!(strs, vec!["a", "b", "c"]);
+    }
+
+    // v0.7.0 F2.3 (#1427) — coverage for the Form-4 / Form-6 flag arms.
+
+    #[test]
+    fn test_store_form4_form6_flags_valid_roundtrip() {
+        let _lock = locked_env();
+        // Exercises every Some(_) success arm (kind/citations/source_uri/
+        // source_span/entity_id) in a single store call.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.kind = Some("reflection".to_string());
+        args.citations = Some(
+            r#"[{"uri":"uri:https://example.com/a","accessed_at":"2026-05-31T00:00:00Z"}]"#
+                .to_string(),
+        );
+        args.source_uri = Some("uri:https://example.com/src".to_string());
+        args.source_span = Some(r#"{"start":0,"end":5}"#.to_string());
+        args.entity_id = Some("ent-123".to_string());
+        {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("test-agent"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["memory_kind"].as_str().unwrap(), "reflection");
+        assert_eq!(
+            v["source_uri"].as_str().unwrap(),
+            "uri:https://example.com/src"
+        );
+        assert_eq!(v["entity_id"].as_str().unwrap(), "ent-123");
+        assert_eq!(v["citations"].as_array().unwrap().len(), 1);
+        assert_eq!(v["source_span"]["end"].as_u64().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_store_invalid_kind_errors() {
+        let _lock = locked_env();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.kind = Some("ginormous".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(err.to_string().contains("invalid --kind"), "got: {err}");
+    }
+
+    #[test]
+    fn test_store_invalid_citations_json_errors() {
+        let _lock = locked_env();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.citations = Some("not-json".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --citations JSON"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_citations_entry_errors() {
+        let _lock = locked_env();
+        // Well-formed JSON, but the entry fails validate_citation
+        // (bare URI without a uri:/doc:/file: scheme).
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.citations =
+            Some(r#"[{"uri":"example.com","accessed_at":"2026-05-31T00:00:00Z"}]"#.to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --citations entry"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_source_uri_errors() {
+        let _lock = locked_env();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.source_uri = Some("bareword-no-scheme".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-uri"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_source_span_json_errors() {
+        let _lock = locked_env();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.source_span = Some("not-json".to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-span JSON"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_store_invalid_source_span_range_errors() {
+        let _lock = locked_env();
+        // Valid JSON, but start >= end fails validate_source_span.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.source_span = Some(r#"{"start":5,"end":5}"#.to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --source-span"),
+            "got: {err}"
+        );
+    }
+
+    // #626 Layer-3 (Task 1.3 / C5) — `--sign` attestation gate coverage.
+    //
+    // These three tests mutate process env (`AI_MEMORY_KEY_DIR`,
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`) so they serialize on
+    // `ENV_LOCK` and restore the prior values on exit, per the
+    // env-test discipline. Key material lives under a `tempfile::tempdir()`
+    // (never `/tmp` directly — the OS temp root is fine for the OS-created
+    // dir; the project no-/tmp rule covers agent-AUTHORED scratch paths).
+
+    /// Process-global env lock shared with
+    /// [`crate::identity::keypair::key_dir_env_lock`]. Every test across the
+    /// crate that mutates `AI_MEMORY_KEY_DIR` (keypair, mcp, governance::audit,
+    /// cli::verify) serialises on this ONE mutex; a module-local lock would let
+    /// those suites race this one on the shared `AI_MEMORY_KEY_DIR` /
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` process env and flake. #626 Layer-3.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        crate::identity::keypair::key_dir_env_lock()
+    }
+
+    /// Poison-resilient acquire of the shared env lock. Centralises the
+    /// `into_inner` recovery in one place (via the `PoisonError::into_inner`
+    /// fn-pointer, not a per-call-site closure) so the never-firing-in-green
+    /// poison branch is a single covered instantiation rather than one
+    /// uncovered closure per test.
+    fn locked_env() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// RAII restore of an env var to its pre-test value.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, val: &std::ffi::OsStr) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+        fn clear(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn test_store_sign_with_bound_key_stamps_agent_attested() {
+        let _lock = locked_env();
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+
+        // Persist the agent's keypair on disk so `--sign` can load + sign.
+        let kp = crate::identity::keypair::generate("test-agent").unwrap();
+        crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Register the agent + bind its pubkey so the gate resolves a bound
+        // key matching the presented signature → AgentAttested.
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "test-agent", "ai:claude-opus-4.7", &[]).unwrap();
+            db::bind_agent_pubkey(&conn, "test-agent", &kp.public_base64()).unwrap();
+        }
+
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("test-agent"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(
+            v["metadata"]["attest_level"].as_str().unwrap(),
+            "agent_attested"
+        );
+    }
+
+    #[test]
+    fn test_store_sign_without_local_keypair_errors() {
+        let _lock = locked_env();
+        // Empty key dir — no `<agent_id>.priv` to load.
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("--sign requires a local keypair"),
+            "got: {err}"
+        );
+    }
+
+    // #1609 — the strict-require rejection case (`test_store_require_
+    // attestation_rejects_unsigned`) used to live here, SETTING the
+    // process-global `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` under
+    // `locked_env()`. The lock covers fellow MUTATORS, but the gate's
+    // READERS (`require_agent_attestation_enabled` callers in
+    // `mcp::tools::store` / `handlers::create` tests) run lock-free in
+    // the same parallel lib-test process, so the set-window leaked into
+    // any sibling store test scheduled concurrently (narrow-filter
+    // repro: `cargo test --lib 'store::tests'`). The case now drives
+    // the compiled binary with child-process env in
+    // `tests/agent_attestation_integrity.rs::
+    // cli_require_attestation_rejects_unsigned_store` — same coverage,
+    // zero process-global mutation. Per the design rule documented in
+    // `src/mcp/tools/store/tests.rs` (#626 section header): the
+    // parallel lib-test binary must NEVER set the require flag.
+
+    // EnvVarGuard Drop with a pre-existing value → Some-arm restore (set_var)
+    // rather than the None-arm remove. Pins the RAII restore contract.
+    #[test]
+    fn env_var_guard_restores_previous_value_on_drop() {
+        let _lock = locked_env();
+        let prior = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AI_MEMORY_KEY_DIR", prior.path().as_os_str()) };
+        {
+            let other = tempfile::tempdir().unwrap();
+            let _g = EnvVarGuard::set("AI_MEMORY_KEY_DIR", other.path().as_os_str());
+            assert_eq!(
+                std::env::var_os("AI_MEMORY_KEY_DIR").as_deref(),
+                Some(other.path().as_os_str())
+            );
+            // _g drops here → Some-arm restore of `prior`.
+        }
+        assert_eq!(
+            std::env::var_os("AI_MEMORY_KEY_DIR").as_deref(),
+            Some(prior.path().as_os_str())
+        );
+        unsafe { std::env::remove_var("AI_MEMORY_KEY_DIR") };
     }
 }

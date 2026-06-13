@@ -47,11 +47,34 @@
 
 use crate::cli::CliOutput;
 use crate::db;
+use crate::models::field_names;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
+
+// ── #1558 batch 6 — repeated doctor fact / section labels ──────────────
+const FACT_DIM_VIOLATIONS: &str = "dim_violations";
+const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
+const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
+const FACT_RERANKER_ACTIVE: &str = "reranker_active";
+const SECTION_LLM_REACHABILITY: &str = "LLM Reachability (#1146)";
+const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
+const MSG_RAW_SQL_DB_MODE: &str = "raw SQL section — only available in --db mode";
+/// #1598 literal-dedup — shared probe-client failure fact prefix for
+/// the LLM + Embeddings reachability sections.
+const MSG_HTTP_CLIENT_BUILD_FAILED: &str = "http client build failed";
+
+/// #1558 batch 5 wave 3 — placeholder fact value rendered when the
+/// probed capabilities payload does not carry the requested feature
+/// key (older daemons).
+const NOT_IN_RESPONSE: &str = "not_in_response";
+
+/// #1558 batch 5 wave 3 — placeholder fact value for the recall-mode /
+/// reranker distribution rows, which need the P3 rolling counter that
+/// has not landed yet.
+const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 
 /// Severity bucket attached to every doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -225,7 +248,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
         // Always include the full per-tool table when --raw-table is
         // set; --json gives the rolled-up view.
         let payload = serde_json::json!({
-            "schema_version": "v0.6.4-tokens-1",
+            (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
             "tokenizer": "cl100k_base",
             "active_profile": profile.families().iter().map(|f| f.name()).collect::<Vec<_>>(),
             "active_total_tokens": active_total,
@@ -306,7 +329,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     writeln!(out.stdout)?;
     writeln!(
         out.stdout,
-        "  Tools/list payload (v0.7 C4 trim, optionals hidden):"
+        "  Tools/list payload (v0.7 C4 + #859 trim — properties exposed, prose stripped):"
     )?;
     writeln!(
         out.stdout,
@@ -359,7 +382,7 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
 
     if args.json {
         let payload = serde_json::json!({
-            "schema_version": "v0.7-hooks-1",
+            (field_names::SCHEMA_VERSION): "v0.7-hooks-1",
             "config_path": path_opt.as_ref().map(|p| p.display().to_string()),
             "hooks_loaded": hooks.len(),
             "executors": hooks.iter().map(|h| serde_json::json!({
@@ -525,6 +548,9 @@ fn run_local(db_path: &Path) -> Report {
     sections.push(section_sync(&conn));
     sections.push(section_webhook(&conn));
     sections.push(section_capabilities_local());
+    sections.push(section_reflection_health(&conn));
+    sections.push(section_llm_reachability_1146());
+    sections.push(section_embeddings_reachability_1598());
 
     Report {
         mode: "local".into(),
@@ -542,7 +568,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
 
     match db::stats(conn, db_path) {
         Ok(stats) => {
-            facts.push(("total_memories".into(), stats.total.to_string()));
+            facts.push((field_names::TOTAL_MEMORIES.into(), stats.total.to_string()));
             facts.push(("expiring_within_1h".into(), stats.expiring_soon.to_string()));
             facts.push(("links".into(), stats.links_count.to_string()));
             facts.push(("db_size_bytes".into(), stats.db_size_bytes.to_string()));
@@ -562,10 +588,10 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
     // dim_violations (P2 surface). Pre-P2: Ok(None) -> render N/A line, no severity bump.
     match db::doctor_dim_violations(conn) {
         Ok(Some(0)) => {
-            facts.push(("dim_violations".into(), "0".into()));
+            facts.push((FACT_DIM_VIOLATIONS.into(), "0".into()));
         }
         Ok(Some(n)) => {
-            facts.push(("dim_violations".into(), n.to_string()));
+            facts.push((FACT_DIM_VIOLATIONS.into(), n.to_string()));
             severity = Severity::Critical;
             note = Some(format!(
                 "{n} memories have an embedding dim that disagrees with their namespace's modal dim"
@@ -573,7 +599,7 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
         }
         Ok(None) => {
             facts.push((
-                "dim_violations".into(),
+                FACT_DIM_VIOLATIONS.into(),
                 "not_observed (pre-P2 schema)".into(),
             ));
         }
@@ -652,11 +678,11 @@ fn section_recall_local() -> ReportSection {
         facts: vec![
             (
                 "recall_mode_distribution".into(),
-                "not_observed (pre-P3 rolling counter)".into(),
+                NOT_OBSERVED_PRE_P3.into(),
             ),
             (
                 "reranker_used_distribution".into(),
-                "not_observed (pre-P3 rolling counter)".into(),
+                NOT_OBSERVED_PRE_P3.into(),
             ),
             (
                 "hint".into(),
@@ -706,11 +732,11 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     match db::doctor_oldest_pending_age_secs(conn) {
         Ok(Some(age)) => {
             facts.push(("oldest_pending_age_secs".into(), age.to_string()));
-            if age > 86_400 {
+            if age > crate::SECS_PER_DAY {
                 severity = Severity::Critical;
                 note = Some(format!(
                     "oldest pending action is {age}s old (>{} threshold = 24h)",
-                    86_400
+                    crate::SECS_PER_DAY,
                 ));
             }
         }
@@ -745,7 +771,7 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
 
     if peer_count == 0 {
         facts.push((
-            "max_skew_secs".into(),
+            FACT_MAX_SKEW_SECS.into(),
             "not_observed (no peers registered)".into(),
         ));
         return ReportSection {
@@ -758,7 +784,7 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
 
     match db::doctor_max_sync_skew_secs(conn) {
         Ok(Some(skew)) => {
-            facts.push(("max_skew_secs".into(), skew.to_string()));
+            facts.push((FACT_MAX_SKEW_SECS.into(), skew.to_string()));
             if skew > 600 {
                 severity = Severity::Critical;
                 note = Some(format!(
@@ -767,7 +793,7 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
             }
         }
         Ok(None) => {
-            facts.push(("max_skew_secs".into(), "not_observed".into()));
+            facts.push((FACT_MAX_SKEW_SECS.into(), "not_observed".into()));
         }
         Err(e) => {
             facts.push(("sync_query_error".into(), e.to_string()));
@@ -828,10 +854,522 @@ fn section_capabilities_local() -> ReportSection {
         name: "Capabilities".into(),
         severity: Severity::NotAvailable,
         facts: vec![(
-            "capabilities".into(),
+            field_names::CAPABILITIES.into(),
             "use --remote <url> to query the live capabilities endpoint".into(),
         )],
         note: None,
+    }
+}
+
+/// v0.7.x (#1146) — LLM reachability probe.
+///
+/// Resolves the canonical LLM configuration via
+/// [`crate::config::AppConfig::resolve_llm`] (the same path used by
+/// MCP, HTTP daemon, atomise, curator, and the boot banner) and
+/// fires a lightweight HTTP probe at the resolved `base_url`. Maps
+/// the response to a Severity per the #1146 spec:
+///
+/// | Status   | HTTP outcomes                          |
+/// |----------|----------------------------------------|
+/// | INFO     | 200 (vendor reachable + auth OK)       |
+/// | WARN     | 401 / 403 (auth issue; URL reachable)  |
+/// | WARN     | 429 (rate-limited; reachable)          |
+/// | WARN     | 5xx (vendor outage; reachable)         |
+/// | CRIT     | 4xx other (likely wrong base_url)      |
+/// | CRIT     | network/DNS/connect-refused/TLS error  |
+///
+/// Probe endpoint per backend:
+/// - `ollama` → `GET <base_url>/api/tags` (no auth)
+/// - any OpenAI-compatible → `GET <base_url>/models` (Bearer auth)
+///
+/// The section's `facts` carry the resolver's full provenance
+/// (`backend`, `model`, `base_url`, `config_source`, `key_source`)
+/// plus the HTTP status code + observed latency, so operators can
+/// see WHERE the wiring came from and WHY the probe lands where it
+/// does.
+fn section_llm_reachability_1146() -> ReportSection {
+    use crate::config::{AppConfig, ConfigSource, KeySource};
+
+    let app_config = AppConfig::load();
+    let resolved = app_config.resolve_llm(None, None, None);
+
+    let mut facts = vec![
+        ("backend".into(), resolved.backend.clone()),
+        ("model".into(), resolved.model.clone()),
+        ("base_url".into(), resolved.base_url.clone()),
+        ("config_source".into(), resolved.source.as_str().to_string()),
+        (
+            field_names::KEY_SOURCE.into(),
+            resolved.api_key_source.as_str().to_string(),
+        ),
+    ];
+
+    // If the key resolution surfaced an error during resolve (file
+    // perms / missing env / etc.), call it out — but still try the
+    // probe so the operator sees if the URL is at least reachable.
+    if let KeySource::Error(reason) = &resolved.api_key_source {
+        facts.push(("key_error".into(), reason.clone()));
+    }
+
+    // Compiled-default — operator has no LLM configuration anywhere
+    // (a fresh install or a keyword-tier-only deployment). This is a
+    // legitimate state, not a misconfiguration: emit INFO with a
+    // pointer at how to enable LLM features rather than WARN (which
+    // would break the "fresh-DB doctor report = all INFO" invariant
+    // pinned by `tests/doctor_cli.rs::doctor_reports_clean_on_fresh_db`).
+    if matches!(resolved.source, ConfigSource::CompiledDefault) {
+        return ReportSection {
+            name: SECTION_LLM_REACHABILITY.into(),
+            severity: Severity::Info,
+            facts,
+            note: Some(
+                "no operator LLM configuration found (CLI / env / [llm] section / \
+                 legacy flat fields all absent); LLM-powered features will be \
+                 inactive. To enable, set AI_MEMORY_LLM_BACKEND in the process \
+                 env or write a [llm] section in config.toml. See \
+                 docs/CONFIG_SCHEMA.md for the canonical schema."
+                    .into(),
+            ),
+        };
+    }
+
+    // Build the probe URL.
+    let (probe_url, bearer) = if resolved.is_ollama_native() {
+        (crate::llm::ollama_tags_url(&resolved.base_url), None)
+    } else {
+        (
+            format!("{}/models", resolved.base_url),
+            resolved.api_key().map(str::to_string),
+        )
+    };
+    facts.push(("probe_url".into(), probe_url.clone()));
+
+    let started = std::time::Instant::now();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push((
+                "error".into(),
+                format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
+            ));
+            return ReportSection {
+                name: SECTION_LLM_REACHABILITY.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("could not build HTTP client for probe".into()),
+            };
+        }
+    };
+
+    let mut req = client.get(&probe_url);
+    if let Some(k) = bearer {
+        req = req.bearer_auth(k);
+    }
+
+    let (severity, note) = match req.send() {
+        Ok(resp) => {
+            let status = resp.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push(("http_status".into(), status.as_u16().to_string()));
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
+
+            if status.is_success() {
+                (Severity::Info, None)
+            } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "auth failed (status {}); URL is reachable but the \
+                         resolved API key was rejected — check [llm].api_key_env / \
+                         [llm].api_key_file / process env",
+                        status.as_u16()
+                    )),
+                )
+            } else if status.as_u16() == 429 {
+                (
+                    Severity::Warning,
+                    Some("rate-limited (status 429); vendor reachable but throttling".into()),
+                )
+            } else if status.is_server_error() {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "vendor 5xx (status {}); reachable but currently degraded",
+                        status.as_u16()
+                    )),
+                )
+            } else {
+                (
+                    Severity::Critical,
+                    Some(format!(
+                        "unexpected status {} from {} — verify base_url + endpoint shape",
+                        status.as_u16(),
+                        probe_url
+                    )),
+                )
+            }
+        }
+        Err(e) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
+            facts.push(("error".into(), e.to_string()));
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
+            (
+                Severity::Critical,
+                Some(format!(
+                    "network/{kind} error contacting {probe_url} — verify \
+                     base_url and connectivity"
+                )),
+            )
+        }
+    };
+
+    ReportSection {
+        name: SECTION_LLM_REACHABILITY.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// #1598 — should the operator GPU-policy WARN fire? Pure predicate
+/// (unit-testable without probing the host): the warn applies when the
+/// resolved embedding backend is the local Ollama wire shape on a host
+/// with no compatible GPU — operator policy prefers API embeddings on
+/// CPU-only nodes.
+fn gpu_policy_warn_applicable(backend: &str, gpu_detected: bool) -> bool {
+    !crate::config::is_api_embed_backend(backend) && !gpu_detected
+}
+
+/// #1598 — best-effort NVIDIA GPU detection: `nvidia-smi -L` on PATH
+/// returning success. Any failure (binary missing, driver absent,
+/// non-zero exit) is treated as no-GPU. Deliberately simple — the
+/// GPU-policy WARN is advisory, not load-bearing.
+fn nvidia_gpu_detected() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// #1598 — Embeddings Reachability section. Mirrors
+/// [`section_llm_reachability_1146`] for the embedding endpoint:
+///
+/// Resolves the canonical embeddings configuration via
+/// [`crate::config::AppConfig::resolve_embeddings`] (the same ladder
+/// the MCP stdio init + daemon `build_embedder` consume per #1598)
+/// and fires a lightweight probe at the resolved URL:
+///
+/// - `ollama` backend → `GET <url>/api/tags` (no auth)
+/// - API backends → `POST <url>/embeddings` with a 1-char input +
+///   the resolved Bearer key
+///
+/// Severity mapping matches the LLM section: INFO on 2xx; WARN on
+/// 401/403/429/5xx (reachable but degraded/auth issue); CRIT on
+/// other 4xx / network / DNS errors. The section facts carry the
+/// resolver's full provenance (backend / model / base_url /
+/// config_source / key_source — NEVER the key itself).
+///
+/// Additionally emits the operator GPU-policy WARN
+/// ([`gpu_policy_warn_applicable`]) when the resolved backend is
+/// `ollama` on a host with no detectable NVIDIA GPU.
+fn section_embeddings_reachability_1598() -> ReportSection {
+    use crate::config::{AppConfig, ConfigSource, KeySource};
+
+    let app_config = AppConfig::load();
+    let resolved = app_config.resolve_embeddings();
+
+    let mut facts = vec![
+        ("backend".into(), resolved.backend.clone()),
+        ("model".into(), resolved.model.clone()),
+        ("base_url".into(), resolved.url.clone()),
+        ("config_source".into(), resolved.source.as_str().to_string()),
+        (
+            field_names::KEY_SOURCE.into(),
+            resolved.key_source.as_str().to_string(),
+        ),
+    ];
+
+    // If the key resolution surfaced an error during resolve (file
+    // perms / missing env / etc.), call it out — but still try the
+    // probe so the operator sees if the URL is at least reachable.
+    if let KeySource::Error(reason) = &resolved.key_source {
+        facts.push(("key_error".into(), reason.clone()));
+    }
+
+    // Compiled-default — operator has no embeddings configuration
+    // anywhere (a fresh install; the tier preset governs). Legitimate
+    // state, not a misconfiguration: emit INFO without probing so the
+    // "fresh-DB doctor report = all INFO" invariant holds (mirrors
+    // the LLM section's early return).
+    if matches!(resolved.source, ConfigSource::CompiledDefault) {
+        return ReportSection {
+            name: SECTION_EMBEDDINGS_REACHABILITY.into(),
+            severity: Severity::Info,
+            facts,
+            note: Some(
+                "no operator embeddings configuration found (env / [embeddings] \
+                 section / legacy flat fields all absent); the tier preset \
+                 governs the embedder. To wire an API embedding backend, set \
+                 AI_MEMORY_EMBED_BACKEND or write an [embeddings] section in \
+                 config.toml (#1598)."
+                    .into(),
+            ),
+        };
+    }
+
+    let is_api = crate::config::is_api_embed_backend(&resolved.backend);
+
+    let started = std::time::Instant::now();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push((
+                "error".into(),
+                format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
+            ));
+            return ReportSection {
+                name: SECTION_EMBEDDINGS_REACHABILITY.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("could not build HTTP client for probe".into()),
+            };
+        }
+    };
+
+    // Build the probe request: a no-auth model listing for the
+    // Ollama wire shape, a minimal 1-char embed for API backends.
+    let (probe_url, req) = if is_api {
+        let url = format!(
+            "{}{}",
+            resolved.url,
+            crate::llm::OPENAI_COMPAT_EMBEDDINGS_PATH
+        );
+        let mut req = client
+            .post(&url)
+            .json(&serde_json::json!({ "model": resolved.model, "input": "a" }));
+        if let Some(key) = resolved.api_key() {
+            req = req.bearer_auth(key);
+        }
+        (url, req)
+    } else {
+        let url = crate::llm::ollama_tags_url(&resolved.url);
+        let req = client.get(&url);
+        (url, req)
+    };
+    facts.push(("probe_url".into(), probe_url.clone()));
+
+    let (mut severity, mut note) = match req.send() {
+        Ok(resp) => {
+            let status = resp.status();
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push(("http_status".into(), status.as_u16().to_string()));
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
+
+            if status.is_success() {
+                (Severity::Info, None)
+            } else if status.as_u16() == 401 || status.as_u16() == 403 {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "auth failed (status {}); URL is reachable but the \
+                         resolved embedding API key was rejected — check \
+                         [embeddings].api_key_env / [embeddings].api_key_file / process env",
+                        status.as_u16()
+                    )),
+                )
+            } else if status.as_u16() == 429 {
+                (
+                    Severity::Warning,
+                    Some("rate-limited (status 429); vendor reachable but throttling".into()),
+                )
+            } else if status.is_server_error() {
+                (
+                    Severity::Warning,
+                    Some(format!(
+                        "vendor 5xx (status {}); reachable but currently degraded",
+                        status.as_u16()
+                    )),
+                )
+            } else {
+                (
+                    Severity::Critical,
+                    Some(format!(
+                        "unexpected status {} from {} — verify base_url + endpoint shape",
+                        status.as_u16(),
+                        probe_url
+                    )),
+                )
+            }
+        }
+        Err(e) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
+            facts.push(("error".into(), e.to_string()));
+            let kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
+            (
+                Severity::Critical,
+                Some(format!(
+                    "network/{kind} error contacting {probe_url} — verify \
+                     base_url and connectivity"
+                )),
+            )
+        }
+    };
+
+    // Operator GPU-policy WARN (#1598): local-Ollama embeddings on a
+    // CPU-only host — operator policy prefers API embeddings there.
+    if gpu_policy_warn_applicable(&resolved.backend, nvidia_gpu_detected()) {
+        severity = severity_max(severity, Severity::Warning);
+        let gpu_note = format!(
+            "embeddings backend '{}' on a host with no compatible GPU — \
+             operator policy prefers API embeddings on CPU-only nodes (#1598)",
+            resolved.backend
+        );
+        facts.push(("gpu_policy".into(), gpu_note.clone()));
+        note = Some(match note {
+            Some(existing) => format!("{existing}; {gpu_note}"),
+            None => gpu_note,
+        });
+    }
+
+    ReportSection {
+        name: SECTION_EMBEDDINGS_REACHABILITY.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// L1-4 — Reflection Health section.
+///
+/// Reports:
+/// - depth distribution per namespace (depth-0 / depth-1 / depth-2 / depth-3+)
+/// - reflection totals last 24h, 7d, all-time per namespace
+/// - depth-limit refusals in the last 24h (from `signed_events`)
+/// - average + max reflection chain depth per namespace (informational)
+///
+/// Severity rules:
+/// - INFO: any reflection activity (at least one reflected memory exists)
+/// - WARN: depth-limit refusals > 0 last 24h
+/// - WARN: any namespace where `max_depth` is within 1 of the compiled
+///   default cap (max_reflection_depth = 3, i.e. max_depth >= 2)
+///
+/// An empty namespace set renders as INFO with a "no reflections" note.
+fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
+    let mut facts = Vec::new();
+    let mut severity = Severity::Info;
+    let mut notes: Vec<String> = Vec::new();
+
+    // ── depth-distribution per namespace ─────────────────────────────
+    let dist_rows = db::doctor_reflection_depth_distribution(conn).unwrap_or_default();
+
+    if dist_rows.is_empty() {
+        facts.push(("reflections_observed".into(), "none".into()));
+    } else {
+        // Per-namespace breakdown.
+        for row in &dist_rows {
+            facts.push((
+                format!("ns::{}::dist", row.namespace),
+                format!(
+                    "depth-0={} depth-1={} depth-2={} depth-3+={} avg={:.2} max={}",
+                    row.depth0,
+                    row.depth1,
+                    row.depth2,
+                    row.depth3_plus,
+                    row.avg_depth,
+                    row.max_depth
+                ),
+            ));
+            // WARN when max_depth approaches the compiled cap (cap=3, warn at >=2).
+            // The cap value is the `GovernancePolicy` compiled-in default; namespaces
+            // with a custom cap resolved via governance are out of scope here (we'd
+            // need to query every namespace's policy chain, which is expensive).
+            const WARN_DEPTH_THRESHOLD: i64 = 2;
+            if row.max_depth >= WARN_DEPTH_THRESHOLD {
+                severity = severity_max(severity, Severity::Warning);
+                notes.push(format!(
+                    "namespace '{}' max_depth={} approaches default cap (max_reflection_depth=3)",
+                    row.namespace, row.max_depth
+                ));
+            }
+        }
+    }
+
+    // ── per-namespace totals (24h / 7d / all-time) ───────────────────
+    let totals = db::doctor_reflection_totals_by_namespace(conn).unwrap_or_default();
+    for (ns, last_24h, last_7d, all_time) in &totals {
+        facts.push((
+            format!("ns::{}::totals", ns),
+            format!("24h={last_24h} 7d={last_7d} all_time={all_time}"),
+        ));
+    }
+
+    // ── depth-limit refusals last 24h ────────────────────────────────
+    let last_day_cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let refusals_24h =
+        db::doctor_reflection_depth_exceeded_count(conn, &last_day_cutoff).unwrap_or(0);
+    facts.push(("depth_limit_refusals_24h".into(), refusals_24h.to_string()));
+
+    if refusals_24h > 0 {
+        severity = severity_max(severity, Severity::Warning);
+        notes.push(format!(
+            "{refusals_24h} depth-limit refusal(s) in the last 24h \
+             (event_type='reflection.depth_exceeded' in signed_events)"
+        ));
+    }
+
+    // All-time refusals as an informational counter.
+    let refusals_all =
+        db::doctor_reflection_depth_exceeded_count(conn, "1970-01-01T00:00:00Z").unwrap_or(0);
+    facts.push((
+        "depth_limit_refusals_all_time".into(),
+        refusals_all.to_string(),
+    ));
+
+    let note = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("; "))
+    };
+
+    ReportSection {
+        name: "Reflection Health".into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// Return the higher-severity value of `a` and `b`.
+/// Defined pub(super) so the reflection-health helpers in this module
+/// can share the ordering logic without duplicating the `rank` table.
+pub(super) fn severity_max(a: Severity, b: Severity) -> Severity {
+    if Report::rank(b) > Report::rank(a) {
+        b
+    } else {
+        a
     }
 }
 
@@ -843,8 +1381,8 @@ fn run_remote(url: &str, db_path: &Path) -> Report {
     let mut sections = Vec::with_capacity(2);
 
     let base = url.trim_end_matches('/');
-    let cap_url = format!("{base}/api/v1/capabilities");
-    let stats_url = format!("{base}/api/v1/stats");
+    let cap_url = format!("{base}{}", crate::handlers::routes::CAPABILITIES);
+    let stats_url = format!("{base}{}", crate::handlers::routes::STATS);
 
     sections.push(section_capabilities_remote(&cap_url));
     sections.push(section_recall_remote(&cap_url));
@@ -852,37 +1390,25 @@ fn run_remote(url: &str, db_path: &Path) -> Report {
     sections.push(ReportSection {
         name: "Index".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
     sections.push(ReportSection {
         name: "Governance".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
     sections.push(ReportSection {
         name: "Sync".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
     sections.push(ReportSection {
         name: "Webhook".into(),
         severity: Severity::NotAvailable,
-        facts: vec![(
-            "hint".into(),
-            "raw SQL section — only available in --db mode".into(),
-        )],
+        facts: vec![("hint".into(), MSG_RAW_SQL_DB_MODE.into())],
         note: None,
     });
 
@@ -919,34 +1445,40 @@ fn section_capabilities_remote(url: &str) -> ReportSection {
         Ok(v) => {
             // schema_version: "1" (legacy v0.6.3) or "2" (post-P1).
             let schema = v
-                .get("schema_version")
+                .get(field_names::SCHEMA_VERSION)
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            facts.push(("schema_version".into(), schema.to_string()));
+            facts.push((field_names::SCHEMA_VERSION.into(), schema.to_string()));
 
             // P1 v2 fields — best-effort lookup. The legacy v1 shape
             // doesn't carry these; we render the missing ones as
             // "not_in_response" rather than failing.
             let recall_mode = v
                 .get("features")
-                .and_then(|f| f.get("recall_mode_active"))
+                .and_then(|f| f.get(FACT_RECALL_MODE_ACTIVE))
                 .and_then(Value::as_str)
-                .unwrap_or("not_in_response");
-            facts.push(("recall_mode_active".into(), recall_mode.to_string()));
+                .unwrap_or(NOT_IN_RESPONSE);
+            facts.push((FACT_RECALL_MODE_ACTIVE.into(), recall_mode.to_string()));
 
             let reranker = v
                 .get("features")
-                .and_then(|f| f.get("reranker_active"))
+                .and_then(|f| f.get(FACT_RERANKER_ACTIVE))
                 .and_then(Value::as_str)
-                .unwrap_or("not_in_response");
-            facts.push(("reranker_active".into(), reranker.to_string()));
+                .unwrap_or(NOT_IN_RESPONSE);
+            facts.push((FACT_RERANKER_ACTIVE.into(), reranker.to_string()));
 
             // Severity hints. recall_mode in {"degraded", "disabled",
             // "keyword_only"} bumps to Warning when the tier is supposed
             // to support hybrid (semantic / smart / autonomous).
             if matches!(recall_mode, "degraded" | "disabled" | "keyword_only") {
                 let tier = v.get("feature_tier").and_then(Value::as_str).unwrap_or("");
-                if matches!(tier, "semantic" | "smart" | "autonomous") {
+                if [
+                    crate::config::FeatureTier::Semantic.as_str(),
+                    crate::config::FeatureTier::Smart.as_str(),
+                    crate::config::FeatureTier::Autonomous.as_str(),
+                ]
+                .contains(&tier)
+                {
                     severity = Severity::Warning;
                     note = Some(format!(
                         "tier={tier} but recall_mode_active={recall_mode} — silent degradation"
@@ -976,19 +1508,19 @@ fn section_recall_remote(cap_url: &str) -> ReportSection {
     if let Ok(v) = http_get_json(cap_url) {
         let recall_mode = v
             .get("features")
-            .and_then(|f| f.get("recall_mode_active"))
+            .and_then(|f| f.get(FACT_RECALL_MODE_ACTIVE))
             .and_then(Value::as_str)
-            .unwrap_or("not_in_response");
+            .unwrap_or(NOT_IN_RESPONSE);
         facts.push(("active_recall_mode".into(), recall_mode.to_string()));
         let reranker = v
             .get("features")
-            .and_then(|f| f.get("reranker_active"))
+            .and_then(|f| f.get(FACT_RERANKER_ACTIVE))
             .and_then(Value::as_str)
-            .unwrap_or("not_in_response");
+            .unwrap_or(NOT_IN_RESPONSE);
         facts.push(("active_reranker".into(), reranker.to_string()));
         facts.push((
             "recall_mode_distribution".into(),
-            "not_observed (pre-P3 rolling counter)".into(),
+            NOT_OBSERVED_PRE_P3.into(),
         ));
     } else {
         facts.push(("error".into(), "could not fetch capabilities".into()));
@@ -1009,7 +1541,7 @@ fn section_storage_remote(stats_url: &str) -> ReportSection {
     match http_get_json(stats_url) {
         Ok(v) => {
             if let Some(total) = v.get("total").and_then(Value::as_u64) {
-                facts.push(("total_memories".into(), total.to_string()));
+                facts.push((field_names::TOTAL_MEMORIES.into(), total.to_string()));
             }
             if let Some(exp) = v.get("expiring_soon").and_then(Value::as_u64) {
                 facts.push(("expiring_within_1h".into(), exp.to_string()));
@@ -1018,7 +1550,7 @@ fn section_storage_remote(stats_url: &str) -> ReportSection {
                 facts.push(("links".into(), links.to_string()));
             }
             facts.push((
-                "dim_violations".into(),
+                FACT_DIM_VIOLATIONS.into(),
                 "not_in_remote_response (P2 surface lands at /api/v1/stats)".into(),
             ));
         }
@@ -1247,11 +1779,14 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_seven_sections() {
+    fn local_run_on_empty_db_produces_ten_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
-        assert_eq!(report.sections.len(), 7);
+        // L1-4 added "Reflection Health"; #1146 added
+        // "LLM Reachability (#1146)"; #1598 added
+        // "Embeddings Reachability (#1598)" — total is now 10.
+        assert_eq!(report.sections.len(), 10);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1262,9 +1797,58 @@ mod tests {
                 "Governance",
                 "Sync",
                 "Webhook",
-                "Capabilities"
+                "Capabilities",
+                "Reflection Health",
+                "LLM Reachability (#1146)",
+                "Embeddings Reachability (#1598)",
             ]
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #1598 — Embeddings Reachability section
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn gpu_policy_warn_applies_only_to_local_backend_without_gpu_1598() {
+        // ollama + no GPU → warn fires.
+        assert!(gpu_policy_warn_applicable(
+            crate::llm::BACKEND_OLLAMA,
+            false
+        ));
+        // ollama + GPU present → no warn.
+        assert!(!gpu_policy_warn_applicable(
+            crate::llm::BACKEND_OLLAMA,
+            true
+        ));
+        // API backends never trigger the warn, GPU or not.
+        assert!(!gpu_policy_warn_applicable("openrouter", false));
+        assert!(!gpu_policy_warn_applicable("openai-compatible", false));
+        assert!(!gpu_policy_warn_applicable("openrouter", true));
+    }
+
+    #[test]
+    fn embeddings_reachability_section_present_with_provenance_facts_1598() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        let emb = find(&report, SECTION_EMBEDDINGS_REACHABILITY);
+        // Provenance facts are always present, regardless of whether
+        // the probe ran (compiled-default short-circuits pre-probe).
+        for key in [
+            "backend",
+            "model",
+            "base_url",
+            "config_source",
+            "key_source",
+        ] {
+            assert!(
+                emb.facts.iter().any(|(k, _)| k == key),
+                "missing fact {key} in {:?}",
+                emb.facts
+            );
+        }
+        // The resolved key value itself must NEVER appear as a fact key.
+        assert!(emb.facts.iter().all(|(k, _)| k != "api_key"));
     }
 
     #[test]
@@ -1454,7 +2038,7 @@ mod tests {
             // last_seen_at = now, last_pulled_at = 1 hour ago → 3600s skew.
             let now = chrono::Utc::now();
             let now_s = now.to_rfc3339();
-            let earlier = (now - chrono::Duration::seconds(3600)).to_rfc3339();
+            let earlier = (now - chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
             conn.execute(
                 "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
                  VALUES ('me', 'peer-1', ?1, ?2)",
@@ -1569,6 +2153,285 @@ mod tests {
         let depth = fact(gov, "inheritance_depth");
         assert!(depth.contains("d0=") && depth.contains("d1=") && depth.contains("d2="));
         assert_eq!(fact(gov, "namespaces_without_policy"), "3");
+    }
+
+    // -------------------------------------------------------------------
+    // L1-4 — Reflection Health section tests
+    // -------------------------------------------------------------------
+
+    /// Helper: insert a memory with a specific `reflection_depth` directly.
+    fn seed_reflection(conn: &rusqlite::Connection, namespace: &str, depth: i32, title: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories \
+             (id, tier, namespace, title, content, tags, priority, confidence, source, \
+              access_count, created_at, updated_at, metadata, reflection_depth) \
+             VALUES (?, 'mid', ?, ?, 'content', '[]', 5, 1.0, 'test', 0, ?, ?, '{}', ?)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                namespace,
+                title,
+                now,
+                now,
+                depth
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Helper: insert a `reflection.depth_exceeded` signed event.
+    fn seed_depth_exceeded_event(conn: &rusqlite::Connection, timestamp: &str) {
+        // Route through `append_signed_event` so the cross-row chain
+        // (v34, #698 V-4 closeout) is populated correctly. The
+        // helper used a raw INSERT before v34 because there was no
+        // chain to populate; v34's UNIQUE INDEX on `sequence`
+        // tolerates the raw NULL-sequence shape but the seeded
+        // events would not chain-verify, which complicates any
+        // downstream doctor probe that walks the chain.
+        let event = crate::signed_events::SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "test-agent".to_string(),
+            event_type: crate::signed_events::event_types::REFLECTION_DEPTH_EXCEEDED.to_string(),
+            payload_hash: vec![0xaa],
+            signature: None,
+            attest_level: "unsigned".to_string(),
+            timestamp: timestamp.to_string(),
+            ..crate::signed_events::SignedEvent::default()
+        };
+        crate::signed_events::append_signed_event(conn, &event).unwrap();
+    }
+
+    #[test]
+    fn reflection_health_section_empty_db_is_info_no_reflections() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        let rh = find(&report, "Reflection Health");
+        assert_eq!(rh.severity, Severity::Info);
+        assert_eq!(fact(rh, "reflections_observed"), "none");
+        assert_eq!(fact(rh, "depth_limit_refusals_24h"), "0");
+        assert_eq!(fact(rh, "depth_limit_refusals_all_time"), "0");
+    }
+
+    #[test]
+    fn reflection_health_section_depth_distribution_counts() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            // ns-alpha: 3 depth-0, 2 depth-1, 1 depth-2
+            seed_reflection(&conn, "ns-alpha", 0, "base-1");
+            seed_reflection(&conn, "ns-alpha", 0, "base-2");
+            seed_reflection(&conn, "ns-alpha", 0, "base-3");
+            seed_reflection(&conn, "ns-alpha", 1, "refl-1");
+            seed_reflection(&conn, "ns-alpha", 1, "refl-2");
+            seed_reflection(&conn, "ns-alpha", 2, "refl-3");
+            // ns-beta: 1 depth-1
+            seed_reflection(&conn, "ns-beta", 1, "beta-refl-1");
+        }
+        let report = run_local_collect(&env.db_path);
+        let rh = find(&report, "Reflection Health");
+        // Both namespaces have reflected memories, so no "none" entry.
+        assert!(
+            rh.facts.iter().all(|(k, _)| k != "reflections_observed"),
+            "reflections_observed key should be absent when reflections exist"
+        );
+        // ns-alpha dist fact should be present.
+        let alpha_dist = rh
+            .facts
+            .iter()
+            .find(|(k, _)| k == "ns::ns-alpha::dist")
+            .map(|(_, v)| v.as_str());
+        assert!(alpha_dist.is_some(), "ns::ns-alpha::dist fact missing");
+        let alpha_str = alpha_dist.unwrap();
+        assert!(
+            alpha_str.contains("depth-0=3"),
+            "expected depth-0=3 in '{alpha_str}'"
+        );
+        assert!(
+            alpha_str.contains("depth-1=2"),
+            "expected depth-1=2 in '{alpha_str}'"
+        );
+        assert!(
+            alpha_str.contains("depth-2=1"),
+            "expected depth-2=1 in '{alpha_str}'"
+        );
+        assert!(
+            alpha_str.contains("depth-3+=0"),
+            "expected depth-3+=0 in '{alpha_str}'"
+        );
+        // ns-beta dist fact.
+        let beta_dist = rh
+            .facts
+            .iter()
+            .find(|(k, _)| k == "ns::ns-beta::dist")
+            .map(|(_, v)| v.as_str());
+        assert!(beta_dist.is_some(), "ns::ns-beta::dist fact missing");
+        let beta_str = beta_dist.unwrap();
+        assert!(
+            beta_str.contains("depth-1=1"),
+            "expected depth-1=1 in '{beta_str}'"
+        );
+    }
+
+    #[test]
+    fn reflection_health_warn_when_max_depth_approaches_cap() {
+        // max_depth = 2 triggers WARN (cap=3, warn threshold >=2).
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            seed_reflection(&conn, "deep-ns", 2, "depth2-refl");
+        }
+        let report = run_local_collect(&env.db_path);
+        let rh = find(&report, "Reflection Health");
+        assert_eq!(rh.severity, Severity::Warning);
+        let note = rh
+            .note
+            .as_ref()
+            .expect("expected a note when depth approaches cap");
+        assert!(
+            note.contains("deep-ns"),
+            "note should name the namespace, got: {note}"
+        );
+        assert!(note.contains("cap"), "note should mention cap, got: {note}");
+    }
+
+    #[test]
+    fn reflection_health_warn_on_depth_limit_refusals_24h() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            // One refusal 1h ago → within 24h window.
+            let one_hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+            seed_depth_exceeded_event(&conn, &one_hour_ago);
+        }
+        let report = run_local_collect(&env.db_path);
+        let rh = find(&report, "Reflection Health");
+        assert_eq!(rh.severity, Severity::Warning);
+        assert_eq!(fact(rh, "depth_limit_refusals_24h"), "1");
+        assert_eq!(fact(rh, "depth_limit_refusals_all_time"), "1");
+        let note = rh.note.as_ref().expect("expected note on refusals");
+        assert!(
+            note.contains("refusal"),
+            "note should mention refusal, got: {note}"
+        );
+    }
+
+    #[test]
+    fn reflection_health_old_refusals_do_not_trigger_24h_warn() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            // Refusal 48h ago — outside 24h window.
+            let old = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+            seed_depth_exceeded_event(&conn, &old);
+        }
+        let report = run_local_collect(&env.db_path);
+        let rh = find(&report, "Reflection Health");
+        // 24h count should be 0, no WARN.
+        assert_eq!(fact(rh, "depth_limit_refusals_24h"), "0");
+        // All-time counter still sees it.
+        assert_eq!(fact(rh, "depth_limit_refusals_all_time"), "1");
+        // No 24h refusal → severity stays Info (unless depth approaches cap).
+        assert_eq!(rh.severity, Severity::Info);
+    }
+
+    #[test]
+    fn reflection_health_totals_per_namespace() {
+        let env = TestEnv::fresh();
+        let recent = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        let old = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            // ns-new: one reflection created 30 min ago (24h + 7d + all_time)
+            conn.execute(
+                "INSERT INTO memories \
+                 (id, tier, namespace, title, content, tags, priority, confidence, source, \
+                  access_count, created_at, updated_at, metadata, reflection_depth) \
+                 VALUES (?, 'mid', 'ns-new', 'new-refl', 'c', '[]', 5, 1.0, 'test', 0, ?, ?, '{}', 1)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), recent, recent],
+            )
+            .unwrap();
+            // ns-old: one reflection created 10 days ago (all_time only)
+            conn.execute(
+                "INSERT INTO memories \
+                 (id, tier, namespace, title, content, tags, priority, confidence, source, \
+                  access_count, created_at, updated_at, metadata, reflection_depth) \
+                 VALUES (?, 'mid', 'ns-old', 'old-refl', 'c', '[]', 5, 1.0, 'test', 0, ?, ?, '{}', 1)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), old, old],
+            )
+            .unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let rh = find(&report, "Reflection Health");
+        // ns-new: 24h=1, 7d=1, all_time=1
+        let new_totals = rh
+            .facts
+            .iter()
+            .find(|(k, _)| k == "ns::ns-new::totals")
+            .map(|(_, v)| v.as_str())
+            .expect("ns::ns-new::totals fact missing");
+        assert!(
+            new_totals.contains("24h=1"),
+            "expected 24h=1 in '{new_totals}'"
+        );
+        assert!(
+            new_totals.contains("7d=1"),
+            "expected 7d=1 in '{new_totals}'"
+        );
+        assert!(
+            new_totals.contains("all_time=1"),
+            "expected all_time=1 in '{new_totals}'"
+        );
+        // ns-old: 24h=0, 7d=0, all_time=1
+        let old_totals = rh
+            .facts
+            .iter()
+            .find(|(k, _)| k == "ns::ns-old::totals")
+            .map(|(_, v)| v.as_str())
+            .expect("ns::ns-old::totals fact missing");
+        assert!(
+            old_totals.contains("24h=0"),
+            "expected 24h=0 in '{old_totals}'"
+        );
+        assert!(
+            old_totals.contains("7d=0"),
+            "expected 7d=0 in '{old_totals}'"
+        );
+        assert!(
+            old_totals.contains("all_time=1"),
+            "expected all_time=1 in '{old_totals}'"
+        );
+    }
+
+    #[test]
+    fn reflection_health_json_output_parseable_and_has_section() {
+        let mut env = TestEnv::fresh();
+        // Seed one reflection so the section has content.
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            seed_reflection(&conn, "ns-json", 1, "json-refl");
+        }
+        let db_path = env.db_path.clone();
+        let mut out = env.output();
+        let exit = run(
+            &db_path,
+            &DoctorArgs {
+                remote: None,
+                json: true,
+                fail_on_warn: false,
+            },
+            &mut out,
+        )
+        .unwrap();
+        // A depth-1 reflection does not warn (threshold is >=2).
+        assert_eq!(exit, 0);
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str()).expect("JSON must parse");
+        let sections = v["sections"].as_array().expect("sections is array");
+        let rh_section = sections
+            .iter()
+            .find(|s| s["name"] == "Reflection Health")
+            .expect("Reflection Health section must be in JSON output");
+        assert_eq!(rh_section["severity"], "info");
+        assert!(rh_section["facts"].is_array(), "facts must be a JSON array");
     }
 
     // -------------------------------------------------------------------
@@ -2097,9 +2960,16 @@ mod tests {
             stdout.contains("Active profile: core"),
             "default profile should be core; got: {stdout}"
         );
+        // v0.7.0 refactor PR-2 (#793) — tool-count SSOT. The "Full (NN
+        // tools loaded)" string is generated from
+        // `Profile::full().expected_tool_count()`, so anchor the
+        // expected substring on the same constant.
+        let n = crate::profile::Profile::full().expected_tool_count();
+        let needle = format!("Full   ({n} tools loaded)");
         assert!(
-            stdout.contains("Full   (51 tools loaded)"),
-            "report should include full-profile baseline (43 + v0.7.0 I4 memory_replay + v0.7 H4 memory_verify + v0.7 B1 memory_load_family + v0.7 B2 memory_smart_load + v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list + v0.7 J7 memory_find_paths + v0.7 K8 memory_quota_status)"
+            stdout.contains(&needle),
+            "report should include full-profile baseline `{needle}` (canonical \
+             from Profile::full().expected_tool_count()); got: {stdout}"
         );
         assert!(
             stdout.contains("Tokenizer: cl100k_base"),
@@ -2122,14 +2992,13 @@ mod tests {
         assert_eq!(v["schema_version"], "v0.6.4-tokens-1");
         assert_eq!(v["tokenizer"], "cl100k_base");
         // Token count grows as schemas evolve. Assert the honest
-        // cl100k_base range from sizes.rs (5K-10K — v0.7 C2 widened
-        // the upper bound after adding per-tool `docs` fields to the
-        // canonical source-of-truth) rather than an exact value; the
-        // exact-figure invariant lives in
+        // cl100k_base range from sizes.rs (5K-17K post-#987 D1.6 — see
+        // `tests/token_budget_guard.rs` for the load-bearing ceilings).
+        // The exact-figure invariant lives in
         // `sizes::tests::full_profile_total_in_honest_measured_range`.
         let total = v["full_profile_total_tokens"].as_u64().unwrap();
         assert!(
-            (5_000..=10_000).contains(&total),
+            (5_000..=17_000).contains(&total),
             "full_profile_total_tokens out of honest range: {total}"
         );
         assert!(v["active_total_tokens"].as_u64().unwrap() > 0);
@@ -2157,8 +3026,10 @@ mod tests {
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            51,
-            "raw_table must include all 51 baseline tools (43 + v0.7.0 I4 memory_replay + v0.7 H4 memory_verify + v0.7 B1 memory_load_family + v0.7 B2 memory_smart_load + v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list + v0.7 J7 memory_find_paths + v0.7 K8 memory_quota_status)"
+            crate::profile::Profile::full().expected_tool_count(),
+            "raw_table must include every tool — canonical count is the \
+             SSOT `Profile::full().expected_tool_count()` (derived from \
+             the per-Family `tool_names` slices); no literal is restated"
         );
         // memory_store is in core and must be loaded under the default
         // (core) profile.
@@ -2184,5 +3055,449 @@ mod tests {
             stderr.contains("case-sensitive lowercase"),
             "diagnostic should mention case rule; got: {stderr}"
         );
+    }
+
+    // ---------- E1 coverage uplift -----------------------------------
+    // Targets: run_hooks (json + human), render_hooks_human (config
+    // present + missing), --tokens --hooks combo.
+
+    fn run_hooks_capture(args: HooksReportArgs) -> (i32, String, String) {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let exit;
+        {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            exit = run_hooks(args, &mut out).expect("run_hooks");
+        }
+        (
+            exit,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// Builds an in-memory `HookConfig` row for the render tests (the
+    /// G3 doctor block renders config shape + zeroed metric
+    /// placeholders, so any valid event/mode pair exercises the row
+    /// renderer).
+    fn mk_hook(command: &str) -> crate::hooks::config::HookConfig {
+        crate::hooks::config::HookConfig {
+            event: crate::hooks::HookEvent::PostStore,
+            command: std::path::PathBuf::from(command),
+            priority: 10,
+            timeout_ms: 1_000,
+            mode: crate::hooks::config::HookMode::Exec,
+            enabled: true,
+            namespace: "*".to_string(),
+            fail_mode: crate::hooks::config::FailMode::Open,
+        }
+    }
+
+    #[test]
+    fn run_hooks_human_default_no_config_lists_zero() {
+        // Default path: HookConfig::default_path() may or may not exist
+        // on this system, but the loader either returns an empty list
+        // (file absent) or whatever is present. With or without, the
+        // human-mode header line surfaces.
+        let (exit, stdout, _stderr) = run_hooks_capture(HooksReportArgs { json: false });
+        assert_eq!(exit, 0);
+        assert!(stdout.contains("ai-memory doctor --hooks"));
+        assert!(stdout.contains("Hooks loaded:"));
+    }
+
+    #[test]
+    fn run_hooks_json_emits_schema_versioned_payload() {
+        let (exit, stdout, _) = run_hooks_capture(HooksReportArgs { json: true });
+        assert_eq!(exit, 0);
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        assert_eq!(v["schema_version"], "v0.7-hooks-1");
+        assert!(v["hooks_loaded"].is_number());
+        assert!(v["executors"].is_array());
+        assert!(v["timeout_violations"].is_number());
+    }
+
+    #[test]
+    fn run_tokens_with_hooks_flag_appends_block() {
+        // Drives the `args.hooks` arm inside run_tokens (lines 329-331).
+        let args = TokensArgs {
+            json: false,
+            raw_table: false,
+            profile: None,
+            hooks: true,
+        };
+        let (exit, stdout, _stderr) = run_tokens_capture(args);
+        assert_eq!(exit, 0);
+        // Token report + appended hooks block.
+        assert!(stdout.contains("ai-memory doctor --tokens"));
+        assert!(stdout.contains("ai-memory doctor --hooks"));
+    }
+
+    // The `run_hooks` paths that depend on a loaded `hooks.toml` at the
+    // operator's real `~/Library/Application Support/ai-memory/hooks.toml`
+    // would violate the hermetic-test contract. We instead exercise the
+    // inner renderer (`render_hooks_human_with`) directly via the
+    // `HookConfig::load_from_str` API — no env mutation, no disk
+    // writes to user-owned paths.
+
+    #[test]
+    fn render_hooks_human_with_synthetic_hook_renders_row() {
+        // Drives render_hooks_human_with lines 414-444 + 446-454 — the
+        // hooks-present branch.
+        let toml_src = r#"
+[[hook]]
+event = "post_store"
+command = "/usr/local/bin/echo-something-long"
+mode = "exec"
+namespace = "*"
+priority = 5
+timeout_ms = 1000
+enabled = true
+"#;
+        let hooks = crate::hooks::config::HookConfig::load_from_str(toml_src).expect("parse hooks");
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let synthetic_path = std::path::PathBuf::from("/tmp/synthetic/hooks.toml");
+        {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            render_hooks_human_with(&mut out, Some(&synthetic_path), &hooks).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("ai-memory doctor --hooks"));
+        assert!(s.contains("Config path:"));
+        assert!(s.contains("Hooks loaded: 1"));
+        // Row carries the truncated file_name.
+        assert!(s.contains("echo-something-long") || s.contains("event"));
+        assert!(s.contains("Chain class-deadline violations"));
+        assert!(s.contains("note: live metrics land"));
+    }
+
+    #[test]
+    fn render_hooks_human_with_no_hooks_emits_helpful_note() {
+        // Drives render_hooks_human_with's hooks.is_empty() branch
+        // (lines 418-424) + the path-Some line (lines 414-416).
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let synthetic_path = std::path::PathBuf::from("/some/path/hooks.toml");
+        {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            render_hooks_human_with(&mut out, Some(&synthetic_path), &[]).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("ai-memory doctor --hooks"));
+        assert!(s.contains("Config path:"));
+        assert!(s.contains("Hooks loaded: 0"));
+        assert!(s.contains("(no hooks configured"));
+    }
+
+    #[test]
+    fn render_hooks_human_with_command_no_filename_falls_back_to_display() {
+        // Drives the `.unwrap_or_else(|| h.command.display().to_string())`
+        // arm (line 438) — fires when command.file_name() returns None.
+        let toml_src = r#"
+[[hook]]
+event = "post_store"
+command = "/"
+mode = "exec"
+namespace = "*"
+priority = 1
+timeout_ms = 500
+enabled = true
+"#;
+        // `command = "/"` has no `file_name()`; the fallback uses
+        // `display()`.
+        let hooks = crate::hooks::config::HookConfig::load_from_str(toml_src).expect("parse hooks");
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            render_hooks_human_with(&mut out, None, &hooks).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        // No `Config path` line because path is None.
+        assert!(!s.contains("Config path:"));
+        assert!(s.contains("Hooks loaded: 1"));
+    }
+
+    /// The happy-path complement of the `/`-fallback test above: a
+    /// hook whose command HAS a `file_name()` renders by basename.
+    /// (Also the call site that keeps `mk_hook` honest — the three
+    /// section tests below were nested inside the previous test fn by
+    /// the ee00d8bb coverage lift, so rustc flagged them unnameable
+    /// and `mk_hook` dead; this test + the un-nesting restore them.)
+    #[test]
+    fn render_hooks_human_with_rows_renders_each_hook() {
+        let hooks = vec![mk_hook("/usr/local/bin/notify-hook.sh")];
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            render_hooks_human_with(&mut out, None, &hooks).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("Hooks loaded: 1"), "got: {s}");
+        assert!(s.contains("notify-hook.sh"), "got: {s}");
+    }
+
+    /// A connection with no schema at all: `db::stats` fails, the
+    /// Storage section must downgrade to WARN with a `stats_error`
+    /// fact, and `dim_violations` renders the pre-P2 `not_observed`
+    /// line (prepare on the missing table fails → `Ok(None)`).
+    #[test]
+    fn storage_section_warns_with_stats_error_on_missing_schema() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        let section = section_storage(&conn, Path::new("/nonexistent/doctor.db"));
+        assert_eq!(section.severity, Severity::Warning);
+        assert!(
+            section.facts.iter().any(|(k, _)| k == "stats_error"),
+            "facts: {:?}",
+            section.facts
+        );
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "dim_violations" && v.contains("not_observed")),
+            "facts: {:?}",
+            section.facts
+        );
+    }
+
+    /// Index section near-capacity arm: ≥95k embedded rows must WARN
+    /// with the MAX_ENTRIES note. The section only counts
+    /// `embedding IS NOT NULL`, so a minimal single-column table keeps
+    /// the fixture cheap (one recursive-CTE insert, no full schema).
+    #[test]
+    fn index_section_warns_when_hnsw_within_5pct_of_cap() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(
+            "CREATE TABLE memories(embedding BLOB);
+             INSERT INTO memories(embedding)
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 95000)
+             SELECT x FROM c;",
+        )
+        .expect("seed 95k embedded rows");
+        let section = section_index(&conn);
+        assert_eq!(section.severity, Severity::Warning);
+        let note = section.note.as_deref().expect("note must explain the cap");
+        assert!(note.contains("within 5%"), "note: {note}");
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "hnsw_size_estimate" && v == "95000"),
+            "facts: {:?}",
+            section.facts
+        );
+    }
+
+    /// Sync section `Ok(None)` skew arm: a registered peer whose
+    /// `last_pulled_at` is NULL yields peer_count ≥ 1 but no measurable
+    /// skew — the section must render `not_observed` at INFO rather
+    /// than N/A (the no-peers early return) or CRIT.
+    #[test]
+    fn sync_section_not_observed_when_peer_has_no_pull_timestamp() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
+        conn.execute_batch(
+            "CREATE TABLE sync_state(last_seen_at TEXT, last_pulled_at TEXT);
+             INSERT INTO sync_state(last_seen_at, last_pulled_at)
+             VALUES ('2026-01-01T00:00:00Z', NULL);",
+        )
+        .expect("seed peer row");
+        let section = section_sync(&conn);
+        assert_eq!(section.severity, Severity::Info);
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "max_skew_secs" && v == "not_observed"),
+            "facts: {:?}",
+            section.facts
+        );
+        assert!(
+            section
+                .facts
+                .iter()
+                .any(|(k, v)| k == "peer_count" && v == "1"),
+            "facts: {:?}",
+            section.facts
+        );
+    }
+    // ---------------------------------------------------------------
+    // #1146 / #1598 reachability probes + #1598 GPU policy — coverage
+    // lift (GA push). Driven by wiremock + spawn_blocking (the
+    // reachability sections use reqwest::blocking) with the resolver
+    // env vars serialised on a module-local lock. Mirrors the
+    // remote-section test idiom above.
+    // ---------------------------------------------------------------
+
+    fn reach_env_lock() -> &'static std::sync::Mutex<()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII env setter scoped to a test; restores prior values on drop.
+    struct EnvScope(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvScope {
+        fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let mut prev = Vec::new();
+            for (k, v) in pairs {
+                prev.push((*k, std::env::var_os(k)));
+                // SAFETY: serialised by reach_env_lock in every caller.
+                unsafe { std::env::set_var(k, v) };
+            }
+            // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
+            // config.toml so the probe sees ONLY our env.
+            prev.push((
+                "AI_MEMORY_NO_CONFIG",
+                std::env::var_os("AI_MEMORY_NO_CONFIG"),
+            ));
+            unsafe { std::env::set_var("AI_MEMORY_NO_CONFIG", "1") };
+            Self(prev)
+        }
+    }
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    fn clear_llm_embed_env() {
+        for k in [
+            "AI_MEMORY_LLM_BACKEND",
+            "AI_MEMORY_LLM_BASE_URL",
+            "AI_MEMORY_LLM_API_KEY",
+            "AI_MEMORY_LLM_MODEL",
+            "AI_MEMORY_EMBED_BACKEND",
+            "AI_MEMORY_EMBED_BASE_URL",
+            "AI_MEMORY_EMBED_API_KEY",
+            "AI_MEMORY_EMBED_MODEL",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    #[test]
+    fn gpu_policy_warn_applicable_matrix_1598() {
+        // API embed backend → never the GPU warn (GPU irrelevant).
+        assert!(!gpu_policy_warn_applicable("openai", true));
+        assert!(!gpu_policy_warn_applicable("openai", false));
+        // ollama + no GPU → warn applies; ollama + GPU → no warn.
+        assert!(gpu_policy_warn_applicable("ollama", false));
+        assert!(!gpu_policy_warn_applicable("ollama", true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_reachability_compiled_default_is_info_1146() {
+        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_llm_embed_env();
+        let _scope = EnvScope::set(&[]);
+        let section = tokio::task::spawn_blocking(section_llm_reachability_1146)
+            .await
+            .unwrap();
+        assert_eq!(section.severity, Severity::Info);
+        assert!(
+            section
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("no operator LLM configuration"),
+            "compiled-default note expected; got {:?}",
+            section.note
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_reachability_probe_arms_1146() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (code, want) in [
+            (200u16, Severity::Info),
+            (401, Severity::Warning),
+            (503, Severity::Warning),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(code))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let section = {
+                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                clear_llm_embed_env();
+                let _scope = EnvScope::set(&[
+                    ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
+                    ("AI_MEMORY_LLM_BASE_URL", &uri),
+                    ("AI_MEMORY_LLM_API_KEY", "probe-key"),
+                    ("AI_MEMORY_LLM_MODEL", "probe-model"),
+                ]);
+                tokio::task::spawn_blocking(section_llm_reachability_1146)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(section.severity, want, "LLM probe status {code}");
+            assert_eq!(fact(&section, "http_status"), code.to_string());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embeddings_reachability_compiled_default_is_info_1598() {
+        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_llm_embed_env();
+        let _scope = EnvScope::set(&[]);
+        let section = tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+            .await
+            .unwrap();
+        assert_eq!(section.severity, Severity::Info);
+        assert!(
+            section
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("no operator embeddings configuration"),
+            "compiled-default note expected; got {:?}",
+            section.note
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embeddings_reachability_api_probe_arms_1598() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (code, want) in [
+            (200u16, Severity::Info),
+            (401, Severity::Warning),
+            (500, Severity::Warning),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(code).set_body_json(serde_json::json!({"data": []})),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let section = {
+                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                clear_llm_embed_env();
+                let _scope = EnvScope::set(&[
+                    ("AI_MEMORY_EMBED_BACKEND", "openai-compatible"),
+                    ("AI_MEMORY_EMBED_BASE_URL", &uri),
+                    ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
+                    ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
+                ]);
+                tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(section.severity, want, "embed probe status {code}");
+            assert_eq!(fact(&section, "http_status"), code.to_string());
+        }
     }
 }

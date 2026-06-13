@@ -1,0 +1,528 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! `memory_store` input validation + `on_conflict` resolution.
+//!
+//! #881 (PR-4 extraction): split out of the monolithic
+//! `src/mcp/tools/store.rs` so the cheapest gate fires in its own
+//! ~120-LOC module. Wire-compat preserved verbatim: every error message
+//! and `OnConflict` variant is byte-identical to the pre-#881 inline
+//! code path.
+
+use crate::mcp::param_names;
+
+/// v0.6.3.1 P2 (G6) — `on_conflict` modes for `memory_store`.
+///
+/// * `Error`   — refuse the write with a typed CONFLICT error. This is
+///               the new default for v2-aware clients.
+/// * `Merge`   — keep the v0.6.3 silent-merge upsert behaviour. Default
+///               for v1 / unknown clients to preserve backward
+///               compatibility.
+/// * `Version` — auto-suffix the title with `(2)`, `(3)`, ... to write
+///               a distinct row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflict {
+    Error,
+    Merge,
+    Version,
+}
+
+impl OnConflict {
+    /// # Errors
+    ///
+    /// Returns the wire-compatible `"invalid on_conflict '...'..."`
+    /// error string surfaced to MCP callers when an unknown value
+    /// appears in the params.
+    ///
+    /// v0.7.0 (multi-agent literal-sweep scanner B finding F-B3.x):
+    /// promoted from `pub(super)` to `pub` so the HTTP handler
+    /// (`src/handlers/create.rs`) can reuse this single parse path
+    /// instead of the prior duplicated `matches!(... "error" | "merge"
+    /// | "version")` + per-mode dispatch. Single SSOT for the on-
+    /// conflict closed set.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "error" => Ok(Self::Error),
+            "merge" => Ok(Self::Merge),
+            "version" => Ok(Self::Version),
+            other => Err(format!(
+                "invalid on_conflict '{other}' (expected error|merge|version)"
+            )),
+        }
+    }
+}
+
+/// Capability profile detection. v2-aware clients default to `Error`;
+/// v1 / unknown clients default to `Merge` to preserve the v0.6.3
+/// contract. The determination keys off the MCP client name (captured
+/// at `initialize` from `clientInfo.name`). Known v2 clients are
+/// listed explicitly so the policy is auditable. The list is
+/// intentionally narrow — adding a name here is a deliberate decision
+/// that "this client knows how to handle a CONFLICT response from
+/// memory_store".
+pub(super) fn default_on_conflict_for_client(mcp_client: Option<&str>) -> OnConflict {
+    let Some(client) = mcp_client else {
+        return OnConflict::Merge;
+    };
+    // Match on the prefix before any '@' — `ai:foo@host:pid-N` style ids.
+    let head = client.split('@').next().unwrap_or(client);
+    let normalized = head.to_ascii_lowercase();
+    // v2-capable clients (explicitly opted-in via known name).
+    const V2_CLIENT_PREFIXES: &[&str] = &["ai:claude-code", "ai:ai-memory-cli/v2"];
+    for prefix in V2_CLIENT_PREFIXES {
+        if normalized.starts_with(prefix) {
+            return OnConflict::Error;
+        }
+    }
+    OnConflict::Merge
+}
+
+/// #881 — input-parse + validation + memory-construction extracted
+/// from the monolithic `handle_store`. Returns the parsed
+/// `(memory, on_conflict, agent_id, explicit_scope)` tuple ready for
+/// the governance gate, or a wire-compatible error string on the
+/// first validation failure.
+///
+/// Wire-compat preserved verbatim: every error message is
+/// byte-identical to the pre-#881 inline path.
+///
+/// # Errors
+///
+/// Returns the typed validation error string surfaced to MCP callers
+/// (`"title is required"` / `"invalid tier: ..."` / etc.) when the
+/// params fail any of the [`crate::validate`] checks, or
+/// `"invalid on_conflict ..."` when an unknown on_conflict mode
+/// appears.
+#[allow(clippy::too_many_lines)]
+pub(super) fn parse_and_build_memory(
+    params: &serde_json::Value,
+    mcp_client: Option<&str>,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    conn: &rusqlite::Connection,
+) -> Result<(crate::models::Memory, OnConflict, String, Option<String>), String> {
+    use crate::models::{ConfidenceSource, Memory, Tier};
+    use crate::{db, validate};
+
+    let title = params["title"]
+        .as_str()
+        .ok_or(crate::errors::msg::TITLE_REQUIRED)?;
+    let content = params["content"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTENT_REQUIRED)?;
+    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
+    // #1590 — namespace default ladder: explicit caller param >
+    // operator-configured `[storage].default_namespace` (seeded
+    // process-wide at boot; `None` for unconfigured deployments) >
+    // compiled `DEFAULT_NAMESPACE`. Pre-#1590 the resolved
+    // `default_namespace` was consumed by NO write path — the MCP
+    // store always hardcoded the compiled "global" fallback.
+    let namespace = params["namespace"].as_str().map_or_else(
+        || {
+            crate::config::configured_default_namespace()
+                .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
+        },
+        str::to_string,
+    );
+    // v0.7.x (issue #1175): vendor-neutral substrate default. The
+    // pre-#1175 hardcode of `"claude"` was a heterogeneous-NHI monoculture
+    // defect — `memory_store` from a non-Anthropic NHI silently stamped
+    // `source = "claude"` regardless of which model actually made the call.
+    // Caller-supplied `params["source"]` still wins; the default is now
+    // the role-categorical vendor-neutral value `"nhi"`.
+    let source = params["source"]
+        .as_str()
+        .unwrap_or(validate::DEFAULT_NHI_SOURCE)
+        .to_string();
+    // v0.6.3.1 P2 (G6) — explicit `on_conflict` overrides the per-client default.
+    let on_conflict = if let Some(s) = params["on_conflict"].as_str() {
+        OnConflict::parse(s)?
+    } else {
+        default_on_conflict_for_client(mcp_client)
+    };
+    // B4 (R2-LOW) — clamp to i32 range instead of panicking on out-of-range
+    // JSON. A maliciously-crafted `"priority": 9999999999` would have crashed
+    // the stdio MCP server pre-fix. `validate_priority` below enforces the
+    // semantic 1-10 range, so the clamp is purely a panic guard.
+    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(i32::MAX);
+    // #1591 — keep "did the caller actually send confidence?" visible
+    // so the row's `confidence_source` is truthful: an omitted value
+    // stamps the compiled DEFAULT_CONFIDENCE with source="default"
+    // instead of falsely claiming "caller_provided".
+    let caller_confidence = params[param_names::CONFIDENCE].as_f64();
+    let confidence = caller_confidence.unwrap_or(crate::models::DEFAULT_CONFIDENCE);
+    let tags: Vec<String> = params["tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    validate::validate_title(title).map_err(|e| e.to_string())?;
+    validate::validate_content(content).map_err(|e| e.to_string())?;
+    validate::validate_namespace(&namespace).map_err(|e| e.to_string())?;
+    validate::validate_source(&source).map_err(|e| e.to_string())?;
+    validate::validate_tags(&tags).map_err(|e| e.to_string())?;
+    validate::validate_priority(priority).map_err(|e| e.to_string())?;
+    validate::validate_confidence(confidence).map_err(|e| e.to_string())?;
+
+    let mut metadata = if params["metadata"].is_object() {
+        params["metadata"].clone()
+    } else {
+        serde_json::json!({})
+    };
+    // Resolve agent_id via the NHI-hardened precedence chain and merge into
+    // metadata. Explicit values win in this order:
+    //   1. top-level `agent_id` param
+    //   2. embedded `metadata.agent_id` (backward compatible with callers
+    //      that supply it inline)
+    //   3. env / MCP clientInfo / host / anonymous (handled inside `identity`)
+    let explicit_agent_id = params["agent_id"].as_str().or_else(|| {
+        metadata
+            .get(param_names::AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+    });
+    let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
+        .map_err(|e| e.to_string())?;
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(agent_id.clone()),
+        );
+    }
+    // #151 scope: top-level `scope` param OR inline metadata.scope
+    let explicit_scope = params["scope"]
+        .as_str()
+        .or_else(|| {
+            metadata
+                .get(param_names::SCOPE)
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string);
+    if let Some(ref s) = explicit_scope {
+        validate::validate_scope(s).map_err(|e| e.to_string())?;
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("scope".to_string(), serde_json::Value::String(s.clone()));
+        }
+    }
+    validate::validate_metadata(&metadata).map_err(|e| e.to_string())?;
+
+    let now = chrono::Utc::now();
+    let expires_at = resolved_ttl
+        .ttl_for_tier(&tier)
+        .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
+
+    // v0.6.3.1 P2 (G6) — apply the conflict policy BEFORE building the
+    // canonical Memory. `Version` mode rewrites `title` to a free suffix;
+    // `Error` mode short-circuits with a typed error if the row already
+    // exists; `Merge` defers to the legacy code path below.
+    let resolved_title = match on_conflict {
+        OnConflict::Error => {
+            if let Some(existing_id) =
+                db::find_by_title_namespace(conn, title, &namespace).map_err(|e| e.to_string())?
+            {
+                return Err(format!(
+                    "CONFLICT: memory with title '{title}' already exists in namespace \
+                     '{namespace}' (existing id: {existing_id}). Pass \
+                     on_conflict='merge' to update in place or 'version' to suffix the title."
+                ));
+            }
+            title.to_string()
+        }
+        OnConflict::Version => {
+            db::next_versioned_title(conn, title, &namespace).map_err(|e| e.to_string())?
+        }
+        OnConflict::Merge => title.to_string(),
+    };
+
+    // v0.7.x Form 6 (issue #759) — caller-supplied `kind` parameter.
+    // Recognised values match the [`crate::models::MemoryKind`] enum.
+    // `None` means the auto-classify hook (if enabled) decides.
+    //
+    // v0.7.0 #1467 — an explicit, non-parseable `kind` is now REJECTED
+    // (was silently coerced to `Observation`) so the MCP store path
+    // matches the CLI / HTTP strict gate. The MCP store path validates
+    // inline (it does not route through `validate::validate_create`), so
+    // call the shared `validate_kind` here directly.
+    let kind_param = params["kind"].as_str();
+    crate::validate::validate_kind(kind_param).map_err(|e| e.to_string())?;
+    let caller_kind = kind_param.and_then(crate::models::MemoryKind::from_str);
+
+    let source_uri = match params[param_names::SOURCE_URI].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            crate::validate::validate_source_uri(s).map_err(|e| e.to_string())?;
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+
+    // v0.7.0 #1421 — sister fix to #1411 (HTTP Form-4 wire-truthfulness).
+    // Pre-fix the MCP store path declared `citations: Vec::new()` and
+    // `source_span: None` even when the caller supplied them in the
+    // request — silently dropping the validated Form-4 provenance
+    // fields. Parse, validate, then thread through.
+    let citations: Vec<crate::models::Citation> = match params.get(param_names::CITATIONS) {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| {
+            format!(
+                "invalid `citations` (expected array of {{uri, accessed_at, hash?, span?}}): {e}"
+            )
+        })?,
+        _ => Vec::new(),
+    };
+    if !citations.is_empty() {
+        crate::validate::validate_citations(&citations).map_err(|e| e.to_string())?;
+    }
+    let source_span: Option<crate::models::SourceSpan> = match params.get(param_names::SOURCE_SPAN)
+    {
+        Some(v) if !v.is_null() => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|e| format!("invalid `source_span` (expected {{start, end}}): {e}"))?,
+        ),
+        _ => None,
+    };
+    if let Some(span) = source_span.as_ref() {
+        crate::validate::validate_source_span(span).map_err(|e| e.to_string())?;
+    }
+
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier,
+        namespace,
+        title: resolved_title,
+        content: content.to_string(),
+        tags,
+        priority: priority.clamp(1, 10),
+        confidence: confidence.clamp(0.0, 1.0),
+        source,
+        access_count: 0,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_accessed_at: None,
+        expires_at,
+        metadata,
+        reflection_depth: 0,
+        memory_kind: caller_kind.unwrap_or(crate::models::MemoryKind::Observation),
+        entity_id: None,
+        persona_version: None,
+        citations,
+        source_uri,
+        source_span,
+        // #1591 — truthful confidence provenance: only an explicit
+        // caller value is `caller_provided`; the compiled fallback is
+        // `default`.
+        confidence_source: if caller_confidence.is_some() {
+            ConfidenceSource::CallerProvided
+        } else {
+            ConfidenceSource::Default
+        },
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+    };
+
+    Ok((mem, on_conflict, agent_id, explicit_scope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_conflict_parse_variants() {
+        assert_eq!(OnConflict::parse("error").unwrap(), OnConflict::Error);
+        assert_eq!(OnConflict::parse("merge").unwrap(), OnConflict::Merge);
+        assert_eq!(OnConflict::parse("version").unwrap(), OnConflict::Version);
+        assert!(OnConflict::parse("nope").is_err());
+    }
+
+    #[test]
+    fn default_on_conflict_for_client_matrix() {
+        assert_eq!(default_on_conflict_for_client(None), OnConflict::Merge);
+        assert_eq!(
+            default_on_conflict_for_client(Some("ai:claude-code@host:pid-1")),
+            OnConflict::Error
+        );
+        assert_eq!(
+            default_on_conflict_for_client(Some("AI:Claude-Code@whatever")),
+            OnConflict::Error,
+            "case-insensitive prefix match"
+        );
+        assert_eq!(
+            default_on_conflict_for_client(Some("ai:ai-memory-cli/v2-something")),
+            OnConflict::Error
+        );
+        assert_eq!(
+            default_on_conflict_for_client(Some("ai:unknown-client@host:pid-1")),
+            OnConflict::Merge
+        );
+    }
+
+    /// v0.7.x (issue #1175) — `parse_and_build_memory` MUST default the
+    /// `source` field to the vendor-neutral [`crate::validate::DEFAULT_NHI_SOURCE`]
+    /// when the caller omits it. Pre-#1175 this site hardcoded `"claude"`
+    /// — a heterogeneous-NHI monoculture defect that silently broke
+    /// forensic queries keyed on `source = 'claude'` for every
+    /// non-Anthropic NHI's writes.
+    ///
+    /// Pinned at the unit-test layer (rather than as an integration
+    /// test) because [`crate::mcp::tools::store::handle_store`] is
+    /// `pub(crate)`; the substrate has not historically committed to a
+    /// public-API surface for the store entry point.
+    #[test]
+    fn issue_1175_source_default_is_vendor_neutral_nhi() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1175-store-default",
+            "content": "memory body",
+            "namespace": "issue-1175-store-default",
+            // No source field — should default to DEFAULT_NHI_SOURCE.
+        });
+
+        let (mem, _on_conflict, _agent_id, _explicit_scope) =
+            parse_and_build_memory(&params, None, &ttl, &conn)
+                .expect("parse_and_build_memory must succeed for a minimal valid payload");
+
+        assert_eq!(
+            mem.source,
+            crate::validate::DEFAULT_NHI_SOURCE,
+            "memory_store must default to the vendor-neutral substrate \
+             source value (\"nhi\"); pre-#1175 this site stamped \"claude\""
+        );
+    }
+
+    /// v0.7.x (issue #1175) — caller-supplied `source` MUST still
+    /// override the default. The vendor-neutral default only fires
+    /// when the caller omits the field; pre-#1175 callers that
+    /// explicitly passed `source: "claude"` continue to land that
+    /// value verbatim.
+    #[test]
+    fn issue_1175_caller_source_overrides_vendor_neutral_default() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1175-store-override",
+            "content": "memory body",
+            "namespace": "issue-1175-store-override",
+            "source": "system",
+        });
+
+        let (mem, _on_conflict, _agent_id, _explicit_scope) =
+            parse_and_build_memory(&params, None, &ttl, &conn)
+                .expect("parse_and_build_memory must succeed");
+
+        assert_eq!(
+            mem.source, "system",
+            "caller-supplied source wins over the default"
+        );
+    }
+
+    /// v0.7.x issue #1591 regression — `memory_store` with NO
+    /// `confidence` argument must stamp the compiled default value
+    /// with TRUTHFUL provenance `confidence_source = "default"`.
+    /// Pre-#1591 the omitted case stamped `confidence = 1.0` +
+    /// `confidence_source = "caller_provided"` — a false provenance
+    /// claim indistinguishable from a deliberate caller assertion.
+    #[test]
+    fn issue_1591_omitted_confidence_stamps_source_default() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1591-omitted",
+            "content": "memory body",
+            "namespace": "issue-1591",
+            // No confidence field.
+        });
+        let (mem, _, _, _) = parse_and_build_memory(&params, None, &ttl, &conn).expect("ok");
+        assert!((mem.confidence - crate::models::DEFAULT_CONFIDENCE).abs() < f64::EPSILON);
+        assert_eq!(
+            mem.confidence_source,
+            crate::models::ConfidenceSource::Default,
+            "#1591: omitted confidence must stamp source=default"
+        );
+        assert_eq!(mem.confidence_source.as_str(), "default");
+    }
+
+    /// v0.7.x issue #1591 regression — an EXPLICIT `confidence=0.8`
+    /// keeps the historical `caller_provided` provenance.
+    #[test]
+    fn issue_1591_explicit_confidence_stays_caller_provided() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-1591-explicit",
+            "content": "memory body",
+            "namespace": "issue-1591",
+            "confidence": 0.8,
+        });
+        let (mem, _, _, _) = parse_and_build_memory(&params, None, &ttl, &conn).expect("ok");
+        assert!((mem.confidence - 0.8).abs() < f64::EPSILON);
+        assert_eq!(
+            mem.confidence_source,
+            crate::models::ConfidenceSource::CallerProvided,
+        );
+    }
+
+    /// v0.7.x issue #1590 regression — the MCP store namespace default
+    /// ladder: explicit param > operator-configured
+    /// `[storage].default_namespace` (process-wide seed) > compiled
+    /// `"global"`. Pre-#1590 the configured value was resolved but
+    /// consumed by NO write path.
+    #[test]
+    fn issue_1590_store_namespace_default_ladder() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let _gate = crate::config::lock_configured_default_namespace_for_test();
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let omitted_ns = json!({
+            "title": "issue-1590-store",
+            "content": "memory body",
+        });
+
+        // Unconfigured deployment: historical compiled default.
+        crate::config::set_configured_default_namespace(None);
+        let (mem, _, _, _) = parse_and_build_memory(&omitted_ns, None, &ttl, &conn).expect("ok");
+        assert_eq!(mem.namespace, crate::DEFAULT_NAMESPACE);
+
+        // Operator explicitly configured [storage].default_namespace.
+        crate::config::set_configured_default_namespace(Some("alphaone".to_string()));
+        let (mem, _, _, _) = parse_and_build_memory(&omitted_ns, None, &ttl, &conn).expect("ok");
+        assert_eq!(
+            mem.namespace, "alphaone",
+            "#1590: configured default_namespace must win over compiled global"
+        );
+
+        // Explicit caller namespace still beats the configured default.
+        let explicit_ns = json!({
+            "title": "issue-1590-store-explicit",
+            "content": "memory body",
+            "namespace": "caller-ns",
+        });
+        let (mem, _, _, _) = parse_and_build_memory(&explicit_ns, None, &ttl, &conn).expect("ok");
+        assert_eq!(mem.namespace, "caller-ns", "explicit param wins");
+
+        crate::config::set_configured_default_namespace(None);
+    }
+}

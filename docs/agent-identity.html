@@ -66,6 +66,17 @@ table tr:last-child td{border-bottom:none}
 
 blockquote{border-left:4px solid var(--p1);background:rgba(110,231,255,.05);padding:1rem 1.25rem;margin:1.25rem 0;border-radius:0 8px 8px 0;color:var(--text-muted)}
 blockquote strong{color:var(--p1)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -75,11 +86,14 @@ blockquote strong{color:var(--p1)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Agent Identity</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -102,6 +116,7 @@ blockquote strong{color:var(--p1)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html" class="current">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -113,6 +128,9 @@ blockquote strong{color:var(--p1)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -122,23 +140,91 @@ blockquote strong{color:var(--p1)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -182,9 +268,9 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
   <div class="container">
     <span class="eyebrow">Definition</span>
     <h2>What <code>agent_id</code> means.</h2>
-    <p><code>agent_id</code> is a <em>claimed</em> identity attached to every memory at write time. It survives every operation that touches the memory: update, dedup, import, sync, consolidate. It's the substrate for filtering, scoping, governance, and (in v0.7) cryptographic attestation.</p>
+    <p><code>agent_id</code> is a <em>claimed</em> identity attached to every memory at write time. It survives every operation that touches the memory: update, dedup, import, sync, consolidate. It's the substrate for filtering, scoping, governance, and — as of v0.7.0 (#626 Layer-3) — cryptographic attestation that upgrades a claimed id to an <em>attested</em> one.</p>
     <blockquote>
-      <strong>Honest framing:</strong> <code>agent_id</code> today is <em>claimed</em>, not <em>attested</em>. Don't make security decisions on it without pairing with agent registration (Task 1.3 — upcoming) or attestation (v0.7+). The schema reservation for cryptographic signatures lives at <code>memory_links.signature</code> (schema v15, v0.6.3) and gets wired in v0.7.
+      <strong>Honest framing:</strong> by default an <em>unsigned</em> <code>agent_id</code> is <em>claimed</em>, not <em>attested</em> — don't make security decisions on it alone. As of <strong>v0.7.0 (#626 Layer-3)</strong> a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> over the canonical <code>SignableWrite</code> envelope on every store surface (CLI <code>--sign</code>, MCP <code>memory_store</code>, HTTP <code>POST /api/v1/memories</code>); the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code> (forged → <code>403 ATTESTATION_FAILED</code>). Operators can require it process-wide with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>. The earlier link-level signature reservation (<code>memory_links.signature</code>, schema v15, v0.6.3) remains the attestation substrate for KG edges. Two edges stay claimed-by-design at v0.7.0 — the federation receive path (mTLS + peer allowlist is the trust boundary) and the permissive default posture — both tracked for v0.8 hardening under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>.
     </blockquote>
   </div>
 </section>
@@ -210,6 +296,14 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
       <li><code>X-Agent-Id</code> request header</li>
       <li>Per-request <code>anonymous:req-&lt;uuid8&gt;</code> (logged at WARN)</li>
     </ol>
+
+    <h3>Read-path visibility caller (v0.7.0 #1468 / #1469)</h3>
+    <p>The ladders above resolve the <em>write</em> identity stamped into <code>metadata.agent_id</code>. The MCP read tools that enforce per-row <code>scope=private</code> ownership — <code>memory_session_start</code>, <code>memory_list</code>, <code>memory_search</code>, <code>memory_recall</code> — resolve their <em>visibility caller</em> through a separate, narrower ladder:</p>
+    <ol>
+      <li><code>AI_MEMORY_AGENT_ID</code> environment variable (when set + shape-valid)</li>
+      <li><code>None</code> — trust-all, single-tenant read posture</li>
+    </ol>
+    <p>The pid-synthesized <code>ai:&lt;client&gt;@&lt;host&gt;:pid-&lt;pid&gt;</code> clientInfo id is <strong>deliberately not</strong> used here: it embeds the live PID, so it could never equal the <code>metadata.agent_id</code> an <em>earlier</em> process wrote, which would hide every prior-session private row from its own owner. When <code>AI_MEMORY_AGENT_ID</code> is set, the read tools drop cross-agent <code>scope=private</code> rows (owned by a different agent, not shared/targeted at the caller) before they reach the wire; collective and caller-owned rows always pass. When unset, the read path keeps the trust-all single-tenant behavior. Multi-tenant MCP hosts must set <code>AI_MEMORY_AGENT_ID</code> per tenant to get private-row isolation on reads.</p>
   </div>
 </section>
 
@@ -255,7 +349,7 @@ ai-memory search --agent-id alice "deploy"
 {"name": "memory_search", "arguments": {"query": "deploy", "agent_id": "alice"}}
 
 # HTTP
-curl 'http://127.0.0.1:9077/api/v1/memories?agent_id=alice&query=deploy'</code></pre>
+curl 'http://127.0.0.1:9077/api/v1/search?q=deploy&agent_id=alice'</code></pre>
   </div>
 </section>
 
@@ -283,7 +377,7 @@ curl 'http://127.0.0.1:9077/api/v1/memories?agent_id=alice&query=deploy'</code><
     <h2>Scrub the leaky default.</h2>
     <p>The fallback <code>host:&lt;hostname&gt;:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> exposes hostname and PID. <strong>When writing memories to a shared or upstream database, set an opaque <code>--agent-id</code> or <code>AI_MEMORY_AGENT_ID</code>.</strong> Tracking issue: #198.</p>
 <pre><code># Production daemon — opaque identity
-AI_MEMORY_AGENT_ID=fleet-prod-9 ai-memory serve --bind 0.0.0.0:9077
+AI_MEMORY_AGENT_ID=fleet-prod-9 ai-memory serve --host 0.0.0.0 --port 9077
 
 # Or per-CLI-call
 ai-memory --agent-id alice store -T "Auth flow notes" -c "..."</code></pre>
@@ -299,7 +393,7 @@ ai-memory --agent-id alice store -T "Auth flow notes" -c "..."</code></pre>
       <li>You can answer <em>"who wrote this?"</em> in every recall — instantly.</li>
       <li>You can scope retrieval to <em>"show me what <code>ai:secops-skill@*</code> learned this week."</em></li>
       <li>Per-namespace governance can require approval for writes from specific agents (see <a href="architectures-t2.html" style="color:var(--p1)">Architectures · T2</a> and <a href="architectures-t3.html" style="color:var(--p1)">T3</a>).</li>
-      <li>v0.7 attestation extends <code>agent_id</code> from claimed to cryptographically signed — same field, stronger guarantee.</li>
+      <li>v0.7.0 attestation (#626 Layer-3) extends <code>agent_id</code> from claimed to cryptographically signed (Ed25519 over the <code>SignableWrite</code> envelope) — same field, stronger guarantee.</li>
     </ul>
     <p><code>ai-memory</code> ships provenance on day one.</p>
   </div>
@@ -318,7 +412,7 @@ ai-memory --agent-id alice store -T "Auth flow notes" -c "..."</code></pre>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

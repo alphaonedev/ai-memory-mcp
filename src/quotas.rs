@@ -1,21 +1,60 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.7.0 Track K, Task K8 — per-agent rate limits + storage caps.
+//! v0.7.0 Track K, Task K8 — per-agent + per-namespace rate limits +
+//! storage caps.
 //!
-//! Each registered agent gets a single row in the `agent_quotas`
-//! table tracking three rolling-window counters (memories written today,
-//! storage bytes consumed lifetime, links written today) against three
-//! limits (`max_memories_per_day`, `max_storage_bytes`,
-//! `max_links_per_day`). The `store_memory` + `memory_link` write paths
-//! consult [`check_quota`] before committing; on exceeded limit the
-//! call returns a [`QuotaError`] naming the limit that was hit, which
-//! the MCP layer maps to a `QUOTA_EXCEEDED` diagnostic.
+//! Each `(agent_id, namespace)` tuple gets a single row in the
+//! `agent_quotas` table tracking three rolling-window counters
+//! (memories written today, storage bytes consumed lifetime, links
+//! written today) against three limits (`max_memories_per_day`,
+//! `max_storage_bytes`, `max_links_per_day`). The `store_memory` +
+//! `memory_link` write paths consult [`check_and_record`] before
+//! committing; on exceeded limit the call returns a [`QuotaError`]
+//! naming the limit that was hit, which the MCP layer maps to a
+//! `QUOTA_EXCEEDED` diagnostic.
+//!
+//! Enforcement scope (#1621): quotas gate the daemon-facing write
+//! surfaces — MCP `memory_store` / `memory_link` and HTTP
+//! `POST /api/v1/memories` / `POST /api/v1/links`. CLI one-shot
+//! writes are operator-as-actor and deliberately uncharged (the same
+//! exemption principle as the L1-6 governance pre-write hook, which
+//! the CLI binaries do not install); CLI writes likewise fire no
+//! webhook dispatch. K8 limits target NHI agents reaching the
+//! substrate through a daemon, not the operator at the shell.
 //!
 //! Daily counters reset at UTC midnight via [`reset_daily`], driven by
 //! the K8 sweep loop wired into `daemon_runtime::bootstrap_serve` —
 //! same lifecycle shape as the K2 pending-actions sweeper and the I3
 //! transcript-lifecycle sweeper.
+//!
+//! ## Per-namespace dimension (v0.7.0 #1156, schema v50)
+//!
+//! Pre-v50 the substrate keyed quota accounting on `agent_id` alone:
+//! an agent that wrote generously in a personal scratch namespace
+//! starved their writes against a shared namespace because the same
+//! daily cap applied to both. v50 extends the PK to
+//! `(agent_id, namespace)` so per-namespace allotments hold even when
+//! a single agent operates across many namespaces. Operators carving
+//! tight blast-radius limits on a single shared namespace no longer
+//! need to lower the agent's overall cap.
+//!
+//! The sentinel namespace string `_global` (underscore prefix puts it
+//! outside the validated namespace charset, so no caller-supplied
+//! namespace can collide) carries forward every pre-v50 row's
+//! accounting verbatim. Callers that do not have a per-namespace
+//! context to pass (boundary layers, the daily-reset sweep, the
+//! legacy aggregate view) use `_global` to land on the
+//! historically-shaped row.
+//!
+//! ## NSA CSI MCP mapping
+//!
+//! This module backs **NSA recommendation (c)** "Implement strict
+//! input validation and authorization checks" and **NSA concern (h)**
+//! "Denial of service" by giving operators per-namespace blast-radius
+//! controls on a compromised or misbehaving agent. Defense-in-depth
+//! on top of the seven-layer DoS substrate documented in
+//! `docs/compliance/nsa-csi-mcp-security-mapping.md`.
 //!
 //! Compiled defaults: 1000 memories/day, 100 MiB storage cap, 5000
 //! links/day. Defaults are deliberately generous so the K8 substrate is
@@ -25,19 +64,84 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-/// Default daily memory store ceiling per agent. Generous; tune down
-/// per-deployment by overwriting the row's `max_memories_per_day` after
-/// it auto-inserts on first use.
+/// Sentinel namespace string used by the v50 backwards-compat path
+/// and by every call site that lacks a per-namespace context.
+///
+/// The leading underscore visibly separates the sentinel from
+/// user-supplied namespaces by convention; while
+/// [`crate::validate::validate_namespace`] does not strictly reject
+/// `_`-prefixed identifiers, the substrate convention is that
+/// operators don't use them for user data.
+///
+/// Pre-v50 rows backfill to this namespace during the v50 schema
+/// migration; the MCP tool / HTTP route boundary defaults to this
+/// string when the caller omits the optional `namespace` argument.
+pub const GLOBAL_NAMESPACE: &str = "_global";
+
+/// Default daily memory store ceiling per (agent, namespace). Generous;
+/// tune down per-deployment by overwriting the row's
+/// `max_memories_per_day` after it auto-inserts on first use.
 pub const DEFAULT_MAX_MEMORIES_PER_DAY: i64 = 1000;
 
-/// Default lifetime storage cap per agent (100 MiB). Counts the
-/// (title + content + metadata) byte length of every memory the agent
-/// writes; not reset by the daily sweep.
+/// Default lifetime storage cap per (agent, namespace) (100 MiB).
+/// Counts the (title + content + metadata) byte length of every memory
+/// the agent writes; not reset by the daily sweep.
 pub const DEFAULT_MAX_STORAGE_BYTES: i64 = 100 * 1024 * 1024;
 
-/// Default daily link creation ceiling per agent. Same shape as the
-/// memory ceiling; reset to 0 at UTC midnight.
+/// Default daily link creation ceiling per (agent, namespace). Same
+/// shape as the memory ceiling; reset to 0 at UTC midnight.
 pub const DEFAULT_MAX_LINKS_PER_DAY: i64 = 5000;
+
+/// Operator-resolved quota defaults stamped at quota-row auto-insert.
+///
+/// The three quota ceilings live per-row in `agent_quotas`, but a row
+/// only materialises on first use — at which point [`ensure_row`] stamps
+/// these values. Pre-this-change the stamp used the compiled
+/// `DEFAULT_MAX_*` constants directly, so the only way to raise a cap was
+/// an out-of-band `UPDATE`. Now the daemon installs operator-resolved
+/// values (from `[limits]` / `AI_MEMORY_MAX_*`) at boot via
+/// [`set_quota_defaults`], and every fresh row inherits the operator's
+/// configured ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaDefaults {
+    /// Per-(agent, namespace) daily memory-write ceiling.
+    pub max_memories_per_day: i64,
+    /// Per-(agent, namespace) lifetime storage cap in bytes.
+    pub max_storage_bytes: i64,
+    /// Per-(agent, namespace) daily link-creation ceiling.
+    pub max_links_per_day: i64,
+}
+
+impl Default for QuotaDefaults {
+    /// The compiled fallback — used in CLI / unit-test contexts where
+    /// the daemon never installed operator overrides.
+    fn default() -> Self {
+        Self {
+            max_memories_per_day: DEFAULT_MAX_MEMORIES_PER_DAY,
+            max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
+            max_links_per_day: DEFAULT_MAX_LINKS_PER_DAY,
+        }
+    }
+}
+
+static QUOTA_DEFAULTS: std::sync::OnceLock<QuotaDefaults> = std::sync::OnceLock::new();
+
+/// Install the operator-resolved quota defaults. Idempotent — the first
+/// successful set wins (subsequent calls are ignored), matching the
+/// once-at-boot lifecycle. Called from `daemon_runtime::run` so serve,
+/// MCP, and CLI write paths all stamp the same operator-configured
+/// ceilings.
+pub fn set_quota_defaults(defaults: QuotaDefaults) {
+    let _ = QUOTA_DEFAULTS.set(defaults);
+}
+
+/// Resolved quota defaults for the auto-insert path. Falls back to
+/// [`QuotaDefaults::default`] (the compiled `DEFAULT_MAX_*` constants)
+/// when the daemon never installed operator overrides.
+#[must_use]
+pub fn quota_defaults() -> QuotaDefaults {
+    QUOTA_DEFAULTS.get().copied().unwrap_or_default()
+}
 
 /// Which write operation to charge against the agent's quota.
 ///
@@ -91,6 +195,10 @@ impl QuotaLimit {
 pub struct QuotaError {
     /// Agent whose quota was exceeded.
     pub agent_id: String,
+    /// Namespace whose quota was exceeded (v50; #1156). Pre-v50
+    /// surfaces always reported `_global` here for byte-for-byte
+    /// compatibility with the legacy single-PK accounting.
+    pub namespace: String,
     /// Which limit was hit.
     pub limit: QuotaLimit,
     /// The current value of the counter the limit applies to.
@@ -103,8 +211,9 @@ impl std::fmt::Display for QuotaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "QUOTA_EXCEEDED: agent {} hit {} (current={}, max={})",
+            "QUOTA_EXCEEDED: agent {} namespace {} hit {} (current={}, max={})",
             self.agent_id,
+            self.namespace,
             self.limit.as_str(),
             self.current,
             self.max,
@@ -114,11 +223,19 @@ impl std::fmt::Display for QuotaError {
 
 impl std::error::Error for QuotaError {}
 
-/// Snapshot of one agent's quota row, returned by [`get_status`] and
-/// surfaced over the MCP `memory_quota_status` tool.
+/// Snapshot of one `(agent_id, namespace)` quota row, returned by
+/// [`get_status`] and surfaced over the MCP `memory_quota_status`
+/// tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaStatus {
     pub agent_id: String,
+    /// Per-namespace dimension (v50, #1156). `_global` for callers
+    /// that did not pass a namespace; otherwise the caller-supplied
+    /// namespace string. The aggregate-view path
+    /// ([`get_aggregate_status`]) reports `_global` here too because
+    /// the rollup is keyed by `agent_id` alone.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
     pub max_memories_per_day: i64,
     pub max_storage_bytes: i64,
     pub max_links_per_day: i64,
@@ -130,56 +247,67 @@ pub struct QuotaStatus {
     pub updated_at: String,
 }
 
-/// Auto-insert a default quota row for an agent that doesn't have one
-/// yet, then return the row. Idempotent — concurrent calls converge on
-/// a single row because `agent_id` is the PRIMARY KEY.
-fn ensure_row(conn: &Connection, agent_id: &str) -> Result<QuotaStatus> {
-    if let Some(row) = load_row(conn, agent_id)? {
+fn default_namespace() -> String {
+    GLOBAL_NAMESPACE.to_string()
+}
+
+/// Auto-insert a default quota row for an `(agent_id, namespace)`
+/// tuple that doesn't have one yet, then return the row. Idempotent —
+/// concurrent calls converge on a single row because
+/// `(agent_id, namespace)` is the PRIMARY KEY.
+fn ensure_row(conn: &Connection, agent_id: &str, namespace: &str) -> Result<QuotaStatus> {
+    if let Some(row) = load_row(conn, agent_id, namespace)? {
         return Ok(row);
     }
     let now = chrono::Utc::now().to_rfc3339();
     let day = day_bucket(&now);
+    let defaults = quota_defaults();
     conn.execute(
         "INSERT OR IGNORE INTO agent_quotas
-         (agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+         (agent_id, namespace,
+          max_memories_per_day, max_storage_bytes, max_links_per_day,
           current_memories_today, current_storage_bytes, current_links_today,
           day_started_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 0, 0, 0, ?5, ?6, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?7, ?7)",
         params![
             agent_id,
-            DEFAULT_MAX_MEMORIES_PER_DAY,
-            DEFAULT_MAX_STORAGE_BYTES,
-            DEFAULT_MAX_LINKS_PER_DAY,
+            namespace,
+            defaults.max_memories_per_day,
+            defaults.max_storage_bytes,
+            defaults.max_links_per_day,
             day,
             now,
         ],
     )
     .context("failed to insert default quota row")?;
-    load_row(conn, agent_id)?
+    load_row(conn, agent_id, namespace)?
         .context("quota row missing immediately after insert (concurrent delete?)")
 }
 
-/// Load a quota row by agent_id, returning `None` if the row does not
-/// exist. Pure read — does not insert defaults.
-fn load_row(conn: &Connection, agent_id: &str) -> Result<Option<QuotaStatus>> {
+/// Load a quota row by `(agent_id, namespace)`, returning `None` if
+/// the row does not exist. Pure read — does not insert defaults.
+fn load_row(conn: &Connection, agent_id: &str, namespace: &str) -> Result<Option<QuotaStatus>> {
     conn.query_row(
-        "SELECT agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
+        "SELECT agent_id, namespace,
+                max_memories_per_day, max_storage_bytes, max_links_per_day,
                 current_memories_today, current_storage_bytes, current_links_today,
                 day_started_at, created_at, updated_at
-         FROM agent_quotas WHERE agent_id = ?1",
-        params![agent_id],
+         FROM agent_quotas
+         WHERE agent_id = ?1 AND namespace = ?2",
+        params![agent_id, namespace],
         |r| {
             Ok(QuotaStatus {
                 agent_id: r.get(0)?,
-                max_memories_per_day: r.get(1)?,
-                max_storage_bytes: r.get(2)?,
-                max_links_per_day: r.get(3)?,
-                current_memories_today: r.get(4)?,
-                current_storage_bytes: r.get(5)?,
-                current_links_today: r.get(6)?,
-                day_started_at: r.get(7)?,
-                created_at: r.get(8)?,
-                updated_at: r.get(9)?,
+                namespace: r.get(1)?,
+                max_memories_per_day: r.get(2)?,
+                max_storage_bytes: r.get(3)?,
+                max_links_per_day: r.get(4)?,
+                current_memories_today: r.get(5)?,
+                current_storage_bytes: r.get(6)?,
+                current_links_today: r.get(7)?,
+                day_started_at: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
             })
         },
     )
@@ -194,15 +322,23 @@ fn day_bucket(rfc3339: &str) -> String {
     rfc3339.get(..10).unwrap_or(rfc3339).to_string()
 }
 
-/// v0.7 K8 — pre-write quota check. Auto-inserts the default row on
-/// first call for an agent. If the agent's `day_started_at` rolled
-/// over since the last write, the counters are zeroed inline (the
-/// sweeper is the bulk path; this path keeps the per-write quota
-/// honest even if the sweeper hasn't fired yet).
+/// v0.7 K8 — pre-write quota check.
+///
+/// Auto-inserts the default row on first call for an `(agent_id,
+/// namespace)` tuple. If the row's `day_started_at` rolled over since
+/// the last write, the counters are zeroed inline (the sweeper is the
+/// bulk path; this path keeps the per-write quota honest even if the
+/// sweeper hasn't fired yet).
 ///
 /// On a clean check, returns `Ok(())`. On a quota breach, returns
 /// `Err(QuotaError)` naming the limit that was hit and the
 /// counter/ceiling values at the moment of the check.
+///
+/// ## v0.7.0 #1156 — per-namespace dimension
+///
+/// `namespace` keys the per-namespace accounting row. Callers that
+/// lack a per-namespace context (boundary layers, daily reset)
+/// pass [`GLOBAL_NAMESPACE`].
 ///
 /// # Errors
 ///
@@ -212,9 +348,10 @@ fn day_bucket(rfc3339: &str) -> String {
 pub fn check_quota(
     conn: &Connection,
     agent_id: &str,
+    namespace: &str,
     op: QuotaOp,
 ) -> std::result::Result<(), QuotaCheckError> {
-    let row = ensure_row(conn, agent_id).map_err(QuotaCheckError::Sql)?;
+    let row = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
 
     // Inline daily-bucket roll: if the stored bucket isn't today, treat
     // the daily counters as 0 for this check. The sweeper performs the
@@ -230,17 +367,29 @@ pub fn check_quota(
 
     match op {
         QuotaOp::Memory { bytes } => {
-            if memories_today + 1 > row.max_memories_per_day {
+            // #1256 (LOW, 2026-05-25) — `saturating_add` keeps the cap
+            // check honest even when a synthetic `i64::MAX` bytes (or
+            // any other adversarial input that crossed the
+            // saturating-cast boundary upstream) would otherwise wrap
+            // the unchecked `+` to a negative and bypass the
+            // `> max_storage_bytes` comparison. The clamp at
+            // `i64::MAX` is fine for the comparison because the
+            // ceiling fields themselves are bounded by
+            // `DEFAULT_MAX_STORAGE_BYTES` (100 MB) — `i64::MAX` is
+            // unambiguously over cap.
+            if memories_today.saturating_add(1) > row.max_memories_per_day {
                 return Err(QuotaCheckError::Quota(QuotaError {
                     agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
                     limit: QuotaLimit::MemoriesPerDay,
                     current: memories_today,
                     max: row.max_memories_per_day,
                 }));
             }
-            if row.current_storage_bytes + bytes > row.max_storage_bytes {
+            if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
                 return Err(QuotaCheckError::Quota(QuotaError {
                     agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
                     limit: QuotaLimit::StorageBytes,
                     current: row.current_storage_bytes,
                     max: row.max_storage_bytes,
@@ -248,9 +397,12 @@ pub fn check_quota(
             }
         }
         QuotaOp::Link => {
-            if links_today + 1 > row.max_links_per_day {
+            // #1256 — same saturating-add safety net for the daily
+            // links counter.
+            if links_today.saturating_add(1) > row.max_links_per_day {
                 return Err(QuotaCheckError::Quota(QuotaError {
                     agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
                     limit: QuotaLimit::LinksPerDay,
                     current: links_today,
                     max: row.max_links_per_day,
@@ -285,6 +437,20 @@ impl std::fmt::Display for QuotaCheckError {
 
 impl std::error::Error for QuotaCheckError {}
 
+/// #1558 batch 5 wave 2 — canonical `"update failed: {e}"` →
+/// [`QuotaCheckError::Sql`] mapping for the four `agent_quotas`
+/// UPDATE statements in [`check_and_record`]. Byte-identical detail.
+fn quota_update_failed(e: impl std::fmt::Display) -> QuotaCheckError {
+    QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}"))
+}
+
+/// #1558 batch 5 wave 2 — canonical refund-failure WARN line shared by
+/// the three quota-refund rollback sites (HTTP create, MCP store, MCP
+/// link). Message bytes identical to the prior inline `tracing::warn!`.
+pub(crate) fn log_refund_op_failed(agent_id: &str, e: &dyn std::fmt::Display) {
+    tracing::warn!("quota refund_op failed for agent {agent_id}: {e}");
+}
+
 /// v0.7 K8 / H12 (#628 blocker) — atomic check + record. Combines the
 /// quota check with the counter increment under a single
 /// `BEGIN IMMEDIATE` SQLite transaction so concurrent writers cannot
@@ -292,18 +458,20 @@ impl std::error::Error for QuotaCheckError {}
 /// cap. `BEGIN IMMEDIATE` acquires a `RESERVED` lock on the database
 /// at the start of the transaction; SQLite serialises every other
 /// would-be writer behind the lock until COMMIT/ROLLBACK, which is
-/// the SQLite analogue of `SELECT ... FOR UPDATE` against the single
-/// `agent_quotas` row.
+/// the SQLite analogue of `SELECT ... FOR UPDATE` against the
+/// `(agent_id, namespace)` `agent_quotas` row.
 ///
 /// On a clean check + increment, returns `Ok(())`. On a quota breach,
 /// returns `Err(QuotaError)` naming the limit that was hit and the
 /// counter / ceiling values at the moment of the check; the
 /// transaction is rolled back so no counter mutation persists.
 ///
-/// Callers replace the previous two-step `check_quota(...)?;
-/// op(...)?; record_op(...)?` pattern with `check_and_record(...)?;
-/// op(...)?;` (then `refund_op(...)` on op-failure if needed) so the
-/// gap between check and record cannot be raced.
+/// ## v0.7.0 #1156 — per-namespace dimension
+///
+/// `namespace` keys the per-namespace accounting row. The K8 write
+/// paths (`store_memory`, `memory_link`) supply the target memory's
+/// namespace so per-namespace allotments hold even when one agent
+/// writes across many namespaces.
 ///
 /// # Errors
 ///
@@ -313,26 +481,27 @@ impl std::error::Error for QuotaCheckError {}
 pub fn check_and_record(
     conn: &Connection,
     agent_id: &str,
+    namespace: &str,
     op: QuotaOp,
 ) -> std::result::Result<(), QuotaCheckError> {
     // Make sure the row exists OUTSIDE the immediate transaction;
     // `INSERT OR IGNORE` itself is atomic and contention-free.
-    let _ = ensure_row(conn, agent_id).map_err(QuotaCheckError::Sql)?;
+    let _ = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
 
     // BEGIN IMMEDIATE — acquires a RESERVED lock immediately. This is
     // the SQLite shape of "SELECT ... FOR UPDATE": no other connection
     // can begin a write transaction until we COMMIT or ROLLBACK. The
     // window between SELECT and UPDATE inside the transaction is
     // therefore safe from another writer's UPDATE racing past us.
-    conn.execute_batch("BEGIN IMMEDIATE")
+    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
         .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
 
     let result: std::result::Result<(), QuotaCheckError> = (|| {
-        let row = load_row(conn, agent_id)
+        let row = load_row(conn, agent_id, namespace)
             .map_err(QuotaCheckError::Sql)?
             .ok_or_else(|| {
                 QuotaCheckError::Sql(anyhow::anyhow!(
-                    "quota row vanished mid-transaction for agent {agent_id}"
+                    "quota row vanished mid-transaction for agent {agent_id} namespace {namespace}"
                 ))
             })?;
 
@@ -351,17 +520,23 @@ pub fn check_and_record(
 
         match op {
             QuotaOp::Memory { bytes } => {
-                if memories_today + 1 > row.max_memories_per_day {
+                // #1256 (LOW, 2026-05-25) — saturating-add safety net
+                // on the in-transaction cap check too, matching the
+                // pre-transaction `check_quota` arm. See the comment
+                // there for the full threat-model rationale.
+                if memories_today.saturating_add(1) > row.max_memories_per_day {
                     return Err(QuotaCheckError::Quota(QuotaError {
                         agent_id: agent_id.to_string(),
+                        namespace: namespace.to_string(),
                         limit: QuotaLimit::MemoriesPerDay,
                         current: memories_today,
                         max: row.max_memories_per_day,
                     }));
                 }
-                if row.current_storage_bytes + bytes > row.max_storage_bytes {
+                if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
                     return Err(QuotaCheckError::Quota(QuotaError {
                         agent_id: agent_id.to_string(),
+                        namespace: namespace.to_string(),
                         limit: QuotaLimit::StorageBytes,
                         current: row.current_storage_bytes,
                         max: row.max_storage_bytes,
@@ -375,26 +550,29 @@ pub fn check_and_record(
                            current_storage_bytes = current_storage_bytes + ?1,
                            day_started_at = ?2,
                            updated_at = ?2
-                         WHERE agent_id = ?3",
-                        params![bytes, now, agent_id],
+                         WHERE agent_id = ?3 AND namespace = ?4",
+                        params![bytes, now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 } else {
                     conn.execute(
                         "UPDATE agent_quotas SET
                            current_memories_today = current_memories_today + 1,
                            current_storage_bytes = current_storage_bytes + ?1,
                            updated_at = ?2
-                         WHERE agent_id = ?3",
-                        params![bytes, now, agent_id],
+                         WHERE agent_id = ?3 AND namespace = ?4",
+                        params![bytes, now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 }
             }
             QuotaOp::Link => {
-                if links_today + 1 > row.max_links_per_day {
+                // #1256 (LOW, 2026-05-25) — saturating-add safety net
+                // on the daily-link counter check.
+                if links_today.saturating_add(1) > row.max_links_per_day {
                     return Err(QuotaCheckError::Quota(QuotaError {
                         agent_id: agent_id.to_string(),
+                        namespace: namespace.to_string(),
                         limit: QuotaLimit::LinksPerDay,
                         current: links_today,
                         max: row.max_links_per_day,
@@ -407,19 +585,19 @@ pub fn check_and_record(
                            current_links_today = 1,
                            day_started_at = ?1,
                            updated_at = ?1
-                         WHERE agent_id = ?2",
-                        params![now, agent_id],
+                         WHERE agent_id = ?2 AND namespace = ?3",
+                        params![now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 } else {
                     conn.execute(
                         "UPDATE agent_quotas SET
                            current_links_today = current_links_today + 1,
                            updated_at = ?1
-                         WHERE agent_id = ?2",
-                        params![now, agent_id],
+                         WHERE agent_id = ?2 AND namespace = ?3",
+                        params![now, agent_id, namespace],
                     )
-                    .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("update failed: {e}")))?;
+                    .map_err(quota_update_failed)?;
                 }
             }
         }
@@ -428,14 +606,14 @@ pub fn check_and_record(
 
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
                 .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("quota commit failed: {e}")))?;
             Ok(())
         }
         Err(e) => {
             // Rollback is best-effort — even if it fails, the
             // transaction is implicitly aborted on connection drop.
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
             Err(e)
         }
     }
@@ -450,10 +628,16 @@ pub fn check_and_record(
 /// Counters never go below zero (saturating) so a buggy double-refund
 /// cannot poison the substrate.
 ///
+/// ## v0.7.0 #1156 — per-namespace dimension
+///
+/// Pass the same `(agent_id, namespace)` pair the matching
+/// [`check_and_record`] call used so the refund lands on the same
+/// accounting row.
+///
 /// # Errors
 ///
 /// Wrapped SQL errors on update failure.
-pub fn refund_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
+pub fn refund_op(conn: &Connection, agent_id: &str, namespace: &str, op: QuotaOp) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     match op {
         QuotaOp::Memory { bytes } => {
@@ -462,8 +646,8 @@ pub fn refund_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
                    current_memories_today = MAX(current_memories_today - 1, 0),
                    current_storage_bytes = MAX(current_storage_bytes - ?1, 0),
                    updated_at = ?2
-                 WHERE agent_id = ?3",
-                params![bytes, now, agent_id],
+                 WHERE agent_id = ?3 AND namespace = ?4",
+                params![bytes, now, agent_id, namespace],
             )?;
         }
         QuotaOp::Link => {
@@ -471,17 +655,17 @@ pub fn refund_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
                 "UPDATE agent_quotas SET
                    current_links_today = MAX(current_links_today - 1, 0),
                    updated_at = ?1
-                 WHERE agent_id = ?2",
-                params![now, agent_id],
+                 WHERE agent_id = ?2 AND namespace = ?3",
+                params![now, agent_id, namespace],
             )?;
         }
     }
     Ok(())
 }
 
-/// v0.7 K8 — record a successful write against the agent's quota
-/// counters. Called AFTER the underlying insert succeeds so a failed
-/// store does not consume quota.
+/// v0.7 K8 — record a successful write against the
+/// `(agent_id, namespace)` quota counters. Called AFTER the underlying
+/// insert succeeds so a failed store does not consume quota.
 ///
 /// **DEPRECATED for new code paths**: prefer [`check_and_record`]
 /// which combines the check + record into a single atomic transaction
@@ -496,10 +680,10 @@ pub fn refund_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
 /// # Errors
 ///
 /// Wrapped SQL errors on update failure.
-pub fn record_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
+pub fn record_op(conn: &Connection, agent_id: &str, namespace: &str, op: QuotaOp) -> Result<()> {
     // ensure_row is idempotent so callers that skip check_quota (none
     // today, but defensive) still produce a coherent counter.
-    let row = ensure_row(conn, agent_id)?;
+    let row = ensure_row(conn, agent_id, namespace)?;
     let now = chrono::Utc::now().to_rfc3339();
     let today = day_bucket(&now);
     let stored_day = day_bucket(&row.day_started_at);
@@ -515,8 +699,8 @@ pub fn record_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
                        current_storage_bytes = current_storage_bytes + ?1,
                        day_started_at = ?2,
                        updated_at = ?2
-                     WHERE agent_id = ?3",
-                    params![bytes, now, agent_id],
+                     WHERE agent_id = ?3 AND namespace = ?4",
+                    params![bytes, now, agent_id, namespace],
                 )?;
             } else {
                 conn.execute(
@@ -524,8 +708,8 @@ pub fn record_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
                        current_memories_today = current_memories_today + 1,
                        current_storage_bytes = current_storage_bytes + ?1,
                        updated_at = ?2
-                     WHERE agent_id = ?3",
-                    params![bytes, now, agent_id],
+                     WHERE agent_id = ?3 AND namespace = ?4",
+                    params![bytes, now, agent_id, namespace],
                 )?;
             }
         }
@@ -537,16 +721,16 @@ pub fn record_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
                        current_links_today = 1,
                        day_started_at = ?1,
                        updated_at = ?1
-                     WHERE agent_id = ?2",
-                    params![now, agent_id],
+                     WHERE agent_id = ?2 AND namespace = ?3",
+                    params![now, agent_id, namespace],
                 )?;
             } else {
                 conn.execute(
                     "UPDATE agent_quotas SET
                        current_links_today = current_links_today + 1,
                        updated_at = ?1
-                     WHERE agent_id = ?2",
-                    params![now, agent_id],
+                     WHERE agent_id = ?2 AND namespace = ?3",
+                    params![now, agent_id, namespace],
                 )?;
             }
         }
@@ -555,11 +739,15 @@ pub fn record_op(conn: &Connection, agent_id: &str, op: QuotaOp) -> Result<()> {
 }
 
 /// v0.7 K8 — daily counter reset. Zeros `current_memories_today` +
-/// `current_links_today` for every row whose `day_started_at` is not
-/// the current UTC date. Driven by the K8 sweep loop on a 60-second
-/// cadence; the inline-roll branch in [`check_quota`] / [`record_op`]
-/// is the per-write fallback so the substrate stays honest even if
-/// the sweeper is delayed.
+/// `current_links_today` for every `(agent_id, namespace)` row whose
+/// `day_started_at` is not the current UTC date. Driven by the K8
+/// sweep loop on a 60-second cadence; the inline-roll branch in
+/// [`check_quota`] / [`record_op`] is the per-write fallback so the
+/// substrate stays honest even if the sweeper is delayed.
+///
+/// Operates across every namespace in one statement — no per-namespace
+/// loop is needed because the WHERE clause hits every stale row by
+/// definition.
 ///
 /// Returns the number of rows that were reset (0 when no agent has
 /// crossed midnight since the previous sweep).
@@ -582,52 +770,163 @@ pub fn reset_daily(conn: &Connection) -> Result<usize> {
     Ok(affected)
 }
 
-/// v0.7 K8 — read the current quota row for an agent, auto-inserting a
-/// default row if none exists. Backs the `memory_quota_status` MCP
-/// tool.
+/// v0.7 K8 — read the current quota row for an
+/// `(agent_id, namespace)` tuple, auto-inserting a default row if
+/// none exists. Backs the namespace-scoped form of the
+/// `memory_quota_status` MCP tool.
+///
+/// ## v0.7.0 #1156 — per-namespace dimension
+///
+/// Callers that lack a per-namespace context (boundary layer with no
+/// `namespace` arg supplied, legacy tests) pass [`GLOBAL_NAMESPACE`]
+/// to land on the historically-shaped row.
 ///
 /// # Errors
 ///
 /// Wrapped SQL errors on read failure.
-pub fn get_status(conn: &Connection, agent_id: &str) -> Result<QuotaStatus> {
-    ensure_row(conn, agent_id)
+pub fn get_status(conn: &Connection, agent_id: &str, namespace: &str) -> Result<QuotaStatus> {
+    ensure_row(conn, agent_id, namespace)
+}
+
+/// v0.7 K8 / #1156 — read the aggregate quota row for an agent,
+/// summing every per-namespace row. Returns a synthesised
+/// [`QuotaStatus`] with `namespace = "_global"` and the *summed*
+/// daily counters + summed lifetime storage bytes; the ceiling
+/// columns report the maximum observed across every namespace row
+/// (so the surfaced numbers don't lie about the per-namespace caps).
+///
+/// When the agent has no rows at all, falls back to
+/// [`ensure_row`] against [`GLOBAL_NAMESPACE`] — the same shape
+/// pre-v50 callers expected (auto-inserts a default `_global` row).
+///
+/// Backs the namespace-omitted form of `memory_quota_status` so the
+/// pre-#1156 tool shape continues to make sense even after the
+/// per-namespace dimension lands.
+///
+/// # Errors
+///
+/// Wrapped SQL errors on read failure.
+pub fn get_aggregate_status(conn: &Connection, agent_id: &str) -> Result<QuotaStatus> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                COALESCE(MAX(max_memories_per_day), 0),
+                COALESCE(MAX(max_storage_bytes), 0),
+                COALESCE(MAX(max_links_per_day), 0),
+                COALESCE(SUM(current_memories_today), 0),
+                COALESCE(SUM(current_storage_bytes), 0),
+                COALESCE(SUM(current_links_today), 0),
+                COALESCE(MIN(day_started_at), ''),
+                COALESCE(MIN(created_at), ''),
+                COALESCE(MAX(updated_at), '')
+             FROM agent_quotas WHERE agent_id = ?1",
+        )
+        .context("failed to prepare aggregate quota query")?;
+    let row: Option<(i64, i64, i64, i64, i64, i64, String, String, String)> = stmt
+        .query_row(params![agent_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })
+        .optional()
+        .context("failed to read aggregate quota row")?;
+    drop(stmt);
+    if let Some((mm, ms, ml, cm, cs, cl, day, created, updated)) = row {
+        if !created.is_empty() {
+            return Ok(QuotaStatus {
+                agent_id: agent_id.to_string(),
+                namespace: GLOBAL_NAMESPACE.to_string(),
+                max_memories_per_day: mm,
+                max_storage_bytes: ms,
+                max_links_per_day: ml,
+                current_memories_today: cm,
+                current_storage_bytes: cs,
+                current_links_today: cl,
+                day_started_at: day,
+                created_at: created,
+                updated_at: updated,
+            });
+        }
+    }
+    // No rows at all: fall back to ensure_row at the global sentinel.
+    ensure_row(conn, agent_id, GLOBAL_NAMESPACE)
 }
 
 /// v0.7 K8 — read every quota row in the substrate. Backs the
 /// `memory_quota_status` MCP tool when the operator omits the
 /// `agent_id` parameter (operator-facing surface).
 ///
+/// ## v0.7.0 #1156 — per-namespace dimension
+///
+/// When `namespace_filter` is `Some(ns)`, only rows in that namespace
+/// are returned (drives the `?namespace=` HTTP query param + the
+/// MCP tool's optional `namespace` arg). When `None`, every row in
+/// the substrate is returned, ordered by `(agent_id ASC, namespace ASC)`
+/// for stable output across calls.
+///
 /// # Errors
 ///
 /// Wrapped SQL errors on read failure.
-pub fn list_status(conn: &Connection) -> Result<Vec<QuotaStatus>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT agent_id, max_memories_per_day, max_storage_bytes, max_links_per_day,
-                    current_memories_today, current_storage_bytes, current_links_today,
-                    day_started_at, created_at, updated_at
-             FROM agent_quotas ORDER BY agent_id ASC",
-        )
-        .context("failed to prepare quota list query")?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(QuotaStatus {
-                agent_id: r.get(0)?,
-                max_memories_per_day: r.get(1)?,
-                max_storage_bytes: r.get(2)?,
-                max_links_per_day: r.get(3)?,
-                current_memories_today: r.get(4)?,
-                current_storage_bytes: r.get(5)?,
-                current_links_today: r.get(6)?,
-                day_started_at: r.get(7)?,
-                created_at: r.get(8)?,
-                updated_at: r.get(9)?,
-            })
+pub fn list_status(conn: &Connection, namespace_filter: Option<&str>) -> Result<Vec<QuotaStatus>> {
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<QuotaStatus> {
+        Ok(QuotaStatus {
+            agent_id: r.get(0)?,
+            namespace: r.get(1)?,
+            max_memories_per_day: r.get(2)?,
+            max_storage_bytes: r.get(3)?,
+            max_links_per_day: r.get(4)?,
+            current_memories_today: r.get(5)?,
+            current_storage_bytes: r.get(6)?,
+            current_links_today: r.get(7)?,
+            day_started_at: r.get(8)?,
+            created_at: r.get(9)?,
+            updated_at: r.get(10)?,
         })
-        .context("failed to query quota rows")?;
+    };
     let mut out = Vec::new();
-    for row in rows {
-        out.push(row.context("failed to materialize quota row")?);
+    if let Some(ns) = namespace_filter {
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, namespace,
+                        max_memories_per_day, max_storage_bytes, max_links_per_day,
+                        current_memories_today, current_storage_bytes, current_links_today,
+                        day_started_at, created_at, updated_at
+                 FROM agent_quotas
+                 WHERE namespace = ?1
+                 ORDER BY agent_id ASC, namespace ASC",
+            )
+            .context("failed to prepare per-namespace quota list query")?;
+        let rows = stmt
+            .query_map(params![ns], map_row)
+            .context("failed to query per-namespace quota rows")?;
+        for row in rows {
+            out.push(row.context("failed to materialize quota row")?);
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, namespace,
+                        max_memories_per_day, max_storage_bytes, max_links_per_day,
+                        current_memories_today, current_storage_bytes, current_links_today,
+                        day_started_at, created_at, updated_at
+                 FROM agent_quotas
+                 ORDER BY agent_id ASC, namespace ASC",
+            )
+            .context("failed to prepare quota list query")?;
+        let rows = stmt
+            .query_map([], map_row)
+            .context("failed to query quota rows")?;
+        for row in rows {
+            out.push(row.context("failed to materialize quota row")?);
+        }
     }
     Ok(out)
 }
@@ -638,45 +937,71 @@ mod tests {
 
     fn fresh_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory");
-        // Apply the K8 substrate via the production migration. We
-        // can't call db::open() on `:memory:` because it sets pragmas
-        // that need a real path, so we hand-apply the substrate.
+        // Apply the K8 substrate via the production migration ladder:
+        // v28 creates the legacy single-PK table; v50 migrates it to
+        // the compound `(agent_id, namespace)` PK shape #1156 ships.
+        // Hand-apply both so unit tests see the v50 shape.
         conn.execute_batch(include_str!(
             "../migrations/sqlite/0022_v07_agent_quotas.sql"
         ))
-        .expect("apply K8 migration");
+        .expect("apply v28 K8 migration");
+        conn.execute_batch(include_str!(
+            "../migrations/sqlite/0042_v50_per_namespace_quota.sql"
+        ))
+        .expect("apply v50 per-namespace migration");
         conn
     }
 
     #[test]
     fn check_quota_under_limit_returns_ok() {
         let conn = fresh_db();
-        assert!(check_quota(&conn, "agent-a", QuotaOp::Memory { bytes: 100 }).is_ok());
+        assert!(
+            check_quota(
+                &conn,
+                "agent-a",
+                GLOBAL_NAMESPACE,
+                QuotaOp::Memory { bytes: 100 }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn check_quota_at_memory_limit_returns_quota_exceeded() {
         let conn = fresh_db();
-        // Tighten the cap to 1 so a single store-then-store sequence
-        // hits the wall.
-        conn.execute(
-            "UPDATE agent_quotas SET max_memories_per_day = 1 WHERE agent_id = ?1",
-            params!["agent-a"],
-        )
-        .ok();
-        // First call inserts the default row; tighten after.
-        check_quota(&conn, "agent-a", QuotaOp::Memory { bytes: 1 }).unwrap();
-        conn.execute(
-            "UPDATE agent_quotas SET max_memories_per_day = 1 WHERE agent_id = ?1",
-            params!["agent-a"],
+        // First call inserts the default row.
+        check_quota(
+            &conn,
+            "agent-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
         )
         .unwrap();
-        record_op(&conn, "agent-a", QuotaOp::Memory { bytes: 1 }).unwrap();
-        let err = check_quota(&conn, "agent-a", QuotaOp::Memory { bytes: 1 }).unwrap_err();
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 1
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-a", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "agent-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        let err = check_quota(
+            &conn,
+            "agent-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap_err();
         match err {
             QuotaCheckError::Quota(q) => {
                 assert_eq!(q.limit, QuotaLimit::MemoriesPerDay);
                 assert_eq!(q.max, 1);
+                assert_eq!(q.namespace, GLOBAL_NAMESPACE);
             }
             QuotaCheckError::Sql(e) => panic!("expected QuotaError, got SQL: {e}"),
         }
@@ -685,13 +1010,26 @@ mod tests {
     #[test]
     fn check_quota_storage_bytes_limit_fires() {
         let conn = fresh_db();
-        check_quota(&conn, "agent-b", QuotaOp::Memory { bytes: 1 }).unwrap();
-        conn.execute(
-            "UPDATE agent_quotas SET max_storage_bytes = 100 WHERE agent_id = ?1",
-            params!["agent-b"],
+        check_quota(
+            &conn,
+            "agent-b",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
         )
         .unwrap();
-        let err = check_quota(&conn, "agent-b", QuotaOp::Memory { bytes: 200 }).unwrap_err();
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = 100
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-b", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        let err = check_quota(
+            &conn,
+            "agent-b",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 200 },
+        )
+        .unwrap_err();
         match err {
             QuotaCheckError::Quota(q) => assert_eq!(q.limit, QuotaLimit::StorageBytes),
             QuotaCheckError::Sql(e) => panic!("expected QuotaError, got SQL: {e}"),
@@ -701,14 +1039,14 @@ mod tests {
     #[test]
     fn check_quota_links_per_day_limit_fires() {
         let conn = fresh_db();
-        check_quota(&conn, "agent-c", QuotaOp::Link).unwrap();
+        check_quota(&conn, "agent-c", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
         conn.execute(
             "UPDATE agent_quotas SET max_links_per_day = 1, current_links_today = 1
-             WHERE agent_id = ?1",
-            params!["agent-c"],
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-c", GLOBAL_NAMESPACE],
         )
         .unwrap();
-        let err = check_quota(&conn, "agent-c", QuotaOp::Link).unwrap_err();
+        let err = check_quota(&conn, "agent-c", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap_err();
         match err {
             QuotaCheckError::Quota(q) => assert_eq!(q.limit, QuotaLimit::LinksPerDay),
             QuotaCheckError::Sql(e) => panic!("expected QuotaError, got SQL: {e}"),
@@ -718,32 +1056,44 @@ mod tests {
     #[test]
     fn record_op_increments_counters() {
         let conn = fresh_db();
-        record_op(&conn, "agent-d", QuotaOp::Memory { bytes: 42 }).unwrap();
-        let s = get_status(&conn, "agent-d").unwrap();
+        record_op(
+            &conn,
+            "agent-d",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 42 },
+        )
+        .unwrap();
+        let s = get_status(&conn, "agent-d", GLOBAL_NAMESPACE).unwrap();
         assert_eq!(s.current_memories_today, 1);
         assert_eq!(s.current_storage_bytes, 42);
-        record_op(&conn, "agent-d", QuotaOp::Link).unwrap();
-        let s2 = get_status(&conn, "agent-d").unwrap();
+        record_op(&conn, "agent-d", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        let s2 = get_status(&conn, "agent-d", GLOBAL_NAMESPACE).unwrap();
         assert_eq!(s2.current_links_today, 1);
     }
 
     #[test]
     fn reset_daily_zeros_stale_rows_only() {
         let conn = fresh_db();
-        record_op(&conn, "agent-e", QuotaOp::Memory { bytes: 10 }).unwrap();
-        record_op(&conn, "agent-f", QuotaOp::Link).unwrap();
+        record_op(
+            &conn,
+            "agent-e",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 10 },
+        )
+        .unwrap();
+        record_op(&conn, "agent-f", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
         // Roll agent-e's day_started_at back to yesterday.
         conn.execute(
             "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00'
-             WHERE agent_id = ?1",
-            params!["agent-e"],
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-e", GLOBAL_NAMESPACE],
         )
         .unwrap();
         let n = reset_daily(&conn).unwrap();
         assert_eq!(n, 1, "exactly one stale row should be reset");
-        let s_e = get_status(&conn, "agent-e").unwrap();
+        let s_e = get_status(&conn, "agent-e", GLOBAL_NAMESPACE).unwrap();
         assert_eq!(s_e.current_memories_today, 0);
-        let s_f = get_status(&conn, "agent-f").unwrap();
+        let s_f = get_status(&conn, "agent-f", GLOBAL_NAMESPACE).unwrap();
         assert_eq!(
             s_f.current_links_today, 1,
             "fresh row must not be touched by the daily reset"
@@ -755,10 +1105,28 @@ mod tests {
     #[test]
     fn list_status_returns_all_rows_sorted() {
         let conn = fresh_db();
-        record_op(&conn, "z-agent", QuotaOp::Memory { bytes: 1 }).unwrap();
-        record_op(&conn, "a-agent", QuotaOp::Memory { bytes: 1 }).unwrap();
-        record_op(&conn, "m-agent", QuotaOp::Memory { bytes: 1 }).unwrap();
-        let rows = list_status(&conn).unwrap();
+        record_op(
+            &conn,
+            "z-agent",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "a-agent",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "m-agent",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        let rows = list_status(&conn, None).unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["a-agent", "m-agent", "z-agent"]);
     }
@@ -766,10 +1134,636 @@ mod tests {
     #[test]
     fn get_status_auto_inserts_default_row() {
         let conn = fresh_db();
-        let s = get_status(&conn, "fresh-agent").unwrap();
+        let s = get_status(&conn, "fresh-agent", GLOBAL_NAMESPACE).unwrap();
         assert_eq!(s.max_memories_per_day, DEFAULT_MAX_MEMORIES_PER_DAY);
         assert_eq!(s.max_storage_bytes, DEFAULT_MAX_STORAGE_BYTES);
         assert_eq!(s.max_links_per_day, DEFAULT_MAX_LINKS_PER_DAY);
         assert_eq!(s.current_memories_today, 0);
+        assert_eq!(s.namespace, GLOBAL_NAMESPACE);
+    }
+
+    #[test]
+    fn quota_limit_as_str_returns_expected_canonical_form() {
+        assert_eq!(QuotaLimit::MemoriesPerDay.as_str(), "memories_per_day");
+        assert_eq!(QuotaLimit::StorageBytes.as_str(), "storage_bytes");
+        assert_eq!(QuotaLimit::LinksPerDay.as_str(), "links_per_day");
+    }
+
+    #[test]
+    fn quota_error_display_format_contract() {
+        let err = QuotaError {
+            agent_id: "alice".to_string(),
+            namespace: "team/policies".to_string(),
+            limit: QuotaLimit::StorageBytes,
+            current: 1024,
+            max: 2048,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("QUOTA_EXCEEDED"));
+        assert!(s.contains("alice"));
+        assert!(s.contains("team/policies"));
+        assert!(s.contains("storage_bytes"));
+        assert!(s.contains("current=1024"));
+        assert!(s.contains("max=2048"));
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn quota_check_error_display_quota_variant_delegates_to_inner() {
+        let err = QuotaCheckError::Quota(QuotaError {
+            agent_id: "bob".to_string(),
+            namespace: GLOBAL_NAMESPACE.to_string(),
+            limit: QuotaLimit::MemoriesPerDay,
+            current: 99,
+            max: 100,
+        });
+        let s = format!("{err}");
+        assert!(s.contains("QUOTA_EXCEEDED"));
+        assert!(s.contains("memories_per_day"));
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn quota_check_error_display_sql_variant_wraps_substrate_error() {
+        let err = QuotaCheckError::Sql(anyhow::anyhow!("boom"));
+        let s = format!("{err}");
+        assert!(s.contains("quota check substrate error"));
+        assert!(s.contains("boom"));
+    }
+
+    #[test]
+    fn check_and_record_under_limit_increments_counters() {
+        let conn = fresh_db();
+        check_and_record(
+            &conn,
+            "agent-cr-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 50 },
+        )
+        .unwrap();
+        let s = get_status(&conn, "agent-cr-a", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 1);
+        assert_eq!(s.current_storage_bytes, 50);
+        check_and_record(&conn, "agent-cr-a", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        let s2 = get_status(&conn, "agent-cr-a", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s2.current_links_today, 1);
+    }
+
+    #[test]
+    fn check_and_record_at_memories_limit_returns_quota_error_and_rolls_back() {
+        let conn = fresh_db();
+        check_and_record(
+            &conn,
+            "agent-cr-b",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        // Tighten the cap so the next write would exceed.
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 1
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-cr-b", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        let err = check_and_record(
+            &conn,
+            "agent-cr-b",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap_err();
+        match err {
+            QuotaCheckError::Quota(q) => {
+                assert_eq!(q.limit, QuotaLimit::MemoriesPerDay);
+            }
+            QuotaCheckError::Sql(e) => panic!("expected Quota, got SQL: {e}"),
+        }
+        // Counter NOT incremented (rollback).
+        let s = get_status(&conn, "agent-cr-b", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 1);
+    }
+
+    #[test]
+    fn check_and_record_storage_limit_returns_quota_error() {
+        let conn = fresh_db();
+        check_and_record(
+            &conn,
+            "agent-cr-c",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = 100
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-cr-c", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        let err = check_and_record(
+            &conn,
+            "agent-cr-c",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1000 },
+        )
+        .expect_err("storage cap should fire");
+        match err {
+            QuotaCheckError::Quota(q) => assert_eq!(q.limit, QuotaLimit::StorageBytes),
+            QuotaCheckError::Sql(e) => panic!("expected quota, got SQL: {e}"),
+        }
+    }
+
+    #[test]
+    fn check_and_record_links_limit_returns_quota_error() {
+        let conn = fresh_db();
+        check_and_record(&conn, "agent-cr-d", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET max_links_per_day = 1
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-cr-d", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        let err = check_and_record(&conn, "agent-cr-d", GLOBAL_NAMESPACE, QuotaOp::Link)
+            .expect_err("links cap should fire");
+        match err {
+            QuotaCheckError::Quota(q) => assert_eq!(q.limit, QuotaLimit::LinksPerDay),
+            QuotaCheckError::Sql(e) => panic!("expected quota, got SQL: {e}"),
+        }
+    }
+
+    #[test]
+    fn check_and_record_day_roll_branch_for_memory_zeros_daily_counters() {
+        let conn = fresh_db();
+        check_and_record(
+            &conn,
+            "agent-cr-e",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 10 },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00',
+                current_memories_today = 999, current_links_today = 7
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-cr-e", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        check_and_record(
+            &conn,
+            "agent-cr-e",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 5 },
+        )
+        .unwrap();
+        let s = get_status(&conn, "agent-cr-e", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 1);
+        assert_eq!(s.current_links_today, 0);
+        assert_eq!(s.current_storage_bytes, 15);
+    }
+
+    #[test]
+    fn check_and_record_day_roll_branch_for_link_resets_daily_counters() {
+        let conn = fresh_db();
+        check_and_record(&conn, "agent-cr-f", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00',
+                current_memories_today = 50, current_links_today = 8
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-cr-f", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        check_and_record(&conn, "agent-cr-f", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        let s = get_status(&conn, "agent-cr-f", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 0);
+        assert_eq!(s.current_links_today, 1);
+    }
+
+    #[test]
+    fn refund_op_memory_decrements_counters_saturating_to_zero() {
+        let conn = fresh_db();
+        check_and_record(
+            &conn,
+            "agent-rf-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 200 },
+        )
+        .unwrap();
+        refund_op(
+            &conn,
+            "agent-rf-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 200 },
+        )
+        .unwrap();
+        let s = get_status(&conn, "agent-rf-a", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 0);
+        assert_eq!(s.current_storage_bytes, 0);
+        refund_op(
+            &conn,
+            "agent-rf-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 200 },
+        )
+        .unwrap();
+        let s2 = get_status(&conn, "agent-rf-a", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s2.current_memories_today, 0);
+        assert_eq!(s2.current_storage_bytes, 0);
+    }
+
+    #[test]
+    fn refund_op_link_decrements_counter_saturating_to_zero() {
+        let conn = fresh_db();
+        check_and_record(&conn, "agent-rf-b", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        refund_op(&conn, "agent-rf-b", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        let s = get_status(&conn, "agent-rf-b", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_links_today, 0);
+        refund_op(&conn, "agent-rf-b", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        let s2 = get_status(&conn, "agent-rf-b", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s2.current_links_today, 0);
+    }
+
+    #[test]
+    fn record_op_day_roll_branch_for_memory() {
+        let conn = fresh_db();
+        record_op(
+            &conn,
+            "agent-ro-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 100 },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00',
+                current_memories_today = 50, current_links_today = 4
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-ro-a", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "agent-ro-a",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 5 },
+        )
+        .unwrap();
+        let s = get_status(&conn, "agent-ro-a", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 1);
+        assert_eq!(s.current_links_today, 0);
+        assert_eq!(s.current_storage_bytes, 105);
+    }
+
+    #[test]
+    fn record_op_day_roll_branch_for_link() {
+        let conn = fresh_db();
+        record_op(&conn, "agent-ro-b", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00',
+                current_memories_today = 7, current_links_today = 9
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-ro-b", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        record_op(&conn, "agent-ro-b", GLOBAL_NAMESPACE, QuotaOp::Link).unwrap();
+        let s = get_status(&conn, "agent-ro-b", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.current_memories_today, 0);
+        assert_eq!(s.current_links_today, 1);
+    }
+
+    #[test]
+    fn quota_status_serde_roundtrip_carries_namespace() {
+        let conn = fresh_db();
+        let s = get_status(&conn, "ser-agent", "team/policies").unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: QuotaStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent_id, "ser-agent");
+        assert_eq!(parsed.namespace, "team/policies");
+        assert_eq!(parsed.max_memories_per_day, DEFAULT_MAX_MEMORIES_PER_DAY);
+    }
+
+    #[test]
+    fn check_quota_day_roll_branch_treats_daily_as_zero() {
+        let conn = fresh_db();
+        check_quota(
+            &conn,
+            "agent-cq-roll",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET day_started_at = '2020-01-01T00:00:00+00:00',
+                current_memories_today = 99999, current_links_today = 99999
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-cq-roll", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        assert!(
+            check_quota(
+                &conn,
+                "agent-cq-roll",
+                GLOBAL_NAMESPACE,
+                QuotaOp::Memory { bytes: 1 }
+            )
+            .is_ok()
+        );
+        assert!(check_quota(&conn, "agent-cq-roll", GLOBAL_NAMESPACE, QuotaOp::Link).is_ok());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.7.0 #1156 — per-namespace dimension regression tests
+    // ─────────────────────────────────────────────────────────────────
+
+    /// #1156 — quota counters MUST stay isolated across namespaces.
+    /// An agent that hits their memories/day cap in namespace A still
+    /// has full headroom in namespace B.
+    #[test]
+    fn per_namespace_isolation_memories() {
+        let conn = fresh_db();
+        // Auto-insert default rows in two namespaces.
+        check_and_record(
+            &conn,
+            "agent-ns",
+            "alice/scratch",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        check_and_record(
+            &conn,
+            "agent-ns",
+            "team/policies",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        // Tighten ONLY the alice/scratch row.
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 1
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-ns", "alice/scratch"],
+        )
+        .unwrap();
+        // Second write to alice/scratch trips the cap.
+        let err = check_and_record(
+            &conn,
+            "agent-ns",
+            "alice/scratch",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap_err();
+        match err {
+            QuotaCheckError::Quota(q) => {
+                assert_eq!(q.namespace, "alice/scratch");
+                assert_eq!(q.limit, QuotaLimit::MemoriesPerDay);
+            }
+            QuotaCheckError::Sql(e) => panic!("expected Quota, got SQL: {e}"),
+        }
+        // But team/policies still has headroom: writes succeed.
+        check_and_record(
+            &conn,
+            "agent-ns",
+            "team/policies",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+    }
+
+    /// #1156 — storage cap is per-namespace too. Bytes recorded in
+    /// namespace A do not consume the cap of namespace B.
+    #[test]
+    fn per_namespace_isolation_storage_bytes() {
+        let conn = fresh_db();
+        check_and_record(
+            &conn,
+            "agent-ns2",
+            "alice/scratch",
+            QuotaOp::Memory { bytes: 50 },
+        )
+        .unwrap();
+        // Tighten alice/scratch storage cap to 100 bytes.
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = 100
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-ns2", "alice/scratch"],
+        )
+        .unwrap();
+        // A 60-byte write in alice/scratch trips storage cap.
+        let err = check_and_record(
+            &conn,
+            "agent-ns2",
+            "alice/scratch",
+            QuotaOp::Memory { bytes: 60 },
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuotaCheckError::Quota(q) if q.limit == QuotaLimit::StorageBytes));
+        // Same 60-byte write in shared/team-a goes through (independent
+        // accounting row, 100 MiB default cap).
+        check_and_record(
+            &conn,
+            "agent-ns2",
+            "shared/team-a",
+            QuotaOp::Memory { bytes: 60 },
+        )
+        .unwrap();
+    }
+
+    /// #1156 — per-namespace links/day isolation.
+    #[test]
+    fn per_namespace_isolation_links() {
+        let conn = fresh_db();
+        check_and_record(&conn, "agent-ns3", "alice/scratch", QuotaOp::Link).unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET max_links_per_day = 1
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-ns3", "alice/scratch"],
+        )
+        .unwrap();
+        let err = check_and_record(&conn, "agent-ns3", "alice/scratch", QuotaOp::Link)
+            .expect_err("links cap on alice/scratch should fire");
+        assert!(matches!(err, QuotaCheckError::Quota(q) if q.limit == QuotaLimit::LinksPerDay));
+        // Different namespace still has headroom.
+        check_and_record(&conn, "agent-ns3", "team/policies", QuotaOp::Link).unwrap();
+    }
+
+    /// #1156 — `get_aggregate_status` sums counters across every
+    /// namespace row for an agent.
+    #[test]
+    fn aggregate_status_sums_across_namespaces() {
+        let conn = fresh_db();
+        record_op(
+            &conn,
+            "agent-agg",
+            "alice/scratch",
+            QuotaOp::Memory { bytes: 100 },
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "agent-agg",
+            "team/policies",
+            QuotaOp::Memory { bytes: 200 },
+        )
+        .unwrap();
+        record_op(&conn, "agent-agg", "alice/scratch", QuotaOp::Link).unwrap();
+        record_op(&conn, "agent-agg", "team/policies", QuotaOp::Link).unwrap();
+        record_op(&conn, "agent-agg", "team/policies", QuotaOp::Link).unwrap();
+
+        let agg = get_aggregate_status(&conn, "agent-agg").unwrap();
+        assert_eq!(agg.agent_id, "agent-agg");
+        assert_eq!(agg.namespace, GLOBAL_NAMESPACE);
+        // Two memory ops in two namespaces.
+        assert_eq!(agg.current_memories_today, 2);
+        // 100 + 200 bytes.
+        assert_eq!(agg.current_storage_bytes, 300);
+        // 1 + 2 links.
+        assert_eq!(agg.current_links_today, 3);
+    }
+
+    /// #1156 — `list_status(None)` returns every row across every
+    /// namespace, sorted by (agent_id ASC, namespace ASC).
+    #[test]
+    fn list_status_returns_per_namespace_rows_sorted() {
+        let conn = fresh_db();
+        record_op(&conn, "agent-ls", "z-ns", QuotaOp::Memory { bytes: 1 }).unwrap();
+        record_op(&conn, "agent-ls", "a-ns", QuotaOp::Memory { bytes: 1 }).unwrap();
+        let rows = list_status(&conn, None).unwrap();
+        // Should have 2 rows, both for agent-ls.
+        let agent_ls_rows: Vec<&QuotaStatus> =
+            rows.iter().filter(|r| r.agent_id == "agent-ls").collect();
+        assert_eq!(agent_ls_rows.len(), 2);
+        // Namespaces are sorted ascending: a-ns before z-ns.
+        assert_eq!(agent_ls_rows[0].namespace, "a-ns");
+        assert_eq!(agent_ls_rows[1].namespace, "z-ns");
+    }
+
+    /// #1156 — `list_status(Some(ns))` filters down to one namespace.
+    #[test]
+    fn list_status_namespace_filter() {
+        let conn = fresh_db();
+        record_op(
+            &conn,
+            "agent-lf",
+            "team/policies",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "agent-lf",
+            "alice/scratch",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        record_op(
+            &conn,
+            "other-agent",
+            "team/policies",
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+        let rows = list_status(&conn, Some("team/policies")).unwrap();
+        for r in &rows {
+            assert_eq!(r.namespace, "team/policies");
+        }
+        // Two agents wrote in team/policies — both must appear.
+        let agent_ids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.agent_id.as_str()).collect();
+        assert!(agent_ids.contains("agent-lf"));
+        assert!(agent_ids.contains("other-agent"));
+    }
+
+    /// #1156 — sentinel namespace `_global` is the backwards-compat
+    /// landing zone. Pre-v50 callers (who pass `_global`) see the
+    /// historically-shaped accounting row.
+    #[test]
+    fn global_sentinel_is_backwards_compat_landing_zone() {
+        let conn = fresh_db();
+        record_op(
+            &conn,
+            "agent-bc",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 42 },
+        )
+        .unwrap();
+        let s = get_status(&conn, "agent-bc", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s.namespace, GLOBAL_NAMESPACE);
+        assert_eq!(s.current_memories_today, 1);
+        assert_eq!(s.current_storage_bytes, 42);
+    }
+
+    /// #1256 (LOW, 2026-05-25) — regression: a synthetic `i64::MAX`
+    /// storage-bytes input must NOT wrap to a negative under
+    /// unchecked `+` and bypass the `> max_storage_bytes` cap check.
+    /// Pre-#1256 `row.current_storage_bytes + bytes` was a plain `+`;
+    /// with `current_storage_bytes = 1` and `bytes = i64::MAX`,
+    /// the sum overflows to `i64::MIN` (a large negative number),
+    /// which is `< max_storage_bytes` (any positive integer), so the
+    /// cap check incorrectly passed and the quota system silently
+    /// accepted the over-cap write.
+    ///
+    /// With `saturating_add` the sum clamps at `i64::MAX`, which is
+    /// unambiguously `>` the bounded `max_storage_bytes` ceiling
+    /// (defaults to 100 MB) so the cap check refuses the write.
+    #[test]
+    fn issue_1256_i64_max_input_does_not_wrap_under_saturating_add() {
+        let conn = fresh_db();
+        // Bootstrap: store a small memory under one agent so the row
+        // exists with sane defaults. The default
+        // `max_storage_bytes` = 100 MB is fine — `i64::MAX` is way
+        // above that.
+        check_quota(
+            &conn,
+            "agent-1256",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .expect("seed call must pass");
+        record_op(
+            &conn,
+            "agent-1256",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: 1 },
+        )
+        .unwrap();
+
+        // Adversarial input: `bytes = i64::MAX`. Pre-#1256 the
+        // unchecked `+` overflows the i64 cap to a negative,
+        // bypassing the comparison. Post-#1256 `saturating_add`
+        // clamps at i64::MAX > max_storage_bytes so the check refuses.
+        let err = check_quota(
+            &conn,
+            "agent-1256",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: i64::MAX },
+        )
+        .expect_err("i64::MAX bytes input MUST be refused (post-#1256 saturating_add)");
+        match err {
+            QuotaCheckError::Quota(q) => {
+                assert_eq!(
+                    q.limit,
+                    QuotaLimit::StorageBytes,
+                    "#1256: the storage-bytes cap must fire on the saturated sum, \
+                     not any other limit"
+                );
+                assert_eq!(q.agent_id, "agent-1256");
+            }
+            QuotaCheckError::Sql(e) => {
+                panic!("#1256: expected QuotaError::StorageBytes, got SQL: {e}")
+            }
+        }
+
+        // Repeat for the atomic `check_and_record` arm — same i64::MAX
+        // input, same saturating-add safety net.
+        let err = check_and_record(
+            &conn,
+            "agent-1256-atomic",
+            GLOBAL_NAMESPACE,
+            QuotaOp::Memory { bytes: i64::MAX },
+        )
+        .expect_err("check_and_record must also refuse i64::MAX bytes (post-#1256)");
+        match err {
+            QuotaCheckError::Quota(q) => {
+                assert_eq!(q.limit, QuotaLimit::StorageBytes);
+            }
+            QuotaCheckError::Sql(e) => panic!("#1256: expected QuotaError, got SQL: {e}"),
+        }
     }
 }

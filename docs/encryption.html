@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Encryption — at-rest, in-transit, integrity</title>
-<meta name="description" content="ai-memory v0.6.3.1 cryptographic surface. SQLCipher at-rest (PRAGMA key), mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, signed git tags + SBOM, v0.7 Ed25519 attested identity roadmap.">
+<meta name="description" content="ai-memory v0.7.0 cryptographic surface. SQLCipher at-rest (PRAGMA key), mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, signed git tags + SBOM, v0.7 Ed25519 attested identity roadmap.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/encryption.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -90,6 +90,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -99,11 +110,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Encryption</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -126,6 +140,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -137,6 +152,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -146,35 +164,103 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>Encryption — at rest, in transit, integrity, supply chain.</h1>
-  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 at rest. mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. Signed git tags + SBOM for supply chain. <strong>What's covered, what isn't, and what's coming in v0.7.</strong></p>
+  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 at rest. mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. Signed git tags + SBOM for supply chain. <strong>What's covered, what isn't, and what v0.7.0 added (Ed25519 attested identity).</strong></p>
   <div class="pills">
     <span class="pill">SQLCipher at-rest</span>
     <span class="pill">mTLS federation</span>
     <span class="pill">HMAC-SHA256 webhooks</span>
     <span class="pill">signed tags + SBOM</span>
-    <span class="pill">v0.7: Ed25519 attested</span>
+    <span class="pill">Ed25519 attested (v0.7.0)</span>
   </div>
 </section>
 
@@ -219,13 +305,15 @@ footer a{color:var(--text-muted)}
     <div class="feature rest">
       <div class="feature-head"><span class="feature-name">PRAGMA key</span><span class="feature-tag live">live since v0.5</span></div>
       <div class="feature-desc">When the daemon opens an encrypted DB, it issues <code>PRAGMA key = '…'</code> with the operator's passphrase. SQLCipher's libsqlcipher (drop-in libsqlite3 replacement) handles AES-256-CBC of every page + PBKDF2-HMAC-SHA512 key derivation. A wrong key → loud error at startup.</div>
-      <div class="snip"><span class="cm">// from src/db.rs::open</span>
-<span class="key">conn</span>.execute_batch(<span class="val">"PRAGMA key = 'YOUR_PASSPHRASE'"</span>)
+      <div class="snip"><span class="cm">// from src/storage/connection.rs (sqlcipher build)</span>
+<span class="key">conn</span>.execute_batch(<span class="val">"PRAGMA key = '…'"</span>)
     .context(<span class="val">"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</span>)?;
 
-<span class="cm">// Operator workflow</span>
-<span class="ok">$</span> export AI_MEMORY_DB_KEY=<span class="val">"$(cat /run/secrets/db-key)"</span>
-<span class="ok">$</span> ai-memory serve --db /var/lib/ai-memory/data.sqlite
+<span class="cm">// Operator workflow — pass the passphrase by FILE (mode 0400), not env:
+// the CLI reads it once and exports AI_MEMORY_DB_PASSPHRASE for the process.</span>
+<span class="ok">$</span> chmod 0400 /run/secrets/db-passphrase
+<span class="ok">$</span> ai-memory --db-passphrase-file /run/secrets/db-passphrase \
+    serve --db /var/lib/ai-memory/data.sqlite
 
 <span class="cm">// On the wire — encrypted database file is opaque to anyone without the key.
 // Even page headers are encrypted; the file looks like noise to a forensic
@@ -269,7 +357,7 @@ sha256:111222…aaa888    <span class="cm"># node-3 backup</span>
       <div class="feature-desc">Outbound webhook URLs pass through two SSRF guards before any HTTP attempt: a URL guard (rejects non-http/https schemes, file://, data:) and a DNS guard (resolves the host, rejects loopback / RFC1918 / link-local addresses). Two SSRF defects were closed in commit <code>9eeb453</code> for v0.6.3 final.</div>
     </div>
 
-    <div class="honest"><strong>Honest assessment — what mTLS does and doesn't do</strong><p>mTLS authenticates the <em>peer node</em>, not the <em>memory author</em>. Once a peer is allowlisted, every memory it pushes is trusted. v0.7 Bucket 1 (Ed25519 attested identity) closes that gap by attaching a per-memory signature so individual memories' provenance is verifiable independent of which peer relayed them.</p></div>
+    <div class="honest"><strong>Honest assessment — what mTLS does and doesn't do</strong><p>mTLS authenticates the <em>peer node</em>, not the <em>memory author</em>. Once a peer is allowlisted, every memory it pushes is trusted at the node level. v0.7.0 (#791/#922) adds envelope-level Ed25519 push signatures + nonce anti-replay (<code>AI_MEMORY_FED_REQUIRE_SIG=1</code> / <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> secure defaults), and #626 Layer-3 verifies caller-presented per-memory signatures on the store surfaces; per-row signature verification across federation relay remains v0.8 hardening (#1464).</p></div>
   </div>
 </section>
 
@@ -285,7 +373,7 @@ sha256:111222…aaa888    <span class="cm"># node-3 backup</span>
 {
   <span class="key">"url"</span>:    <span class="val">"https://hooks.example.com/ai-memory"</span>,
   <span class="key">"secret"</span>: <span class="val">"…32+ random bytes…"</span>,            <span class="cm">// HMAC key (operator-supplied)</span>
-  <span class="key">"events"</span>: [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>]
+  <span class="key">"event_types"</span>: [<span class="val">"memory_store"</span>, <span class="val">"memory_promote"</span>]   <span class="cm">// #912 typed array; legacy `events` comma-list still parses</span>
 }
 
 <span class="cm">// Outbound POST to the webhook URL</span>
@@ -340,18 +428,18 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 
 <section>
   <div class="container">
-    <span class="eyebrow">v0.7 roadmap</span>
+    <span class="eyebrow">Shipped at v0.7.0</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Per-memory cryptographic identity.</h2>
-    <p class="lede">v0.6.3 ships a placeholder <code>signature</code> column on <code>memory_links</code> + a deferred <code>observed_by</code> column. v0.7 Bucket 1 fills that contract.</p>
+    <p class="lede">v0.6.3 shipped a placeholder <code>signature</code> column on <code>memory_links</code> + a deferred <code>observed_by</code> column. v0.7.0 fills that contract.</p>
 
     <div class="feature future">
-      <div class="feature-head"><span class="feature-name">Ed25519 attested identity</span><span class="feature-tag future">v0.7 Bucket 1</span></div>
-      <div class="feature-desc">Each agent gets an Ed25519 keypair. Every memory write attaches a signature over the canonical row (id + content hash + timestamp). Receivers verify the signature before accepting the memory. Cross-peer provenance becomes verifiable end-to-end — not "this peer says X authored this" but "we have a cryptographic proof X authored this."</div>
+      <div class="feature-head"><span class="feature-name">Ed25519 attested identity</span><span class="feature-tag live">SHIPPED · v0.7.0 (#626 Layer-3)</span></div>
+      <div class="feature-desc">Agents hold Ed25519 keypairs. A caller can attach a detached signature over the canonical <code>SignableWrite</code> envelope on every store surface; the daemon verifies it against the agent's bound public key and stamps <code>attest_level = "agent_attested"</code> (forged → 403). Links carry per-link signatures + <code>attest_level</code> + <code>signed_at</code>. Unsigned writes stay permitted (landing <code>claimed</code>) unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code>.</div>
     </div>
 
     <div class="feature future">
-      <div class="feature-head"><span class="feature-name">Sidechain transcripts</span><span class="feature-tag future">v0.7 Bucket 1.7</span></div>
-      <div class="feature-desc">Every governed action lands a row in a transcript table with the full payload + verdict + signature. Independent of the daemon log, queryable, and tamper-evident (each transcript row signs the previous row's hash, forming a chain).</div>
+      <div class="feature-head"><span class="feature-name">Sidechain transcripts + signed-events chain</span><span class="feature-tag live">SHIPPED · v0.7.0</span></div>
+      <div class="feature-desc">Governed actions land rows in the append-only <code>signed_events</code> audit chain with the V-4 cross-row hash chain — independent of the daemon log, queryable (<code>memory_replay</code>), and tamper-evident (each row chains the previous row's hash).</div>
     </div>
 
     <div class="feature future">
@@ -375,7 +463,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · crypto modules: <code>db.rs</code> (SQLCipher) · <code>federation.rs</code> (rustls) · <code>subscriptions.rs</code> (HMAC-SHA256) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · crypto modules: <code>src/storage/connection.rs</code> (SQLCipher) · <code>src/federation/</code> (rustls) · <code>src/subscriptions.rs</code> (HMAC-SHA256) · <code>src/identity/</code> (Ed25519) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="release-pipeline.html">Release pipeline</a> · <a href="memory-rules.html">Memory rules</a></p>
 </footer>
 

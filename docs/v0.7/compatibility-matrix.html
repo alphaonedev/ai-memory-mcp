@@ -112,7 +112,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
 
 <section class="hero">
   <div class="container">
-    <span class="badge">v0.7.0 &middot; attested-cortex &middot; in progress</span>
+    <span class="badge">v0.7.0 &middot; attested-cortex &middot; release</span>
     <h1>v0.7 Compatibility Matrix</h1>
     <p class="subtitle">
       Which AI harnesses support which v0.7 attested-cortex features &mdash; today,
@@ -122,8 +122,8 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
     <div class="meta">
       <span>9 harnesses</span>
       <span>8 v0.7 features</span>
-      <span>schema v20 &rarr; v22</span>
-      <span>updated 2026-05-05</span>
+      <span>schema v33 &rarr; v55</span>
+      <span>updated 2026-06-10</span>
     </div>
     <div class="cta-row">
       <a class="solid" href="V0.7-EPIC.md">📐 V0.7 EPIC</a>
@@ -315,20 +315,19 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
       </div>
 
       <div class="card amber">
-        <span class="tag">B1 &middot; lands later in v0.7.x</span>
+        <span class="tag">B1 &middot; shipped in v0.7.0</span>
         <h3><code>memory_load_family</code></h3>
         <p>Named loader tool that takes a family identifier (e.g. <code>"governance"</code>,
         <code>"knowledge_graph"</code>) and registers that family&rsquo;s tools into the live MCP
         session. Replaces the v0.6.4 paradigm of
         <code>memory_capabilities(family=&hellip;, include_schema=true)</code> as the canonical
-        runtime-expansion path. Most cells today are <strong>🚧 in progress</strong> because B1
-        is mid-track in v0.7.x.</p>
+        runtime-expansion path. Ships in the default <code>core</code> profile at v0.7.0.</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
         <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track B</a></p>
       </div>
 
       <div class="card violet">
-        <span class="tag">B2 &middot; lands later in v0.7.x</span>
+        <span class="tag">B2 &middot; shipped in v0.7.0</span>
         <h3><code>memory_smart_load</code></h3>
         <p>Natural-language loader that takes an <code>intent</code> string
         (e.g. <code>"I need to write a permission policy"</code>) and infers which families to
@@ -394,12 +393,13 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
       </div>
 
       <div class="card green">
-        <span class="tag">K10 &middot; lands later in v0.7.x</span>
+        <span class="tag">K10 &middot; API shipped in v0.7.0</span>
         <h3>Approval API</h3>
-        <p>HTTP + SSE + MCP surfaces for human-in-the-loop approvals, with HMAC mandatory and
-        <code>remember=forever</code> persistence. Wraps the K9 permission-decision contract
-        plus the G4 hook <code>AskUser</code> decision shape. Most harness cells show
-        <strong>🚧 in progress</strong> &mdash; harness UX integration is per-harness work
+        <p>HTTP + SSE + MCP surfaces for human-in-the-loop approvals
+        (<code>memory_pending_list</code> / <code>memory_pending_approve</code> /
+        <code>memory_pending_reject</code>), with HMAC-mandatory webhooks. Wraps the K9
+        permission-decision contract plus the G4 hook <code>AskUser</code> decision shape.
+        Harness UX integration remains per-harness work
         (the API is universal but the UX shell varies).</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
         <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track K10</a></p>
@@ -478,7 +478,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         <ul class="checked">
           <li>R4 &mdash; Curator CLI surface (wraps Pillar 2.5 + Bucket 0 hooks)</li>
           <li>R6 &mdash; Consensus memory truth-determination (CRDT LWW-Register tiebreak)</li>
-          <li>End-to-end memory encryption (X25519 + ChaCha20-Poly1305) &mdash; #228</li>
+          <li>End-to-end memory encryption (X25519 + ChaCha20-Poly1305) &mdash; #228 &mdash; <strong>pulled forward: landed in v0.7.0</strong> at schema v44 (<code>encrypted_envelope</code> column)</li>
           <li>Typed cognition (Goal / Plan / Step / Observation / Decision)</li>
           <li>Six-stage compaction pipeline + distributed task queue</li>
         </ul>

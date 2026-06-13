@@ -94,6 +94,18 @@ table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid 
 table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
 table td{color:var(--text-muted)}
 table tr:last-child td{border-bottom:none}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -103,11 +115,14 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T2</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -130,6 +145,7 @@ table tr:last-child td{border-bottom:none}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -141,6 +157,9 @@ table tr:last-child td{border-bottom:none}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -150,28 +169,96 @@ table tr:last-child td{border-bottom:none}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v0.6.3</span>
+  <span class="cap-badge cap-today">SHIPS TODAY · v0.7.0</span>
   <h1>Tier 2 — Single node, many agents</h1>
   <p class="tagline">The first <strong>multi-tenant</strong> tier. One ai-memory process, but a swarm of agents — typically 10 concurrent — each writing into its own namespace, recalling with scope visibility filters, and gated by per-namespace governance with a pending-approval queue.</p>
   <div class="pills">
@@ -273,7 +360,7 @@ table tr:last-child td{border-bottom:none}
           <text x="672" y="266" text-anchor="middle" class="sub-label">as_agent param</text>
           <text x="672" y="284" text-anchor="middle" class="sub-label">FTS5 + HNSW</text>
           <text x="672" y="300" text-anchor="middle" class="sub-label">touch + promote</text>
-          <text x="672" y="318" text-anchor="middle" class="sub-label">v0.6.3 KG layer</text>
+          <text x="672" y="318" text-anchor="middle" class="sub-label">v0.6.3 KG layer (extended at v0.7.0 — Apache AGE backend + Ed25519 attestation)</text>
         </g>
 
         <!-- SQLITE -->
@@ -364,37 +451,38 @@ table tr:last-child td{border-bottom:none}
 
     <h3>Namespace isolation</h3>
     <p>Every agent has a namespace position — typically <code>agents/&lt;role&gt;</code> or <code>org/team/role</code>. Memories are written with that namespace, and the indexed <code>scope_idx</code> generated column captures the agent's visibility scope (<code>private</code> / <code>team</code> / <code>unit</code> / <code>org</code> / <code>collective</code>).</p>
-    <p>When agent <code>agents/planner</code> calls <code>memory_recall</code> and passes <code>as_agent=agents/planner</code>, <code>compute_visibility_prefixes()</code> (<code>src/db.rs:26-38</code>) walks the namespace ancestors and returns <code>[agents/planner, agents/, '']</code>. The recall SQL then <code>WHERE</code>s on <code>scope_idx IN (...)</code> — the planner sees its own private memories plus anything scoped <code>team</code> or <code>collective</code> that an ancestor namespace publishes.</p>
+    <p>When agent <code>agents/planner</code> calls <code>memory_recall</code> and passes <code>as_agent=agents/planner</code>, <code>compute_visibility_prefixes()</code> (<code>src/storage/mod.rs</code>) walks the namespace ancestors and returns <code>[agents/planner, agents/, '']</code>. The recall SQL then <code>WHERE</code>s on <code>scope_idx IN (...)</code> — the planner sees its own private memories plus anything scoped <code>team</code> or <code>collective</code> that an ancestor namespace publishes.</p>
     <p>This is the same machinery T1 has — but at T2 it's actually doing work.</p>
 
     <h3>Per-namespace governance</h3>
     <p>Set a policy with <code>memory_namespace_set_standard</code>:</p>
-<pre><code>ai-memory namespace set-standard agents/secops --governance '{
-  "write": "approve",
-  "promote": "owner",
-  "delete": "approve"
-}'</code></pre>
-    <p>Now any agent writing into <code>agents/secops</code> triggers <code>governance::check()</code> which returns <code>Pending(action_id)</code>. The write isn't committed — it's parked in <code>pending_actions</code>. The owning operator (or a designated approver agent) calls <code>memory_pending_list</code>, inspects the diff, and either <code>memory_pending_approve</code> or <code>memory_pending_reject</code>. Approved writes get committed; rejected ones are dropped with an audit row.</p>
+<pre><code># 1. store the standard memory that carries the policy, capture its id
+ai-memory --json store -T "secops namespace standard" -c "write gating" -n agents/secops
+# 2. bind it — the JSON merges into the standard's metadata.governance
+ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-memory-uuid&gt; \
+  --governance '{"write":"approve","promote":"owner","delete":"approve"}'</code></pre>
+    <p>Now any agent writing into <code>agents/secops</code> triggers the governance gate (<code>check_agent_action()</code>) which returns <code>Pending(action_id)</code>. The write isn't committed — it's parked in <code>pending_actions</code>. The owning operator (or a designated approver agent) calls <code>memory_pending_list</code>, inspects the diff, and either <code>memory_pending_approve</code> or <code>memory_pending_reject</code>. Approved writes get committed; rejected ones are dropped with an audit row.</p>
     <p>Per-namespace policy means a strict-write namespace can sit next to a permissive one. The hierarchy lets you set a default at <code>org/</code> and override at <code>org/team/</code>.</p>
 
     <h3>Capabilities introspection (v0.6.3)</h3>
     <p>Before an agent invokes a skill, it can ask: <em>"is auto-tag actually wired here?"</em></p>
-<pre><code>$ ai-memory capabilities --json
+<pre><code>$ curl -s http://127.0.0.1:9077/api/v1/capabilities   # or the memory_capabilities MCP tool
 {
-  "version": "0.6.3",
+  "schema_version": "3",
   "tier": "semantic",
+  "version": "0.7.0",
   "features": {
+    "keyword_search": true,
     "hybrid_recall": true,
     "auto_tagging": false,
     "contradiction_analysis": false,
-    "approval_workflow": true,
-    "kg_temporal": true
+    "cross_encoder_reranking": false,
+    ...
   },
-  "permissions": ["read", "write", "promote", "approve"],
-  "hooks": ["pre_store", "post_recall"],
-  "approval": {"queue_depth": 7, "policies": 3}
+  "permissions": { ... }, "hooks": { ... },
+  "approval": {"pending_requests": 7, ...}
 }</code></pre>
-    <p>Capabilities v2 ships in v0.6.3 — agents discover what's available at runtime instead of hard-coding assumptions.</p>
+    <p>Capabilities v2 shipped in v0.6.3; at v0.7.0 the envelope defaults to <code>schema_version "3"</code> (v1/v2 still negotiable via <code>Accept-Capabilities</code>) — agents discover what's available at runtime instead of hard-coding assumptions.</p>
   </div>
 </section>
 
@@ -404,24 +492,28 @@ table tr:last-child td{border-bottom:none}
     <h2>Workstation, multi-agent, multi-namespace.</h2>
 <pre><code># Run as a long-lived HTTP daemon on the workstation
 ai-memory --db /var/lib/ai-memory/store.db serve \
-  --bind 127.0.0.1:9077 \
-  --tier semantic
+  --host 127.0.0.1 --port 9077
 
-# Each agent is a separate MCP client (or HTTP client) pointing at the same store
+# Each agent is a separate MCP client (or HTTP client) pointing at the same store.
+# MCP is stdio JSON-RPC, not an HTTP endpoint — spawn ai-memory mcp directly.
 # In .mcp.json for each agent's Claude Code config:
 {
   "mcpServers": {
     "memory": {
-      "command": "curl",
-      "args": ["-s", "-X", "POST", "http://127.0.0.1:9077/api/v1/mcp"],
+      "command": "ai-memory",
+      "args": ["mcp", "--profile", "full"],
       "env": {"AI_MEMORY_AGENT_ID": "agents/planner"}
     }
   }
 }
 
+# HTTP clients (non-MCP agents) connect to the daemon's REST surface:
+#   curl -s -X POST http://127.0.0.1:9077/api/v1/recall \
+#     -H "X-Agent-Id: agents/planner" -d '{"context": "..."}'
+
 # Agents pass as_agent=agents/&lt;role&gt; on every recall
 # Per-namespace policies set once, enforced forever:
-ai-memory namespace set-standard agents/secops \
+ai-memory namespace set-standard --namespace agents/secops --id &lt;standard-memory-uuid&gt; \
   --governance '{"write":"approve","delete":"approve"}'</code></pre>
   </div>
 </section>
@@ -431,9 +523,9 @@ ai-memory namespace set-standard agents/secops \
     <span class="eyebrow">Wiring</span>
     <h2>Governance, skills, and attestations at T2.</h2>
     <ul>
-      <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models.rs:405-409</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
-      <li><strong>Skills</strong> — Skills register themselves as agents (<code>mcp__memory__memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
-      <li><strong>Attestations</strong> — Field-level reservation only. <code>memory_links.signature</code> (schema v15) is populated with claimed identity at v0.6.3; v0.7 will sign with the agent's keypair and verify on read.</li>
+      <li><strong>Governance</strong> — Live and enforced. <code>GovernancePolicy</code> (<code>src/models/mod.rs</code>) per namespace, hierarchical with parent inheritance, supports <code>any</code> / <code>registered</code> / <code>owner</code> / <code>approve</code> for each of <code>write</code> / <code>promote</code> / <code>delete</code>. Namespace metadata lives in <code>namespace_meta</code> and is the source of truth for the gate.</li>
+      <li><strong>Skills</strong> — Skills register themselves as agents (<code>memory_agent_register</code>). Auto-tagging, contradiction detection, query expansion, and consolidation all run through the same scope visibility — a skill at <code>skills/auto-tag</code> with <code>team</code> scope only sees memories its team published. Skills can be subject to the same governance policies as humans-in-the-loop.</li>
+      <li><strong>Attestations</strong> — <code>memory_links.signature</code> (reserved as a schema v15 column at v0.6.3) is POPULATED at v0.7.0 with Ed25519 per-link attestation — see <code>src/signed_events.rs</code> + the V-4 cross-row hash chain at schema v34. Peers verify signatures on receive.</li>
     </ul>
   </div>
 </section>
@@ -463,12 +555,12 @@ ai-memory namespace set-standard agents/secops \
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>src/db.rs:26-38</code> — <code>compute_visibility_prefixes()</code> (scope visibility)</li>
-      <li><code>src/db.rs:91-104</code> — <code>visibility_clause()</code> (SQL filter)</li>
-      <li><code>src/db.rs:309-330</code> — <code>namespace_meta</code> table for per-namespace policy</li>
-      <li><code>src/models.rs:351-365</code> — <code>PendingAction</code> struct</li>
-      <li><code>src/models.rs:405-409</code> — <code>GovernancePolicy</code></li>
-      <li><code>src/mcp.rs:119</code> — <code>as_agent</code> parameter on recall</li>
+      <li><code>src/storage/mod.rs</code> — <code>compute_visibility_prefixes()</code> (scope visibility)</li>
+      <li><code>src/storage/mod.rs</code> — <code>visibility_clause()</code> (SQL filter)</li>
+      <li><code>src/storage/mod.rs</code> — <code>namespace_meta</code> table for per-namespace policy</li>
+      <li><code>src/models/mod.rs</code> — <code>PendingAction</code> struct</li>
+      <li><code>src/models/mod.rs</code> — <code>GovernancePolicy</code></li>
+      <li><code>src/mcp/mod.rs</code> — <code>as_agent</code> parameter on recall</li>
       <li><code>docs/AI_DEVELOPER_GOVERNANCE.md</code> — governance contract</li>
       <li><code>docs/CHANGELOG.md</code> — v0.6.2 (governance GA), v0.6.3 (taxonomy + capabilities v2)</li>
     </ul>
@@ -476,7 +568,7 @@ ai-memory namespace set-standard agents/secops \
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

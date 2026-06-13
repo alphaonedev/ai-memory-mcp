@@ -1,7 +1,13 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-#![recursion_limit = "256"]
+// v0.7.0 ARCH-12 (med/low review batch) — match the lib crate's
+// `recursion_limit = "512"` so macro-heavy code (clap derive, schemars
+// derive, etc.) that lands in `main.rs` does not surprise-hit a tighter
+// cap than the same code compiled through the lib target. The 256 default
+// historically sufficed when `main.rs` was a near-empty shim; keeping the
+// two compile units in lockstep prevents drift surprises.
+#![recursion_limit = "512"]
 
 // W6 reduced `main.rs` to a thin shim: every CLI subcommand and the HTTP
 // daemon body now live in `ai_memory::daemon_runtime`. The bin keeps its
@@ -18,6 +24,25 @@ use ai_memory::cli::helpers::{human_age, id_short};
 #[cfg(test)]
 use ai_memory::tls;
 
+// COVERAGE NOTE (FUPC): the `#[tokio::main] async fn main()` body
+// (lines ~30-97 below) is the real process entry point. It is
+// UNREACHABLE from any in-process test — it performs `Cli::parse()`
+// (reads the live process argv), installs process-wide singletons
+// (color init, OnceLock-backed permissions/hmac/audit posture) and
+// can call `std::process::exit(78)` on a bad hmac secret, which would
+// abort the test harness. Its individual steps are covered indirectly:
+//   - `config::AppConfig::load` / `write_default_if_missing` — config tests
+//   - `daemon_runtime::apply_anonymize_default` — daemon_runtime tests
+//   - `config::set_active_permissions_mode` / `set_active_hooks_hmac_secret`
+//     / `set_allow_loopback_webhooks` — config tests
+//   - `subscriptions::validate_hmac_secret_hex` — subscriptions tests
+//   - `permissions::set_active_permission_rules` — permissions tests
+//   - `logging::init_file_logging` / `audit::init_from_config` — their
+//     own module tests
+//   - `init_forensic_audit` — see `tests::init_forensic_audit_*` below
+//   - `daemon_runtime::run` — the serve_*/cli_*/cov_* integration suite
+// The `std::process::exit(78)` arm (invalid hmac secret) is documented
+// as uncoverable: exercising it would terminate the test process.
 #[tokio::main]
 async fn main() -> Result<()> {
     color::init();
@@ -35,7 +60,22 @@ async fn main() -> Result<()> {
     // Idempotent; the dispatcher reads via
     // `crate::config::active_hooks_hmac_secret` and falls back to the
     // per-subscription secret when unset.
-    config::set_active_hooks_hmac_secret(app_config.effective_hooks_hmac_secret());
+    //
+    // v0.7.0 #1048 (Agent-5 #8) — validate that the operator-supplied
+    // `hmac_secret` is valid hex BEFORE installing it. The runtime
+    // `subscriptions::hmac_sha256_hex` falls back to using the raw
+    // config bytes as HMAC key material when the hex decode fails —
+    // wire-stable but the WEAK-key posture is not what the operator
+    // configured. Surface the misconfiguration at boot so the
+    // operator fixes it before traffic flows.
+    let resolved_hmac_secret = app_config.effective_hooks_hmac_secret();
+    if let Err(msg) =
+        ai_memory::subscriptions::validate_hmac_secret_hex(resolved_hmac_secret.as_deref())
+    {
+        eprintln!("ai-memory: boot refused — #1048 invalid hmac_secret\n  {msg}");
+        std::process::exit(78); // EX_CONFIG per sysexits.h
+    }
+    config::set_active_hooks_hmac_secret(resolved_hmac_secret);
 
     // v0.7.0 H11 (#628 blocker) — pin the loopback-webhook opt-in. The
     // SSRF guard in `validate_url` rejects loopback URLs by default;
@@ -63,8 +103,39 @@ async fn main() -> Result<()> {
         eprintln!("ai-memory: audit init failed (continuing without): {e}");
     }
 
+    // v0.7.0 #697 — bootstrap the Ed25519-signed forensic governance
+    // log alongside the flat audit chain. Same resolved directory as
+    // the flat audit log; daily-rotated `forensic-<YYYY-MM-DD>.jsonl`
+    // files chained + signed by the daemon's Ed25519 key (when one is
+    // enrolled). The sink is process-wide; failures here are logged
+    // and swallowed so a missing key never blocks daemon startup.
+    init_forensic_audit(&app_config);
+
     let cli = Cli::parse();
     daemon_runtime::run(cli, &app_config).await
+}
+
+/// v0.7.0 #697 — best-effort init for the forensic governance log.
+/// Resolves the directory parallel to the flat audit log, loads the
+/// daemon's signing key (when present), and brings up the sink. A
+/// missing key results in unsigned rows — never a fatal error.
+fn init_forensic_audit(app_config: &config::AppConfig) {
+    let audit_cfg = app_config.effective_audit();
+    // Reuse the flat audit log path resolver — same directory pattern.
+    let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
+    let Some(dir) = log_path.parent() else {
+        eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
+        return;
+    };
+    // Resolve the daemon's agent_id with the standard precedence
+    // chain and try to load its keypair. Unsigned rows are accepted.
+    let agent_id = ai_memory::identity::resolve_agent_id(None, None)
+        .unwrap_or_else(|_| "ai-memory".to_string());
+    let signing_key =
+        ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None);
+    if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
+        eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +216,36 @@ mod tests {
         assert!(set.contains(&[0xaa; 32]));
         assert!(set.contains(&[0xbb; 32]));
         assert!(set.contains(&[0xcc; 32]));
+    }
+
+    /// FUPC — `init_forensic_audit` resolves the audit dir (here pinned
+    /// to a temp path via `AI_MEMORY_AUDIT_DIR`), loads the (absent)
+    /// daemon signing key, and brings the sink up. A missing key is a
+    /// non-fatal unsigned-rows posture, never a panic. Exercises the
+    /// happy path through `resolve_audit_path` → `dir.parent()` →
+    /// `governance::audit::init`.
+    #[test]
+    fn init_forensic_audit_with_temp_dir_does_not_panic() {
+        // Scratch under the repo's gitignored .local-runs/ per the
+        // project no-/tmp HARD RULE.
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".local-runs")
+            .join("main-init-forensic-audit");
+        std::fs::create_dir_all(&root).ok();
+        let tmp = tempfile::tempdir_in(&root).expect("tempdir under .local-runs");
+        let prev = std::env::var("AI_MEMORY_AUDIT_DIR").ok();
+        // SAFETY: single-threaded test process; env set/restore is local.
+        unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", tmp.path()) };
+
+        let app_config = config::AppConfig::default();
+        // Must not panic and must leave the process bootable (unsigned).
+        init_forensic_audit(&app_config);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_AUDIT_DIR") },
+        }
     }
 
     #[tokio::test]

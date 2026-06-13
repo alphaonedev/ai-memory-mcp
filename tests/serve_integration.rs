@@ -21,20 +21,58 @@
 //! window but is the standard pattern across Rust integration suites.
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+mod common;
+use common::free_port;
 
-/// Pick a free port by binding to `127.0.0.1:0` and immediately dropping
-/// the listener. The OS won't reassign that port to another process for
-/// a brief window, which is enough for `serve` to bind it.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    listener.local_addr().expect("local_addr").port()
+// CI's Code Coverage job runs the test binary under `cargo llvm-cov`
+// instrumentation, which inflates startup time by 3-5x. 60s gives
+// enough headroom on every supported CI surface (Linux/macOS/Windows)
+// regardless of instrumentation overhead.
+const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Number of times `spawn_serve` re-rolls the ephemeral port when the
+/// daemon child loses the `free_port()` TOCTOU race and exits with a
+/// bind error before `/health` comes up. The window is tiny but real
+/// under full-suite concurrency (many daemon-spawning tests bind
+/// ephemeral ports at once), so we re-roll on a collision rather than
+/// fail the suite on an environmental flake. A genuine startup crash
+/// carries different stderr and is surfaced immediately, never retried.
+const SPAWN_BIND_RETRY_ATTEMPTS: usize = 5;
+
+/// Substring the daemon's `bind` error carries on an ephemeral-port
+/// collision — `std::io::Error` for `EADDRINUSE` renders as this on both
+/// Linux and macOS. Used to tell a retryable port race apart from a real
+/// startup failure so retries never mask a genuine crash.
+const BIND_IN_USE_MARKER: &str = "Address already in use";
+
+/// Poll interval while waiting for the spawned daemon's `/health` to come
+/// up (and for an early-exit child to surface).
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Per-request timeout for the readiness `/health` probe.
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Why a single `try_spawn_serve_once` attempt failed. `BindRace` is the
+/// only retryable variant; the others are surfaced to the caller with the
+/// child's captured stderr for diagnosis.
+enum SpawnFailure {
+    /// Child exited before readiness and its stderr names an in-use port —
+    /// it lost the `free_port()` TOCTOU race. Safe to retry on a new port.
+    BindRace { stderr: String },
+    /// Child exited before readiness for some other reason — a real
+    /// startup failure. Carries exit status + stderr for the panic.
+    Crashed {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+    /// Child stayed up but `/health` never returned 200 within
+    /// [`SPAWN_TIMEOUT`].
+    NeverReady { stderr: String },
 }
 
 /// RAII guard for the spawned daemon. Drops kill the child on test
@@ -64,15 +102,70 @@ impl Drop for ServeChild {
 /// child on drop. `extra_args` are appended to the serve subcommand.
 /// `extra_envs` lets callers set `HOME` (for config-driven `api_key`
 /// scenarios) or other env vars on the child.
+///
+/// Retries on the `free_port()` TOCTOU bind race (see
+/// [`SPAWN_BIND_RETRY_ATTEMPTS`]); a real startup crash is surfaced
+/// immediately with the child's captured stderr.
 fn spawn_serve(
     db: &std::path::Path,
     extra_args: &[&str],
     extra_envs: &[(&str, &str)],
 ) -> ServeChild {
+    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
+        match try_spawn_serve_once(db, extra_args, extra_envs) {
+            Ok(child) => return child,
+            Err(SpawnFailure::BindRace { stderr }) => {
+                // Lost the ephemeral-port race to a concurrent binder —
+                // re-roll the port. Not a product defect.
+                eprintln!(
+                    "spawn_serve: ephemeral-port bind race on attempt \
+                     {attempt}/{SPAWN_BIND_RETRY_ATTEMPTS}, re-rolling port. \
+                     child stderr:\n{stderr}"
+                );
+            }
+            Err(SpawnFailure::Crashed { status, stderr }) => {
+                panic!(
+                    "serve child exited before /health became ready: {status}\n\
+                     --- child stderr ---\n{stderr}"
+                );
+            }
+            Err(SpawnFailure::NeverReady { stderr }) => {
+                panic!(
+                    "serve daemon did not become ready within {SPAWN_TIMEOUT:?}\n\
+                     --- child stderr ---\n{stderr}"
+                );
+            }
+        }
+    }
+    panic!(
+        "serve daemon lost the ephemeral-port bind race \
+         {SPAWN_BIND_RETRY_ATTEMPTS} times in a row"
+    );
+}
+
+/// Single spawn-and-wait attempt backing [`spawn_serve`]. Captures the
+/// child's stderr so the outcome can distinguish a retryable port race
+/// from a genuine startup crash (and so panics carry real diagnostics).
+fn try_spawn_serve_once(
+    db: &std::path::Path,
+    extra_args: &[&str],
+    extra_envs: &[(&str, &str)],
+) -> Result<ServeChild, SpawnFailure> {
     let port = free_port();
     let port_s = port.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #976 (2026-05-20) — admin allowlist so the post-#946
+        // admin-gated routes (stats, archive, forget, …) exercise the
+        // happy-path 200 in this test fixture. Negative admin
+        // contracts belong in dedicated test files.
+        //
+        // #1001 (2026-05-21) — pre-#980 this used the `"*"` wildcard
+        // sentinel; #980 made `"*"` shape-invalid in
+        // `validate_agent_id`, so the env entry got dropped. Tests
+        // using `spawn_serve` that hit admin endpoints must thread
+        // `X-Agent-Id: ai:serve-test-admin` (matches the env value).
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -90,16 +183,34 @@ fn spawn_serve(
     }
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
 
-    // Drain stdout / stderr in background so the child doesn't block.
+    // Drain stdout to the void; capture stderr into a shared buffer so
+    // an early exit can be classified (bind race vs. real crash) and so
+    // failures surface the daemon's own error instead of being silent.
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
     }
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
-    }
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        let sink = std::sync::Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut guard = sink.lock().unwrap();
+                guard.push_str(&line);
+                guard.push('\n');
+            }
+        })
+    });
+    // Join the stderr drainer (the pipe EOFs once the child exits, so the
+    // thread ends promptly) and return everything it captured.
+    let drain_stderr = move || -> String {
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+        stderr_buf.lock().unwrap().clone()
+    };
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
+        .timeout(READINESS_PROBE_TIMEOUT)
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{port}/api/v1/health");
@@ -108,20 +219,27 @@ fn spawn_serve(
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
         {
-            return ServeChild {
+            return Ok(ServeChild {
                 child: Some(child),
                 port,
-            };
+            });
         }
         // Bail early if the child crashed — don't burn the full timeout.
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("serve child exited before /health became ready: {status}");
+            let stderr = drain_stderr();
+            return Err(if stderr.contains(BIND_IN_USE_MARKER) {
+                SpawnFailure::BindRace { stderr }
+            } else {
+                SpawnFailure::Crashed { status, stderr }
+            });
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(READINESS_POLL_INTERVAL);
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("serve daemon did not become ready within {SPAWN_TIMEOUT:?}");
+    Err(SpawnFailure::NeverReady {
+        stderr: drain_stderr(),
+    })
 }
 
 fn http_client() -> reqwest::blocking::Client {
@@ -187,6 +305,14 @@ fn serve_metrics_endpoint_at_v1_path() {
 
 #[test]
 fn serve_create_then_get_memory() {
+    // #927/#930 (Track A P4/P9, 2026-05-20) added scope=private +
+    // caller-vs-owner gates on the sqlite GET/UPDATE/PROMOTE paths.
+    // Set a stable X-Agent-Id on BOTH the write and the read so the
+    // round-trip lands on the same principal — without it the write
+    // creates a row owned by `anonymous:req-A` and the read tries to
+    // load it as `anonymous:req-B`, and the visibility gate 404s.
+    const AGENT: &str = "ai:serve-roundtrip";
+
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
@@ -201,6 +327,7 @@ fn serve_create_then_get_memory() {
     });
     let resp = client
         .post(serve.url("/api/v1/memories"))
+        .header("X-Agent-Id", AGENT)
         .json(&create_body)
         .send()
         .unwrap();
@@ -216,6 +343,7 @@ fn serve_create_then_get_memory() {
     // GET /api/v1/memories/{id}
     let resp = client
         .get(serve.url(&format!("/api/v1/memories/{id}")))
+        .header("X-Agent-Id", AGENT)
         .send()
         .unwrap();
     assert!(resp.status().is_success());
@@ -248,6 +376,13 @@ fn serve_api_key_required_when_configured() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env_remove("AI_MEMORY_NO_CONFIG")
         .env("HOME", tmp.path().to_str().unwrap())
+        // #976 (2026-05-20) — `/api/v1/stats` is admin-gated post-#955;
+        // the test exercises the api_key auth happy path, not the
+        // admin-rejection contract, so seed a concrete admin id and
+        // thread it as `X-Agent-Id` on the GET below. #1001: pre-#980
+        // this used the `"*"` wildcard which is now rejected by
+        // `validate_agent_id`.
+        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -294,10 +429,11 @@ fn serve_api_key_required_when_configured() {
     let resp = client.get(format!("{}/api/v1/stats", &url)).send().unwrap();
     assert_eq!(resp.status().as_u16(), 401);
 
-    // With header → 200
+    // With header → 200 (admin id threaded via X-Agent-Id per #1001).
     let resp = client
         .get(format!("{}/api/v1/stats", &url))
         .header("x-api-key", api_key)
+        .header("x-agent-id", "ai:serve-test-admin")
         .send()
         .unwrap();
     assert!(

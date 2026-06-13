@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · T4 — Data-center swarm</title>
-<meta name="description" content="Multi-rack deployment with Postgres+pgvector backbone, mTLS peer mesh, per-rack governance — agents swarm across pods. v0.7 roadmap, with shipping primitives called out.">
+<meta name="description" content="Multi-rack deployment with Postgres+pgvector backbone + Apache AGE Cypher graph + mTLS peer mesh + per-rack governance — agents swarm across pods. Shipped at v0.7.0 via --features sal-postgres.">
 <meta property="og:title" content="ai-memory · T4 — Data-center swarm">
 <meta property="og:description" content="Multi-rack swarm. Quorum writes ship today; Postgres+pgvector backbone GA v0.7.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t4.html">
@@ -91,6 +91,18 @@ table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid 
 table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
 table td{color:var(--text-muted)}
 table tr:last-child td{border-bottom:none}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -100,11 +112,14 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T4</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -127,6 +142,7 @@ table tr:last-child td{border-bottom:none}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -138,6 +154,9 @@ table tr:last-child td{border-bottom:none}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html" class="current">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -147,31 +166,99 @@ table tr:last-child td{border-bottom:none}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">CORE TODAY · v0.6.3</span>
-  <span class="cap-badge cap-roadmap">PG+pgvector GA · v0.7</span>
+  <span class="cap-badge cap-today">CORE TODAY · v0.7.0</span>
+  <span class="cap-badge cap-today">PG+pgvector + Apache AGE · v0.7.0 SHIPPED</span>
   <h1>Tier 4 — Data-center swarm</h1>
-  <p class="tagline">Hundreds of nodes. Thousands of agents. Multiple racks. <strong>One coherent memory fabric.</strong> The core fabric ships in v0.6.3; the piece still maturing toward GA at this scale is the shared distributed store (Postgres + pgvector).</p>
+  <p class="tagline">Hundreds of nodes. Thousands of agents. Multiple racks. <strong>One coherent memory fabric.</strong> The core fabric shipped at v0.6.3; the shared distributed store (Postgres + pgvector + Apache AGE) shipped GA at v0.7.0.</p>
   <div class="pills">
     <span class="pill">100s nodes · 1000s agents</span>
     <span class="pill">multi-rack</span>
@@ -182,18 +269,18 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <p>The core fabric ships in v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The piece still maturing toward GA at this scale is the <strong>shared distributed store</strong> (Postgres + pgvector, behind the <code>sal-postgres</code> Cargo feature today, GA targeted v0.7).</p>
-    <p>The diagram distinguishes shipping vs roadmap: solid edges = today, indigo dashed = v0.7 GA piece.</p>
+    <p>The core fabric shipped at v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The <strong>shared distributed store</strong> (Postgres + pgvector) SHIPPED at v0.7.0 via <code>--features sal-postgres</code>.</p>
+    <p>The diagram distinguishes layers: solid edges = always-on at v0.7.0; the Postgres + Apache AGE + pgvector layer ships at v0.7.0 via `--features sal-postgres`.</p>
   </div>
 </section>
 
 <section>
   <div class="container">
     <span class="eyebrow">Architecture diagram</span>
-    <h2>Multi-rack swarm · pgvector backbone (roadmap).</h2>
+    <h2>Multi-rack swarm · pgvector + Apache AGE backbone (shipped at v0.7.0).</h2>
 
     <div class="arch-diagram">
-      <div class="arch-diagram-title">T4 · Multi-rack swarm · pgvector backbone (roadmap) · quorum writes (today)</div>
+      <div class="arch-diagram-title">T4 · Multi-rack swarm · pgvector + Apache AGE backbone (shipped at v0.7.0) · quorum writes (always-on)</div>
 
       <svg class="arch-svg" viewBox="0 0 940 620" role="img" aria-label="Multi-rack ai-memory data center swarm with Postgres pgvector backbone">
 
@@ -286,7 +373,7 @@ table tr:last-child td{border-bottom:none}
           <text x="490" y="533" text-anchor="middle" class="node-label" style="font-size: 12px">Postgres + pgvector</text>
           <text x="490" y="550" text-anchor="middle" class="sub-label">--features sal-postgres</text>
           <text x="490" y="565" text-anchor="middle" class="sub-label">shared store · shared HNSW</text>
-          <text x="490" y="580" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">ROADMAP · v0.7 Track B</text>
+          <text x="490" y="580" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">SHIPPED · v0.7.0 sal-postgres + Apache AGE</text>
         </g>
 
         <use href="#t4-RaPg" class="edge-roadmap" marker-end="url(#t4-arrow)" style="color: #a78bfa" />
@@ -331,7 +418,7 @@ table tr:last-child td{border-bottom:none}
       <div class="arch-legend">
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>sync_push mesh (today)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #facc15"></span>federated control plane</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>pgvector / quorum (roadmap)</span>
+        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>pgvector / quorum / Apache AGE (shipped v0.7.0)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>mTLS peer transport</span>
       </div>
 
@@ -349,8 +436,8 @@ table tr:last-child td{border-bottom:none}
     <h2>Shipping today.</h2>
     <p>The big T4-relevant capability that's already wired:</p>
     <ul>
-      <li><code>src/main.rs:405-411</code> — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
-      <li><code>src/handlers.rs:442-454</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
+      <li><code>src/handlers/</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
       <li>Same wiring on <code>link</code>, <code>consolidate</code>, <code>pending_decision</code>, <code>namespace_meta</code>, and the <code>clear_namespace_meta</code> path.</li>
       <li>mTLS for the outbound side via <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code>.</li>
     </ul>
@@ -360,11 +447,11 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <span class="eyebrow">Track B roadmap</span>
+    <span class="eyebrow">Track B — SHIPPED v0.7.0</span>
     <h2>Postgres + pgvector backbone.</h2>
     <p>The single-SQLite-per-node ceiling bites at T4 scale (>10⁶ memories per node, hot writers). The structural fix is a <strong>shared store</strong>.</p>
     <p><strong>Today (v0.6.x):</strong> <code>sal-postgres</code> Cargo feature flag exists; <code>sqlx</code> + <code>pgvector</code> deps wired. The Postgres adapter compiles and runs; correctness fixes shipped in v0.6.0 pre-tag (#294 SAL upsert key alignment, #295 <code>metadata.agent_id</code> immutability via <code>jsonb_set</code>, #296 tier-downgrade protection via SQL <code>tier_rank()</code>, #297 schema parity with 6 tables + generated <code>scope_idx</code> column). That work is the foundation.</p>
-    <p><strong>v0.7 GA:</strong> Performance maturation, migration tool for SQLite→Postgres on existing fleets, pgvector index tuning at &gt;10⁷ memories, official deployment recipes.</p>
+    <p><strong>v0.7.0 SHIPPED:</strong> Performance maturation complete, <code>ai-memory migrate --from sqlite:// --to postgres://</code> migration tool wired, pgvector + Apache AGE recipes in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/migration-v0.7.0-postgres.md">docs/migration-v0.7.0-postgres.md</a>, official deployment via <code>--features sal-postgres</code>.</p>
     <p>What the shared store unlocks at GA:</p>
     <ul>
       <li>Horizontal read scaling (Postgres read replicas).</li>
@@ -396,7 +483,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Honest ceilings.</h2>
     <table>
       <thead>
-        <tr><th>Dimension</th><th>Today (v0.6.3)</th><th>v0.7 GA</th></tr>
+        <tr><th>Dimension</th><th>v0.6.4</th><th>v0.7.0 SHIPPED</th></tr>
       </thead>
       <tbody>
         <tr><td>Total memories per cluster</td><td>bounded by per-node HNSW RAM</td><td>pgvector → 10⁸+</td></tr>
@@ -417,8 +504,7 @@ table tr:last-child td{border-bottom:none}
     <h2>Today: quorum + mTLS allowlist.</h2>
 <pre><code># rack-a/node-2 — quorum 3-of-5 across the rack, mTLS enforced
 ai-memory --db /var/lib/ai-memory/store.db serve \
-  --bind 0.0.0.0:9077 \
-  --tier semantic \
+  --host 0.0.0.0 --port 9077 \
   --quorum-writes 3 \
   --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077,https://rack-b-2:9077,https://rack-c-1:9077 \
   --quorum-timeout-ms 1500 \
@@ -430,11 +516,10 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
   --quorum-ca-cert /etc/ai-memory/ca.crt \
   --catchup-interval-secs 15</code></pre>
 
-    <p>v0.7 GA target — same node, swap to Postgres-backed store:</p>
+    <p>v0.7.0 — same node, swap to Postgres-backed store:</p>
 <pre><code>ai-memory serve \
   --store-url postgres://ai-memory@pg-cluster.svc.cluster.local:5432/store \
-  --bind 0.0.0.0:9077 \
-  --tier semantic \
+  --host 0.0.0.0 --port 9077 \
   --quorum-writes 3 \
   --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077</code></pre>
 
@@ -449,7 +534,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <ul>
       <li><strong>Governance</strong> — Same machinery as T2/T3, just at scale. The federated control plane is the central nervous system: a single policy update on <code>org/eu/finance</code> reaches every node within seconds. Pending-action queues are visible per-rack for on-call routing.</li>
       <li><strong>Skills</strong> — Skills register as agents and get the same scope visibility. At T4, skills are typically pinned to specific racks (latency, data-residency) but their outputs (tags, contradictions, consolidations) propagate fleet-wide via <code>sync_push</code>.</li>
-      <li><strong>Attestations</strong> — v0.7 attested identity is the gating capability for trustworthy multi-tenant T4. Without it, the cluster is "trust-the-network" — operationally fine inside a controlled VPC, not fine for cross-tenant or cross-organization deployments.</li>
+      <li><strong>Attestations</strong> — v0.7.0 attested identity (#626 Layer-3 Ed25519 store-surface signatures) is the gating capability for trustworthy multi-tenant T4. Unsigned writes still land <code>attest_level = "claimed"</code> unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code> — without enforcement the cluster is "trust-the-network": operationally fine inside a controlled VPC, not fine for cross-tenant or cross-organization deployments.</li>
     </ul>
   </div>
 </section>
@@ -459,11 +544,11 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>src/main.rs:405-447</code> — quorum-write CLI surface</li>
-      <li><code>src/main.rs:230</code> — <code>--store-url postgres://...</code> URL syntax</li>
-      <li><code>src/main.rs:380-393</code> — TLS / mTLS allowlist enforcement</li>
-      <li><code>src/handlers.rs:442-454, 524-540</code> — <code>broadcast_store_quorum</code> + ack counting</li>
-      <li><code>src/replication.rs</code> (422 lines) — <code>QuorumWriter</code> + <code>AckTracker</code> (functional)</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI surface</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs::store_url</code>) — <code>--store-url postgres://...</code> URL syntax</li>
+      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist enforcement</li>
+      <li><code>src/handlers/</code> + <code>src/federation/{sync,quorum}.rs</code> — <code>broadcast_store_quorum</code> + ack counting</li>
+      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code> (functional)</li>
       <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature, sqlx + pgvector deps</li>
       <li><code>CHANGELOG.md</code> — v0.6.0 pre-tag SAL fixes (#294-#297), v0.6.2 fanout bugs (#325-#327)</li>
       <li><code>docs/ADR-0001-quorum-replication.md</code> — realised design</li>
@@ -473,7 +558,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

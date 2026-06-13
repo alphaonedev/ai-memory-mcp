@@ -1,0 +1,34 @@
+-- v0.7.0 #1476 — federation-catchup `updated_at` index (schema v55).
+--
+-- `storage::memories_updated_since` (and its postgres twin
+-- `PostgresStore::list_memories_updated_since`) drives every W=2 peer
+-- catchup over `GET /api/v1/sync/since` with:
+--
+--     WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT ?2
+--
+-- The predicate was made sargable in this same change (the former
+-- `(?1 IS NULL OR updated_at > ?1)` OR-NULL branch was split out into a
+-- None path with no predicate and a Some path with the bare range
+-- bound). But a sargable predicate only helps if there is an index to
+-- range over: without one, SQLite still full-scans `memories` and sorts
+-- the whole result before applying the LIMIT.
+--
+-- `idx_memories_updated_at` lets the planner:
+--   * Some path — use the index as a range bound (`updated_at > ?1`),
+--     walking entries in `updated_at` order and stopping at the LIMIT.
+--   * None path — read the index in order to satisfy `ORDER BY
+--     updated_at ASC LIMIT` without a sort.
+--
+-- Measured on a 200k-row postgres probe (the seq-scan signature is
+-- shared across both backends): EXPLAIN GENERIC_PLAN full-scan cost
+-- 7177 -> 2396 (~3x) once the OR-NULL branch is gone and the index is
+-- present; the OR-NULL form even WITH an index degrades to an
+-- Index Scan + Filter rather than a true Index Cond range scan, which
+-- is why both the rewrite and this index are required together.
+--
+-- Pure additive `CREATE INDEX IF NOT EXISTS` — fully idempotent and
+-- replay-safe. The Rust arm (`src/storage/migrations.rs::if version <
+-- CURRENT_SCHEMA_VERSION`) sources this file inside the BEGIN EXCLUSIVE
+-- transaction that wraps the whole migrate() body.
+CREATE INDEX IF NOT EXISTS idx_memories_updated_at
+    ON memories (updated_at);

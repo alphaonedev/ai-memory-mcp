@@ -1,0 +1,290 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  Audience page: developer — issue #832.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ai-memory for developers &mdash; build, embed, extend</title>
+<meta name="description" content="ai-memory for engineers: build from source, three interfaces (MCP, HTTP, CLI) with a working example for each, NHI agent_id semantics, hooks and subscriptions, extending.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/audience/developer.html">
+<style>
+:root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:840px;--w-wide:1080px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:var(--font-mono);font-size:.88rem}
+code{background:var(--code-bg);padding:.1em .35em;border-radius:3px;color:#d4d4d4}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:1rem 1.15rem;overflow-x:auto;line-height:1.55;margin:1rem 0}
+pre code{background:none;padding:0;color:#d4d4d4}
+.wrap-mid{max-width:var(--w-mid);margin:0 auto;padding:0 1.5rem}
+.topnav{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,10,10,.92);backdrop-filter:blur(8px);z-index:50}
+.topnav .row{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;max-width:var(--w-wide);margin:0 auto;font-size:.9rem}
+.topnav .brand{color:var(--text);font-weight:600}
+.topnav .links{display:flex;gap:1.5rem}
+.topnav .links a{color:var(--muted)}
+.topnav .links a:hover{color:var(--text);text-decoration:none}
+.crumb{padding:1.25rem 1.5rem 0;max-width:var(--w-mid);margin:0 auto;color:var(--dim);font-size:.82rem;font-family:var(--font-mono)}
+.crumb a{color:var(--muted)}
+.hero{padding:3rem 0 2.5rem}
+.hero .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase;margin-bottom:1rem}
+.hero h1{font-size:2.2rem;font-weight:700;letter-spacing:-.025em;line-height:1.15;margin-bottom:1.25rem}
+.hero .lede{font-size:1.1rem;color:var(--muted);max-width:680px;line-height:1.6}
+section{padding:3rem 0;border-top:1px solid var(--border)}
+.eyebrow-h2{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
+h2{font-size:1.5rem;font-weight:700;letter-spacing:-.015em;margin-bottom:1rem}
+h3{font-size:1.05rem;font-weight:600;margin:1.75rem 0 .5rem;color:var(--text)}
+p{color:var(--muted);margin-bottom:1rem;max-width:680px}
+p.lede{color:var(--text);font-size:1rem}
+ul,ol{color:var(--muted);margin:0 0 1rem 1.5rem}
+li{margin-bottom:.35rem}
+li code{font-size:.85em}
+.if-tabs{display:flex;gap:.5rem;margin:1.5rem 0 .5rem;flex-wrap:wrap}
+.if-tab{padding:.4rem .9rem;background:var(--panel);border:1px solid var(--border);border-radius:5px;font-family:var(--font-mono);font-size:.78rem;color:var(--muted);font-weight:600}
+.if-tab.mcp{color:var(--accent);border-color:var(--accent)}
+.if-tab.http{color:var(--warn);border-color:var(--warn)}
+.if-tab.cli{color:var(--good);border-color:var(--good)}
+.callout{border-left:3px solid var(--accent);padding:1rem 1.25rem;background:rgba(110,231,255,.04);border-radius:0 6px 6px 0;margin:1.5rem 0;font-size:.92rem}
+.callout strong{color:var(--text)}
+footer{padding:3rem 0;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;text-align:center}
+footer a{color:var(--muted)}
+.next{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.6rem;margin:1.5rem 0}
+.next a{display:block;padding:.85rem 1rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.9rem;transition:border-color .15s}
+.next a:hover{border-color:var(--accent);text-decoration:none}
+.next a .desc{display:block;color:var(--muted);font-size:.78rem;margin-top:.2rem;font-weight:400}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="row">
+    <a class="brand" href="../">ai-memory</a>
+    <div class="links">
+      <a href="../#install">Install</a>
+      <a href="../for-everyone.html">Everyone</a>
+      <a href="operator.html">Operator</a>
+      <a href="developer.html" style="color:var(--text)">Developer</a>
+      <a href="decision-maker.html">Decision</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="crumb"><a href="../">ai-memory</a> &nbsp;/&nbsp; audience &nbsp;/&nbsp; developer</div>
+
+<header class="hero wrap-mid">
+  <div class="eyebrow">For developers</div>
+  <h1>Build with ai-memory.</h1>
+  <p class="lede">Three interfaces share one SQLite-backed core: MCP stdio, HTTP REST, native CLI. Same data, same validation, same agent_id semantics. This page gives you a working example of each in ten lines or less, then points at the extension surfaces.</p>
+</header>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Build from source</div>
+  <h2>Rust 1.96+, one binary.</h2>
+  <pre><code>git clone https://github.com/alphaonedev/ai-memory-mcp
+cd ai-memory-mcp
+cargo build --release
+# binary at target/release/ai-memory (~26 MB stripped)</code></pre>
+  <p>All four gates must pass before a PR is opened:</p>
+  <pre><code>cargo fmt --check
+cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
+AI_MEMORY_NO_CONFIG=1 cargo test
+cargo audit</code></pre>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Three interfaces, one example each</div>
+  <h2>Pick the surface that fits your call site.</h2>
+  <p>All three share <code>src/storage/</code> + <code>src/validate.rs</code>. There is no behavioural divergence; whatever the CLI does, the MCP tool and the HTTP endpoint do too. Post-#966 (Wave-2 Tier-C1, May 2026), DTO-bundling validation routes through the shared <code>RequestValidator</code> fluent surface so adding a new cross-field invariant is one impl method on the facade instead of three audited per-surface duplicates.</p>
+
+  <h3>MCP &mdash; stdio JSON-RPC 2.0</h3>
+  <div class="if-tabs"><span class="if-tab mcp">74 entries at --profile full, 7 default in --profile core</span></div>
+  <pre><code>printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"demo","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"hello","content":"first MCP memory","tier":"mid"}}}' \
+  | ai-memory mcp --profile core</code></pre>
+
+  <h3>HTTP &mdash; Axum REST</h3>
+  <div class="if-tabs"><span class="if-tab http">88 routes (74 unique paths) at /api/v1/ (+ /metrics)</span></div>
+  <pre><code>ai-memory serve --host 127.0.0.1 --port 9077 &amp;
+
+curl -X POST http://127.0.0.1:9077/api/v1/memories \
+  -H 'Content-Type: application/json' \
+  -H 'X-Agent-Id: ai:my-app@host01' \
+  -d '{"title":"hello","content":"first HTTP memory","tier":"mid"}'</code></pre>
+
+  <h3>CLI &mdash; clap subcommands</h3>
+  <div class="if-tabs"><span class="if-tab cli">80 subcommands in default build (82 with --features sal or --features sal-postgres), all support --json</span></div>
+  <pre><code>ai-memory store --title hello --content "first CLI memory" --tier mid
+ai-memory recall "hello"
+ai-memory stats --json | jq .</code></pre>
+
+  <p>Full surface: <a href="../USER_GUIDE.md">USER_GUIDE.md</a> (MCP tools), <a href="../API_REFERENCE.md">API_REFERENCE.md</a> (HTTP), <a href="../CLI_REFERENCE.md">CLI_REFERENCE.md</a> (CLI). The canonical tool count is asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code>; see issue #862 for the 73+1 disambiguation.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">LLM provider configuration matrix (#1067)</div>
+  <h2>Provider-agnostic LLM substrate.</h2>
+  <p>Every tier that calls an LLM (smart, autonomous, query expansion, auto-tag, contradiction detection, consolidate, reflect, atomise) routes through a single <code>LlmProvider</code> abstraction. The wire shape is selected via <code>AI_MEMORY_LLM_BACKEND</code>; defaults to <code>ollama</code> for backward compatibility with v0.6.x.</p>
+
+  <h3>Recognized backend aliases</h3>
+  <pre><code># AI_MEMORY_LLM_BACKEND= one of:
+ollama              # native /api/chat + /api/embed, no auth (default)
+openai-compatible   # generic; requires AI_MEMORY_LLM_BASE_URL
+
+# OR a vendor alias (pre-fills base URL + accepts vendor-canonical key env var):
+openai      # https://api.openai.com/v1                              · OPENAI_API_KEY
+xai         # https://api.x.ai/v1                                    · XAI_API_KEY
+anthropic   # https://api.anthropic.com/v1                           · ANTHROPIC_API_KEY
+gemini      # https://generativelanguage.googleapis.com/v1beta/openai · GEMINI_API_KEY | GOOGLE_API_KEY
+deepseek    # https://api.deepseek.com/v1                            · DEEPSEEK_API_KEY
+kimi        # https://api.moonshot.cn/v1                             · MOONSHOT_API_KEY | KIMI_API_KEY
+qwen        # https://dashscope.aliyuncs.com/compatible-mode/v1      · DASHSCOPE_API_KEY | QWEN_API_KEY
+mistral     # https://api.mistral.ai/v1                              · MISTRAL_API_KEY
+groq        # https://api.groq.com/openai/v1                         · GROQ_API_KEY
+together    # https://api.together.xyz/v1                            · TOGETHER_API_KEY
+cerebras    # https://api.cerebras.ai/v1                             · CEREBRAS_API_KEY
+openrouter  # https://openrouter.ai/api/v1                           · OPENROUTER_API_KEY
+fireworks   # https://api.fireworks.ai/inference/v1                  · FIREWORKS_API_KEY
+lmstudio    # http://localhost:1234/v1                               · (none / local)</code></pre>
+
+  <h3>Override knobs (universal precedence: CLI flag &gt; env &gt; config &gt; default)</h3>
+  <ul>
+    <li><code>AI_MEMORY_LLM_BACKEND</code> &mdash; selector (see list above)</li>
+    <li><code>AI_MEMORY_LLM_BASE_URL</code> &mdash; overrides the alias default URL (use for self-hosted vLLM, llama.cpp-server, etc.)</li>
+    <li><code>AI_MEMORY_LLM_API_KEY</code> &mdash; Bearer key; vendor-canonical env vars (above) are also accepted</li>
+    <li><code>AI_MEMORY_LLM_MODEL</code> &mdash; model name passed through verbatim (<code>grok-4</code>, <code>gpt-4o</code>, <code>claude-3-7-sonnet</code>, <code>deepseek-chat</code>, <code>qwen-max</code>, &hellip;)</li>
+    <li>Legacy <code>OLLAMA_BASE_URL</code> still honored when <code>AI_MEMORY_LLM_BACKEND=ollama</code></li>
+  </ul>
+
+  <h3>Examples</h3>
+  <pre><code># 1. Default — local Ollama with gemma3:4b
+ai-memory serve   # no env needed; uses http://localhost:11434
+
+# 2. Cloud — xAI Grok via vendor alias
+export AI_MEMORY_LLM_BACKEND=xai
+export XAI_API_KEY=xai-...
+export AI_MEMORY_LLM_MODEL=grok-4
+ai-memory serve
+
+# 3. Self-hosted vLLM (private DC, posture 7)
+export AI_MEMORY_LLM_BACKEND=openai-compatible
+export AI_MEMORY_LLM_BASE_URL=https://vllm.internal.corp/v1
+export AI_MEMORY_LLM_API_KEY=$(cat /run/secrets/vllm-token)
+export AI_MEMORY_LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+ai-memory serve</code></pre>
+
+  <p>Wire-shape canonical source: <code>src/llm.rs::LlmProvider</code> (the <code>Ollama</code> / <code>OpenAiCompatible { api_key }</code> enum). See the release notes for the cross-vendor compat table.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">NHI agent_id semantics</div>
+  <h2>Every memory carries a claimed identity.</h2>
+  <p><code>metadata.agent_id</code> is the AI Non-Human Identity marker. By default an unsigned write's id is <strong>claimed</strong>, not attested &mdash; don't make security decisions on it alone. As of v0.7.0 (#626 Layer-3) a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> on the CLI (<code>store --sign</code>), MCP (<code>memory_store</code>), or HTTP (<code>POST /api/v1/memories</code>) store path; the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code>. Operators can require it with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>.</p>
+
+  <h3>Resolution ladder (CLI + MCP)</h3>
+  <ol>
+    <li>Explicit caller value (<code>--agent-id</code>, MCP <code>agent_id</code> param, or <code>metadata.agent_id</code> in store request)</li>
+    <li><code>AI_MEMORY_AGENT_ID</code> env var</li>
+    <li>(MCP only) <code>initialize.clientInfo.name</code> &rarr; <code>ai:&lt;client&gt;@&lt;hostname&gt;:pid-&lt;pid&gt;</code></li>
+    <li><code>host:&lt;hostname&gt;:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> (stable per-process)</li>
+    <li><code>anonymous:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> (no hostname)</li>
+  </ol>
+
+  <p>The HTTP daemon is multi-tenant and skips the process-level default: it reads <code>agent_id</code> from the request body, then <code>X-Agent-Id</code>, then assigns <code>anonymous:req-&lt;uuid8&gt;</code> and logs WARN.</p>
+
+  <h3>Read-path visibility caller (#1468 / #1469)</h3>
+  <p>The ladder above resolves the <em>write</em> identity. The MCP read tools that enforce per-row <code>scope=private</code> ownership &mdash; <code>memory_session_start</code>, <code>memory_list</code>, <code>memory_search</code>, <code>memory_recall</code> &mdash; resolve their <em>visibility caller</em> from <code>AI_MEMORY_AGENT_ID</code> only (else <code>None</code>, trust-all). The pid-synthesized <code>clientInfo</code> id is deliberately not used: it embeds the live PID and could never match the <code>metadata.agent_id</code> an earlier process wrote, which would hide every prior-session private row from its owner. Set <code>AI_MEMORY_AGENT_ID</code> to drop cross-agent private rows from read results; leave it unset for single-tenant trust-all reads.</p>
+
+  <div class="callout"><strong>Validation regex:</strong> <code>^[A-Za-z0-9_\-:@./]{1,128}$</code>. Permits prefixed forms (<code>ai:</code>, <code>host:</code>), <code>@</code> scope separator, <code>/</code> for future SPIFFE-style ids. Rejects whitespace, null bytes, control chars, shell metacharacters.</div>
+
+  <p>Full reference (immutability invariants, special metadata keys, defaults-that-leak warnings): <a href="../agent-identity.html">agent-identity.html</a>.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Hooks and subscriptions</div>
+  <h2>25-event hook pipeline + HMAC subscriptions.</h2>
+  <p>The hook pipeline fires on 25 named substrate events (snake_case wire names from the <code>HookEvent</code> enum in <code>src/hooks/events.rs</code>): <code>pre_store</code>, <code>post_store</code>, <code>pre_recall</code>, <code>post_recall</code>, <code>pre_link</code>, <code>post_reflect</code>, etc. Hooks run synchronously (default) or async-fan-out (subscriptions).</p>
+
+  <h3>Register a webhook subscription</h3>
+  <pre><code>ai-memory subscribe \
+  --url https://my-app.example.com/ai-memory-events \
+  --events post_store \
+  --secret "$(cat /etc/my-app/hmac.key)"</code></pre>
+  <p>Events are POSTed as JSON with an <code>X-AI-Memory-Signature</code> HMAC header. Unsigned subscribers are refused at registration. SSRF gate: loopback URLs require <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code>.</p>
+  <p>Full hook taxonomy + payload schemas: <a href="../hook-pipeline.md">hook-pipeline.md</a>.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Extend the substrate</div>
+  <h2>New tools, new families, new hooks.</h2>
+
+  <h3>New MCP tool</h3>
+  <ol>
+    <li>Create <code>src/mcp/tools/&lt;name&gt;.rs</code> with a <code>&lt;Name&gt;Request</code> struct (<code>#[derive(JsonSchema, Deserialize)]</code>) and a zero-sized <code>&lt;Name&gt;Tool</code> implementing <code>McpTool</code> (#972 D1.x pattern)</li>
+    <li>Register the tool in <code>registered_tools()</code> in <code>src/mcp/registry.rs</code> (D1.6 #987 iterator collapses the historical <code>tool_definitions()</code> macro)</li>
+    <li>Add the handler under <code>src/mcp/tools/&lt;name&gt;.rs</code> (or an existing module): <code>fn(&amp;Connection, params) -&gt; Result&lt;Value&gt;</code></li>
+    <li>Add a parity test in the same file's <code>d1_x_NNN_tests</code> mod via <code>crate::mcp::parity_test_helpers::*</code></li>
+  </ol>
+
+  <h3>New CLI subcommand</h3>
+  <ol>
+    <li>Add variant to the top-level <code>Command</code> enum in <code>src/daemon_runtime.rs</code> (the v0.7.0 W6 refactor moved it out of src/main.rs)</li>
+    <li>Define an <code>Args</code> struct</li>
+    <li>Add dispatch case in <code>main()</code></li>
+    <li>Implement <code>cmd_*</code> handler taking <code>&amp;Path</code> + args</li>
+  </ol>
+
+  <h3>New HTTP endpoint</h3>
+  <ol>
+    <li>Add route in the Axum router (<code>src/lib.rs</code>; route-path SSOT in <code>src/handlers/routes.rs</code>)</li>
+    <li>Implement handler in <code>src/handlers/</code> using the <code>Db</code> extractor</li>
+  </ol>
+
+  <p>For deeper changes (new memory_kind, new family, new tier), the writeup is in <a href="../DEVELOPER_GUIDE.md">DEVELOPER_GUIDE.md</a> and the family/kind distinction is clarified in <a href="../agent-skills.md">agent-skills.md</a>.</p>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Test results</div>
+  <h2>What the NHI playbook verified.</h2>
+  <p>The Track A NHI test playbook exercises the MCP tool surface, HTTP API parity, CLI dispatch, knowledge-graph traversal, capabilities v3 discovery, token budget, hooks, and chaos &mdash; the exact developer-facing surfaces you'd build against. Latest release-gate campaign (2026-05-22): <strong>7,321 PASS / 0 FAIL across 269 test binaries</strong>, 22 issues (#1120-#1141) fixed in-campaign, no deferrals to v0.8.0.</p>
+  <div class="next">
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest campaign index</strong><span class="desc">2026-05-22 &middot; SHIP-RECOMMENDED &middot; tip <code>fd172f2cf</code></span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/track-a-build-install-results.md"><strong>Engineering writeup</strong><span class="desc">Track A build + install verification</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.md"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, schema ladder v15&rarr;v49, per-issue root cause, future-bug prevention</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.md"><strong>For decision-makers</strong><span class="desc">Verdict, risk, cost, roadmap</span></a>
+  </div>
+</section>
+
+<section class="wrap-mid">
+  <div class="eyebrow-h2">Next</div>
+  <h2>Where to go from here.</h2>
+  <div class="next">
+    <a href="../DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Full reference</span></a>
+    <a href="../USER_GUIDE.md"><strong>MCP tool reference</strong><span class="desc">74 entries at --profile full</span></a>
+    <a href="../API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">88 routes (74 unique paths)</span></a>
+    <a href="../CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">80 subcommands</span></a>
+    <a href="../agent-identity.html"><strong>Agent identity</strong><span class="desc">NHI semantics</span></a>
+    <a href="../hook-pipeline.md"><strong>Hook pipeline</strong><span class="desc">25 events</span></a>
+    <a href="../knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links + temporal validity</span></a>
+    <a href="../RECURSIVE_LEARNING.md"><strong>Recursive learning</strong><span class="desc">reflect / atomise / consolidate, depth-capped</span></a>
+    <a href="../integrations/README.md"><strong>Integrations</strong><span class="desc">Claude Code, Cursor, etc</span></a>
+    <a href="../engineering-discipline.html"><strong>Engineering discipline</strong><span class="desc">The #1558 literal burn-down: 497&rarr;28 baseline entries, CI ratchet, committed census</span></a>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap-mid">
+    <a href="../">&larr; back to ai-memory</a> &middot;
+    <a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> &middot;
+    Apache-2.0 &middot; &copy; 2026 AlphaOne LLC
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,256 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# docker-1461 — reproducible "0→60" full-spectrum test mesh.
+#
+#   2 IronClaw ai-memory peers (HTTPS + mTLS + zero-touch enrollment)
+#   1 PostgreSQL 18 + Apache AGE + pgvector substrate
+#
+# This file declares ONLY topology + wiring. Every concrete value
+# (image tags, container names, ports, store URLs, federation ids,
+# model ids, the bridge subnet) is interpolated from the generated
+# `campaign.env` (`--env-file`), which the provisioning step renders
+# from the single source of truth `provision/lib.sh`. Nothing peer-,
+# region-, or vendor-specific is hardcoded here: re-pointing the mesh
+# is a matter of regenerating `campaign.env`, never editing this file.
+#
+# Secrets posture:
+#   - PG password + per-peer store URLs come from `campaign.env`
+#     (gitignored run dir, mode 0600) — never committed, never echoed.
+#   - OPENROUTER_API_KEY / AI_MEMORY_API_KEY come from the operator
+#     SHELL env (`:?` fails fast with a clear message if unset); they
+#     are deliberately NOT written to any file. Source ~/.env first:
+#       set -a; . ~/.env; set +a
+#
+# Bring-up is driven by the campaign Makefile / provision scripts, not
+# by a bare `docker compose up` — the peers will not pass their mTLS
+# healthcheck until the TLS + zero-touch material has been generated
+# into each peer's node dir and bind-mounted below.
+
+name: ${COMPOSE_PROJECT:-ai-memory-docker-1461}
+
+services:
+  pg-age:
+    # PostgreSQL 18 + Apache AGE (graph) + pgvector (embedding type).
+    # Built from the campaign Dockerfile.pg-age-vector; the bare
+    # apache/age image ships AGE but not pgvector, which the
+    # sal-postgres adapter requires for the embedding column type.
+    image: ${PG_IMAGE:?PG_IMAGE must be set in campaign.env}
+    container_name: ${PG_CONTAINER:?PG_CONTAINER must be set in campaign.env}
+    hostname: ${PG_HOSTNAME:-pg-age}
+    restart: unless-stopped
+    # Entrypoint wrapper: re-install the bind-mounted CA-signed server
+    # cert/key to a postgres-OWNED path (mode 0600) before handing off to
+    # the stock postgres entrypoint. A bind-mounted host key keeps its host
+    # uid; PostgreSQL refuses an ssl_key_file it does not own. `$$@` defers
+    # `$@` to the in-container shell (compose strips one `$`), so the stock
+    # entrypoint receives the `command:` args below verbatim.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        install -d -o postgres -g postgres -m 0750 /etc/postgresql/tls &&
+        install -o postgres -g postgres -m 0644 /certs/server.pem /etc/postgresql/tls/server.pem &&
+        install -o postgres -g postgres -m 0600 /certs/server.key /etc/postgresql/tls/server.key &&
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - --
+    command:
+      # TLS on, leaf cert + key from the postgres-owned install path, and the
+      # hostssl-only client-auth map rendered by provision/00_seed.sh.
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.pem
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    environment:
+      POSTGRES_USER: ${PG_USER:?PG_USER must be set in campaign.env}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set in campaign.env}
+      POSTGRES_DB: ${PG_DB:?PG_DB must be set in campaign.env}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      # PG18+ moved the default PGDATA to a major-version-specific dir
+      # (/var/lib/postgresql/$PG_MAJOR/docker) and the entrypoint refuses
+      # to boot when a volume is mounted at the legacy
+      # /var/lib/postgresql/data while PGDATA is the new default
+      # (docker-library/postgres PR #1259 — "unused mount/volume" abort).
+      # Pinning PGDATA to a subdir of our mounted volume skips that
+      # legacy-detection branch and keeps the data path deterministic.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      # Host-loopback only (127.0.0.1) — exempt from the macOS local-
+      # network gate and never advertised on the LAN.
+      - "127.0.0.1:${PG_PUBLISHED_PORT:?PG_PUBLISHED_PORT must be set}:${PG_INTERNAL_PORT:-5432}"
+    volumes:
+      - pg-age-data:/var/lib/postgresql/data
+      # AGE + pgvector extension + per-peer schema bootstrap. Daemon
+      # auto-migrates its own tables on `serve`; this only creates the
+      # extensions, the graph, and the peer schemas.
+      - ${PG_INIT_SQL:?PG_INIT_SQL must be set}:/docker-entrypoint-initdb.d/01-init-age.sql:ro
+      # CA-signed PG server cert/key (daemon->PG TLS leg), re-installed
+      # postgres-owned by the entrypoint wrapper above.
+      - ${PG_NODE_DIR:?PG_NODE_DIR must be set}/tls:/certs:ro
+      # hostssl-only client-auth map — rejects non-TLS TCP pre-auth.
+      - ${PG_HBA_FILE:?PG_HBA_FILE must be set}:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - mesh
+
+  peer-1:
+    image: ${DAEMON_IMAGE:?DAEMON_IMAGE must be set in campaign.env}
+    container_name: ${PEER1_NAME:?PEER1_NAME must be set in campaign.env}
+    hostname: ${PEER1_NAME}
+    restart: on-failure
+    depends_on:
+      pg-age:
+        condition: service_healthy
+    extra_hosts:
+      # Host Ollama embedder reach (nomic-embed-text) via host-gateway.
+      - "host.docker.internal:host-gateway"
+    environment:
+      # --- preflight: skip the #878 peer-reach probe (boot ordering) ---
+      # Both peers must skip or the boot chain deadlocks (each waits on
+      # the other's HTTP handler). The federation broadcast loop
+      # discovers peers lazily on the first store/forward.
+      AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
+      # --- daemon identity + transport ---
+      AI_MEMORY_AGENT_ID: ${PEER1_AGENT_ID:?PEER1_AGENT_ID must be set}
+      AI_MEMORY_TIER: ${DAEMON_TIER:-autonomous}
+      AI_MEMORY_LISTEN_HOST: "0.0.0.0"
+      AI_MEMORY_LISTEN_PORT: ${CONTAINER_HTTPS_PORT:-19077}
+      AI_MEMORY_STORE_URL: ${PEER1_STORE_URL:?PEER1_STORE_URL must be set}
+      AI_MEMORY_TLS_DIR: ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}
+      # --- federation quorum mesh (HTTPS + mTLS client certs) ---
+      AI_MEMORY_PEER_URLS: ${PEER1_PEER_URLS:?PEER1_PEER_URLS must be set}
+      # --- zero-touch first-party trust (fail-closed on unenrolled) ---
+      AI_MEMORY_FED_IDENTITY: ${PEER1_FED_ID:?PEER1_FED_ID must be set}
+      AI_MEMORY_KEY_DIR: ${REMOTE_KEY_DIR:-/etc/ai-memory/keys}
+      AI_MEMORY_FED_TRUST_BUNDLE_DIR: ${REMOTE_TRUST_DIR:-/etc/ai-memory/trust}
+      AI_MEMORY_FED_TRUST_DOMAIN: ${FED_TRUST_DOMAIN:?FED_TRUST_DOMAIN must be set}
+      AI_MEMORY_FED_CRED_PATH: ${REMOTE_CRED_PATH:-/etc/ai-memory/credential}
+      AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT: "1"
+      # --- AI NHI brain (LLM) + embedder ---
+      AI_MEMORY_LLM_BACKEND: ${LLM_BACKEND:-openrouter}
+      AI_MEMORY_LLM_MODEL: ${LLM_MODEL:?LLM_MODEL must be set}
+      AI_MEMORY_AUTO_TAG_MODEL: ${AUTO_TAG_MODEL:-${LLM_MODEL}}
+      AI_MEMORY_EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      # Secrets — shell env only (never written to campaign.env).
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before bringing the mesh up}
+      AI_MEMORY_API_KEY: ${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}
+      RUST_LOG: ${RUST_LOG:-ai_memory=info,sqlx=warn}
+    volumes:
+      # Per-peer node tree (TLS + zero-touch material), generated by the
+      # provision step into the gitignored run dir and bind-mounted in.
+      #   tls   : server.pem/key, mtls-allowlist.txt, client.pem/key, ca.pem
+      #   keys  : <fed_id>.priv/.pub (rw — daemon also writes daemon.* here)
+      #   trust : <issuer-id>.pub (the sole trust anchor)
+      #   credential : this peer's CA-signed credential header
+      - ${PEER1_NODE_DIR:?PEER1_NODE_DIR must be set}/tls:${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}:ro
+      - ${PEER1_NODE_DIR}/keys:${REMOTE_KEY_DIR:-/etc/ai-memory/keys}
+      - ${PEER1_NODE_DIR}/trust:${REMOTE_TRUST_DIR:-/etc/ai-memory/trust}:ro
+      - ${PEER1_NODE_DIR}/credential:${REMOTE_CRED_PATH:-/etc/ai-memory/credential}:ro
+      - peer-1-audit:/var/log/ai-memory/audit
+    ports:
+      - "127.0.0.1:${PEER1_PUBLISHED_PORT:?PEER1_PUBLISHED_PORT must be set}:${CONTAINER_HTTPS_PORT:-19077}"
+    networks:
+      - mesh
+    healthcheck:
+      # mTLS HTTPS probe: the daemon now requires a client cert whose
+      # DER SHA-256 is on the allowlist, so the healthcheck presents the
+      # campaign client cert + CA and the X-API-Key. `$$VAR` defers
+      # expansion to the in-container shell (compose strips one `$`).
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl -f -sS --max-time 3
+          --cacert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/ca.pem
+          --cert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.pem
+          --key ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.key
+          -H "X-API-Key: $$AI_MEMORY_API_KEY"
+          https://127.0.0.1:${CONTAINER_HTTPS_PORT:-19077}/api/v1/capabilities
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+
+  peer-2:
+    image: ${DAEMON_IMAGE:?DAEMON_IMAGE must be set in campaign.env}
+    container_name: ${PEER2_NAME:?PEER2_NAME must be set in campaign.env}
+    hostname: ${PEER2_NAME}
+    restart: on-failure
+    depends_on:
+      pg-age:
+        condition: service_healthy
+      peer-1:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
+      AI_MEMORY_AGENT_ID: ${PEER2_AGENT_ID:?PEER2_AGENT_ID must be set}
+      AI_MEMORY_TIER: ${DAEMON_TIER:-autonomous}
+      AI_MEMORY_LISTEN_HOST: "0.0.0.0"
+      AI_MEMORY_LISTEN_PORT: ${CONTAINER_HTTPS_PORT:-19077}
+      AI_MEMORY_STORE_URL: ${PEER2_STORE_URL:?PEER2_STORE_URL must be set}
+      AI_MEMORY_TLS_DIR: ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}
+      AI_MEMORY_PEER_URLS: ${PEER2_PEER_URLS:?PEER2_PEER_URLS must be set}
+      AI_MEMORY_FED_IDENTITY: ${PEER2_FED_ID:?PEER2_FED_ID must be set}
+      AI_MEMORY_KEY_DIR: ${REMOTE_KEY_DIR:-/etc/ai-memory/keys}
+      AI_MEMORY_FED_TRUST_BUNDLE_DIR: ${REMOTE_TRUST_DIR:-/etc/ai-memory/trust}
+      AI_MEMORY_FED_TRUST_DOMAIN: ${FED_TRUST_DOMAIN:?FED_TRUST_DOMAIN must be set}
+      AI_MEMORY_FED_CRED_PATH: ${REMOTE_CRED_PATH:-/etc/ai-memory/credential}
+      AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT: "1"
+      AI_MEMORY_LLM_BACKEND: ${LLM_BACKEND:-openrouter}
+      AI_MEMORY_LLM_MODEL: ${LLM_MODEL:?LLM_MODEL must be set}
+      AI_MEMORY_AUTO_TAG_MODEL: ${AUTO_TAG_MODEL:-${LLM_MODEL}}
+      AI_MEMORY_EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before bringing the mesh up}
+      AI_MEMORY_API_KEY: ${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}
+      RUST_LOG: ${RUST_LOG:-ai_memory=info,sqlx=warn}
+    volumes:
+      - ${PEER2_NODE_DIR:?PEER2_NODE_DIR must be set}/tls:${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}:ro
+      - ${PEER2_NODE_DIR}/keys:${REMOTE_KEY_DIR:-/etc/ai-memory/keys}
+      - ${PEER2_NODE_DIR}/trust:${REMOTE_TRUST_DIR:-/etc/ai-memory/trust}:ro
+      - ${PEER2_NODE_DIR}/credential:${REMOTE_CRED_PATH:-/etc/ai-memory/credential}:ro
+      - peer-2-audit:/var/log/ai-memory/audit
+    ports:
+      - "127.0.0.1:${PEER2_PUBLISHED_PORT:?PEER2_PUBLISHED_PORT must be set}:${CONTAINER_HTTPS_PORT:-19077}"
+    networks:
+      - mesh
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl -f -sS --max-time 3
+          --cacert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/ca.pem
+          --cert ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.pem
+          --key ${REMOTE_TLS_DIR:-/etc/ai-memory-a2a/tls}/client.key
+          -H "X-API-Key: $$AI_MEMORY_API_KEY"
+          https://127.0.0.1:${CONTAINER_HTTPS_PORT:-19077}/api/v1/capabilities
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+
+networks:
+  mesh:
+    name: ${MESH_NETWORK:?MESH_NETWORK must be set in campaign.env}
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: ${MESH_SUBNET:?MESH_SUBNET must be set in campaign.env}
+
+volumes:
+  pg-age-data:
+  peer-1-audit:
+  peer-2-audit:

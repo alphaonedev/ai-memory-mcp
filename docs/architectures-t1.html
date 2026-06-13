@@ -95,6 +95,18 @@ table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid 
 table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
 table td{color:var(--text-muted)}
 table tr:last-child td{border-bottom:none}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -104,11 +116,14 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T1</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -131,6 +146,7 @@ table tr:last-child td{border-bottom:none}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -142,6 +158,9 @@ table tr:last-child td{border-bottom:none}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -151,28 +170,96 @@ table tr:last-child td{border-bottom:none}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v0.6.3</span>
+  <span class="cap-badge cap-today">SHIPS TODAY · v0.7.0</span>
   <h1>Tier 1 — Single node, single agent</h1>
   <p class="tagline">The bedrock primitive. <strong>One process. One consumer. Zero network.</strong> SQLite + WAL, FTS5 keyword recall, in-process HNSW vector index, no replication, no peers.</p>
   <div class="pills">
@@ -229,7 +316,7 @@ table tr:last-child td{border-bottom:none}
           <rect x="290" y="80" width="280" height="280" rx="16"
                 fill="url(#t1-mem-gradient)" stroke="#2dd4bf" stroke-width="1.6" />
           <text x="430" y="105" text-anchor="middle" class="node-label" style="font-size: 13px">ai-memory process</text>
-          <text x="430" y="122" text-anchor="middle" class="sub-label">single Arc&lt;Mutex&lt;Connection&gt;&gt;</text>
+          <text x="430" y="122" text-anchor="middle" class="sub-label">one SQLite DB (WAL)</text>
 
           <!-- Three interfaces -->
           <rect x="306" y="138" width="78" height="40" rx="6" class="node" />
@@ -316,7 +403,7 @@ table tr:last-child td{border-bottom:none}
       </div>
 
       <div class="arch-diagram-caption">
-        Agent talks to ai-memory over MCP, HTTP, or CLI. ai-memory holds a single SQLite connection behind a mutex.
+        Agent talks to ai-memory over MCP, HTTP, or CLI. The HTTP daemon guards a single SQLite connection behind a mutex; MCP stdio is single-threaded by protocol; each CLI invocation opens its own connection (#965 audit).
         Every recall is a hot loop — FTS5 + HNSW + scoring + access-count touch — all in-process.
       </div>
     </div>
@@ -330,9 +417,9 @@ table tr:last-child td{border-bottom:none}
 
     <h3>A write — <code>memory_store</code></h3>
     <ol>
-      <li>The agent calls <code>memory_store</code> over MCP (or <code>POST /api/v1/memory</code> over HTTP, or <code>ai-memory store ...</code> from the CLI).</li>
+      <li>The agent calls <code>memory_store</code> over MCP (or <code>POST /api/v1/memories</code> over HTTP, or <code>ai-memory store ...</code> from the CLI).</li>
       <li>The handler validates the input (<code>src/validate.rs</code>), then acquires the connection mutex.</li>
-      <li>Governance gate runs (<code>src/db.rs</code> → <code>governance::check()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
+      <li>Governance gate runs (<code>src/governance/</code> → <code>check_agent_action()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
       <li>Memory row is <code>INSERT</code>ed (or <code>UPDATE</code>d on <code>(title, namespace)</code> collision). FTS5 is kept in sync via triggers. The <code>scope_idx</code> generated column gets recomputed automatically.</li>
       <li>If the feature tier is <code>semantic</code> or above, the embedding is generated and added to the in-memory HNSW index.</li>
       <li>WAL is fsynced; the call returns.</li>
@@ -341,8 +428,8 @@ table tr:last-child td{border-bottom:none}
     <h3>A recall — <code>memory_recall</code></h3>
     <ol>
       <li>Agent calls <code>memory_recall</code> with a context string.</li>
-      <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>fts.rank + priority*0.5 + access_count*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
-      <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback in the keyword tier).</li>
+      <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
+      <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback); skipped entirely in the keyword tier.</li>
       <li><strong>Adaptive blend</strong> — semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text. Final score is <code>semantic_weight * cosine + (1 - semantic_weight) * norm_fts</code>.</li>
       <li><strong>Touch</strong> — every returned memory has <code>access_count</code> incremented, TTL extended, and (for mid-tier memories) auto-promoted to long-tier on the 5th access. Priority bumps every 10 accesses.</li>
       <li>Result formatted as <code>toon_compact</code> (40-60% smaller than JSON), <code>toon</code>, or <code>json</code>.</li>
@@ -357,13 +444,13 @@ table tr:last-child td{border-bottom:none}
     <span class="eyebrow">Deployment recipe</span>
     <h2>Install, run, verify.</h2>
 <pre><code># install
-cargo install ai-memory --version 0.6.3
+cargo install ai-memory --version 0.7.0
 
 # run as MCP server (for Claude Code, etc.)
 ai-memory --db ~/.claude/ai-memory.db mcp --tier semantic
 
 # OR run as HTTP daemon
-ai-memory --db ~/.claude/ai-memory.db serve --bind 127.0.0.1:9077 --tier semantic
+ai-memory --db ~/.claude/ai-memory.db serve --host 127.0.0.1 --port 9077
 
 # verify
 ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
@@ -377,8 +464,8 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
     <h2>Governance, skills, and attestations at T1.</h2>
     <ul>
       <li><strong>Governance</strong> — Default policy is <code>write: any, promote: any, delete: owner</code>. Override per-namespace via <code>memory_namespace_set_standard</code> if you want pending-approval behavior for sensitive memories. The same governance machinery as T2+ is present; you just rarely use it with one agent.</li>
-      <li><strong>Skills</strong> — Auto-tagging (<code>memory_auto_tag</code>) and contradiction detection (<code>memory_detect_contradiction</code>) require the <code>smart</code> or <code>autonomous</code> feature tier (Ollama backend). Capabilities introspection v2 (v0.6.3) lets the agent ask the server which skills are available before invoking them.</li>
-      <li><strong>Attestations</strong> — Not enforced at T1; the <code>signature</code> column on <code>memory_links</code> (added schema v15 / v0.6.3) is reserved for v0.7 attested identity.</li>
+      <li><strong>Skills</strong> — Auto-tagging (<code>memory_auto_tag</code>) and contradiction detection (<code>memory_detect_contradiction</code>) require the <code>smart</code> or <code>autonomous</code> feature tier (LLM-bound). Post-#1067 + #1146 (v0.7.0), tier no longer dictates vendor — any tier can route to Ollama OR any of 15+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code> (canonical schema: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>) or via <code>AI_MEMORY_LLM_BACKEND</code> env vars (override). Capabilities introspection v2 (v0.6.3) lets the agent ask the server which skills are available before invoking them.</li>
+      <li><strong>Attestations</strong> — Not enforced at T1; the <code>signature</code> column on <code>memory_links</code> (added schema v15 / v0.6.3) is populated at v0.7.0 with Ed25519 attestation.</li>
     </ul>
   </div>
 </section>
@@ -408,19 +495,19 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>src/main.rs</code> — daemon setup, command dispatch (26 CLI commands)</li>
-      <li><code>src/mcp.rs</code> — MCP tool handlers wired to the same DB layer</li>
-      <li><code>src/handlers.rs</code> — HTTP route handlers (the Axum router in <code>main.rs</code> registers 48 <code>/api/v1/*</code> routes)</li>
-      <li><code>src/db.rs</code> — schema, recall scoring, GC, migrations (current schema v15 per v0.6.3 release notes)</li>
+      <li><code>src/main.rs</code> + <code>src/daemon_runtime.rs</code> — CLI parsing + daemon setup (80 subcommands at v0.7.x in the default build (82 under <code>--features sal</code> or <code>--features sal-postgres</code>; #1598 added <code>reembed</code>))</li>
+      <li><code>src/mcp/</code> — MCP server (74 advertised entries at <code>--profile full</code>; 7 at <code>--profile core</code>)</li>
+      <li><code>src/handlers/</code> — HTTP route handlers (router registers 88 <code>/api/v1/*</code> route bindings / 75 unique URL paths at v0.7.0)</li>
+      <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v57 per v0.7.0 release notes; v57 = postgres stored generated tsvector + memories_tsv_gin #1579 B2; v56 = composite list/archive ordering indexes + sargable list #1579 A2; v55 = sargable list_memories_updated_since federation-catchup rewrite + idx_memories_updated_at #1476; v54 = tier-default expiry backfill #1466; v53 = memories_au FTS5 trigger scoping #1418; v52 = transcript_line_dedup #1389; v51 = federation_nonces persistence #1255 / PR #1296; v50 = per-namespace K8 quota dimension #1156)</li>
       <li><code>src/reranker.rs</code> — adaptive blend semantic + keyword</li>
       <li><code>src/hnsw.rs</code> — in-memory ANN</li>
-      <li><code>docs/ARCHITECTURE.md</code> — full module map</li>
+      <li><code>CLAUDE.md</code> §Architecture / Key Modules — full module map</li>
     </ul>
   </div>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

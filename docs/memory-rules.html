@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Memory Rules — the namespace policy stack</title>
-<meta name="description" content="ai-memory v0.6.3.1 memory rules. Namespace standards, governance policy, validation, scope visibility, parent-namespace inheritance. The unified per-namespace policy stack that controls who can write what, where, and when.">
+<meta name="description" content="ai-memory v0.7.0 memory rules. Namespace standards, governance policy, validation, scope visibility, parent-namespace inheritance. The unified per-namespace policy stack that controls who can write what, where, and when.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/memory-rules.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -84,6 +84,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -93,11 +104,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Memory Rules</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -120,6 +134,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -131,6 +146,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -140,23 +158,91 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -200,7 +286,7 @@ footer a{color:var(--text-muted)}
       <rect class="b l1" x="180" y="40" width="200" height="80"/>
       <text class="h" x="280" y="68" text-anchor="middle">L1 · Validation</text>
       <text class="s" x="280" y="88" text-anchor="middle">size · format · charset</text>
-      <text class="s" x="280" y="105" text-anchor="middle">23 validate_* fns</text>
+      <text class="s" x="280" y="105" text-anchor="middle">31 validate_* fns</text>
 
       <!-- Layer 2: Scope -->
       <rect class="b l2" x="180" y="135" width="200" height="80"/>
@@ -284,7 +370,7 @@ footer a{color:var(--text-muted)}
 
     <div class="layer l1">
       <div class="layer-head"><span class="layer-num">L1</span><span class="layer-name">Validation</span><span class="layer-tag">structural · per-write · always-on</span></div>
-      <div class="layer-desc">23 single-purpose validators in <code>src/validate.rs</code>. Reject malformed input before anything else runs. The same checks run on HTTP, MCP, CLI, and federation receive — there is no privileged path that bypasses them.</div>
+      <div class="layer-desc">31 single-purpose validators in <code>src/validate.rs</code>. Reject malformed input before anything else runs. The same checks run on HTTP, MCP, CLI, and federation receive — there is no privileged path that bypasses them.</div>
       <ul class="checklist">
         <li><code>validate_title</code> — non-empty, ≤512 chars, no control chars</li>
         <li><code>validate_content</code> — non-empty, ≤65 536 bytes, no control chars</li>
@@ -294,7 +380,7 @@ footer a{color:var(--text-muted)}
         <li><code>validate_confidence</code> — 0.0–1.0, finite (no NaN, no Inf)</li>
         <li><code>validate_tags</code> — ≤50 tags, ≤128 bytes each</li>
         <li><code>validate_ttl_secs</code> — positive, ≤1 year (caps "accidental immortality")</li>
-        <li><code>validate_source</code> — closed set: <code>user</code>, <code>claude</code>, <code>hook</code>, <code>api</code>, <code>cli</code>, <code>import</code>, <code>consolidation</code>, <code>system</code>, <code>chaos</code>, <code>notify</code></li>
+        <li><code>validate_source</code> — closed set: <code>user</code>, <code>nhi</code> (v0.7 vendor-neutral default), <code>claude</code> (deprecated), <code>hook</code>, <code>api</code>, <code>cli</code>, <code>import</code>, <code>consolidation</code>, <code>system</code>, <code>chaos</code>, <code>notify</code></li>
       </ul>
       <p style="margin-top:.85rem;color:var(--text-muted);font-size:.88rem"><a href="validators.html" style="color:var(--p1)">Full validators atlas →</a></p>
     </div>
@@ -323,7 +409,7 @@ footer a{color:var(--text-muted)}
 
     <div class="layer l3">
       <div class="layer-head"><span class="layer-num">L3</span><span class="layer-name">Governance — Allow / Deny / Pending</span><span class="layer-tag">write-time gate · per-action</span></div>
-      <div class="layer-desc">Three actions are gated: <code>store</code>, <code>promote</code>, <code>delete</code>. Four levels: <code>Any</code>, <code>Registered</code>, <code>Owner</code>, <code>Approve</code>. Three approver types: <code>Human</code>, <code>Agent(id)</code>, <code>Consensus(N)</code>. The default policy opens writes/promotes wide and gates deletes to owners — operators tighten as needed.</div>
+      <div class="layer-desc">Four actions are gated: <code>store</code>, <code>promote</code>, <code>delete</code>, and (v0.7.0 L1-8) <code>reflect</code>. Four levels: <code>Any</code>, <code>Registered</code>, <code>Owner</code>, <code>Approve</code>. Three approver types: <code>Human</code>, <code>Agent(id)</code>, <code>Consensus(N)</code>. The default policy opens writes/promotes wide and gates deletes to owners — operators tighten as needed (allow-on-silence, #1569: a namespace with no standard falls through to the permissive default). v0.7.0 also adds the <strong>K11 substrate rules engine</strong> (<code>src/governance/</code>, <code>governance_rules</code> table): operator-signed Ed25519 rules evaluated on agent actions, listed via the <code>memory_rule_list</code> MCP tool, and <strong>fail-CLOSED on rule-consultation errors by default</strong> (#1054; escape hatch <code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR</code>).</div>
       <div class="snip">// Default policy
 { <span class="key">"write"</span>: <span class="val">"any"</span>, <span class="key">"promote"</span>: <span class="val">"any"</span>, <span class="key">"delete"</span>: <span class="val">"owner"</span>, <span class="key">"approver"</span>: <span class="val">"human"</span> }
 
@@ -417,7 +503,7 @@ apply: <span class="ok">policy.write=registered</span> to the new memory's L3 ch
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · rules live in <code>src/validate.rs</code> + <code>src/governance.rs</code> + <code>src/db.rs::namespace_meta</code> · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · rules live in <code>src/validate.rs</code> + <code>src/governance/</code> + <code>src/storage/mod.rs::namespace_meta</code> · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="hierarchies.html">Hierarchies</a> · <a href="governance.html">Governance</a> · <a href="validators.html">Validators</a></p>
 </footer>
 

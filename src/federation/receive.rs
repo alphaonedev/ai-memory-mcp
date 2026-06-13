@@ -1,0 +1,550 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Post-partition catchup poller: spawn_catchup_loop, catchup_once,
+//! urlencoding_encode.
+
+#[cfg(feature = "sal")]
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::FederationConfig;
+
+// ---------------------------------------------------------------------------
+// #1558 batch 5 wave 2 — file-local catchup log helpers.
+//
+// The three catchup variants (`catchup_once_with_store`,
+// `catchup_once_legacy`, `catchup_once_for_tests`) previously spelled
+// each of these tracing templates inline, tripling every wording. The
+// helpers below are the single spelling; message bytes are IDENTICAL
+// to the prior inline macros (`tracing` level per helper unchanged).
+// ---------------------------------------------------------------------------
+
+fn log_catchup_http_skip(peer_id: &str, status: impl std::fmt::Display) {
+    tracing::debug!("catchup: peer {peer_id} returned HTTP {status} — skipping this tick");
+}
+
+fn log_catchup_unreachable(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::debug!("catchup: peer {peer_id} unreachable: {e}");
+}
+
+fn log_catchup_unparseable_body(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: peer {peer_id} returned unparseable body: {e}");
+}
+
+fn log_catchup_pull_ok(peer_id: &str, rows: usize) {
+    tracing::info!("catchup: pull: {peer_id} ok ({rows} row(s) returned)");
+}
+
+fn log_catchup_unparseable_memory(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: unparseable memory from peer {peer_id}: {e}");
+}
+
+fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Display) {
+    tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
+}
+
+/// v0.6.0.1 (#320) — post-partition catchup poller.
+///
+/// Previously a node rejoining the mesh after SIGSTOP / network blip / restart
+/// would only receive NEW writes that arrived AFTER resume; anything the
+/// other peers wrote during the outage stayed on those peers. r14 scenario-14
+/// observed this as node-3 seeing 2/20 writes post-SIGCONT.
+///
+/// This loop periodically calls `GET /api/v1/sync/since?peer=<local>` against
+/// each configured peer, applying returned memories via `insert_if_newer`.
+/// The `since` value is the receiver-side vector clock entry for that peer,
+/// so we never re-pull already-applied rows. First catchup after a restart
+/// runs with `since=None`, pulling a capped snapshot (limit=500).
+///
+/// Interval is operator-tunable via `--catchup-interval-secs`. 0 disables.
+/// The loop is a best-effort background task: errors are logged but never
+/// propagated. In the happy path a partitioned node converges within one
+/// interval after resume.
+///
+/// This is deliberately NOT a substitute for the synchronous quorum-write
+/// path — it's a safety net for the tail. Normal writes still fan out via
+/// `broadcast_store_quorum`; catchup only fires for rows that DIDN'T land
+/// during the original write deadline.
+pub fn spawn_catchup_loop(
+    config: FederationConfig,
+    db: crate::handlers::Db,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    // Pre-existing no-sal build break (caught by the #625 port subagent
+    // 2026-05-11): the historical bootstrap path forwarded through
+    // `spawn_catchup_loop_with_store`, which is `#[cfg(feature = "sal")]`
+    // only. With `sal` off the call site is unresolved. Inline the
+    // tokio::spawn loop here so the sqlite-only build compiles. Under
+    // `sal` we still route through the store-aware variant so
+    // postgres-backed daemons keep the M3 routing fix.
+    #[cfg(feature = "sal")]
+    {
+        spawn_catchup_loop_with_store(config, db, None, interval)
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            loop {
+                catchup_once(&config, &db).await;
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+}
+
+/// v0.7.0 M3 — same as [`spawn_catchup_loop`] but accepts an optional
+/// SAL-trait store handle. When `store` is `Some`, applied memories are
+/// written through `store.apply_remote_memory` (which routes through the
+/// active backend — postgres on `--store-url postgres://` deployments,
+/// sqlite otherwise). When `None`, the legacy `db::insert_if_newer` path
+/// over the shared rusqlite connection is preserved verbatim.
+///
+/// The split exists so the bootstrap can keep the historical
+/// `spawn_catchup_loop` signature (used by tests) intact while
+/// postgres-backed daemons get the routing fix.
+#[cfg(feature = "sal")]
+pub fn spawn_catchup_loop_with_store(
+    config: FederationConfig,
+    db: crate::handlers::Db,
+    store: Option<Arc<dyn crate::store::MemoryStore>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Small upfront delay so the first catchup doesn't fire before the
+        // HTTP server has bound — avoids spurious "connection refused" on
+        // node-1 during rolling start of a fresh cluster.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        loop {
+            catchup_once_with_store(&config, &db, store.as_ref()).await;
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+/// Legacy two-arg wrapper preserved so existing tests + non-SAL builds
+/// keep dispatching through the sqlite path. Postgres-backed daemons
+/// should invoke [`catchup_once_with_store`] directly via
+/// [`spawn_catchup_loop_with_store`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) async fn catchup_once(config: &FederationConfig, db: &crate::handlers::Db) {
+    #[cfg(feature = "sal")]
+    {
+        catchup_once_with_store(config, db, None).await;
+    }
+    #[cfg(not(feature = "sal"))]
+    {
+        catchup_once_legacy(config, db).await;
+    }
+}
+
+#[cfg(feature = "sal")]
+pub(super) async fn catchup_once_with_store(
+    config: &FederationConfig,
+    db: &crate::handlers::Db,
+    store: Option<&Arc<dyn crate::store::MemoryStore>>,
+) {
+    let local_id = config.sender_agent_id.clone();
+    for peer in &config.peers {
+        // Rebuild the peer's base URL from sync_push_url to get the
+        // /api/v1/sync/since endpoint without recomputing peer config.
+        let base = peer
+            .sync_push_url
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
+            .to_string();
+
+        // Load our local vector-clock entry for this peer so we only pull
+        // the delta. First-time-ever runs with no prior clock pull a full
+        // snapshot (capped below by ?limit=500 on the peer side).
+        let since_opt: Option<String> = {
+            let lock = db.lock().await;
+            match crate::db::sync_state_load(&lock.0, &local_id) {
+                Ok(clock) => clock.entries.get(&peer.id).cloned(),
+                Err(_) => None,
+            }
+        };
+
+        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
+
+        // v0.7.0 #239 — attach `x-peer-id` to the outbound /sync/since
+        // GET so the peer's per-peer namespace allowlist can scope
+        // the returned rows. Without this, a v0.7.0 peer that's
+        // configured an allowlist will default-deny our catchup and
+        // hand back an empty page.
+        //
+        // #935 (v0.7.0 Track D, 2026-05-20): attach `x-api-key` when
+        // the daemon was configured with `[api] api_key` so peers
+        // running with api-key auth accept the catchup GET. The
+        // pre-#935 catchup loop omitted this header even though
+        // `sync_cycle_once` and `broadcast_store_quorum` both forward
+        // it, so alice's catchup-pull from bob 401'd on every tick
+        // while the broadcast path worked. The header is attached
+        // ONLY when `config.api_key` is `Some` so mTLS-only
+        // deployments keep the v0.6.x backwards-compatible header
+        // set (the inbound `/sync/since` auth bypass for mTLS
+        // listeners absorbs the missing header). Also attach
+        // `x-agent-id` for parity with `sync_cycle_once` so the
+        // receive-side identity gate (#238/#239) sees a consistent
+        // wire identity on every sync path.
+        let mut req = config
+            .client
+            .get(&url)
+            .header(crate::HEADER_AGENT_ID, local_id.as_str())
+            .header(
+                crate::federation::peer_attestation::PEER_ID_HEADER,
+                local_id.as_str(),
+            );
+        if let Some(ref key) = config.api_key {
+            req = req.header(crate::HEADER_API_KEY, key);
+        }
+        let resp = match req.send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                log_catchup_http_skip(&peer.id, r.status());
+                continue;
+            }
+            Err(e) => {
+                log_catchup_unreachable(&peer.id, e);
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                log_catchup_unparseable_body(&peer.id, e);
+                continue;
+            }
+        };
+
+        let memories = match body.get("memories").and_then(|v| v.as_array()) {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        // #935 (v0.7.0 Track D, 2026-05-20): emit an info-level
+        // success line on every accepted pull so operators tailing
+        // `docker logs alice | grep catchup` can confirm the
+        // catchup loop is healthy without enabling `RUST_LOG=trace`.
+        // The "pull: <peer-id> ok" tag pins the canonical wording
+        // pinned by the regression test in
+        // `tests/federation_catchup_api_key.rs`.
+        log_catchup_pull_ok(&peer.id, memories.len());
+
+        if memories.is_empty() {
+            continue;
+        }
+
+        let mut applied = 0usize;
+        let mut latest_ts: Option<String> = None;
+
+        // v0.7.0 M3 — when a SAL store handle is supplied (postgres-
+        // backed daemons) we dispatch each row through
+        // `store.apply_remote_memory`, which routes the write to the
+        // active backend instead of always landing in the local sqlite
+        // file. Default-None preserves the legacy behavior (sqlite via
+        // `db::insert_if_newer`) for daemons that don't yet have a SAL
+        // handle plumbed through (e.g. v0.6.x configurations).
+        if let Some(store) = store {
+            // #910 — federation catchup is operator-level (peer sync);
+            // it MUST round-trip every row regardless of metadata.scope
+            // so the receiving daemon has the full snapshot. Use the
+            // admin builder to bypass the SAL visibility filter.
+            let ctx = crate::store::CallerContext::for_admin(
+                crate::identity::sentinels::FEDERATION_CATCHUP,
+            );
+            for raw in &memories {
+                let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log_catchup_unparseable_memory(&peer.id, e);
+                        continue;
+                    }
+                };
+                if crate::validate::validate_memory(&mem).is_err() {
+                    continue;
+                }
+                if latest_ts
+                    .as_deref()
+                    .is_none_or(|cur| mem.updated_at.as_str() > cur)
+                {
+                    latest_ts = Some(mem.updated_at.clone());
+                }
+                match store.apply_remote_memory(&ctx, &mem).await {
+                    Ok(_) => applied += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            "catchup: apply_remote_memory failed for peer {}: {e}",
+                            peer.id
+                        );
+                    }
+                }
+            }
+            if let Some(ts) = latest_ts.as_deref() {
+                let lock = db.lock().await;
+                if let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts) {
+                    log_catchup_sync_state_observe_failed(&peer.id, e);
+                }
+            }
+        } else {
+            let lock = db.lock().await;
+            for raw in &memories {
+                let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log_catchup_unparseable_memory(&peer.id, e);
+                        continue;
+                    }
+                };
+                if crate::validate::validate_memory(&mem).is_err() {
+                    continue;
+                }
+                if latest_ts
+                    .as_deref()
+                    .is_none_or(|cur| mem.updated_at.as_str() > cur)
+                {
+                    latest_ts = Some(mem.updated_at.clone());
+                }
+                if crate::db::insert_if_newer(&lock.0, &mem).is_ok() {
+                    applied += 1;
+                }
+            }
+            if let Some(ts) = latest_ts.as_deref()
+                && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts)
+            {
+                log_catchup_sync_state_observe_failed(&peer.id, e);
+            }
+        }
+
+        if applied > 0 {
+            tracing::info!(
+                "catchup: applied {applied} memories from peer {} (since={})",
+                peer.id,
+                since_opt.as_deref().unwrap_or("<full-snapshot>"),
+            );
+        }
+    }
+}
+
+/// v0.7.0 M3 — non-SAL fallback. Default sqlite-only path is preserved
+/// verbatim for builds without `--features sal`. The signature parallels
+/// the SAL variant minus the `store` parameter so callers compiled
+/// against the legacy posture continue to dispatch through the local
+/// rusqlite connection.
+#[cfg(not(feature = "sal"))]
+async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db) {
+    let local_id = config.sender_agent_id.clone();
+    for peer in &config.peers {
+        let base = peer
+            .sync_push_url
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
+            .to_string();
+
+        let since_opt: Option<String> = {
+            let lock = db.lock().await;
+            match crate::db::sync_state_load(&lock.0, &local_id) {
+                Ok(clock) => clock.entries.get(&peer.id).cloned(),
+                Err(_) => None,
+            }
+        };
+
+        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
+
+        // v0.7.0 #239 — attach `x-peer-id` so the peer's per-peer
+        // namespace allowlist can scope the returned rows (sqlite
+        // catchup path, parity with the SAL-routed loop above).
+        //
+        // #935 (v0.7.0 Track D, 2026-05-20): attach `x-api-key` +
+        // `x-agent-id` for parity with the SAL branch and
+        // `sync_cycle_once`. See the matching block in
+        // `catchup_once_with_store` for the full RCA.
+        let mut req = config
+            .client
+            .get(&url)
+            .header(crate::HEADER_AGENT_ID, local_id.as_str())
+            .header(
+                crate::federation::peer_attestation::PEER_ID_HEADER,
+                local_id.as_str(),
+            );
+        if let Some(ref key) = config.api_key {
+            req = req.header(crate::HEADER_API_KEY, key);
+        }
+        let resp = match req.send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                log_catchup_http_skip(&peer.id, r.status());
+                continue;
+            }
+            Err(e) => {
+                log_catchup_unreachable(&peer.id, e);
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                log_catchup_unparseable_body(&peer.id, e);
+                continue;
+            }
+        };
+
+        let memories = match body.get("memories").and_then(|v| v.as_array()) {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        // #935 — emit the canonical "pull: <peer> ok" success line
+        // pinned by `tests/federation_catchup_api_key.rs`.
+        log_catchup_pull_ok(&peer.id, memories.len());
+
+        if memories.is_empty() {
+            continue;
+        }
+
+        let mut applied = 0usize;
+        let mut latest_ts: Option<String> = None;
+        {
+            let lock = db.lock().await;
+            for raw in &memories {
+                let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log_catchup_unparseable_memory(&peer.id, e);
+                        continue;
+                    }
+                };
+                if crate::validate::validate_memory(&mem).is_err() {
+                    continue;
+                }
+                if latest_ts
+                    .as_deref()
+                    .is_none_or(|cur| mem.updated_at.as_str() > cur)
+                {
+                    latest_ts = Some(mem.updated_at.clone());
+                }
+                if crate::db::insert_if_newer(&lock.0, &mem).is_ok() {
+                    applied += 1;
+                }
+            }
+            if let Some(ts) = latest_ts.as_deref()
+                && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts)
+            {
+                log_catchup_sync_state_observe_failed(&peer.id, e);
+            }
+        }
+
+        if applied > 0 {
+            tracing::info!(
+                "catchup: applied {applied} memories from peer {} (since={})",
+                peer.id,
+                since_opt.as_deref().unwrap_or("<full-snapshot>"),
+            );
+        }
+    }
+}
+
+/// v0.7.0 Track D #935 — minimal test-driver helper for the
+/// catchup GET path. Used by `tests/federation_catchup_api_key.rs`
+/// to assert the outbound request headers without bringing the
+/// full sqlite `Db` / `MemoryStore` plumbing into the test scope.
+///
+/// The helper fires ONE GET against the configured peer's
+/// `/api/v1/sync/since` endpoint using the exact same header set
+/// `catchup_once_with_store` does (including the #935 `x-api-key`
+/// forward when `config.api_key.is_some()`), then logs the
+/// canonical `catchup: pull: <peer-id> ok` line on success so
+/// regression coverage can pin the wire-level wording.
+///
+/// This is a no-side-effect probe: no memories are applied, no
+/// sync-state is advanced. Production code MUST continue to call
+/// `spawn_catchup_loop_with_store` (SAL) or `spawn_catchup_loop`
+/// (sqlite-only) — this helper is `#[cfg(any(test, ...))]`-gated
+/// for the integration test only.
+#[doc(hidden)]
+pub async fn catchup_once_for_tests(config: &FederationConfig) {
+    let local_id = config.sender_agent_id.clone();
+    for peer in &config.peers {
+        let base = peer
+            .sync_push_url
+            .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
+            .to_string();
+        let url = sync_since_url(&base, &local_id, None);
+
+        let mut req = config
+            .client
+            .get(&url)
+            .header(crate::HEADER_AGENT_ID, local_id.as_str())
+            .header(
+                crate::federation::peer_attestation::PEER_ID_HEADER,
+                local_id.as_str(),
+            );
+        if let Some(ref key) = config.api_key {
+            req = req.header(crate::HEADER_API_KEY, key);
+        }
+        let resp = match req.send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                log_catchup_http_skip(&peer.id, r.status());
+                continue;
+            }
+            Err(e) => {
+                log_catchup_unreachable(&peer.id, e);
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                log_catchup_unparseable_body(&peer.id, e);
+                continue;
+            }
+        };
+        let memories = body
+            .get("memories")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        log_catchup_pull_ok(&peer.id, memories.len());
+    }
+}
+
+/// Build the outbound `/api/v1/sync/since` catch-up URL for `base`
+/// (the peer base URL with the push suffix already trimmed): optional
+/// `since` vector-clock cursor + the local peer id. ONE builder so the
+/// three catch-up paths (store-backed, legacy, test harness) cannot
+/// drift on the query shape (#1558 batch 4).
+fn sync_since_url(base: &str, local_id: &str, since: Option<&str>) -> String {
+    match since {
+        Some(s) => format!(
+            "{base}{}?since={}&peer={local_id}",
+            crate::handlers::routes::SYNC_SINCE,
+            urlencoding_encode(s)
+        ),
+        None => format!(
+            "{base}{}?peer={local_id}",
+            crate::handlers::routes::SYNC_SINCE
+        ),
+    }
+}
+
+// Minimal RFC 3986 percent-encoder for the `since` timestamp. Only covers
+// what RFC 3339 + our namespace/id charsets can produce. We intentionally
+// avoid pulling in a url-encoding crate for a 12-character string.
+pub(super) fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 6);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}

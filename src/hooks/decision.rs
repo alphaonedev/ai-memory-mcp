@@ -77,13 +77,12 @@ use super::events::{HookEvent, MemoryDelta};
 /// See the module-level documentation for the JSON wire contract
 /// and the runtime validation rules.
 ///
-/// `PartialEq` is hand-rolled rather than derived because
-/// [`MemoryDelta`] (the inner of `Modify`) holds a
-/// `serde_json::Value` and `Value` is not itself `Eq`. Equality
-/// for `Modify` falls back to a JSON-canonical comparison so
-/// tests can assert structural equality without caring about
-/// field ordering inside the metadata bag.
-#[derive(Debug, Clone, Serialize)]
+/// #969 — `PartialEq` is now derived. Pre-#969 it was hand-rolled
+/// on the (mistaken) premise that `serde_json::Value` was not
+/// `PartialEq`; it IS (serde_json 1.0 derives `Eq + PartialEq + Hash`
+/// on `Value`). The real blocker for `derive(Eq)` is `Option<f64>`
+/// inside `MemoryDelta`, which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HookDecision {
     /// Continue the memory operation unchanged. Wire shape:
@@ -120,45 +119,9 @@ pub enum HookDecision {
 /// [`MemoryDelta`] fields onto the decision object — keeping the
 /// delta nested means future expansions (extra metadata, hook
 /// trace ids) won't collide with `MemoryDelta` field names.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModifyPayload {
     pub delta: MemoryDelta,
-}
-
-impl PartialEq for HookDecision {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (HookDecision::Allow, HookDecision::Allow) => true,
-            (HookDecision::Modify(a), HookDecision::Modify(b)) => {
-                // MemoryDelta carries a serde_json::Value (metadata)
-                // which is not Eq; compare via canonical JSON.
-                serde_json::to_value(&a.delta).ok() == serde_json::to_value(&b.delta).ok()
-            }
-            (
-                HookDecision::Deny {
-                    reason: r1,
-                    code: c1,
-                },
-                HookDecision::Deny {
-                    reason: r2,
-                    code: c2,
-                },
-            ) => r1 == r2 && c1 == c2,
-            (
-                HookDecision::AskUser {
-                    prompt: p1,
-                    options: o1,
-                    default: d1,
-                },
-                HookDecision::AskUser {
-                    prompt: p2,
-                    options: o2,
-                    default: d2,
-                },
-            ) => p1 == p2 && o1 == o2 && d1 == d2,
-            _ => false,
-        }
-    }
 }
 
 fn default_deny_code() -> i32 {
@@ -245,6 +208,12 @@ impl HookDecision {
     /// JSON object, when `action` is unknown, when a required
     /// field is missing, or when the JSON itself is syntactically
     /// invalid.
+    /// `"<field>" must be a string` — shared malformed-field shape
+    /// (#1558 batch 6; single synthesis site for the repeated message).
+    fn malformed_must_be_string(field: &str) -> DecisionParseError {
+        DecisionParseError::Malformed(format!("\"{field}\" must be a string"))
+    }
+
     pub fn parse(line: &str) -> Result<Self, DecisionParseError> {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed == "{}" {
@@ -265,7 +234,7 @@ impl HookDecision {
             .get("action")
             .ok_or(DecisionParseError::MissingAction)?
             .as_str()
-            .ok_or_else(|| DecisionParseError::Malformed("\"action\" must be a string".into()))?;
+            .ok_or_else(|| Self::malformed_must_be_string("action"))?;
 
         match action {
             "allow" => Ok(HookDecision::Allow),
@@ -286,9 +255,7 @@ impl HookDecision {
                         field: "reason",
                     })?
                     .as_str()
-                    .ok_or_else(|| {
-                        DecisionParseError::Malformed("\"reason\" must be a string".into())
-                    })?
+                    .ok_or_else(|| Self::malformed_must_be_string("reason"))?
                     .to_string();
                 let code = obj
                     .get("code")
@@ -306,9 +273,7 @@ impl HookDecision {
                         field: "prompt",
                     })?
                     .as_str()
-                    .ok_or_else(|| {
-                        DecisionParseError::Malformed("\"prompt\" must be a string".into())
-                    })?
+                    .ok_or_else(|| Self::malformed_must_be_string("prompt"))?
                     .to_string();
                 let options_v = obj.get("options").ok_or(DecisionParseError::MissingField {
                     action: "ask_user",
@@ -321,9 +286,7 @@ impl HookDecision {
                     Some(Value::Null) => None,
                     Some(v) => Some(
                         v.as_str()
-                            .ok_or_else(|| {
-                                DecisionParseError::Malformed("\"default\" must be a string".into())
-                            })?
+                            .ok_or_else(|| Self::malformed_must_be_string("default"))?
                             .to_string(),
                     ),
                 };
@@ -365,24 +328,57 @@ impl HookDecision {
 /// because the runtime guard is the only consumer today; G5's
 /// chain runner will reach for it the same way when wiring
 /// `Modify` accumulation through the pipeline.
+///
+/// ARCH-7 (FX-C4-batch2, 2026-05-26): the body uses an EXHAUSTIVE
+/// `match` over `HookEvent` (rather than the prior `matches!` macro)
+/// so adding a 26th hook variant fails compilation at THIS function
+/// rather than silently defaulting the new variant to the
+/// "post-event" treatment. The `#[deny(unreachable_patterns)]` outer
+/// gate catches the inverse failure mode (a duplicate / dead arm
+/// signalling a stale match table). The test
+/// `arch_7_is_pre_event_exhaustive_on_all_known_variants` in the
+/// inline tests below + `tests/hook_pipeline_exhaustiveness.rs`
+/// pin the coverage.
 #[must_use]
+#[deny(unreachable_patterns)]
 pub fn is_pre_event(event: HookEvent) -> bool {
-    matches!(
-        event,
+    match event {
+        // ---- pre-events: `Modify` decisions ARE honoured -----------------
         HookEvent::PreStore
-            | HookEvent::PreRecall
-            | HookEvent::PreSearch
-            | HookEvent::PreDelete
-            | HookEvent::PrePromote
-            | HookEvent::PreLink
-            | HookEvent::PreConsolidate
-            | HookEvent::PreGovernanceDecision
-            | HookEvent::PreArchive
-            | HookEvent::PreTranscriptStore
-            // G10: hot-path query expansion fires before the recall
-            // call — Modify decisions rewrite the in-flight query.
-            | HookEvent::PreRecallExpand
-    )
+        | HookEvent::PreRecall
+        | HookEvent::PreSearch
+        | HookEvent::PreDelete
+        | HookEvent::PrePromote
+        | HookEvent::PreLink
+        | HookEvent::PreConsolidate
+        | HookEvent::PreGovernanceDecision
+        | HookEvent::PreArchive
+        | HookEvent::PreTranscriptStore
+        // G10: hot-path query expansion fires before the recall
+        // call — Modify decisions rewrite the in-flight query.
+        | HookEvent::PreRecallExpand
+        // v0.7.0 Task 6/8: pre_reflect fires before the depth-cap
+        // check so a Deny veto refuses the reflection BEFORE the
+        // substrate evaluates `effective_max_reflection_depth()`.
+        | HookEvent::PreReflect
+        // v0.7.0 L1-7: pre_compaction fires before the cluster is
+        // processed by a CompactionPass — Deny aborts the cluster.
+        | HookEvent::PreCompaction => true,
+
+        // ---- post-/on- events: `Modify` decisions are degraded to Allow --
+        HookEvent::PostStore
+        | HookEvent::PostRecall
+        | HookEvent::PostSearch
+        | HookEvent::PostDelete
+        | HookEvent::PostPromote
+        | HookEvent::PostLink
+        | HookEvent::PostConsolidate
+        | HookEvent::PostGovernanceDecision
+        | HookEvent::OnIndexEviction
+        | HookEvent::PostTranscriptStore
+        | HookEvent::PostReflect
+        | HookEvent::OnCompactionRollback => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +651,8 @@ mod tests {
 
     #[test]
     fn is_pre_event_classifies_all_variants() {
-        // Pre- variants (G10 added PreRecallExpand)
+        // Pre- variants (G10 added PreRecallExpand; v0.7.0 Task 6/8
+        // added PreReflect; L1-7 added PreCompaction).
         for ev in [
             HookEvent::PreStore,
             HookEvent::PreRecall,
@@ -668,10 +665,13 @@ mod tests {
             HookEvent::PreArchive,
             HookEvent::PreTranscriptStore,
             HookEvent::PreRecallExpand,
+            HookEvent::PreReflect,
+            HookEvent::PreCompaction,
         ] {
             assert!(is_pre_event(ev), "expected {ev:?} to be a pre- event");
         }
-        // Post- + on- variants
+        // Post- + on- variants (v0.7.0 Task 6/8 added PostReflect;
+        // L1-7 added OnCompactionRollback — notify-only).
         for ev in [
             HookEvent::PostStore,
             HookEvent::PostRecall,
@@ -683,6 +683,8 @@ mod tests {
             HookEvent::PostGovernanceDecision,
             HookEvent::OnIndexEviction,
             HookEvent::PostTranscriptStore,
+            HookEvent::PostReflect,
+            HookEvent::OnCompactionRollback,
         ] {
             assert!(!is_pre_event(ev), "expected {ev:?} to be a post-/on- event");
         }
@@ -710,5 +712,166 @@ mod tests {
                 "Display missing context for {e:?}: {s}"
             );
         }
+    }
+
+    #[test]
+    fn parse_action_must_be_string() {
+        let err = HookDecision::parse(r#"{"action": 42}"#).unwrap_err();
+        match err {
+            DecisionParseError::Malformed(m) => assert!(m.contains("must be a string")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_deny_reason_must_be_string() {
+        let err = HookDecision::parse(r#"{"action":"deny","reason": 99}"#).unwrap_err();
+        match err {
+            DecisionParseError::Malformed(m) => assert!(m.contains("reason")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_user_prompt_must_be_string() {
+        let err =
+            HookDecision::parse(r#"{"action":"ask_user","prompt":1,"options":["a"]}"#).unwrap_err();
+        match err {
+            DecisionParseError::Malformed(m) => assert!(m.contains("prompt")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_user_default_must_be_string_when_present() {
+        let err = HookDecision::parse(
+            r#"{"action":"ask_user","prompt":"p","options":["a"],"default":42}"#,
+        )
+        .unwrap_err();
+        match err {
+            DecisionParseError::Malformed(m) => assert!(m.contains("default")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_user_default_null_is_none() {
+        let d = HookDecision::parse(
+            r#"{"action":"ask_user","prompt":"q","options":["yes","no"],"default":null}"#,
+        )
+        .expect("parse");
+        match d {
+            HookDecision::AskUser { default, .. } => assert!(default.is_none()),
+            other => panic!("expected AskUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_modify_with_invalid_delta_returns_malformed() {
+        // delta must deserialise into MemoryDelta; an entirely wrong shape
+        // forces the serde_json::from_value error path.
+        let err = HookDecision::parse(r#"{"action":"modify","delta": 7}"#).unwrap_err();
+        match err {
+            DecisionParseError::Malformed(_) => {}
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_user_options_must_be_array_of_strings() {
+        let err = HookDecision::parse(r#"{"action":"ask_user","prompt":"p","options":"nope"}"#)
+            .unwrap_err();
+        match err {
+            DecisionParseError::Malformed(_) => {}
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_deny_code_out_of_i32_range_falls_back_to_default() {
+        // Code larger than i32::MAX falls back to the default 403.
+        let raw = r#"{"action":"deny","reason":"big code","code": 9999999999}"#;
+        let d = HookDecision::parse(raw).expect("parse");
+        match d {
+            HookDecision::Deny { code, .. } => assert_eq!(code, 403),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_decision_deserialize_via_serde_routes_through_parse() {
+        // The custom Deserialize impl funnels through `parse`.
+        let raw = r#"{"action":"allow"}"#;
+        let d: HookDecision = serde_json::from_str(raw).expect("decode");
+        assert_eq!(d, HookDecision::Allow);
+    }
+
+    #[test]
+    fn hook_decision_deserialize_unknown_action_returns_serde_error() {
+        let raw = r#"{"action":"explode"}"#;
+        let r: Result<HookDecision, _> = serde_json::from_str(raw);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn hook_decision_partial_eq_modify_with_equal_deltas() {
+        let a = HookDecision::Modify(ModifyPayload {
+            delta: MemoryDelta {
+                tags: Some(vec!["x".into()]),
+                ..Default::default()
+            },
+        });
+        let b = HookDecision::Modify(ModifyPayload {
+            delta: MemoryDelta {
+                tags: Some(vec!["x".into()]),
+                ..Default::default()
+            },
+        });
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hook_decision_partial_eq_modify_with_different_deltas() {
+        let a = HookDecision::Modify(ModifyPayload {
+            delta: MemoryDelta {
+                tags: Some(vec!["x".into()]),
+                ..Default::default()
+            },
+        });
+        let b = HookDecision::Modify(ModifyPayload {
+            delta: MemoryDelta {
+                tags: Some(vec!["y".into()]),
+                ..Default::default()
+            },
+        });
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hook_decision_partial_eq_distinct_variants() {
+        assert_ne!(
+            HookDecision::Allow,
+            HookDecision::Deny {
+                reason: "x".into(),
+                code: 403,
+            }
+        );
+        assert_ne!(
+            HookDecision::Deny {
+                reason: "a".into(),
+                code: 403,
+            },
+            HookDecision::AskUser {
+                prompt: "p".into(),
+                options: vec!["a".into()],
+                default: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_payload_rejected_as_not_object() {
+        let err = HookDecision::parse("[1,2,3]").unwrap_err();
+        assert!(matches!(err, DecisionParseError::NotAnObject));
     }
 }

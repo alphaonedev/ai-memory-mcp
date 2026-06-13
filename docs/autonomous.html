@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Autonomous — agent intelligence powered by Gemma 4</title>
-<meta name="description" content="ai-memory v0.6.3.1 autonomous features. Auto-tagging, auto-consolidation, query expansion, contradiction detection, memory reflection, session start. All powered by Google's open-source Gemma 4 served via Ollama. Local-first, no SaaS, no API keys.">
+<meta name="description" content="ai-memory v0.7.0 autonomous features. Auto-tagging, auto-consolidation, query expansion, contradiction detection, memory reflection, session start. All powered by Google's open-source Gemma 4 served via Ollama. Local-first, no SaaS, no API keys.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/autonomous.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--google:#4285f4;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -99,6 +99,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -108,11 +119,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Autonomous</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -135,6 +149,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -146,6 +161,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -155,33 +173,101 @@ footer a{color:var(--text-muted)}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
 <section class="hero">
   <h1>Autonomous-tier intelligence.</h1>
-  <p class="tagline">Auto-tagging. Auto-consolidation. Query expansion. Contradiction detection. Memory reflection. Six features that turn ai-memory from a store into an agent — every one local, every one running on Google's open-source Gemma 4 via Ollama. <strong>No SaaS. No API keys. No content leaving the host.</strong></p>
+  <p class="tagline">Auto-tagging. Auto-consolidation. Query expansion. Contradiction detection. Memory reflection. Six features that turn ai-memory from a store into an agent &mdash; <strong>local-first by default</strong> (Gemma via Ollama) and, as of v0.7.0 (#1067 + #1146), <strong>provider-agnostic by config</strong>: route any of these through xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or any other OpenAI-compatible endpoint via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code>. Local stays the default for the privacy story below; cloud unlocks the CPU-only and cellphone postures. <strong>Canonical schema (single source of truth, every surface):</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>. <strong>Per-vendor recipes (config.toml + MCP env-block override):</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/llm-backends.md">integrations/llm-backends.md</a>.</p>
   <div class="pills">
-    <span class="pill">Gemma 4 E2B / E4B</span>
-    <span class="pill">Ollama-served</span>
-    <span class="pill">on-device</span>
+    <span class="pill">Ollama local (default)</span>
+    <span class="pill">15+ cloud vendors via #1067</span>
+    <span class="pill">CPU-only mode</span>
     <span class="pill">no telemetry</span>
   </div>
 </section>
@@ -209,7 +295,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The four feature tiers</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Pick the model size your hardware allows.</h2>
-    <p class="lede">Autonomous features unlock as the operator allocates more memory to the daemon. Keyword tier needs zero extra RAM — just FTS5. Semantic tier loads embeddings (~256 MB). Smart tier adds Gemma 4 E2B (~1 GB). Autonomous tier upgrades to Gemma 4 E4B + cross-encoder reranker (~4 GB total).</p>
+    <p class="lede">Autonomous features unlock as the operator allocates more memory to the daemon. Keyword tier needs zero extra RAM — just FTS5. Semantic tier loads embeddings (~256 MB). Smart tier adds Gemma 4 E2B (~1 GB). Autonomous tier upgrades to Gemma 4 E4B + cross-encoder reranker (~4 GB total). <strong>The RAM figures below are the local-model path</strong> (Ollama serving Gemma + a local embedder); when you point <code>[llm]</code> + <code>[embeddings]</code> at a remote API (see <a href="#no-gpu">No GPU required</a> below), the daemon host carries no model weight at all — only the ~90 MB CPU cross-encoder if reranking is enabled.</p>
     <div class="tier-cards">
       <div class="tier kw">
         <div class="nm">Keyword</div>
@@ -254,8 +340,8 @@ footer a{color:var(--text-muted)}
         <div class="feats">
           <span class="on">▸ all of Smart</span>
           <span class="on">▸ cross_encoder_reranking</span>
-          <span class="on">▸ memory_reflection (planned, v0.7+)</span>
-          <span class="on">▸ session_start (LLM-driven)</span>
+          <span class="on">▸ memory_reflect (SHIPPED at v0.7.0 — recursive learning with reflection_depth cap)</span>
+          <span class="on">▸ session_start boot recall</span>
         </div>
       </div>
     </div>
@@ -288,7 +374,7 @@ footer a{color:var(--text-muted)}
   <span class="key">"namespace"</span>: <span class="val">"alphaone/eng"</span>
 }
 
-<span class="ok">→ {"consolidated_id": "…", "summary": "<Gemma 4 generates a coherent summary>",
+<span class="ok">→ {"consolidated_id": "…", "summary": "&lt;Gemma 4 generates a coherent summary&gt;",
    "source_count": 12, "links_created": 12}  // each source → derived_from edge</span></div>
     </div>
 
@@ -330,19 +416,17 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="feature au">
-      <div class="feature-head"><span class="feature-name">memory_session_start</span><span class="feature-need au">Autonomous tier (LLM-driven)</span></div>
-      <div class="feature-desc">Run at the start of an agent session. Recalls the most relevant memories given the session's stated context, optionally LLM-summarized into a session brief. The agent's "morning briefing" — pulls in the right context without explicit recall calls peppered through the prompt.</div>
+      <div class="feature-head"><span class="feature-name">memory_session_start</span><span class="feature-need au">All tiers</span></div>
+      <div class="feature-desc">Run at the start of an agent session. Auto-recalls the recent + high-priority memories (optionally scoped to a namespace) so the agent boots with context — the "morning briefing" without explicit recall calls peppered through the prompt. Default output is token-efficient <code>toon_compact</code>.</div>
       <div class="snip"><span class="cm">// MCP — memory_session_start</span>
 {
-  <span class="key">"context"</span>:    <span class="val">"continuing the q3 OKR review thread from yesterday"</span>,
-  <span class="key">"namespace"</span>:  <span class="val">"alphaone/eng/leadership"</span>,
-  <span class="key">"as_agent"</span>:   <span class="val">"alphaone/eng/leadership/alice"</span>,
-  <span class="key">"summarize"</span>:  <span class="ok">true</span>                       <span class="cm">// LLM-generate a brief from the recall hits</span>
+  <span class="key">"namespace"</span>:  <span class="val">"alphaone/eng/leadership"</span>,   <span class="cm">// optional filter</span>
+  <span class="key">"limit"</span>:      <span class="num">10</span>,                          <span class="cm">// default 10 · cap 50</span>
+  <span class="key">"format"</span>:     <span class="val">"toon_compact"</span>               <span class="cm">// json | toon | toon_compact</span>
 }
 
-<span class="ok">→ {"recalled": [12 top memories, ranked, with budget_tokens cap respected],
-   "session_brief": "Yesterday's discussion focused on..." // Gemma 4 summary
-  }</span></div>
+<span class="ok">→ count:10|mode:session_start
+   memories[id|title|tier|namespace|priority|score|tags|agent_id]: …</span></div>
     </div>
   </div>
 </section>
@@ -374,27 +458,110 @@ footer a{color:var(--text-muted)}
 <span class="cm"># or for the smaller Smart-tier model:</span>
 <span class="ok">$</span> ollama pull gemma4:e2b
 
-<span class="cm"># 3. Configure ai-memory for autonomous tier</span>
+<span class="cm"># 3. Configure ai-memory for autonomous tier (canonical v0.7.x schema-v2</span>
+<span class="cm">#    sectioned form, per CONFIG_SCHEMA.md / #1146). The legacy flat shape</span>
+<span class="cm">#    (`ollama_url = "..."` / `cross_encoder = true` at the top level) still</span>
+<span class="cm">#    parses for backward compat — run `ai-memory config migrate` to rewrite</span>
+<span class="cm">#    in v2 shape (`.bak.&lt;ts&gt;` saved); legacy fields are removed in v0.8.0.</span>
 <span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF
+schema_version = <span class="num">2</span>
 tier = <span class="val">"autonomous"</span>
-ollama_url = <span class="val">"http://localhost:11434"</span>
-cross_encoder = <span class="ok">true</span>
+
+[llm]
+backend = <span class="val">"ollama"</span>
+model   = <span class="val">"gemma4:e4b"</span>     <span class="cm"># the model pulled in step 2 (compiled default: gemma3:4b)</span>
+base_url = <span class="val">"http://localhost:11434"</span>
+
+[embeddings]
+backend = <span class="val">"ollama"</span>          <span class="cm"># #1598: or any API vendor alias / "openai-compatible"</span>
+url     = <span class="val">"http://localhost:11434"</span>
+model   = <span class="val">"nomic-embed-text-v1.5"</span>
+
+[reranker]
+enabled = <span class="ok">true</span>
+model   = <span class="val">"ms-marco-MiniLM-L-6-v2"</span>
 EOF
 
 <span class="cm"># 4. Start the daemon</span>
 <span class="ok">$</span> ai-memory serve
 
-<span class="cm"># Verify the autonomous features came online:</span>
-<span class="ok">$</span> ai-memory capabilities
+<span class="cm"># Verify the autonomous features came online (HTTP capabilities surface,
+# or the memory_capabilities MCP tool, or `ai-memory doctor`):</span>
+<span class="ok">$</span> curl -s http://127.0.0.1:9077/api/v1/capabilities
 <span class="ok">→ "tier": "autonomous"</span>
-<span class="ok">→ "features": { "auto_tag": true, "auto_consolidation": true,
-                  "cross_encoder_reranking": true, "embedder_loaded": true }</span></div>
+<span class="ok">→ "features": { "auto_tagging": true, "auto_consolidation": true,
+                  "cross_encoder_reranking": true, "semantic_search": true, … }</span></div>
     <p class="lede" style="margin-top:1rem">From this point on, the autonomous MCP tools are live. Wire them into your AI client (Claude Code, Cursor, Codex, Continue, etc.) — see <a href="integrations.html" style="color:var(--p1)">integrations atlas</a>.</p>
   </div>
 </section>
 
+<section id="no-gpu">
+  <div class="container">
+    <span class="eyebrow">No GPU required — any LLM backend</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">Autonomous mode on CPU-only or air-gapped hosts — point <code>[llm]</code> at any LLM you have API access to.</h2>
+    <p class="lede">Nothing on this page is hard-wired to a GPU, to Ollama, or to Gemma. The Ollama + Gemma quick-start above is the <strong>local-first default</strong>, not a requirement. As of v0.7.0 (#1067 + #1146) <strong>any LLM reachable over an HTTP endpoint can drive every autonomous feature</strong> — wherever you have API access, wherever you run on hosts with no GPUs, and you want to run ai-memory in autonomous mode with <code>--profile full</code>. The backend is a config choice (<code>[llm]</code> in <code>config.toml</code> or the <code>AI_MEMORY_LLM_*</code> env vars), resolved through the canonical precedence ladder <code>CLI&nbsp;&gt;&nbsp;env&nbsp;&gt;&nbsp;[llm]&nbsp;&gt;&nbsp;legacy&nbsp;&gt;&nbsp;default</code>.</p>
+    <p class="lede" style="margin-top:.5rem">Two CPU-only / air-gap postures below. The model names are <strong>examples, not requirements</strong> — substitute whatever model your provider or internal endpoint serves.</p>
+
+    <h3 style="font-family:var(--font-sans);font-size:1.15rem;margin-top:1.75rem">A. Cloud API — no local model, no GPU (OpenRouter shown as one low-cost example)</h3>
+    <div class="snip"><span class="cm"># Any OpenAI-compatible vendor works (openai | xai | anthropic | gemini |</span>
+<span class="cm"># deepseek | kimi | qwen | mistral | groq | together | cerebras |</span>
+<span class="cm"># openrouter | fireworks | …). OpenRouter + a Gemma 4 chat model is shown</span>
+<span class="cm"># here only as a low-cost EXAMPLE — swap `model` for any model the vendor serves.</span>
+<span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF
+schema_version = <span class="num">2</span>
+tier = <span class="val">"autonomous"</span>
+
+[llm]
+backend     = <span class="val">"openrouter"</span>
+model       = <span class="val">"google/gemma-4-26b-it"</span>   <span class="cm"># example; any served model is fine</span>
+api_key_env = <span class="val">"OPENROUTER_API_KEY"</span>      <span class="cm"># env-var reference — never inline the key</span>
+
+[embeddings]
+backend = <span class="val">"openai-compatible"</span>          <span class="cm"># CPU-only remote embeddings — no local model</span>
+url     = <span class="val">"https://api.openai.com/v1"</span>
+model   = <span class="val">"text-embedding-3-small"</span>
+
+[reranker]
+enabled = <span class="ok">true</span>
+model   = <span class="val">"ms-marco-MiniLM-L-6-v2"</span>     <span class="cm"># ~90 MB CPU cross-encoder; no GPU</span>
+EOF
+
+<span class="ok">$</span> export OPENROUTER_API_KEY=<span class="val">"sk-or-…"</span>     <span class="cm"># secret via env, never written to config</span>
+<span class="ok">$</span> ai-memory serve --profile full
+<span class="ok">$</span> ai-memory doctor                       <span class="cm"># LLM Reachability (#1146) — confirms which layer won</span>
+<span class="ok">→ "tier": "autonomous"</span></div>
+
+    <h3 style="font-family:var(--font-sans);font-size:1.15rem;margin-top:1.5rem">B. Air-gapped — internal HA inference endpoint (no public internet, no GPU on the ai-memory host)</h3>
+    <div class="snip"><span class="cm"># The ai-memory host needs no GPU and no public egress — it speaks HTTP to an</span>
+<span class="cm"># internal load-balanced inference endpoint (vLLM / llama.cpp server / TGI /</span>
+<span class="cm"># your own gateway). `openai-compatible` requires an explicit base_url.</span>
+<span class="ok">$</span> cat &gt; ~/.config/ai-memory/config.toml &lt;&lt;EOF
+schema_version = <span class="num">2</span>
+tier = <span class="val">"autonomous"</span>
+
+[llm]
+backend  = <span class="val">"openai-compatible"</span>
+model    = <span class="val">"gemma-4-26b"</span>                       <span class="cm"># example; whatever your gateway serves</span>
+base_url = <span class="val">"https://llm-ha.internal.corp/v1"</span>    <span class="cm"># internal HA VIP, mTLS terminated upstream</span>
+api_key_env = <span class="val">"AI_MEMORY_LLM_API_KEY"</span>
+
+[embeddings]
+backend = <span class="val">"openai-compatible"</span>
+url     = <span class="val">"https://llm-ha.internal.corp/v1"</span>
+model   = <span class="val">"nomic-embed-text-v1.5"</span>
+
+[reranker]
+enabled = <span class="ok">true</span>
+model   = <span class="val">"ms-marco-MiniLM-L-6-v2"</span>
+EOF
+
+<span class="ok">$</span> ai-memory serve --profile full</div>
+    <p class="lede" style="margin-top:1rem"><strong>Secrets discipline:</strong> the key is referenced by env-var name (<code>api_key_env</code>) or by a mode-0400 file (<code>api_key_file</code>) — an inline <code>api_key = "…"</code> literal is rejected at parse time. <strong>Canonical schema + per-vendor recipes:</strong> <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a> · <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/llm-backends.md">integrations/llm-backends.md</a>.</p>
+  </div>
+</section>
+
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · LLM bridge in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/llm.rs">llm.rs</a> · models served via <a href="https://ollama.com">Ollama</a></p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · LLM bridge in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/llm.rs">llm.rs</a> · models served via <a href="https://ollama.com">Ollama</a> by default, or <a href="#no-gpu">any OpenAI-compatible endpoint</a> (cloud or air-gap, no GPU)</p>
   <p style="margin-top:.7rem;color:var(--google)">▸ <strong>Thanks to Google for open-sourcing Gemma 4.</strong> The autonomous tier of ai-memory is built on the foundation Gemma provides.</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="credits.html">Credits</a></p>
 </footer>

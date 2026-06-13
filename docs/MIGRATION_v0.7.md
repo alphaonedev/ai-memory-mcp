@@ -1,8 +1,8 @@
 # Migrating from v0.6.4 to v0.7.0
 
-**v0.7.0 — `attested-cortex`** rolls together the v0.6.5 cortex-fluent legibility work with ROADMAP2 §7.3's full v0.7 trust + A2A maturity scope. The substrate becomes both **more articulate** (capabilities v3, named loaders, compacted schemas) and **cryptographically trustworthy** (Ed25519 attestation, sidechain transcripts, programmable hook pipeline, enforced namespace inheritance).
+**v0.7.0 — `attested-cortex`** rolls together the v0.6.5 cortex-fluent legibility work with ROADMAP §7.3's full v0.7 trust + A2A maturity scope, **plus** (per operator directive 2026-05-09) the originally-v0.7.1 postgres+AGE first-class work, **plus** the post-grand-slam ship-readiness wave (Batman Forms 1-6 + 7th-form Option-B foundation + QW-1/2/3 + reconciliation security sweep). The substrate becomes both **more articulate** (capabilities v3, named loaders, compacted schemas, Batman `MemoryKind` vocabulary, persona/atomisation/multistep-ingest primitives) and **cryptographically trustworthy** (Ed25519 attestation, sidechain transcripts, programmable 25-event hook pipeline, enforced namespace inheritance, V-4 cross-row signed-events hash chain).
 
-> **Status:** v0.7.0 migration draft — refined as tracks G/H/I/J/K land. Sections marked TODO point at work not yet merged.
+> **Status:** Released 2026-05-15 at HEAD `c9472c1`. v0.7.0 closes the `attested-cortex` epic at 69/69 tasks across 11 tracks (A/B/C/D/E/F/G/H/I/J/K), plus the grand-slam recursive-learning + Agent Skills + L1-6 substrate-rules wave, plus the post-grand-slam Forms 1-6 + 7th-form + QW closeout (PRs [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-[#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766)). See [`CHANGELOG.md`](../CHANGELOG.md) for the full release entry and [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.md) for the per-area walk-through. The canonical post-grand-slam feature truth lives at [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
 
 ---
 
@@ -10,34 +10,55 @@
 
 | Area | What ships | Default behavior | Opt-in surface |
 |---|---|---|---|
-| Capabilities v3 | `summary`, `to_describe_to_user`, `callable_now`, `agent_permitted_families` | Returned alongside v2 fields | Read v3 fields if present; v2 unchanged |
-| Loader tools | `memory_load_family`, `memory_smart_load` | Always-on (replace `memory_capabilities --include-schema` ergonomics) | Call directly from agent loop |
-| Hook pipeline | 20 lifecycle events, exec + daemon modes | **No change** — no hooks fire | `~/.config/ai-memory/hooks.toml` |
+| Capabilities v3 | `summary`, `to_describe_to_user`, `callable_now`, `agent_permitted_families`, `schema_version="3"` | Returned alongside v2 fields | Read v3 fields if present; v2 unchanged |
+| Loader tools | `memory_load_family`, `memory_smart_load` join `core` | **Always-on under `--profile core`** (now 7 tools, was 5) | Replace `memory_capabilities --include-schema` ergonomics |
+| Hook pipeline | **25 lifecycle events**, exec + daemon modes | **No change** — no hooks fire | `~/.config/ai-memory/hooks.toml` ([doc](hook-pipeline.md)) |
 | Ed25519 attestation | Per-agent keypair, link signing, `attest_level` enum, `signed_events` audit table | `attest_level = "unsigned"` for legacy callers | `ai-memory identity generate` |
-| Sidechain transcripts | zstd-3 BLOB store, `memory_transcript_links`, `memory_replay` | Off | `[transcripts]` config per namespace |
+| Signed-events V-4 chain | Cross-row `prev_hash` + `sequence` SHA-256 chain | On for new daemons (backfilled by `migrate_v34_backfill_chain`) | `ai-memory verify-signed-events-chain` ([doc](signed-events-v4.md)) |
+| Sidechain transcripts | zstd-3 BLOB store, `memory_transcript_links`, `memory_replay` | Off | `[transcripts]` config per namespace ([doc](sidechain-transcripts.md)) |
 | Apache AGE acceleration | Cypher backend for KG ops, `memory_find_paths` | SQLite/CTE path unchanged | Install AGE Postgres extension |
+| Postgres-first SAL | `ai-memory serve --store-url postgres://…`, `ai-memory schema-init` | Sqlite default unchanged | Build with `--features sal-postgres` |
 | G1 inheritance enforcement | `resolve_governance_policy` walks the namespace chain | **Behavior change** for pre-v0.6.3.1 v0.6.x users | Per-policy `inherit: bool` (default `true`) |
-| Permission system | Refactored governance with rules + modes + hooks → decision | `mode = "advisory"` preserves v0.6.4 semantics on first boot | `ai-memory governance migrate-to-permissions` |
+| Permission system | Refactored governance with rules + modes + hooks → decision | `permissions.mode = "enforce"` (was `"advisory"` in v0.6.4) | `ai-memory governance migrate-to-permissions` ([doc](governance.md)) |
+| Federation hardening | mTLS + X-API-Key + fingerprint allowlist | Same as v0.6.4 if not configured | Three new `AI_MEMORY_FED_*` env vars ([doc](federation.md)) |
+| K8 quota tool | `memory_quota_status` + `/api/v1/quota/status` | Per-agent daily quota tracked, surfaced on demand | [doc](k8-quotas.md) |
+| K10 SSE approvals | `/api/v1/approvals/stream` with mandatory HMAC | Off when `permissions.mode = "off"` | [doc](k10-sse-approvals.md) |
+| Batman Form 1 (online dedup-and-synthesis) | Single-batch action-emitting LLM on store | Opt-IN via existing autonomy flag | `legacy_per_pair_classifier = true` to revert |
+| Batman Form 2 (synchronous atomise) | `memory_atomise` MCP tool + pre-store hook | `auto_atomise_mode = Off` default | `Synchronous | Deferred` ([doc](atomisation.md)) |
+| Batman Form 3 (multi-step ingest) | `memory_ingest_multistep` MCP tool | Caller-driven | [doc](multistep-ingest.md) |
+| Batman Form 4 (fact provenance) | Citations + source-URI + atom-grain spans | Caller-driven via `memory_store` payload | [doc](provenance.md) |
+| Batman Form 5 (auto-confidence) | `memory_calibrate_confidence` MCP tool | Shadow mode by default | Four `AI_MEMORY_CONFIDENCE_*` env vars ([doc](confidence-calibration.md)) |
+| Batman Form 6 (MemoryKind vocab) | 10-variant enum, optional auto-classify pre-store hook | `auto_classify_kind = off` default | `regex_only \| regex_then_llm` ([doc](memory-kind-vocab.md)) |
+| Batman 7th-form (Layer-4 wiring) | Operator-signed rules `R001..R004`, `memory_check_agent_action`, `memory_rule_list` | Substrate-INTERNAL writes gated; agent-EXTERNAL `callable_now` flag | v0.8.0 full cover per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697) |
+| QW-1 file-backed reflection export | `memory_export_reflection` MCP tool | Opt-IN per namespace | `auto_export_reflections_to_filesystem = true` |
+| QW-2 persona-as-artifact | `memory_persona` + `memory_persona_generate` tools, `MemoryKind::Persona` | Opt-IN per namespace | `auto_persona_trigger_every_n_memories = N` ([doc](persona.md)) |
+| QW-3 context-offload primitive | `memory_offload` + `memory_deref` tools | Caller-driven | [doc](context-offload.md) |
+| Provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) | `LlmProvider::OpenAiCompatible` wire shape, 15 vendor aliases, `OllamaClient::from_env()` | Backend defaults to `ollama` if `AI_MEMORY_LLM_BACKEND` unset — every v0.6.4 caller keeps working | Set `AI_MEMORY_LLM_BACKEND` + (alias-specific) API key env var to route the smart / autonomous tier to any of xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp |
+| Mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068)) | `aarch64-apple-ios` + `aarch64-linux-android` cross-compile gates, iOS xcframework + Android jniLibs release artifacts, simulator/emulator runtime tests | No change for desktop deploys | Consume `ai-memory-ios.xcframework.tar.gz` + `ai-memory-android.tar.gz` release artifacts; C-ABI FFI surface itself lands v0.7.x |
 
 ---
 
 ## Why this matters
 
-v0.7.0 closes two long-standing gaps at once.
+v0.7.0 closes three long-standing gaps at once.
 
 **Legibility gap (cortex-fluent):** the 2026-05-05 NHI Discovery Gate verdict on v0.6.4 came back **6/6 PASS, GATE GREEN**, but reasoning-class LLMs (Grok 4.2 reasoning) didn't find the runtime loader because it lived inside an introspection tool's parameter set. v0.7.0 promotes loaders to first-class tools (`memory_load_family`, `memory_smart_load`) and pre-computes per-agent calibration in `memory_capabilities` v3.
 
-**Trust gap (attested):** v0.6.3 left an Ed25519 `signature` column in `memory_links` that nothing populated (the v0.6.3 audit's "dead column" finding). Hook events were advertised via subscriptions but lifecycle hooks weren't programmable. Permissions were advisory, not enforced. Namespace inheritance was display-only — a parent `Approve` rule didn't actually block a child write. v0.7.0 fills the column, ships the hook pipeline, enforces inheritance, and lands an append-only `signed_events` audit chain.
+**Trust gap (attested):** v0.6.3 left an Ed25519 `signature` column in `memory_links` that nothing populated (the v0.6.3 audit's "dead column" finding). Hook events were advertised via subscriptions but lifecycle hooks weren't programmable. Permissions were advisory, not enforced. Namespace inheritance was display-only — a parent `Approve` rule didn't actually block a child write. v0.7.0 fills the column, ships the hook pipeline, enforces inheritance, and lands an append-only `signed_events` audit chain with cross-row hash chaining (V-4 closeout #698).
+
+**Write-time-investment gap (Batman):** the v0.7.0 audit at commit `53b4d39` ([`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.md)) found 0 of Batman's 6 forms cleanly IMPLEMENTED. The post-grand-slam Forms 1-6 wave + the 7th-form Option-B foundation closed every gap; HEAD `c9472c1` ships all 7 forms IMPLEMENTED.
 
 ---
 
 ## Action required
 
-Most users on v0.6.4 see **no behavior change** unless they opt in. The exceptions:
+Most users on v0.6.4 see **two intentional behavior changes** + a few opt-in surfaces:
 
-1. **Pre-v0.6.3.1 v0.6.x users** — the G1 namespace inheritance fix (already shipped in v0.6.3.1) means parent `Approve` policies now block child writes. See [G1 inheritance fix](#g1-inheritance-fix-behavior-change) below.
-2. **Operators with custom governance policies** — run `ai-memory governance migrate-to-permissions --dry-run` before upgrading to preview the migration.
-3. **SDK consumers reading `memory_capabilities`** — v3 adds fields; v2 fields remain. No code changes required, but adopt v3 fields for richer per-agent calibration.
+1. **`permissions.mode` flips `advisory` → `enforce`** (F8 — Round-2 NHI sweep). Operators who relied on default-permissive behavior must opt back in via `[permissions] mode = "advisory"` in config.toml.
+2. **`ai-memory forget --pattern` / `--tier` without `--namespace` requires `--confirm-global`** (F11). Scoped forget is unchanged.
+3. **Pre-v0.6.3.1 v0.6.x users** — the G1 namespace inheritance fix (already shipped in v0.6.3.1) means parent `Approve` policies now block child writes. See [G1 inheritance fix](#g1-inheritance-fix-behavior-change) below.
+4. **Operators with custom governance policies** — run `ai-memory governance migrate-to-permissions --dry-run` before upgrading to preview the migration.
+5. **SDK consumers reading `memory_capabilities`** — v3 adds fields; v2 fields remain. No code changes required, but adopt v3 fields for richer per-agent calibration.
 
 ---
 
@@ -47,56 +68,163 @@ Most users on v0.6.4 see **no behavior change** unless they opt in. The exceptio
 
 | Field | Type | Purpose |
 |---|---|---|
+| `schema_version` | string (`"3"`) | Top-level version tag. |
 | `summary` | string | Top-level pre-computed description ("AI Memory MCP exposes a 7-tool core with N additional families available via runtime expansion.") |
-| `to_describe_to_user` | string | Human-shaped summary the agent can paraphrase verbatim — eliminates calibration drift |
-| `callable_now` | bool (per tool) | Whether this caller may invoke the tool right now (allowlist + profile aware) |
-| `agent_permitted_families` | array<string> | Families this caller is allowed to expand into via `memory_load_family` |
+| `to_describe_to_user` | string | Human-shaped summary the agent can paraphrase verbatim — eliminates calibration drift. |
+| `callable_now` | bool (per tool) | Whether this caller may invoke the tool right now (allowlist + profile aware). |
+| `agent_permitted_families` | array<string> | Families this caller is allowed to expand into via `memory_load_family`. |
+| `memory_kind_vocab` | object | Form-6 vocabulary + auto-classify modes (see [`docs/memory-kind-vocab.md`](memory-kind-vocab.md)). |
 
-**Wire shape (v2 → v3):** the response gains a top-level `schema_version: 3` field. Clients that pin `schema_version: 2` continue to receive the v2 shape — v2 stays supported through v0.7.x.
-
-```json
-{
-  "schema_version": 3,
-  "summary": "AI Memory MCP exposes a 7-tool core ...",
-  "to_describe_to_user": "I have access to a memory substrate ...",
-  "agent_permitted_families": ["core", "graph"],
-  "tools": [
-    {
-      "name": "memory_store",
-      "callable_now": true,
-      "...": "..."
-    }
-  ]
-}
-```
+Clients that pin `schema_version: 2` continue to receive the v2 shape — v2 stays supported through v0.7.x.
 
 Backward compat: v0.6.4 SDKs continue to work — they read v2 fields and ignore the new top-level keys.
 
-> **TODO** — track A (A1-A5) lands the v3 fields; track B (B5) updates `memory_capabilities` description to point at the new loaders. Status will be linked here once merged.
+To inspect the live v3 response (there is no `ai-memory mcp call`
+sub-subcommand — probe the stdio server with raw JSON-RPC, or use the
+HTTP surface):
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_capabilities","arguments":{}}}' \
+  | ai-memory mcp --profile full
+# or, with a running daemon:
+curl -s http://127.0.0.1:9077/api/v1/capabilities | jq .memory_kind_vocab
+```
 
 ---
 
-## New tools
+## New MCP tools
 
-v0.7.0 adds the following MCP tools. Every tool is documented in `docs/API_REFERENCE.md` once the corresponding track merges.
+v0.7.0 adds the following tools relative to v0.6.4. Every tool ships
+in [`src/mcp/registry.rs`](../src/mcp/registry.rs) and is grouped into
+a `Family` (see [`src/profile.rs`](../src/profile.rs)). Full
+post-grand-slam inventory: [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
 
-| Tool | Track | One-line description |
-|---|---|---|
-| `memory_load_family(family)` | B1 | Always-on loader — registers the named family's tools without restarting the MCP server |
-| `memory_smart_load(intent)` | B2 | Embedding-matched loader — picks the family that best fits a natural-language intent string |
-| `memory_find_paths(source, target, max_depth=5)` | J7 (R2) | Returns paths through the knowledge graph; Cypher on AGE, recursive CTE on SQLite |
-| `memory_replay(memory_id)` | I4 | Reconstructs the transcript chain for a memory by traversing `memory_transcript_links` |
-| `memory_verify(link_id)` | H4 | Returns `{signature_verified, attest_level, signed_by, signed_at}` for a link |
-| `memory_approval_pending` | K10 | Lists pending approval requests |
-| `memory_approval_decide(id, decision, remember=forever?)` | K10 | Decides a pending approval; `remember=forever` enables progressive trust |
+| Tool | Family | Track / form | One-line description |
+|---|---|---|---|
+| `memory_load_family(family)` | Core | B1 | Always-on loader — registers the named family's tools without restarting the MCP server. |
+| `memory_smart_load(intent)` | Core | B2 | Embedding-matched loader — picks the family that best fits a natural-language intent string. |
+| `memory_find_paths(source, target, max_depth=5)` | Graph | J7 | Returns paths through the knowledge graph; Cypher on AGE, recursive CTE on SQLite. |
+| `memory_replay(memory_id, depth?)` | Graph | I4 / L2-4 | Reconstructs the transcript chain for a memory by traversing `memory_transcript_links`. |
+| `memory_verify(link_id)` | Graph | H4 | Returns `{signature_verified, attest_level, signed_by, signed_at}` for a link. |
+| `memory_pending_list` | Power | K10 | Lists pending approval requests. **Note:** the original v0.7-alpha drafts called this `memory_approval_pending`; the shipped name is `memory_pending_list`. |
+| `memory_pending_approve(id, …)` | Power | K10 | Approves a pending action. HMAC-signed body required. |
+| `memory_pending_reject(id, …, remember=forever?)` | Power | K10 | Rejects a pending action; `remember=forever` enables progressive trust. |
+| `memory_subscription_dlq_list` | Power | K7 | Lists dead-letter subscription deliveries. |
+| `memory_subscription_replay` | Power | K7 | Replays a DLQ entry. |
+| `memory_quota_status` | Power | K8 | Returns the caller's per-agent daily quota row. See [`docs/k8-quotas.md`](k8-quotas.md). |
+| `memory_reflect` | Power | Recursive-learning Task 4/8 | Substrate primitive that synthesises a reflection over a recall set; depth-capped per namespace. |
+| `memory_reflection_origin` | Power | L2-2 / #667 | Reads `reflection_origin` metadata that federation receivers stamp on import. |
+| `memory_dependents_of_invalidated` | Power | L2-3 / #668 | Notifies dependents when a Reflection→Reflection `supersedes` edge fires. |
+| `memory_check_agent_action` | Power | 7th-form / #691 | Dry-run check against the operator-signed rule corpus. |
+| `memory_rule_list` | Power | 7th-form / #691 | Read-only listing of the rule corpus. |
+| `memory_export_reflection` | Power | QW-1 | File-backed reflection-chain export. |
+| `memory_offload` | Power | QW-3 | Move a large blob out of the agent context window into addressable blob storage. |
+| `memory_deref` | Power | QW-3 | Read-side companion to `memory_offload`. |
+| `memory_atomise` | Power | WT-1-C / Form 2 | Curator decomposes a long memory into 2-10 atomic propositions. |
+| `memory_persona` | Power | QW-2 | Read/write a `MemoryKind::Persona` row. |
+| `memory_persona_generate` | Power | QW-2 | Synthesise a persona over the entity's observation set. |
+| `memory_ingest_multistep` | Power | Form 3 / #756 | Multi-step ingest orchestrator with deterministic helpers + prompt-cache reuse. |
+| `memory_calibrate_confidence` | Power | Form 5 / #758 | Per-source baseline calibration sweep (shadow mode by default). |
+| `memory_skill_register` | Other | L1-5 | Register a SKILL.md-format Agent Skill. |
+| `memory_skill_list` | Other | L1-5 | List skills. |
+| `memory_skill_get` | Other | L1-5 | Read a skill. |
+| `memory_skill_resource` | Other | L1-5 | Read a resource referenced by a skill. |
+| `memory_skill_export` | Other | L1-5 | Export a skill back to SKILL.md. |
+| `memory_skill_promote_from_reflection` | Other | L2-6 / #671 | Promote a Reflection (depth ≥ 1) to a SKILL.md-format Agent Skill. |
+| `memory_skill_compositional_context` | Other | L2-7 / #672 | Return a skill body + bounded reflection set ranked by recency + recall count. |
 
-> **TODO** — tools land per their respective tracks. Track G hook pipeline lands first; H/I/J/K tools follow.
+---
+
+## Per-form migration notes
+
+### Form 1 — online dedup-and-synthesis ([#754](https://github.com/alphaonedev/ai-memory-mcp/issues/754))
+
+The store path now issues a **single batch action-emitting LLM call** that emits `add | update | delete | no-op` per existing memory candidate, replacing the v0.6.x per-pair binary yes/no classifier. The new path is gated by the same `autonomous_hooks` toggle that gated the v0.6.x classifier; behavior is opt-in.
+
+To preserve the v0.6.x per-pair behavior on a specific namespace, set on the namespace standard:
+
+```jsonc
+{
+  "governance": {
+    "legacy_per_pair_classifier": true
+  }
+}
+```
+
+The shipped code path is `src/synthesis/mod.rs`. Tests:
+[`tests/form_1_synthesis.rs`](../tests/form_1_synthesis.rs).
+
+### Form 2 — synchronous atomise-before-embed ([#755](https://github.com/alphaonedev/ai-memory-mcp/issues/755))
+
+New `memory_atomise` MCP tool + `auto_atomise_mode` namespace-policy field with three settings:
+
+- **`Off`** (default) — caller-driven, no curator pass.
+- **`Deferred`** — curator runs out-of-band after the write commits.
+- **`Synchronous`** — curator runs inside the pre-store hook chain; the parent memory is archived once atoms commit.
+
+Token budget is governed by `auto_atomise_threshold_cl100k` (default 800) and `auto_atomise_max_atom_tokens` (default 200). Each atom is a first-class memory with an `atom_of` back-pointer and a signed `derives_from` edge.
+
+Operator doc: [`docs/atomisation.md`](atomisation.md). Cookbook: [`cookbook/atomisation/01-basic-flow.sh`](../cookbook/atomisation/01-basic-flow.sh).
+
+### Form 3 — multi-step ingest orchestrator ([#756](https://github.com/alphaonedev/ai-memory-mcp/issues/756))
+
+`memory_ingest_multistep` threads deterministic Jaccard+FTS helpers through prompt-cache-stable LLM stages. The two reference variants (two-phase Understand-Anything exemplar; four-step OpenKB exemplar) both produce reports with a single distinct cache key per run — provable by the cookbook recipe.
+
+Operator doc: [`docs/multistep-ingest.md`](multistep-ingest.md). Cookbook: [`cookbook/multistep-ingest/01-two-phase.sh`](../cookbook/multistep-ingest/01-two-phase.sh).
+
+### Form 4 — fact provenance ([#757](https://github.com/alphaonedev/ai-memory-mcp/issues/757))
+
+No new MCP tool; provenance rides on the existing `memory_store` / `memory_atomise` payloads. Schema migration `0032_v07_form4_provenance.sql` adds the columns. Federation wire shape stays backward-compatible — pre-v0.7.0 peers ignore the new fields.
+
+Operator doc: [`docs/provenance.md`](provenance.md).
+
+### Form 5 — auto-confidence + shadow-mode calibration + freshness decay ([#758](https://github.com/alphaonedev/ai-memory-mcp/issues/758))
+
+`memory_calibrate_confidence` MCP tool + four env vars:
+
+- `AI_MEMORY_AUTO_CONFIDENCE` — enable on-write confidence assignment.
+- `AI_MEMORY_CONFIDENCE_SHADOW` — calibrate in shadow mode (no live writes).
+- `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE` — shadow-mode sample rate (default 0.1).
+- `AI_MEMORY_CONFIDENCE_DECAY` — enable per-memory freshness decay.
+
+Schema migration `0033_v07_form5_confidence_calibration.sql`. Capability registry entry: `CapabilityConfidenceCalibration` at `src/config.rs:1331`.
+
+Operator doc: [`docs/confidence-calibration.md`](confidence-calibration.md).
+
+### Form 6 — MemoryKind Batman vocabulary ([#759](https://github.com/alphaonedev/ai-memory-mcp/issues/759))
+
+10-variant `MemoryKind` enum: `Observation` (default) + `Reflection`, `Persona`, `Concept`, `Entity`, `Claim`, `Relation`, `Event`, `Conversation`, `Decision`. **No schema migration** — `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` has no CHECK constraint, so new variants land as new string values on the existing column.
+
+Optional `auto_classify_kind` pre-store hook on each namespace standard: `off | regex_only | regex_then_llm`. See [`docs/memory-kind-vocab.md`](memory-kind-vocab.md) for the per-variant matrix and recall-filter wire shapes.
+
+### 7th-form — agent-EXTERNAL Layer-4 wiring ([#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760))
+
+**Status:** Option-B foundation SHIPPED in v0.7.0; full cover at v0.8.0 per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697).
+
+What v0.7.0 ships:
+
+- Operator-keypair-signed seed rules `R001..R004` (`~/.config/ai-memory/operator.key`).
+- `memory_check_agent_action` MCP tool — dry-run check against the rule corpus.
+- `memory_rule_list` MCP tool — read-only listing.
+- Substrate `storage::insert` pre-write hook surfaces structured refusal via the `MemoryError::RefusedByGovernance` error variant.
+- `ai-memory install claude-code --hook pretool --apply` wires the policy hook at install time (routes Bash / Edit / Write tool calls through `memory_check_agent_action`).
+
+What v0.7.0 ALSO ships (post-PE-1/PE-2/PE-3 fold — supersedes the earlier "v0.8.0 cover" framing):
+
+- Agent-EXTERNAL enforcement (wire kinds `bash` / `filesystem_write` / `network_request` / `process_spawn`) is live at four daemon-side `GOVERNANCE_PRE_ACTION` boundaries (skill-manifest emission, federation peer POST, hooks subprocess spawn, LLM HTTP) plus the harness PreToolUse hook (`ai-memory install claude-code --hook pretool --apply`). See [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point audit.
+
+What v0.7.0 does NOT ship (v0.8.0 cover, [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)):
+
+- Subprocess-chain visibility (bash spawn → fork → exec), mandatory-hook attestation, and engine-level read gating (`AgentAction::Read`).
+
+Audit-honest framing: see [`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](RECURSIVE_LEARNING.md#substrate-authority-claim--v070-option-b-foundation). Operator doc: [`docs/policy-engine.md`](policy-engine.md) + [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.md).
 
 ---
 
 ## Hook pipeline (opt-in)
 
-v0.7.0 adds 20 lifecycle hook events at every memory operation point — a programmable extension surface that R3 (auto-link inference) and R5 (auto-extraction) build on.
+v0.7.0 ships **25 lifecycle hook events** (20 baseline + 5 grand-slam additions) at every memory operation point — a programmable extension surface that R3 (auto-link inference) and R5 (auto-extraction) build on.
 
 Default: **no behavior change.** Hooks fire only when `~/.config/ai-memory/hooks.toml` exists and registers them.
 
@@ -111,13 +239,16 @@ enabled = true
 namespace = "team/*"
 ```
 
-**Event matrix (20 events):** `pre_store`, `post_store`, `pre_recall`, `post_recall`, `pre_search`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction`, `pre_archive`, `pre_transcript_store`, `post_transcript_store`.
+**Event matrix (25 events):**
+
+- 20 baseline: `pre_store`, `post_store`, `pre_recall`, `post_recall`, `pre_search`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction`, `pre_archive`, `pre_transcript_store`, `post_transcript_store`.
+- 5 grand-slam additions: `pre_recall_expand` (G10), `pre_reflect` + `post_reflect` (recursive-learning Task 6/8), `pre_compaction` + `on_compaction_rollback` (L1-7).
 
 **Decision contract:** hooks return one of `Allow`, `Modify(delta)` (pre- events only), `Deny{reason, code}`, or `AskUser{prompt, options, default}`. Chain ordering is priority-desc; first `Deny` short-circuits.
 
 **Hot-path constraint:** `post_recall` and `post_search` default to `daemon` mode, preserving the v0.6.3 50ms recall p95 budget. `mode = "exec"` requires explicit override.
 
-> **TODO** — track G (G1-G11) lands the pipeline. Per-task documentation will live under `docs/hooks/` once merged. See [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md#track-g--hook-pipeline-bucket-0) for the full task list.
+Operator doc: [`docs/hook-pipeline.md`](hook-pipeline.md).
 
 ---
 
@@ -133,13 +264,17 @@ ai-memory identity export-pub --agent-id ai:claude-code@host:pid-12345
 
 Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode 0600 / 0644.
 
-**`attest_level` enum:** `unsigned` (no keypair present — preserves v0.6.4 backward compat), `self_signed` (active agent has a keypair; outbound writes signed), `peer_attested` (federated link verified against the peer's known public key).
+**`attest_level` enum (links / signed events):** `unsigned` (no keypair present — preserves v0.6.4 backward compat), `self_signed` (active agent has a keypair; outbound writes signed), `peer_attested` (federated link verified against the peer's known public key), plus two later v0.7.0 additions: `signed_by_peer` (L4 `memory_capture_turn` host-signed memory verified against `AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST`) and `daemon_signed` (the daemon's own signature on its governance-audit emissions). (The *store-path* write attestation in `metadata.attest_level` uses a separate two-value vocabulary: `claimed` / `agent_attested`.)
 
-**Append-only `signed_events` audit table** (schema v21) records every signed write — no UPDATE or DELETE through the application layer.
+**Append-only `signed_events` audit table** records every signed write — no UPDATE or DELETE through the application layer. The V-4 closeout ([#698](https://github.com/alphaonedev/ai-memory-mcp/issues/698)) added a cross-row hash chain (`prev_hash` BLOB + `sequence` INTEGER) so the chain itself is tamper-evident, not just each row. Verify with:
 
-> **Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP2; available in the AgenticMem commercial layer.
+```bash
+ai-memory verify-signed-events-chain --format json
+```
 
-> **TODO** — track H (H1-H6) lands attestation. See [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md#track-h--ed25519-attested-identity-bucket-1) for task detail.
+Operator doc: [`docs/signed-events-v4.md`](signed-events-v4.md).
+
+> **Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP; available in the AgenticMem commercial layer.
 
 ---
 
@@ -147,20 +282,24 @@ Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode 0600 / 0
 
 v0.7.0 adds raw conversation/reasoning trail storage in zstd-3-compressed BLOBs, linked to derived memories via `memory_transcript_links`. Substrate for R5 auto-extraction.
 
-Default: **off.** Opt in per namespace via `[transcripts]` config:
+Default: **off.** Opt in per namespace via `[transcripts]` config
+(times are in seconds; per-namespace tables live under
+`[transcripts.namespaces."<pattern>"]`):
 
 ```toml
-[transcripts."team/*"]
-enabled = true
-ttl_days = 30
-archive_after_days = 7
+[transcripts]
+default_ttl_secs   = 2592000   # 30d archive-eligibility
+archive_grace_secs = 604800    # 7d linger before prune
+
+  [transcripts.namespaces."team/*"]
+  default_ttl_secs   = 2592000
+  archive_grace_secs = 604800
+  auto_extract       = true    # opt into the R5 transcript-extractor hook
 ```
 
-Schema migration v21 → v22 adds `memory_transcripts` and `memory_transcript_links`. Background sweeper archives transcripts whose memories are all expired, then prunes after a grace period.
+Background sweeper archives transcripts whose memories are all expired, then prunes after a grace period. `memory_replay(memory_id, depth?)` reconstructs the transcript chain; `depth=0` reproduces the pre-L2-4 shape.
 
-`memory_replay(memory_id)` reconstructs the transcript chain for a memory; returns the decompressed text plus span metadata.
-
-> **TODO** — track I (I1-I5) lands transcripts. See [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md#track-i--sidechain-transcripts-bucket-17) for task detail.
+Operator doc: [`docs/sidechain-transcripts.md`](sidechain-transcripts.md).
 
 ---
 
@@ -168,11 +307,16 @@ Schema migration v21 → v22 adds `memory_transcripts` and `memory_transcript_li
 
 v0.7.0 detects Apache AGE in Postgres at SAL initialization (`SELECT * FROM pg_extension WHERE extname='age'`). When present, KG operations route through Cypher; otherwise the recursive-CTE path used since v0.6.x stays in place.
 
-Install AGE in your Postgres instance, restart `ai-memory`, and confirm via `ai-memory doctor --kg-backend` (which prints `kg_backend = "age"` or `"cte"`).
+Install AGE in your Postgres instance and restart `ai-memory`. To confirm which backend is live, check the daemon's startup log — the postgres adapter emits one INFO line at connect (tracing target `store::postgres`):
+
+```
+Postgres KG backend: AGE     # Cypher path active
+Postgres KG backend: CTE     # recursive-CTE fallback
+```
+
+(The v0.7-alpha drafts referenced an `ai-memory doctor --kg-backend` flag and a populated `kg_backend` capabilities field; neither shipped at v0.7.0 — the capabilities envelope declares the `kg_backend` field but no production surface populates it yet, so the startup log line is the authoritative check.)
 
 **Acceptance gate:** AGE p95 must beat CTE p95 by ≥30% at depth=5 to ship — the bench gate (`feat/v0.7-j-8-age-bench-gate`) enforces it. If AGE isn't faster on your hardware, stay on the CTE path.
-
-> **TODO** — track J (J1-J8) lands AGE. See [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md#track-j--apache-age-acceleration-bucket-2) for task detail.
 
 ---
 
@@ -204,72 +348,344 @@ Audit log records which ancestor's policy fired on every gate decision.
 
 v0.7.0 refactors the existing `governance` system into:
 
-- **Rules** — declarative policies (the existing governance shape)
-- **Modes** — `enforce` / `advisory` / `off`
-- **Hooks** — programmable from Track G
+- **Rules** — declarative policies (the existing governance shape, now operator-keypair-signed under 7th-form).
+- **Modes** — `enforce` (v0.7.0 default) / `advisory` / `off`.
+- **Hooks** — programmable from Track G.
 
 → a single `Decision`. Default deny-first; ask-by-default for ambiguous cases.
 
 **Migration tool** (idempotent, dry-run by default):
 
 ```bash
-ai-memory governance migrate-to-permissions               # dry-run
-ai-memory governance migrate-to-permissions --apply       # commit
+ai-memory governance migrate-to-permissions               # dry-run (prints, writes nothing)
+ai-memory governance migrate-to-permissions \
+  --config-out ~/.config/ai-memory/config.toml            # commit (in-place merge)
 ```
 
-The dry-run prints the proposed `permissions` rows alongside the source `governance` rows; `--apply` writes them. Re-running is safe — already-migrated rows are skipped.
+The dry-run prints the rendered `[[permissions.rules]]` block derived from the legacy `[[governance.policy]]` entries; `--config-out <path>` writes it (an in-place merge when the path matches the loaded config; `--config-in <path>` overrides the source). Re-running is safe.
 
 Honest disclosures from v0.6.3.1 close out:
 
-- `permissions.mode = "advisory"` is now actually consulted by the gate (K3)
-- `default_timeout_seconds` on `pending_actions` is now enforced by a 60s sweeper (K2)
-- `approval.subscribers` events are now actually published through the subscription system (K4)
-- `rule_summary` is now populated with a real ordered list of active governance rules (K5)
+- `permissions.mode = "advisory"` is now actually consulted by the gate (K3).
+- `default_timeout_seconds` on `pending_actions` is now enforced by a 60s sweeper (K2).
+- `approval.subscribers` events are now actually published through the subscription system (K4).
+- `rule_summary` is now populated with a real ordered list of active governance rules (K5).
 
-> **TODO** — track K (K1-K11) lands the permission system. K1 (G1 inheritance) is the **mandatory cutline** — even if everything else slips, K1 ships.
+Operator docs: [`docs/governance.md`](governance.md), [`docs/policy-engine.md`](policy-engine.md), [`docs/k10-sse-approvals.md`](k10-sse-approvals.md).
+
+---
+
+## Provider-agnostic LLM backend ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146))
+
+v0.7.0 promotes the LLM client to a provider-agnostic substrate. Pre-v0.7.0
+the smart and autonomous tiers required local Ollama; post-v0.7.0 the same
+tiers run against any of: local Ollama, xAI Grok, OpenAI, Anthropic (via
+the OpenAI shim), Google Gemini, DeepSeek, Kimi (Moonshot), Qwen (Alibaba),
+Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio,
+vLLM, or llama.cpp server.
+
+**No action required for v0.6.4 callers** — `AI_MEMORY_LLM_BACKEND`
+defaults to `ollama` if unset, and the legacy `OLLAMA_BASE_URL` env var
+is still honoured. Every v0.6.4 setup keeps working byte-identically.
+
+### Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)
+
+v0.7.x ships a **single source of truth** for LLM / embeddings /
+reranker / storage configuration. Every surface (MCP stdio, HTTP daemon,
+`ai-memory atomise`, `ai-memory curator`, the boot banner, the
+`ai-memory doctor` reachability probe) consumes the same resolver
+output, so the boot banner and the live MCP server are guaranteed to
+report the same backend.
+
+```toml
+# ~/.config/ai-memory/config.toml
+schema_version = 2
+
+tier = "autonomous"
+db   = "/Users/<you>/.claude/ai-memory.db"
+
+[llm]
+backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
+                                       # deepseek | kimi | qwen | mistral | groq |
+                                       # together | cerebras | openrouter |
+                                       # fireworks | lmstudio | openai-compatible
+model       = "grok-4.3"               # vendor-specific identifier
+base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+
+# Alternative to api_key_env — file (mode 0400 enforced).
+# api_key_file = "/etc/ai-memory/keys/xai.key"
+```
+
+**Secret-handling discipline.** Inline `api_key = "<literal>"` in
+config.toml is **rejected at parse time** — `config.toml` is typically
+world-readable, so literal keys would be a credential leak. Operators
+MUST use either `api_key_env` (process-env reference) or `api_key_file`
+(file path; mode 0400 enforced, `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1`
+escape hatch available per [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
+`api_key_env` and `api_key_file` are mutually exclusive.
+
+**Why this is the recommended path.** Pre-#1146 operators routed LLM
+config through the `mcpServers.<name>.env` block of `~/.claude.json`
+(or the equivalent per AI client). That works but has three
+operator-hostile properties:
+
+1. The `ai-memory boot` SessionStart hook reads from the **parent shell
+   env**, not the MCP-spawned subprocess env, so the boot banner
+   reported the legacy Ollama default while the live MCP server
+   correctly used the configured backend — two sources of truth, one
+   confused operator.
+2. Every AI client (Claude Code, Cursor, Codex CLI, Cline, Continue,
+   Zed, Windsurf, Goose, Roo Code, Aider, Cody, openclaw, …) needed
+   its own duplicate env block to behave consistently.
+3. API keys lived inline in `~/.claude.json` — typically world-readable
+   in `$HOME`.
+
+`[llm]` in `config.toml` retires all three. The same file is consulted
+by every surface; the resolver enforces no-inline-keys; the boot banner
+reports `llm=<backend>:<model>` matching the live MCP server.
+
+### Migration tool
+
+```bash
+# Rewrite legacy v0.6.x flat-field config.toml into v2 sectioned shape.
+ai-memory config migrate              # writes config.toml.bak.<ts> + rewrites in place
+ai-memory config migrate --dry-run    # prints the diff to stderr, writes nothing
+
+# After verifying the new config works, sweep stale env blocks from claude.json.
+ai-memory config migrate --also-clean-claude-json
+```
+
+Idempotent — running against an already-v2 file is a no-op INFO log.
+
+### Verification
+
+```bash
+# Boot banner — should now report your configured backend, not the legacy default.
+ai-memory boot --quiet --limit 1
+
+# Reachability probe — DNS + TLS + auth round-trip against the resolved base_url.
+ai-memory doctor | grep -A8 "LLM Reachability (#1146)"
+```
+
+The doctor probe emits PASS / WARN / CRIT with the resolved provenance
+facts (`backend`, `model`, `base_url`, `config_source`, `key_source`)
+so operators can see WHICH precedence layer won.
+
+### Precedence ladder (uniform across all four resolvers)
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+Same ladder applies to `resolve_llm_auto_tag`, `resolve_embeddings`,
+`resolve_reranker`, and `resolve_storage`.
+
+### Override path — `AI_MEMORY_LLM_*` env vars
+
+Env vars still work — they're the override layer ABOVE the config file.
+Useful for CI / per-session tweaks. Same examples in env-var form:
+
+```bash
+# Example: xAI Grok 4.3 for the autonomous tier (v0.7.0 compiled default for xai backend)
+export AI_MEMORY_LLM_BACKEND=xai           # alias — pre-fills base URL
+export AI_MEMORY_LLM_MODEL=grok-4.3
+export XAI_API_KEY=xai-…                    # per-vendor fallback (or AI_MEMORY_LLM_API_KEY)
+
+# Example: OpenAI gpt-5 (v0.7.0 compiled default for openai backend)
+export AI_MEMORY_LLM_BACKEND=openai
+export AI_MEMORY_LLM_MODEL=gpt-5
+export OPENAI_API_KEY=sk-…
+
+# Example: Anthropic Claude Opus 4.7 (v0.7.0 compiled default for anthropic backend)
+export AI_MEMORY_LLM_BACKEND=anthropic
+export AI_MEMORY_LLM_MODEL=claude-opus-4.7
+export ANTHROPIC_API_KEY=sk-ant-…
+
+# Example: generic OpenAI-compatible endpoint (vLLM, llama.cpp server, etc.)
+export AI_MEMORY_LLM_BACKEND=openai-compatible
+export AI_MEMORY_LLM_BASE_URL=http://your-host:8000/v1   # REQUIRED — no default URL
+export AI_MEMORY_LLM_MODEL=your-model
+export AI_MEMORY_LLM_API_KEY=…
+```
+
+**Tier independence.** Setting `AI_MEMORY_LLM_BACKEND` (or `[llm].backend`)
+routes the LLM client through the provider-agnostic path **regardless
+of tier**. Tier still determines which other features run (embedder,
+reranker).
+
+### Operator references
+
+- [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) — canonical schema reference (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`).
+- [`docs/ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — config-file + env-var matrix.
+- [`docs/integrations/llm-backends.md`](integrations/llm-backends.md) — per-vendor recipes.
+- [`src/llm.rs`](../src/llm.rs) — module-level rustdoc; the LlmProvider
+  table at the top of the file is the canonical
+  provider × wire-shape × auth × vendor anchor.
+
+---
+
+## Mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068))
+
+The Rust library (`crate-type = ["rlib", "staticlib", "cdylib"]`) now
+cross-compiles for iOS + Android. v0.7.0 ships the CI pipeline:
+
+- **Layer 1** — cross-compile gate on every PR: `cargo check --target
+  aarch64-apple-ios --no-default-features --features sqlite-bundled --lib`
+  (macos-latest), `cargo check --target aarch64-linux-android --no-default-features
+  --features sqlite-bundled --lib` (ubuntu-latest with NDK r26d).
+- **Layer 2** — release artifacts: `ai-memory-ios.xcframework.tar.gz`
+  (3 slices: device + sim arm64 + sim x86_64) + `ai-memory-android.tar.gz`
+  (4 ABIs in `jniLibs/<abi>/` layout) attach to every stable
+  (non-prerelease) tag.
+- **Layer 3** — simulator/emulator runtime: ~13 scoped tests run on
+  iPhone 15 (iOS Simulator) + Android API-30 emulator on every
+  `release/**` push.
+
+The C-callable FFI surface itself (`#[no_mangle] extern "C"` items)
+lands in a v0.7.x follow-up; v0.7.0 ships the BUILD pipeline +
+artifact layout. Consuming the artifacts:
+
+- **iOS** — download `ai-memory-ios.xcframework.tar.gz` from the
+  v0.7.x release page, unpack, drag `AiMemory.xcframework` into your
+  Xcode project under "Frameworks, Libraries, and Embedded Content."
+- **Android** — download `ai-memory-android.tar.gz`, unpack, copy the
+  `jniLibs/` tree into your app module's `src/main/jniLibs/`.
+
+Operator doc: [`tests/mobile/README.md`](../tests/mobile/README.md) — test
+selection rationale + ~$10/month cost-cap rationale.
+
+---
+
+## Federation hardening
+
+v0.7.0 hardens the v0.6.x federation surface with mTLS + X-API-Key + SHA-256 cert fingerprint allowlist + three new `AI_MEMORY_FED_*` env vars:
+
+- `AI_MEMORY_FED_PEER_ATTESTATION` — require peer Ed25519 attestation on inbound sync.
+- `AI_MEMORY_FED_SYNC_TRUST_PEER` — trust the peer's claim about origin agent on inbound sync (default deny).
+- `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` — trust the wire body's `agent_id` claim (default deny — use the authenticated peer cert).
+
+Operator doc: [`docs/federation.md`](federation.md).
 
 ---
 
 ## Upgrade steps
 
 ```bash
-# 1. Stop the running daemon
-ai-memory stop
+# 1. Stop the running daemon (there is no `ai-memory stop` subcommand —
+#    use your service manager, or pkill -INT for shell-launched daemons)
+systemctl --user stop ai-memory   # or: pkill -INT ai-memory
 
-# 2. Backup your DB before the schema migration
-cp ~/.local/share/ai-memory/memory.db ~/.local/share/ai-memory/memory.db.v0.6.4.bak
+# 2. Backup your DB before the schema migration. Default DB filename
+#    is `ai-memory.db` (NOT `memory.db`); confirm via `ai-memory --help`.
+cp ~/.claude/ai-memory.db ~/.claude/ai-memory.db.v0.6.4.bak
 
-# 3. Upgrade the binary (pick your channel)
-brew upgrade ai-memory                                    # Homebrew
-cargo install --git https://github.com/alphaonedev/ai-memory-mcp ai-memory --locked  # crates.io / source
+# 3. Upgrade the binary. UNTIL v0.7.0 IS PUBLISHED to the
+#    alphaonedev/homebrew-tap formula AND crates.io, prefer the
+#    GitHub Releases tarball or the --tag v0.7.0 source build.
+#    Release assets are named by Rust target triple
+#    (x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu /
+#    x86_64-apple-darwin / aarch64-apple-darwin /
+#    x86_64-pc-windows-msvc.zip). Example, Linux x86_64:
+curl -fsSL "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-x86_64-unknown-linux-gnu.tar.gz" \
+  | tar -xz -C ~/.local/bin
+# OR from source (locks the tag explicitly):
+cargo install --git https://github.com/alphaonedev/ai-memory-mcp \
+  --tag v0.7.0 --locked ai-memory
+# Once the tap formula + crates.io publication land:
+# brew upgrade ai-memory   /   cargo install ai-memory
 
-# 4. Preview the permissions migration
+# 4. Migrate config.toml (v0.6.x flat fields → v2 sectioned shape)
+ai-memory config migrate --dry-run        # preview
+ai-memory config migrate                  # apply with timestamped .bak
+ai-memory config migrate --also-clean-claude-json   # OPT-IN: also strip
+                                                     # mcpServers.<*>.env
+                                                     # from ~/.claude.json
+                                                     # (only direct
+                                                     # `ai-memory` launchers
+                                                     # — wrapper-script
+                                                     # launchers need manual
+                                                     # audit: `grep -l
+                                                     # AI_MEMORY_LLM
+                                                     # ~/.claude.json`)
+
+# 5. Preview the permissions migration (governance v0.6.4 → permissions v0.7.0)
 ai-memory governance migrate-to-permissions               # dry-run
 
-# 5. Apply if happy
-ai-memory governance migrate-to-permissions --apply
+# 6. Apply if happy (in-place merge into the loaded config)
+ai-memory governance migrate-to-permissions \
+  --config-out ~/.config/ai-memory/config.toml
 
-# 6. (Optional) Generate an Ed25519 keypair for outbound link signing
-ai-memory identity generate --agent-id "$(ai-memory identity suggest-id)"
+# 7. (Optional) Generate an Ed25519 keypair for outbound link signing.
+#    Omitting --agent-id uses the NHI-hardened default id.
+ai-memory identity generate
 
-# 7. Restart
-ai-memory start
+# 8. Restart
+systemctl --user start ai-memory   # or relaunch your MCP host
 
-# 8. Verify
+# 9. Verify — `ai-memory doctor` now reports 10 sections incl. the new
+#    "LLM Reachability (#1146)" section that probes the resolved backend.
+ai-memory doctor
 ai-memory doctor --tokens
-ai-memory doctor --kg-backend                             # cte | age
+curl -s http://127.0.0.1:9077/api/v1/capabilities | jq '.schema_version'
+ai-memory verify-signed-events-chain --format json | jq -e .chain_holds
 ```
 
-Schema migration v20 → v22 (audit_log → signed_events → memory_transcripts) runs automatically on first start. The migration is idempotent.
+**For the comprehensive 3-tier walkthrough** (non-technical /
+SME-fleet / DevOps-idempotent recipes), see
+[`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.md). The
+QUICKSTART covers the security-posture default flips (federation
+sig+nonce, permissions enforce, SSRF DNS-fail-CLOSED, governance
+fail-CLOSED, passphrase strict-perms) with their staged-rollout
+opt-out env vars.
+
+Schema migrations (sqlite v20 → v57, postgres v15 → v57 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 57` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration file is [`migrations/sqlite/0047_v56_list_composite_indexes.sql`](../migrations/sqlite/0047_v56_list_composite_indexes.sql) (sqlite splits per-bump, file-name counter ≠ logical version; v54 is an in-code backfill arm with no new .sql file, while v55/v56 add their indexes via their own .sql files, and v57 is a sqlite no-op version stamp) and the postgres in-process `migrate_v57()` arm (postgres runs a single greenfield+upgrade pair, with v34 → v57 deltas applied through in-process `migrate_v34()` … `migrate_v57()` async functions; `migrate_v55()` and `migrate_v56()` are version-stamp no-ops on postgres — `memories_updated_at_idx (updated_at DESC)` already serves the federation-catchup range scan, and the #1579 v56 composite list/archive indexes are sqlite-side fixes paired with the sargable `storage::list` rewrite — while `migrate_v57()` (#1579 B2) adds the stored generated `tsv` tsvector column + `memories_tsv_gin` GIN index and drops the legacy `memories_content_fts` expression index, so the search/recall shapes match AND rank on a write-time-precomputed column; the `ADD COLUMN` takes an ACCESS EXCLUSIVE table rewrite, sub-second at ~8k rows).
+
+**Per-bump narrative for the post-v34 sqlite ladder (every operator SHOULD back up to a sibling `.bak` before `ai-memory serve` first-touches the DB — the migrator also writes its own automatic `<db>.pre-migration-v<from>-to-v<to>-<token>.bak` `VACUUM INTO` snapshot before any schema-mutating upgrade — because the daemon will traverse all 24 of these bumps on first open):**
+
+- **v34** — V-4 closeout (#698): `signed_events.prev_hash` + `signed_events.sequence` cross-row hash chain.
+- **v35** — shadow retention columns on calibration tables.
+- **v36** — `auto_persona_entity_id` column on `memories` (QW-2 persona artefact).
+- **v37** — persona signing atomicity (cross-table CHECK).
+- **v38** — recursive-learning `recall_observations` table.
+- **v39** — `provenance_version` column (Form-4 source URI carry).
+- **v40** — source-URI backfill (in-place data migration).
+- **v41** — federation push DLQ (Track D #933).
+- **v42** — confidence-tier nullability fix.
+- **v43** — links temporal-validity columns (`valid_from` / `valid_until` / `observed_by`).
+- **v44** — link attestation columns (`signature` / `attest_level` / `signed_at`).
+- **v45** — Gap-1 optimistic-concurrency `version` BIGINT column on `memories` (#1036).
+- **v46** — recall_observations capacity widening (Bucket-0 L2-3 #687).
+- **v47** — confidence_tier index (#1042).
+- **v48** — `federation_push_dlq` table + dispatch indices (#933).
+- **v49** — `archived_memories` full v0.7.0 column carry: 14 nullable columns added so archive → restore is lossless for the full v0.7.0 Memory shape on both backends (`reflection_depth`, `atomised_into`, `atom_of`, `memory_kind`, `entity_id`, `persona_version`, `citations`, `source_uri`, `source_span`, `confidence_source`, `confidence_signals`, `confidence_decayed_at`, `mentioned_entity_id`, `version`; #1025).
+- **v50** — per-namespace K8 quota dimension extension (#1156): `agent_quotas` PRIMARY KEY extended from `(agent_id)` to `(agent_id, namespace)` so per-namespace quota allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel namespace, preserving pre-v50 row accounting verbatim. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls. Postgres mirror via `migrate_v50()` runs `ALTER TABLE agent_quotas ADD COLUMN namespace TEXT NOT NULL DEFAULT '_global'` + PK swap + supporting index.
+- **v51** — federation nonce cache persistence (#1255 / PR #1296): adds the `federation_nonce_cache` table so peer-replay-prevention nonces survive daemon restarts. Pre-v51 the per-peer nonce LRU was in-memory only, so a daemon restart re-opened a replay window equal to the maximum `X-Memory-Nonce` age tolerated by `AI_MEMORY_FED_REQUIRE_NONCE`. v51 persists the LRU to disk so the replay window collapses to zero across restarts. Postgres mirror via `migrate_v51()` creates the equivalent `federation_nonce_cache` table + indices.
+- **v52** — transcript line-dedup persistence (#1389, closes #1388): adds the `transcript_line_dedup` table backing the sha256-keyed idempotency layer for the four-layer capture architecture (L2 recover-on-boot + L3 substrate watcher + L4 `memory_capture_turn` MCP tool). Closes the #1388 substrate failure mode at the storage layer so a crashed/restarted capture pipeline cannot double-ingest the same transcript line. Postgres mirror via `migrate_v52()` creates the equivalent table + unique index.
+- **v53** — `memories_au` FTS5 trigger scoping (#1418, R5.F5.2 perf-audit closeout): pure DDL — drops and recreates the after-update FTS sync trigger as `AFTER UPDATE OF title, content, tags` so hot-path UPDATEs that touch only non-FTS columns (`embedding`, `access_count`, `last_accessed_at`, `confidence_decayed_at`, `version`) no longer pay 2 spurious FTS5 row ops apiece. A 100k-row embed backfill drops 200k wasted FTS5 ops; `touch_many` for K=10 recalls sheds 5–10× wall cost. Idempotent. Postgres mirror via `migrate_v53()`.
+- **v54** — tier-default expiry backfill (#1466): in-code backfill arm (no new `.sql` file) that stamps the per-tier create-time expiry backstop onto legacy NULL-`expires_at` mid/short rows, closing the TTL-leak immortal-rows class where pre-v54 rows that never got touched would never expire. Idempotent. Postgres mirror via `migrate_v54()`.
+- **v55** — federation-catchup `updated_at` index (#1476): the W=2 peer-catchup query `WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT ?2` (driving every `GET /api/v1/sync/since`) was made sargable by splitting the former `(?1 IS NULL OR updated_at > ?1)` OR-NULL predicate into a None path (no predicate) and a Some path (bare range bound). On sqlite the bump also creates `idx_memories_updated_at ON memories(updated_at)` via [`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`](../migrations/sqlite/0046_v55_idx_memories_updated_at.sql) so the planner range-scans the index instead of full-scanning + sorting. Postgres adds NO new index — `memories_updated_at_idx (updated_at DESC)` already serves the range scan via Index Scan Backward — so `migrate_v55()` is a version-stamp no-op on postgres. Measured ~3× cost reduction (EXPLAIN GENERIC_PLAN 7177 → 2396 on a 200k-row probe). Idempotent (`CREATE INDEX IF NOT EXISTS`).
+- **v56** — composite list/archive ordering indexes (#1579 A2 + B6d): adds `idx_memories_list_order (priority DESC, updated_at DESC)` + `idx_memories_ns_list_order (namespace, priority DESC, updated_at DESC)` via [`migrations/sqlite/0047_v56_list_composite_indexes.sql`](../migrations/sqlite/0047_v56_list_composite_indexes.sql), plus `idx_archived_ns_archived_at (namespace, archived_at DESC)` behind an `archived_memories` table probe in the Rust arm. Paired with the sargable `storage::list` rewrite (the former `(?N IS NULL OR col = ?N)` filter arms became distinct prepared shapes built by `storage::build_list_query`) so the planner walks the composite index in ORDER BY order with early-stop under LIMIT instead of a full-table temp B-tree sort — P1-measured 141 ms → 0.06 ms on a 100k-row list page. Postgres mirror `migrate_v56()` is a version-stamp no-op (its list path is its own SQL builder over `memories_priority_idx` / `memories_updated_at_idx`). Idempotent (`CREATE INDEX IF NOT EXISTS`).
+- **v57** — postgres stored generated tsvector column (#1579 B2, perf-audit final gate): on sqlite this is a version-stamp no-op (FTS5 already materialises the indexed text in the `memories_fts` virtual table, so the per-matched-row recompute this fixes never existed there). On postgres, `migrate_v57()` adds `tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(title,'')||' '||coalesce(content,''))) STORED`, creates the `memories_tsv_gin` GIN index on the COLUMN, and drops the legacy `memories_content_fts` EXPRESSION index (it only ever served the `@@` match; `ts_rank` re-parsed the full document per matched row — ~305 of 306 ms at 8k rows in the P3 perf audit). The recall/search/contradiction query shapes now match AND rank on `tsv`. Operational note: the `ADD COLUMN` takes an ACCESS EXCLUSIVE table-rewrite lock (sub-second at ~8k rows; plan a window for very large deployments). Idempotent (`ADD COLUMN IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` + `DROP INDEX IF EXISTS`).
+
+**Operator advisory.** Before the first `ai-memory serve` against a v0.6.4-era DB, run:
+
+```bash
+cp ~/.local/share/ai-memory/ai-memory.db ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07
+sqlite3 ~/.local/share/ai-memory/ai-memory.db.bak.pre-v07 'PRAGMA schema_version;' \
+  > /dev/null && echo "backup verified readable"
+```
+
+The ladder is idempotent on restart but forward-only (not reversible) — once `schema_version` reaches 55, you cannot downgrade to v34 in place; restore from your `.bak` file (or the automatic pre-migration snapshot) if you need to roll back to v0.6.4.
 
 ---
 
 ## What did **not** change
 
-- v0.6.4 default tool surface (`--profile core`) is **unchanged in spirit**. The seven core tools (the original 5 — `store`, `recall`, `list`, `get`, `search` — plus v0.7 B1's `memory_load_family` and v0.7 B2's `memory_smart_load`) stay the only advertised tools by default.
+- The original v0.6.4 5-tool default surface is **preserved in spirit** — the v0.7 B1/B2 loaders (`memory_load_family`, `memory_smart_load`) joined the `core` family, bringing the default count to 7. No tool was removed from `core`.
 - Existing v0.6.4 SDKs continue to work against a v0.7.0 server. Capabilities v3 fields are additive; v2 fields stay at their existing paths.
 - Memory data — no migration required for stored memories; embeddings, archives, links, governance policies all carry forward.
-- HTTP API endpoints — every v0.6.4 route stays at the same path with the same shape.
+- HTTP API endpoints — every v0.6.4 route stays at the same path with the same shape. v0.7.0 adds 15 net-new route registrations (73 → 88; the original "8 new HTTP routes" inventory pre-dated the #1146 config + #1416 capture_turn additions — see [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md)).
 - The CLI surface (`ai-memory store`, `recall`, etc.) — every v0.6.4 subcommand continues to work unchanged.
 - Boot manifest cost — `ai-memory boot` output is independent of attestation, hooks, transcripts, AGE.
 - Hook pipeline — **default off.** A v0.7.0 install with no `hooks.toml` behaves identically to v0.6.4 at the lifecycle layer.
@@ -278,9 +694,11 @@ Schema migration v20 → v22 (audit_log → signed_events → memory_transcripts
 
 ## Related
 
-- [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md) — single-doc framework for the v0.7.0 sprint
-- [`docs/MIGRATION_v0.6.4.md`](MIGRATION_v0.6.4.md) — predecessor migration guide
-- [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.md) — earlier migration
-- [`ROADMAP2.md §7.3`](../ROADMAP2.md) — original v0.7 spec
-- [`CHANGELOG.md`](../CHANGELOG.md) — full v0.7.0 entry (TODO until release tagged)
-- v0.7.0 cert campaign in [`alphaonedev/ai-memory-test-hub`](https://github.com/alphaonedev/ai-memory-test-hub) (TODO — `campaigns/v0.7.md` filed at release)
+- [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.md) — full release notes (incl. post-grand-slam ship-readiness wave).
+- [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md) — canonical feature truth.
+- [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md) — single-doc framework for the v0.7.0 sprint.
+- [`docs/MIGRATION_v0.6.4.md`](MIGRATION_v0.6.4.md) — predecessor migration guide.
+- [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.md) — earlier migration.
+- [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — sqlite → postgres migration runbook.
+- [`ROADMAP.md §7.3`](../ROADMAP.md) — original v0.7 spec.
+- [`CHANGELOG.md`](../CHANGELOG.md) — full v0.7.0 entry.

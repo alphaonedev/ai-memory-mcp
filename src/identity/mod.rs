@@ -53,6 +53,23 @@ pub mod sign;
 // `observed_by` claim. Consumed by federation `sync_push` link replay
 // so tampered or forged links never land in `memory_links`.
 pub mod verify;
+// H5 (v0.7.0 round-2) — Ed25519 verify-link replay protection.
+// Bounded in-memory LRU keyed on `(link_id, signature, nonce)`. Sits
+// in front of `verify_link_handler` and rejects exact-repeat requests
+// with 409 Conflict so an attacker cannot replay a captured verify
+// indefinitely. See module docs for the threat model + memory bound.
+pub mod replay;
+// #626 Layer-3 (Task 1.3 / C4) — store-path agent attestation glue.
+// Ties SignableWrite (C1) + bound-key lookup (C3) + the attest_write gate
+// (C4) into stamp_attestation_{sync,async}, which the write surfaces call
+// to resolve metadata.attest_level (claimed / agent_attested) before
+// persisting. Permissive-default; fail-closed on a presented-but-bad sig.
+pub mod attest;
+// #1558 — reserved caller-identity sentinel SSOT. Every internal /
+// system principal string (privileged carve-outs, resolve-failure
+// sentinels, daemon agent ids) lives here as one named const;
+// `crate::validate::RESERVED_AGENT_IDS` is built from these.
+pub mod sentinels;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
@@ -61,10 +78,12 @@ const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 /// Environment variable opt-out for the hostname-revealing default (#198).
 /// When truthy (`1`, `true`, `yes`, `on`), the `host:<hostname>:pid-...`
 /// fallback is skipped and `anonymous:pid-...` is used instead.
+/// `pub` since #1558 so the daemon bootstrap (which maps the config
+/// flag onto this env var) shares the spelling.
 /// `AppConfig::effective_anonymize_default()` mirrors the same semantics
 /// from the config file, and CLI startup maps config → this env var so
 /// the downstream resolution stays env-only.
-const ENV_ANONYMIZE: &str = "AI_MEMORY_ANONYMIZE";
+pub const ENV_ANONYMIZE: &str = "AI_MEMORY_ANONYMIZE";
 
 /// Returns true when the hostname-revealing default should be suppressed.
 fn anonymize_default_enabled() -> bool {
@@ -140,11 +159,25 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
     }
 
     // 2. AI_MEMORY_AGENT_ID env var (for MCP path; CLI clap merges this already,
-    //    but MCP callers that don't pass it explicitly need this fallback)
+    //    but MCP callers that don't pass it explicitly need this fallback).
+    //
+    //    Uses [`validate::validate_agent_id_shape`] (shape-only) rather than
+    //    [`validate::validate_agent_id`] (wire-strict, also rejects
+    //    [`validate::RESERVED_AGENT_IDS`]) because the env-var path is an
+    //    internal-bootstrap surface: the daemon's own self-signing keypair
+    //    label (`DAEMON_KEYPAIR_LABEL` = "daemon" at
+    //    `src/daemon_runtime.rs`) legitimately resolves through this path
+    //    when the operator (or `entrypoint.plan-c.sh` pre-#1231) injects
+    //    `AI_MEMORY_AGENT_ID=daemon` for daemon-process startup. Wire-side
+    //    callers (HTTP body `agent_id`, MCP `agent_id` tool param) still
+    //    flow through the strict `validate_agent_id` at their own ingress
+    //    boundary — the env-var carve-out does not loosen the wire posture.
+    //    Closes #1234 (RCA: this site was missed when #977 introduced
+    //    RESERVED_AGENT_IDS + the shape/wire split).
     if let Ok(v) = std::env::var(ENV_AGENT_ID)
         && !v.is_empty()
     {
-        validate::validate_agent_id(&v)?;
+        validate::validate_agent_id_shape(&v)?;
         return Ok(v);
     }
 
@@ -184,31 +217,122 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
     Ok(id)
 }
 
+/// v0.7.0 #1468/#1469 — resolve the visibility *caller* for MCP read
+/// paths (`memory_session_start` / `memory_list` / `memory_search` /
+/// `memory_recall`).
+///
+/// Returns ONLY the stable `AI_MEMORY_AGENT_ID` env override — the exact
+/// same step-2 value the write ladder in [`resolve_agent_id`] stamps into
+/// `metadata.agent_id` — or `None`.
+///
+/// This deliberately does NOT fall through to the clientInfo/host
+/// synthesized ids (steps 3-5). Those embed the live `pid`, so a caller
+/// id minted this process can NEVER equal the owner stamped by a *prior*
+/// process. Threading such an id as the read-path caller both (a) hides an
+/// env-pinned agent's own `scope=private` rows on a fresh-process resume
+/// (#1469) and (b) fails to scope a multi-agent deployment that relies on
+/// the env override for stable identity (#1468). Returning `None` when the
+/// env is unset preserves the single-tenant "trust the local caller"
+/// read posture: the handler skips the ownership post-filter entirely.
+#[must_use]
+pub fn resolve_read_visibility_caller() -> Option<String> {
+    let v = std::env::var(ENV_AGENT_ID).ok()?;
+    if v.is_empty() {
+        return None;
+    }
+    // Match the write path's shape gate so the caller string is identical
+    // to the owner the store stamped via the same env var. A
+    // shape-invalid env value never became an owner, so it can never be a
+    // legitimate caller — drop to None (trust-all) rather than filter
+    // against a value nothing is owned by.
+    validate::validate_agent_id_shape(&v).ok()?;
+    Some(v)
+}
+
 /// Resolve `agent_id` for a single HTTP request.
 ///
-/// `body` is the `agent_id` field from `CreateMemory`; `header` is the value
-/// of the `X-Agent-Id` request header. If neither is present a per-request
-/// `anonymous:req-<uuid8>` id is synthesized and a `WARN` is logged so
-/// operators notice unauthenticated writes.
+/// `body` is the (optional) `agent_id` field from `CreateMemory`;
+/// `header` is the value of the `X-Agent-Id` request header. If neither
+/// is present a per-request `anonymous:req-<uuid8>` id is synthesized
+/// and a `WARN` is logged so operators notice unauthenticated writes.
+///
+/// # SECURITY (v0.7.0 — header-first; body must match)
+///
+/// This primitive is **safe by default**: the request header
+/// `X-Agent-Id` is the AUTHORITATIVE identity slot, and any body-side
+/// `agent_id` is a REFINEMENT that MUST agree with the header. The
+/// body slot is caller-controlled — historically it had PRECEDENCE
+/// over the header, which was the cross-tenant spoof vector closed by
+/// the v0.7.0 #874/#901/#905-#910 issue series (#874 unsubscribe +
+/// list_subscriptions, #901 notify + subscribe + get_inbox, #905
+/// power_consolidation, #907 create_memory, #909 quota_status, #910
+/// list_memories + kg_query visibility filter). Those per-handler
+/// patches each had to pass `body: None` as a workaround because the
+/// primitive itself trusted body-first. This fn now closes the
+/// underlying primitive so ANY future caller is structurally safe
+/// regardless of what they pass for `body`.
+///
+/// Resolution rules:
+///
+/// 1. The header is resolved first (or the per-request anonymous
+///    fallback is synthesized when no header is present).
+/// 2. If `body` is `Some(non-empty)` it is validated and compared
+///    against the header-resolved id. A MISMATCH returns an error
+///    tagged `agent_id_body_header_mismatch` so handlers can map it
+///    to `403 Forbidden`. An empty `body` is treated as "no claim"
+///    (same as `None`).
+/// 3. Validation errors on either side surface unchanged.
+///
+/// New callers SHOULD pass `body: None` and rely on header-only
+/// authentication; the body-refinement slot is preserved only for
+/// the existing federation receiver path (where the body carries an
+/// envelope-attributed identity, gated by
+/// `AI_MEMORY_FED_TRUST_BODY_AGENT_ID`) and for backwards-compatible
+/// callers that want defense-in-depth checks at this layer.
+/// Synthesize the per-request anonymous HTTP principal —
+/// `anonymous:req-<uuid8>`. The ONE synthesis path for every HTTP
+/// fallback site (#1560: before this helper, eight handler sites
+/// drifted to a full 36-char uuid suffix while the documented contract
+/// and this module's resolver used uuid8).
+pub fn anonymous_request_id() -> String {
+    format!("{}{}", sentinels::ANONYMOUS_REQ_PREFIX, short_uuid())
+}
+
 pub fn resolve_http_agent_id(body: Option<&str>, header: Option<&str>) -> Result<String> {
-    if let Some(id) = body
+    // 1. Header is authoritative — resolve it first (validate if
+    //    present; synthesize anonymous fallback otherwise).
+    let resolved = if let Some(id) = header
         && !id.is_empty()
     {
         validate::validate_agent_id(id)?;
-        return Ok(id.to_string());
-    }
-    if let Some(id) = header
-        && !id.is_empty()
+        id.to_string()
+    } else {
+        let anon = anonymous_request_id();
+        tracing::warn!(
+            "HTTP memory write without agent_id body field or X-Agent-Id header; assigned {anon}"
+        );
+        validate::validate_agent_id(&anon)?;
+        anon
+    };
+
+    // 2. Body, when non-empty, is a refinement that MUST match the
+    //    authoritative header-resolved id. Validate the body shape
+    //    first so a malformed claim surfaces as a 400 rather than a
+    //    403 mismatch (the validation error is the more informative
+    //    diagnostic).
+    if let Some(claim) = body
+        && !claim.is_empty()
     {
-        validate::validate_agent_id(id)?;
-        return Ok(id.to_string());
+        validate::validate_agent_id(claim)?;
+        if claim != resolved {
+            anyhow::bail!(
+                "agent_id_body_header_mismatch: body-supplied agent_id {claim:?} disagrees \
+                 with authenticated header-resolved id {resolved:?}"
+            );
+        }
     }
-    let id = format!("anonymous:req-{}", short_uuid());
-    tracing::warn!(
-        "HTTP memory write without agent_id body field or X-Agent-Id header; assigned {id}"
-    );
-    validate::validate_agent_id(&id)?;
-    Ok(id)
+
+    Ok(resolved)
 }
 
 /// Preserve `existing.agent_id` through update/dedup.
@@ -236,6 +360,19 @@ pub fn preserve_agent_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M9 — process-wide guard for every test below that mutates
+    /// `ENV_AGENT_ID`. `cargo test --jobs N` runs the test functions in
+    /// parallel by default, so an unguarded `remove_var` race can
+    /// surface as a flake when a sibling test reads the same var
+    /// mid-mutation. Acquire this mutex before every env-mutating step.
+    fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn process_discriminator_is_stable() {
@@ -291,9 +428,10 @@ mod tests {
     fn resolve_empty_explicit_falls_through() {
         // Empty explicit should be treated as "not provided" and fall through
         // to the MCP client / host / anonymous branches.
-        // SAFETY: test only, no threads concurrent-modify env here.
-        // Scrub env so step 2 doesn't short-circuit.
-        // SAFETY: single-threaded test block.
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`. Scrub env so step 2
+        // doesn't short-circuit.
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
         }
@@ -303,7 +441,9 @@ mod tests {
 
     #[test]
     fn resolve_mcp_client_synthesizes_ai_prefix() {
-        // SAFETY: single-threaded test block.
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
         }
@@ -314,7 +454,9 @@ mod tests {
 
     #[test]
     fn resolve_mcp_client_sanitizes_name() {
-        // SAFETY: single-threaded test block.
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
         }
@@ -324,7 +466,9 @@ mod tests {
 
     #[test]
     fn resolve_default_is_host_or_anonymous() {
-        // SAFETY: single-threaded test block.
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
         }
@@ -335,10 +479,104 @@ mod tests {
         );
     }
 
+    // --- v0.7.0 #1468/#1469 — read-path visibility caller resolution ------
+
     #[test]
-    fn resolve_http_body_wins() {
-        let id = resolve_http_agent_id(Some("alice"), Some("bob")).unwrap();
+    fn read_visibility_caller_returns_env_when_set() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "ai:alice");
+        }
+        let got = resolve_read_visibility_caller();
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+        assert_eq!(got.as_deref(), Some("ai:alice"));
+    }
+
+    #[test]
+    fn read_visibility_caller_none_when_unset() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+        assert_eq!(resolve_read_visibility_caller(), None);
+    }
+
+    #[test]
+    fn read_visibility_caller_none_when_empty_or_shape_invalid() {
+        let _g = env_var_lock();
+        // Empty → None (treated as unset).
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "");
+        }
+        assert_eq!(resolve_read_visibility_caller(), None);
+        // Shape-invalid (whitespace) → None: a value the write path would
+        // have rejected can never be a legitimate owner, so do not filter
+        // against it (drop to trust-all rather than hide everything).
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "has space");
+        }
+        assert_eq!(resolve_read_visibility_caller(), None);
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
+
+    /// v0.7.0 SECURITY regression — primitive-level closure of the
+    /// #874-class agent_id spoof. Previously `body` had PRECEDENCE
+    /// over `header`, so a caller authenticated as `bob` (via
+    /// `X-Agent-Id`) could pass `body=Some("alice")` and the resolver
+    /// would return `"alice"`. Post-fix the header is authoritative
+    /// and a body-vs-header mismatch is a typed error so handlers
+    /// can map to `403 Forbidden`.
+    #[test]
+    fn resolve_http_body_mismatch_is_err() {
+        let r = resolve_http_agent_id(Some("alice"), Some("bob"));
+        assert!(r.is_err(), "mismatch must be Err, got Ok({r:?})");
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("agent_id_body_header_mismatch"),
+            "error must carry tag agent_id_body_header_mismatch, got: {msg}"
+        );
+        // Header value MUST NOT leak into the resolver's return on
+        // mismatch — the contract is "error, not silent override".
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn resolve_http_body_matching_header_is_ok() {
+        // Body is a defense-in-depth refinement — when it matches the
+        // header the resolver returns the agreed id.
+        let id = resolve_http_agent_id(Some("alice"), Some("alice")).unwrap();
         assert_eq!(id, "alice");
+    }
+
+    #[test]
+    fn resolve_http_empty_body_is_no_claim() {
+        // Empty body MUST be treated as "no body-side claim" — same
+        // contract as None. Header wins, no mismatch error.
+        let id = resolve_http_agent_id(Some(""), Some("bob")).unwrap();
+        assert_eq!(id, "bob");
+    }
+
+    #[test]
+    fn resolve_http_body_without_header_uses_anonymous_and_mismatches() {
+        // No header → anonymous fallback id is synthesized. A body
+        // claim then mismatches the anonymous id → typed error.
+        // This is the strict posture: a caller cannot launder a body
+        // claim through an absent-header request.
+        let r = resolve_http_agent_id(Some("alice"), None);
+        assert!(r.is_err(), "body without header must be Err, got Ok({r:?})");
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("agent_id_body_header_mismatch"),
+            "error must carry tag agent_id_body_header_mismatch, got: {msg}"
+        );
     }
 
     #[test]
@@ -387,5 +625,106 @@ mod tests {
         let merged = preserve_agent_id(&existing, &incoming);
         assert!(merged.is_object());
         assert_eq!(merged["agent_id"], "alice");
+    }
+
+    // -----------------------------------------------------------------
+    // L0.7-2 Tier A — ENV_ANONYMIZE truthy/falsy + env-var fallback
+    // + anonymize-forced default
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn anonymize_default_enabled_truthy_variants() {
+        let _g = env_var_lock();
+        for v in ["1", "true", "yes", "on", "TRUE", " yes ", "On", "YES"] {
+            // SAFETY: env mutation serialised via env_var_lock guard.
+            unsafe {
+                std::env::set_var(ENV_ANONYMIZE, v);
+            }
+            assert!(anonymize_default_enabled(), "value {v:?} must be truthy");
+        }
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+    }
+
+    #[test]
+    fn anonymize_default_enabled_falsy_variants() {
+        let _g = env_var_lock();
+        for v in ["0", "false", "no", "off", "", "garbage"] {
+            // SAFETY: env mutation serialised via env_var_lock guard.
+            unsafe {
+                std::env::set_var(ENV_ANONYMIZE, v);
+            }
+            assert!(!anonymize_default_enabled(), "value {v:?} must be falsy");
+        }
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+    }
+
+    #[test]
+    fn anonymize_default_enabled_unset_is_falsy() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+        assert!(!anonymize_default_enabled());
+    }
+
+    #[test]
+    fn resolve_uses_env_agent_id_when_no_explicit_no_mcp() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "env-alice");
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        assert_eq!(id, "env-alice");
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
+
+    #[test]
+    fn resolve_anonymize_forces_anonymous_prefix() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::set_var(ENV_ANONYMIZE, "1");
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        assert!(
+            id.starts_with("anonymous:"),
+            "AI_MEMORY_ANONYMIZE=1 must skip host: default, got: {id}"
+        );
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+    }
+
+    #[test]
+    fn resolve_empty_env_falls_through() {
+        // Empty env var should be treated as "not set" and continue
+        // down the precedence chain.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "");
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        assert!(
+            id.starts_with("host:") || id.starts_with("anonymous:") || id.starts_with("ai:"),
+            "empty env must fall through to host/anonymous default, got: {id}"
+        );
+        // SAFETY: env mutation serialised.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+        }
     }
 }

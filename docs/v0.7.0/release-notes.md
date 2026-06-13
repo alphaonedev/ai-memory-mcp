@@ -1,0 +1,1900 @@
+# ai-memory v0.7.0 — `attested-cortex` (release notes)
+
+## Release procedure (operator-gated, post v0.7.0)
+
+v0.7.0 separates CI verification from publish. `ci.yml` runs on every
+push + PR + tag (lint, check matrix, feature gates, dockerfile-validate,
+coverage). `release.yml` runs ONLY on explicit `workflow_dispatch` and
+handles the actual 5-channel fanout (binary builds + GitHub Release +
+crates.io + Homebrew tap + GHCR Docker + Fedora COPR).
+
+To publish a tag:
+
+```bash
+# 1. Create the signed tag locally
+git tag -s v<X.Y.Z> -m "..."
+
+# 2. Push the tag — fires ci.yml verification only
+git push origin v<X.Y.Z>
+
+# 3. Wait for ci.yml to land GREEN (Check matrix is the release gate)
+
+# 4. Manually trigger publish — operator-gated, intentional
+gh workflow run release.yml \
+  --repo alphaonedev/ai-memory-mcp \
+  -f tag=v<X.Y.Z>
+```
+
+Pre-release tags (SemVer `-` suffix, e.g. `v0.7.0-rc.1`) auto-skip the
+downstream stable channels (crates.io, Homebrew, Docker, COPR) so
+operator dry-runs are safe.
+
+This separation closes the historical gap where CI passing on a tag-push
+auto-fired the entire publish pipeline. The act of releasing is now a
+deliberate, named action — not a side effect of green tests.
+
+---
+
+> **Status (2026-05-09):** v0.7.0 is **release-pending Wave 1-4 cert**.
+> The original `attested-cortex` epic shipped at commit `fcdd2a5` on
+> 2026-05-06; the Round-2 multi-agent NHI sweep (PR #643 against
+> `round-2-fixes`) closed 13 follow-on findings (F6-F18) including 3
+> blockers; the v0.7.0 A2A campaign re-cert and the operator-directed
+> postgres+AGE first-class scope expansion (Wave 1-4) are landing in
+> the same v0.7.0 tag rather than a separate v0.7.0.1 / v0.7.1.
+>
+> **Tag-cut criterion:** two consecutive 100% GREEN A2A rounds against
+> the binary built from `round-2-fixes` after Wave 1-4 lands, **with
+> both droplets pointed at a shared postgres+AGE backend** (Wave 4
+> live-on-postgres acceptance gate).
+
+## Headline
+
+v0.7.0 closes the `attested-cortex` epic — **69/69 tasks across 11 tracks**
+(A/B/C/D/E/F/G/H/I/J/K) plus the grand-slam recursive-learning + Agent
+Skills + L1-6 substrate-rules wave (and the V-4 closeout #698 cross-row
+hash chain) — and ships **postgres + Apache AGE as a first-class storage
+backend** including live daemon support
+(`ai-memory serve --store-url postgres://…`), full schema parity with
+sqlite (Wave 1-4 narrative v15 → v28 port; terminal v0.7.0 ship is
+sqlite v34 / postgres v33 after L0.7 + L2 wave + V-4 closeout), 6-factor
+recall scoring parity, link migration, and a new `ai-memory schema-init`
+CLI verb.
+
+The substrate becomes both **more articulate** (capabilities v3 with
+pre-computed calibration strings, named loaders, 52% MCP-tool token
+reduction on the full profile) and **cryptographically trustworthy**
+(per-agent Ed25519 attestation with append-only `signed_events` audit
+chain — with V-4 cross-row hash chain at v34 (#698) — sidechain
+transcripts with `memory_replay`, programmable
+25-event hook pipeline, opt-in Apache AGE acceleration, K1/G1
+namespace-inheritance enforcement, real permission system with
+deny-first semantics, A2A maturity). Note: signed-events row `sig`
+population is gated on the resolved daemon `agent_id` having an
+Ed25519 `*.priv` on disk under the key directory
+(`src/main.rs:116-118` — `load_daemon_signing_key` returning `None`
+deliberately swallows the failure with the "continuing unsigned"
+stderr line; the cross-row hash chain itself remains tamper-evident
+in either posture).
+
+## v0.7.0 hardcoded-literal SSOT remediation — [#1558](https://github.com/alphaonedev/ai-memory-mcp/issues/1558) campaign (2026-06-09)
+
+A five-batch burn-down of duplicated string/numeric literals across the
+substrate, enforced going forward by the pm-v3.1 mechanical ratchet gate
+(`scripts/check-hardcoded-literals.sh`, companion to
+`scripts/check-vendor-literals.sh` — baseline counts may only shrink).
+Predominantly behavior-preserving refactors; the wire-visible exceptions
+are called out explicitly below.
+
+### Operator advisories (behaviour changes — read before upgrading)
+
+- **[#1562](https://github.com/alphaonedev/ai-memory-mcp/issues/1562)
+  — `RUST_LOG` target filtering now works (and changes) for the
+  postgres adapter.** 58 tracing sites used FIELD syntax
+  (`target = "..."`), which `RUST_LOG` target filtering cannot match —
+  converted to real metadata targets routed through consts
+  (`src/store/postgres.rs` `TRACE_TARGET`/`TRACE_TARGET_KG`,
+  `src/cli/schema_init.rs`, plus single-site fixes in
+  `federation/peer.rs`, `handlers/parity.rs`, `handlers/system.rs`).
+  Consequence: postgres SAL adapter events now emit under the literal
+  targets `store::postgres` / `store::postgres::kg` — an
+  `RUST_LOG=ai_memory=debug` filter no longer matches them; add
+  `store::postgres=debug` explicitly. Closed alongside
+  [#1563](https://github.com/alphaonedev/ai-memory-mcp/issues/1563)
+  (dead postgres-gate arm for an unregistered `POST
+  /api/v1/archive/purge` path removed).
+- **[#1560](https://github.com/alphaonedev/ai-memory-mcp/issues/1560)
+  — anonymous request-id suffix length unified (wire-visible).** One
+  `identity::anonymous_request_id()` helper (`anonymous:req-<uuid8>`)
+  replaces 10 divergent synthesis sites, 8 of which stamped the full
+  36-char UUID against the documented uuid8 contract. Anonymous
+  principals recorded in logs/audit rows now carry an 8-char suffix
+  everywhere; anything parsing the old 36-char form must accept the
+  documented short form.
+
+### Structural SSOT modules (batches 1-5)
+
+- **`src/identity/sentinels.rs` (batch 2)** — every internal/system
+  principal string (`DAEMON_PRINCIPAL`, `ANONYMOUS_INVALID`,
+  `AI_CURATOR`, `AI_HTTP`, federation/subscription/migrate/export/
+  governance internals, `ANONYMOUS_REQ_PREFIX`) as one named const;
+  82 production sites routed. These are authz-relevant: cross-tenant
+  ownership gates exempt callers whose principal EQUALS one of these
+  strings. `validate::RESERVED_AGENT_IDS` is now BUILT from the
+  sentinel consts (was a parallel literal list with a "MUST stay in
+  sync" comment) and a new invariant test pins every privileged
+  sentinel ∈ the list. `DAEMON_KEYPAIR_LABEL` moved to
+  `src/identity/keypair.rs` as the canonical `pub const` (key-file
+  label, deliberately distinct from `DAEMON_PRINCIPAL`).
+- **`src/mcp/jsonrpc.rs` (batch 3)** — JSON-RPC 2.0 version tag,
+  reserved error codes (`-32700`/`-32600`/`-32601`/`-32602`), MCP
+  method names, and the protocolVersion revision as named consts; the
+  crate-root `METHOD_*` consts become aliases of the domain-canonical
+  `jsonrpc::*` set.
+- **`src/handlers/routes.rs` (batch 4a)** — one const per production
+  HTTP route path (74 consts). The `src/lib.rs` router registers them
+  and the postgres surface gate (`handlers/postgres_gate.rs`, 207
+  literals), federation receiver, and CLI doctor match on them — the
+  gate now structurally cannot drift from the router registration. The
+  legacy `ROUTE_*` crate-root consts now alias the new SSOT.
+- **Postgres `agent_quotas` DDL parity (batch 1)** — the postgres
+  bootstrap DDL defaults now interpolate
+  `quotas::DEFAULT_MAX_{MEMORIES_PER_DAY,STORAGE_BYTES,LINKS_PER_DAY}`;
+  the sqlite path already routed through `quota_defaults()` and the
+  postgres twin was the drift.
+- **Batches 4b/5** — SQL transaction fragments
+  (`storage::connection::{SQL_BEGIN_IMMEDIATE,SQL_COMMIT,SQL_ROLLBACK}`,
+  49 copies), auth-header spellings (`HEADER_API_KEY` /
+  `HEADER_AI_MEMORY_SIGNATURE` / `HEADER_AI_MEMORY_TIMESTAMP` shared by
+  client + server sites), tracing-target consts across 14 duplicated
+  targets, config/installer keys, version/url/env/actor-label consts,
+  and tool-name + wire-enum values routed through owning types
+  (`MemoryLinkRelation::as_str()`, `AttestLevel::as_str()`; BOTH link
+  allowlist arrays now BUILT from the enum).
+
+### Gate + test fixes landed during the campaign
+
+- **[#1561](https://github.com/alphaonedev/ai-memory-mcp/issues/1561)**
+  — the literal gate's test boundary now includes
+  `#[cfg(test)]`-attributed modules (previously only `mod tests`
+  blocks were excluded by name).
+- **Batch 5c** — gate file-level `cfg(test)` fix: whole-file test
+  fixtures no longer count toward production literal totals.
+- **[#1577](https://github.com/alphaonedev/ai-memory-mcp/issues/1577)**
+  — the boundary must not fire on `cfg(test)` mod DECLARATIONS, and
+  `cfg(all(test, ...))` mods are now caught.
+- **[#1567](https://github.com/alphaonedev/ai-memory-mcp/issues/1567)**
+  — flaky-test fix: hold all 32 listeners alive through the #1201
+  port-uniqueness assert.
+
+### Federation operational findings (documented posture, not code changes)
+
+- **[#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)**
+  — the default `--quorum-timeout-ms 2000` is same-DC-tuned;
+  cross-region quorum pushes hit `deadline_exceeded` → DLQ (do-1461
+  finding). Cross-region meshes need **5000-10000 ms**; the reference
+  3-region deploy runs `FED_QUORUM_TIMEOUT_MS=8000`
+  (`deploy/do-1461/provision/lib.sh` carries the rationale — written
+  when the receiver's embed-on-receive after a dimension migration
+  could add ~1 s/row; that cost no longer rides the ack window, see
+  #1566 below). Raising the deadline is safe: the write
+  commits locally first, so a longer remote-ack wait widens only the
+  synchronous-durability gate, never the local commit. WAN guidance
+  documented in `docs/federation.md` §Tuning,
+  `docs/ADR-0001-quorum-replication.md`, and
+  `docs/TROUBLESHOOTING.md`.
+- **[#1566](https://github.com/alphaonedev/ai-memory-mcp/issues/1566)**
+  — **fixed pre-tag under #1579 B1 (embed-once-replicate-vector +
+  ack-after-commit).** Pre-fix, receivers synchronously re-embedded
+  every federation-received row (~1 s/row) inside the sender's
+  quorum-ack window — after an embedding-dimension migration this
+  inflated quorum latency + DLQ pressure fleet-wide. Now the push
+  payload ships the sender's embedding vector inside the
+  Ed25519-signed body (optional `embeddings` field; older peers
+  interoperate), dim-matching receivers store it directly, and rows
+  without a usable shipped vector are embedded by a background task
+  after the ack. Companion #1579 B5: persistent pooled outbound
+  federation connections (5-min idle pool, 60 s TCP keepalive, error
+  bodies drained for connection reuse) + adaptive DLQ replay batching
+  (`AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH`, default cap 2048, floor 64).
+
+## Known operational postures at v0.7.0 ([#1531](https://github.com/alphaonedev/ai-memory-mcp/issues/1531) residual round, 2026-06-09)
+
+Documented dispositions — deliberate v0.7.0 behavior, stated
+explicitly so operators don't have to reverse-engineer it from source.
+
+- **Security posture —
+  [#1569](https://github.com/alphaonedev/ai-memory-mcp/issues/1569):
+  namespace governance defaults are allow-on-silence.** Absent an
+  explicit namespace standard, `CorePolicy::default()` is
+  `write: Any`, `promote: Any`, `delete: Owner`
+  (`src/models/namespace.rs`) — **write/promote are ungated by design
+  at v0.7.0**; the governance pipeline gates only what operators
+  configure. Hardening knob: attach a standard via
+  `memory_namespace_set_standard` with a `metadata.governance`
+  policy. Set standards on every production namespace. Documented in
+  `docs/governance.md` §"Namespace-standard defaults" + CLAUDE.md
+  §Data Model.
+- **Deprecation —
+  [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574):
+  `?api_key=` query-parameter authentication.** The supported
+  credential channel is the `x-api-key` request header. The query
+  form leaks credentials into access logs, `Referer` headers, and
+  proxy logs; at v0.7.0 it is still accepted for back-compat with a
+  once-per-process WARN (`handlers::transport::api_key_auth`), and is
+  slated for v0.8 rejection behind a temporary escape hatch. Migrate
+  callers now. Documented in `docs/production-deployment.md` §3b.
+- **Rollback contract —
+  [#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576):
+  migrations are forward-only by design; snapshot-restore is the
+  rollback.** Every schema-mutating upgrade first writes an automatic
+  sibling snapshot
+  `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak`
+  (`PRE_MIGRATION_BACKUP_INFIX`, `src/storage/migrations.rs`;
+  `VACUUM INTO`, transactionally consistent, SQLCipher keying
+  inherited) and refuses to mutate the schema if the snapshot fails.
+  Rollback = stop daemon → reinstall previous binary → restore the
+  snapshot → start. Procedure in `docs/ADMIN_GUIDE.md`
+  §Migration → Rollback.
+
+## Substrate-native API embeddings ([#1598](https://github.com/alphaonedev/ai-memory-mcp/issues/1598), 2026-06-11)
+
+The #1067 provider-agnostic substrate now extends to the **embedder**.
+Pre-#1598, semantic recall embeddings were local-only (Ollama-native
+`/api/embed` or the in-process MiniLM/nomic path); the `[embeddings]`
+section accepted only `backend = "ollama"` shapes. Post-#1598 the
+`[embeddings]` section is fully API-capable and CPU-only nodes can run
+the full semantic/autonomous tiers against a cloud or self-hosted
+embedding API.
+
+**New configuration surface.**
+
+- `[embeddings].backend` — `ollama` (default), any #1067 vendor alias
+  (`openrouter`, `openai`, `gemini`, …), or `openai-compatible` for
+  self-hosted `/v1/embeddings` endpoints (HuggingFace
+  text-embeddings-inference, vLLM, llama.cpp server).
+- `[embeddings].base_url` — synonym of the existing `url` field
+  (named to match `[llm].base_url`); `base_url` wins when both set.
+- `[embeddings].api_key_env` XOR `[embeddings].api_key_file` (mode
+  0400 enforced) — inline `api_key = "<literal>"` is REJECTED at
+  parse time, mirroring `[llm].api_key`.
+- `[embeddings].dim` — explicit vector-dim override for models not in
+  `config.rs::KNOWN_EMBEDDING_DIMS` (the table gained
+  `google/gemini-embedding-2` (3072) and the IBM Granite entries).
+- New env vars (precedence per field: env > `[embeddings]` section >
+  legacy flat > compiled default): `AI_MEMORY_EMBED_BACKEND`,
+  `AI_MEMORY_EMBED_BASE_URL`, `AI_MEMORY_EMBED_MODEL`,
+  `AI_MEMORY_EMBED_API_KEY` (**secret**).
+
+**Behaviour changes.**
+
+- **Fail-closed embedder boot (closes
+  [#1593](https://github.com/alphaonedev/ai-memory-mcp/issues/1593)).**
+  When embedder construction fails, semantic recall degrades to
+  keyword mode with a loud ERROR on stderr — the chat LLM client is
+  **never** silently reused for embeddings.
+- **Truthful capabilities (closes
+  [#1594](https://github.com/alphaonedev/ai-memory-mcp/issues/1594)).**
+  `memory_capabilities` reports the LIVE posture: a remote embedder
+  whose endpoint is failing at request time reports
+  `embedder_loaded = false` and `recall_mode_active` follows
+  (`degraded` instead of `hybrid`).
+- **Resilient backfill (closes
+  [#1595](https://github.com/alphaonedev/ai-memory-mcp/issues/1595)).**
+  The embedding backfill survives poison rows: failed batches retry
+  per-row, rows that still fail are skipped with a WARN naming the
+  row, and Ollama requests send `truncate: true` so over-length inputs
+  no longer abort a batch.
+
+**New operator tooling.**
+
+- **`ai-memory reembed [--namespace <ns>] [--dry-run] [--batch <n>]
+  [--json]`** — the vector-space migration tool. Re-embeds the corpus
+  under the currently-resolved backend/model; `--dry-run` prints
+  `{total_rows, rows_missing_embeddings, target_model, target_dim,
+  backend}`; a live run replaces all vectors with per-row fallback +
+  skip-with-WARN on poison rows and a summary JSON. CLI subcommand
+  count: 79 → **80** default build, 81 → **82** under
+  `--features sal`.
+- **`ai-memory doctor` section "Embeddings Reachability (#1598)"** —
+  probes the resolved endpoint (ollama `GET /api/tags`; API backends
+  `POST /embeddings` with the resolved Bearer key), reports
+  PASS/WARN/CRIT plus full provenance facts, and fires a GPU-policy
+  WARN when `backend = ollama` resolves on a host with no compatible
+  GPU (operator policy: local Ollama embeddings only on GPU-equipped
+  nodes).
+
+**Reference shapes.** The operator-selected reference cloud model is
+`openrouter` + `google/gemini-embedding-2` (3072-dim, 8192-token
+context, ~$0.20/M tokens, Google AI Studio provider, USA; paid-tier
+only — no `:free` routes). For airgapped/self-hosted deployments the
+Apache-2.0 USA model set is `nomic-embed-text-v1.5` (768d — zero
+re-embed for existing corpora), Snowflake `arctic-embed` l/m/s
+(1024/768/384) and IBM `granite-embedding` (768/384), served via TEI,
+vLLM, or llama.cpp server. See the two new enterprise reference
+architectures:
+[CPU + Memory federated nodes](../reference-architecture/enterprise-cpu-memory.md)
+and
+[CPU + Memory + GPU federated nodes](../reference-architecture/enterprise-cpu-memory-gpu.md).
+
+## v0.7.0 provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067), 2026-05-21)
+
+The historical Ollama-only LLM client is now a **provider-agnostic LLM
+substrate**. Every tier (keyword / semantic / smart / autonomous) can
+speak to any vendor — one code path, two wire shapes, fifteen
+pre-configured vendor aliases.
+
+**Wire shapes:**
+
+- **Ollama-native** — `POST /api/chat`, `POST /api/embed`. No auth.
+  Default, backward compatible with v0.6.x callers.
+- **OpenAI-compatible** — `POST /v1/chat/completions`, `POST /v1/embeddings`.
+  `Authorization: Bearer <api_key>`. Covers every spec-compliant vendor.
+
+**Vendor aliases** (pre-filled base URL + per-vendor API-key env var):
+
+| Alias | Default base URL | Fallback env vars |
+|-------|------------------|---------------------|
+| `ollama` | `http://localhost:11434` | (none — no auth) |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
+| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `kimi` (= `moonshot`) | `https://api.moonshot.cn/v1` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
+| `qwen` (= `dashscope`) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` |
+| `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `together` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| `cerebras` | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `fireworks` | `https://api.fireworks.ai/inference/v1` | `FIREWORKS_API_KEY` |
+| `lmstudio` | `http://localhost:1234/v1` | (none) |
+| `openai-compatible` | (none — REQUIRES `AI_MEMORY_LLM_BASE_URL`) | `AI_MEMORY_LLM_API_KEY` |
+
+**Env-var surface (new):**
+
+- `AI_MEMORY_LLM_BACKEND` — selector. Accepts any of the aliases above
+  plus `openai-compatible` (generic) and `ollama` (default).
+- `AI_MEMORY_LLM_BASE_URL` — overrides per-alias default. REQUIRED
+  when `BACKEND=openai-compatible`. Legacy `OLLAMA_BASE_URL` is still
+  honored when `BACKEND=ollama`.
+- `AI_MEMORY_LLM_API_KEY` — Bearer secret for OpenAI-compatible. Per-vendor
+  fallback env vars honoured in the table above (e.g. `XAI_API_KEY`).
+  Treated as **secret** (never echoed in capabilities / banners / audit
+  rows).
+- `AI_MEMORY_LLM_MODEL` — model identifier passed through verbatim.
+  Vendor-specific (e.g. `grok-4` for xAI, `deepseek-chat` for DeepSeek,
+  `qwen-max` for Qwen, `gemma3:4b` for Ollama).
+
+**Tier independence.** The substrate's tier no longer dictates which
+vendor speaks. Pre-#1067 the autonomous tier required local Ollama,
+forcing every customer to procure a GPU. Post-#1067, customers pick
+from a deployment matrix that spans Raspberry Pi / mobile edge ($0/mo)
+to enterprise multi-GPU clusters ($10k+/mo); the substrate is identical,
+only the env vars change.
+
+**Auto-tag chat-shape routing (2026-05-21 follow-up to #1067).** The
+runtime smoke against IronClaw-on-Grok-4.3 surfaced an L5 hook regression:
+`auto_tag` was routing through `generate_with_body` which was hardcoded
+to `/api/generate` (Ollama text-completion). Non-Ollama vendors don't
+expose `/api/generate`, so every store request 404'd against the
+configured Grok endpoint. Fixed by routing `auto_tag` through
+`generate_with_model_override` which selects the provider-aware
+chat-shape (`/api/chat` for Ollama, `/v1/chat/completions` for
+OpenAI-compat); the model-override path (`gemma3:4b` → `grok-4.3`
+etc.) is preserved across both branches. Wiremock tests updated;
+`generate_with_body` retained as a private legacy helper for the
+test that pins the `check_outbound()` gate ordering invariant.
+
+**docker-compose for IronClaw on Grok 4.3.** The
+`infra/lan-parity-test/docker-compose.yml` `ic-parity-alice` +
+`ic-parity-bob` services now set `AI_MEMORY_LLM_BACKEND=xai`,
+`AI_MEMORY_LLM_MODEL=${AI_MEMORY_LLM_MODEL:-grok-4}`, and
+`XAI_API_KEY=${XAI_API_KEY:?…}` (REQUIRED, fail-fast). Operators
+run `set -a; source ~/.env; set +a` before `docker compose up` to
+inject the secret from a 0400-mode env file.
+
+**Schema reference:** module-level docs at
+[`src/llm.rs`](../../src/llm.rs); `LlmProvider` enum + `OllamaClient::from_env()`
+constructor are the canonical anchors.
+
+## v0.7.0 enterprise configuration standard ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146), 2026-05-23)
+
+The #1067 LLM substrate landed env-aware resolution into every
+production code path that builds an LLM client, but the operator
+configuration surface remained fragmented across five disjoint sources
+(`~/.config/ai-memory/config.toml` partial flat fields,
+`~/.claude.json` MCP env block, the SessionStart hook env, compiled
+tier presets in `src/config.rs`, and process env). The boot banner
+reported one backend; the live MCP server ran another; API keys lived
+inline in `~/.claude.json`. #1146 retires that fragmentation.
+
+**Single source of truth — sectioned config schema v2.**
+`~/.config/ai-memory/config.toml` now carries dedicated
+`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, and `[storage]`
+sections. The compile-time tier presets (`src/config.rs::FeatureTier` preset
+constructors + `default_tier_llm_model`)
+remain as the last-resort fallback under the precedence ladder, not
+as a parallel source of truth.
+
+```toml
+schema_version = 2
+
+[llm]
+backend     = "xai"
+model       = "grok-4.3"
+base_url    = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
+# api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced; alt to api_key_env
+
+[llm.auto_tag]
+backend = "ollama"
+model   = "gemma3:4b"
+```
+
+**Canonical resolver — one shape, every surface.** Every LLM-init site
+(MCP stdio at `src/mcp/mod.rs`, HTTP daemon at `src/daemon_runtime.rs`,
+`ai-memory atomise` at `src/cli/commands/atomise.rs`, `ai-memory curator`
+at `src/cli/curator.rs`, the boot banner at `src/cli/boot.rs`, the
+doctor probe at `src/cli/doctor.rs`) now consumes
+`AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url) -> ResolvedLlm`
+with a uniform precedence ladder:
+
+```
+CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
+```
+
+Sister resolvers `resolve_llm_auto_tag`, `resolve_embeddings`,
+`resolve_reranker`, and `resolve_storage` follow the same ladder. The
+`ResolvedLlm` struct's `Debug` impl redacts the resolved `api_key` to
+`<redacted>` so accidental `{:?}` prints never leak credentials.
+
+**Inline-key rejection.** `[llm].api_key = "<literal>"` is **rejected
+at parse time** with a clear stderr error and the daemon falls back to
+`AppConfig::default()` so it still boots. Operators MUST use either
+`[llm].api_key_env = "<ENV_VAR_NAME>"` (process-env reference) or
+`[llm].api_key_file = "/path"` (file path; mode 0400 enforced via the
+`AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` escape hatch from
+[#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)).
+`api_key_env` and `api_key_file` are mutually exclusive.
+
+**Migration tool — `ai-memory config migrate`.** Rewrites a legacy
+v0.6.x flat-field `config.toml` in place (with a timestamped `.bak`)
+to the v2 sectioned shape. Idempotent. `--dry-run` prints the diff
+without writing; `--also-clean-claude-json` additionally removes
+`mcpServers.<*>.env` blocks whose `command` resolves to `ai-memory`
+from `~/.claude.json` after the operator has verified the new config
+works.
+
+```bash
+ai-memory config migrate
+ai-memory config migrate --dry-run
+ai-memory config migrate --also-clean-claude-json
+```
+
+**Reachability probe — `ai-memory doctor`.** A new `LLM Reachability
+(#1146)` section in the doctor report resolves the canonical config
+and probes the endpoint with the resolved Bearer key
+(`GET <base_url>/api/tags` for Ollama, `GET <base_url>/models` for
+OpenAI-compatible). Severity partition:
+
+| Severity | Outcome                                          |
+|----------|--------------------------------------------------|
+| INFO     | 200 (vendor reachable + auth OK)                 |
+| WARN     | 401 / 403 (auth issue; URL reachable)            |
+| WARN     | 429 (rate-limited; reachable)                    |
+| WARN     | 5xx (vendor outage; reachable)                   |
+| CRIT     | 4xx other (likely wrong base_url / endpoint)     |
+| CRIT     | network / DNS / connect-refused / TLS error      |
+
+The report surfaces the resolved provenance facts (`backend`, `model`,
+`base_url`, `config_source`, `key_source`) so operators see WHICH
+precedence layer won.
+
+**Legacy v0.6.x flat fields** (`llm_model`, `ollama_url`, `embed_url`,
+`embedding_model`, `cross_encoder`, `default_namespace`,
+`archive_on_gc`, `archive_max_days`, `max_memory_mb`,
+`auto_tag_model`) continue to parse and feed the resolver's `Legacy`
+arm. Loading a legacy config emits a `Once`-gated stderr WARN
+pointing at `ai-memory config migrate`. **Legacy fields will be
+removed in v0.8.0.**
+
+**HTTP / CLI surface additions.** The `Config` subcommand and the
+`/api/v1/config/*` HTTP routes are new at v0.7.x; the count change is
+captured in [`CLAUDE.md`](../../CLAUDE.md) §Architecture (88 HTTP
+routes, 78 CLI subcommands in default build / 80 under --features sal —
+SSOT: `ai_memory::EXPECTED_PRODUCTION_ROUTES_COUNT` and
+`EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` in `src/lib.rs`).
+
+**Test pins.** Resolver precedence + secret-handling discipline are
+pinned by 19 tests under `src/config::tests::*1146*` +
+`src/cli/commands/config::tests::migrate_*`. Adding a new resolver
+field requires updating the resolver function AND the precedence
+test for that resolver.
+
+**Operator references.**
+
+- [`docs/CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) — canonical reference for every section + field.
+- [`docs/MIGRATION_v0.7.md` §"Provider-agnostic LLM backend"](../MIGRATION_v0.7.md#provider-agnostic-llm-backend-1067--1146) — recommended config-first path.
+- [`docs/ADMIN_GUIDE.md` §"LLM Backend Setup"](../ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — operator runbook.
+
+## v0.7.0 mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068), Posture-1a 3-layer ship, 2026-05-21)
+
+Lands the three-layer CI coverage for the Posture-1a (Edge / Mobile)
+row from [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) —
+ai-memory's claim to run on iPhone + Android via `aarch64-apple-ios`
+and `aarch64-linux-android`.
+
+| Layer | Workflow | Coverage |
+|---|---|---|
+| 1 — cross-compile | [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) — `mobile-cross-compile` matrix job | `cargo check --no-default-features --features sqlite-bundled --lib` on every PR + push to `release/**` for both `aarch64-apple-ios` (macos-latest with Apple SDK) and `aarch64-linux-android` (ubuntu-latest with NDK r26d via `nttld/setup-ndk`; `CC_*` / `AR_*` / `CARGO_TARGET_*_LINKER` pointed at android24-clang so rusqlite's bundled SQLite C blob compiles against the Android sysroot). Catches ~80% of mobile bit-rot risk. |
+| 2 — release artifacts | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — `mobile-ios` + `mobile-android` jobs | `mobile-ios` builds `aarch64-apple-ios` + `aarch64-apple-ios-sim` + `x86_64-apple-ios` static libs, combines via `xcodebuild -create-xcframework` into `AiMemory.xcframework` with a cbindgen-generated C header + module.modulemap, publishes `ai-memory-ios.xcframework.tar.gz` + `.sha256`. `mobile-android` builds aarch64 / armv7 / x86_64 / i686 -linux-android `.so` files in the canonical `jniLibs/<abi>/` layout, publishes `ai-memory-android.tar.gz` + `.sha256`. Gated on stable (non-prerelease) tags. Until `#[no_mangle] extern "C"` items land in `src/lib.rs` (v0.7.x follow-up), the C header is a stub. |
+| 3 — simulator / emulator runtime | [`.github/workflows/mobile-runtime.yml`](../../.github/workflows/mobile-runtime.yml) | `ios-simulator` runs `tests/mobile_runtime.rs` (13 scoped tests under `tests/mobile/`) on iPhone 15 via `xcrun simctl spawn` on macos-latest. `android-emulator` runs the same binary on a KVM-accelerated Android API-30 emulator via `reactivecircus/android-emulator-runner@v2`. Gated on `release/**` push + `workflow_dispatch` (PRs run iOS arm only to keep cost down). Tests cover: fs sandboxing + WAL/SHM sibling cleanup, FTS5 + PRAGMA journal_mode round-trip, HNSW build/query + zero-vector NaN pin, candle CPU tensor + matmul smoke, reqwest + wiremock OpenAI-compat TLS round-trip. |
+
+Selection rationale + ~$10/month cost-cap rationale documented at
+[`tests/mobile/README.md`](../../tests/mobile/README.md).
+
+`Cargo.toml` `[lib]` `crate-type` was extended to `["rlib", "staticlib", "cdylib"]`
+so the static lib (iOS) + dynamic lib (Android) artifacts actually link;
+`rlib` default preserved for every other consumer (bins, integration
+tests, downstream crates).
+
+The "5 supported platforms" framing in older docs (Mac, Linux, Windows
+desktop / Mac, Linux server) is superseded — v0.7.0 ships CI coverage
+for **7+ targets**: x86_64-linux, aarch64-linux, x86_64-apple-darwin,
+aarch64-apple-darwin, x86_64-pc-windows-{msvc,gnu}, aarch64-apple-ios,
+aarch64-linux-android.
+
+## v0.7.0 ship-readiness items (6-agent review batch, 2026-05-21)
+
+The 6-agent v0.7.0 code+security review (post-PR-#820 merge) surfaced
+four discrete items that landed in commit
+[`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)
+before the #1067 / #1068 substrate work.
+
+- **[#1015](https://github.com/alphaonedev/ai-memory-mcp/issues/1015)
+  (MEDIUM after restatement) — `rule_cache.rs` doc drift.** Three
+  independent agents landed on the same finding: the module-doc claimed
+  "every write to `governance_rules` from the SAME cache-aware caller
+  calls `RuleCache::invalidate_all`" — false. No production caller of
+  `rules_store::insert` / `remove` / `set_enabled` / `update_signature`
+  invokes `invalidate_all`. **Fix:** module-doc replaced with the
+  honest contract — **invalidate-on-restart-only at v0.7.0**.
+  Documents that (a) the substrate `rules_store` mutators do NOT hold
+  an `Arc<RuleCache>`, (b) rule writes happen exclusively via CLI
+  (separate process — daemon cache cannot observe sibling writes),
+  (c) the daemon does NOT expose an HTTP / MCP rule-write surface at
+  v0.7.0, (d) operators must restart `ai-memory serve` for rule
+  changes via CLI to take effect. `invalidate_all` / `invalidate`
+  remain exposed for test fixtures and future SIGHUP / admin-endpoint
+  use.
+  - **Operator advisory** ([#1047](https://github.com/alphaonedev/ai-memory-mcp/issues/1047)
+    cross-reference): the `ai-memory rules add` / `enable` / `disable`
+    CLI subcommands write to a **separate process** from the running
+    daemon. The daemon's in-memory `RuleCache` does NOT observe those
+    sibling writes. After any `ai-memory rules <verb>` invocation,
+    restart the daemon (`systemctl restart ai-memory` or equivalent)
+    for the rule change to take effect on the wire-check / pre-write
+    governance gates. A future v0.8 admin-endpoint or `SIGHUP` handler
+    will close this gap by calling `invalidate_all` over the running
+    daemon's IPC; until then, restart is the load-bearing remediation.
+- **[#1027](https://github.com/alphaonedev/ai-memory-mcp/issues/1027)
+  (CRITICAL) — `run_gc` HTTP route missing `require_admin` gate.**
+  `src/handlers/admin.rs::run_gc` emitted an audit row but did
+  NOT enforce admin-allowlist membership. Any API-key holder could
+  trigger the GC sweep which permanently DELETEs every row past
+  `expires_at` — force-purge across tenants in advance of any restore
+  window. **Fix:** prepend `require_admin(&app, &headers, "run_gc")?`
+  matching the shape of `export_memories` (#957) +
+  `forget_memories` (#956). Non-admin callers now get
+  `403 FORBIDDEN` before any state change.
+- **[#1050](https://github.com/alphaonedev/ai-memory-mcp/issues/1050)
+  (CRITICAL) — `memory_share` advertised but dispatch arm missing.**
+  `registered_tools()` shipped `memory_share`, `src/mcp/tools/share.rs::handle_share`
+  exists, capabilities v3 reports `callable_now=true` under any
+  profile containing `Family::Power` — but `TOOL_DISPATCH_TABLE`
+  (`src/mcp/mod.rs`) contained no `register_mcp_tool!("memory_share", …)`
+  arm. `tools/call memory_share` returned `-32601 unknown tool`.
+  Wire-contract break: `tools/list` advertised, `tools/call` rejected.
+  **Fix:** added `dispatch_memory_share(ctx)` wrapper +
+  `register_mcp_tool!` arm + two regression tests
+  (`every_registered_tool_has_dispatch_arm_1050` +
+  `every_dispatch_arm_has_registered_tool_1050`) that pin the
+  invariant in both directions so this class of drift cannot recur.
+- **[#1065](https://github.com/alphaonedev/ai-memory-mcp/issues/1065)
+  (INFRA) — lan-parity compose uses bare apache/age image.** The SAL
+  postgres adapter's `init schema` fails on `extension "vector" is
+  not available` because `apache/age:release_PG16_1.6.0` doesn't
+  carry pgvector. **Fix:** the `pg-age` service in
+  `infra/lan-parity-test/docker-compose.yml` now uses
+  `build: { dockerfile: Dockerfile.pg-age-vector }` so the image
+  layers `postgresql-16-pgvector` on top via apt. The same
+  Dockerfile.pg-age-vector pattern applies to any postgres+AGE
+  deployment that needs the daemon's vector recall path — see
+  [`docs/postgres-age-guide.md`](../postgres-age-guide.md).
+
+Two additional CRITICAL items landed under commit
+[`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956)
+on the postgres SAL adapter:
+
+- **[#1024](https://github.com/alphaonedev/ai-memory-mcp/issues/1024)
+  — trait `update` silently skipped version bump (Gap-1 contract
+  break on postgres).** `MemoryStore::update` SET list omitted
+  `version = version + 1` on postgres. The inherent helper
+  `update_with_expected_version` (NOT on the trait) was the only
+  postgres-side path that bumped version; a postgres-backed daemon
+  answering `PUT /api/v1/memories/:id` WITHOUT `If-Match` routed
+  through the trait method and left `version` permanently at 1 —
+  concurrent optimistic-concurrency detection silently broken on
+  postgres while the surface looked identical to sqlite. **Fix:**
+  append `version = version + 1` to the SET clause (10-bind
+  parameter list unchanged).
+- **[#1026](https://github.com/alphaonedev/ai-memory-mcp/issues/1026)
+  — `run_gc` archive+delete was NOT transactional on postgres.**
+  Fix wraps the archive INSERT + DELETE in a single transaction so
+  partial archive+delete state cannot leak after a worker panic /
+  network hiccup mid-sweep.
+
+Two additional follow-on closures landed in commit
+[`7c7c102a2`](https://github.com/alphaonedev/ai-memory-mcp/commit/7c7c102a2)
+beyond the auto_tag chat-shape fix described in §#1067 above:
+
+- **postgres `list.agent_id` filter** — `MemoryStore::list` did not
+  honour the `agent_id` filter on postgres. The HTTP / MCP / CLI
+  `list` paths that filter by `?agent_id=<id>` returned every row
+  regardless on postgres-backed daemons. Fixed by appending the
+  `AND metadata->>'agent_id' = $N` clause to the postgres adapter's
+  `list` query.
+- **memory ID path-traversal hardening** — `validate_memory_id`
+  now rejects strings containing `/` `\` `..` `\0` or any control
+  char before any storage call. Closes a defense-in-depth class of
+  bug where a sufficiently-malformed id could be coerced into a
+  path-traversal probe under operating-system FS layers that ai-memory
+  doesn't currently expose but might in a future export-path feature.
+
+## v0.7.0 ship-readiness session 2026-05-20/05-21 — security + audit hardening
+
+The 2026-05-20 → 2026-05-21 wave closed roughly 50 agent-filed issues spanning federation/audit chain, governance fail-CLOSED postures, MCP wire honesty, postgres parity, and the v48→v49 archived_memories carry. Every fix below has a regression test pinning it. Grouped by severity.
+
+### Operator advisories (behaviour changes — read before upgrading)
+
+Three v0.7.0 postures flip from v0.6.x fail-open behaviour to v0.7.0 fail-CLOSED. Each has a one-line env-var escape hatch (documented in CLAUDE.md §Environment Variables rows 36-41) for operators who need the legacy posture during peer enrolment:
+
+- **Governance hooks fail-CLOSED on rule-consultation error** ([#1054](https://github.com/alphaonedev/ai-memory-mcp/issues/1054), commit [`bc4bc4323`](https://github.com/alphaonedev/ai-memory-mcp/commit/bc4bc4323)). Transient rule-provider errors now block the write; set `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1` to revert to v0.6.x permissive behaviour.
+- **SSRF guard fail-CLOSED on DNS resolution failure** ([#1053](https://github.com/alphaonedev/ai-memory-mcp/issues/1053), commit [`488bdb6a8`](https://github.com/alphaonedev/ai-memory-mcp/commit/488bdb6a8)). Webhook + federation push targets that fail DNS now refuse the dispatch; set `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1` to revert.
+- **`passphrase_from_file` rejects lax permissions** ([#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055), commit [`0ef54ae64`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ef54ae64)). Files with bits set in `mode & 0o077` are refused; `chmod 0400 ./passphrase.txt` before upgrade, or set `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1` to revert.
+- **`hmac_secret` boot validator + fixed-length HMAC pin** ([#1039](https://github.com/alphaonedev/ai-memory-mcp/issues/1039) / [#1048](https://github.com/alphaonedev/ai-memory-mcp/issues/1048), commit [`4fd15d359`](https://github.com/alphaonedev/ai-memory-mcp/commit/4fd15d359)). Non-hex HMAC secrets are now rejected at boot rather than silently producing length-leaking comparisons. Operators with non-hex secrets must rotate to hex format pre-upgrade.
+
+### CRITICAL — schema bump + audit chain integrity
+
+- **#1025 — archived_memories full v0.7.0 column carry, schema v48 → v49** (commits [`b1b462a77`](https://github.com/alphaonedev/ai-memory-mcp/commit/b1b462a77) + [`bd74c2e2c`](https://github.com/alphaonedev/ai-memory-mcp/commit/bd74c2e2c)). v49 added 14 nullable columns to `archived_memories` on both backends so archive → restore is lossless for the full v0.7.0 Memory shape (reflection_depth / memory_kind / entity_id / persona_version / citations / source_uri / source_span / confidence_source / confidence_signals / confidence_decayed_at / mentioned_entity_id / version / atomised_into / atom_of). Both adapters now at `CURRENT_SCHEMA_VERSION = 49`.
+- **#1156 — per-namespace K8 quota dimension extension, schema v49 → v50**. v50 extends `agent_quotas` PRIMARY KEY from `(agent_id)` to `(agent_id, namespace)` so per-namespace allotments hold even when a single agent operates across many namespaces. Pre-v50 rows backfill to the `_global` sentinel. NSA CSI MCP recommendation (c) — defense-in-depth blast-radius controls.
+- **#1255 — federation_nonces persistence across daemon restarts, schema v50 → v51** (PR [#1296](https://github.com/alphaonedev/ai-memory-mcp/pull/1296)). v51 added the `federation_nonces` table so peer-replay-prevention nonces survive daemon restarts.
+- **#1389 — transcript_line_dedup persistence, schema v51 → v52** (closes [#1388](https://github.com/alphaonedev/ai-memory-mcp/issues/1388)). v52 added the `transcript_line_dedup` table backing the sha256-keyed idempotency layer for the four-layer capture architecture (L2 recover-on-boot + L3 substrate watcher + L4 `memory_capture_turn`), closing the #1388 substrate failure mode so a crashed or restarted capture pipeline cannot double-ingest the same transcript line.
+- **#1418 — memories_au FTS5 trigger scoping, schema v52 → v53** (R5.F5.2 perf-audit closeout). v53 scopes the `memories_au` FTS5 sync trigger to `AFTER UPDATE OF title, content, tags` so hot-path UPDATEs touching only non-FTS columns (`embedding`, `access_count`, `last_accessed_at`, `confidence_decayed_at`, `version`) no longer pay 2 spurious FTS5 row ops apiece — a 100k-row embed backfill sheds 200k wasted ops; `touch_many` for K=10 recalls drops 5–10× wall cost. Pure DDL, idempotent.
+- **#1466 — tier-default expiry backfill onto legacy NULL-expiry rows, schema v53 → v54**. v54 backfills `expires_at = created_at + tier.default_ttl_secs()` onto legacy mid/short rows whose `expires_at` was left NULL by a pre-TTL daemon, closing the TTL-leak immortal-rows class so GC reclaims them on schedule. In-code backfill arm (no new `.sql` file); idempotent — rows that already carry an `expires_at` or are `long`-tier are untouched.
+- **#1476 — sargable `list_memories_updated_since` federation-catchup + `idx_memories_updated_at`, schema v54 → v55**. v55 rewrites the non-sargable `($1 IS NULL OR updated_at > $1)` predicate into a `None` path (no predicate) and a `Some` path (bare `updated_at > $1`) so the planner gets a true `Index Cond` range + early-stop under `LIMIT` instead of a seq scan (`EXPLAIN GENERIC_PLAN` on a 200k-row probe: full-scan cost 7177 → 2396, ~3×). SQLite adds `idx_memories_updated_at ON memories(updated_at)` (`migrations/sqlite/0046_v55_idx_memories_updated_at.sql`, also inline in the bootstrap `SCHEMA` const); postgres adds NO new index because its bootstrap schema already ships `memories_updated_at_idx ON memories(updated_at DESC)`, so `migrate_v55()` is a postgres version-stamp no-op (the v51/v53 precedent). Both adapters ship at `CURRENT_SCHEMA_VERSION = 55`.
+
+### HIGH — federation, audit chain, governance
+
+- **#1017 HookSink::write opens fresh Connection per webhook firing — connection-reuse refactor** (commit [`604b57e32`](https://github.com/alphaonedev/ai-memory-mcp/commit/604b57e32)). Reuses the long-lived hook consultation connection; ~1-2ms/write reclaimed.
+- **#1028 federation visibility-gate audit (legacy-row regression)** (commits [`6215f8d5b`](https://github.com/alphaonedev/ai-memory-mcp/commit/6215f8d5b) + [`ed47b4d60`](https://github.com/alphaonedev/ai-memory-mcp/commit/ed47b4d60) revert + [`3befc2284`](https://github.com/alphaonedev/ai-memory-mcp/commit/3befc2284) regression test). Pinned mTLS peers cannot enumerate other agents' private rows via `/sync/since`.
+- **#1029 postgres apply_remote_memory drops federation provenance** (commit [`c855a24cc`](https://github.com/alphaonedev/ai-memory-mcp/commit/c855a24cc)). Postgres apply_remote_memory now carries all 26 v0.7.0 Memory columns.
+- **#1030 postgres list ignores Filter.agent_id** (commit [`7c7c102a2`](https://github.com/alphaonedev/ai-memory-mcp/commit/7c7c102a2)).
+- **#1031 sync/since X-Peer-Id accepted without signature verification** (commit [`ecccb9c52`](https://github.com/alphaonedev/ai-memory-mcp/commit/ecccb9c52)). `/sync/since` now requires `X-Memory-Sig`.
+- **#1032 FederationPushDlqSink poison-message infinite retry** (commit [`9c6d59a8d`](https://github.com/alphaonedev/ai-memory-mcp/commit/9c6d59a8d)). Quarantines after `MAX_REPLAY_ATTEMPTS`.
+- **#1033 ReplayCache eviction never flushed to disk under sustained load** (commit [`594a178f4`](https://github.com/alphaonedev/ai-memory-mcp/commit/594a178f4)). O(1) lookup + 10× capacity + eviction metric.
+- **#1034 wire-check refusals not entered into signed_events audit chain** (commit [`b21326b60`](https://github.com/alphaonedev/ai-memory-mcp/commit/b21326b60)).
+- **#1035 governance.check writes unsigned audit rows** (commit [`b21326b60`](https://github.com/alphaonedev/ai-memory-mcp/commit/b21326b60)). Every audit row now signed.
+- **#1037 HNSW rebuild_async no-op handle race** (commit [`17e0d4a0c`](https://github.com/alphaonedev/ai-memory-mcp/commit/17e0d4a0c)). `rebuild()` sync shim now bounded-waits.
+- **#1038 FederationNonceCache outer-HashMap unbounded peer count** (commit [`8d89e8c90`](https://github.com/alphaonedev/ai-memory-mcp/commit/8d89e8c90)). Outer-HashMap LRU bound.
+- **#1039 + #1048 HMAC verify length-leak + hmac_secret boot validator** (commit [`4fd15d359`](https://github.com/alphaonedev/ai-memory-mcp/commit/4fd15d359)).
+- **#1040 mTLS bypass + sig gate composition pinned for /sync/*** (commit [`f337efb4a`](https://github.com/alphaonedev/ai-memory-mcp/commit/f337efb4a)). Sig still required.
+- **#1049 + #1056 TOFU peer-id allowlist gate + X-Peer-Id input validation** (commit [`8a808d098`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a808d098)).
+- **#1052 MCP additionalProperties contract gap** (commit [`b79d1340b`](https://github.com/alphaonedev/ai-memory-mcp/commit/b79d1340b)). Dropped `schemars(deny_unknown_fields)` so wire matches the dispatch tolerance.
+- **#1053 SSRF guard fail-CLOSED on DNS failure** (commit [`488bdb6a8`](https://github.com/alphaonedev/ai-memory-mcp/commit/488bdb6a8)) — see Operator advisories.
+- **#1054 governance hooks fail-CLOSED on rule consultation error** (commit [`bc4bc4323`](https://github.com/alphaonedev/ai-memory-mcp/commit/bc4bc4323)) — see Operator advisories.
+- **#1055 passphrase_from_file rejects lax permissions** (commit [`0ef54ae64`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ef54ae64)) — see Operator advisories.
+- **#1057 + #1058 + #1059 MCP wire honesty trio — token budget + default:null strip + overlay parity** (commit [`357b40873`](https://github.com/alphaonedev/ai-memory-mcp/commit/357b40873)).
+- **#1060 + #1062 constant_time_eq no len leak + for_admin_checked typed gate** (commit [`2c7356ca1`](https://github.com/alphaonedev/ai-memory-mcp/commit/2c7356ca1)).
+- **#1066 + #1067 provider-agnostic LLM substrate** (commit [`b8d94a89e`](https://github.com/alphaonedev/ai-memory-mcp/commit/b8d94a89e)). Every tier × every vendor (15 OpenAI-compatible aliases + Ollama).
+- **#1068 + #1070 mobile target CI** (commits [`29fef82aa`](https://github.com/alphaonedev/ai-memory-mcp/commit/29fef82aa) + [`6f4584daf`](https://github.com/alphaonedev/ai-memory-mcp/commit/6f4584daf)).
+
+### MEDIUM — postgres parity, audit-trail hygiene, performance
+
+- **#1018 RuleCache::is_empty returns wrong answer on poisoned lock** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1019 RuleCache slow-path allocates String on every loser-of-race** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1020 RuleCache::get_or_load typed error on substrate-public surface** (commit [`fcd17b560`](https://github.com/alphaonedev/ai-memory-mcp/commit/fcd17b560)).
+- **#1021 RuleCache hot-path methods missing `#[inline]`** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1022 extract_missing_fields unbounded result vec** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1024 postgres update trait silently skips version bump** (commit [`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956)).
+- **#1026 postgres run_gc archive+delete now transactional** (commit [`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956)).
+- **#1027 run_gc HTTP route now require_admin-gated** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)).
+- **#1036 non-version-bumping write sites documented + pinned** (commit [`fce76a4ea`](https://github.com/alphaonedev/ai-memory-mcp/commit/fce76a4ea)).
+- **#1041 + #1042 governance UI honesty — rule_list + install-defaults** (commit [`fe4e841ee`](https://github.com/alphaonedev/ai-memory-mcp/commit/fe4e841ee)).
+- **#1043 governance_check_action tests now hold forensic_sink_test_lock** (commit [`8a5136049`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a5136049)).
+- **#1044 signed_events_dlq postgres column promoted to TIMESTAMPTZ** (commit [`4a8a48cb4`](https://github.com/alphaonedev/ai-memory-mcp/commit/4a8a48cb4)).
+- **#1045 migrate_v16 skipped on postgres — explanatory comment added** (commit [`4a8a48cb4`](https://github.com/alphaonedev/ai-memory-mcp/commit/4a8a48cb4)).
+- **#1046 signed_events DLQ replay-into-chain contract documented** (commit [`371a28d7d`](https://github.com/alphaonedev/ai-memory-mcp/commit/371a28d7d)).
+- **#1047 rule-cache cross-process staleness operator advisory** (commit [`4a8a48cb4`](https://github.com/alphaonedev/ai-memory-mcp/commit/4a8a48cb4)).
+- **#1051 memory_share dispatch arm restored** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)) — pre-#1050 follow-up that surfaced the dispatch-arm-missing CRITICAL early in this wave.
+- **#1061 FederationNonceCache FIFO eviction replay window documented** (commit [`371a28d7d`](https://github.com/alphaonedev/ai-memory-mcp/commit/371a28d7d)).
+- **#1063 MCP tool registry deny_unknown_fields compile-time invariant** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1064 tool_definitions test comment count drift (51 → 73)** (commit [`71c8726d7`](https://github.com/alphaonedev/ai-memory-mcp/commit/71c8726d7)).
+- **#1069 backfill promised regression tests + harden test isolation** (commit [`8a5136049`](https://github.com/alphaonedev/ai-memory-mcp/commit/8a5136049)).
+
+### LOW — doc hygiene + cleanup
+
+- **#1015 rule_cache.rs doc drift** — see existing 6-agent review batch section.
+- **#1016 AppState.rule_cache dead on HTTP path** — see existing 6-agent review batch section.
+- **#1023 MCP handle_check_agent_action RuleCache bypass documented** (commit [`371a28d7d`](https://github.com/alphaonedev/ai-memory-mcp/commit/371a28d7d)).
+- **#1050 memory_share advertised but undispatched** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)).
+- **#1065 lan-parity compose missing pgvector** (commit [`e10830887`](https://github.com/alphaonedev/ai-memory-mcp/commit/e10830887)).
+
+## v0.7.0 ship-readiness session 2026-05-21 — registry refactor (Wave-2 Tier-D1)
+
+The 2026-05-21 ship-readiness session closed [#972](https://github.com/alphaonedev/ai-memory-mcp/issues/972)
+(MCP registry split) end-to-end across the D1.1 → D1.8 sub-tickets.
+The net change is structural — the wire shape is byte-identical
+modulo the documented allowed-diffs catalog — but the contributor
+recipe and the source-of-truth surface flip:
+
+- **73 of 74 MCP tools** now carry per-tool schemars-derived `McpTool`
+  impls under `src/mcp/tools/<name>.rs`. Each tool owns its
+  `<Tool>Request` DTO (`#[derive(JsonSchema)]`), a zero-sized
+  `<Tool>Tool` type, and the matching dispatch handler. The trait
+  lives at `crate::mcp::registry::McpTool`.
+- **`tool_definitions()` collapses from a ~1100-line `json!({...})`
+  macro body to a 4-line iteration** over `registered_tools()` in
+  [`src/mcp/registry.rs`](../../src/mcp/registry.rs). Adding a new
+  tool is now one file in `src/mcp/tools/` plus one
+  `RegisteredTool::of::<...>()` line in `registered_tools()`.
+- **Wire-shape parity test** (`src/mcp/registry.rs::d1_6_987_tests`)
+  pins the post-D1.6 catalog against the stored pre-D1.6 snapshot at
+  `tests/snapshots/tool_definitions_pre_d1_6.json` — same tool count
+  (73), same names, descriptions byte-for-byte equal, same
+  `required[]`. Allowed-diffs (schemars `Option<T>` → nullable union,
+  schemars `null` defaults, `additionalProperties: false` from
+  `deny_unknown_fields`, schemars-only metadata stripped by the wire
+  trimmer) are enumerated in the test-mod doc-comment.
+- **Per-profile snapshot tests** (D1.7 #988) lock the `--profile core`
+  / `--profile full` projections of `registered_tools()` so future
+  family-filter regressions are caught at compile + test time.
+- **Compile-time schema ↔ handler invariant** (D1.7 #988). The
+  per-tool module shapes the `<Tool>Request` DTO and the
+  `handle_<tool>` body in the same file, so a field rename in the
+  DTO that breaks the handler fails to build — not at runtime.
+- **Wire trimmer extended** to drop the schemars-only `inputSchema`
+  metadata that the legacy hand-coded macro never emitted: top-level
+  `description` on the request struct, `$schema`, `title`, nested
+  `definitions.*` descriptions, and long string defaults (>32 chars).
+  The full schema remains available on demand through the verbose
+  drilldown (`memory_capabilities { family=<f>, include_schema: true,
+  verbose: true }`).
+
+The contributor-facing recipe is documented in
+[`src/mcp/tools/README.md`](../../src/mcp/tools/README.md),
+[`CLAUDE.md`](../../CLAUDE.md) § "Adding New Functionality", and
+[`docs/audience/developer.html`](../audience/developer.html). The
+pre-D1.6 recipe ("add a JSON definition in `tool_definitions()` + add
+a match arm") is gone.
+
+## v0.7.0 substrate-canonical-discipline ([#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174) PR-train, pm-v3.1, 2026-05-23/24)
+
+The pm-v3.1 substrate-canonical-discipline campaign closed [#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174)
+end-to-end across 10 sequenced PRs ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184) →
+[#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) plus the [#1183](https://github.com/alphaonedev/ai-memory-mcp/issues/1183)
+WrapStrategy split ([#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199))
+and the [#1192](https://github.com/alphaonedev/ai-memory-mcp/issues/1192) /
+[#1196](https://github.com/alphaonedev/ai-memory-mcp/issues/1196) /
+[#1205](https://github.com/alphaonedev/ai-memory-mcp/issues/1205) RuntimeContext
+follow-up ([#1204](https://github.com/alphaonedev/ai-memory-mcp/pull/1204)).
+Three independent decorrelated codegraph-driven QC audits confirmed
+ZERO-DEFECTS-CONFIRMED per pm-v3.2 NO FAIL MISSION closure discipline
+(ai-memory `global/policies` memory `2cb15d34-2399-4611-a020-df6ef91683fe`).
+
+The net change is structural — **the wire shape is byte-identical** —
+but the substrate-vendor literal scatter is gone, magic time-second
+literals are gone, the per-CLI-binary `WrapStrategy` table is split
+into a sibling module, and a process-wide `RuntimeContext` singleton
+replaces the dual `ACTIVE_*` / `OVERRIDE_*` static pairs.
+
+**Wave 1 — substrate const extraction (6 PRs).**
+
+- [`crate::mcp::registry::tool_names`](../../src/mcp/registry.rs) module
+  with 73 canonical MCP tool-name consts ([#1187](https://github.com/alphaonedev/ai-memory-mcp/pull/1187)).
+- [`crate::HEADER_CONTENT_TYPE`](../../src/lib.rs) / [`crate::MIME_JSON`](../../src/lib.rs)
+  HTTP wire consts ([#1188](https://github.com/alphaonedev/ai-memory-mcp/pull/1188)).
+- [`crate::SECS_PER_HOUR`](../../src/lib.rs) (3_600) /
+  [`crate::SECS_PER_DAY`](../../src/lib.rs) (86_400) /
+  [`crate::SECS_PER_WEEK`](../../src/lib.rs) (604_800) named time
+  constants ([#1185](https://github.com/alphaonedev/ai-memory-mcp/pull/1185)).
+- [`crate::llm::BACKEND_OLLAMA`](../../src/llm.rs) substrate-vendor literal
+  sweep ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184)).
+- [`crate::DEFAULT_NAMESPACE`](../../src/lib.rs) (`"global"`) with explicit
+  disambiguation from [`crate::quotas::GLOBAL_NAMESPACE`](../../src/quotas.rs)
+  (`"_global"`) so the storage default and the quota sentinel can no
+  longer be conflated at call sites
+  ([#1190](https://github.com/alphaonedev/ai-memory-mcp/pull/1190)).
+- Typed [`Tier::Short.as_str()`](../../src/models.rs) /
+  `Mid.as_str()` / `Long.as_str()` raw-string sweep
+  ([#1186](https://github.com/alphaonedev/ai-memory-mcp/pull/1186)).
+
+**Wave 2 — static-state extraction + cross-surface containers (5 PRs).**
+
+- `ACTIVE/OVERRIDE_PERMISSIONS_MODE` dual-source-of-truth collapsed
+  into a single `RwLock` ([#1191](https://github.com/alphaonedev/ai-memory-mcp/pull/1191)).
+- Class A SHOULD statics extracted into `AppState` / metrics registry
+  ([#1195](https://github.com/alphaonedev/ai-memory-mcp/pull/1195)).
+- Test fixtures deflaked from vendor-specific `"claude"` literals via
+  fresh canonical `"nhi"` / `"api"` constants in `tests/common::FIXTURE_SOURCE`
+  ([#1189](https://github.com/alphaonedev/ai-memory-mcp/pull/1189)).
+- Per-vendor CLI-binary `WrapStrategy` table extracted from
+  `src/cli/wrap.rs` into a new sibling
+  [`src/llm_cli_wrap.rs`](../../src/llm_cli_wrap.rs) module
+  ([#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199),
+  closes [#1183](https://github.com/alphaonedev/ai-memory-mcp/issues/1183)).
+- **NEW** [`src/runtime_context.rs`](../../src/runtime_context.rs) with
+  `pub struct RuntimeContext` + process-wide
+  `OnceLock<Arc<RuntimeContext>>` singleton (`RuntimeContext::global()`
+  / `global_arc()`) carrying MUST-class statics (`hooks_hmac_secret`,
+  `max_decompressed_bytes`, `audit: Arc<AuditState>`) + SHOULD-class
+  statics (`recall_tracker`, `keypair_cache`).
+  `AppState.runtime: Arc<RuntimeContext>` threads the singleton onto
+  the HTTP daemon (73 `AppState { ... }` literals updated across
+  production + test trees); MCP stdio + CLI reach the same singleton
+  via the `OnceLock`
+  ([#1204](https://github.com/alphaonedev/ai-memory-mcp/pull/1204),
+  closes [#1192](https://github.com/alphaonedev/ai-memory-mcp/issues/1192)
+  + [#1196](https://github.com/alphaonedev/ai-memory-mcp/issues/1196)
+  + [#1205](https://github.com/alphaonedev/ai-memory-mcp/issues/1205)).
+
+**Wave 3 — load-bearing lint-gate enforcement (1 PR).**
+
+[`scripts/check-vendor-literals.sh`](../../scripts/check-vendor-literals.sh)
+([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200))
+HARD-BLOCKs (a) vendor-monoculture literals (`"claude"`, `"openai"`,
+`"xai"`, `"anthropic"`, `"gemini"`, `"deepseek"`, `"groq"`, `"ollama"`,
+`"grok"`, `"mistral"`, `"cohere"`, `"huggingface"`) outside the 7-file
+substrate carve-out (`src/llm.rs`, `src/config.rs`, `src/mine.rs`,
+`src/validate.rs`, `src/cli/wrap.rs`, `src/llm_cli_wrap.rs`,
+`src/harness.rs`) and (b) `Duration::from_secs(3600 | 86400 | 604800 | 3_600
+| 86_400 | 604_800 | 7200 | 21600 | 172800)` magic numbers anywhere in
+production code. The gate's own `--self-test` mode injects a contrived
+`"anthropic"` literal at a production site, verifies the gate trips,
+then cleans up — providing a CI-side canary against future
+detection-logic decay. Wired into
+[`.github/workflows/c8-precheck.yml`](../../.github/workflows/c8-precheck.yml)
+alongside the existing four cargo gates (fmt + clippy + test + audit).
+Full contract documented in
+[`CLAUDE.md`](../../CLAUDE.md) §"Lint gates (issue #1174 PR10)".
+
+**Wire impact.** The PR9 ([#1189](https://github.com/alphaonedev/ai-memory-mcp/pull/1189))
+`source: "claude"` → `source: "nhi"` / `"api"` test-fixture flip changes
+the `source` field on memories stored by the test harness only —
+production daemons preserve caller-supplied `source` verbatim (no live
+wire change). The PR4 ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184))
+`"ollama"` substrate sweep is internal-only — all wire surfaces continue
+to accept and emit the literal string `"ollama"` as a backend name. The
+PR [#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199)
+WrapStrategy module move is purely internal — `src/cli/wrap.rs`'s
+public surface is unchanged (the move split detection logic from the
+per-vendor table).
+
+The CHANGELOG entry is the canonical record (commit
+[`0b7530c92`](https://github.com/alphaonedev/ai-memory-mcp/commit/0b7530c92)).
+
+## What's new since v0.6.4
+
+### HNSW async rebuild + double-buffering (Wave-2 Tier-C3, issue [#968](https://github.com/alphaonedev/ai-memory-mcp/issues/968))
+
+The in-memory HNSW vector-index rebuild path is now non-blocking. Before
+this change, every rebuild — both the `REBUILD_THRESHOLD`-triggered
+auto-rebuild and the 100k-cap eviction-edge rebuild — ran synchronously
+on the request thread. Graph construction is O(N log N) with constant
+factors that put 100k vectors at ~3-10 s on commodity hardware, so the
+producer's `memory_store` call (and every search caller contending on
+the inner mutex) blocked for the full build window. Recall p95 spiked
+from <20 ms to multi-second on the eviction edge.
+
+Post-#968 the rebuild runs on a background thread (`std::thread::spawn`
+— HNSW build is CPU-bound; no tokio runtime needed). The new graph
+warms up in an `Arc<Mutex<Option<RebuildResult>>>` slot while readers
+and writers continue against the existing `active` graph; the swap
+into `active` is a single `std::mem::swap` under the inner mutex held
+for microseconds. Concurrent writes during rebuild flow into overflow
+normally; the swap path trims only the overflow prefix already in the
+new graph, so no write is ever dropped.
+
+**Operator-visible win.** At the 100k cap eviction edge, `memory_store`
+returns in microseconds instead of blocking for the multi-second graph
+build. Bench-verified by `cargo bench --bench hnsw_rebuild_async`
+(release build, 2k-vector fixture): search **p95 = 43 µs during a
+rebuild**, well under the published 35 ms PERFORMANCE.md budget.
+
+Four regression tests pin the contract in
+`src/hnsw.rs::d1_968_tests`:
+
+- `rebuild_async_does_not_block_search_968` — concurrent search loop
+  completes under budget during a rebuild.
+- `rebuild_failure_leaves_active_unchanged_968` — short-circuit /
+  no-warmed-result paths preserve the prior `active` graph.
+- `concurrent_writes_during_rebuild_consistent_968` — 30 inserts
+  during a rebuild are all findable post-swap.
+- `rebuild_swap_is_atomic_968` — `len()` observer never sees a
+  partial-state index.
+
+The pre-existing synchronous `VectorIndex::rebuild()` is preserved as
+a shim that delegates to `rebuild_async().join() + try_swap_warming()`
+so the v0.6 test contract ("the graph is rebuilt by the time this
+returns") is unchanged. New code paths should call `rebuild_async()`
+directly.
+
+### Provenance gaps 1-7 + dogfood-fix sprint (2026-05-18)
+
+ai-memory v0.7.0 documented a **7-level provenance framework** (Identity,
+Source, Causal, Capture confidence, Versioned, Reciprocal, Decoration) on
+the capabilities surface, but the substrate's write + read paths carried
+partial coverage — every gap was a real defect under the prime directive.
+This sprint closes all seven end-to-end across the sqlite and postgres
+adapters, lands the four wire-schema + docstring fixes a 2026-05-19
+dogfood session surfaced, and ships the postgres parity work tracked
+under issue [#894](https://github.com/alphaonedev/ai-memory-mcp/issues/894).
+Tool count rises **71 → 73** (Gap 3 `memory_recall_observations` + the
+Gap 4 `confidence_tier` callable). At v0.7.0 release HEAD the schema
+ladder reaches **v49** on both backends (single logical version after
+the #933 v48 `federation_push_dlq` table land and the #1025 v49
+14-column carry on `archived_memories`). Cross-link to the full evidence
+bundle:
+[`docs/v0.7.0/test-campaign-2026-05-18-dogfood/`](./test-campaign-2026-05-18-dogfood/).
+
+**The 7-level framework — gap × before × after × evidence.**
+
+| Gap | Level | Before | After | Issue | Commit |
+|----|-------|--------|-------|-------|--------|
+| 1 | Versioned (optimistic concurrency) | `memory_update` was last-write-wins; concurrent writers silently clobbered each other | `memories.version BIGINT NOT NULL DEFAULT 1`; `update_with_expected_version` returns typed `VersionConflict { id, expected_version, current_version }`; MCP `expected_version` arg + HTTP `If-Match: <version>` → 409 with structured envelope | [#884](https://github.com/alphaonedev/ai-memory-mcp/issues/884) | [`6ad87c8`](https://github.com/alphaonedev/ai-memory-mcp/commit/6ad87c824) |
+| 2 | Source (URI as first-class) | `source_uri` lived in `metadata` JSON; un-indexable, un-queryable, surfaced only by full-row decode | First-class column with partial index `idx_memories_source_uri WHERE source_uri IS NOT NULL`; schema v45 backfills from `metadata.source_uri` AND `citations[0].uri`; insert path promotes it out of metadata automatically | [#885](https://github.com/alphaonedev/ai-memory-mcp/issues/885) | [`6ad87c8`](https://github.com/alphaonedev/ai-memory-mcp/commit/6ad87c824) |
+| 3 | Causal (recall-consumption ledger) | Substrate couldn't tell which recall candidates the caller actually cited downstream | Schema v47 `recall_observations` ledger keyed by `(recall_id, memory_id)` with `retriever`, `rank`, `score`, `consumed`, `consumed_by_memory_id` columns; `memory_recall` stamps UUIDv4 `recall_id` into every response; `memory_store` + `memory_link` consume hook reads `recall_id + cited_memory_ids` and flips matching rows; new `memory_recall_observations` MCP tool for filtered read-back; TTL pruner gated by `AI_MEMORY_OBSERVATIONS_TTL_DAYS` (default 7) | [#886](https://github.com/alphaonedev/ai-memory-mcp/issues/886) | [`3cd8c11`](https://github.com/alphaonedev/ai-memory-mcp/commit/3cd8c116d) |
+| 4 | Capture confidence (tier breakpoints exposed) | `confidence` was a bare f64; callers re-derived `Confirmed` / `Likely` / `Ambiguous` against undocumented breakpoints | `ConfidenceTier` enum (`Confirmed >= 0.95`, `Likely >= 0.7`, `Ambiguous < 0.7`); `Memory::confidence_tier()` method; capabilities-v3 `confidence_calibration.tier_thresholds` block surfaces `ConfidenceTierThresholds { confirmed, likely, ambiguous }`; `memory_recall` accepts `confidence_tier: Option<String>` filter | [#887](https://github.com/alphaonedev/ai-memory-mcp/issues/887) | [`23379e2`](https://github.com/alphaonedev/ai-memory-mcp/commit/23379e26f) |
+| 5 | Reciprocal (edit-source on supersede) | `update_with_archive_on_supersede` archived the old row but emitted no supersede-lineage audit columns | `archived_memories.archive_reason = 'superseded'` on OLD row; `new_memory.metadata.superseded_id` forward pointer on NEW row; atomic write inside a transaction (SELECT FOR UPDATE → archive → delete old → insert new); the FK `target_id REFERENCES memories(id)` prevents a `memory_links` row at supersede time — provenance is encoded via the two metadata mechanisms instead | [#888](https://github.com/alphaonedev/ai-memory-mcp/issues/888) | [`6ad87c8`](https://github.com/alphaonedev/ai-memory-mcp/commit/6ad87c824) |
+| 6 | Source (query by URI) | `source_uri` filter unsupported — callers had to full-scan and post-filter | MCP `memory_search` accepts `source_uri` query arg; storage `search_with_source_uri` + `list_by_source_uri` hit the partial index from Gap 2; namespace composability preserved | [#889](https://github.com/alphaonedev/ai-memory-mcp/issues/889) | [`6ad87c8`](https://github.com/alphaonedev/ai-memory-mcp/commit/6ad87c824) |
+| 7 | Decoration (recall response audit envelope) | `memory_recall` returned raw rows; callers re-derived freshness, link-attest, tier from N+1 lookups | Default `verbose_provenance=true` decorates every row with `confidence`, derived `confidence_tier` (from Gap 4), `source`, `source_uri`, derived `freshness_state` (computed from `expires_at + last_accessed_at + access_count`), `access_count`, `last_accessed_at`, `latest_link_attest_level` (strongest `AttestLevel` across incident links); envelope echoes Gap 3 `recall_id` UUID for downstream citation | [#890](https://github.com/alphaonedev/ai-memory-mcp/issues/890) | [`c3e344c`](https://github.com/alphaonedev/ai-memory-mcp/commit/c3e344c7a) |
+
+**Wire contract notes.**
+
+- The `confidence_tier` breakpoints are surfaced on the capabilities v3
+  envelope under `confidence_calibration.tier_thresholds`; legacy v2
+  consumers stay backward-compatible via `#[serde(default)]`.
+- HTTP `If-Match` accepts both bare integer (`If-Match: 5`) and quoted
+  ETag-style (`If-Match: "5"`) per RFC 7232 §3.1; the conflict envelope
+  matches the MCP shape (`{status: "conflict", id, expected_version,
+  current_version}`).
+- The Gap 3 ledger's `consumed` boolean defaults to `FALSE` — recall
+  candidates that the caller never cites stay observable as
+  `consumed=false` rows so substrate-side analytics can distinguish
+  recall surface area from recall *use*.
+- The Gap 7 verbose envelope respects the post-#829 trimmed budget
+  ceiling; verbose total stays under 10 000 cl100k tokens.
+
+**Dogfood findings (2026-05-19 session) — 5 surfaced, 4 fixed in this
+sprint.**
+
+Per pm-v3 (memory `cd8ede94`): documentation drift between code behavior
+and docstrings is a real defect — file AND fix. The dogfood session that
+validated Gaps 1-7 on a live MCP daemon caught five contract violations
+the unit tests had not pinned. All five were filed at discovery; four
+shipped fixes in the same session.
+
+| Finding | Class | Resolution | Commit |
+|---------|-------|-----------|--------|
+| [#892](https://github.com/alphaonedev/ai-memory-mcp/issues/892) | MCP wire schema | `memory_store` schema missing `source_uri` AND handler dropped it on the floor at `validation.rs:224` (hard-coded `None`). Both sides fixed; SQL row now persists `source_uri` end-to-end through MCP. Verified against `doc:dogfood-2026-05-19-verify` test memory. **CLOSED.** | [`39aa158`](https://github.com/alphaonedev/ai-memory-mcp/commit/39aa158f9) |
+| [#893](https://github.com/alphaonedev/ai-memory-mcp/issues/893) | MCP wire schema | `memory_update` schema missing `expected_version` + `edit_source` — handlers already read them but NHIs couldn't discover them via `tools/list`. Schema fix also exposes `source_uri` on the update path. Verbose token budget trimmed 10196 → 9998 (under 10000 ceiling) by tightening 8 docstring blocks. **CLOSED.** | [`39aa158`](https://github.com/alphaonedev/ai-memory-mcp/commit/39aa158f9) |
+| [#895](https://github.com/alphaonedev/ai-memory-mcp/issues/895) | Docstring drift | `SupersedeResult` docstring claimed a `supersedes` link was written; impl correctly skips (lines 1417-1423) because the FK `target_id REFERENCES memories(id)` would reject pointing at an archived id. Docstring corrected to document the actual two-mechanism encoding. **CLOSED (docs path).** The expensive path (relax FK to allow `memory_links → archived_memories`, OR parallel `archive_links` table) tracked separately for v0.7.0 consideration. | [`19b0854`](https://github.com/alphaonedev/ai-memory-mcp/commit/19b08543c) |
+| [#894](https://github.com/alphaonedev/ai-memory-mcp/issues/894) | Adapter parity | `cargo build --features sal-postgres` failed with 11 distinct compile errors in `src/handlers/*` (Memory / Utc / ConfidenceSource / StorageBackend / `store_err_to_response` / `get_with_visibility_retry` missing imports), blocking postgres adapter work from reaching the gate. All fixes scoped to `cfg(sal-postgres)`-gated import shuffles or visibility tweaks. Postgres SAL parity methods + 5 migrations landed in the same issue. **CLOSED IN-SESSION (all sub-tasks: migrations + SAL methods + parity harness + unblocker).** | [`a69eed0`](https://github.com/alphaonedev/ai-memory-mcp/commit/a69eed03b), [`e3ae0a5`](https://github.com/alphaonedev/ai-memory-mcp/commit/e3ae0a555), [`9bec43c`](https://github.com/alphaonedev/ai-memory-mcp/commit/9bec43c7c), [`62cf9e4`](https://github.com/alphaonedev/ai-memory-mcp/commit/62cf9e49b) |
+| [#891](https://github.com/alphaonedev/ai-memory-mcp/issues/891) | HTTP behavior | HTTP `/api/v1/search` rejects `source_uri`-only with 400 — `search_memories` early-returns on empty `q` before the `source_uri`-only branch can run. One AC pin in `tests/store_parity_gaps.rs` is `#[ignore]`-marked against this. **FILED, retained open** for handler-side fix (pinned by the ignored AC). | (pending) |
+
+**Postgres + Apache AGE parity (issue #894).** Five new migrations
+([commit `a69eed0`](https://github.com/alphaonedev/ai-memory-mcp/commit/a69eed03b))
+mirror the sqlite v45/v46/v47 ladder onto postgres v25 → v29:
+
+- `0025_v07_memory_version.sql` — Gap 1 `BIGINT` optimistic-concurrency counter
+- `0026_v07_source_uri_upgrade.sql` — Gap 2 column + partial index + metadata/citations backfill
+- `0027_v07_recall_observations.sql` — Gap 3 ledger with `(recall_id, memory_id)` PK + FK CASCADE
+- `0028_v07_edit_source_archive_metadata.sql` — Gap 5 `archive_reason` audit + `metadata.superseded_id` forward-pointer indexes
+- `0029_v07_links_temporal_columns.sql` — Gap 7 defensive `ADD COLUMN IF NOT EXISTS` on `memory_links.valid_from / valid_until / observed_by / attest_level`
+
+Greenfield deploys pick up identical columns + indexes inline from
+`postgres_schema.sql`; existing PG installs traverse the five-step
+ladder. Six inherent `PostgresStore` SAL methods
+([commit `e3ae0a5`](https://github.com/alphaonedev/ai-memory-mcp/commit/e3ae0a555))
+bring byte-identical parity with the sqlite-side `storage::` free
+functions (`update_with_expected_version`,
+`update_with_archive_on_supersede`, `search_with_source_uri`,
+`list_by_source_uri`, plus the Gap 7 link-decoration twins). ~870 LOC.
+Inherent (not on the `MemoryStore` trait) so call-sites holding
+`Arc<PostgresStore>` can drive them today; the trait can be widened in
+a follow-up once both adapters stabilise.
+
+**Cross-adapter parity harness.** `tests/store_parity_gaps.rs`
+([commit `9bec43c`](https://github.com/alphaonedev/ai-memory-mcp/commit/9bec43c7c))
+adds six `verify_<gap>_sqlite` reference functions and six matching
+`pg_parity_gap_<n>` postgres twins. Sqlite-side tests always run;
+postgres-side tests are `#[ignore]` and self-skip when
+`AI_MEMORY_TEST_POSTGRES_URL` is unset. The harness compiles cleanly
+under both default and `--features sal-postgres` so a future runner
+that flips the env var picks up zero-friction parity coverage.
+
+**Track C/D status.** The cross-adapter parity tests are green on the
+sqlite side and compile-clean on the postgres side, but live postgres
+execution remains gated on the
+[issue #79](https://github.com/alphaonedev/ai-memory-mcp/issues/79)
+inter-subnet routing blocker (192.168.50.100 cannot reach the
+192.168.1.50 postgres node — different subnets, no bridge / VPN /
+route). The substrate change is complete; what's missing is network
+plumbing. The Track C/D verdict memo will mint to SHIP once the
+operator-side routing change lands and the same harness re-runs
+green against the live PG+AGE backend.
+
+**Regression coverage (51 new pin tests).** Commit
+[`ce1415a`](https://github.com/alphaonedev/ai-memory-mcp/commit/ce1415ca6)
+maps every acceptance criterion in the seven gap issues to a named
+regression test. Total provenance-gap coverage advances **28 → 79
+tests** across 9 files (7 extended + 2 new HTTP files). Per-issue new
+test counts: #884 +5 (missing/clone/downcast/HTTP) + 5 new
+`http_if_match_concurrency`; #885 +5 (insert promotion / limit /
+idempotence); #886 +7 (since/until/noop/probe filters); #887 +5
+(boundaries / serde / unknown filter); #888 +7 (parse / inherit /
+new-row v1); #889 +3 (ordering / namespace compose / kg_query) + 4
+new `http_source_uri_query`; #890 +7 (freshness states / `recall_id`
+UUID). MCP `recall_observations` tool param-branch coverage
+([commit `913a2ff`](https://github.com/alphaonedev/ai-memory-mcp/commit/913a2ffb0))
+pins the three previously-uncovered closure branches in
+`src/mcp/tools/recall_observations.rs::handle_recall_observations`
+(since / until / limit), lifting file line coverage from ~94.5%
+to > 98%.
+
+### Headline new capability — postgres+AGE first-class
+
+- **`ai-memory serve --store-url postgres://…`** — daemon-level
+  adapter selection. The full HTTP + MCP surface routes through the
+  SAL trait; sqlite is the default, postgres is opt-in.
+- **`ai-memory schema-init`** — new CLI verb that bootstraps a fresh
+  postgres store, including the AGE projection (or `--skip-age`
+  for the CTE fallback) and the v28 schema. Idempotent on rerun.
+- **Schema parity v28 across both backends** — the 13 v0.7-alpha
+  postgres-missing migrations (governance inheritance, webhook
+  subscriptions, audit chain, transcripts, signed events, agent
+  quotas, link `attest_level`, A2A correlation, smart-load veto, KG
+  temporal-index v2, tier-promotion metadata, subscription DLQ,
+  `consolidated_from_agents` array) are now ported.
+- **`PostgresStore::link()` and `::register_agent()` implemented** —
+  retire the two `UnsupportedCapability` errors that v0.7-alpha
+  surfaced.
+- **6-factor recall scoring parity** — postgres recall now applies the
+  same `priority` / `access_count` / `confidence` / `tier_bonus` /
+  `recency` factors sqlite has. Pinned by
+  `tests/recall_scoring_parity.rs`.
+- **`migrate.rs` walks `from.list_links()`** — KG migrations now carry
+  edges, not just nodes.
+- **AGE 1.5 + PG 16 cypher-binding harness fix** — test-side only;
+  production code never hit it. Unblocks the parity test suite on
+  AGE 1.5.0.
+- **Documentation** — operator how-to ([`docs/postgres-age-guide.md`](../postgres-age-guide.md))
+  and migration runbook ([`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md)).
+
+### Wave-3 Continuation 6 — F7 closure + mTLS-validated cert posture
+
+- **Three new HTTP endpoints** close the Wave-4 cert-harness F7 gaps:
+  - `POST /api/v1/quota/status` — `MemoryStore::quota_status` reads
+    the `agent_quotas` table directly on postgres (no fallthrough to
+    the empty scratch sqlite). Auto-inserts a default row on first
+    call. Closes S61.
+  - `POST /api/v1/kg/find_paths` — `MemoryStore::find_paths` lifts
+    the SQLite recursive-CTE / Postgres AGE-Cypher-or-CTE path
+    enumeration to the trait surface. Closes S65.
+  - `POST /api/v1/links/verify` — `MemoryStore::verify_link` resolves
+    the `(source, target?, relation?)` triple and re-verifies the
+    canonical-CBOR signature against the enrolled peer key. Closes
+    S52. Wire shape: `{verified, attest_level, signature_present,
+    observed_by, source_id, target_id, relation, findings}`.
+- **HTTPS / mTLS validated end-to-end.** The cert-closure run wires
+  `--tls-cert`, `--tls-key`, and `--mtls-allowlist` flags into the
+  daemon's systemd unit and exercises the full campaign from the
+  cert harness with `TLS_MODE=mtls` + per-agent client certs. The
+  `tls_handshake` block on each scenario report captures min/mean/max
+  handshake durations so operators can quantify the perf overhead of
+  switching from plain HTTP. See [`docs/postgres-age-guide.md` §
+  HTTPS / mTLS configuration](../postgres-age-guide.md#https--mtls-configuration).
+- **Test harness — per-agent client cert plumbing.**
+  `Harness.client_cert_for(agent_id)` resolves
+  `TLS_CLIENT_CERT_<stem>` / `TLS_CLIENT_KEY_<stem>` env vars per
+  agent so each scenario authenticates as its caller. Each HTTP
+  request emits curl `time_appconnect` / `time_connect` markers so
+  the JSON report carries authoritative per-handshake timings.
+- **Deploy script** (`scripts/deploy_wave4.sh`) gains an opt-in
+  `DEPLOY_TLS=1` mode that distributes certs from `/tmp/a2a-v07-tls/`
+  to each droplet's `/etc/ai-memory-a2a/tls/` and rewrites the
+  systemd `ExecStart=` line idempotently.
+
+### Security hardening — federation red-team P2 closeouts
+
+Two red-team #230 findings on `/api/v1/sync/*` are closed in v0.7.0
+proper rather than deferred to v0.8.0:
+
+- **[#238](https://github.com/alphaonedev/ai-memory-mcp/issues/238)
+  Body-claimed `sender_agent_id` is now attested against the wire-
+  level `x-peer-id` header**, with an operator-configured allowlist
+  for legitimate cross-author claims. Mismatched claims return
+  `403 sender_agent_id_mismatch`; a missing header returns
+  `403 peer_id_header_missing`. Legacy peers can opt in to pre-v0.7.0
+  behaviour via `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`. See
+  [`docs/security/audit-trail-coverage.md` §9.1](../security/audit-trail-coverage.md#91-per-author-attestation-on-syncpush-v070-238).
+- **[#239](https://github.com/alphaonedev/ai-memory-mcp/issues/239)
+  `/api/v1/sync/since` now applies a per-peer namespace allowlist**
+  to the projection before returning rows. Default-deny posture for
+  peers without an operator-configured allowlist (empty page + WARN);
+  legacy "full dump" posture preserved via
+  `AI_MEMORY_FED_SYNC_TRUST_PEER=1`. Response envelope gains
+  `excluded_for_scope: <count>` + `scope_status: …` for honest
+  partial-view diagnostics. See
+  [`docs/security/audit-trail-coverage.md` §9.2](../security/audit-trail-coverage.md#92-per-peer-namespace-scope-on-syncsince-v070-239).
+
+**Cert-SAN extraction follow-up.** Today's mTLS substrate
+(`FingerprintAllowlistVerifier`) pins client certificates by SHA-256
+fingerprint but does not propagate the cert's SAN/CN to handler code
+(axum-server 0.8 has no per-request extension surface for that).
+v0.7.0 closes the substantive integrity gaps using the `x-peer-id`
+header convention bound to fingerprints via operator deployment
+runbook. The cryptographic-attestation surface (cert SAN ↔ peer-id
+binding inside the verifier) lands in v0.8.0 — tracked as a follow-up
+to #238/#239.
+
+### Track-level rollup (the original epic, unchanged)
+
+- **Track A — Capabilities v3 response shape (5 tasks).** Adds
+  `summary`, `to_describe_to_user`, `callable_now`,
+  `agent_permitted_families` to the `memory_capabilities` response,
+  plus `schema_version="3"` (additive over v2). Pre-computed per-agent
+  calibration strings let LLMs converge on accurate first-answer
+  descriptions instead of improvising.
+- **Track B — Loader tools (5 tasks).** `memory_load_family` and
+  `memory_smart_load(intent)` are promoted to **always-on first-class
+  tools** (no longer hidden inside an introspection tool's parameter
+  set). Includes harness detection from MCP `clientInfo` for the 11
+  supported harnesses (Claude Code, Codex CLI, Grok CLI, Gemini CLI,
+  Continue, Cursor, Cline, Aider, Goose, Claude Desktop, generic
+  JSON-RPC).
+- **Track C — Schema compaction (5 tasks).** **52% MCP tool-token
+  reduction** on the full profile. Hard CI gate enforces ≤ 3,500
+  input tokens for `--profile full` `tools/list`.
+- **Track D — Per-harness positioning + tests (4 tasks).** Cross-harness
+  benchmark; landing-page compatibility matrix; install-time
+  system-prompt snippet; harness integration tests.
+- **Track E — Discovery Gate T0 calibration cells (3 tasks).** Loader
+  cells; T0 orchestration script; post-ship convergence verification.
+- **Track F — Docs + release (6 tasks).** Migration guide, what's-new
+  page, RFC, README updates, top-nav badges, this release-cut PR.
+- **Track G — Hook Pipeline (11 tasks).** 25 lifecycle event types (20 Track G baseline + `pre_recall_expand` G10 + `pre_reflect`/`post_reflect` recursive-learning Task 6/8 + `pre_compaction`/`on_compaction_rollback` L1-7);
+  `ExecExecutor` + `DaemonExecutor`; decision types
+  (`Allow`/`Deny`/`Modify`/`Defer`); chain ordering; per-event
+  timeouts; hot reload on `hooks.toml` mtime change;
+  `on_index_eviction`; reranker batching; `pre_recall` daemon-mode
+  hook; **R3 auto-link reference detector** as a reference hook
+  binary; **R5 `pre_store` transcript-extraction reference hook**.
+- **Track H — Ed25519 Attested Identity (6 tasks).** `ai-memory
+  identity generate` CLI; outbound link signing; inbound signature
+  verification on every link write; `attest_level` enum; `memory_verify`
+  MCP tool; **append-only `signed_events` audit table** with
+  hash-chained provenance.
+- **Track I — Sidechain Transcripts (5 tasks).** `memory_transcripts`
+  schema (BLOB + zstd-3); `memory_transcript_links` join table;
+  per-namespace TTL; `memory_replay` MCP tool; **R5 `pre_store`
+  transcript-extraction reference hook**.
+- **Track J — Apache AGE Acceleration (8 tasks).** AGE detected at
+  Postgres-SAL connect-time via `pg_extension` probe; Cypher
+  implementations of `kg_query`, `kg_timeline`, `kg_invalidate`, and
+  **R2 `find_paths`**; dual-path tests gated on
+  `AI_MEMORY_TEST_AGE_URL`; AGE / CTE per-query performance budgets;
+  `KgBackend { Cte, Age }` enum exposed via `Capabilities`.
+- **Track K — A2A + Permissions + G1 cutline (11 tasks).** **K1/G1
+  namespace-inheritance enforcement**; `pending_actions` timeout
+  sweeper; `permissions.mode` enforcement gate (defaults to `enforce`
+  per F8 fix); approval-event routing; A2A correlation IDs + ACK
+  retries + TTL + replay protection; subscription DLQ + replay-from-cursor
+  + HMAC; per-agent quotas with daily reset; unified permission
+  pipeline; approval API on **HTTP + SSE + MCP** with HMAC and
+  `remember=forever`; `ai-memory governance migrate-to-permissions`
+  translator CLI.
+
+### Round-2 NHI sweep findings (F1-F18, all closed in v0.7.0)
+
+The v0.7.0 A2A campaign and the parallel post-ship NHI Round-2 sweep
+surfaced 18 findings; all 18 are closed in the v0.7.0 ship.
+
+| ID | Severity | Title | Status |
+|---|---|---|---|
+| F1 | P1 | namespace_owner doesn't walk parent chain — deep-child Owner write 403s | Closed (commit `e0d2086`, issue #644) |
+| F2 | P1 | audit `sequence` resets to 1 across daemon restart | Closed (commit `e0d2086`, issue #645) |
+| F3 | P3 | S70 import CLI flag drift (test-side) | Closed |
+| F4 | P3 | `Harness.node_db_path()` helper for multi-droplet topology | Closed |
+| F5 | P3 | AGE perf gate documentation | Closed |
+| F6 | P3 | postgres SQL views + migrate-links + schema-init CLI surfaces | **Closing in v0.7.0 via Wave 1-4** (issue #646) |
+| F7 | BLOCKER | HTTP `POST /memories` bypasses `agent_quotas` | Closed (commit `f9ef40a`) |
+| F8 | SECURITY | `permissions.mode` defaults to `advisory` — flipped to `enforce` | Closed (commit `579afe2`, `63c46ab`) |
+| F9 | release-notes | HTTP missing-required field returns 422 not 400 | Closed (commit `f9ef40a`) |
+| F10 | release-notes | Embedder timeout silently produces un-indexed row at 201 | Closed (commit `f9ef40a`) |
+| F11 | release-notes | `forget --pattern X` without `--namespace` is GLOBAL — `--confirm-global` now required | Closed (commit `579afe2`, `bd01978`) |
+| F12 | release-notes | Ed25519 keypair NOT auto-generated on `serve` startup | Closed (commit `579afe2`, `63c46ab`) |
+| F13 | release-notes | `memory_capabilities` schema/behavior drift | Closed (commit `66f48ae`) |
+| F14 | release-notes | Smart-load router under-weights underscore tokens | Closed (commit `66f48ae`, `5b36d7c`) |
+| F15 | release-notes | MCP `memory_store`/`memory_update` missing `metadata` in `inputSchema` | Closed (commit `66f48ae`) |
+| F16 | release-notes | `agent_type` MCP enum closed but daemon permissive | Closed (commit `66f48ae`) |
+| F17 | release-notes | `find_paths` `max_depth` cap; directed vs undirected docs | Closed (commit `082c999`, `f02d092`) |
+| F18 | release-notes | `check_duplicate` similarity caps at ~0.92 for byte-identical strings | Closed (commit `082c999`, `63c46ab`) |
+
+### Round-2-fixes folding (2026-05-11) — items originally triaged for v0.7.0.1, now in v0.7.0
+
+Operator directive 2026-05-11: there will be no v0.7.0.1 patch release.
+The following items fold into v0.7.0 directly.
+
+| ID | Severity | Title | Status |
+|---|---|---|---|
+| #318 | high | MCP stdio writes bypass federation fanout | Closed in v0.7.0 — opt-in `mcp_federation_forward_url` forwards MCP `memory_store` to local HTTP daemon which runs `broadcast_store_quorum` |
+| #355 | low | rustls-pemfile RUSTSEC-2025-0134 (unmaintained, transitive via axum-server) | Closed in v0.7.0 — `axum-server 0.7 → 0.8`; `cargo audit` clean |
+| #507 | medium | `config.toml` `db = "~/..."` not expanded | Closed in v0.7.0 — `expand_tilde` helper in `AppConfig::effective_db` |
+| #625 | low | E1/E2 orchestration scripts ported from bash to Rust binaries | Closed in v0.7.0 — `tools/t0-orchestrate/` + `tools/post-ship-converge/` crates; bash deleted; `#![cfg(unix)]` gates dropped |
+
+Plus three v0.7.0 cert-driven fixes surfaced by Plan C R4:
+
+- **L15 entrypoint wire** — `entrypoint.plan-c.sh` writes
+  `auto_tag_model = "gemma3:4b"` to `config.toml` so auto_tag runs
+  fast (~0.7s) instead of Gemma 4 e4b's thinking-mode 30+s
+  timeout. Closes R4 S67 regression.
+- **Postgres SAL `consolidate` upsert** — was a plain INSERT,
+  exploded with `duplicate key value violates unique constraint
+  "memories_title_ns_uidx"` on cert re-runs against a persistent
+  postgres database. Rewrote as `ON CONFLICT (title, namespace)
+  DO UPDATE` matching the adapter's standard upsert contract.
+  Closes R4 S5 regression.
+- **No-sal `federation.rs` build break** — `spawn_catchup_loop`
+  unconditionally called `#[cfg(feature = "sal")]`-gated
+  `spawn_catchup_loop_with_store`. Cfg-branched the body so the
+  sqlite-only build compiles.
+
+### Substrate-native recursive refinement (issue [#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655))
+
+ai-memory v0.7.0 ships **substrate-native recursive refinement with
+cryptographic provenance and bounded depth**, alongside the broader
+attested-cortex epic and the Anthropic dreaming research preview. An
+agent reads one or more memories, synthesises a higher-order
+reflection (a lesson, pattern, contradiction-resolution, etc.), and
+persists it with cryptographic-grade provenance back to each source
+it reflects on. The reflection memory is just another memory row —
+the same recall, search, governance, federation, attestation, and
+audit primitives apply to it. The recursion is what's new.
+
+**Bounded by design — not by aspiration.** Reflection depth is
+substrate-enforced, not application-enforced: every reflection write
+goes through a single `db::reflect` substrate function that consults
+`GovernancePolicy.max_reflection_depth` (per-namespace), falls back
+to a compiled default of 3, and refuses any reflection whose
+proposed depth exceeds the cap with a structured
+`REFLECTION_DEPTH_EXCEEDED` error (HTTP 409). The cap is set in JSON
+governance metadata so operators can tune it per namespace without
+a schema migration. A per-namespace cap of `Some(0)` is a documented
+kill-switch — every reflection refuses, regardless of depth — for
+deployments that want to opt every namespace under that subtree out
+of the primitive entirely. **No autonomous goal modification, no
+model fine-tuning loops, no unbounded recursion.**
+
+Concrete API hooks shipped in Tasks 1-4 of the epic (commits below;
+Tasks 5-8 land on the same branch and roll up into this v0.7.0 tag):
+
+- **New column** ([commit `f5d8a9e`](https://github.com/alphaonedev/ai-memory-mcp/commit/f5d8a9e), Task 1/8) —
+  `memories.reflection_depth INTEGER NOT NULL DEFAULT 0` on SQLite
+  (schema v29) and Postgres (`CURRENT_SCHEMA_VERSION 31`). The
+  `Memory` struct gains the field with `#[serde(default)]` so v0.6.4
+  federation peers continue to round-trip cleanly. UPSERT clauses on
+  both adapters take `MAX(old, new)` so federation merges preserve
+  the higher-depth signal.
+- **New governance field** ([commit `630a6db`](https://github.com/alphaonedev/ai-memory-mcp/commit/630a6db), Task 2/8) —
+  `GovernancePolicy.max_reflection_depth: Option<u32>` (pure JSON
+  metadata; no schema bump). Accessor
+  `effective_max_reflection_depth()` returns `3` when unset; `Some(0)`
+  is the documented kill-switch.
+- **New relation** ([commit `b51a3f3`](https://github.com/alphaonedev/ai-memory-mcp/commit/b51a3f3), Task 3/8) —
+  `reflects_on` joins the canonical link relation set
+  (`related_to` / `supersedes` / `contradicts` / `derived_from` /
+  `reflects_on`). Directionality matches `derived_from`: the
+  reflection row is `source_id`, the original being reflected on is
+  `target_id`. `db::find_paths` auto-walks the new label — reflection
+  chains surface naturally in chain-walk queries without further
+  work.
+- **New MCP tool** ([commit `3dc76f3`](https://github.com/alphaonedev/ai-memory-mcp/commit/3dc76f3), Task 4/8) —
+  `memory_reflect` (Power family, tool count 51 → 52). Atomic insert
+  of a reflection memory + N `reflects_on` link writes in a single
+  transaction; any link-insert failure rolls back the entire write.
+  Postgres parity via inherent `PostgresStore::reflect`.
+- **New error code** (Task 4/8) — `MemoryError::ReflectionDepthExceeded
+  { attempted: u32, cap: u32, namespace: String }`. HTTP status
+  `409 CONFLICT`, code `REFLECTION_DEPTH_EXCEEDED`. The structured
+  triple is what downstream auditors and hook emitters need without
+  parsing error strings.
+
+The relevant CHANGELOG block sits under the same v0.7.0 heading
+("v0.7.0 recursive-learning add-on"). Conceptual model, depth-cap
+rationale, directionality contract, and the
+`find_paths` chain-walk behaviour are written up in
+[`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md). The
+reproducibility script is at
+[`scripts/reproduce-recursive-learning.sh`](../../scripts/reproduce-recursive-learning.sh) —
+a self-contained Bash demo that builds the release binary, inserts
+three sample memories into a fresh sqlite DB under `.local-runs/`,
+reflects on them at depth=1, recursively reflects up to depth=3
+(the default cap), and demonstrates the refusal at depth=4 with a
+clear `REFLECTION_DEPTH_EXCEEDED` verdict block.
+
+#### Cryptographic provenance for cap refusals (Task 5/8)
+
+Every `memory_reflect` call that would exceed the namespace's resolved
+`max_reflection_depth` now appends a row to the append-only
+`signed_events` audit table before the cap refusal propagates back to
+the caller. The row carries `event_type = "reflection.depth_exceeded"`
+and a canonical-CBOR (RFC 8949 §4.2.1) payload binding
+`(agent_id, attempted, cap, namespace, source_ids, proposed_title,
+created_at)` under a SHA-256 `payload_hash`. The row is written with
+`attest_level = "unsigned"` (the substrate refusal is the operation
+being audited; per-event Ed25519 signing of refusal records is a
+separate Track-H Bucket-1.5 line item). The reflection's content body
+is deliberately omitted from the payload — only enumerable provenance
+fields are part of the signed bytes, so PII the caller may have placed
+in `content` never enters the audit chain. Audit-write failures are
+best-effort: logged at `WARN` (`target = "signed_events"`) but the
+substrate cap refusal still propagates so the wire contract stays
+unchanged for callers. ([commit `c61a05b`](https://github.com/alphaonedev/ai-memory-mcp/commit/c61a05b).)
+
+#### Hook integration (Task 6/8)
+
+The Track-G hook pipeline grows from 21 to 23 events with two new
+`HookEvent` variants:
+
+- **`pre_reflect`** — decision-class hook, `EventClass::Write`, 5-second
+  deadline budget. Fires inside `db::reflect_with_hooks` step 4, BEFORE
+  the depth-cap check evaluates and BEFORE the write transaction opens.
+  A handler returning `Deny { reason, code }` short-circuits the
+  reflection and propagates as
+  `ReflectError::HookVeto`
+  (`"REFLECTION_HOOK_VETO (code=<N>): <reason>"`) — distinct from the
+  Task 5 cap refusal on the wire so callers can tell substrate-policy
+  refusals apart from caller-policy refusals.
+- **`post_reflect`** — notify-class hook, `EventClass::Write`, 5-second
+  deadline budget. Fires inside `db::reflect_with_hooks` step 7, AFTER
+  `COMMIT` succeeds. Post-handlers read the fully-durable reflection
+  memory and its `reflects_on` links via the same connection — useful
+  for notification fan-out, federation push, audit-side-channel sinks,
+  and the v0.8.0 reflection-pass curator's bookkeeping path. Notify
+  handlers cannot veto; return values are ignored beyond logging.
+
+The pipeline event count is `21 → 23`, not `20 → 22` — the G10 hot-path
+`pre_recall_expand` event had already raised the floor from 20 to 21
+before Task 6 landed. Hook vetoes do **not** emit the Task 5
+`reflection.depth_exceeded` audit row: caller-policy refusals carry
+their own provenance via the hook's own audit channel, and conflating
+them with substrate-cap refusals would dilute the audit signal. The
+MCP-side wire-in of `hooks.toml` → `ReflectHooks` is deferred to G7+;
+the v0.7.0 `memory_reflect` MCP handler ships an unreachable
+`HookVeto` arm against that bridge so the wire surface is forward-
+compatible without yet emitting hook events from the production
+handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit/fbf093c).)
+
+### Substrate-Native Recursive Learning Grand-Slam (NEW)
+
+> **Operator-level summary.** The v0.7.0 grand-slam wave extends the
+> recursive-learning substrate primitive (issue [#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655))
+> from "an MCP verb that mints a reflection memory" into a complete
+> substrate-native learning loop: a curator that reflects across a
+> namespace asynchronously, federation-aware cross-peer depth
+> bookkeeping, invalidation propagation, transcript replay union,
+> procurement-grade forensic export, reflection-to-skill promotion,
+> skill ↔ reflection composition, and a reflection-aware reranker
+> boost. The L1-6 substrate rules-enforcement engine ships the
+> operator-keypair-signed rule store and the bypass-impossibility
+> test fleet. Schema bumps to v33 (L2 wave CHECK constraint on
+> `memory_links.relation`) and then v34 (V-4 closeout #698: `signed_events`
+> cross-row hash chain — `prev_hash BLOB` + `sequence INTEGER`) per the
+> v0.7.1-fold decision (`05e0cb9a`). Postgres parity is at v33 (the V-4
+> closeout maps to postgres v33 since the postgres ladder ran one step
+> behind). The MCP tool count moves from 60 → 71 over the L2 wave + Batman Forms 1-6 + 7th-form + QW-1/2/3 closeout (the +8 over the original 63 narrative cover Forms/QW/L2 additions enumerated below); the
+> full reflection narrative lives in
+> [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md), the
+> Agent Skills surface in [`docs/agent-skills.md`](../agent-skills.md),
+> and the forensic-export surface in
+> [`docs/forensic-export.md`](../forensic-export.md).
+
+#### Schema and tool-surface deltas
+
+- **Schema v34 (sqlite) / v33 (postgres) — terminal v0.7.0 ship.** The
+  L2 wave first bumped sqlite to v33 (`memory_links.relation` CHECK
+  constraint promoted from v23 trigger to SQL-side CHECK covering
+  `related_to | supersedes | contradicts | derived_from | reflects_on`);
+  the V-4 closeout (#698) then added migration 0028
+  (`signed_events.prev_hash BLOB` + `signed_events.sequence INTEGER`
+  + UNIQUE index — the SQL-side cross-row hash chain that flips the
+  V-4 validation from YELLOW to GREEN) for the final sqlite v34 floor.
+  Postgres parity mirror lands at v33 (postgres ran one step behind
+  the sqlite ladder). Per `05e0cb9a` v0.7.1-fold decision (no separate
+  v0.7.1 release; both bumps land in the v0.7.0 tag).
+  ([`src/storage/migrations.rs`](../../src/storage/migrations.rs)
+  `CURRENT_SCHEMA_VERSION = 34`;
+  [`src/store/postgres.rs`](../../src/store/postgres.rs)
+  `CURRENT_SCHEMA_VERSION = 33`.)
+- **MCP tool count 60 → 74** (post-grand-slam + Gap 3 recall_observations + Gap 4 confidence_tier surface;
+  authoritative count from `Profile::full().expected_tool_count()` in
+  [`src/profile.rs`](../../src/profile.rs) and verified by
+  `grep -oE '"memory_[a-z_]+"' src/mcp/registry.rs | sort -u | wc -l`).
+  The L2 wave added three tools:
+  `memory_dependents_of_invalidated` (L2-3 / #668),
+  `memory_skill_promote_from_reflection` (L2-6 / #671), and
+  `memory_skill_compositional_context` (L2-7 / #672). The L1-5
+  Agent Skills substrate added 5 tools (`memory_skill_register`,
+  `_list`, `_get`, `_resource`, `_export`) earlier in the grand-slam
+  branch. The L2-2 federation-aware reflection coordination added
+  `memory_reflection_origin`. The post-grand-slam Forms / QW wave
+  added a further 8: `memory_atomise` (WT-1 / Form 2), `memory_ingest_multistep`
+  (Form 3 / #756), `memory_calibrate_confidence` (Form 5 / #758),
+  `memory_check_agent_action` + `memory_rule_list` (7th-form / #691),
+  `memory_export_reflection` (QW-1), `memory_persona` +
+  `memory_persona_generate` (QW-2), `memory_offload` + `memory_deref`
+  (QW-3). See [`docs/agent-skills.md`](../agent-skills.md) for the
+  Skills per-tool wire surface; the canonical post-grand-slam
+  inventory lives in [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md).
+
+#### L1-6 substrate rules engine (issues [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691), [#693](https://github.com/alphaonedev/ai-memory-mcp/issues/693))
+
+The v0.7.0 Option B substrate-authority foundation:
+
+- **Operator-keypair-signed seed rules.** Every seeded rule
+  (`R001..R004`) is signed with the operator's Ed25519 private key
+  via the new `ai-memory rules sign` CLI; the daemon verifies the
+  signature on load and refuses to start when a rule's
+  `attest_level = "signed"` but the signature does not verify
+  against the enrolled operator public key.
+  ([`src/cli/rules.rs`](../../src/cli/rules.rs),
+  [`src/governance/rules_store.rs`](../../src/governance/rules_store.rs).)
+- **Bypass-impossibility integration tests.** A dedicated test
+  fleet (`tests/governance/`, commit
+  [`6038f85`](https://github.com/alphaonedev/ai-memory-mcp/commit/6038f85))
+  exercises every adapter write path that goes through the substrate
+  `storage::insert` pre-write hook and asserts the rule corpus is
+  consulted on each call. The fleet is the regression anchor for
+  the v0.8.0 "100% coverage" epic.
+- **MCP read-only inspection.** `memory_rule_list` and
+  `memory_check_agent_action` provide structured read access to the
+  rule corpus and a dry-run rule check. Per design revision
+  2026-05-13, **mutation is operator-only** via CLI/HTTP with the
+  signed operator key — the MCP surface cannot add, remove, enable,
+  or disable rules.
+- **Pre-write hook on `storage::insert`.** L1-6 Deliverable E
+  ([commit `1b877ce`](https://github.com/alphaonedev/ai-memory-mcp/commit/1b877ce),
+  [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691))
+  wires `check_agent_action` into the `storage::insert` pre-write
+  path. The HTTP handler surfaces the structured refusal via the
+  `MemoryError::RefusedByGovernance` error variant
+  ([`src/errors.rs`](../../src/errors.rs)). Other adapter write
+  paths (link insert, consolidate, reflect, federation receive)
+  continue to enforce reflection-specific authority via the
+  existing reflection-depth cap; the v0.8.0 epic
+  ([#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697))
+  is where the rule engine wires into 100% of write paths.
+
+**Audit-honest framing.** Substrate authority is a **foundation in
+v0.7.0, a complete cover in v0.8.0**. Operators evaluating the
+authority claim today should read
+[`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](../RECURSIVE_LEARNING.md#substrate-authority-claim--v070-option-b-foundation)
+alongside this section. Any "100% substrate authority" marketing
+that elides the wiring gap is inaccurate.
+
+#### L2 wave — what landed
+
+| Task | Commit | Issue | Headline |
+|---|---|---|---|
+| L2-1 reflection-pass curator | [`c3f6e82`](https://github.com/alphaonedev/ai-memory-mcp/commit/c3f6e82) | [#666](https://github.com/alphaonedev/ai-memory-mcp/issues/666) | Asynchronous curator clusters `Observation`-kind memories and mints reflections via the substrate path. Opt-in per namespace; honors the substrate cap; one level of reflection per pass. |
+| L2-2 federation reflection coordination | [`0b1c9cc`](https://github.com/alphaonedev/ai-memory-mcp/commit/0b1c9cc) | [#667](https://github.com/alphaonedev/ai-memory-mcp/issues/667) | Cross-peer depth bookkeeping. Receivers stamp `metadata.reflection_origin = {peer_origin, original_depth, local_depth_at_arrival}` on import and enforce the **local** cap on derived writes — federation cannot launder depth. `memory_reflection_origin` MCP tool. |
+| L2-3 invalidation propagation | [`3f419be`](https://github.com/alphaonedev/ai-memory-mcp/commit/3f419be) | [#668](https://github.com/alphaonedev/ai-memory-mcp/issues/668) | A Reflection→Reflection `supersedes` edge fires the walker; one notification memory is written per dependent under `<dependent.namespace>/_invalidations`. **Notification, NOT cascade.** Cascade rollback is v0.8.0 Pillar 2.5. |
+| L2-4 transcript replay union | [`a50b34c`](https://github.com/alphaonedev/ai-memory-mcp/commit/a50b34c) | [#669](https://github.com/alphaonedev/ai-memory-mcp/issues/669) | `memory_replay` on a reflection memory returns the **union** of transcripts reachable by walking `reflects_on` to the source observations. Caller controls the walk depth (`depth=N`); `depth=0` reproduces the pre-L2-4 shape. |
+| L2-5 forensic bundle | [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3) | [#670](https://github.com/alphaonedev/ai-memory-mcp/issues/670) | `ai-memory export-forensic-bundle` + `verify-forensic-bundle`: deterministic POSIX-ustar tar, byte-identical mod timestamp, operator-signed when keypair is on disk. AgenticMem Attest tier integration. See [`docs/forensic-export.md`](../forensic-export.md). |
+| L2-6 reflection-as-skill | [`505c538`](https://github.com/alphaonedev/ai-memory-mcp/commit/505c538) | [#671](https://github.com/alphaonedev/ai-memory-mcp/issues/671) | `memory_skill_promote_from_reflection` promotes a reflection (depth ≥ 1) to a SKILL.md-format Agent Skill. Each `reflects_on` source becomes a `references/source_{i}.md` resource. Round-trip digest-identical to a hand-authored SKILL.md. Closes the recursive-learning loop. |
+| L2-7 skill composition | [`0966b57`](https://github.com/alphaonedev/ai-memory-mcp/commit/0966b57) | [#672](https://github.com/alphaonedev/ai-memory-mcp/issues/672) | `composes_with_reflections` SKILL.md frontmatter declares a skill's affinity for one or more reflection-bearing namespaces. `memory_skill_compositional_context` returns the body + bounded reflection set ranked by recency + recall_count. Per-namespace `max_reflection_depth` is the authoritative ceiling — composition cannot bypass the cap. |
+| L2-8 reflection-aware reranker boost | [`90291c0`](https://github.com/alphaonedev/ai-memory-mcp/commit/90291c0) | [#673](https://github.com/alphaonedev/ai-memory-mcp/issues/673) | Reranker applies `boost * (1 + per_depth_increment * min(depth, cap))` to `Reflection`-kind memories AFTER the cross-encoder blend. Defaults `1.2` / `0.05` / `3`. `boost = 1.0` is the documented kill-switch. |
+
+#### Agent Skills (Pillar 1.5)
+
+The L1-5 Agent Skills ingestion substrate landed on the grand-slam
+branch as the substrate path for
+[agentskills.io](https://agentskills.io/)-compliant `SKILL.md`
+modules:
+
+- **7 MCP tools** in the `memory_skill_*` family. See
+  [`docs/agent-skills.md`](../agent-skills.md) for the per-tool
+  wire surface.
+- **Round-trip digest guarantee** — register → export → re-register
+  produces the identical SHA-256 digest. Survives transport,
+  federation, and the v0.7 → v0.8 schema revision.
+- **Ed25519 attestation** on every signed row when an operator
+  keypair is on disk.
+- **SKILL.md format** with `composes_with_reflections` frontmatter
+  field (L2-7) — declares a skill's affinity for reflection
+  namespaces with a per-entry `min_depth` floor.
+
+The closing-loop bridge: a reflection memory ↔ a skill manifest.
+Operators codify learnings into skills via
+`memory_skill_promote_from_reflection`, then activate them on
+demand with `memory_skill_compositional_context` returning a
+bounded reflection context alongside the skill body.
+
+#### Forensic export (AgenticMem Attest)
+
+The L1-3 `verify-reflection-chain` and L2-5
+`export-forensic-bundle` / `verify-forensic-bundle` triad ships the
+procurement-grade evidence path. Full surface in
+[`docs/forensic-export.md`](../forensic-export.md). Headlines:
+
+- **Deterministic tar bundle.** Byte-identical mod timestamp.
+- **In-process POSIX ustar.** No `tar` crate dependency.
+- **Manifest carries per-file SHA-256 + optional Ed25519
+  signature.** Auditor re-verifies with no daemon state and no
+  network.
+- **`AgenticMem Attest` evidence tier.** The OSS-side artefact
+  pairs with the operator-keypair attestation chain to deliver the
+  full Attest-tier evidence packet on demand.
+
+### Quality
+
+- **Hard coverage gate ≥ 93%.** CI fails any PR below the line floor.
+- **Clippy `-D pedantic` clean baseline** restored across nine files
+  (#614).
+- **MCP registry refactor (#987 / D1.6 split).** The hand-coded
+  ~1100-line `json!({...})` body in
+  `src/mcp/registry.rs::tool_definitions()` is collapsed to a
+  four-line iteration over `registered_tools()`. Each tool's
+  catalog row is now derived from its per-tool `McpTool` impl
+  (`crate::mcp::registry::McpTool`) via the schemars `JsonSchema`
+  derive on the request struct. Adding a new MCP tool is now ONE
+  line in `registered_tools()` + the per-tool module (vs. the
+  pre-D1.6 multi-site recipe). A 6-test wire-shape regression
+  suite (`src/mcp/registry.rs::d1_6_987_tests`) pins the post-D1.6
+  catalog against a stored pre-D1.6 snapshot
+  (`tests/snapshots/tool_definitions_pre_d1_6.json`) — same tool
+  count, same names, descriptions byte-for-byte equal, same
+  `required[]`. Allowed-diffs are documented in the test module
+  doc-comment.
+- **Test race fixes** for the subscription `dispatch_count` race, the
+  snippet env race, the keypair env race, the binary-spawn flake on
+  macOS (OnceLock + PID-scoped target), and the b3 budget race.
+- **52% MCP tool token reduction** on the full profile (Track C),
+  measured against `cl100k_base`.
+- **CI token budget gate** — hard 3,500-token ceiling on
+  `--profile full` `tools/list` (Track C5).
+- **A2A regression suite** — 76 scenarios consolidating ai2ai-gate
+  v0.6.x baseline + v0.7.0 net-new + postgres+AGE substrate. Cert
+  acceptance is two consecutive 100% GREEN rounds.
+
+## Post-grand-slam ship-readiness wave (2026-05-15)
+
+After the original `attested-cortex` epic landed at `fcdd2a5` (2026-05-06)
+and the Round-2 NHI sweep closed F1-F18, a final ship-readiness wave
+folded into the v0.7.0 tag rather than slipping to v0.7.1:
+
+- **Batman 6-form audit + Forms 1-6 + 7th-form closeout** (PRs
+  [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-
+  [#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766),
+  merged 2026-05-15). The
+  [`docs/internal/batman-framework-audit.md`](../internal/batman-framework-audit.md)
+  audit at commit `53b4d39` found 0/6 forms cleanly IMPLEMENTED + 4
+  partial + 2 absent. The Forms wave closed every gap to **all 7 forms
+  IMPLEMENTED at HEAD `c9472c1`**:
+  - **Form 1 (online dedup-and-synthesis, issue [#754](https://github.com/alphaonedev/ai-memory-mcp/issues/754)).**
+    Single-batch action-emitting LLM call on `memory_store`.
+    `src/synthesis/mod.rs`. Opt back into the v0.6.x per-pair
+    classifier via `legacy_per_pair_classifier = true` on the
+    namespace standard.
+  - **Form 2 (synchronous atomise-before-embed, issue [#755](https://github.com/alphaonedev/ai-memory-mcp/issues/755)).**
+    `auto_atomise_mode = Synchronous` pre-store hook in
+    `src/hooks/pre_store/auto_atomise.rs`. New `memory_atomise` MCP
+    tool. Doc: [`docs/atomisation.md`](../atomisation.md).
+  - **Form 3 (multi-step ingest orchestrator, issue [#756](https://github.com/alphaonedev/ai-memory-mcp/issues/756)).**
+    `memory_ingest_multistep` threads deterministic helpers (Jaccard
+    overlap, FTS classifier) before prompt-cache-stable LLM stages.
+    `src/multistep_ingest/{mod,executor,helpers,pipeline,cache}.rs`.
+    Doc: [`docs/multistep-ingest.md`](../multistep-ingest.md). Cookbook:
+    [`cookbook/multistep-ingest/01-two-phase.sh`](../../cookbook/multistep-ingest/01-two-phase.sh).
+  - **Form 4 (fact provenance, issue [#757](https://github.com/alphaonedev/ai-memory-mcp/issues/757)).**
+    Citations + source-URI + atom-grain spans ride on existing
+    `memory_store` / `memory_atomise` payloads. Schema migration
+    `0032_v07_form4_provenance.sql`. Doc:
+    [`docs/provenance.md`](../provenance.md).
+  - **Form 5 (auto-confidence + shadow calibration + freshness decay,
+    issue [#758](https://github.com/alphaonedev/ai-memory-mcp/issues/758)).**
+    `memory_calibrate_confidence` MCP tool +
+    `src/confidence/{mod,calibrate,shadow,decay}.rs`. Env vars
+    `AI_MEMORY_AUTO_CONFIDENCE`, `AI_MEMORY_CONFIDENCE_SHADOW`,
+    `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE`,
+    `AI_MEMORY_CONFIDENCE_DECAY`. Schema migration
+    `0033_v07_form5_confidence_calibration.sql`. Doc:
+    [`docs/confidence-calibration.md`](../confidence-calibration.md).
+  - **Form 6 (`MemoryKind` Batman vocabulary, issue [#759](https://github.com/alphaonedev/ai-memory-mcp/issues/759)).**
+    10-variant `MemoryKind` enum (`Observation` default + 9 specific
+    variants). Optional `auto_classify_kind` pre-store hook
+    (`off | regex_only | regex_then_llm`). No CHECK constraint on
+    `memories.memory_kind` — future variants land additively. Doc:
+    [`docs/memory-kind-vocab.md`](../memory-kind-vocab.md).
+  - **7th-form (agent-EXTERNAL Layer-4 wiring, issue [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760);
+    full cover at v0.8.0 per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).**
+    Option-B foundation: operator-keypair-signed seed rules
+    `R001..R004`, `memory_check_agent_action` + `memory_rule_list`
+    MCP tools, substrate `storage::insert` pre-write hook. Doc:
+    [`docs/policy-engine.md`](../policy-engine.md) +
+    [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md).
+- **QW (Tencent quick-wins).** Four QW items are referenced in the
+  Tencent positioning work; **three carry code (QW-1/QW-2/QW-3); QW-4
+  is a docs-only deliverable** (competitive positioning page +
+  landscape comparison, no substrate or wire-surface change). Per
+  [`docs/internal/v070-ship-readiness-adrs.md` ADR-1](../internal/v070-ship-readiness-adrs.md#adr-1--qw-4-disposition-docs-only-no-code-feature).
+  - **QW-1** file-backed reflection chain export — `memory_export_reflection`
+    + `auto_export_reflections_to_filesystem` namespace policy.
+    Default destination `~/.ai-memory/reflections/<ns>/<id>.md`.
+    Cookbook: `cookbook/file-backed-export/`.
+  - **QW-2** persona-as-artifact — `memory_persona` + `memory_persona_generate`,
+    `MemoryKind::Persona` rows, `auto_persona_trigger_every_n_memories`
+    + `auto_export_personas_to_filesystem` namespace policy. Doc:
+    [`docs/persona.md`](../persona.md). Cookbook: `cookbook/persona/`.
+  - **QW-3** context offload primitive — `memory_offload` + `memory_deref`
+    move large tool outputs out of the agent context window into an
+    addressable blob store with a background TTL sweep. Doc:
+    [`docs/context-offload.md`](../context-offload.md). Cookbook:
+    `cookbook/context-offload/`.
+  - **QW-4** *(docs-only — competitive positioning)* — Tencent
+    landscape page at [`docs/positioning.md`](../positioning.md).
+    Not a code feature; included for inventory completeness so a
+    procurement reader counting "QW items shipped" against the
+    Tencent analysis sees the same denominator.
+- **Reconciliation security sweep (11 late-cycle commits, merged
+  into trunk at `64528b1`).** K9 governance gate on `handle_kg_invalidate`
+  (`a41c08f`), K10 SSE `host:` prefix bypass (`7496a6e`), K10 HMAC
+  method+pending_id binding (`99ffacc`), K10 HMAC nonce single-use 300s
+  window (`a69325f`), K10 SSE lagged-event count strip (`d1f6c9f`),
+  SSRF IPv4-mapped-IPv6 + NAT64 (`3ab72dc`), `invalidate_link` BEGIN
+  IMMEDIATE wrap (`2c77537`), hooks executor secret-redaction
+  (`cbe934c`), H8 rebound-namespace `Ask` walk (`69ad41c`), I1
+  zstd-decompression cap config-driven (`26fab06`). Pinned by
+  [`tests/k10_approval_security.rs`](../../tests/k10_approval_security.rs),
+  [`tests/i1_zstd_bomb.rs`](../../tests/i1_zstd_bomb.rs),
+  [`tests/h2_invalidate_link_signed.rs`](../../tests/h2_invalidate_link_signed.rs).
+- **Default tool surface.** The original v0.6.4 narrative said
+  "5 default tools". The actual v0.7.0 `--profile core` surface is
+  **7 tools** (`memory_store`, `memory_recall`, `memory_list`,
+  `memory_get`, `memory_search`, `memory_load_family`,
+  `memory_smart_load`) per `Family::Core.expected_tool_count()` in
+  [`src/profile.rs`](../../src/profile.rs). The `memory_capabilities`
+  bootstrap remains always-on regardless of profile.
+- **Six new operator-focused docs landed alongside this wave:**
+  [`docs/hook-pipeline.md`](../hook-pipeline.md),
+  [`docs/federation.md`](../federation.md),
+  [`docs/k8-quotas.md`](../k8-quotas.md),
+  [`docs/k10-sse-approvals.md`](../k10-sse-approvals.md),
+  [`docs/sidechain-transcripts.md`](../sidechain-transcripts.md),
+  [`docs/signed-events-v4.md`](../signed-events-v4.md).
+- **Canonical feature inventory.** The full post-grand-slam feature
+  truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
+  (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 74 MCP tools at
+  release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
+  vars, 88 production HTTP route registrations (74 unique URL paths), 33+ sqlite migrations on disk + the in-
+  process arms that converge sqlite + postgres on the single
+  logical `CURRENT_SCHEMA_VERSION = 57`).
+
+## Backward compatibility
+
+- **MCP wire shape.** v3 capabilities are **additive** over v2; existing
+  v0.6.4 SDKs continue to work against a v0.7.0 server.
+- **5-tool default surface** is unchanged from v0.6.4 — `ai-memory mcp`
+  still advertises `memory_store`, `memory_recall`, `memory_list`,
+  `memory_get`, `memory_search` plus the always-on
+  `memory_capabilities` bootstrap.
+- **Hook pipeline** is **default off** — a v0.7.0 install with no
+  `hooks.toml` behaves identically to v0.6.4 at the lifecycle layer.
+- **Postgres backend** is opt-in. `ai-memory serve` without
+  `--store-url` continues to use sqlite. Default builds without
+  `--features sal-postgres` are unchanged byte-for-byte.
+- **Schema migrations** v20 → v34 run automatically on first start of
+  a sqlite-backed daemon and are idempotent (the Wave 1-4 v15 → v28
+  port was the initial postgres+AGE land; subsequent in-flight v0.7.0
+  work added v29-v30 for L0.7-1/L1-1 recursive-learning, v33 for the
+  L2 wave `memory_links.relation` CHECK, and v34 for the V-4 closeout
+  #698 `signed_events` cross-row hash chain). Postgres schema bootstrap
+  is via `ai-memory schema-init` per the migration guide.
+
+## Breaking changes
+
+The v0.7.0 ship has **two intentional behavior changes** over v0.6.4
+that may affect existing deployments:
+
+### F8 — `permissions.mode` flips from `advisory` to `enforce`
+
+**Before (v0.6.4 / v0.7.0-alpha):** fresh deploys had no write
+enforcement by default — a security default-bad. The Round-2 NHI sweep
+flagged this as a SECURITY DECISION.
+
+**After (v0.7.0 ship):** `permissions.mode` defaults to `enforce`.
+Operators who relied on the old default-permissive behavior must
+opt back in explicitly:
+
+```toml
+# config.toml
+[permissions]
+mode = "advisory"
+```
+
+The first `ai-memory serve` boot prints a one-time migration banner
+explaining the change.
+
+### F11 — `forget --pattern` and `forget --tier` without `--namespace` require `--confirm-global`
+
+**Before:** `ai-memory forget --pattern foo` silently deleted matching
+memories across **all** namespaces.
+
+**After:** the same command refuses to run without an explicit
+`--confirm-global` flag. `--namespace`-scoped forget is unchanged.
+
+```bash
+# v0.6.4 behavior — global delete (now refused):
+ai-memory forget --pattern 'PII:.*'
+
+# v0.7.0 — must be explicit:
+ai-memory forget --pattern 'PII:.*' --confirm-global
+```
+
+## Upgrade path
+
+### From v0.6.4 (sqlite, staying on sqlite)
+
+1. Backup `~/.local/share/ai-memory/memory.db`.
+2. Install v0.7.0 (`brew upgrade ai-memory` / `cargo install ai-memory`
+   / your distro path).
+3. First start auto-migrates v20 → v34 (transcripts, signed_events,
+   audit chain, attest_level on memory_links, recursive-learning
+   `reflection_depth`, `memory_links.relation` SQL-side CHECK, and the
+   V-4 closeout `signed_events.prev_hash` + `sequence` cross-row hash
+   chain). Watch the daemon log for `schema migration: v20 → v34
+   complete`.
+4. Read `docs/MIGRATION_v0.7.md` for the v0.6.4 → v0.7.0 surface
+   changes (permissions.mode, forget safety, new MCP tools).
+
+### From v0.6.4 (sqlite, switching to postgres)
+
+Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md):
+
+1. Provision postgres + Apache AGE + pgvector per
+   [`docs/postgres-age-guide.md`](../postgres-age-guide.md).
+2. `ai-memory schema-init --store-url postgres://…`.
+3. `ai-memory migrate --from sqlite:///… --to postgres://… --dry-run`.
+4. Real migration; verify row counts + content fingerprint.
+5. Re-point the daemon at postgres via `--store-url` or
+   `AI_MEMORY_STORE_URL`.
+6. Confirm `/api/v1/capabilities` reports `store_backend: PostgresStore`
+   and `kg_backend: Age`.
+
+### From v0.7-alpha (postgres at schema v15)
+
+1. `ai-memory schema-init --store-url postgres://… --upgrade` to walk
+   v15 → v33 idempotently (Wave 1-4 ported v15 → v28; subsequent
+   L0.7 / L2 wave / V-4 closeout added v29-v33 on the postgres side).
+2. Restart the daemon.
+3. (Optional) Re-run the migration tool to backfill links if your
+   v0.7-alpha migration predated the Wave 1 link-walk fix:
+   `ai-memory migrate --from sqlite:///… --to postgres://… --since
+   <ISO8601>` — only the delta migrates.
+
+## Operator references
+
+- **Operator how-to:** [`docs/postgres-age-guide.md`](../postgres-age-guide.md)
+- **Migration runbook:** [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md)
+- **Adapter-selection design:** [`docs/RUNBOOK-adapter-selection.md`](../RUNBOOK-adapter-selection.md)
+- **What's new (visual):** [`docs/whats-new-v07.html`](../whats-new-v07.html)
+- **v0.7.0 → v0.6.4 surface delta:** [`docs/MIGRATION_v0.7.md`](../MIGRATION_v0.7.md)
+- **RFC (design rationale):** [`docs/v0.7/rfc-attested-cortex.md`](../v0.7/rfc-attested-cortex.md)
+- **Recursive learning primer:** [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md)
+- **Agent Skills primer:** [`docs/agent-skills.md`](../agent-skills.md)
+- **Forensic export primer:** [`docs/forensic-export.md`](../forensic-export.md)
+- **Curator soak runbook:** [`docs/RUNBOOK-curator-soak.md`](../RUNBOOK-curator-soak.md)
+- **A2A campaign Pages:** https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/
+- **Test Hub Pages:** https://alphaonedev.github.io/ai-memory-test-hub/
+
+## Tracking issues + PRs
+
+- Master tracking: [#637](https://github.com/alphaonedev/ai-memory-mcp/issues/637)
+- F1 (closed): [#644](https://github.com/alphaonedev/ai-memory-mcp/issues/644)
+- F2 (closed): [#645](https://github.com/alphaonedev/ai-memory-mcp/issues/645)
+- F6 (closing via Wave 1-4): [#646](https://github.com/alphaonedev/ai-memory-mcp/issues/646)
+- v0.7.0 expanded postgres+AGE scope tracker: filed alongside this
+  release note (Wave 1-4 closure anchor).
+- Round-2 fixes PR: [#643](https://github.com/alphaonedev/ai-memory-mcp/pull/643)
+  on `round-2-fixes`.
+
+## Post-tag follow-up batches (NHI re-run, 2026-05-17 / 2026-05-18)
+
+After the v0.7.0 tag, the NHI re-run campaign (canonical results at
+[`docs/v0.7.0/test-campaign-2026-05-18/`](test-campaign-2026-05-18/))
+surfaced a fix-batch the lane-1 meta-lane absorbed without slipping
+the tag. All items shipped in `local/install-815-816` (HEAD `875bc19`
+on 2026-05-18) and pre-merged into the v0.7.0 retag candidate:
+
+- **#857** — serve_postgres_continuation2/3 + extended test failures.
+  Bulk source-allowlist sweep + designated-approver typing + 404 vs.
+  403 contract on missing-pending-row. Commits `3f13138`, `64436d0`,
+  `4ef8217`, `7eb73fd`, `dbae41d`. **33/33 postgres tests green.**
+- **#858** — bucket_b_subscriptions_persist + cont6_find_paths handler
+  parity. AGE projection on link insert degrades to warn instead of
+  503 (the prior 503 was a substrate bug surfaced by the
+  source-allowlist tightening). Commits `6d8b13a`, `ccd05f7`,
+  `f612675`.
+- **#859** — MCP `tools/list` exposes optional property schemas for
+  NHI discovery. The verbose schema trim in #829 had stripped
+  optional-property descriptions; #859 restores them under the
+  ceiling. Surfaces `memory_update` (10 fields), `memory_link`
+  (relation enum), other tools that gained optional params during
+  v0.7.0. Commit `5ab3315`. Added 8-test regression suite
+  `tests/mcp_tools_list_schema_discovery.rs`.
+- **#860** — `memory_get_links` surfaces temporal + attest columns
+  (`valid_from`, `valid_until`, `observed_by`, `signature`,
+  `attest_level`, `signed_at`). Commit `091350c`.
+- **#861** — `memory_archive_list` preserves metadata + emits tags
+  as JSON array (was emitting the SQL-side string). Commit `091350c`.
+- **#862** — clarified "72 of 72 advertised" vs. "73 advertised
+  entries at v0.7.0" — the +1 is the always-on `memory_capabilities`
+  bootstrap; `Profile::full().expected_tool_count()` returns 73 while
+  `memory_capabilities` summary reports the 72-memory-tool count;
+  both numbers are intentional. Commit `dc07da4` (docs/index.html
+  header correction); subsequent tool additions in the v0.7.0
+  cycle moved the historical 70/71 reference at #862-close time to
+  the current 72/73 numbers — `src/profile.rs::Profile::full().expected_tool_count()` is the canonical assertion.
+- **#863** — `ai-memory governance check-action` CLI subcommand —
+  parity with the substrate `check_agent_action` MCP tool. Commit
+  `3b21228`.
+- **#864** — clarified "Family" naming: MCP tool family
+  (`Family::Core|Graph|Admin|Power`) is unrelated to `MemoryKind`
+  taxonomy (the Batman Form-6 vocabulary). Commit `7647cfe`.
+- **#829** — trim verbose tool docs from 15570 → 9507 cl100k tokens
+  (-38.9%). Verbose token budget ceiling relaxed from 5K-10K (original
+  v0.6.4 playbook) to **≤ 10000 (post-#829)**. Trimmed budget remains
+  **≤ 5000** (post-#859, raised from 3500 → 5000 to support
+  optional-property discovery). Commit `d41b8cb`. 3 CI guards added.
+- **#830** — TTL extend wording clarified across docs: per-tier
+  `*_extend_secs` is a sliding-window **REPLACEMENT**, NOT a
+  max-of-old-and-new extend. The create-time `*_ttl_secs` backstop
+  applies only until first access. Field names retained for
+  backward-compat. Pinned in CLAUDE.md §"Recall Pipeline" and the
+  ADMIN_GUIDE `[ttl]` table.
+- **#831** — MCP `memory_promote` accepts optional `target_tier`
+  parameter (`"mid"` or `"long"`). Omitting preserves the historical
+  highest-reachable-tier behavior. 3 regression tests pin the match
+  arms.
+
+**Closed documentation-labeled issues** as part of this lane-5 sweep:
+
+- **#800** — operator how-to "Activate Batman Mode" — closed on
+  the v0.7.0 ship via [`docs/batman-active-mode.md`](../batman-active-mode.md).
+- **#545** — `memory_capabilities` operational summary + per-tool
+  `callable_now` — closed on the v0.7.0 ship via capabilities-v3
+  (A1-A4 increments; `summary`, `to_describe_to_user`, `callable_now`,
+  `agent_permitted_families` all live on the v3 envelope).
+
+## Acknowledgements
+
+The Round-2 NHI sweep was driven by a 5-agent parallel orchestration
+against the live v0.7.0-alpha binary on a multi-droplet DigitalOcean
+topology. The expanded postgres+AGE scope was driven by a 3-stream
+parallel implementation under PR #643. The full A2A campaign artifact
+trail is at https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/.
+
+— AlphaOne LLC, 2026-05-09

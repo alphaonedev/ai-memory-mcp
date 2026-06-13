@@ -83,7 +83,7 @@ pub fn cmd_get(
             }
         }
     } else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
     Ok(())
@@ -159,7 +159,7 @@ pub fn cmd_delete(
     let conn = db::open(db_path)?;
     let target = db::resolve_id(&conn, &args.id)?;
     let Some(target) = target else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     };
 
@@ -199,7 +199,9 @@ pub fn cmd_delete(
             crate::audit::AuditAction::Delete,
             crate::audit::actor(
                 identity::resolve_agent_id(cli_agent_id, None).unwrap_or_default(),
-                cli_agent_id.map_or("default_fallback", |_| "explicit"),
+                cli_agent_id.map_or(crate::audit::synthesis_sources::DEFAULT_FALLBACK, |_| {
+                    crate::audit::synthesis_sources::EXPLICIT
+                }),
                 None,
             ),
             crate::audit::target_memory(
@@ -220,7 +222,7 @@ pub fn cmd_delete(
             writeln!(out.stdout, "deleted: {}", target.id)?;
         }
     } else {
-        writeln!(out.stderr, "not found: {}", args.id)?;
+        writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     }
     Ok(())
@@ -415,7 +417,7 @@ mod tests {
         }
         let cfg = config::AppConfig::default();
         let mut args = list_args();
-        args.tier = Some("long".to_string());
+        args.tier = Some(Tier::Long.as_str().to_string());
         {
             let mut out = env.output();
             cmd_list(&db, &args, true, &cfg, &mut out).unwrap();
@@ -423,7 +425,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         let mems = v["memories"].as_array().unwrap();
         assert_eq!(mems.len(), 1);
-        assert_eq!(mems[0]["tier"].as_str().unwrap(), "long");
+        assert_eq!(mems[0]["tier"].as_str().unwrap(), Tier::Long.as_str());
     }
 
     #[test]
@@ -535,18 +537,22 @@ mod tests {
             crate::config::PermissionsMode::Enforce,
         );
 
-        use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         // Seed a memory in 'gov-ns' first so resolve_id finds something.
         let id = seed_memory(&db, "gov-ns", "tt", "cc");
         // Now seed a governance policy that gates delete behind Approve.
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Approve,
-            approver: ApproverType::Human,
-            inherit: true,
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Approve,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         let conn = db::open(&db).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -577,6 +583,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata,
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         let standard_id = db::insert(&conn, &standard).unwrap();
         db::set_namespace_standard(&conn, "gov-ns", &standard_id, None).unwrap();

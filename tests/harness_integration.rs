@@ -39,23 +39,20 @@
 //! tool count changes; the surface stays at the v0.7.0 tool count
 //! (51 tools — pinned in `src/profile.rs::Profile::full`).
 
-use ai_memory::config::{FeatureTier, McpConfig, TierConfig};
+use ai_memory::config::{FeatureTier, McpConfig, ResolvedModels, TierConfig};
 use ai_memory::harness::Harness;
 use ai_memory::mcp::handle_capabilities_with_conn_v3;
 use ai_memory::profile::Profile;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+mod common;
+use common::fresh_conn;
+
 // ---------------------------------------------------------------------------
 // Helpers — mirror the patterns in tests/capabilities_v3.rs so the two
 // suites stay legible side by side.
 // ---------------------------------------------------------------------------
-
-/// Fresh in-memory rusqlite connection so each test gets a clean DB
-/// state for the live-count overlays inside the capabilities builder.
-fn fresh_conn() -> rusqlite::Connection {
-    ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
-}
 
 /// Default tier for these tests. Matches `tests/capabilities_v3.rs`.
 fn semantic_tier() -> TierConfig {
@@ -75,6 +72,7 @@ fn allowlist(rows: &[(&str, &[&str])]) -> McpConfig {
     McpConfig {
         profile: None,
         allowlist: Some(map),
+        ..McpConfig::default()
     }
 }
 
@@ -119,6 +117,7 @@ fn round_trip(
     let harness = detect_from_initialize(client_name);
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -406,6 +405,7 @@ fn d4_empty_client_info_name_falls_back_to_generic_and_omits_field() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),

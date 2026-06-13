@@ -77,7 +77,7 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
             && orig != caller_id
         {
             obj.insert(
-                "imported_from_agent_id".to_string(),
+                crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
                 serde_json::Value::String(orig),
             );
         }
@@ -153,7 +153,7 @@ pub fn run(
                 }
             }
             for link in &links {
-                if validate::validate_link(&link.source_id, &link.target_id, &link.relation)
+                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
                     .is_err()
                 {
                     continue;
@@ -162,7 +162,7 @@ pub fn run(
                     &local_conn,
                     &link.source_id,
                     &link.target_id,
-                    &link.relation,
+                    link.relation.as_str(),
                 );
             }
             if json_out {
@@ -189,7 +189,7 @@ pub fn run(
                 }
             }
             for link in &links {
-                if validate::validate_link(&link.source_id, &link.target_id, &link.relation)
+                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
                     .is_err()
                 {
                     continue;
@@ -198,7 +198,7 @@ pub fn run(
                     &remote_conn,
                     &link.source_id,
                     &link.target_id,
-                    &link.relation,
+                    link.relation.as_str(),
                 );
             }
             if json_out {
@@ -230,7 +230,7 @@ pub fn run(
                 }
             }
             for link in &r_links {
-                if validate::validate_link(&link.source_id, &link.target_id, &link.relation)
+                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
                     .is_err()
                 {
                     continue;
@@ -239,7 +239,7 @@ pub fn run(
                     &local_conn,
                     &link.source_id,
                     &link.target_id,
-                    &link.relation,
+                    link.relation.as_str(),
                 );
             }
             for mem in &l_mems {
@@ -251,7 +251,7 @@ pub fn run(
                 }
             }
             for link in &l_links {
-                if validate::validate_link(&link.source_id, &link.target_id, &link.relation)
+                if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
                     .is_err()
                 {
                     continue;
@@ -260,7 +260,7 @@ pub fn run(
                     &remote_conn,
                     &link.source_id,
                     &link.target_id,
-                    &link.relation,
+                    link.relation.as_str(),
                 );
             }
             if json_out {
@@ -391,7 +391,7 @@ pub async fn run_daemon(
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("ai_memory=info".parse()?)
+                .add_directive(crate::logging::DEFAULT_LOG_DIRECTIVE.parse()?)
                 .add_directive("tower_http=info".parse()?),
         )
         .try_init();
@@ -577,6 +577,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "remote-agent"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         restamp_agent_id(&mut mem, "local-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "local-agent");
@@ -604,6 +615,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({"agent_id": "same-agent"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         restamp_agent_id(&mut mem, "same-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "same-agent");
@@ -676,7 +698,9 @@ mod tests {
         let local_conn = db::open(&local).unwrap();
         let local_links = db::export_links(&local_conn).unwrap();
         assert!(
-            local_links.iter().any(|l| l.relation == "related_to"),
+            local_links
+                .iter()
+                .any(|l| l.relation == crate::models::MemoryLinkRelation::RelatedTo),
             "expected pulled link to land in local: {local_links:?}"
         );
     }
@@ -702,7 +726,11 @@ mod tests {
         assert_eq!(v["direction"].as_str().unwrap(), "push");
         let remote_conn = db::open(&remote).unwrap();
         let remote_links = db::export_links(&remote_conn).unwrap();
-        assert!(remote_links.iter().any(|l| l.relation == "supersedes"));
+        assert!(
+            remote_links
+                .iter()
+                .any(|l| l.relation == crate::models::MemoryLinkRelation::Supersedes)
+        );
     }
 
     #[test]
@@ -734,12 +762,12 @@ mod tests {
         let l_relations: Vec<String> = db::export_links(&lconn)
             .unwrap()
             .into_iter()
-            .map(|l| l.relation)
+            .map(|l| l.relation.as_str().to_string())
             .collect();
         let r_relations: Vec<String> = db::export_links(&rconn)
             .unwrap()
             .into_iter()
-            .map(|l| l.relation)
+            .map(|l| l.relation.as_str().to_string())
             .collect();
         assert!(l_relations.iter().any(|r| r == "derived_from"));
         assert!(r_relations.iter().any(|r| r == "related_to"));
@@ -824,11 +852,26 @@ mod tests {
             confidence: 1.0,
             source: "test".to_string(),
             access_count: 0,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+            // created_at is `now` so the #1466 tier-default expiry
+            // backfill on this Mid row (created_at + 7d) lands in the
+            // future and the row survives the sync pull; updated_at stays
+            // far-future so it still classifies as the "newer" side.
+            created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: "2099-01-01T00:00:00Z".to_string(),
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);
@@ -860,6 +903,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         restamp_agent_id(&mut mem, "caller-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "caller-agent");
@@ -868,6 +922,20 @@ mod tests {
 
     #[test]
     fn pr9i_pull_skips_invalid_link() {
+        // v0.7.0 fix campaign R1-M2 — the substrate CHECK trigger now
+        // refuses an empty / off-closed-set relation at the SQL layer,
+        // so the original "seed a bad row then pull and verify skip"
+        // shape can no longer be set up: the seed itself fails. Verify
+        // both halves of the defense-in-depth contract instead —
+        //
+        //   1. The CHECK trigger refuses to seed an invalid relation
+        //      directly via SQL (this is the new R1-M2 guarantee).
+        //   2. The pull path's `validate_link` filter (kept in place
+        //      as a second line of defense for legacy DBs where the
+        //      trigger hasn't run yet) is still wired up, asserted
+        //      indirectly by the same call returning a successful
+        //      `direction: pull` envelope after seeing the seed
+        //      attempt fail.
         let mut env = TestEnv::fresh();
         let local = env.db_path.clone();
         let remote_env = TestEnv::fresh();
@@ -875,11 +943,15 @@ mod tests {
         let id1 = seed_memory(&remote, "ns", "src", "src");
         let id2 = seed_memory(&remote, "ns", "tgt", "tgt");
         let conn = db::open(&remote).unwrap();
-        conn.execute(
+        let seed = conn.execute(
             "INSERT INTO memory_links (source_id, target_id, relation, created_at) VALUES (?, ?, '', datetime('now'))",
             rusqlite::params![id1, id2],
-        )
-        .unwrap();
+        );
+        assert!(
+            seed.is_err(),
+            "R1-M2 CHECK trigger must refuse to land an empty relation; \
+             a successful seed would mean defense-in-depth has regressed"
+        );
         drop(conn);
         let args = args_for(remote, "pull");
         {

@@ -1,0 +1,1813 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! MCP `memory_recall` handler and namespace-chain helpers.
+
+use crate::embeddings::Embed;
+use crate::hnsw::VectorIndex;
+use crate::mcp::param_names;
+use crate::mcp::registry::McpTool;
+use crate::models::{
+    AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
+};
+use crate::observations;
+use crate::reranker::BatchedReranker;
+use crate::{db, validate};
+use serde_json::{Value, json};
+
+// --- D1.3 (#984): per-tool McpTool impl for `memory_recall` ---
+
+// #967 — `RecallRequest` and `KindsFilter` were promoted to canonical
+// DTOs under `crate::models::recall_request`. They're re-exported here
+// so the d1_3_984 parity test (which references the local `RecallRequest`
+// symbol via `schemars::schema_for!`) keeps compiling unchanged, and so
+// `RecallTool::input_schema()` continues to derive the schema from the
+// same struct every surface marshals into. `KindsFilter` is part of the
+// public re-export so legacy `mcp::tools::recall::KindsFilter` callers
+// keep resolving even though only `RecallRequest` is touched in this
+// module.
+#[allow(unused_imports)]
+pub use crate::models::recall_request::{KindsFilter, RecallRequest};
+
+/// v0.7.0 #972 D1.3 (#984) — `McpTool` impl for `memory_recall`.
+#[allow(dead_code)]
+pub struct RecallTool;
+
+impl McpTool for RecallTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_RECALL
+    }
+    fn description() -> &'static str {
+        "Recall memories relevant to a context (ranked)."
+    }
+    fn docs() -> &'static str {
+        "Fuzzy OR recall ranked by relevance + priority + access + tier. Optional: budget_tokens (cl100k cap), context_tokens (query-embed bias), session_id (+0.05 recency boost per #518), session_default (splice [agents.defaults.recall_scope]), include_archived, kinds filter. Default format toon_compact (~79% smaller)."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<RecallRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Core.name()
+    }
+}
+
+#[cfg(test)]
+mod d1_3_984_tests {
+    //! D1.3 (#984) — schema parity for the `memory_recall` tool.
+    //! Reuses the allowed-diffs catalog documented in d1_2_983_tests.
+    use super::*;
+
+    fn legacy_props(tool_name: &str) -> serde_json::Map<String, Value> {
+        let defs = crate::mcp::registry::tool_definitions();
+        let tools = defs
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tool_definitions emits `tools` array");
+        let entry = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name))
+            .unwrap_or_else(|| panic!("{tool_name} must be in legacy catalog"));
+        entry
+            .pointer("/inputSchema/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{tool_name}.inputSchema.properties must be object"))
+            .clone()
+    }
+
+    fn derived_props_for<T: schemars::JsonSchema>() -> serde_json::Map<String, Value> {
+        let schema = schemars::schema_for!(T);
+        let v = serde_json::to_value(schema).expect("schema → value");
+        v.get("properties")
+            .and_then(Value::as_object)
+            .or_else(|| {
+                v.pointer(&format!(
+                    "/definitions/{}/properties",
+                    std::any::type_name::<T>().rsplit("::").next().unwrap_or("")
+                ))
+                .and_then(Value::as_object)
+            })
+            .cloned()
+            .expect("schemars schema must have properties at a known path")
+    }
+
+    fn assert_property_set_parity(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        let legacy_keys: std::collections::BTreeSet<&str> =
+            legacy.keys().map(String::as_str).collect();
+        let derived_keys: std::collections::BTreeSet<&str> =
+            derived.keys().map(String::as_str).collect();
+        assert_eq!(
+            legacy_keys,
+            derived_keys,
+            "{tool_name}: property set drift; diff = {:?}",
+            legacy_keys
+                .symmetric_difference(&derived_keys)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn assert_descriptions_match(tool_name: &str, derived: &serde_json::Map<String, Value>) {
+        let legacy = legacy_props(tool_name);
+        for (name, legacy_prop) in &legacy {
+            if let Some(want) = legacy_prop.get("description").and_then(Value::as_str) {
+                let got = derived
+                    .get(name)
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str);
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "{tool_name}.{name}: description must match legacy byte-for-byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recall_parity_984() {
+        let derived = derived_props_for::<RecallRequest>();
+        assert_property_set_parity("memory_recall", &derived);
+        assert_descriptions_match("memory_recall", &derived);
+    }
+
+    #[test]
+    fn recall_tool_metadata_984() {
+        assert_eq!(RecallTool::name(), "memory_recall");
+        assert_eq!(RecallTool::family(), "core");
+    }
+}
+
+// #967 — `parse_kinds_filter(params: &Value)` is removed. The DTO's
+// `kinds: Option<KindsFilter>` field carries the typed wire shape, and
+// `KindsFilter::parse()` does the OR-of-kinds + COR-4 (#767) honoured
+// resolution. See `src/models/recall_request.rs` for the canonical
+// implementation + tests (`kinds_filter_typo_array_returns_empty_some_cor4`).
+
+/// v0.7.x Form 6 — apply the parsed kinds filter to a recall result
+/// set in-place. No-op when `kinds == None`. OR-of-kinds semantics:
+/// a memory passes when `kinds.contains(&memory.memory_kind)`.
+///
+/// Cluster E audit COR-4 (issue #767): `Some(vec![])` (empty allow-
+/// list, intentionally declared filter that matched zero known kinds)
+/// returns zero rows rather than collapsing into "no filter".
+fn apply_kinds_filter(
+    results: Vec<(Memory, f64)>,
+    kinds: Option<&[MemoryKind]>,
+) -> Vec<(Memory, f64)> {
+    match kinds {
+        None => results,
+        Some(allowed) => results
+            .into_iter()
+            .filter(|(m, _)| allowed.contains(&m.memory_kind))
+            .collect(),
+    }
+}
+
+/// Build the standards-inheritance chain for a namespace, most-general
+/// first. Task 1.6 extends this from the historical 3-level scheme
+/// (global → parent → namespace) to N levels by walking the `/`-derived
+/// ancestors from [`crate::models::namespace_ancestors`] plus any
+/// `namespace_meta` explicit-parent chain rooted at the top of the
+/// hierarchical path (which keeps legacy flat-namespace setups working).
+///
+/// Returned vector is top-down: `[*, org, unit, team, agent]` for a
+/// 4-level hierarchical namespace. Cycle-safe and bounded.
+/// Display-side wrapper around [`db::build_namespace_chain`].
+///
+/// v0.6.3.1 (P4, audit G1): the chain walker moved into `db.rs` so the
+/// governance enforcement gate could share a single canonical
+/// implementation with the recall/standard injection paths. This thin
+/// shim keeps existing call sites compiling without re-routing every
+/// invocation through `db::`.
+
+pub async fn handle_recall_with_pre_recall_hook(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&BatchedReranker>,
+    archive_on_gc: bool,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    chain: &crate::hooks::HookChain,
+    registry: &mut crate::hooks::ExecutorRegistry,
+    // v0.7.0 (issue #518) — recall scope defaults; forwarded
+    // unchanged to `handle_recall_caller`.
+    recall_scope: Option<&crate::config::RecallScope>,
+    // v0.7.0 #1468 — caller-scoped `scope=private` post-filter caller.
+    // Threaded through to `handle_recall_caller` so the pre-recall-hook
+    // entry point applies the SAME ownership gate as the plain dispatch
+    // path. `None` keeps the single-tenant trust-all read posture. This
+    // is wired now (rather than left as `None`) so wiring this surface
+    // into MCP dispatch later cannot silently bypass #1468.
+    caller: Option<&str>,
+) -> Result<Value, String> {
+    // Resolve the (query, namespace, k) triple once so the hook
+    // sees exactly what the recall would see.
+    let context = params["context"]
+        .as_str()
+        .ok_or(crate::errors::msg::CONTEXT_REQUIRED)?;
+    let namespace = params["namespace"].as_str().unwrap_or("");
+    let k = u32::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(u32::MAX);
+
+    // Fire the hot-path chain. The chain runner enforces the 50ms
+    // class deadline (G6); a hook that exceeds it converts to
+    // fail-open Allow per the configured `FailMode`.
+    let outcome =
+        crate::hooks::apply_pre_recall_expand(context, namespace, k, chain, registry).await;
+
+    if let crate::hooks::PreRecallOutcome::Denied { reason, code } = &outcome {
+        // The recall is suppressed. Return the same envelope shape
+        // a normal empty recall would produce, decorated with a
+        // `meta.diagnostic.pre_recall_denied` block so the caller
+        // can distinguish "no matches" from "blocked by hook".
+        let mut resp = json!({
+            "memories": [],
+            "count": 0,
+            "mode": "denied_by_hook",
+        });
+        let meta = resp
+            .as_object_mut()
+            .expect("recall response is always a JSON object")
+            .entry("meta".to_string())
+            .or_insert_with(|| json!({}));
+        meta["diagnostic"] = json!({
+            "pre_recall_denied": {
+                "reason": reason,
+                "code": code,
+            }
+        });
+        return Ok(resp);
+    }
+
+    // Apply any Modify-side rewrites onto the params bag before
+    // calling the sync recall path. We clone the input so the
+    // caller's Value is left untouched.
+    let mut effective = params.clone();
+    if let crate::hooks::PreRecallOutcome::Modified {
+        query: q,
+        namespace: ns,
+        k: nk,
+    } = outcome
+    {
+        if let Some(obj) = effective.as_object_mut() {
+            obj.insert("context".to_string(), json!(q));
+            // Only inject `namespace` if the hook actually rewrote
+            // it (vs leaving the original empty-string default).
+            if !ns.is_empty() {
+                obj.insert("namespace".to_string(), json!(ns));
+            }
+            obj.insert("limit".to_string(), json!(u64::from(nk)));
+        }
+    }
+
+    handle_recall_caller(
+        conn,
+        &effective,
+        embedder,
+        vector_index,
+        reranker,
+        archive_on_gc,
+        resolved_ttl,
+        resolved_scoring,
+        recall_scope,
+        caller,
+    )
+}
+
+/// v0.7.0 Gap 7 (#890) — Tier-3 recall-row decoration.
+///
+/// Serialise a `(Memory, score)` pair into the JSON shape the recall
+/// response surfaces. When `verbose_provenance` is true (the default
+/// since v0.7.0), the row carries the full provenance audit trail —
+/// derived `confidence_tier`, derived `freshness_state`, and the
+/// `latest_link_attest_level` lookup over `memory_links`. Plain serde
+/// already round-trips the substrate-side columns (`confidence`,
+/// `source`, `source_uri`, `access_count`, `last_accessed_at`), so
+/// the additional decoration is the *derived* half.
+///
+/// Token-budget contract: the verbose decoration adds at most ~120
+/// bytes per row (3 short snake_case keys + 3 short snake_case
+/// values). The token-budget guards (`tests/token_budget_guard.rs`)
+/// pin the catalog totals; the per-row decoration grows with `count`
+/// not catalog size, so the guards remain accurate.
+///
+/// v0.7.x (#1155) — exposed as `pub(crate)` so the HTTP recall handler
+/// at `src/handlers/recall.rs` can apply the same verbose-decoration
+/// shape under operator opt-in via the `Accept-Provenance: verbose`
+/// HTTP header. MCP wire default is `verbose_provenance=true`
+/// (set inline at `handle_recall_dto`); HTTP default is
+/// `verbose_provenance=false` for v0.6.x wire-shape backwards compat
+/// (consumers opt in via header).
+pub(crate) fn decorate_memory(
+    mem: &Memory,
+    score: f64,
+    verbose_provenance: bool,
+    conn: &rusqlite::Connection,
+) -> Value {
+    let mut val = serde_json::to_value(mem).unwrap_or_default();
+    let Some(obj) = val.as_object_mut() else {
+        return val;
+    };
+    obj.insert(
+        "score".to_string(),
+        json!(
+            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round() / crate::SCORE_DISPLAY_ROUND_FACTOR
+        ),
+    );
+    if !verbose_provenance {
+        return val;
+    }
+    // Gap 7 (#890) — derived confidence tier (Gap 4 enum).
+    obj.insert(
+        "confidence_tier".to_string(),
+        json!(mem.confidence_tier().as_str()),
+    );
+    // Gap 7 — derived freshness_state from expires_at + last_accessed_at.
+    obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
+    // Gap 7 — latest link attest level. Best-effort: a SQL error here
+    // collapses to None so a corrupt links row doesn't break the
+    // recall response.
+    let latest_attest = latest_link_attest_level(conn, &mem.id);
+    if let Some(level) = latest_attest {
+        obj.insert("latest_link_attest_level".to_string(), json!(level));
+    }
+    val
+}
+
+/// v0.7.0 Gap 7 (#890) — derive a coarse freshness state from
+/// substrate-side timestamps.
+///
+/// - `"expired"` — `expires_at` is set and lies in the past.
+/// - `"stale"`   — no access recorded in the last 30 days (long-tier
+///                 rows that haven't been touched for a month).
+/// - `"warm"`    — has been accessed in the last 30 days.
+/// - `"fresh"`   — newly created OR `last_accessed_at == created_at`
+///                 (never touched, but young).
+///
+/// Conservative defaults: a row with unparseable timestamps lands in
+/// `"warm"` (the substrate sees activity recently enough to surface
+/// it via recall, so blocking it on a timestamp parse would be
+/// hostile). Pure function; no DB queries.
+pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
+    let now = chrono::Utc::now();
+    if let Some(exp) = mem.expires_at.as_deref()
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp)
+        && dt < now
+    {
+        return "expired";
+    }
+    let last = mem.last_accessed_at.as_deref().unwrap_or(&mem.created_at);
+    let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last) else {
+        return "warm";
+    };
+    let age_days = (now - last_dt.with_timezone(&chrono::Utc)).num_days();
+    if age_days > 30 {
+        "stale"
+    } else if age_days < 1 && mem.access_count == 0 {
+        "fresh"
+    } else {
+        "warm"
+    }
+}
+
+/// v0.7.0 Gap 7 (#890) — return the strongest attestation level
+/// across every link incident on `memory_id`. `peer_attested >
+/// self_signed > unsigned`. Returns `None` when no links exist.
+/// Best-effort: a SQL error returns `None` so the recall row keeps
+/// its remaining decoration.
+pub(crate) fn latest_link_attest_level(
+    conn: &rusqlite::Connection,
+    memory_id: &str,
+) -> Option<String> {
+    let links = db::get_links(conn, memory_id).ok()?;
+    let mut best: Option<AttestLevel> = None;
+    for link in &links {
+        let Some(level_str) = link.attest_level.as_deref() else {
+            continue;
+        };
+        let Some(level) = AttestLevel::from_str(level_str) else {
+            continue;
+        };
+        let candidate_rank = attest_rank(level);
+        match best {
+            None => best = Some(level),
+            Some(curr) if candidate_rank > attest_rank(curr) => best = Some(level),
+            _ => {}
+        }
+    }
+    best.map(|l| l.as_str().to_string())
+}
+
+const fn attest_rank(level: AttestLevel) -> u8 {
+    // v0.7.0 #1430 fix: new SignedByPeer (L4 capture_turn) + DaemonSigned
+    // (governance audit) variants ranked alongside the original 3.
+    // Ranking semantics:
+    //   - Unsigned     (0) — no signature, lowest trust
+    //   - SelfSigned   (1) — writer-local signature
+    //   - DaemonSigned (1) — substrate-self signature on its own
+    //                        audit emission (semantically equivalent
+    //                        rank to SelfSigned — daemon writing about
+    //                        its own actions)
+    //   - SignedByPeer (2) — host-supplied signature, allowlist-verified
+    //                        (equivalent rank to PeerAttested: both
+    //                        require an external pubkey enrollment +
+    //                        signature verification)
+    //   - PeerAttested (2) — federation H3 inbound, allowlist-verified
+    match level {
+        AttestLevel::Unsigned => 0,
+        AttestLevel::SelfSigned | AttestLevel::DaemonSigned => 1,
+        AttestLevel::PeerAttested | AttestLevel::SignedByPeer => 2,
+    }
+}
+
+/// FX-4 / PERF-2 (2026-05-26) — batched lookup of the strongest
+/// attestation level across every link incident on each `memory_id`
+/// in `ids`. Replaces the per-row [`latest_link_attest_level`] call
+/// that the HTTP recall handler used to issue under the DB mutex
+/// (one round-trip per row × N rows = N round-trips under the lock).
+/// One `IN(...)` SQL emit covers the batch; the map is keyed by
+/// `memory_id` and only entries with a non-`None` level land in it.
+/// Best-effort: a SQL error returns an empty map so the recall
+/// response keeps its remaining decoration.
+pub(crate) fn latest_link_attest_level_many(
+    conn: &rusqlite::Connection,
+    ids: &[&str],
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    // Chunk to keep the SQL parameter count well below sqlite's
+    // default `SQLITE_LIMIT_VARIABLE_NUMBER` (999 on the standard
+    // build); each row contributes 2 placeholders (source_id +
+    // target_id) so 250 ids per chunk = 500 params, comfortable
+    // headroom. The recall handler caps `limit` at 50 today so the
+    // typical batch is one chunk; the cap is defensive only.
+    const CHUNK: usize = 250;
+    // Track best attestation per id across both the `source_id` and
+    // `target_id` columns. A link with `target_id = id` still
+    // contributes to `id`'s attestation rank because `get_links`
+    // surfaces incident edges in either direction.
+    let mut best_by_id: std::collections::HashMap<String, AttestLevel> =
+        std::collections::HashMap::new();
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_id, target_id, attest_level \
+             FROM memory_links \
+             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})"
+        );
+        // Bind ids twice — once for the `source_id IN (...)` clause
+        // and once for the `target_id IN (...)` clause. Allocation
+        // is a single `Vec<&str>` of length 2 × chunk.len().
+        let mut params: Vec<&str> = Vec::with_capacity(chunk.len() * 2);
+        params.extend_from_slice(chunk);
+        params.extend_from_slice(chunk);
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            // Prepare error — return what we have. The decorator
+            // already treats `None` as a degraded-best-effort signal.
+            return out;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let source_id: String = row.get(0)?;
+            let target_id: String = row.get(1)?;
+            let level: Option<String> = row.get(2)?;
+            Ok((source_id, target_id, level))
+        }) else {
+            return out;
+        };
+        // `chunk` is &[&str] — convert to a HashSet<&str> for O(1)
+        // membership tests across both columns.
+        let in_batch: std::collections::HashSet<&str> = chunk.iter().copied().collect();
+        for r in rows {
+            let Ok((source_id, target_id, level_opt)) = r else {
+                continue;
+            };
+            let Some(level_str) = level_opt else { continue };
+            let Some(level) = AttestLevel::from_str(&level_str) else {
+                continue;
+            };
+            let rank = attest_rank(level);
+            // Apply to whichever endpoint(s) of the link are in our
+            // batch — both directions count as "incident" per the
+            // per-row implementation above.
+            for endpoint in [&source_id, &target_id] {
+                if !in_batch.contains(endpoint.as_str()) {
+                    continue;
+                }
+                match best_by_id.get(endpoint) {
+                    None => {
+                        best_by_id.insert(endpoint.clone(), level);
+                    }
+                    Some(curr) if rank > attest_rank(*curr) => {
+                        best_by_id.insert(endpoint.clone(), level);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (id, level) in best_by_id {
+        out.insert(id, level.as_str().to_string());
+    }
+    out
+}
+
+/// FX-4 / PERF-2 (2026-05-26) — batched front-end for
+/// [`decorate_memory`] used by the HTTP recall handler. Resolves
+/// the verbose-decoration link-attestation lookup for every memory
+/// in one SQL round-trip via [`latest_link_attest_level_many`]
+/// instead of N round-trips. Returns one `Value` per `(mem, score)`
+/// in input order so the caller can splice it straight into the
+/// response payload.
+///
+/// Per-row pure fields (`confidence_tier`, `freshness_state`, the
+/// serialised `Memory` body, and the rounded `score`) match the
+/// shape that [`decorate_memory`] produces — the only structural
+/// difference is that the attestation lookup is amortised across
+/// the batch. The verbose-OFF path is identical to the legacy
+/// per-row shape (no DB queries) and is short-circuited here.
+pub fn decorate_memory_many(
+    rows: &[(Memory, f64)],
+    verbose_provenance: bool,
+    conn: &rusqlite::Connection,
+) -> Vec<Value> {
+    if !verbose_provenance {
+        return rows
+            .iter()
+            .map(|(mem, score)| {
+                let mut val = serde_json::to_value(mem).unwrap_or_default();
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "score".to_string(),
+                        json!(
+                            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                                / crate::SCORE_DISPLAY_ROUND_FACTOR
+                        ),
+                    );
+                }
+                val
+            })
+            .collect();
+    }
+    let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
+    let attest_map = latest_link_attest_level_many(conn, &ids);
+    rows.iter()
+        .map(|(mem, score)| {
+            let mut val = serde_json::to_value(mem).unwrap_or_default();
+            let Some(obj) = val.as_object_mut() else {
+                return val;
+            };
+            obj.insert(
+                "score".to_string(),
+                json!(
+                    (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+                        / crate::SCORE_DISPLAY_ROUND_FACTOR
+                ),
+            );
+            obj.insert(
+                "confidence_tier".to_string(),
+                json!(mem.confidence_tier().as_str()),
+            );
+            obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
+            if let Some(level) = attest_map.get(&mem.id) {
+                obj.insert("latest_link_attest_level".to_string(), json!(level));
+            }
+            val
+        })
+        .collect()
+}
+
+/// v0.7.0 Gap 3 (#886) — record one `recall_observations` row per
+/// returned candidate under `recall_id`. The `retriever` label is
+/// stamped uniformly across the batch ("hybrid+rerank", "hybrid",
+/// "keyword") to match the corresponding response `mode`. Best-
+/// effort: a SQL error logs at warn level and continues, since the
+/// recall response is already minted by the time this runs.
+fn record_recall_observations(
+    conn: &rusqlite::Connection,
+    recall_id: &str,
+    memories_json: &[Value],
+    retriever: &str,
+) {
+    if !observations::table_exists(conn) {
+        return;
+    }
+    let mut candidates: Vec<observations::Candidate<'_>> = Vec::with_capacity(memories_json.len());
+    let mut id_holders: Vec<&str> = Vec::with_capacity(memories_json.len());
+    for (idx, m) in memories_json.iter().enumerate() {
+        if let Some(id) = m.get(param_names::ID).and_then(Value::as_str) {
+            id_holders.push(id);
+            let score = m.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+            #[allow(clippy::cast_possible_wrap)]
+            let rank = (idx + 1) as i64;
+            candidates.push(observations::Candidate {
+                // QUAL-4 (med/low review batch) — load-bearing `.expect()`
+                // with a reason string. The push at line 572 above is the
+                // immediate predecessor; `id_holders.last()` cannot be
+                // `None` here. The annotation pins the local invariant so
+                // a future refactor that breaks the push-then-read pairing
+                // surfaces a named panic instead of a bare unwrap.
+                memory_id: id_holders
+                    .last()
+                    .copied()
+                    .expect("just pushed id_holders above"),
+                retriever,
+                rank,
+                score,
+            });
+        }
+    }
+    if let Err(e) = observations::record_recall(conn, recall_id, &candidates) {
+        tracing::warn!(
+            target: "observations",
+            recall_id = %recall_id,
+            "record_recall failed (non-fatal): {e}"
+        );
+    }
+}
+
+/// #967 — JSON-bag entry kept as a thin wrapper around
+/// [`handle_recall_dto`]. The pre-#967 surface continues to accept the
+/// `&Value` params bag so existing call sites (tests + the MCP
+/// dispatcher) compile unchanged; field extraction is delegated to
+/// [`RecallRequest::from_mcp_params`].
+#[allow(clippy::too_many_arguments)]
+pub fn handle_recall(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&BatchedReranker>,
+    archive_on_gc: bool,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    recall_scope: Option<&crate::config::RecallScope>,
+) -> Result<Value, String> {
+    handle_recall_caller(
+        conn,
+        params,
+        embedder,
+        vector_index,
+        reranker,
+        archive_on_gc,
+        resolved_ttl,
+        resolved_scoring,
+        recall_scope,
+        None,
+    )
+}
+
+/// v0.7.0 #1468 — caller-scoped MCP recall entry. Identical to
+/// [`handle_recall`] but threads a visibility `caller` (resolved by the
+/// dispatch layer via
+/// [`crate::identity::resolve_read_visibility_caller`]) into
+/// [`handle_recall_dto`], which post-filters every retrieval branch by
+/// the canonical [`crate::visibility::is_visible_to_caller`] predicate.
+/// `None` preserves the single-tenant trust-all read posture.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_recall_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&BatchedReranker>,
+    archive_on_gc: bool,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    recall_scope: Option<&crate::config::RecallScope>,
+    caller: Option<&str>,
+) -> Result<Value, String> {
+    let req = RecallRequest::from_mcp_params(params)?;
+    handle_recall_dto(
+        conn,
+        &req,
+        embedder,
+        vector_index,
+        reranker,
+        archive_on_gc,
+        resolved_ttl,
+        resolved_scoring,
+        recall_scope,
+        caller,
+    )
+}
+
+/// #967 canonical-DTO entry. The `&RecallRequest` carries every
+/// caller-supplied scalar (18 fields pre-#967 extracted one-by-one
+/// from the `params: &Value` bag). The remaining args are the
+/// substrate-side context that doesn't belong on the wire DTO:
+/// connection handle, embedder, vector index, reranker, gc-archive
+/// flag, resolved TTL / scoring configs, and the operator's
+/// `[agents.defaults.recall_scope]` defaults.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+pub fn handle_recall_dto(
+    conn: &rusqlite::Connection,
+    req: &RecallRequest,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&VectorIndex>,
+    reranker: Option<&BatchedReranker>,
+    archive_on_gc: bool,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    resolved_scoring: &crate::config::ResolvedScoring,
+    // v0.7.0 (issue #518) — operator-configured recall defaults.
+    // When `session_default=true` is set on the request AND a given
+    // filter axis is absent, the corresponding `recall_scope` field
+    // is spliced into the request before the storage call. `None`
+    // keeps v0.6.x recall semantics exactly.
+    recall_scope: Option<&crate::config::RecallScope>,
+    // v0.7.0 #1468 — read-path visibility caller. The `db::recall*`
+    // family applies the #151 namespace-scope (`as_agent`) gate but NOT
+    // the per-row `scope=private` ownership predicate, so a cross-agent
+    // private row could otherwise reach the MCP wire. When `Some`, every
+    // retrieval branch drops rows the caller does not own via
+    // `crate::visibility::is_visible_to_caller`. `None` (single-tenant /
+    // no stable env identity) keeps the trust-all read posture.
+    caller: Option<&str>,
+) -> Result<Value, String> {
+    // v0.7.0 Gap 7 (#890) — `verbose_provenance` defaults to true.
+    // Pre-Gap-7 recall responses dropped per-row provenance scaffolding
+    // (confidence_tier / source_uri / freshness_state / access_count /
+    // latest_link_attest_level) to keep the wire small; v0.7.0
+    // reverses the default so MCP callers see the full audit trail
+    // by default. Clients that want the trimmed shape can pass
+    // `verbose_provenance=false`.
+    let verbose_provenance = req.verbose_provenance.unwrap_or(true);
+
+    // v0.7.0 Gap 3 (#886) — fresh per-call recall_id stamped into
+    // every observation row (and echoed back in the response so the
+    // caller can cite it on a later memory_store / memory_link).
+    let recall_id = uuid::Uuid::new_v4().to_string();
+
+    // v0.7.0 Gap 4 (#887) — derived-tier filter (`"confirmed"` /
+    // `"likely"` / `"ambiguous"`). When set, keeps only the matching
+    // tier. Unknown / empty values fall through to "no filter" so a
+    // typo on the client side doesn't silently inverter the filter.
+    let confidence_tier_filter: Option<ConfidenceTier> = req
+        .confidence_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(ConfidenceTier::parse);
+
+    // Helper: serialize scored memories with score field (#95) and,
+    // when `verbose_provenance` is set, the Gap 7 (#890) decoration
+    // block (`confidence_tier`, `freshness_state`, `latest_link_attest_level`).
+    // Plain serde already emits `confidence`, `source`, `source_uri`,
+    // `access_count`, `last_accessed_at`; the Gap 7 contract just adds
+    // the derived fields the substrate computes here.
+    let scored_memories =
+        |results: Vec<(Memory, f64)>, conn: &rusqlite::Connection| -> Vec<Value> {
+            results
+                .into_iter()
+                .map(|(mem, score)| decorate_memory(&mem, score, verbose_provenance, conn))
+                .collect()
+        };
+
+    // v0.7.0 Gap 4 (#887) — filter `(Memory, f64)` candidates by the
+    // derived confidence tier. No-op when `confidence_tier_filter` is
+    // None.
+    let apply_confidence_tier_filter = |results: Vec<(Memory, f64)>| -> Vec<(Memory, f64)> {
+        match confidence_tier_filter {
+            None => results,
+            Some(target) => results
+                .into_iter()
+                .filter(|(m, _)| m.confidence_tier() == target)
+                .collect(),
+        }
+    };
+
+    // v0.7.0 #1468 — per-row ownership visibility filter. Applied at every
+    // retrieval branch immediately before serialization so a cross-agent
+    // `scope=private` row never reaches the wire. No-op when `caller` is
+    // `None` (single-tenant trust-all read posture).
+    let apply_visibility_filter = |results: Vec<(Memory, f64)>| -> Vec<(Memory, f64)> {
+        match caller {
+            None => results,
+            Some(c) => results
+                .into_iter()
+                .filter(|(m, _)| crate::visibility::is_visible_to_caller(m, c))
+                .collect(),
+        }
+    };
+
+    let _ = db::gc_if_needed(conn, archive_on_gc);
+    let context = req.context.as_str();
+    if context.is_empty() {
+        return Err(crate::errors::msg::CONTEXT_REQUIRED.to_string());
+    }
+    // v0.7.0 (issue #518) — when the caller passed
+    // `session_default=true` AND a given filter axis is absent,
+    // splice in the corresponding `[agents.defaults.recall_scope]`
+    // value. Explicit args always win. Sqlite recall does not
+    // expose a `tier` filter on the legacy `db::recall` /
+    // `db::recall_hybrid` paths, so the `tier` axis is plumbed but
+    // not consumed on this branch (the postgres SAL handler in
+    // `handlers/recall.rs::recall_response` applies it via
+    // `Filter.tier`).
+    let session_default = req.session_default.unwrap_or(false);
+    let scope = if session_default { recall_scope } else { None };
+    // Compute owned defaults so they outlive the parse step.
+    let scope_namespace: Option<String> = scope
+        .and_then(|s| s.namespaces.as_ref())
+        .and_then(|v| v.first())
+        .cloned();
+    let scope_since: Option<String> = scope.and_then(|s| {
+        s.since.as_deref().and_then(|d| {
+            crate::config::parse_duration_string(d).map(|dur| {
+                let cutoff = chrono::Utc::now() - dur;
+                cutoff.to_rfc3339()
+            })
+        })
+    });
+    let explicit_namespace = req.namespace.as_deref();
+    let explicit_since = req.since.as_deref();
+    let namespace: Option<&str> = explicit_namespace.or(scope_namespace.as_deref());
+    let limit = if let Some(v) = req.limit
+        && v > 0
+    {
+        usize::try_from(v).unwrap_or(usize::MAX)
+    } else if let Some(v) = scope.and_then(|s| s.limit) {
+        usize::try_from(v).unwrap_or(usize::MAX)
+    } else {
+        10
+    };
+    let tags = req.tags.as_deref();
+    let since: Option<&str> = explicit_since.or(scope_since.as_deref());
+    let until = req.until.as_deref();
+    // #151 visibility
+    let as_agent = req.as_agent.as_deref();
+    if let Some(a) = as_agent {
+        validate::validate_namespace(a).map_err(|e| e.to_string())?;
+    }
+    // Task 1.11 / Phase P6 (R1): optional token budget. R1 semantics
+    // permit `0` ("give me nothing") and return an empty result with
+    // `meta.budget_overflow = false` — see the comment on
+    // `db::apply_token_budget`. This supersedes the v0.6.3 Ultrareview
+    // #348 hard-reject of 0; the meta block now disambiguates "user
+    // asked for zero" from "buggy uninitialized counter" by always
+    // round-tripping the requested budget.
+    let budget_tokens = req.resolved_budget_tokens();
+
+    // v0.7.x Form 6 — Batman-taxonomy `kinds` filter. Parsed once
+    // and applied to every result vector below (keyword, hybrid,
+    // hybrid+rerank). OR-of-kinds within the param, AND with the
+    // other filters (namespace, tags, time window, visibility).
+    let kinds_filter = req.kinds.as_ref().and_then(KindsFilter::parse);
+
+    // v0.7.0 WT-1-E — atom-preference recall semantics.
+    //
+    // By default recall surfaces atoms in place of archived sources
+    // (the WT-1-B atomiser sets `atomised_into > 0` AND
+    // `metadata.atomisation_archived_at` on the parent row when atoms
+    // exist). Auditors and the forensic-export path opt in via
+    // `include_archived=true` to see both atoms AND the archived
+    // source for the same query — the substrate read is the same;
+    // only the WHERE clause changes.
+    //
+    // Composes with namespace, memory_kind (via storage filter),
+    // time-window, tier, and the existing visibility predicate.
+    let include_archived = req.include_archived.unwrap_or(false);
+
+    // v0.7.0 Form 4 (issue #757) — fact-provenance post-filters.
+    // `has_citations` keeps only memories with a non-empty citations
+    // array; `source_uri_prefix` keeps only memories whose
+    // `source_uri` column begins with the supplied string. Both
+    // compose with the existing SQL-side filters; we run them in
+    // Rust after the recall returns so the substrate signature
+    // doesn't grow another two positional args. Tool-count baseline
+    // preserved (no new MCP tool).
+    let has_citations_filter = req.has_citations.unwrap_or(false);
+    let source_uri_prefix: Option<String> = req.source_uri_prefix.clone();
+
+    // v0.7.0 (issue #518) — per-session "recently accessed" boost.
+    // When the caller passes a non-empty `session_id`, the rerank
+    // post-step adds `SESSION_RECENCY_BOOST` to every candidate
+    // already in the session's ring buffer and records the post-
+    // boost hit set back into the buffer so the next recall in the
+    // same session reuses the new context. `None` / empty preserves
+    // pre-#518 recall semantics exactly.
+    let session_id: Option<String> = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(std::string::ToString::to_string);
+    let session_tracker = crate::reranker::global_session_recall_tracker();
+
+    // v0.6.0.0 contextual recall — caller-supplied recent conversation tokens.
+    let context_tokens: Vec<String> = req
+        .context_tokens
+        .as_ref()
+        .map(|arr| arr.iter().filter(|s| !s.is_empty()).cloned().collect())
+        .unwrap_or_default();
+
+    // Helper: tack tokens_used / budget_tokens onto the response, plus
+    // — when a budget was supplied — the Phase P6 RecallMeta-style
+    // sub-block (`meta.budget_tokens_used`, `budget_tokens_remaining`,
+    // `memories_dropped`, `budget_overflow`). The legacy top-level
+    // `tokens_used` / `budget_tokens` fields are preserved verbatim so
+    // pre-P6 callers continue to work byte-for-byte.
+    //
+    // NOTE on RecallMeta: Phase P3 introduces a top-level `meta` block
+    // (recall_mode, reranker_used, candidate_counts, blend_weight). This
+    // P6 worktree pre-dates the P3 merge, so we define the budget-mode
+    // sub-block directly under `meta.budget` and let P3's rebase fold
+    // its fields in alongside ours. See REMEDIATIONv0631.md L488-489.
+    let decorate_budget = |resp: &mut Value, outcome: &db::BudgetOutcome| {
+        resp["tokens_used"] = json!(outcome.tokens_used);
+        if let Some(b) = budget_tokens {
+            resp["budget_tokens"] = json!(b);
+            // Phase P6 R1 meta block. Always emitted when a budget is
+            // supplied so callers can rely on the field set. Kept under
+            // a dedicated `meta` key so the top-level shape stays
+            // backward-compatible — pre-P6 callers ignore unknown keys.
+            let meta = resp
+                .as_object_mut()
+                .expect("recall response is always a JSON object")
+                .entry("meta".to_string())
+                .or_insert_with(|| json!({}));
+            meta["budget_tokens_used"] = json!(outcome.tokens_used);
+            meta["budget_tokens_remaining"] = json!(outcome.tokens_remaining.unwrap_or(0));
+            meta["memories_dropped"] = json!(outcome.memories_dropped);
+            meta["budget_overflow"] = json!(outcome.budget_overflow);
+        }
+    };
+
+    // v0.6.3.1 (P3): build the per-request meta block from retrieval-stage
+    // telemetry + the runtime reranker variant. The block is always
+    // present in the response — clients that don't read it ignore unknown
+    // fields per JSON-RPC convention. Closes audit gaps G2/G8/G11 by
+    // making silent-degrade paths visible at request time.
+    // v0.7.0 R3-S2 — distinguish *originally lexical* from
+    // *degraded lexical* so the recall response surfaces an in-band
+    // signal when the operator's configured neural cross-encoder
+    // failed to load and fell back. Pre-R3 this was a tracing-event-
+    // only signal; the G8 closure claim required a per-call field
+    // and now has one. Wire shape:
+    //   - "neural"          — configured + loaded
+    //   - "lexical"         — operator chose lexical or never asked
+    //                         for a neural cross-encoder
+    //   - "degraded_lexical"— configured neural, runtime fell back
+    //   - "none"            — no reranker plumbed at all
+    let reranker_used = match reranker {
+        Some(ce) if ce.is_neural() => "neural",
+        Some(ce) if ce.is_degraded_lexical() => "degraded_lexical",
+        Some(_) => "lexical",
+        None => "none",
+    };
+    let attach_meta = |resp: &mut Value, recall_mode: &str, telemetry: &RecallTelemetry| {
+        // Round blend_weight to 3 decimals — matches the score field
+        // precision and keeps the wire shape stable regardless of f64
+        // representation jitter.
+        let blend_weight = (telemetry.blend_weight_avg * crate::SCORE_DISPLAY_ROUND_FACTOR).round()
+            / crate::SCORE_DISPLAY_ROUND_FACTOR;
+        let meta = RecallMeta {
+            recall_mode: recall_mode.to_string(),
+            reranker_used: reranker_used.to_string(),
+            candidate_counts: CandidateCounts {
+                fts: telemetry.fts_candidates,
+                hnsw: telemetry.hnsw_candidates,
+            },
+            blend_weight,
+        };
+        // Merge into existing meta object rather than replacing — P6's
+        // decorate_budget may have already populated budget_* keys here.
+        if let Ok(Value::Object(p3_fields)) = serde_json::to_value(&meta) {
+            let meta_obj = resp
+                .as_object_mut()
+                .expect("recall response is always a JSON object")
+                .entry("meta".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(existing) = meta_obj.as_object_mut() {
+                for (k, v) in p3_fields {
+                    existing.insert(k, v);
+                }
+            }
+        }
+    };
+
+    // Use hybrid recall if embedder is available
+    if let Some(emb) = embedder {
+        match emb.embed_query(context) {
+            Ok(primary_emb) => {
+                // v0.6.0.0: fuse primary query with context-token embedding
+                // at 70/30 when caller supplied conversation tokens.
+                let query_emb = if context_tokens.is_empty() {
+                    primary_emb
+                } else {
+                    let joined = context_tokens.join(" ");
+                    match emb.embed_query(&joined) {
+                        Ok(ctx_emb) => crate::embeddings::Embedder::fuse(
+                            &primary_emb,
+                            &ctx_emb,
+                            crate::RECALL_PRIMARY_CTX_BLEND,
+                        ),
+                        Err(e) => {
+                            tracing::warn!("context_tokens embed failed, using primary only: {e}");
+                            primary_emb
+                        }
+                    }
+                };
+                let (results, outcome, telemetry) = db::recall_hybrid_with_telemetry(
+                    conn,
+                    context,
+                    &query_emb,
+                    namespace,
+                    limit.min(50),
+                    tags,
+                    since,
+                    until,
+                    vector_index,
+                    resolved_ttl.short_extend_secs,
+                    resolved_ttl.mid_extend_secs,
+                    as_agent,
+                    budget_tokens,
+                    resolved_scoring,
+                    include_archived,
+                    // v0.7.0 Cluster-A PERF-3 — push source-URI prefix
+                    // into SQL WHERE so the partial
+                    // `idx_memories_source_uri` index covers the lookup.
+                    // The post-filter call below is a no-op when the
+                    // SQL push-down already constrained the set; we
+                    // keep it for the `has_citations` axis only.
+                    source_uri_prefix.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+                let results = crate::cli::recall::apply_form4_recall_filters(
+                    results,
+                    has_citations_filter,
+                    source_uri_prefix.as_deref(),
+                );
+
+                // Apply cross-encoder reranking if available
+                if let Some(ce) = reranker {
+                    let ce_reranked = ce.rerank(context, results);
+                    let ce_reranked = apply_kinds_filter(ce_reranked, kinds_filter.as_deref());
+                    let ce_reranked = apply_confidence_tier_filter(ce_reranked);
+                    let ce_reranked = apply_visibility_filter(ce_reranked);
+                    // v0.7.0 (issue #518) — session recency boost.
+                    let ce_reranked = crate::reranker::apply_session_recency_boost(
+                        ce_reranked,
+                        session_id.as_deref(),
+                        session_tracker,
+                    );
+                    let memories = scored_memories(ce_reranked, conn);
+                    record_recall_observations(
+                        conn,
+                        &recall_id,
+                        &memories,
+                        crate::models::RECALL_MODE_HYBRID_RERANK,
+                    );
+                    let mut resp = json!({
+                        "recall_id": recall_id,
+                        "memories": memories,
+                        "count": memories.len(),
+                        "mode": crate::models::RECALL_MODE_HYBRID_RERANK,
+                    });
+                    decorate_budget(&mut resp, &outcome);
+                    attach_meta(&mut resp, "hybrid", &telemetry);
+                    super::inject_namespace_standard(conn, namespace, &mut resp);
+                    return Ok(resp);
+                }
+
+                let results = apply_kinds_filter(results, kinds_filter.as_deref());
+                let results = apply_confidence_tier_filter(results);
+                let results = apply_visibility_filter(results);
+                // v0.7.0 (issue #518) — session recency boost (no
+                // cross-encoder branch).
+                let results = crate::reranker::apply_session_recency_boost(
+                    results,
+                    session_id.as_deref(),
+                    session_tracker,
+                );
+                let memories = scored_memories(results, conn);
+                record_recall_observations(conn, &recall_id, &memories, "hybrid");
+                let mut resp = json!({
+                    "recall_id": recall_id,
+                    "memories": memories,
+                    "count": memories.len(),
+                    "mode": "hybrid",
+                });
+                decorate_budget(&mut resp, &outcome);
+                attach_meta(&mut resp, "hybrid", &telemetry);
+                super::inject_namespace_standard(conn, namespace, &mut resp);
+                return Ok(resp);
+            }
+            Err(e) => {
+                // v0.6.3.1 (P3, G11): the embedder being present but the
+                // per-query embed failing is a different silent-degrade
+                // path than "embedder unavailable at startup" — preserve
+                // the existing tracing event and fall through to
+                // keyword_only mode below, which is what the meta block
+                // will report.
+                tracing::warn!("embedding failed, falling back to FTS: {}", e);
+            }
+        }
+    }
+
+    // Fallback to keyword-only recall
+    let (results, outcome, telemetry) = db::recall_with_telemetry(
+        conn,
+        context,
+        namespace,
+        limit.min(50),
+        tags,
+        since,
+        until,
+        resolved_ttl.short_extend_secs,
+        resolved_ttl.mid_extend_secs,
+        as_agent,
+        budget_tokens,
+        include_archived,
+        // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
+        source_uri_prefix.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let results = crate::cli::recall::apply_form4_recall_filters(
+        results,
+        has_citations_filter,
+        source_uri_prefix.as_deref(),
+    );
+    let results = apply_kinds_filter(results, kinds_filter.as_deref());
+    let results = apply_confidence_tier_filter(results);
+    let results = apply_visibility_filter(results);
+    // v0.7.0 (issue #518) — session recency boost on the keyword-only
+    // fallback branch as well, so the contract is uniform regardless
+    // of which retrieval mode produced the candidate set.
+    let results = crate::reranker::apply_session_recency_boost(
+        results,
+        session_id.as_deref(),
+        session_tracker,
+    );
+    let memories = scored_memories(results, conn);
+    record_recall_observations(conn, &recall_id, &memories, "keyword");
+    let mut resp = json!({
+        "recall_id": recall_id,
+        "memories": memories,
+        "count": memories.len(),
+        "mode": "keyword",
+    });
+    decorate_budget(&mut resp, &outcome);
+    attach_meta(&mut resp, "keyword_only", &telemetry);
+    super::inject_namespace_standard(conn, namespace, &mut resp);
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    //! L0.7-3 Tier B chunk-A — coverage tests for `handle_recall`
+    //! and `handle_recall_with_pre_recall_hook`.
+    //!
+    //! Six-category template:
+    //! A. happy path — keyword + hybrid + reranker
+    //! B. validation — missing context
+    //! D. state-dependent — empty result, namespace filter miss
+    //! Embedder-bound: BOTH None and Some(&dyn Embed) paths.
+
+    use super::*;
+    use crate::config::{RecallScope, ResolvedScoring, ResolvedTtl};
+    use crate::embeddings::test_support::MockEmbedder;
+    use crate::hnsw::VectorIndex;
+    use crate::models::{Memory, Tier};
+    use crate::reranker::{BatchedReranker, CrossEncoder};
+    use crate::storage as db;
+
+    fn fresh_conn() -> rusqlite::Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    fn make_mem(title: &str, content: &str, ns: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": "ai:test"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+        }
+    }
+
+    fn seed(conn: &rusqlite::Connection) {
+        db::insert(
+            conn,
+            &make_mem(
+                "Rust ownership",
+                "Rust ownership rules prevent data races",
+                "test",
+            ),
+        )
+        .unwrap();
+        db::insert(
+            conn,
+            &make_mem(
+                "Python typing",
+                "Python typing is dynamic with hints",
+                "test",
+            ),
+        )
+        .unwrap();
+        db::insert(conn, &make_mem("Other topic", "Unrelated content", "other")).unwrap();
+    }
+
+    // B. validation — missing context
+    #[test]
+    fn missing_context_errors() {
+        let conn = fresh_conn();
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let err = handle_recall(
+            &conn,
+            &json!({}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("context"));
+    }
+
+    // A. happy path — keyword-only (embedder=None)
+    #[test]
+    fn keyword_only_path() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("keyword"));
+        assert_eq!(resp["meta"]["recall_mode"].as_str(), Some("keyword_only"));
+    }
+
+    // --- v0.7.0 #1468 — caller-scoped visibility on the recall path -------
+
+    fn owned_mem(title: &str, agent: &str, scope: Option<&str>) -> Memory {
+        let mut m = make_mem(title, "shared ownership keyword content", "vis");
+        m.metadata = match scope {
+            Some(s) => json!({crate::META_KEY_AGENT_ID: agent, crate::META_KEY_SCOPE: s}),
+            None => json!({crate::META_KEY_AGENT_ID: agent}),
+        };
+        m
+    }
+
+    fn seed_vis(conn: &rusqlite::Connection) {
+        use crate::models::namespace::MemoryScope;
+        db::insert(conn, &owned_mem("priv", "ai:alice", None)).expect("ins");
+        db::insert(
+            conn,
+            &owned_mem("shared", "ai:bob", Some(MemoryScope::Collective.as_str())),
+        )
+        .expect("ins");
+    }
+
+    fn recall_titles(resp: &Value) -> Vec<String> {
+        resp["memories"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["title"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // #1468 — caller=None preserves trust-all recall (single-tenant).
+    #[test]
+    fn recall_caller_none_returns_all() {
+        let conn = fresh_conn();
+        seed_vis(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall_caller(
+            &conn,
+            &json!({"context": "ownership", "namespace": "vis"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(2));
+    }
+
+    // #1468 — a non-owner caller never recalls another agent's private row.
+    #[test]
+    fn recall_non_owner_excludes_cross_agent_private() {
+        let conn = fresh_conn();
+        seed_vis(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall_caller(
+            &conn,
+            &json!({"context": "ownership", "namespace": "vis"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+            Some("ai:carol"),
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(1));
+        assert_eq!(recall_titles(&resp), vec!["shared".to_string()]);
+    }
+
+    // #1468 — the owning caller recalls its OWN private row plus shared.
+    #[test]
+    fn recall_owner_sees_own_private_and_shared() {
+        let conn = fresh_conn();
+        seed_vis(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall_caller(
+            &conn,
+            &json!({"context": "ownership", "namespace": "vis"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+            Some("ai:alice"),
+        )
+        .expect("ok");
+        assert_eq!(resp["count"].as_u64(), Some(2));
+    }
+
+    // A. happy path — hybrid (embedder=Some)
+    #[test]
+    fn hybrid_path_with_embedder() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let mock = MockEmbedder::new_local().expect("mock");
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership rules", "namespace": "test"}),
+            Some(&mock as &dyn crate::embeddings::Embed),
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("hybrid"));
+        assert_eq!(resp["meta"]["recall_mode"].as_str(), Some("hybrid"));
+    }
+
+    // A. happy path — hybrid + reranker
+    #[test]
+    fn hybrid_with_reranker_path() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let mock = MockEmbedder::new_local().expect("mock");
+        let lex = CrossEncoder::new();
+        let batched = BatchedReranker::new(lex);
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership rules", "namespace": "test"}),
+            Some(&mock as &dyn crate::embeddings::Embed),
+            None,
+            Some(&batched),
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("hybrid+rerank"));
+        assert_eq!(resp["meta"]["reranker_used"].as_str(), Some("lexical"));
+    }
+
+    // hybrid with vector_index Some-path
+    #[test]
+    fn hybrid_with_vector_index() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let mock = MockEmbedder::new_local().expect("mock");
+        let idx = VectorIndex::empty();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test"}),
+            Some(&mock as &dyn crate::embeddings::Embed),
+            Some(&idx),
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("hybrid"));
+    }
+
+    // budget_tokens path
+    #[test]
+    fn budget_tokens_meta_emitted() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test", "budget_tokens": 100u64}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert!(resp["meta"]["budget_tokens_used"].is_number());
+        assert_eq!(resp["budget_tokens"].as_u64(), Some(100));
+    }
+
+    // budget_tokens=0 (R1 semantic: allow zero)
+    #[test]
+    fn budget_tokens_zero_returns_empty() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test", "budget_tokens": 0u64}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert!(resp["meta"]["budget_overflow"].is_boolean());
+    }
+
+    // session_default + recall_scope splice
+    #[test]
+    fn session_default_recall_scope_splices_defaults() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let scope = RecallScope {
+            namespaces: Some(vec!["test".to_string()]),
+            since: Some("24h".to_string()),
+            tier: None,
+            limit: Some(2),
+        };
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "session_default": true}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            Some(&scope),
+        )
+        .expect("ok");
+        // Should match the spliced namespace ("test")
+        assert!(resp["count"].as_u64().unwrap() <= 2);
+    }
+
+    // context_tokens fusion path (with embedder)
+    #[test]
+    fn context_tokens_fusion_path() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let mock = MockEmbedder::new_local().expect("mock");
+        let resp = handle_recall(
+            &conn,
+            &json!({
+                "context": "ownership",
+                "namespace": "test",
+                "context_tokens": ["rust", "memory"]
+            }),
+            Some(&mock as &dyn crate::embeddings::Embed),
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("hybrid"));
+    }
+
+    // as_agent path (visibility filter)
+    #[test]
+    fn as_agent_validated() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test", "as_agent": "ai:viewer"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert!(resp["count"].is_number());
+    }
+
+    // as_agent invalid
+    #[test]
+    fn as_agent_invalid_errors() {
+        let conn = fresh_conn();
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let err = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "as_agent": "has space"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // archive_on_gc=true exercises gc_if_needed branch
+    #[test]
+    fn archive_on_gc_true_runs_gc() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test"}),
+            None,
+            None,
+            None,
+            true,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert!(resp["memories"].is_array());
+    }
+
+    // until + since explicit filters
+    #[test]
+    fn since_until_filters_applied() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({
+                "context": "ownership",
+                "namespace": "test",
+                "since": "2000-01-01T00:00:00Z",
+                "until": "2100-01-01T00:00:00Z",
+                "tags": "rust",
+            }),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert!(resp["memories"].is_array());
+    }
+
+    // limit huge → saturate
+    #[test]
+    fn limit_overflow_saturates() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test", "limit": u64::MAX}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert!(resp["memories"].is_array());
+    }
+
+    // Failing embedder — drives the per-query embed-error fallback
+    // (lines 357/364) and the context_tokens embed-error fallback
+    // (lines 314-316).
+    struct FailEmbedder {
+        fail_first: bool,
+        fail_second: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FailEmbedder {
+        fn primary_fail() -> Self {
+            Self {
+                fail_first: true,
+                fail_second: false,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn secondary_fail() -> Self {
+            Self {
+                fail_first: false,
+                fail_second: true,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl crate::embeddings::Embed for FailEmbedder {
+        fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if (n == 0 && self.fail_first) || (n >= 1 && self.fail_second) {
+                anyhow::bail!("FailEmbedder: synthetic failure on call {n}");
+            }
+            Ok(vec![0.1_f32; 384])
+        }
+    }
+
+    #[test]
+    fn primary_embedder_error_falls_back_to_keyword() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let fe = FailEmbedder::primary_fail();
+        let resp = handle_recall(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test"}),
+            Some(&fe as &dyn crate::embeddings::Embed),
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("keyword"));
+        assert_eq!(resp["meta"]["recall_mode"].as_str(), Some("keyword_only"));
+    }
+
+    #[test]
+    fn context_tokens_embedder_error_uses_primary_only() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let fe = FailEmbedder::secondary_fail();
+        let resp = handle_recall(
+            &conn,
+            &json!({
+                "context": "ownership",
+                "namespace": "test",
+                "context_tokens": ["rust", "memory"]
+            }),
+            Some(&fe as &dyn crate::embeddings::Embed),
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        )
+        .expect("ok");
+        // hybrid mode still — primary succeeded, context_tokens failed
+        assert_eq!(resp["mode"].as_str(), Some("hybrid"));
+    }
+
+    // Pre-recall hook variant: empty chain → falls through
+    #[tokio::test]
+    async fn pre_recall_hook_empty_chain_passes_through() {
+        let conn = fresh_conn();
+        seed(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let chain = crate::hooks::HookChain::new(vec![]);
+        let mut registry = crate::hooks::ExecutorRegistry::default();
+        let resp = handle_recall_with_pre_recall_hook(
+            &conn,
+            &json!({"context": "ownership", "namespace": "test"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            &chain,
+            &mut registry,
+            None,
+            None,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(resp["mode"].as_str(), Some("keyword"));
+    }
+
+    // Pre-recall hook variant: context missing
+    #[tokio::test]
+    async fn pre_recall_hook_missing_context_errors() {
+        let conn = fresh_conn();
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+        let chain = crate::hooks::HookChain::new(vec![]);
+        let mut registry = crate::hooks::ExecutorRegistry::default();
+        let err = handle_recall_with_pre_recall_hook(
+            &conn,
+            &json!({}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            &chain,
+            &mut registry,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("context"));
+    }
+}

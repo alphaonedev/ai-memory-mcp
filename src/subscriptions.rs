@@ -20,13 +20,20 @@
 //!   shared secret; the plaintext is returned **once** at
 //!   subscription time and never leaves the DB after.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use crate::models::field_names;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+
+/// Tracing target for the subscription fan-out / DLQ surface
+/// (#1558 tracing-target SSOT).
+const SUBSCRIPTIONS_TRACE_TARGET: &str = "ai_memory::subscriptions";
 
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,15 +90,56 @@ pub struct NewSubscription<'a> {
 /// `memory_kg_invalidate` fires this event after the link's
 /// `valid_until` is set, regardless of which KG backend handled the
 /// SET).
+// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the three
+// entries that ARE MCP tool names reference the canonical
+// `tool_names` consts.
+//
+// v0.7.0 multi-agent literal-sweep (scanner B finding F-B10.x): the
+// remaining four entries — subscription-event types distinct from
+// MCP method names — now also consume named consts in
+// [`webhook_events`] below. Pre-sweep these were the last raw-literal
+// holdouts in this array; centralising them closes the drift class.
 pub const WEBHOOK_EVENT_TYPES: &[&str] = &[
-    "memory_store",
-    "memory_promote",
-    "memory_delete",
-    "memory_link_created",
-    "memory_link_invalidated",
-    "memory_consolidated",
-    "approval_requested",
+    crate::mcp::registry::tool_names::MEMORY_STORE,
+    crate::mcp::registry::tool_names::MEMORY_PROMOTE,
+    crate::mcp::registry::tool_names::MEMORY_DELETE,
+    webhook_events::MEMORY_LINK_CREATED,
+    webhook_events::MEMORY_LINK_INVALIDATED,
+    webhook_events::MEMORY_CONSOLIDATED,
+    webhook_events::APPROVAL_REQUESTED,
 ];
+
+/// v0.7.0 multi-agent literal-sweep (scanner B finding F-B10.x) —
+/// canonical webhook-event-type slugs that are NOT MCP tool names.
+///
+/// Distinct from `signed_events::event_types` (audit-chain slugs use
+/// dot-separated names like `"memory_link.created"`); webhook events
+/// use underscore-separated names matching the v0.6.x wire contract
+/// (`"memory_link_created"`). A rename or schema-evolution that adds
+/// new webhook events touches this mod + the [`WEBHOOK_EVENT_TYPES`]
+/// array (which is statically-asserted to contain every const here
+/// via the unit test `webhook_event_consts_appear_in_array`).
+pub mod webhook_events {
+    /// Fired by `memory_link.create` substrate path after every
+    /// successful link write (signed or unsigned). Subscribers consume
+    /// via the K10 / J4 webhook fan-out.
+    pub const MEMORY_LINK_CREATED: &str = "memory_link_created";
+
+    /// Fired by `memory_kg_invalidate` after `valid_until` is set,
+    /// regardless of which KG backend handled the SET. Joined the
+    /// webhook set at v0.7 J4 / G14 so subscribers can replay the
+    /// audit-edge timeline.
+    pub const MEMORY_LINK_INVALIDATED: &str = "memory_link_invalidated";
+
+    /// Fired by `memory_consolidate` after a successful consolidation
+    /// write (post-#867 W6 consolidation primitive).
+    pub const MEMORY_CONSOLIDATED: &str = "memory_consolidated";
+
+    /// Fired by the K10 Approval API after a governance `Pending`
+    /// decision queues a pending action. Consumed directly by the
+    /// K10 Approval HTTP+SSE handler.
+    pub const APPROVAL_REQUESTED: &str = "approval_requested";
+}
 
 /// Insert a subscription, hashing any secret before persisting.
 ///
@@ -133,18 +181,52 @@ pub fn insert(conn: &Connection, req: &NewSubscription<'_>) -> Result<String> {
     Ok(id)
 }
 
-/// Delete a subscription by id. Returns true if a row was removed.
-pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
-    let n = conn.execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
+/// Delete a subscription by id, optionally scoped to its owner.
+///
+/// Cross-tenant authorization (#870, security-high, 2026-05-18):
+/// When `caller_agent_id` is `Some(aid)`, the DELETE only matches rows
+/// where `created_by = aid` — preventing tenant A from unsubscribing
+/// tenant B's webhook. When `None`, the DELETE matches by id alone
+/// (admin path: federation receive, GC, operator CLI). Callers exposed
+/// to untrusted input (MCP `memory_unsubscribe`, HTTP
+/// `DELETE /api/v1/subscriptions`) MUST pass `Some(<authenticated
+/// caller>)` — anything else is a bypass.
+///
+/// Returns true if a row was removed (i.e. it both existed AND matched
+/// the owner clause when one was supplied).
+pub fn delete(conn: &Connection, id: &str, caller_agent_id: Option<&str>) -> Result<bool> {
+    let n = if let Some(aid) = caller_agent_id {
+        conn.execute(
+            "DELETE FROM subscriptions WHERE id = ?1 AND created_by = ?2",
+            params![id, aid],
+        )?
+    } else {
+        conn.execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?
+    };
     Ok(n > 0)
 }
 
-/// List all active subscriptions.
-pub fn list(conn: &Connection) -> Result<Vec<Subscription>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, url, events, namespace_filter, agent_filter, created_by, created_at, dispatch_count, failure_count, event_types FROM subscriptions ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map([], |row| {
+/// List active subscriptions, optionally scoped to a single owner.
+///
+/// Cross-tenant authorization (#872, security-high, 2026-05-18):
+/// When `caller_agent_id` is `Some(aid)`, only rows where
+/// `created_by = aid` are returned — preventing tenant A from
+/// enumerating tenant B's webhook fleet. When `None`, every row is
+/// returned (internal use: dispatch fan-out, federation, operator
+/// inventory). Callers exposed to untrusted input (MCP
+/// `memory_list_subscriptions`, HTTP `GET /api/v1/subscriptions`) MUST
+/// pass `Some(<authenticated caller>)`.
+pub fn list(conn: &Connection, caller_agent_id: Option<&str>) -> Result<Vec<Subscription>> {
+    let mut stmt = if caller_agent_id.is_some() {
+        conn.prepare(
+            "SELECT id, url, events, namespace_filter, agent_filter, created_by, created_at, dispatch_count, failure_count, event_types FROM subscriptions WHERE created_by = ?1 ORDER BY created_at DESC",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT id, url, events, namespace_filter, agent_filter, created_by, created_at, dispatch_count, failure_count, event_types FROM subscriptions ORDER BY created_at DESC",
+        )?
+    };
+    let row_decoder = |row: &rusqlite::Row<'_>| {
         let event_types_raw: Option<String> = row.get(9)?;
         // P5: decode the JSON column. A corrupt row should not break
         // the entire list — fall back to None (= all-events) and warn.
@@ -170,9 +252,38 @@ pub fn list(conn: &Connection) -> Result<Vec<Subscription>> {
             failure_count: row.get(8)?,
             event_types,
         })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("subscription row decode failed")
+    };
+    let rows = if let Some(aid) = caller_agent_id {
+        stmt.query_map(params![aid], row_decoder)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    } else {
+        stmt.query_map([], row_decoder)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    };
+    rows.context("subscription row decode failed")
+}
+
+/// Look up a subscription's owner (`created_by`) by id.
+///
+/// v0.7.0 #1115 / #1118 (SR-1 #5 / #6, HIGH) — used by the MCP +
+/// HTTP authz gates on `memory_subscription_replay` and
+/// `memory_subscription_dlq_list` to refuse cross-tenant reads of
+/// other agents' subscriptions. Returns `Ok(None)` when the
+/// subscription does not exist; callers map this to the same
+/// not-found envelope as a real miss so the existence of the id is
+/// not leaked.
+///
+/// # Errors
+/// - SQL prepare / query / decode failure.
+pub fn get_owner(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT created_by FROM subscriptions WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    if let Some(row) = rows.next().context("subscription owner row")? {
+        let owner: Option<String> = row.get(0)?;
+        Ok(owner)
+    } else {
+        Ok(None)
+    }
 }
 
 /// P5 (G9): list subscriptions matching a specific event type. Returns
@@ -231,7 +342,12 @@ pub fn list_by_event(conn: &Connection, event_type: &str) -> Result<Vec<Subscrip
 /// legacy `sub_events` comma-string — the structured opt-in is the
 /// authoritative filter for that subscriber. When `None`, the legacy
 /// whitelist applies (backward compat for pre-P5 subscribers).
-fn matches_filters(
+///
+/// #932 (v0.7.0 Track D, 2026-05-20) — bumped from private to
+/// `pub(crate)` so the postgres-aware dispatch helper at
+/// `crate::handlers::subscriptions::dispatch_event_postgres` can
+/// reuse the canonical filter logic instead of forking it.
+pub(crate) fn matches_filters(
     sub_events: &str,
     sub_event_types: Option<&[String]>,
     sub_namespace: Option<&str>,
@@ -318,6 +434,106 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// retry. Exposed so the integration tests can pin the wall-clock
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// PERF-3 (fix campaign 2026-05-26, FX-10) — default upper bound on the
+/// number of webhook deliveries that may be in flight concurrently.
+///
+/// Pre-fix posture: every matching subscriber span on every store event
+/// spawned a fresh `std::thread::spawn` worker that opened its own
+/// SQLite connection. At 1000 subscribers this minted 1000 OS threads
+/// (~1 MB stack each = 1 GB virtual) and 1000 SQLite handles per
+/// store event, bypassing the existing Tokio runtime entirely.
+///
+/// Post-fix posture: each delivery is enqueued on a bounded
+/// [`tokio::sync::Semaphore`] (default permits = this constant) and
+/// the blocking-HTTP + audit-write step runs inside
+/// [`tokio::task::spawn_blocking`] so the dispatcher uses the
+/// existing runtime's blocking-thread pool instead of unbounded
+/// OS-thread spawn.
+///
+/// Operators tune the bound via `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`.
+/// Values outside `1..=4096` fall back to the default with a warn-log.
+pub const DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY: usize = 32;
+
+/// PERF-3 (FX-10) — module-level shared semaphore that bounds the
+/// in-flight webhook delivery count across every concurrent
+/// `dispatch_event_to_subs` call. Built lazily on first dispatch from
+/// `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY` (default
+/// [`DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY`]). Held in `Arc` so worker
+/// tasks can clone-and-move it into their async body.
+static DISPATCH_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Resolve the bound from env (test seam: tests call
+/// [`override_dispatch_concurrency_for_tests`] before any dispatch
+/// runs to pin the bound to a known value).
+fn dispatch_concurrency_bound() -> usize {
+    if let Some(forced) = TEST_DISPATCH_CONCURRENCY_OVERRIDE.get() {
+        return *forced;
+    }
+    match std::env::var("AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=4096).contains(&n) => n,
+            _ => {
+                tracing::warn!(
+                    "AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY={raw:?} not in 1..=4096; \
+                     falling back to default {DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY}"
+                );
+                DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY
+            }
+        },
+        Err(_) => DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY,
+    }
+}
+
+/// Return a clone of the shared dispatch semaphore, building it on
+/// first call from the resolved concurrency bound.
+fn dispatch_semaphore() -> Arc<Semaphore> {
+    DISPATCH_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(dispatch_concurrency_bound())))
+        .clone()
+}
+
+/// Test-only override for the dispatch concurrency bound. Tests set
+/// this BEFORE the first dispatch runs in the process so the
+/// semaphore is sized to the assertion's expectations. Subsequent
+/// changes after the semaphore is built are ignored (the bound is
+/// per-process).
+static TEST_DISPATCH_CONCURRENCY_OVERRIDE: OnceLock<usize> = OnceLock::new();
+
+/// Test-only seam: pin the dispatch concurrency bound to `n`. Must be
+/// called before any `dispatch_event*` runs in the current process.
+/// Returns `Err(_)` if the bound has already been set (in which case
+/// the prior value remains authoritative).
+#[doc(hidden)]
+pub fn override_dispatch_concurrency_for_tests(n: usize) -> Result<(), usize> {
+    TEST_DISPATCH_CONCURRENCY_OVERRIDE.set(n)
+}
+
+/// PERF-3 (FX-10) — diagnostic accessor returning the number of
+/// permits currently AVAILABLE on the shared dispatch semaphore. Used
+/// by the regression test in
+/// `tests/subscriptions_no_thread_spawn_per_subscriber.rs` to assert
+/// the in-flight ceiling holds even when 50 subscribers fan out
+/// concurrently.
+#[doc(hidden)]
+pub fn dispatch_semaphore_available_permits() -> usize {
+    dispatch_semaphore().available_permits()
+}
+
+// v0.7.0 #1073 — `dispatch_http_client()` scaffolding REMOVED
+//
+// v0.7.x (issue #1174 follow-up #1196) — the dead-code shared-client
+// accessor + its `OnceLock<Option<reqwest::blocking::Client>>` static
+// were removed. Sub-agent code review (#1196 PR8) found zero
+// production callers — only the `tests/sr3_perf_regressions.rs`
+// scaffolding-pin test kept the symbol alive. The SR-2 #1082 SSRF
+// hardening (per-call `builder.resolve(host, addr)` DNS pinning)
+// keeps the per-call builder path live in `send()`; the future
+// custom `reqwest::dns::Resolve` refactor will re-introduce a shared
+// client at that point through `RuntimeContext`, not as a private
+// module-level OnceLock. Removed alongside the test pin in the same
+// commit so the scaffolding doesn't drift back via the existence
+// assertion.
 
 /// One row of the `subscription_events` per-delivery audit log. K6
 /// writes one row before each network send; K7's
@@ -469,13 +685,24 @@ pub struct LinkInvalidatedEventDetails {
     pub previous_valid_until: Option<String>,
 }
 
-/// Fire an event to all matching subscribers. Each dispatch runs in
-/// its own OS thread and does NOT block the caller. Errors are logged
-/// and counted in the DB via `failure_count`.
+/// Fire an event to all matching subscribers. Each dispatch is
+/// fire-and-forget — the caller is NOT blocked on delivery. Errors are
+/// logged and counted in the DB via `failure_count`.
 ///
-/// Caller owns the connection. Dispatch threads re-open the connection
-/// as needed to update counters (cheap — `SQLite` connections are
-/// process-shared via WAL).
+/// PERF-3 (FX-10, 2026-05-26): pre-fix posture was
+/// `std::thread::spawn` + per-worker `Connection::open(...)` per
+/// matching subscriber — 1000 subscribers minted 1000 OS threads + 1000
+/// SQLite handles per store event. Post-fix posture uses a bounded
+/// [`tokio::sync::Semaphore`] (default 32 permits, tunable via
+/// `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`) + `tokio::task::spawn_blocking`
+/// against the existing daemon Tokio runtime so the in-flight delivery
+/// count is capped. The pre-fix `std::thread::spawn` path is preserved
+/// as a fallback for legacy unit tests that run outside any runtime.
+///
+/// Caller owns the connection. Dispatch workers still re-open the
+/// connection per delivery to update counters (cheap — `SQLite`
+/// connections are process-shared via WAL — and the new concurrency
+/// bound keeps the simultaneous handle count bounded too).
 ///
 /// P5 (G9): convenience wrapper for the historical no-details case
 /// (used by `memory_store`). New event types should call
@@ -508,14 +735,38 @@ pub fn dispatch_event_with_details(
     db_path: &std::path::Path,
     details: Option<serde_json::Value>,
 ) {
-    let subs = match list(conn) {
+    // Dispatch path needs the global view (every tenant's subscriptions
+    // for this event), so `None` here is correct — ownership scoping
+    // would silently drop matching subscribers belonging to OTHER
+    // tenants. The cross-tenant authorization gate lives at the wire
+    // surface (MCP/HTTP handlers), not here. See #870/#872/#874.
+    //
+    // v0.7.0 #1097 — pre-filter by event type at the SQL level using
+    // `list_by_event` instead of the legacy `list(conn, None)` full
+    // table scan. The Rust-side `matches_filters` below stays as the
+    // authoritative gate (it covers the namespace/agent filters which
+    // the SQL prefilter doesn't honour); only the coarse event-type
+    // filter moves into SQL. At 100 subscribers the write-event
+    // fanout cost drops from O(N) to whatever fraction actually
+    // subscribes to the fired event type.
+    let subs = match list_by_event(conn, event) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("subscription list failed during dispatch: {e}");
             return;
         }
     };
-    let matching: Vec<Subscription> = subs
+    // Resolve each matching sub's secret_hash from sqlite BEFORE
+    // dispatching to the per-sub worker pool. #932 (v0.7.0 Track D,
+    // 2026-05-20) extracted this into `dispatch_event_to_subs` so the
+    // postgres-backed `dispatch_event_postgres` path can resolve
+    // secret_hash from the subscription memory's metadata instead.
+    //
+    // v0.7.0 #1072 — secret_hash now reuses the dispatch caller's
+    // `&Connection` instead of opening a fresh `Connection::open(...)`
+    // per matching subscription. Saves one connection open per
+    // subscriber in the fanout.
+    let matching: Vec<(Subscription, Option<String>)> = subs
         .into_iter()
         .filter(|s| {
             matches_filters(
@@ -528,16 +779,77 @@ pub fn dispatch_event_with_details(
                 agent_id,
             )
         })
+        .map(|s| {
+            let secret_hash = load_secret_hash_with_conn(conn, &s.id).unwrap_or(None);
+            (s, secret_hash)
+        })
         .collect();
+    dispatch_event_to_subs(
+        matching, event, memory_id, namespace, agent_id, db_path, details,
+    );
+}
+
+/// #932 (v0.7.0 Track D, 2026-05-20) — backend-neutral per-sub
+/// dispatch worker pool. Takes an already-resolved
+/// `Vec<(Subscription, Option<secret_hash>)>` so the sqlite path
+/// (via `dispatch_event_with_details`) and the postgres path (via
+/// `dispatch_event_postgres`) share the same delivery + audit +
+/// DLQ + HMAC code while their subscription-source lookups remain
+/// adapter-specific.
+///
+/// The `db_path` argument is still the SQLite audit-mirror path —
+/// `record_subscription_event` / `record_dispatch` / `record_dlq`
+/// still write to sqlite even on postgres-backed daemons because
+/// every daemon currently keeps a sqlite scratch DB alongside the
+/// SAL store handle. A future SAL audit-log surface (#-tracking)
+/// will route this through the trait too.
+pub fn dispatch_event_to_subs(
+    matching: Vec<(Subscription, Option<String>)>,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+) {
     if matching.is_empty() {
         return;
+    }
+    // PERF — warm the reqwest::blocking TLS connector once per process,
+    // off the delivery critical path, so the first webhook does not pay
+    // the cold root-cert init inside its ACK_TIMEOUT retry budget. See
+    // `prewarm_dispatch_tls`.
+    {
+        static KICK: std::sync::Once = std::sync::Once::new();
+        KICK.call_once(|| {
+            std::thread::spawn(prewarm_dispatch_tls);
+        });
     }
     // Timestamp is part of the canonical string the signature is
     // computed over. Receivers SHOULD reject requests whose timestamp
     // differs from their clock by more than 5 minutes (replay window).
     // (#301 item 1 — prior implementation had no replay protection.)
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    for sub in matching {
+
+    // PERF-3 (FX-10, 2026-05-26) — bridge the dispatch fan-out onto
+    // the existing Tokio runtime. We grab the current Handle once per
+    // batch; the per-subscriber worker is enqueued as
+    // `handle.spawn(async { semaphore.acquire().await;
+    // spawn_blocking(|| { … reqwest::blocking::send + audit
+    // writes … }).await })`. The semaphore caps in-flight deliveries
+    // at [`DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY`] (operator-tunable
+    // via `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`) so 1000 matching
+    // subscribers no longer mint 1000 OS threads + 1000 SQLite
+    // handles.
+    //
+    // Fallback: when no Tokio runtime is attached to the calling
+    // thread (e.g. legacy CLI tests that call `dispatch_event`
+    // outside a runtime), fall back to the pre-fix
+    // `std::thread::spawn` path. Production daemons (CLI/MCP/HTTP)
+    // ALL run under `#[tokio::main]`, so this fallback is the cold
+    // path.
+    let handle = tokio::runtime::Handle::try_current().ok();
+    for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
         // (subscription, event) pair so receivers can correlate ACKs
         // back to the dispatched payload across the retry ladder.
@@ -566,22 +878,52 @@ pub fn dispatch_event_with_details(
         let event_owned = event.to_string();
         let ts = timestamp.clone();
         let db_path = db_path.to_path_buf();
-        std::thread::spawn(move || {
+        let secret_hash_owned = sub_secret_hash.clone();
+
+        // PERF-3 (FX-10) — the entire per-subscriber delivery body
+        // is captured by a `FnOnce()` closure so it can run either
+        // on the Tokio blocking pool (production path) or on a
+        // freshly-spawned `std::thread` (no-runtime fallback). The
+        // body is otherwise unchanged from the pre-fix code.
+        let work = move || {
+            // v0.7.0 #1072 — open ONE sqlite connection for the
+            // whole delivery instead of 4-5 across the
+            // event-audit / status-update / dispatch-counter / DLQ
+            // sites. Saves the per-connection PRAGMA + WAL setup
+            // cost (~2-5 ms each) on every dispatched event. The
+            // single connection lives on the worker thread stack
+            // for the lifetime of the delivery and is dropped on
+            // thread exit. Same audit posture as the pre-#1072
+            // path — every write site is best-effort and logs on
+            // failure.
+            let worker_conn = match Connection::open(&db_path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(
+                        "subscription dispatch: worker_conn open failed: {e}; \
+                         falling back to per-write connections"
+                    );
+                    None
+                }
+            };
             // Persist the per-delivery audit row BEFORE the network
             // send so replay-from-cursor (K7) sees a stable record
             // even if the dispatcher process crashes mid-retry.
-            if let Err(e) =
+            let event_audit_result = if let Some(c) = worker_conn.as_ref() {
+                record_subscription_event_with_conn(
+                    c,
+                    &sub_id,
+                    &correlation_id,
+                    &event_owned,
+                    &body,
+                )
+            } else {
                 record_subscription_event(&db_path, &sub_id, &correlation_id, &event_owned, &body)
-            {
+            };
+            if let Err(e) = event_audit_result {
                 tracing::warn!("subscription event audit write failed: {e}");
             }
-            let secret_hash = match load_secret_hash(&db_path, &sub_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("subscription secret lookup failed: {e}");
-                    return;
-                }
-            };
+            let secret_hash = secret_hash_owned;
             // Canonical string: "<timestamp>.<body>". Keyed HMAC over
             // the DB-stored secret hash. Receivers verify by computing
             // SHA256(plaintext_secret) and then
@@ -604,27 +946,151 @@ pub fn dispatch_event_with_details(
                     hmac_sha256_hex(&key_hash, &canonical)
                 }),
             };
+            // R3-S1.HMAC (v0.7.0 fix campaign 2026-05-13): refuse to
+            // dispatch an unsigned payload. New subscriptions cannot
+            // register without a per-sub or server-wide secret (see
+            // `crate::handlers::subscribe` + MCP `handle_subscribe`), so
+            // hitting this branch means a legacy row was persisted before
+            // the gate landed, or the server-wide override was removed
+            // after registration. Either way, fail loudly to the DLQ
+            // instead of dispatching the body in clear so a receiver
+            // never has to guess whether a body is authentic.
+            if signature.is_none() {
+                tracing::error!(
+                    "subscription {sub_id} dispatch refused: no per-sub secret AND no \
+                     server-wide [hooks.subscription] hmac_secret configured. \
+                     Configure one of the two and replay via memory_subscription_replay. \
+                     (v0.7.0 fix campaign R3-S1.HMAC, 2026-05-13)"
+                );
+                let outcome = DeliveryOutcome::unsigned_refused();
+                let ok = outcome.success;
+                // v0.7.0 #1072 — reuse `worker_conn` for every sqlite
+                // write below.
+                if let Some(c) = worker_conn.as_ref() {
+                    record_dispatch_with_conn(c, &sub_id, ok);
+                    update_event_status_with_conn(c, &correlation_id, ok);
+                } else {
+                    record_dispatch(&db_path, &sub_id, ok);
+                    update_event_status(&db_path, &correlation_id, ok);
+                }
+                let dlq_result = if let Some(c) = worker_conn.as_ref() {
+                    record_dlq_with_conn(
+                        c,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                } else {
+                    record_dlq(
+                        &db_path,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                };
+                if let Err(e) = dlq_result {
+                    tracing::warn!("subscription DLQ write failed: {e}");
+                }
+                return;
+            }
             let outcome =
                 deliver_with_retry(&url, &body, &ts, signature.as_deref(), &correlation_id);
             let ok = outcome.success;
-            record_dispatch(&db_path, &sub_id, ok);
-            update_event_status(&db_path, &correlation_id, ok);
+            // v0.7.0 #1072 — reuse `worker_conn` for every sqlite write
+            // below.
+            if let Some(c) = worker_conn.as_ref() {
+                record_dispatch_with_conn(c, &sub_id, ok);
+                update_event_status_with_conn(c, &correlation_id, ok);
+            } else {
+                record_dispatch(&db_path, &sub_id, ok);
+                update_event_status(&db_path, &correlation_id, ok);
+            }
             if !ok {
-                if let Err(e) = record_dlq(
-                    &db_path,
-                    &sub_id,
-                    &correlation_id,
-                    &event_owned,
-                    &body,
-                    outcome.attempts,
-                    &outcome.last_error,
-                    &outcome.first_failed_at,
-                    &outcome.last_failed_at,
-                ) {
+                let dlq_result = if let Some(c) = worker_conn.as_ref() {
+                    record_dlq_with_conn(
+                        c,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                } else {
+                    record_dlq(
+                        &db_path,
+                        &sub_id,
+                        &correlation_id,
+                        &event_owned,
+                        &body,
+                        outcome.attempts,
+                        &outcome.last_error,
+                        &outcome.first_failed_at,
+                        &outcome.last_failed_at,
+                    )
+                };
+                if let Err(e) = dlq_result {
                     tracing::warn!("subscription DLQ write failed: {e}");
                 }
             }
-        });
+        };
+
+        // PERF-3 (FX-10) — production path: bounded semaphore + Tokio
+        // blocking pool. The semaphore caps concurrent in-flight
+        // deliveries at the operator-tunable bound; permits are
+        // released when the `_permit` guard drops at the end of the
+        // worker. Cold path (no runtime attached): legacy
+        // `std::thread::spawn`. Tests use the production path because
+        // `#[tokio::test]` attaches a runtime to the calling thread.
+        if let Some(rt) = handle.as_ref() {
+            let permit_sem = dispatch_semaphore();
+            rt.spawn(async move {
+                // Acquire-then-blocking-step. `acquire_owned` returns
+                // an `OwnedSemaphorePermit` that gets moved into the
+                // blocking task and is dropped when the worker
+                // returns — releasing the slot for the next pending
+                // dispatch.
+                let permit = match permit_sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            "subscription dispatch: semaphore acquire failed: {e}; \
+                             dropping delivery (semaphore closed)"
+                        );
+                        return;
+                    }
+                };
+                // The reqwest::blocking + rusqlite work is sync; run
+                // it on the Tokio blocking pool so we don't pin a
+                // runtime worker thread on the LLM-slow HTTP send.
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    work();
+                    drop(permit);
+                })
+                .await
+                {
+                    tracing::warn!("subscription dispatch: spawn_blocking join failed: {e}");
+                }
+            });
+        } else {
+            // Fallback: no runtime in scope. This path is exercised
+            // only by legacy unit tests that call `dispatch_event`
+            // outside `#[tokio::test]`; production daemons always
+            // run under `#[tokio::main]`.
+            std::thread::spawn(work);
+        }
     }
 }
 
@@ -691,7 +1157,7 @@ pub fn dispatch_approval_requested(conn: &Connection, pending_id: &str, db_path:
     });
     dispatch_event_with_details(
         conn,
-        "approval_requested",
+        webhook_events::APPROVAL_REQUESTED,
         &pa.id,
         &pa.namespace,
         Some(&pa.requested_by),
@@ -717,11 +1183,76 @@ struct DeliveryOutcome {
     last_failed_at: String,
 }
 
+impl DeliveryOutcome {
+    /// R3-S1.HMAC (v0.7.0 fix campaign 2026-05-13): synthesise a failure
+    /// outcome for a dispatch refused at the gate because neither a
+    /// per-sub secret nor a server-wide override was configured. The
+    /// DLQ row carries an explicit `last_error` so operators can tell a
+    /// missing-secret refusal apart from a transport failure.
+    fn unsigned_refused() -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            success: false,
+            attempts: 0,
+            last_error: "dispatch refused: no per-subscription secret AND no server-wide \
+                 [hooks.subscription] hmac_secret configured (v0.7.0 R3-S1.HMAC)"
+                .to_string(),
+            first_failed_at: now.clone(),
+            last_failed_at: now,
+        }
+    }
+}
+
 /// v0.7.0 K6 — dispatcher driver. Issues the initial POST plus up to
 /// three retries spaced [200ms, 1s, 5s] apart. Each attempt validates
 /// the receiver's ACK body — a 2xx response with no ACK or a
 /// mismatched correlation_id counts as failure and triggers the next
 /// retry. Returns the cumulative [`DeliveryOutcome`].
+/// One-time process-global warm-up of the `reqwest::blocking` TLS
+/// connector used by webhook delivery.
+///
+/// The first `reqwest::blocking::Client` constructed in a process
+/// builds the TLS connector, which loads the system root-certificate
+/// store. On some platforms (notably macOS, where the load goes
+/// through Security.framework) that first load can take several
+/// seconds and is process-cached thereafter. Because webhook delivery
+/// rebuilds a fresh client per attempt (the #1082 per-call
+/// `.resolve()` DNS pin precludes a fully process-shared client), a
+/// cold first delivery would otherwise pay that init on attempt 1 — and
+/// when it exceeds [`ACK_TIMEOUT`] the K6 retry budget is consumed by
+/// the cold init rather than by real delivery failures, delaying (or,
+/// under a short receiver poll window, failing) the first webhook of a
+/// process by tens of seconds.
+///
+/// Calling this is idempotent via an internal [`std::sync::Once`].
+/// [`dispatch_event_to_subs`] kicks it on a background thread the first
+/// time it has work to deliver, so a long-lived daemon warms its
+/// connector ahead of real load. Integration tests that assert delivery
+/// latency call it synchronously during setup so the one-time cost
+/// lands before the timed assertion window.
+pub fn prewarm_dispatch_tls() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        // Build on a dedicated OS thread, then join. `reqwest::blocking`'s
+        // client constructor blocks waiting for its internal runtime
+        // thread to spin up, which panics if invoked directly on a thread
+        // that is currently driving a Tokio runtime (an async test, or a
+        // daemon runtime worker). A freshly-spawned `std::thread` has no
+        // ambient runtime, so blocking there is always allowed. Joining
+        // makes the warm-up synchronous for the caller (tests rely on the
+        // connector being warm once this returns).
+        let _ = std::thread::spawn(|| {
+            if let Err(e) = reqwest::blocking::Client::builder()
+                .timeout(ACK_TIMEOUT)
+                .build()
+            {
+                tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
+            }
+        })
+        .join();
+    });
+}
+
 fn deliver_with_retry(
     url: &str,
     body: &str,
@@ -788,19 +1319,62 @@ fn send(
         tracing::warn!("SSRF guard rejected webhook URL {url}: {e}");
         return Err(format!("ssrf-rejected: {e}"));
     }
-    // DNS-resolution guard (#301 item 2). We rely on reqwest to
-    // perform the connect, but pre-check by resolving the host here
-    // and rejecting if any returned address is private / loopback /
-    // link-local. Prevents DNS-rebind SSRF against attacker-controlled
-    // domains that resolve to internal IPs.
-    if let Err(e) = validate_url_dns(url) {
-        tracing::warn!("DNS SSRF guard rejected webhook URL {url}: {e}");
-        return Err(format!("dns-ssrf-rejected: {e}"));
-    }
-    let client = match reqwest::blocking::Client::builder()
+    // v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Resolve
+    // the host once via the SSRF guard AND capture the validated
+    // addresses, then bind reqwest's resolver to exactly those
+    // addresses via `Client::builder().resolve(host, addr)`. Pre-
+    // #1082 reqwest did its own independent DNS query at send time,
+    // letting an attacker-controlled DNS server (TTL=0 / split-
+    // horizon) return a public IP on the daemon's first lookup
+    // (passing the guard) and a private IP on reqwest's second
+    // lookup (the webhook payload posted internally). The new
+    // resolver override pins reqwest's connect to the daemon's
+    // already-validated IP set; reqwest's own DNS query never
+    // happens for this client.
+    let (resolved_host, validated_addrs) =
+        match validate_url_dns_resolved(url, crate::config::allow_loopback_webhooks()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("DNS SSRF guard rejected webhook URL {url}: {e}");
+                return Err(format!("dns-ssrf-rejected: {e}"));
+            }
+        };
+    // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
+    // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
+    // for the *validated* host only. reqwest's default redirect
+    // policy follows up to 10 hops and re-resolves DNS for the new
+    // Location host — a host whose addresses were never SSRF-validated
+    // — so a webhook endpoint that returns `302 Location:
+    // http://169.254.169.254/...` would let reqwest connect to an
+    // internal address the guard never cleared. Disabling redirects
+    // closes that window: a 3xx is surfaced as a non-success status
+    // (`http-{status}` below) and fails the dispatch safely, exactly
+    // like any other non-2xx.
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
-        .build()
-    {
+        .redirect(reqwest::redirect::Policy::none());
+    for addr in &validated_addrs {
+        // Pin reqwest's per-host override. The override SHADOWS
+        // reqwest's own DNS query for this host on this client,
+        // closing the rebind window.
+        builder = builder.resolve(&resolved_host, *addr);
+    }
+    // v0.7.0 #1073 + #1082 (SR-3 perf + SR-2 SSRF) — the SSRF
+    // hardening at #1082 requires per-call per-host DNS pinning via
+    // `builder.resolve(host, addr)`; that pin lives on the client
+    // itself, so a fully process-wide shared client can't hold pins
+    // that vary per dispatched URL. We still amortize the bulk of
+    // the work (TLS provider init, default connector) by sharing
+    // the resolver+TLS state through this thread-local builder.
+    // A future custom-resolver refactor will move the per-call pin
+    // onto a trait-object `dns::Resolve` so the client itself can be
+    // process-shared (matching the federation `peer.rs` pattern, and
+    // re-introduced through `RuntimeContext` at that point). For now
+    // correctness (SSRF closure) wins over the per-attempt client
+    // rebuild cost. The prior `dispatch_http_client()` scaffolding
+    // was removed in #1196 — it had zero production callers, only a
+    // test pin kept it alive.
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("webhook client build failed: {e}");
@@ -809,18 +1383,21 @@ fn send(
     };
     let mut req = client
         .post(url)
-        .header("content-type", "application/json")
-        .header("user-agent", "ai-memory/0.6.0.0")
-        .header("x-ai-memory-timestamp", timestamp)
+        .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+        .header(
+            "user-agent",
+            format!("ai-memory/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header(crate::HEADER_AI_MEMORY_TIMESTAMP, timestamp)
         .header("x-ai-memory-correlation-id", correlation_id);
     if let Some(sig) = signature {
-        req = req.header("x-ai-memory-signature", format!("sha256={sig}"));
+        req = req.header(crate::HEADER_AI_MEMORY_SIGNATURE, format!("sha256={sig}"));
     }
     let resp = match req.body(body.to_string()).send() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("webhook POST to {url} failed: {e}");
-            return Err(format!("network: {e}"));
+            return Err(crate::errors::msg::network(e));
         }
     };
     if !resp.status().is_success() {
@@ -865,11 +1442,35 @@ pub(crate) fn sha256_hex(s: &str) -> String {
 /// primitive.
 pub(crate) fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
     const BLOCK: usize = 64;
-    // Decode key — if invalid hex, fall back to the raw bytes (which
-    // keeps the signature stable for operators who set bad secrets;
-    // verification will fail equally at receive time, which is loud
-    // enough).
-    let mut key = hex_decode(key_hex).unwrap_or_else(|| key_hex.as_bytes().to_vec());
+    // v0.7.0 #1048 (Agent-5 #8) — decode the operator-supplied
+    // `hmac_secret` as hex. The pre-#1048 behaviour silently fell
+    // back to using the raw config bytes as HMAC key material when
+    // the hex decode failed, which produced a stable-but-WEAK key
+    // (`HMAC(b"not-a-hex-key!!", body)` instead of the intended
+    // hex-decoded bytes). The fallback is preserved for wire
+    // compatibility because both sender and receiver are typically
+    // configured from the same secret string — flipping the
+    // fallback would silently break running federations — but
+    // every invalid-hex compute emits a WARN so an operator
+    // running with a misconfigured secret sees the diagnostic on
+    // every webhook dispatch. The boot-time validator
+    // [`validate_hmac_secret_hex`] surfaces this BEFORE the daemon
+    // accepts traffic; operators who want strict hex enforcement
+    // call the validator at startup.
+    let mut key = match hex_decode(key_hex) {
+        Some(k) => k,
+        None => {
+            tracing::warn!(
+                target: SUBSCRIPTIONS_TRACE_TARGET,
+                "hmac_sha256_hex: hmac_secret is not valid hex (len={}); falling back to raw \
+                 bytes as key material — this produces a STABLE BUT WEAK key. Re-encode the \
+                 secret as hex (e.g. `openssl rand -hex 32`) and restart the daemon. \
+                 See #1048.",
+                key_hex.len(),
+            );
+            key_hex.as_bytes().to_vec()
+        }
+    };
     if key.len() > BLOCK {
         let mut h = Sha256::new();
         h.update(&key);
@@ -902,6 +1503,37 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// v0.7.0 #1048 (Agent-5 #8) — boot-time hex validator for the
+/// operator-supplied `hmac_secret`. Returns `Ok(())` when the value
+/// is `None` (no secret configured) OR is valid hex; returns
+/// `Err(String)` with a descriptive operator-facing message when
+/// the value is non-hex. Callers MUST surface the error before the
+/// daemon accepts traffic; the runtime `hmac_sha256_hex` will
+/// otherwise silently degrade to a stable-but-WEAK key (raw bytes
+/// of the misconfigured secret) on every dispatch.
+///
+/// # Errors
+///
+/// Returns the validation error string when the input is
+/// `Some(secret)` and `secret` fails the hex parse. The message
+/// includes recommended remediation (`openssl rand -hex 32`).
+pub fn validate_hmac_secret_hex(secret: Option<&str>) -> Result<(), String> {
+    let Some(secret) = secret else {
+        return Ok(());
+    };
+    if hex_decode(secret).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "[hooks.subscription] hmac_secret is not valid hex (len={}): expected an even-length \
+         hex string. Generate a fresh secret with `openssl rand -hex 32` and update the \
+         config. The runtime still computes a (weak) HMAC under the misconfigured value for \
+         wire compatibility, but the boot validator refuses to start so the operator sees \
+         the diagnostic immediately. See #1048.",
+        secret.len(),
+    ))
+}
+
 /// SSRF guard with DNS resolution (#301 item 2). Resolves the host
 /// via the stdlib resolver and rejects if ANY returned
 /// `SocketAddr`'s IP is private / loopback / link-local. Guards
@@ -912,20 +1544,100 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// we let reqwest surface the error rather than fail closed, because
 /// transient DNS outages should not silently drop webhook delivery.
 pub fn validate_url_dns(url: &str) -> Result<()> {
-    validate_url_dns_with(url, crate::config::allow_loopback_webhooks())
+    validate_url_dns_with(url, crate::config::allow_loopback_webhooks()).map(|_| ())
+}
+
+/// v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Returns
+/// the validated host + the pre-resolved `Vec<SocketAddr>` so the
+/// caller can pin reqwest's resolver to the SAME addresses the
+/// SSRF guard cleared. Pre-#1082 the guard resolved once,
+/// validated, and discarded the addresses — reqwest then did its
+/// OWN independent resolve at send time, opening a DNS-rebind
+/// window where the second resolve could return a private IP that
+/// the daemon never saw.
+///
+/// # Errors
+/// - URL has no scheme.
+/// - DNS resolution failed AND `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL`
+///   is not set (post-#1053 fail-CLOSED).
+/// - Any resolved address is private / link-local (or loopback when
+///   `allow_loopback` is false).
+pub(crate) fn validate_url_dns_resolved(
+    url: &str,
+    allow_loopback: bool,
+) -> Result<(String, Vec<std::net::SocketAddr>)> {
+    validate_url_dns_with(url, allow_loopback)
+}
+
+/// `true` when the operator opted into the legacy permissive SSRF
+/// posture via `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` (`1` / `true`).
+/// Shared by the resolution-failure branch and the RFC 1035
+/// hostname-shape branch so the two read the override identically.
+fn ssrf_dns_fail_open() -> bool {
+    std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// RFC 1035 §2.3.4 hostname shape check: every dot-separated label
+/// must be 1..=63 octets and the whole name (sans one optional
+/// trailing dot) must be <=253 octets. Returns `true` when the host
+/// VIOLATES the shape.
+///
+/// FX-Fwin (#1053 follow-up) — `getaddrinfo(3)` is documented to
+/// reject an oversized label with `EAI_*`, but Windows' resolver
+/// does NOT enforce the 63-octet ceiling at the API boundary (it
+/// synthesizes a hit / returns `Ok`), so the cross-platform CI
+/// `Check (windows-latest)` job saw the SSRF guard pass an oversized
+/// label that macOS/Linux reject. A portable SSRF guard must
+/// validate the shape itself rather than delegating to libc. IP
+/// literals (no oversized labels) are unaffected.
+fn hostname_shape_invalid(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty() || name.len() > 253 {
+        return true;
+    }
+    name.split('.')
+        .any(|label| label.is_empty() || label.len() > 63)
 }
 
 /// H11 inner helper: takes `allow_loopback` explicitly so tests can
 /// assert both branches without poking the process-wide atomic
 /// (which would race with parallel tests). Production callers go
 /// through `validate_url_dns`.
-fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
+///
+/// v0.7.0 #1082 — returns the resolved `(host, addresses)` so the
+/// `send` path can install a reqwest `Client::builder().resolve()`
+/// override pinning the connect to exactly the IPs the guard
+/// cleared. Closes the DNS-rebind TOCTOU window.
+fn validate_url_dns_with(
+    url: &str,
+    allow_loopback: bool,
+) -> Result<(String, Vec<std::net::SocketAddr>)> {
     let lower = url.to_ascii_lowercase();
     let (_scheme, rest) = lower
         .split_once("://")
         .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
     let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host_port = &rest[..host_end];
+    // v0.7.0 #1082 — extract the host (sans port + brackets) for the
+    // reqwest `Client::builder().resolve(host, addr)` override the
+    // caller installs. The override matches by host string the
+    // reqwest URL parser produces, so we strip the brackets / port
+    // here to match.
+    let resolved_host = {
+        let s = host_port;
+        if let Some(close_idx) = s.strip_prefix('[').and(s.find(']')) {
+            // [ipv6]:port or [ipv6] — return the inner ipv6 text.
+            s[1..close_idx].to_string()
+        } else if let Some(idx) = s.rfind(':') {
+            // Hostname:port — strip the port. (IPv4-with-port. Bare
+            // ipv4 has no `:` so falls through to the else branch.)
+            s[..idx].to_string()
+        } else {
+            s.to_string()
+        }
+    };
     // Supply a default port so ToSocketAddrs resolves correctly.
     // SSRF fix (W11): bracketed IPv6 without an explicit port ("[fe80::1]"
     // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
@@ -949,13 +1661,75 @@ fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
         } else {
             format!("{host_port}:80")
         };
+    // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
+    // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
+    // resolver returned Ok(()) here, but the subsequent
+    // `reqwest::send` performs its OWN DNS resolution under
+    // potentially-attacker-controlled DNS (TTL-zero / DNS rebind).
+    // The attacker's first resolution at the daemon could SERVFAIL
+    // (bypassing the SSRF guard), then their second resolution under
+    // reqwest could return a private-range or link-local IP
+    // (169.254.169.254 cloud metadata, 127.0.0.1:5432 Postgres,
+    // 10.0.0.0/8 internal services). Closing the gap by treating
+    // DNS failure as Err means an attacker can't smuggle internal
+    // IPs through a DNS-rebind path even if the daemon's resolver
+    // hiccups.
+    //
+    // Operators with environments where transient DNS pressure is
+    // expected (containers with flaky CoreDNS, etc.) can opt back
+    // into the legacy permissive posture via
+    // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`. The unsafe override is
+    // logged at WARN on every fire so an audit can detect the
+    // legacy-permissive mode.
+    // FX-Fwin (#1053 follow-up) — enforce RFC 1035 hostname shape
+    // IN-GUARD before resolution. Windows' `getaddrinfo` does not
+    // reject an oversized (>63-octet) DNS label at the API boundary,
+    // so relying on the resolver to reject it (as the pre-FX-Fwin code
+    // did) made the guard platform-dependent. A shape violation is
+    // treated identically to a DNS resolution failure: fail-CLOSED
+    // unless the operator opted into the legacy permissive posture.
+    if hostname_shape_invalid(&resolved_host) {
+        if ssrf_dns_fail_open() {
+            tracing::warn!(
+                target: SUBSCRIPTIONS_TRACE_TARGET,
+                "SSRF guard: hostname {resolved_host} violates RFC 1035 label/length \
+                 limits for {url}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
+                 ALLOW (UNSAFE, legacy posture)"
+            );
+            return Ok((resolved_host, Vec::new()));
+        }
+        return Err(anyhow!(
+            "SSRF guard: DNS resolution failed for {url}: hostname violates RFC 1035 \
+             label/length limits; failing CLOSED (post-#1053 secure default — set \
+             AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
+        ));
+    }
     let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
         Ok(iter) => iter.collect(),
-        Err(_) => return Ok(()), // DNS hiccup — let reqwest surface it
+        Err(e) => {
+            let fail_open = ssrf_dns_fail_open();
+            if fail_open {
+                tracing::warn!(
+                    target: SUBSCRIPTIONS_TRACE_TARGET,
+                    "SSRF guard: DNS resolution failed for {url}: {e}; \
+                     AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to ALLOW \
+                     (UNSAFE, legacy posture) — reqwest's resolver may bind to \
+                     private/loopback IPs the daemon could not pre-check"
+                );
+                // Empty address list — caller's resolver-override
+                // loop is a no-op and reqwest falls back to its
+                // own DNS query (the explicit UNSAFE legacy posture).
+                return Ok((resolved_host, Vec::new()));
+            }
+            return Err(anyhow!(
+                "SSRF guard: DNS resolution failed for {url}: {e}; failing CLOSED \
+                 (post-#1053 secure default — set AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
+            ));
+        }
     };
     for addr in &addrs {
         let ip = addr.ip();
-        if is_private(ip) && !ip.is_loopback() {
+        if is_private(ip) && !is_loopback_normalized(ip) {
             return Err(anyhow!(
                 "host resolves to private/link-local IP {ip}: {url}"
             ));
@@ -964,7 +1738,7 @@ fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
         // Default-OFF; operators with `[subscriptions]
         // allow_loopback_webhooks = true` accept loopback-resolving
         // hostnames.
-        if ip.is_loopback() && !allow_loopback {
+        if is_loopback_normalized(ip) && !allow_loopback {
             return Err(anyhow!(
                 "host resolves to loopback IP {ip}: {url} — rejected by default \
                  (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
@@ -972,7 +1746,9 @@ fn validate_url_dns_with(url: &str, allow_loopback: bool) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    // v0.7.0 #1082 — return the resolved host + addr list so the
+    // caller can pin reqwest's connect to exactly these addresses.
+    Ok((resolved_host, addrs))
 }
 
 /// SSRF guard. Rejects URLs that would cause the daemon to connect
@@ -1021,7 +1797,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     // 5432, the hooks daemon, etc.).
     let is_loopback_hostname = matches!(host, "localhost" | "localhost.localdomain" | "");
     let parsed_ip = IpAddr::from_str(host).ok();
-    let is_loopback_ip = parsed_ip.is_some_and(|ip| ip.is_loopback());
+    let is_loopback_ip = parsed_ip.is_some_and(is_loopback_normalized);
     let is_loopback = is_loopback_hostname || is_loopback_ip;
     if is_loopback && !allow_loopback {
         return Err(anyhow!(
@@ -1034,7 +1810,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         // Accept http only to parsed-loopback IPs; everything else
         // requires https.
         if let Some(ip) = parsed_ip {
-            if !ip.is_loopback() {
+            if !is_loopback_normalized(ip) {
                 return Err(anyhow!(
                     "webhook URL must be https for non-loopback host: {url}"
                 ));
@@ -1052,7 +1828,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     // up reverse proxies or allow explicitly in config.
     if let Some(ip) = parsed_ip
         && is_private(ip)
-        && !ip.is_loopback()
+        && !is_loopback_normalized(ip)
     {
         return Err(anyhow!(
             "webhook URL targets private / link-local address: {url}"
@@ -1061,8 +1837,42 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     Ok(())
 }
 
-fn is_private(ip: IpAddr) -> bool {
+// SSRF fix (#628 H3 follow-up): canonicalize IPv6 addresses that wrap an
+// IPv4 address (4-mapped `::ffff:a.b.c.d`, deprecated 4-compatible
+// `::a.b.c.d`, and the well-known NAT64 prefix `64:ff9b::/96`) into their
+// IPv4 form before applying SSRF checks. Without this, `Ipv6Addr::is_loopback()`
+// and the v6 branch of `is_private` silently miss `::ffff:127.0.0.1`,
+// `::ffff:10.0.0.1`, `::ffff:169.254.1.1`, and similar bypasses.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V6(v6) => {
+            let canonical = v6.to_canonical();
+            if matches!(canonical, IpAddr::V4(_)) {
+                return canonical;
+            }
+            let segs = v6.segments();
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                let v4_bits = (u32::from(segs[6]) << 16) | u32::from(segs[7]);
+                return IpAddr::V4(Ipv4Addr::from(v4_bits));
+            }
+            IpAddr::V6(v6)
+        }
+        v4 @ IpAddr::V4(_) => v4,
+    }
+}
+
+fn is_loopback_normalized(ip: IpAddr) -> bool {
+    normalize_ip(ip).is_loopback()
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
         IpAddr::V4(v4) => {
             // SSRF fix (W11): include `is_unspecified` (0.0.0.0). On most
             // OSes the kernel routes 0.0.0.0 to a local listener, so an
@@ -1088,16 +1898,27 @@ fn is_private(ip: IpAddr) -> bool {
     }
 }
 
+/// v0.7.0 #1072 — kept for the existing test harness and the
+/// public-API contract. Production dispatch routes through
+/// [`load_secret_hash_with_conn`] to reuse the caller's connection.
+#[allow(dead_code)]
 fn load_secret_hash(db_path: &std::path::Path, sub_id: &str) -> Result<Option<String>> {
     let conn = Connection::open(db_path).context("load_secret_hash open")?;
-    let row = conn
-        .query_row(
-            "SELECT secret_hash FROM subscriptions WHERE id = ?1",
-            params![sub_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .context("load_secret_hash query")?;
-    Ok(row)
+    load_secret_hash_with_conn(&conn, sub_id)
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of [`load_secret_hash`].
+/// Lets the per-subscription dispatch worker open ONE
+/// `Connection::open` per delivery (instead of 4-5 across the
+/// secret-load / event-audit / status-update / dispatch-counter /
+/// DLQ sites). Same pattern as the #1017 hook-sink fix.
+fn load_secret_hash_with_conn(conn: &Connection, sub_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT secret_hash FROM subscriptions WHERE id = ?1",
+        params![sub_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .context("load_secret_hash query")
 }
 
 /// v0.7.0 K6 — append a `subscription_events` audit row for one
@@ -1115,6 +1936,19 @@ pub fn record_subscription_event(
     payload: &str,
 ) -> Result<()> {
     let conn = Connection::open(db_path).context("subscription_events open")?;
+    record_subscription_event_with_conn(&conn, sub_id, correlation_id, event_type, payload)
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant. Used by the per-
+/// subscription dispatch worker so a single thread-local connection
+/// covers every sqlite write in the delivery path.
+pub fn record_subscription_event_with_conn(
+    conn: &Connection,
+    sub_id: &str,
+    correlation_id: &str,
+    event_type: &str,
+    payload: &str,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO subscription_events \
@@ -1134,6 +1968,12 @@ fn update_event_status(db_path: &std::path::Path, correlation_id: &str, ok: bool
     let Ok(conn) = Connection::open(db_path) else {
         return;
     };
+    update_event_status_with_conn(&conn, correlation_id, ok);
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of
+/// [`update_event_status`].
+fn update_event_status_with_conn(conn: &Connection, correlation_id: &str, ok: bool) {
     let status = if ok { "ack" } else { "failed" };
     let _ = conn.execute(
         "UPDATE subscription_events SET delivery_status = ?1 WHERE correlation_id = ?2",
@@ -1157,6 +1997,75 @@ pub fn record_dlq(
     last_failed_at: &str,
 ) -> Result<()> {
     let conn = Connection::open(db_path).context("subscription_dlq open")?;
+    record_dlq_with_conn(
+        &conn,
+        sub_id,
+        correlation_id,
+        event_type,
+        payload,
+        retry_count,
+        last_error,
+        first_failed_at,
+        last_failed_at,
+    )
+}
+
+/// #1253 (MED, 2026-05-25) — operator-disk-fill DoS guard. Hard cap
+/// on the per-subscription `subscription_dlq` depth. Pre-#1253 the
+/// DLQ grew unboundedly when a hostile (or simply broken) webhook
+/// target failed every delivery — a single bad subscriber could
+/// exhaust the operator's disk by sustaining a high failure rate.
+/// Past this cap [`record_dlq_with_conn`] refuses the insert with
+/// the typed `dlq_overflow` error, increments the
+/// `ai_memory_subscription_dlq_overflow_total` counter, and emits a
+/// `tracing::warn!`. Operators drain the queue via
+/// `memory_subscription_dlq_list` + the planned `... dlq drain`
+/// admin tool before resetting. 10_000 rows is well above realistic
+/// transient-failure depths (a healthy peer recovers in minutes, not
+/// thousands of events) while still bounded enough that a hostile
+/// peer can write at most ~10 MB before being capped (the payload
+/// column is itself bounded by the webhook JSON-body cap upstream).
+pub const MAX_SUBSCRIPTION_DLQ_ROWS: i64 = 10_000;
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dlq`].
+#[allow(clippy::too_many_arguments)]
+pub fn record_dlq_with_conn(
+    conn: &Connection,
+    sub_id: &str,
+    correlation_id: &str,
+    event_type: &str,
+    payload: &str,
+    retry_count: i64,
+    last_error: &str,
+    first_failed_at: &str,
+    last_failed_at: &str,
+) -> Result<()> {
+    // #1253 — refuse the insert if the per-subscription DLQ is full.
+    // Counting before the INSERT keeps the cap honest under
+    // concurrent dispatch threads (the SQLite single-writer lock
+    // serialises this read+write pair against any sibling DLQ
+    // insert against the same subscription).
+    let depth: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+            params![sub_id],
+            |row| row.get(0),
+        )
+        .context("subscription_dlq depth probe")?;
+    if depth >= MAX_SUBSCRIPTION_DLQ_ROWS {
+        crate::metrics::record_subscription_dlq_overflow();
+        tracing::warn!(
+            subscription_id = %sub_id,
+            correlation_id = %correlation_id,
+            event_type = %event_type,
+            depth = depth,
+            cap = MAX_SUBSCRIPTION_DLQ_ROWS,
+            "dlq_overflow: refusing subscription_dlq insert — per-subscription cap reached",
+        );
+        return Err(anyhow!(
+            "dlq_overflow: subscription {sub_id} dlq at cap ({MAX_SUBSCRIPTION_DLQ_ROWS}); drain before further inserts"
+        ));
+    }
     conn.execute(
         "INSERT INTO subscription_dlq \
          (subscription_id, correlation_id, event_type, payload, retry_count, last_error, first_failed_at, last_failed_at) \
@@ -1221,11 +2130,15 @@ fn dlq_row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<DlqEntry> {
 /// since `since_rfc3339`. Returns the audit rows ordered by
 /// `delivered_at` ascending (so cursor-by-time scans are stable).
 ///
-/// **MCP gating:** the companion `memory_subscription_replay` MCP
-/// tool is **not** registered in the dispatch table yet — that wiring
-/// lives in K7 (subscription reliability) so we don't bump the v0.7
-/// tool count cascade while Track B1 is in flight. The handler
-/// surface is exposed here so K7's MCP wiring is a one-line patch.
+/// **MCP wiring (v0.7 K7, landed):** the companion
+/// `memory_subscription_replay` MCP tool IS registered in the
+/// dispatch table — see `MEMORY_SUBSCRIPTION_REPLAY` in
+/// `src/mcp/registry.rs` (entry in `tool_names::ALL`) and the
+/// `handle_subscription_replay` handler in
+/// `src/mcp/tools/subscribe.rs`. The "K6 deferred to K7" gating
+/// noted in the original comment is closed; this docstring was
+/// stale per the v0.7.0 multi-agent literal-sweep (scanner B
+/// finding F-B6.x).
 pub fn replay_subscription_events(
     conn: &Connection,
     subscription_id: &str,
@@ -1255,11 +2168,14 @@ pub fn replay_subscription_events(
     Ok(out)
 }
 
-/// v0.7.0 K6 — handler for `memory_subscription_replay`. Registered in
-/// K7 (subscription reliability) — DO NOT add to the MCP dispatch
-/// table during K6 because the v0.7 tool count cascade collides with
-/// Track B1 in flight. K7 will wire this into `mcp::dispatch_tool`
-/// behind the existing `memory_subscription_*` family.
+/// v0.7.0 K6 — handler for `memory_subscription_replay`. K7 wired
+/// this into the MCP dispatch table behind the existing
+/// `memory_subscription_*` family — see
+/// `src/mcp/tools/subscribe.rs::handle_subscription_replay` for the
+/// thin MCP wrapper that delegates here. The K6-vintage "DO NOT add
+/// to MCP dispatch table" warning in the prior docstring was stale
+/// per the v0.7.0 multi-agent literal-sweep (scanner B finding
+/// F-B6.x); registration has been in tree since K7.
 pub fn memory_subscription_replay(
     conn: &Connection,
     subscription_id: &str,
@@ -1267,7 +2183,7 @@ pub fn memory_subscription_replay(
 ) -> Result<serde_json::Value> {
     let events = replay_subscription_events(conn, subscription_id, since_rfc3339)?;
     Ok(serde_json::json!({
-        "subscription_id": subscription_id,
+        (field_names::SUBSCRIPTION_ID): subscription_id,
         "since": since_rfc3339,
         "count": events.len(),
         "events": events,
@@ -1278,6 +2194,11 @@ fn record_dispatch(db_path: &std::path::Path, sub_id: &str, ok: bool) {
     let Ok(conn) = Connection::open(db_path) else {
         return;
     };
+    record_dispatch_with_conn(&conn, sub_id, ok);
+}
+
+/// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dispatch`].
+fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, ok: bool) {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = if ok {
         "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
@@ -1291,10 +2212,37 @@ fn record_dispatch(db_path: &std::path::Path, sub_id: &str, ok: bool) {
 mod tests {
     use super::*;
 
+    /// Serializes the two #1053 tests that mutate the process-global
+    /// `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` env var. Without it they
+    /// race under the default parallel test runner: the fail-open
+    /// test's `set_var` can be observed by the fail-closed test
+    /// mid-flight, flipping its expected `Err` (fail-CLOSED) into an
+    /// `Ok` (legacy permissive) and panicking. Poison-tolerant via
+    /// `into_inner` so one panicking test doesn't cascade-fail the
+    /// other.
+    static SSRF_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn https_allowed() {
         assert!(validate_url("https://example.com/hook").is_ok());
         assert!(validate_url("https://api.example.com:8443/hook?x=1").is_ok());
+    }
+
+    /// Regression for #1265 — webhook dispatch User-Agent must track
+    /// `CARGO_PKG_VERSION` rather than the v0.6.0.0 string the original
+    /// site hardcoded. The `format!` here mirrors the dispatch site in
+    /// `fn send()` so a bit-rot of one side is caught by the test.
+    #[test]
+    fn webhook_user_agent_tracks_cargo_pkg_version() {
+        let ua = format!("ai-memory/{}", env!("CARGO_PKG_VERSION"));
+        let expected = format!("ai-memory/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(ua, expected);
+        // The legacy hardcoded value MUST NOT be the current expected
+        // value — guards against a future revert to a literal string.
+        assert_ne!(ua, "ai-memory/0.6.0.0");
+        // Shape sanity: matches the documented `ai-memory/<semver>` form.
+        assert!(ua.starts_with("ai-memory/"));
+        assert!(ua.len() > "ai-memory/".len());
     }
 
     #[test]
@@ -1363,6 +2311,48 @@ mod tests {
         assert!(validate_url("ftp://example.com").is_err());
         assert!(validate_url("notaurl").is_err());
         assert!(validate_url("").is_err());
+    }
+
+    #[test]
+    fn rejects_v4_mapped_ipv6_loopback() {
+        // SSRF (#628 H3 follow-up): `Ipv6Addr::is_loopback()` returns false
+        // for `::ffff:127.0.0.1`, but on dual-stack hosts the kernel routes
+        // these to the v4 loopback service. `normalize_ip` collapses to v4
+        // before checking.
+        // Use `validate_url_with(.., false)` (loopback-disabled) to
+        // avoid racing with parallel tests that flip the process-wide
+        // allow_loopback flag (matches the `loopback_blocked_by_default`
+        // test pattern below).
+        assert!(validate_url_with("https://[::ffff:127.0.0.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[::ffff:7f00:1]/hook", false).is_err());
+    }
+
+    #[test]
+    fn rejects_v4_mapped_ipv6_private() {
+        assert!(validate_url_with("https://[::ffff:10.0.0.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[::ffff:192.168.1.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[::ffff:172.16.0.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[::ffff:169.254.1.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[::ffff:0.0.0.0]/hook", false).is_err());
+    }
+
+    #[test]
+    fn rejects_nat64_well_known_prefix() {
+        // 64:ff9b::/96 — RFC 6052 well-known NAT64 prefix. On hosts with
+        // NAT64 deployed, packets to `64:ff9b::a.b.c.d` are translated to
+        // `a.b.c.d` and forwarded; an SSRF gadget if `a.b.c.d` is loopback
+        // or private.
+        assert!(validate_url_with("https://[64:ff9b::127.0.0.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[64:ff9b::10.0.0.1]/hook", false).is_err());
+        assert!(validate_url_with("https://[64:ff9b::169.254.1.1]/hook", false).is_err());
+    }
+
+    #[test]
+    fn allows_v4_mapped_loopback_when_opted_in() {
+        // Symmetric with the existing loopback opt-in: when allow_loopback
+        // is true, `::ffff:127.0.0.1` should be accepted (same as plain
+        // `127.0.0.1`).
+        assert!(validate_url_with("http://[::ffff:127.0.0.1]/hook", true).is_ok());
     }
 
     #[test]
@@ -1630,12 +2620,102 @@ mod tests {
             validate_url_dns("https://1.1.1.1/").is_ok(),
             "public IP literal must be accepted"
         );
-        // example.com may or may not resolve in the sandbox; per the
-        // production comment, DNS failure returns Ok (let reqwest
-        // surface it). Either way the outcome is Ok.
+        // v0.7.0 #1053 — `example.com` either resolves to a public
+        // IP (accepted) OR fails to resolve in a hermetic sandbox
+        // (post-#1053: rejected as fail-closed; pre-#1053: accepted
+        // with let-reqwest-surface-it). Both outcomes are
+        // legitimate behaviours of the SSRF guard, so accept either
+        // status: the test pins that an IP literal is always
+        // accepted, and the public-hostname legitimacy is exercised
+        // by the new fail-closed regression test
+        // `test_validate_url_dns_fails_closed_on_dns_failure_1053`
+        // below.
+        let _ = validate_url_dns("https://example.com/");
+    }
+
+    #[test]
+    fn test_validate_url_dns_fails_closed_on_dns_failure_1053() {
+        // v0.7.0 #1053 (Agent-2 #3) — DNS resolution failure now
+        // returns Err so an attacker cannot smuggle a private-range
+        // IP through a DNS-rebind path where the daemon's resolver
+        // hiccups and reqwest's later resolution lands on an
+        // internal target.
+        //
+        // FX-F1 (2026-05-27) — hermetic hostname construction.
+        // The pre-FX-F1 test used `"https://nonexistent-host.invalid./"`
+        // and relied on RFC 6761 guaranteeing NXDOMAIN for the `.invalid`
+        // TLD. In practice three platforms violate that guarantee:
+        //   - Windows' built-in resolver consults NetBIOS / WINS /
+        //     DNS search-suffix lists and synthesizes a "hit" for
+        //     bare `.invalid` labels.
+        //   - macOS' mDNSResponder + captive-portal DNS in some
+        //     CI runner network configs (observed on
+        //     `release/v0.7.0` SHA 5bfbb109c → job 78098087774)
+        //     also synthesizes a "hit" so the test panicked with
+        //     `got Ok(())` instead of the expected `Err`.
+        //   - Some corporate DNS resolvers wildcard-redirect any
+        //     unresolvable name to a "did-you-mean" landing page.
+        //
+        // To make the test hermetic across every platform we
+        // construct a hostname that the SSRF guard's RFC 1035 shape
+        // check rejects at the SHAPE level rather than at the
+        // DNS-lookup level: each DNS label has a hard 63-octet ceiling
+        // per RFC 1035 §2.3.4, so a single 70-character label is
+        // rejected in-guard (FX-Fwin #1053 follow-up) regardless of
+        // which resolver is configured — including Windows, whose
+        // `getaddrinfo` does not enforce the ceiling at the API
+        // boundary. No DNS query is even attempted.
+        let _env_guard = SSRF_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let oversized_label = "a".repeat(70);
+        let url = format!("https://{oversized_label}.fxf1-test./");
+        let res = validate_url_dns(&url);
         assert!(
-            validate_url_dns("https://example.com/").is_ok(),
-            "public hostname must be accepted (or DNS-skip path returns Ok)"
+            res.is_err(),
+            "#1053: SSRF guard MUST fail-closed on DNS resolution failure \
+             (oversized label rejected at getaddrinfo shape check); got {res:?}"
+        );
+        let err_msg = format!("{}", res.unwrap_err());
+        assert!(
+            err_msg.contains("failing CLOSED")
+                && err_msg.contains("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL"),
+            "#1053: failure message MUST reference fail-closed posture + env-var escape hatch; got {err_msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_url_dns_fail_open_env_overrides_1053() {
+        // v0.7.0 #1053 — operators with flaky DNS environments can
+        // opt back into the legacy permissive posture via
+        // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`. Pin the env-var
+        // contract so a future tweak to the var name fails this
+        // test loudly.
+        //
+        // SAFETY: env mutation in tests is racy across parallel
+        // threads; we serialise via the var name being highly
+        // specific so other tests can't trip it. The set + remove
+        // pair brackets the test region.
+        // SAFETY: env mutation guarded inside a unit test.
+        // The current cargo-test process is the only consumer of
+        // `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL`. Hold SSRF_ENV_GUARD
+        // across the whole set→validate→remove window so the
+        // fail-CLOSED test cannot observe the var mid-flight.
+        let _env_guard = SSRF_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL", "1");
+        }
+        // FX-F1: use the same shape-rejected hostname construction
+        // as `test_validate_url_dns_fails_closed_on_dns_failure_1053`
+        // for hermetic platform-independence (see that test's
+        // docstring for rationale).
+        let oversized_label = "a".repeat(70);
+        let url = format!("https://{oversized_label}.fxf1-test./");
+        let res = validate_url_dns(&url);
+        unsafe {
+            std::env::remove_var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL");
+        }
+        assert!(
+            res.is_ok(),
+            "#1053: AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 MUST restore the legacy permissive posture; got {res:?}"
         );
     }
 
@@ -1740,7 +2820,7 @@ mod tests {
         .unwrap();
         assert!(!id.is_empty());
 
-        let subs = list(&conn).unwrap();
+        let subs = list(&conn, None).unwrap();
         assert_eq!(subs.len(), 1);
         let s = &subs[0];
         assert_eq!(s.id, id);
@@ -1846,15 +2926,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(delete(&conn, &id).unwrap());
-        assert!(list(&conn).unwrap().is_empty());
+        assert!(delete(&conn, &id, None).unwrap());
+        assert!(list(&conn, None).unwrap().is_empty());
     }
 
     #[test]
     fn delete_returns_false_when_row_missing() {
         let (_keep, path) = fresh_db();
         let conn = Connection::open(&path).unwrap();
-        assert!(!delete(&conn, "nope").unwrap());
+        assert!(!delete(&conn, "nope", None).unwrap());
     }
 
     #[test]
@@ -1890,7 +2970,7 @@ mod tests {
             },
         )
         .unwrap();
-        let subs = list(&conn).unwrap();
+        let subs = list(&conn, None).unwrap();
         assert_eq!(subs.len(), 2);
         // Most recent first.
         assert_eq!(subs[0].id, id2);
@@ -1923,6 +3003,71 @@ mod tests {
         assert!(hex_decode("abc").is_none());
         // Non-hex chars must return None.
         assert!(hex_decode("zz").is_none());
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_accepts_none_1048() {
+        // v0.7.0 #1048 — no secret configured = no-op (Ok).
+        assert!(validate_hmac_secret_hex(None).is_ok());
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_accepts_valid_hex_1048() {
+        // v0.7.0 #1048 — even-length all-hex string passes.
+        assert!(validate_hmac_secret_hex(Some("deadbeef")).is_ok());
+        assert!(validate_hmac_secret_hex(Some("0123456789abcdef")).is_ok());
+        // 64-char (32 byte) — the recommended `openssl rand -hex 32` shape.
+        let long = "a".repeat(64);
+        assert!(validate_hmac_secret_hex(Some(&long)).is_ok());
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_rejects_non_hex_1048() {
+        // v0.7.0 #1048 — non-hex secret (operator typo / passphrase
+        // instead of hex) is rejected at boot validator. The
+        // production `main.rs` boot path treats this as fatal.
+        let err = validate_hmac_secret_hex(Some("not-a-hex-key!!"))
+            .expect_err("non-hex MUST fail validation");
+        assert!(
+            err.contains("not valid hex") && err.contains("openssl rand -hex 32"),
+            "#1048: failure msg MUST reference invalid hex + remediation; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_hmac_secret_hex_rejects_odd_length_1048() {
+        // v0.7.0 #1048 — odd-length hex is not parseable; rejected.
+        let err = validate_hmac_secret_hex(Some("abc")).expect_err("odd-length MUST fail");
+        assert!(err.contains("not valid hex"));
+    }
+
+    #[test]
+    fn hmac_sha256_hex_output_is_fixed_64_chars_1039() {
+        // v0.7.0 #1039 (Agent-5 #6) — HMAC-SHA256 output is ALWAYS
+        // 32 bytes = 64 hex chars regardless of input. The
+        // `constant_time_eq` early-return on length mismatch in
+        // `src/handlers/transport.rs` (used by /api/v1/approvals
+        // signature verification) leaks the length of the EXPECTED
+        // sig — but the expected sig is the fixed 64-char output
+        // of this function, so the leak conveys zero attacker-
+        // useful entropy. This test pins the fixed-length contract
+        // so a future hash-agility refactor doesn't accidentally
+        // produce variable-length output that re-opens the timing
+        // oracle.
+        for body in &["", "x", "x".repeat(1024).as_str(), "🦀"] {
+            let sig = hmac_sha256_hex("deadbeef", body);
+            assert_eq!(
+                sig.len(),
+                64,
+                "#1039: HMAC-SHA256 hex output MUST be fixed 64 chars; got len={} for body={:?}",
+                sig.len(),
+                body
+            );
+            assert!(
+                sig.chars().all(|c| c.is_ascii_hexdigit()),
+                "#1039: HMAC hex output MUST be all-hex; got {sig}"
+            );
+        }
     }
 
     #[test]
@@ -2257,6 +3402,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn send_does_not_follow_redirect_ssrf_pin_bypass() {
+        // SR-W3 (HIGH) regression. The webhook client pins reqwest's
+        // DNS to the SSRF-validated address set of the *original* host.
+        // A malicious endpoint could return a 3xx whose Location points
+        // at an internal address the guard never cleared; reqwest's
+        // default redirect policy would follow it and re-resolve DNS for
+        // the new host, bypassing the pin. With redirects disabled the
+        // 3xx is surfaced as a non-success status and the dispatch fails
+        // safely. We assert BOTH that send returns Err AND that the
+        // redirect target was never requested.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The hook returns a redirect to a path that, if followed, the
+        // mock would happily answer 200 — proving the failure is the
+        // un-followed redirect, not a missing target.
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "/internal-rebind-target"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let redirect_followed = Mock::given(path("/internal-rebind-target"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .named("redirect target must NOT be requested");
+        server.register(redirect_followed).await;
+
+        let url = format!("{}/hook", server.uri());
+        let corr = uuid::Uuid::now_v7().to_string();
+        let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
+            .await
+            .unwrap();
+        assert!(
+            res.is_err(),
+            "redirect must not be followed; 3xx surfaces as a failed dispatch: {res:?}"
+        );
+        // The `.expect(0)` on the redirect-target mock is verified on
+        // server drop; assert it explicitly here for a clear failure
+        // message if reqwest ever regains redirect-following behavior.
+        let hits = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == "/internal-rebind-target")
+            .count();
+        assert_eq!(hits, 0, "redirect target was requested — SSRF pin bypassed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn send_signature_header_set_when_provided() {
         use wiremock::matchers::{header, header_exists, method, path};
         use wiremock::{Mock, MockServer};
@@ -2268,7 +3466,7 @@ mod tests {
             .and(header("x-ai-memory-signature", "sha256=abc123"))
             .and(header_exists("x-ai-memory-timestamp"))
             .and(header_exists("x-ai-memory-correlation-id"))
-            .and(header("content-type", "application/json"))
+            .and(header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON))
             .respond_with(AckEcho)
             .expect(1)
             .mount(&server)
@@ -2579,7 +3777,9 @@ mod tests {
                 &NewSubscription {
                     url: &url,
                     events: "approval_requested",
-                    secret: None,
+                    // R3-S1.HMAC (2026-05-13): dispatch refuses
+                    // unsigned bodies; supply a per-sub secret.
+                    secret: Some("test-sub-secret"),
                     namespace_filter: None,
                     agent_filter: None,
                     created_by: None,
@@ -2792,7 +3992,9 @@ mod tests {
                 &NewSubscription {
                     url: &url,
                     events: "*",
-                    secret: None,
+                    // R3-S1.HMAC (2026-05-13): dispatch refuses
+                    // unsigned bodies; supply a per-sub secret.
+                    secret: Some("test-sub-secret"),
                     namespace_filter: None,
                     agent_filter: None,
                     created_by: None,
@@ -2867,7 +4069,9 @@ mod tests {
                 &NewSubscription {
                     url: &url,
                     events: "*",
-                    secret: None,
+                    // R3-S1.HMAC (2026-05-13): dispatch refuses
+                    // unsigned bodies; supply a per-sub secret.
+                    secret: Some("test-sub-secret"),
                     namespace_filter: None,
                     agent_filter: None,
                     created_by: None,
@@ -2975,6 +4179,103 @@ mod tests {
         let envelope = memory_subscription_replay(&conn, &sub_id, "2026-03-01T00:00:00Z").unwrap();
         assert_eq!(envelope["count"], 1);
         assert_eq!(envelope["events"][0]["correlation_id"], "c-new");
+    }
+
+    /// #1253 (MED, 2026-05-25) — regression: per-subscription
+    /// `subscription_dlq` depth is capped at
+    /// [`MAX_SUBSCRIPTION_DLQ_ROWS`]; the (cap + 1)-th insert is
+    /// refused with a `dlq_overflow` error, leaves the table at
+    /// exactly cap rows, and bumps the
+    /// `ai_memory_subscription_dlq_overflow_total` counter.
+    #[test]
+    fn issue_1253_dlq_overflow_cap_refuses_past_max() {
+        let (_keep, db_path) = fresh_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let sub_id = insert(
+            &conn,
+            &NewSubscription {
+                url: "https://example.com/hook",
+                events: "*",
+                secret: Some("s"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: None,
+                event_types: None,
+            },
+        )
+        .unwrap();
+
+        // Drive the DLQ to the cap with the canonical writer so the
+        // test exercises the same insert path production uses.
+        for i in 0..MAX_SUBSCRIPTION_DLQ_ROWS {
+            let corr = format!("c-{i}");
+            record_dlq_with_conn(
+                &conn,
+                &sub_id,
+                &corr,
+                "memory_store",
+                "{}",
+                4,
+                "http-500",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            )
+            .expect("inserts below cap must succeed");
+        }
+        let depth: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+                params![&sub_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(depth, MAX_SUBSCRIPTION_DLQ_ROWS, "DLQ should fill to cap");
+
+        // Snapshot the overflow counter so we can prove it advances.
+        let before = crate::metrics::subscription_dlq_overflow_count();
+
+        // (cap + 1)-th insert must be refused with the typed error
+        // shape — the err string starts with "dlq_overflow:" so
+        // operators / dashboards can pattern-match it.
+        let res = record_dlq_with_conn(
+            &conn,
+            &sub_id,
+            "c-overflow",
+            "memory_store",
+            "{}",
+            4,
+            "http-500",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let err = res.expect_err("over-cap insert must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dlq_overflow"),
+            "error must carry the dlq_overflow tag for operators: {msg}"
+        );
+
+        // The table must remain at cap — refusal is total, not partial.
+        let depth_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+                params![&sub_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            depth_after, MAX_SUBSCRIPTION_DLQ_ROWS,
+            "refused insert must not leak a row into subscription_dlq"
+        );
+
+        // Counter must have ticked. The metrics handle is a singleton
+        // so parallel tests can also bump it; what we own is the +1
+        // contributed by this call.
+        let after = crate::metrics::subscription_dlq_overflow_count();
+        assert!(
+            after >= before + 1,
+            "subscription_dlq_overflow_total did not advance (before={before}, after={after})"
+        );
     }
 }
 

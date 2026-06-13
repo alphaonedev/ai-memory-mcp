@@ -9,14 +9,62 @@
 //! list that is scanned linearly alongside the HNSW results — the index is
 //! rebuilt lazily once the overflow exceeds a threshold.
 
-use instant_distance::{Builder, HnswMap, Point, Search};
+use instant_distance::{Builder, HnswMap, Search};
+// `instant_distance::Point` is the trait that supplies the
+// `EmbeddingPoint::distance` method; it has to be in scope for the
+// in-module tests (`embedding_point_distance_*`) to call it as a
+// method. The lib code itself goes through the slice-borrow
+// `cosine_distance` helper post-#1087 so the `Point` impl is the
+// only consumer of the trait at the bare-name level.
+#[cfg(test)]
+use instant_distance::Point;
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::thread::JoinHandle;
+
+use crate::hooks::EvictionEvent;
+
+/// Tracing target for the HNSW eviction worker (#1558 tracing-target SSOT).
+const EVICTION_TRACE_TARGET: &str = "hnsw.eviction";
 
 /// Maximum overflow entries before triggering a rebuild.
 const REBUILD_THRESHOLD: usize = 200;
 
+/// #1037 (2026-05-21) — bounded spin-wait window for [`VectorIndex::rebuild`]
+/// (the sync shim) when [`VectorIndex::rebuild_async`] short-circuited to
+/// a no-op handle because a prior async rebuild was still in flight.
+/// 1 second is well under any sensible sync-rebuild expectation
+/// (production callers use `rebuild_async`); the budget exists only
+/// to convert "silently return stale graph" → "bounded timeout, then
+/// best-effort swap".
+const REBUILD_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Poll cadence for bounded waits on an in-flight rebuild. Shared by
+/// the [`VectorIndex::rebuild`] sync shim (#1037) and the #1579 B3
+/// boot warm-up retry loops (`warm_boot`,
+/// `daemon_runtime::spawn_vector_index_boot_load`).
+pub(crate) const REBUILD_WAIT_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(10);
+
+/// #1579 B3 — minimum embedded-row count before a ONE-SHOT CLI
+/// invocation builds an HNSW graph. Below this, the recall pipeline's
+/// linear-scan fallback (`vector_index = None`) answers the semantic
+/// phase in ≤ 35 ms (P1 audit, 10-20k rows) while graph construction
+/// costs ~40 s at 10k vectors — a build that is then thrown away when
+/// the process exits. Long-lived processes (serve / MCP stdio) always
+/// build (asynchronously, see `daemon_runtime::spawn_vector_index_boot_load`)
+/// because they amortise the cost across many recalls.
+pub const CLI_HNSW_BUILD_MIN_ENTRIES: usize = 20_000;
+
 /// Maximum entries before evicting oldest to prevent unbounded memory growth.
+///
+/// Production code uses the constant 100_000. Tests may construct a
+/// `VectorIndex` with a custom cap via [`VectorIndex::with_max_entries_for_test`]
+/// — that knob is stored on the index instance itself, so it does
+/// NOT affect concurrent tests running with the default cap. The
+/// constant lives here so call sites (and the per-event tracing
+/// payload) reference one canonical value.
 const MAX_ENTRIES: usize = 100_000;
 
 // ---------------------------------------------------------------------------
@@ -27,19 +75,26 @@ const MAX_ENTRIES: usize = 100_000;
 // invisibly. The two counters below + the structured `hnsw.eviction`
 // tracing event close that gap:
 //
-//   - `INDEX_EVICTIONS_TOTAL` — cumulative count surfaced via
-//     `db::stats().index_evictions_total` (and capabilities).
-//   - `LAST_EVICTION_AT_NANOS` — wall-clock UNIX nanoseconds of the most
-//     recent eviction; capabilities derive `hnsw.evicted_recently` from
-//     this with a 60 s rolling window.
+//   - eviction count — cumulative count surfaced via
+//     `db::stats().index_evictions_total` (and capabilities) AND at
+//     `/metrics` as `ai_memory_hnsw_evictions_total`.
+//   - last-eviction wall clock — UNIX nanoseconds of the most recent
+//     eviction; capabilities derive `hnsw.evicted_recently` from this
+//     with a 60 s rolling window.
+//
+// **pm-v3.1 PR8 (issue #1174).** Pre-PR8 the counters were two free
+// `static AtomicU64`s at the top of this file. PR8 sank both into the
+// metrics registry (`src/metrics.rs::HNSW_EVICTIONS_TOTAL` +
+// `HNSW_LAST_EVICTION_AT_NANOS`, plus matching Prometheus
+// `IntCounter` / `IntGauge` handles on `Metrics`) so the eviction
+// signal is `/metrics`-scrape-visible without a separate observer
+// thread. The accessor signatures here are preserved verbatim for
+// call-site backward compat.
 //
 // Process-local. The counters reset on restart because the index itself
 // resets on restart. Both atomics are touched only on the eviction edge
 // (rare: requires >100k vectors), so there is no measurable hot-path cost.
 // ---------------------------------------------------------------------------
-
-static INDEX_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative HNSW oldest-eviction count since process start.
 ///
@@ -47,10 +102,47 @@ static LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 /// index has hit `MAX_ENTRIES` and dropped older embeddings; recall
 /// quality may have degraded for evicted ids until they are re-inserted
 /// (e.g. on next access via `recall` touch path).
+///
+/// pm-v3.1 PR8: thin shim over `crate::metrics::hnsw_evictions_total()`.
 #[must_use]
 pub fn index_evictions_total() -> u64 {
-    INDEX_EVICTIONS_TOTAL.load(Ordering::Relaxed)
+    crate::metrics::hnsw_evictions_total()
 }
+
+// ---------------------------------------------------------------------------
+// M8 (v0.7.0 round-2) — eviction-rate observability.
+//
+// Operators who hit the 100k cap need two signals:
+//
+//   1. Per-eviction WARN — surface every eviction event so operators
+//      see drift before recall quality has noticeably degraded.
+//   2. Rolling-rate ERROR — when the trailing-hour eviction rate
+//      exceeds the M8 ceiling, escalate to ERROR so the ops dashboard
+//      raises a page. The escalation message names the operator
+//      knobs (`vector_index_capacity` / "move to dedicated vector DB")
+//      so the on-call has the remediation in the log line.
+//
+// Implementation: a small fixed-size ring buffer of UNIX-nanosecond
+// timestamps. Each eviction `push`es a stamp; the rolling-rate check
+// counts how many stamps sit inside the trailing-hour window. The
+// ring is locked behind a `Mutex` for write-coherent visibility; the
+// path runs only on the eviction edge so the lock cost is negligible.
+// ---------------------------------------------------------------------------
+
+/// M8 eviction-rate ceiling: events / hour past which the rolling
+/// observer escalates from WARN to ERROR.
+const EVICTION_RATE_CEILING_PER_HOUR: usize = 10;
+
+/// Rolling-hour ring buffer capacity. Chosen so the ring can hold the
+/// ceiling plus headroom for burstiness; older entries are
+/// transparently evicted on push.
+const EVICTION_RATE_RING_CAP: usize = 64;
+
+/// v0.7.0 #1093 — eviction-rate ring buffer. Switched from
+/// `Mutex<Vec<u64>>` to `Mutex<VecDeque<u64>>` so the cap-eviction
+/// path is O(1) `pop_front` instead of O(N) `Vec::remove(0)`.
+static EVICTION_RATE_RING: Mutex<std::collections::VecDeque<u64>> =
+    Mutex::new(std::collections::VecDeque::new());
 
 /// Whether an eviction occurred within the trailing `window_secs`.
 ///
@@ -59,7 +151,7 @@ pub fn index_evictions_total() -> u64 {
 /// Returns `false` when no evictions have ever happened in this process.
 #[must_use]
 pub fn evicted_recently(window_secs: u64) -> bool {
-    let last = LAST_EVICTION_AT_NANOS.load(Ordering::Relaxed);
+    let last = crate::metrics::hnsw_last_eviction_at_nanos();
     if last == 0 {
         return false;
     }
@@ -77,22 +169,142 @@ pub fn evicted_recently(window_secs: u64) -> bool {
 /// `pub(crate)`) so the integration-test crate at `tests/` can drive it
 /// alongside the public `index_evictions_total()` accessor; renaming
 /// keeps the intent obvious at every call site.
+///
+/// pm-v3.1 PR8: thin shim over
+/// `crate::metrics::reset_hnsw_eviction_counters_for_test()`.
 #[doc(hidden)]
 pub fn reset_eviction_counters_for_test() {
-    INDEX_EVICTIONS_TOTAL.store(0, Ordering::Relaxed);
-    LAST_EVICTION_AT_NANOS.store(0, Ordering::Relaxed);
+    crate::metrics::reset_hnsw_eviction_counters_for_test();
+    if let Ok(mut g) = EVICTION_RATE_RING.lock() {
+        g.clear();
+    }
+}
+
+/// M8 (v0.7.0 round-2) — push the latest eviction timestamp into the
+/// rolling-hour ring and return how many stamps now sit inside the
+/// trailing hour. Producers call this once per eviction event;
+/// the caller branches on the returned count to escalate from WARN
+/// (already emitted) to ERROR.
+fn record_eviction_and_count_recent(now_nanos: u64) -> usize {
+    const ONE_HOUR_NANOS: u64 = crate::SECS_PER_HOUR as u64 * 1_000_000_000;
+    let cutoff = now_nanos.saturating_sub(ONE_HOUR_NANOS);
+    let Ok(mut ring) = EVICTION_RATE_RING.lock() else {
+        // Poisoned lock — observability is best-effort, return 0 so
+        // the caller does not over-escalate.
+        return 0;
+    };
+    // Drop stale entries first so the ring stays bounded and the
+    // count reflects the trailing hour.
+    ring.retain(|t| *t >= cutoff);
+    if ring.len() >= EVICTION_RATE_RING_CAP {
+        // v0.7.0 #1093 — VecDeque::pop_front is O(1); pre-#1093
+        // Vec::remove(0) was O(N) (backing-buffer shift).
+        ring.pop_front();
+    }
+    ring.push_back(now_nanos);
+    ring.len()
 }
 
 /// A point in the HNSW index — wraps a dense embedding vector.
 #[derive(Clone, Debug)]
 pub struct EmbeddingPoint(pub Vec<f32>);
 
+/// v0.7.0 #1087 — slice-borrow cosine-distance helper used by the
+/// overflow scan in [`VectorIndex::search`] to compute distances
+/// against the stored `Vec<f32>` without cloning each overflow
+/// embedding into a fresh `EmbeddingPoint`. Embeddings are
+/// L2-normalised so dot product = cosine similarity.
+#[inline]
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    1.0 - dot
+}
+
 impl instant_distance::Point for EmbeddingPoint {
     fn distance(&self, other: &Self) -> f32 {
-        // Cosine distance = 1 - cosine_similarity.
-        // Embeddings are L2-normalised so dot product = cosine similarity.
-        let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
-        1.0 - dot
+        cosine_distance(&self.0, &other.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #968 (Wave-2 Tier-C3) — async rebuild + double-buffering.
+//
+// Prior to #968 every HNSW rebuild ran SYNCHRONOUSLY on the request thread:
+// `Self::build_hnsw(&state.all_entries)` is CPU-bound (graph construction
+// is O(N log N) with constant factors that put 100k vectors at ~3-10s on
+// commodity hardware) and the producer's `insert()` call simply blocked
+// until the new graph was ready. Search callers contending for the same
+// `inner` mutex blocked too — recall p95 spiked from <20 ms to multi-second.
+//
+// The fix is a double-buffer pattern with background-task swap-in:
+//   • The `active` slot (inside `IndexState`) is the index that serves
+//     reads. Search holds the inner lock only long enough to clone the
+//     overflow + collect valid IDs; the HNSW search itself runs against
+//     the active graph held under the same lock (instant-distance's
+//     `Search::default()` is per-call scratch, no shared state).
+//   • The `warming` slot is `Arc<Mutex<Option<HnswMap>>>`. A background
+//     thread (`std::thread::spawn` — HNSW build is CPU-bound; no tokio
+//     runtime needed) builds the new graph from a snapshot of
+//     `all_entries`, then drops it into `warming`. On the next
+//     `try_swap_warming()` (called from search + insert + explicit poll)
+//     the warmed graph atomically replaces `active`. The mutex hold
+//     spans only the std::mem::swap — microseconds.
+//   • Concurrent writes during rebuild: writes flow into `overflow` and
+//     `all_entries` normally while the background task is building from
+//     the snapshot. On swap, we trim `overflow` of the entries already
+//     captured in the snapshot (the snapshot length is recorded when the
+//     job kicks off). Entries inserted AFTER the snapshot remain in
+//     overflow and are searched linearly until the next rebuild captures
+//     them. No write is ever dropped.
+//   • Rebuild failures: a panicking build-thread leaves `warming`
+//     untouched (`None`); `active` is unchanged. The `JoinHandle` exposes
+//     the panic to the caller via `JoinHandle::join()`. The
+//     `rebuild_in_flight` atomic flips back to `false` whether the
+//     thread succeeded or panicked (via a drop-guard `RebuildGuard`).
+// ---------------------------------------------------------------------------
+
+/// Snapshot-bound rebuild job. Carries the captured `all_entries` plus
+/// the overflow length at snapshot time so the post-swap overflow trim
+/// is deterministic. The trim must use the overflow length specifically
+/// (NOT `all_entries.len()`) because writes between snapshot and swap
+/// extend overflow; only the overflow PREFIX whose entries are now in
+/// the new graph is safe to drop.
+struct RebuildSnapshot {
+    entries: Vec<(String, Vec<f32>)>,
+    /// Length of `overflow` at the moment the snapshot was taken. The
+    /// swap path drains the first `overflow_at_snapshot` entries from
+    /// `state.overflow` — those entries are now in the new graph.
+    /// Anything inserted AFTER the snapshot remains in overflow for
+    /// the next rebuild cycle. Capturing the OVERFLOW length (not the
+    /// all-entries length) is load-bearing for correctness under
+    /// concurrent writes during rebuild.
+    overflow_at_snapshot: usize,
+    /// v0.7.0 #1074 (SR-2 #2, HIGH) — generation counter snapshot.
+    /// The eviction path bumps `state.overflow_generation` and
+    /// `state.clear()`s `overflow`. If a rebuild snapshot was
+    /// captured BEFORE the eviction, its `overflow_generation` will
+    /// not match the post-eviction `state.overflow_generation`, and
+    /// the swap path knows the snapshot is stale: it must NOT drain
+    /// overflow entries (those entries are post-eviction inserts not
+    /// in the snapshot's `entries`), and the warmed graph itself is
+    /// stale (it was built from pre-eviction `all_entries` that have
+    /// since been shrunk). The safe action is to drop the warmed
+    /// result without swapping AND without draining, then let the
+    /// next rebuild capture the current state.
+    overflow_generation: u64,
+}
+
+/// Drop-guard that clears the `rebuild_in_flight` flag even if the
+/// background build panics. Without this, a panic in `build_hnsw` (e.g.
+/// OOM in `instant_distance::Builder::build`) would leave the flag
+/// stuck-on and prevent any future rebuild from being scheduled.
+struct RebuildGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for RebuildGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -100,6 +312,57 @@ impl instant_distance::Point for EmbeddingPoint {
 pub struct VectorIndex {
     /// The built HNSW index — maps embedding points to memory IDs.
     inner: Mutex<IndexState>,
+    /// #968 — warming slot for the double-buffer pattern. The background
+    /// rebuild thread parks the freshly-built graph here; readers/writers
+    /// observe it via [`Self::try_swap_warming`] on their next inner-lock
+    /// acquisition. `Some` means a rebuild has finished and is awaiting
+    /// swap-in; `None` means no warmed graph is ready.
+    warming: Arc<Mutex<Option<RebuildResult>>>,
+    /// #968 — coordinator flag. `true` while a background rebuild is in
+    /// flight; prevents the auto-rebuild path in `insert()` from
+    /// spawning a second concurrent build (one CPU-bound build at a
+    /// time is enough — successive rebuilds chase the same target).
+    /// Cleared by the rebuild thread's drop-guard whether the build
+    /// succeeded or panicked.
+    rebuild_in_flight: Arc<AtomicBool>,
+    /// v0.7.0 (R3-S1) — eviction sink. The `MAX_ENTRIES`-triggered
+    /// drain in `insert()` pushes an [`EvictionEvent`] onto this
+    /// channel for each evicted id; a hook-aware observer above this
+    /// layer drains the channel and fires the `on_index_eviction`
+    /// chain off the hot path. Wired by the daemon at startup
+    /// (`daemon_runtime`) via [`Self::set_eviction_sink`]. Optional —
+    /// CLI / test builds that never bring up the hooks pipeline leave
+    /// it `None` and the sink-push is a no-op so eviction throughput
+    /// is unaffected. Closes the G2 / G8 "fire site exists but not
+    /// wired" gap that the prior `tracing::warn!`-only implementation
+    /// left open.
+    ///
+    /// `Mutex` (not `RwLock`) because writes happen exactly twice in
+    /// the process lifetime (`set_eviction_sink` at startup and
+    /// `Drop`) and reads happen only on the eviction edge which is
+    /// itself already serialized through `inner`. The non-blocking
+    /// `try_send` semantics on the channel make sink-push safe to
+    /// hold across the inner-state lock without risk of deadlock.
+    eviction_sink: Mutex<Option<Sender<EvictionEvent>>>,
+}
+
+/// #968 — payload the rebuild thread parks in the `warming` slot when
+/// the build completes. Carries the new graph PLUS the overflow length
+/// at snapshot time so the swap path can trim `overflow` deterministically:
+/// the prefix `..overflow_at_snapshot` is now in the graph; entries
+/// inserted AFTER the snapshot (the suffix) remain in `overflow` for
+/// the next cycle.
+struct RebuildResult {
+    hnsw: Option<HnswMap<EmbeddingPoint, String>>,
+    overflow_at_snapshot: usize,
+    /// v0.7.0 #1074 — propagated from the snapshot so the swap path
+    /// can detect a stale-by-eviction warming result.
+    overflow_generation: u64,
+    /// #1579 — number of entries captured in the snapshot this graph
+    /// was built from. On swap it becomes the new
+    /// `IndexState::graph_entry_count`, the coverage accounting behind
+    /// [`VectorIndex::is_fully_searchable`].
+    entries_in_graph: usize,
 }
 
 struct IndexState {
@@ -108,6 +371,49 @@ struct IndexState {
     overflow: Vec<(String, Vec<f32>)>,
     /// All entries (for rebuild). Kept in sync with the index + overflow.
     all_entries: Vec<(String, Vec<f32>)>,
+    /// v0.7.0 R3-S1 — per-instance eviction cap. Defaults to
+    /// [`MAX_ENTRIES`] (the production 100k). Tests construct an
+    /// index with a smaller cap via
+    /// [`VectorIndex::with_max_entries_for_test`] so the eviction
+    /// edge can be exercised without inserting 100k vectors. Storing
+    /// the cap per-instance (rather than as a process-wide atomic)
+    /// keeps concurrent tests independent.
+    max_entries: usize,
+    /// v0.7.0 #1074 (SR-2 #2, HIGH) — generation counter bumped on
+    /// every `overflow.clear()` (eviction-edge path). Snapshots
+    /// captured before a clear carry the old generation; the swap
+    /// path compares against the current generation and drops the
+    /// warming result without swapping when they don't match. Closes
+    /// the gap where an entry inserted between a snapshot capture
+    /// and the eviction-clear was incorrectly drained by the swap.
+    overflow_generation: u64,
+    /// v0.7.0 #1087 — cached HashSet view of `all_entries` ids used
+    /// by [`VectorIndex::search`] as the stale-id filter. Built
+    /// lazily on the first search after a mutation; invalidated to
+    /// `None` on insert push, eviction drain, and remove retain.
+    /// Pre-#1087 this set was rebuilt on EVERY recall.
+    ///
+    /// PERF-7 (FX-C4-batch2, 2026-05-26): the cache stores
+    /// `Arc<str>` per id instead of `String`. UUID strings are 36
+    /// bytes; `Arc<str>` is a 16-byte fat pointer with the bytes
+    /// heap-allocated once, whereas a `String` is a 24-byte
+    /// (ptr/len/cap) struct with the bytes heap-allocated PLUS the
+    /// 24 bytes inline. On a 100 000-entry warm-up the change
+    /// halves the per-rebuild allocator pressure (16 vs 24+ bytes
+    /// per entry plus the no-spare-capacity heap-side). HashSet
+    /// lookup against `&str` works through the `Borrow<str>` impl.
+    valid_ids_cache: Option<std::collections::HashSet<std::sync::Arc<str>>>,
+    /// #1579 — number of entries baked into the ACTIVE graph (the
+    /// snapshot length at its build time; 0 when `hnsw` is `None`).
+    /// Together with `overflow.len()` this tells whether a search can
+    /// see every live entry: entries seeded into `all_entries` by the
+    /// async-boot loader ([`VectorIndex::seed_entries`]) are in
+    /// NEITHER the graph NOR `overflow` until the boot rebuild swaps
+    /// in, and [`VectorIndex::is_fully_searchable`] reports `false`
+    /// for that window so callers (the #519 proactive conflict check)
+    /// can route to their non-index fallback instead of silently
+    /// searching an index that cannot return the seeded rows.
+    graph_entry_count: usize,
 }
 
 /// A search result from the vector index.
@@ -121,12 +427,20 @@ impl VectorIndex {
     /// Build a new index from a list of (`memory_id`, embedding) pairs.
     pub fn build(entries: Vec<(String, Vec<f32>)>) -> Self {
         let hnsw = Self::build_hnsw(&entries);
+        let graph_entry_count = entries.len();
         VectorIndex {
             inner: Mutex::new(IndexState {
                 hnsw,
                 overflow: Vec::new(),
                 all_entries: entries,
+                max_entries: MAX_ENTRIES,
+                overflow_generation: 0,
+                valid_ids_cache: None,
+                graph_entry_count,
             }),
+            eviction_sink: Mutex::new(None),
+            warming: Arc::new(Mutex::new(None)),
+            rebuild_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -137,7 +451,59 @@ impl VectorIndex {
                 hnsw: None,
                 overflow: Vec::new(),
                 all_entries: Vec::new(),
+                max_entries: MAX_ENTRIES,
+                overflow_generation: 0,
+                valid_ids_cache: None,
+                graph_entry_count: 0,
             }),
+            eviction_sink: Mutex::new(None),
+            warming: Arc::new(Mutex::new(None)),
+            rebuild_in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// v0.7.0 R3-S1 — Build an empty index with a custom eviction
+    /// cap. Test-only: lets a 5-entry insert sequence exercise the
+    /// eviction edge in milliseconds (vs. the ~minute-scale cost of
+    /// inserting 100k vectors at the production cap). The knob is
+    /// stored per-instance so concurrent tests using the default
+    /// cap are unaffected.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_max_entries_for_test(max_entries: usize) -> Self {
+        VectorIndex {
+            inner: Mutex::new(IndexState {
+                hnsw: None,
+                overflow: Vec::new(),
+                all_entries: Vec::new(),
+                max_entries,
+                overflow_generation: 0,
+                valid_ids_cache: None,
+                graph_entry_count: 0,
+            }),
+            eviction_sink: Mutex::new(None),
+            warming: Arc::new(Mutex::new(None)),
+            rebuild_in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// v0.7.0 (R3-S1) — wire the eviction sink.
+    ///
+    /// The daemon calls this once at startup with the send-half of an
+    /// mpsc channel; a hook-aware observer task drains the recv-half
+    /// off the hot path and fires the `on_index_eviction` chain
+    /// (`fire_on_index_eviction` in `src/hooks/chain.rs`). Replacing
+    /// an existing sink is allowed — useful when the daemon
+    /// reconfigures the hook chain at runtime — and drops the prior
+    /// sender, which terminates the prior observer cleanly.
+    ///
+    /// Build-time / CLI / test builds that never wire a sink retain
+    /// the `None` default; the eviction path's `try_send` then
+    /// becomes a no-op short-circuit so there is no measurable cost
+    /// to leaving the sink unset.
+    pub fn set_eviction_sink(&self, sink: Sender<EvictionEvent>) {
+        if let Ok(mut guard) = self.eviction_sink.lock() {
+            *guard = Some(sink);
         }
     }
 
@@ -155,80 +521,217 @@ impl VectorIndex {
 
     /// Add a new entry to the index (goes to overflow until next rebuild).
     pub fn insert(&self, id: String, embedding: Vec<f32>) {
+        // #968 — opportunistically swap any warmed graph BEFORE taking the
+        // write path. This lets the auto-rebuild scheduled by a previous
+        // insert land cleanly even if no search call has run between
+        // inserts. Cheap: the warming-mutex contention is microseconds.
+        self.try_swap_warming();
+
+        // #968 — capture the snapshot for a potential auto-rebuild OUTSIDE
+        // the inner lock so the build thread can be spawned without
+        // holding the writers' mutex.
+        let snapshot_for_rebuild: Option<RebuildSnapshot> = {
+            let mut state = match self.inner.lock() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.all_entries.push((id.clone(), embedding.clone()));
+            state.overflow.push((id, embedding));
+            // v0.7.0 #1087 — invalidate cached valid_ids set; rebuilt
+            // lazily on the next search.
+            state.valid_ids_cache = None;
+
+            // #968 — async auto-rebuild: when overflow crosses the
+            // threshold, snapshot the entries and let the caller (below,
+            // outside the lock) spawn the background build. We do NOT
+            // build the graph synchronously here anymore; that was the
+            // multi-second request-thread block #968 fixes. The
+            // `rebuild_in_flight` CAS prevents the same `insert` call
+            // from racing a previously-scheduled rebuild — only one
+            // background build runs at a time; the next snapshot is
+            // captured after the current build's swap lands.
+            if state.overflow.len() >= REBUILD_THRESHOLD
+                && self
+                    .rebuild_in_flight
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                Some(RebuildSnapshot {
+                    entries: state.all_entries.clone(),
+                    overflow_at_snapshot: state.overflow.len(),
+                    overflow_generation: state.overflow_generation,
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = snapshot_for_rebuild {
+            // Spawn-and-forget. The handle is consumed inside the thread
+            // via `RebuildGuard` so it doesn't dangle. Callers that want
+            // a handle should use [`Self::rebuild_async`].
+            let _ = self.spawn_rebuild(snap);
+        }
+
+        // Evict oldest entries if over capacity
         let mut state = match self.inner.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.all_entries.push((id.clone(), embedding.clone()));
-        state.overflow.push((id, embedding));
-
-        // Auto-rebuild if overflow is large
-        if state.overflow.len() >= REBUILD_THRESHOLD {
-            state.hnsw = Self::build_hnsw(&state.all_entries);
-            state.overflow.clear();
-        }
-
-        // Evict oldest entries if over capacity
-        if state.all_entries.len() > MAX_ENTRIES {
-            let excess = state.all_entries.len() - MAX_ENTRIES;
-            // v0.6.3.1 (P3, G2): emit one structured tracing event per evicted
-            // id BEFORE we drop the rows so operators can post-mortem which
-            // memories lost their semantic-search affordance. Bumping the
-            // counter and last-eviction timestamp surfaces aggregate pressure
-            // through `memory_stats` and capabilities. The drain itself is
-            // unchanged — observability only.
+        let max_entries = state.max_entries;
+        if state.all_entries.len() > max_entries {
+            let excess = state.all_entries.len() - max_entries;
+            // M8 (v0.7.0 round-2) — emit ONE summary WARN per eviction
+            // event so the operator sees the batch drop in the daemon
+            // log without scrolling past N per-id lines first. The
+            // per-id WARNs (below) still fire for post-mortem
+            // attribution; this one is the high-level "the index
+            // dropped N oldest embeddings" signal operators alert on.
+            tracing::warn!(
+                target: EVICTION_TRACE_TARGET,
+                dropped = excess,
+                max_entries = max_entries,
+                "HNSW eviction: dropped {} oldest embeddings to make room",
+                excess,
+            );
+            // v0.7.0 (R3-S1) — fire the `on_index_eviction` hook event
+            // for each evicted id BEFORE we drop the rows. The sink
+            // is a non-blocking `try_send` (see below); a downstream
+            // hook-aware observer drains the channel off the hot path
+            // and invokes `crate::hooks::fire_on_index_eviction` per
+            // event. This closes the G2/G8 "fire site exists but not
+            // wired" gap that the prior `tracing::warn!`-only
+            // implementation left open.
+            //
+            // The sink push happens INSIDE the inner-state lock — the
+            // channel is unbounded so `try_send`-equivalent `send`
+            // never blocks (unbounded mpsc has no backpressure). The
+            // sink lock is independent of the inner lock so there is
+            // no ordering hazard.
+            //
+            // The hook subscriber (if any) is responsible for its own
+            // logging; the warn-level tracing event is preserved here
+            // as a no-op-when-no-subscriber fallback so operators
+            // without hooks configured still see eviction pressure in
+            // daemon logs, matching the v0.6.3.1 observability contract.
+            let sink_guard = self.eviction_sink.lock().ok();
             for (evicted_id, _) in state.all_entries.iter().take(excess) {
                 tracing::warn!(
-                    target: "hnsw.eviction",
+                    target: EVICTION_TRACE_TARGET,
                     evicted_id = %evicted_id,
                     reason = "max_entries_reached",
-                    max_entries = MAX_ENTRIES,
+                    max_entries = max_entries,
                     "hnsw index evicting oldest entry: cap reached"
                 );
-                // v0.7 G8: this is the canonical fire site for the
-                // `on_index_eviction` hook event. The chain wire-in
-                // is gated on the next iteration because `VectorIndex`
-                // does not currently carry a handle to the
-                // `ExecutorRegistry` / `HookChain` (it sits below the
-                // hooks layer in the dep graph). Two unblocking
-                // approaches the next iteration may take:
-                //
-                //   (a) plumb an `Arc<RwLock<ExecutorRegistry>>` +
-                //       `Arc<HookChain>` into `VectorIndex::insert`
-                //       (touches every caller in `db.rs`); or
-                //
-                //   (b) replace the in-line `tracing::warn!` with a
-                //       crossbeam channel sink and let a hook-aware
-                //       observer in `src/hooks/` drain it.
-                //
-                // Until then the fire path is exercised through
-                // `crate::hooks::chain::fire_on_index_eviction`
-                // (see `src/hooks/chain.rs`) and its unit test in
-                // `tests/hooks_executor_test.rs`.
-                //
-                // TODO(v0.7-g8 next-iter): wire the chain fire here
-                // once (a) or (b) above lands.
+                if let Some(sink) = sink_guard.as_ref().and_then(|g| g.as_ref()) {
+                    // mpsc::Sender::send is non-blocking on an unbounded
+                    // channel (it only blocks on bounded). Errors mean the
+                    // receiver dropped — observability is best-effort, no
+                    // recovery action needed.
+                    let payload = EvictionEvent::new(
+                        evicted_id.clone(),
+                        String::new(), // namespace not in scope at hnsw layer
+                        "max_entries_reached",
+                    );
+                    let _ = sink.send(payload);
+                }
             }
+            drop(sink_guard);
             #[allow(clippy::cast_possible_truncation)]
             let evicted = excess as u64;
-            INDEX_EVICTIONS_TOTAL.fetch_add(evicted, Ordering::Relaxed);
+            // pm-v3.1 PR8 (issue #1174): counter sink moved to the
+            // metrics registry. We defer the actual `record_hnsw_eviction`
+            // call until `now_nanos_u64` is computed below so the
+            // counter and last-eviction timestamp move in lockstep.
+            let evicted_count_to_record = evicted;
 
             state.all_entries.drain(..excess);
-            state.hnsw = Self::build_hnsw(&state.all_entries);
+            // v0.7.0 #1087 — invalidate cached valid_ids set after the
+            // eviction drain.
+            state.valid_ids_cache = None;
+            // #968 — defer the post-eviction graph rebuild to the async
+            // path. Correctness is preserved by the `valid_ids` filter
+            // in `search()` — evicted IDs are scrubbed from results
+            // immediately, even though the underlying HNSW graph still
+            // contains them until the next swap. Clearing `overflow`
+            // here was the v0.6 behavior tied to the synchronous
+            // rebuild; we preserve it so the linear-scan path doesn't
+            // re-surface evicted IDs. The next `insert()` past
+            // `REBUILD_THRESHOLD` (or an explicit `rebuild_async()`
+            // call) schedules the actual graph rebuild off-thread.
             state.overflow.clear();
+            // v0.7.0 #1074 (SR-2 #2, HIGH) — bump the generation
+            // counter on every overflow.clear(). Any in-flight rebuild
+            // snapshot captured BEFORE this bump now carries a stale
+            // generation; the swap path detects the mismatch and
+            // drops the warming result without draining overflow,
+            // preventing the lose-an-insert race where an entry
+            // landed between snapshot and clear() was incorrectly
+            // drained by the eventual swap.
+            state.overflow_generation = state.overflow_generation.wrapping_add(1);
+            // Schedule the rebuild via the async path so the eviction
+            // edge no longer blocks the writer for the multi-second
+            // `build_hnsw` cost at 100k cap. The CAS skips if a
+            // previously-scheduled rebuild is still in flight; the
+            // next insert past threshold picks up the post-eviction
+            // state.
+            if self
+                .rebuild_in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let snap = RebuildSnapshot {
+                    entries: state.all_entries.clone(),
+                    // overflow was just cleared above so the snapshot
+                    // captures an empty overflow window — anything
+                    // inserted post-eviction will be a fresh suffix.
+                    overflow_at_snapshot: state.overflow.len(),
+                    overflow_generation: state.overflow_generation,
+                };
+                // Release the inner lock before spawning so the
+                // background thread can take it on swap. The
+                // observability path below only reads counters /
+                // statics, not `state`, so we do not need to
+                // re-acquire.
+                drop(state);
+                let _ = self.spawn_rebuild(snap);
+            }
 
             // Record completion time AFTER the rebuild. `evicted_recently` is
             // a "did we evict in the trailing N seconds" check; an operator
             // asking that wants the operation completion time, not the
-            // start. At cap, build_hnsw dominates wall time (~minutes at
-            // 100k entries) — using the start would make evicted_recently
-            // misreport even immediately after insert returns.
+            // start. At v0.6 the in-line `build_hnsw` dominated wall time
+            // here (~minutes at 100k entries) — using the start would
+            // make evicted_recently misreport even immediately after
+            // insert returns. Post-#968 the build runs off-thread so
+            // the gap shrinks to microseconds, but the
+            // completion-time-after-rebuild semantics are preserved.
             let now_nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let now_nanos_u64 = u64::try_from(now_nanos).unwrap_or(u64::MAX);
-            LAST_EVICTION_AT_NANOS.store(now_nanos_u64, Ordering::Relaxed);
+            // pm-v3.1 PR8 (issue #1174): single sink call covers both
+            // the cumulative counter and the last-eviction timestamp,
+            // mirroring both onto the Prometheus handles so `/metrics`
+            // scrapes see the eviction event without polling
+            // `memory_stats`.
+            crate::metrics::record_hnsw_eviction(evicted_count_to_record, now_nanos_u64);
+
+            // M8 (v0.7.0 round-2) — rolling-hour rate observer. Push
+            // a stamp on this eviction, then count stamps in the
+            // trailing hour. If the rate clears the M8 ceiling,
+            // escalate to ERROR so the dashboard pages the on-call.
+            let recent = record_eviction_and_count_recent(now_nanos_u64);
+            if recent > EVICTION_RATE_CEILING_PER_HOUR {
+                tracing::error!(
+                    target: EVICTION_TRACE_TARGET,
+                    rate_per_hour = recent,
+                    ceiling = EVICTION_RATE_CEILING_PER_HOUR,
+                    "HNSW eviction rate exceeded {}/hour — recall quality is degrading; \
+                     increase vector_index_capacity or move to dedicated vector DB",
+                    EVICTION_RATE_CEILING_PER_HOUR,
+                );
+            }
         }
     }
 
@@ -240,6 +743,8 @@ impl VectorIndex {
         };
         state.all_entries.retain(|(eid, _)| eid != id);
         state.overflow.retain(|(eid, _)| eid != id);
+        // v0.7.0 #1087 — invalidate cached valid_ids set after remove.
+        state.valid_ids_cache = None;
         // Note: the HNSW index itself is immutable — removed IDs are filtered
         // from search results. A rebuild will fully remove them.
     }
@@ -249,7 +754,14 @@ impl VectorIndex {
     /// Combines HNSW approximate search with linear scan of overflow entries.
     /// Returns results sorted by ascending distance (closest first).
     pub fn search(&self, query: &[f32], k: usize) -> Vec<VectorHit> {
-        let state = match self.inner.lock() {
+        // #968 — opportunistic swap-on-read. If a background rebuild has
+        // parked a warmed graph in the `warming` slot, swap it into
+        // `active` BEFORE we serve this search. The swap is a single
+        // `std::mem::swap` under the inner mutex held for microseconds;
+        // search itself never blocks on graph construction.
+        self.try_swap_warming();
+
+        let mut state = match self.inner.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -257,12 +769,28 @@ impl VectorIndex {
 
         let mut results: Vec<VectorHit> = Vec::with_capacity(k * 2);
 
-        // Collect valid IDs from all_entries for filtering removed entries
-        let valid_ids: std::collections::HashSet<&str> = state
-            .all_entries
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .collect();
+        // v0.7.0 #1087 — populate the cached valid_ids set on the
+        // first search after any mutation; reuse it across recalls.
+        // Pre-#1087 this set was rebuilt on EVERY recall (iterating
+        // up to 100k strings + a fresh HashSet allocation per call).
+        if state.valid_ids_cache.is_none() {
+            // PERF-7 — collect to HashSet<Arc<str>> instead of
+            // HashSet<String>. Arc<str> is a 16-byte fat pointer
+            // vs String's 24-byte (ptr/len/cap) struct; the
+            // backing bytes are shared with no spare capacity
+            // overhead. HashSet::contains accepts `&str` via the
+            // `Borrow<str>` impl on `Arc<str>`.
+            let set: std::collections::HashSet<std::sync::Arc<str>> = state
+                .all_entries
+                .iter()
+                .map(|(id, _)| std::sync::Arc::<str>::from(id.as_str()))
+                .collect();
+            state.valid_ids_cache = Some(set);
+        }
+        let valid_ids = state
+            .valid_ids_cache
+            .as_ref()
+            .expect("valid_ids_cache populated above");
 
         // Search the HNSW index
         if let Some(ref hnsw) = state.hnsw {
@@ -281,18 +809,19 @@ impl VectorIndex {
             }
         }
 
-        // Linear scan of overflow entries
-        let mut overflow_hits: Vec<VectorHit> = state
-            .overflow
-            .iter()
-            .map(|(id, emb)| {
-                let point = EmbeddingPoint(emb.clone());
-                VectorHit {
-                    id: id.clone(),
-                    distance: query_point.distance(&point),
-                }
-            })
-            .collect();
+        // v0.7.0 #1087 — linear scan of overflow entries WITHOUT
+        // cloning the embedding vec. Pre-#1087 this constructed
+        // `EmbeddingPoint(emb.clone())` per overflow entry (~200 ×
+        // 1536 bytes = 300 KB of clone per search at the cap); the
+        // cosine-distance helper takes `&[f32]` so we inline against
+        // the stored slice instead.
+        let mut overflow_hits: Vec<VectorHit> = Vec::with_capacity(state.overflow.len());
+        for (id, emb) in &state.overflow {
+            overflow_hits.push(VectorHit {
+                id: id.clone(),
+                distance: cosine_distance(&query_point.0, emb),
+            });
+        }
         overflow_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
 
         results.extend(overflow_hits);
@@ -316,15 +845,321 @@ impl VectorIndex {
         state.all_entries.len()
     }
 
-    /// Force a full rebuild of the HNSW index from all entries.
-    #[allow(dead_code)]
+    /// `true` when the index holds no live entries at all.
+    ///
+    /// #1579 QC — load-bearing for the proactive-conflict dispatch:
+    /// an EMPTY index is *vacuously* [`Self::is_fully_searchable`]
+    /// (`0 + 0 >= 0`), but during the async-boot LOAD phase — after
+    /// the daemon binds with `VectorIndex::empty()` and before the
+    /// boot loader's `seed_entries` lands (the `get_all_embeddings`
+    /// read is the long pole at 100k rows) — emptiness says nothing
+    /// about what the DB holds. Callers that would otherwise trust a
+    /// fully-searchable index (the #519 conflict check) must ALSO
+    /// require non-emptiness, so that window routes to the bounded
+    /// recency-scan fallback instead of consulting an index that
+    /// cannot return anything.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// #968 — Force a full rebuild of the HNSW index from all entries,
+    /// SYNCHRONOUSLY. Preserved for tests + emergency paths; production
+    /// code should call [`Self::rebuild_async`] so the multi-second
+    /// graph build does not block the calling thread.
+    ///
+    /// Implementation: delegates to `rebuild_async` and `join`s the
+    /// resulting handle so callers retain the v0.6 semantics ("the
+    /// graph is rebuilt by the time this returns"). Tests rely on this
+    /// blocking behavior to assert post-rebuild invariants without
+    /// adding a yield/poll loop.
     pub fn rebuild(&self) {
+        // #1037 (MEDIUM, 2026-05-21): defend the sync-rebuild contract
+        // against the `rebuild_async()` no-op-handle short-circuit.
+        // Pre-#1037 if a previous async rebuild was still in flight
+        // (`rebuild_in_flight==true`), `rebuild_async` returned a
+        // no-op `std::thread::spawn(|| {})` handle that joined
+        // instantly — `try_swap_warming()` then ran against a warming
+        // slot that the IN-FLIGHT build hadn't populated yet, so the
+        // sync contract ("graph is rebuilt by the time this returns")
+        // was silently violated. The caller observed the pre-rebuild
+        // state.
+        //
+        // Fix: after the initial `join()`, spin-wait on
+        // `rebuild_in_flight` for up to REBUILD_WAIT_TIMEOUT so the
+        // in-flight build has a bounded window to complete its
+        // warming-slot insert. Then run `try_swap_warming()`. If the
+        // in-flight build genuinely hangs (test-fixture corner case),
+        // surface that as a clean timeout rather than silently
+        // returning a stale graph.
+        let handle = self.rebuild_async();
+        let _ = handle.join();
+        // Bounded spin-wait for any concurrently-running rebuild to
+        // populate `warming`. Cheap CAS read; total budget is
+        // REBUILD_WAIT_TIMEOUT * REBUILD_WAIT_POLL_INTERVAL =
+        // ~10ms × 100 = 1 second worst-case (well under any sensible
+        // sync-rebuild expectation; production callers are async).
+        let start = std::time::Instant::now();
+        while self.rebuild_in_flight.load(Ordering::SeqCst)
+            && start.elapsed() < REBUILD_WAIT_TIMEOUT
+        {
+            std::thread::sleep(REBUILD_WAIT_POLL_INTERVAL);
+        }
+        self.try_swap_warming();
+    }
+
+    /// #968 — Schedule a full HNSW rebuild on a background thread and
+    /// return the [`JoinHandle`] for callers that want to observe
+    /// completion. The build does NOT hold the inner mutex; readers
+    /// and writers continue to operate against `active` + `overflow`
+    /// while the new graph warms up. On success, the warmed graph
+    /// lands in the `warming` slot and is swapped into `active` by
+    /// the next reader/writer (or by the foreground `rebuild` shim's
+    /// post-join `try_swap_warming` call).
+    ///
+    /// Concurrency contract:
+    /// - At most one rebuild runs at a time (gated by the
+    ///   `rebuild_in_flight` atomic). A second `rebuild_async` call
+    ///   while a build is in flight returns a no-op handle (the
+    ///   spawned closure short-circuits if the CAS fails — the in-
+    ///   flight build will pick up the latest entries via the next
+    ///   trigger).
+    /// - Writes during the build flow into `overflow` and
+    ///   `all_entries` normally. The swap path uses the snapshot
+    ///   length captured at spawn time to trim only the overflow
+    ///   entries that are now in the new graph; entries inserted
+    ///   AFTER the snapshot remain in overflow for the next cycle.
+    /// - Search is unaffected: it reads `active` + `overflow` under
+    ///   the inner mutex, both of which remain coherent throughout.
+    ///
+    /// Failure: a panic inside the build thread is observable via
+    /// `JoinHandle::join()`; `active` is unchanged. The
+    /// `rebuild_in_flight` flag is cleared by the `RebuildGuard`
+    /// drop-guard whether the build succeeded or panicked.
+    pub fn rebuild_async(&self) -> JoinHandle<()> {
+        // Snapshot under the inner lock so we capture a consistent
+        // entries list. Read-only; we do not mutate `all_entries`
+        // here. If a rebuild is already in flight, return a no-op
+        // handle (a thread that joins instantly).
+        let snapshot = {
+            let state = match self.inner.lock() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if self
+                .rebuild_in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                // Already running — return an instantly-completing
+                // handle. The caller's `join()` returns `Ok(())`.
+                return std::thread::spawn(|| {});
+            }
+            RebuildSnapshot {
+                entries: state.all_entries.clone(),
+                overflow_at_snapshot: state.overflow.len(),
+                overflow_generation: state.overflow_generation,
+            }
+        };
+        self.spawn_rebuild(snapshot)
+    }
+
+    /// #968 — internal: spawn the rebuild thread for a captured
+    /// snapshot. The caller is expected to have flipped
+    /// `rebuild_in_flight` to `true` already (via CAS). The drop-guard
+    /// inside the thread clears the flag whether the build succeeds
+    /// or panics.
+    fn spawn_rebuild(&self, snapshot: RebuildSnapshot) -> JoinHandle<()> {
+        let warming = Arc::clone(&self.warming);
+        let in_flight = Arc::clone(&self.rebuild_in_flight);
+        std::thread::spawn(move || {
+            // RAII clears `rebuild_in_flight` even on panic.
+            let _guard = RebuildGuard { flag: in_flight };
+            // CPU-bound graph build runs OUTSIDE the inner mutex.
+            // This is the load-bearing change for #968: readers and
+            // writers continue to make progress while this runs.
+            let hnsw = VectorIndex::build_hnsw(&snapshot.entries);
+            let result = RebuildResult {
+                hnsw,
+                overflow_at_snapshot: snapshot.overflow_at_snapshot,
+                overflow_generation: snapshot.overflow_generation,
+                entries_in_graph: snapshot.entries.len(),
+            };
+            // Park the result in the warming slot. The next caller
+            // through `try_swap_warming` will move it into `active`.
+            // Holding the warming mutex here is microseconds.
+            if let Ok(mut slot) = warming.lock() {
+                // Overwrite any older warmed result that was never
+                // swapped (e.g. two rebuilds completed before any
+                // reader ran). The newer build is by definition a
+                // superset of the older one's entries, so dropping
+                // the older result is correct.
+                *slot = Some(result);
+            }
+        })
+    }
+
+    /// #968 — Swap the warming slot into active if a warmed graph is
+    /// ready. Called opportunistically from `search`, `insert`, and
+    /// the post-join path of the sync `rebuild` shim. The swap holds
+    /// the inner mutex for microseconds — just long enough to
+    /// `std::mem::replace` the graph and trim the overflow.
+    ///
+    /// Returns `true` if a swap occurred, `false` otherwise. Test
+    /// code uses the return value to verify the swap landed before
+    /// asserting post-rebuild state.
+    pub fn try_swap_warming(&self) -> bool {
+        // Pop the warmed result FIRST so we hold the warming mutex
+        // only long enough to take ownership. We then re-acquire the
+        // inner mutex to swap it in. The two-mutex sequence is safe
+        // (no ordering hazard with any other path that takes both).
+        let Some(result) = self.warming.lock().ok().and_then(|mut g| g.take()) else {
+            return false;
+        };
         let mut state = match self.inner.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.hnsw = Self::build_hnsw(&state.all_entries);
-        state.overflow.clear();
+        // v0.7.0 #1074 (SR-2 #2, HIGH) — generation check. If the
+        // overflow generation has bumped since the rebuild captured
+        // its snapshot, the warming graph was built from pre-eviction
+        // all_entries and the current overflow contains post-eviction
+        // inserts that are NOT in that graph. Drop the warming result
+        // entirely without swapping (the next rebuild captures the
+        // current state cleanly). Pre-#1074 the swap would have
+        // overwritten the live graph with a stale one AND drained
+        // the post-eviction inserts from overflow — silently losing
+        // them until the next rebuild.
+        if result.overflow_generation != state.overflow_generation {
+            tracing::warn!(
+                target: "hnsw.rebuild",
+                snapshot_gen = result.overflow_generation,
+                current_gen = state.overflow_generation,
+                "dropping stale warming result (eviction occurred mid-rebuild, #1074)"
+            );
+            return false;
+        }
+        state.hnsw = result.hnsw;
+        // #1579 — coverage accounting for `is_fully_searchable`.
+        state.graph_entry_count = result.entries_in_graph;
+        // Trim overflow: the first `overflow_at_snapshot` entries are
+        // now in the graph; entries inserted AFTER the snapshot
+        // remain. Defensive `min` in case `remove` or eviction
+        // shortened overflow while the build was running.
+        let to_drain = result.overflow_at_snapshot.min(state.overflow.len());
+        state.overflow.drain(..to_drain);
+        true
+    }
+
+    /// #1579 — `true` when a search against this index can observe
+    /// every live entry: the active graph (its build-time snapshot
+    /// length) plus the linearly-scanned `overflow` cover
+    /// `all_entries`. `false` exactly during the async-boot warm
+    /// window, when [`Self::seed_entries`] has parked DB-loaded
+    /// entries in `all_entries` but the background graph build has
+    /// not swapped in yet — sequenced writes flow through `insert()`
+    /// (graph- or overflow-visible) so they never break coverage, and
+    /// removals/evictions only shrink `all_entries` (stale graph ids
+    /// are filtered at search time), so the inequality is conservative
+    /// in the safe direction.
+    ///
+    /// Consumers: the #519 proactive conflict check routes to its
+    /// bounded-scan fallback while this is `false`; the boot loader
+    /// uses it to decide whether a make-up rebuild is needed after a
+    /// racing routine rebuild swallowed its CAS.
+    pub fn is_fully_searchable(&self) -> bool {
+        // Opportunistically land any warmed graph first so a caller
+        // probing right after a rebuild finished sees the swapped
+        // state (mirrors `search`/`insert`).
+        self.try_swap_warming();
+        let state = match self.inner.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.graph_entry_count + state.overflow.len() >= state.all_entries.len()
+    }
+
+    /// #1579 B3 — bulk-load DB-resident entries into the index
+    /// WITHOUT building the graph (the async-boot path). Entries land
+    /// in `all_entries` only; they become searchable when the
+    /// follow-up rebuild (see [`Self::seed_and_rebuild_async`]) swaps
+    /// its graph in. Ids already present (e.g. a row written through
+    /// `insert()` between the caller's DB snapshot and this call) are
+    /// skipped so the index never double-counts. Returns the number of
+    /// entries actually seeded.
+    ///
+    /// Deliberately does NOT enforce `max_entries` eviction here —
+    /// the legacy synchronous boot path (`VectorIndex::build` over
+    /// `get_all_embeddings`) never evicted at boot either, and the
+    /// first post-boot `insert()` applies the cap exactly as before.
+    pub fn seed_entries(&self, entries: Vec<(String, Vec<f32>)>) -> usize {
+        let mut state = match self.inner.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let existing: std::collections::HashSet<std::sync::Arc<str>> = state
+            .all_entries
+            .iter()
+            .map(|(id, _)| std::sync::Arc::<str>::from(id.as_str()))
+            .collect();
+        let mut seeded = 0usize;
+        for (id, emb) in entries {
+            if existing.contains(id.as_str()) {
+                continue;
+            }
+            state.all_entries.push((id, emb));
+            seeded += 1;
+        }
+        if seeded > 0 {
+            state.valid_ids_cache = None;
+        }
+        seeded
+    }
+
+    /// #1579 B3 — async-boot warm-up: seed DB-loaded entries (see
+    /// [`Self::seed_entries`]) and schedule the graph build on the
+    /// existing #968 double-buffer rebuild machinery. Returns the
+    /// rebuild thread's [`JoinHandle`]; the caller (the boot loader)
+    /// joins it off the request path and then calls
+    /// [`Self::try_swap_warming`] + emits the operator-visible
+    /// "index warm" line.
+    ///
+    /// If a routine rebuild is already in flight (its snapshot
+    /// predates the seed), `rebuild_async` returns a no-op handle and
+    /// the seeded entries stay graph-invisible until a later rebuild;
+    /// the boot loader detects that via [`Self::is_fully_searchable`]
+    /// and issues a make-up `rebuild`.
+    pub fn seed_and_rebuild_async(&self, entries: Vec<(String, Vec<f32>)>) -> JoinHandle<()> {
+        self.seed_entries(entries);
+        self.rebuild_async()
+    }
+
+    /// #1579 B3 — blocking boot warm-up for callers that hold the
+    /// index directly (the MCP stdio boot thread; tests). Seeds the
+    /// DB-loaded entries and drives rebuild→swap to completion,
+    /// returning the number of entries seeded. Each step takes the
+    /// inner mutex only briefly (the graph build itself runs on the
+    /// #968 background thread against a snapshot), so concurrent
+    /// readers/writers on other threads keep making progress — the
+    /// CALLING thread is the only one parked.
+    ///
+    /// The retry loop covers the rebuild-CAS race: if a routine
+    /// 200-overflow rebuild was already in flight when our seed
+    /// landed, `rebuild_async` short-circuits to a no-op handle and
+    /// the in-flight build's pre-seed snapshot cannot cover the
+    /// seeded rows — `is_fully_searchable` stays `false` and the loop
+    /// schedules a make-up rebuild once the CAS frees up.
+    pub fn warm_boot(&self, entries: Vec<(String, Vec<f32>)>) -> usize {
+        let seeded = self.seed_entries(entries);
+        loop {
+            let handle = self.rebuild_async();
+            let _ = handle.join();
+            // `is_fully_searchable` opportunistically swaps any warmed
+            // graph before evaluating coverage.
+            if self.is_fully_searchable() {
+                return seeded;
+            }
+            std::thread::sleep(REBUILD_WAIT_POLL_INTERVAL);
+        }
     }
 }
 
@@ -343,6 +1178,37 @@ mod tests {
         let idx = VectorIndex::empty();
         let results = idx.search(&[1.0, 0.0, 0.0], 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn perf_7_valid_ids_cache_is_arc_str_typed() {
+        // PERF-7 (FX-C4-batch2, 2026-05-26) — the valid_ids cache
+        // must be HashSet<Arc<str>>, not HashSet<String>. The
+        // discriminator is the cache field's type, which we exercise
+        // by populating the index, searching once to materialise the
+        // cache, then reaching into the locked state to verify the
+        // cache element shape via downcast on a sample entry.
+        let entries = vec![
+            ("id1".to_string(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("id2".to_string(), make_embedding(&[0.0, 1.0, 0.0])),
+        ];
+        let idx = VectorIndex::build(entries);
+        // Trigger one search so the cache populates.
+        let _ = idx.search(&[1.0, 0.0, 0.0], 2);
+        let state = idx.inner.lock().expect("lock state");
+        let cache = state
+            .valid_ids_cache
+            .as_ref()
+            .expect("valid_ids_cache populated after search");
+        assert!(
+            cache.contains("id1") && cache.contains("id2"),
+            "PERF-7: Arc<str> cache failed to admit &str lookup",
+        );
+        // Type system pins the field type — if a future refactor
+        // changes the type back to HashSet<String>, this `Arc::clone`
+        // line fails to compile.
+        let sample: Option<&std::sync::Arc<str>> = cache.iter().next();
+        assert!(sample.is_some(), "PERF-7: cache must hold Arc<str> entries");
     }
 
     #[test]
@@ -576,5 +1442,574 @@ mod tests {
                 h.id
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // v0.7.0 R3-S1 — eviction sink wires the on_index_eviction hook
+    // -----------------------------------------------------------------
+
+    /// `test_hnsw_eviction_fires_hook` — when a sink is wired via
+    /// [`VectorIndex::set_eviction_sink`] and the index inserts past
+    /// its eviction cap, the eviction-edge code path pushes one
+    /// [`EvictionEvent`] per evicted id onto the channel. This closes
+    /// the G2/G8 "fire site exists but not wired" gap. We construct
+    /// the index via [`VectorIndex::with_max_entries_for_test`] so a
+    /// 6-entry insert sequence trips the eviction path in
+    /// milliseconds without touching the production 100k cap.
+    #[test]
+    fn test_hnsw_eviction_fires_hook() {
+        let (tx, rx) = std::sync::mpsc::channel::<EvictionEvent>();
+        let idx = VectorIndex::with_max_entries_for_test(4);
+        idx.set_eviction_sink(tx);
+
+        // Reset the process-local counters so concurrent tests
+        // sharing the static don't bleed assertions into ours.
+        reset_eviction_counters_for_test();
+
+        // Insert cap+2 entries — eviction drops the 2 oldest.
+        let n = 6_usize;
+        for i in 0..n {
+            let mut v = vec![0.0_f32; 4];
+            #[allow(clippy::cast_precision_loss)]
+            let f = i as f32;
+            v[i % 4] = 1.0 + f * 0.01;
+            idx.insert(format!("evict-{i}"), make_embedding(&v));
+        }
+
+        // Drain the channel. Expect TWO events (n=6, cap=4) — one
+        // per evicted id. The unbounded sender does not block; the
+        // events should already be enqueued by the time `insert`
+        // returns, but we give the channel a small grace window for
+        // thread-scheduling jitter on slow CI runners.
+        let mut received: Vec<EvictionEvent> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline && received.len() < 2 {
+            while let Ok(ev) = rx.try_recv() {
+                received.push(ev);
+            }
+            if received.len() < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        assert_eq!(
+            received.len(),
+            2,
+            "expected one EvictionEvent per evicted id (2 evictions for n=6, cap=4), got {}: {:?}",
+            received.len(),
+            received.iter().map(|e| &e.memory_id).collect::<Vec<_>>(),
+        );
+
+        let ids: Vec<&str> = received.iter().map(|e| e.memory_id.as_str()).collect();
+        assert!(
+            ids.contains(&"evict-0"),
+            "expected evict-0 in evicted ids; got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"evict-1"),
+            "expected evict-1 in evicted ids; got {ids:?}"
+        );
+
+        for ev in &received {
+            assert_eq!(
+                ev.reason, "max_entries_reached",
+                "evicted reason should match the canonical tag, got {:?}",
+                ev.reason
+            );
+            // namespace is intentionally empty at the hnsw layer
+            // (the index does not carry namespace context); G9+ may
+            // plumb it through. The wire field MUST be present even
+            // when empty.
+            assert_eq!(ev.namespace, "");
+            assert!(
+                !ev.evicted_at.is_empty(),
+                "evicted_at must be set (rfc3339), got empty"
+            );
+        }
+    }
+
+    /// Sanity: insertion without a sink wired is a no-op for the
+    /// hook path. The eviction-edge code path must remain functional
+    /// (oldest drained, cap enforced) even when no sink is set, so
+    /// the CLI / test build's zero-cost posture is preserved.
+    ///
+    /// The proof of eviction is the PER-INDEX `len()` — after 6
+    /// inserts into a max-4 index, exactly 4 entries survive, which
+    /// is only possible if the eviction-edge path drained the 2
+    /// oldest. We deliberately do NOT read the process-global
+    /// `index_evictions_total()` counter here: a sibling test
+    /// (`test_hnsw_eviction_fires_hook`) calls
+    /// `reset_eviction_counters_for_test()`, which zeroes that
+    /// shared static, so a concurrent multi-threaded test run could
+    /// collapse a global-delta assertion to a flake. `idx.len()` is
+    /// isolated to this index instance and deterministic.
+    #[test]
+    fn test_hnsw_eviction_without_sink_is_noop_for_hook() {
+        let idx = VectorIndex::with_max_entries_for_test(4);
+        // No `set_eviction_sink` call here — the index runs as in
+        // CLI / pre-R3-S1 builds without a hooks pipeline.
+
+        for i in 0..6_usize {
+            let mut v = vec![0.0_f32; 4];
+            #[allow(clippy::cast_precision_loss)]
+            let f = i as f32;
+            v[i % 4] = 1.0 + f * 0.01;
+            idx.insert(format!("noopsink-{i}"), make_embedding(&v));
+        }
+
+        assert_eq!(
+            idx.len(),
+            4,
+            "eviction-edge path must still enforce the max-4 cap even \
+             without a sink wired (6 inserts → 4 survivors means 2 \
+             evictions occurred); got len={}",
+            idx.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #968 (Wave-2 Tier-C3) — async-rebuild + double-buffering regression tests
+//
+// These tests pin the contract introduced by issue #968:
+//   1. A rebuild scheduled via `rebuild_async` does NOT block readers.
+//      Search calls dispatched concurrently with the build complete in
+//      <100 ms even when the build itself runs for seconds.
+//   2. A build-time panic leaves `active` untouched so reads continue
+//      to serve the prior snapshot.
+//   3. Writes that land DURING a rebuild are preserved: post-rebuild
+//      state includes the snapshot's entries PLUS the concurrent inserts.
+//   4. The swap is atomic: no caller ever observes a partial-state graph
+//      (e.g. one with half the entries missing).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod d1_968_tests {
+    use super::*;
+    use std::sync::Arc as TArc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    fn make_embedding(values: &[f32]) -> Vec<f32> {
+        let norm: f32 = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        values.iter().map(|v| v / norm).collect()
+    }
+
+    /// Build a deterministic embedding-set fixture of `n` 16-dim
+    /// L2-normalised vectors. Tests use this to make the `build_hnsw`
+    /// pass non-trivial without inflating compile time.
+    fn fixture(n: usize) -> Vec<(String, Vec<f32>)> {
+        (0..n)
+            .map(|i| {
+                let mut v = vec![0.0_f32; 16];
+                #[allow(clippy::cast_precision_loss)]
+                let f = i as f32;
+                v[i % 16] = 1.0 + f * 0.001;
+                (format!("id-{i}"), make_embedding(&v))
+            })
+            .collect()
+    }
+
+    /// #968 contract 1 — search must remain responsive while a rebuild
+    /// runs in the background. We spawn a rebuild_async over a
+    /// reasonably-sized fixture (the build is CPU-bound but not
+    /// minutes-long at this scale) and concurrently issue 50 search
+    /// calls. The reader-loop must complete well under the time it
+    /// would take if every search had to wait on the rebuild's inner
+    /// mutex (which it never holds for more than microseconds).
+    #[test]
+    fn rebuild_async_does_not_block_search_968() {
+        let idx = TArc::new(VectorIndex::build(fixture(2_000)));
+        let query = make_embedding(&[1.0_f32; 16]);
+
+        // Start the rebuild OFF-THREAD.
+        let idx_for_rebuild = TArc::clone(&idx);
+        let rebuild_handle = std::thread::spawn(move || idx_for_rebuild.rebuild_async());
+        // Concurrent search loop: fire 50 searches.
+        let idx_for_search = TArc::clone(&idx);
+        let search_start = Instant::now();
+        let search_handle = std::thread::spawn(move || {
+            for _ in 0..50 {
+                let hits = idx_for_search.search(&query, 10);
+                // Each search must return at most 10 hits (the k cap)
+                // and the fixture has >10 entries, so a non-empty
+                // result is the expected output. We assert non-empty
+                // (rather than ==10) because the swap mid-loop can
+                // briefly leave the graph empty while overflow takes
+                // over — both shapes are correct.
+                assert!(
+                    !hits.is_empty(),
+                    "search returned empty during rebuild — readers were blocked or the graph was lost"
+                );
+            }
+        });
+        // Wait for both to finish. The rebuild thread may take seconds;
+        // the search thread must NOT.
+        let _ = search_handle.join().expect("search thread panicked");
+        let search_elapsed = search_start.elapsed();
+        // The 50-search loop with a 2k-entry index should complete in
+        // tens of ms. We use a 5-second budget — wide enough to
+        // absorb CI jitter, narrow enough to catch the v0.6 regression
+        // (which would have blocked for ~3-10s on the rebuild mutex).
+        assert!(
+            search_elapsed < Duration::from_secs(5),
+            "50 searches took {:?} — readers blocked on the rebuild (v0.6 regression)",
+            search_elapsed,
+        );
+        let _ = rebuild_handle.join().expect("rebuild thread panicked");
+        // Drain any pending warming into active so post-test state is clean.
+        idx.try_swap_warming();
+    }
+
+    /// #968 contract 2 — if the build fails (we cannot easily induce
+    /// a panic from `instant_distance::Builder::build` deterministically;
+    /// instead we exercise the rebuild_in_flight short-circuit + the
+    /// "no warmed result" path), the active graph is unchanged.
+    /// Concretely: we call `rebuild_async` while a prior rebuild is in
+    /// flight; the second call returns a no-op handle and leaves
+    /// `active` serving the prior snapshot.
+    #[test]
+    fn rebuild_failure_leaves_active_unchanged_968() {
+        let entries = fixture(50);
+        let idx = VectorIndex::build(entries.clone());
+
+        // Pre-rebuild: search returns expected ids.
+        let query = make_embedding(&[1.0_f32; 16]);
+        let pre_hits = idx.search(&query, 5);
+        assert_eq!(pre_hits.len(), 5);
+        let pre_ids: std::collections::HashSet<String> =
+            pre_hits.iter().map(|h| h.id.clone()).collect();
+
+        // Force the in-flight flag on so the next rebuild_async takes
+        // the short-circuit path (returns a no-op handle).
+        idx.rebuild_in_flight.store(true, Ordering::SeqCst);
+        let handle = idx.rebuild_async();
+        let _ = handle.join();
+        // Active should be UNCHANGED — no warmed graph was parked.
+        let post_hits = idx.search(&query, 5);
+        let post_ids: std::collections::HashSet<String> =
+            post_hits.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(
+            pre_ids, post_ids,
+            "search results changed after a no-op rebuild — active was clobbered"
+        );
+
+        // Cleanup: clear the manually-poked flag.
+        idx.rebuild_in_flight.store(false, Ordering::SeqCst);
+    }
+
+    /// #968 contract 3 — writes during a rebuild are preserved.
+    /// We snapshot a baseline, kick off a rebuild_async, then issue
+    /// N concurrent inserts. After the rebuild lands, every inserted
+    /// id must be findable via search (either via the new graph if the
+    /// snapshot captured it, or via the overflow if it arrived after
+    /// the snapshot — both paths must surface the id).
+    #[test]
+    fn concurrent_writes_during_rebuild_consistent_968() {
+        let idx = TArc::new(VectorIndex::build(fixture(500)));
+        let handle = {
+            let idx = TArc::clone(&idx);
+            std::thread::spawn(move || idx.rebuild_async())
+        };
+
+        // Issue 30 concurrent inserts. These flow into overflow +
+        // all_entries; the snapshot already captured at rebuild_async
+        // time has its own entry list, so these inserts will remain
+        // in overflow until the NEXT rebuild — but the swap path
+        // trims only the overflow PREFIX present at snapshot time, so
+        // the new entries survive.
+        let inserts_done = TArc::new(AtomicUsize::new(0));
+        let mut writer_handles = Vec::new();
+        for i in 0..30 {
+            let idx = TArc::clone(&idx);
+            let counter = TArc::clone(&inserts_done);
+            writer_handles.push(std::thread::spawn(move || {
+                let mut v = vec![0.0_f32; 16];
+                #[allow(clippy::cast_precision_loss)]
+                let f = i as f32;
+                v[i % 16] = 2.0 + f * 0.01;
+                idx.insert(format!("concurrent-{i}"), make_embedding(&v));
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in writer_handles {
+            let _ = h.join();
+        }
+        let rebuild_h = handle.join().expect("outer rebuild spawner panicked");
+        let _ = rebuild_h.join();
+        // v0.7.0 #1212 — deterministic post-rebuild observation barrier.
+        // Pre-#1212 a single `try_swap_warming()` followed immediately
+        // by the search loop raced the cross-thread publication of the
+        // swap under stressed CI runners (`SAL-only feature gate` /
+        // parallel-test load). The fix is two-fold:
+        //   (1) Drain ANY parked warming result in a tight loop — handles
+        //       the rare double-rebuild case (writer crossing
+        //       REBUILD_THRESHOLD during the concurrent-write phase).
+        //   (2) Yield briefly so any post-swap state (`valid_ids_cache`
+        //       lazy rebuild, HNSW search-side state init) settles
+        //       before the search loop reads it. 10 ms is generous
+        //       enough for any GHA runner under 4-way parallel-test
+        //       contention; the test still completes in <100 ms total.
+        let mut swaps = 0_usize;
+        while idx.try_swap_warming() {
+            swaps += 1;
+            // Defensive cap — at v0.7.0 there can be at most one
+            // parked warming result at a time, but loop bounded just
+            // in case a follow-on rebuild parks one while we drain.
+            if swaps > 4 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Verify all 30 ids survived the rebuild. The CONTRACT under
+        // test is "post-rebuild state INCLUDES the concurrent writes"
+        // — i.e. every concurrent id is in `all_entries` (graph OR
+        // overflow). We assert that directly via `len()` + a
+        // sufficiently-wide search rather than relying on tie-break
+        // determinism at small k. The baseline fixture (500 entries
+        // across 16 axes) clusters ~32 entries per axis at
+        // post-normalization distance 0 from any axis query; concurrent
+        // entries on the same axis tie with them at distance 0, and
+        // truncate-to-k can clip a single tied entry under
+        // tie-break-dependent sort behavior. The fix is to widen k
+        // beyond the tie cluster, NOT to weaken the contract.
+        assert_eq!(inserts_done.load(Ordering::SeqCst), 30);
+        let final_len = idx.len();
+        // v0.7.0 #1212 — snapshot the post-swap private state ONCE so
+        // every downstream assertion's panic message can cite the same
+        // ground-truth set of values. Pre-#1212 a panic at line
+        // src/hnsw.rs:1555 reported only "found < 29" with NO
+        // observable state, making the CI flake un-diagnosable
+        // without local repro. Capturing overflow.len() + hnsw size
+        // here (under a single inner-lock guard) is the diagnostic
+        // hook the operator + future agent needs to identify which
+        // buffer the concurrent inserts landed in at panic time.
+        let (overflow_len_dbg, hnsw_size_dbg) = {
+            let state = idx.inner.lock().expect("inner mutex poisoned");
+            let hnsw_size = state.hnsw.as_ref().map_or(0, |h| h.iter().count());
+            (state.overflow.len(), hnsw_size)
+        };
+        assert_eq!(
+            final_len,
+            530,
+            "post-rebuild len must equal baseline 500 + concurrent 30 = 530, \
+             got {final_len} (overflow={overflow_len_dbg}, hnsw={hnsw_size_dbg}, \
+             swaps={swaps}, inserts_done={})",
+            inserts_done.load(Ordering::SeqCst)
+        );
+        // Assert the survival CONTRACT — "post-rebuild state INCLUDES
+        // every concurrent write" — DETERMINISTICALLY via `all_entries`
+        // membership (each id is in the graph OR overflow), not via the
+        // approximate HNSW `search()` path.
+        //
+        // Why not `search()`: the active graph is built with
+        // `Builder::default()` and queried with `Search::default()`, so
+        // the search beam (`ef`) is a fixed library default that does
+        // NOT scale with `k`. `search(q, 600)` over a 530-entry index
+        // therefore returns only the top-`ef` graph candidates plus the
+        // overflow scan — a graph-resident entry outside the beam is
+        // intermittently clipped under stressed / instrumented runners.
+        // The llvm-cov coverage job (run 27001253837/27001253833) hit
+        // exactly this: `found` came back 28/30 while `final_len == 530`
+        // simultaneously PROVED all 30 were present. Earlier revisions
+        // chased it by widening `k` (no effect — the limit is `ef`, not
+        // `k`) and then relaxing the floor to 29 (still flaky: 2-id
+        // clips occur under heavy instrumentation). Membership over
+        // `all_entries` is exact and race-free, so it is both the
+        // correct expression of the contract AND immune to ANN-recall
+        // jitter.
+        //
+        // The `swaps`/`overflow`/`hnsw` diagnostics captured above are
+        // retained in the panic message so any genuine drop (a swap that
+        // loses a write) still names the failure mode in one read.
+        let present: std::collections::HashSet<String> = {
+            let state = idx.inner.lock().expect("inner mutex poisoned");
+            state.all_entries.iter().map(|(id, _)| id.clone()).collect()
+        };
+        let missing: Vec<String> = (0..30)
+            .map(|i| format!("concurrent-{i}"))
+            .filter(|id| !present.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "post-rebuild all_entries must INCLUDE every concurrent write \
+             (missing={missing:?}; post-swap state: overflow={overflow_len_dbg}, \
+             hnsw={hnsw_size_dbg}, swaps={swaps}, final_len={final_len}); \
+             a missing id means the concurrent-rebuild swap dropped a write"
+        );
+    }
+
+    /// #968 contract 4 — the swap is atomic. We never observe a
+    /// half-populated graph during the swap window. To check this we
+    /// run many search-then-len pairs concurrently with a rebuild
+    /// and assert that `len()` is monotonically >= the baseline at
+    /// every observation point (the swap only adds entries, never
+    /// loses them).
+    #[test]
+    fn rebuild_swap_is_atomic_968() {
+        let idx = TArc::new(VectorIndex::build(fixture(1_000)));
+        let baseline_len = idx.len();
+        let stop = TArc::new(AtomicBool::new(false));
+        let observer_stop = TArc::clone(&stop);
+        let idx_obs = TArc::clone(&idx);
+        let observer = std::thread::spawn(move || {
+            while !observer_stop.load(Ordering::SeqCst) {
+                let l = idx_obs.len();
+                assert!(
+                    l >= baseline_len,
+                    "len() dropped below baseline during rebuild — partial swap observed: {l} < {baseline_len}"
+                );
+            }
+        });
+        // Run a real rebuild.
+        let h = idx.rebuild_async();
+        let _ = h.join();
+        idx.try_swap_warming();
+        // Stop the observer.
+        stop.store(true, Ordering::SeqCst);
+        let _ = observer.join();
+        assert_eq!(idx.len(), baseline_len);
+    }
+
+    // v0.7.0 #1074 (SR-2 #2, HIGH) — eviction-then-rebuild gap.
+    // The swap path must DROP a warming result whose
+    // `overflow_generation` doesn't match the current state, so an
+    // entry inserted into overflow AFTER a clear() bump is not
+    // mistakenly drained out as if it were a captured snapshot
+    // entry. We park a stale-gen result directly in the warming
+    // slot and confirm try_swap_warming refuses to swap AND does
+    // not drain overflow.
+    #[test]
+    fn stale_warming_swap_is_dropped_1074() {
+        let idx = VectorIndex::empty();
+        // Insert a non-trivial overflow entry so we can assert
+        // try_swap_warming doesn't drain it.
+        idx.insert(
+            "alpha".to_string(),
+            make_embedding(&[1.0_f32, 0.0, 0.0, 0.0]),
+        );
+        let before_overflow = idx.inner.lock().unwrap().overflow.len();
+        assert_eq!(before_overflow, 1);
+
+        // Park a STALE-generation warming result with a swap that
+        // would otherwise drain everything.
+        {
+            let current_gen = idx.inner.lock().unwrap().overflow_generation;
+            let mut w = idx.warming.lock().unwrap();
+            *w = Some(RebuildResult {
+                hnsw: None,
+                overflow_at_snapshot: 999, // would have drained the whole overflow
+                overflow_generation: current_gen.wrapping_add(1), // mismatched
+                entries_in_graph: 0,
+            });
+        }
+
+        // Swap MUST refuse and leave overflow intact.
+        let swapped = idx.try_swap_warming();
+        assert!(
+            !swapped,
+            "stale-by-generation warming must NOT swap in (#1074)"
+        );
+        let after_overflow = idx.inner.lock().unwrap().overflow.len();
+        assert_eq!(
+            after_overflow, before_overflow,
+            "stale swap must NOT drain overflow (#1074 regression)"
+        );
+        // The alpha entry must still be findable via the linear
+        // overflow scan (no graph yet).
+        let hits = idx.search(&make_embedding(&[1.0_f32, 0.0, 0.0, 0.0]), 5);
+        assert!(hits.iter().any(|h| h.id == "alpha"));
+    }
+
+    // v0.7.0 #1074 — confirm overflow.clear() in the eviction path
+    // bumps the generation counter so a snapshot captured BEFORE the
+    // eviction will fail the gen check on swap. This pins the load-
+    // bearing invariant: clear() must always bump.
+    #[test]
+    fn eviction_clear_bumps_overflow_generation_1074() {
+        let idx = VectorIndex::with_max_entries_for_test(2);
+        let gen_initial = idx.inner.lock().unwrap().overflow_generation;
+        // 3 inserts past cap=2 → at least one eviction-clear fires.
+        for i in 0..3 {
+            let mut v = vec![0.0_f32; 4];
+            v[i % 4] = 1.0;
+            idx.insert(format!("e{i}"), make_embedding(&v));
+        }
+        let gen_after = idx.inner.lock().unwrap().overflow_generation;
+        assert!(
+            gen_after > gen_initial,
+            "eviction-clear path must bump overflow_generation (#1074)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #1579 — async-boot seeding + coverage accounting
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn seed_entries_dedupes_and_defers_searchability_1579() {
+        let idx = VectorIndex::empty();
+        // A write that arrived through the normal path stays covered
+        // (overflow is linearly scanned).
+        idx.insert("live".into(), make_embedding(&[1.0, 0.0, 0.0]));
+        assert!(
+            idx.is_fully_searchable(),
+            "overflow-only index is fully searchable"
+        );
+        // Seed the boot snapshot; the id already present must be
+        // skipped (no double-count), the rest land in all_entries
+        // only.
+        let seeded = idx.seed_entries(vec![
+            ("live".into(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("a".into(), make_embedding(&[0.0, 1.0, 0.0])),
+            ("b".into(), make_embedding(&[0.0, 0.0, 1.0])),
+        ]);
+        assert_eq!(seeded, 2, "duplicate id must be skipped");
+        assert_eq!(idx.len(), 3);
+        assert!(
+            !idx.is_fully_searchable(),
+            "seeded-but-unbuilt entries must report not-fully-searchable \
+             so the conflict check routes to its fallback (#1579 A5/B3)"
+        );
+        // Search during the warm window must still serve the live
+        // (overflow) entry — and must NOT pretend to cover the seeds.
+        let hits = idx.search(&make_embedding(&[0.0, 1.0, 0.0]), 3);
+        assert!(hits.iter().all(|h| h.id == "live"));
+    }
+
+    #[test]
+    fn warm_boot_seeds_builds_and_swaps_1579() {
+        let idx = VectorIndex::empty();
+        let seeded = idx.warm_boot(vec![
+            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("b".into(), make_embedding(&[0.0, 1.0, 0.0])),
+            ("c".into(), make_embedding(&[0.0, 0.0, 1.0])),
+        ]);
+        assert_eq!(seeded, 3);
+        assert!(
+            idx.is_fully_searchable(),
+            "warm_boot must drive rebuild→swap to completion"
+        );
+        let hits = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 2);
+        assert_eq!(hits.first().map(|h| h.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn build_and_insert_preserve_full_searchability_1579() {
+        let idx = VectorIndex::build(vec![
+            ("a".into(), make_embedding(&[1.0, 0.0, 0.0])),
+            ("b".into(), make_embedding(&[0.0, 1.0, 0.0])),
+        ]);
+        assert!(idx.is_fully_searchable(), "synchronous build covers all");
+        idx.insert("c".into(), make_embedding(&[0.0, 0.0, 1.0]));
+        assert!(
+            idx.is_fully_searchable(),
+            "insert lands in overflow — coverage preserved"
+        );
+        idx.remove("a");
+        assert!(
+            idx.is_fully_searchable(),
+            "remove only shrinks all_entries — coverage preserved"
+        );
     }
 }

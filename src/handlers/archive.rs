@@ -1,0 +1,598 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! HTTP handlers for the archive surface (#650 follow-up per-domain
+//! split). The five archive endpoints listed below were extracted
+//! verbatim from `src/handlers/http.rs` (commit 88d9a96, lines
+//! 7196-7558). Wire compatibility is preserved via the
+//! `pub use archive::*` re-export from `src/handlers/mod.rs`; the
+//! Axum router registrations in `src/lib.rs` are unchanged.
+//!
+//! Routes wired here:
+//!
+//! * `GET    /api/v1/archive`              → [`list_archive`]
+//! * `POST   /api/v1/archive`              → [`archive_by_ids`]
+//! * `DELETE /api/v1/archive`              → [`purge_archive`]
+//! * `POST   /api/v1/archive/{id}/restore` → [`restore_archive`]
+//! * `GET    /api/v1/archive/stats`        → [`archive_stats`]
+
+use crate::models::field_names;
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::db;
+use crate::identity::sentinels;
+use crate::validate;
+
+use super::AppState;
+use super::MAX_BULK_SIZE;
+#[cfg(feature = "sal")]
+use super::StorageBackend;
+#[cfg(feature = "sal")]
+use super::store_err_to_response;
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveListQuery {
+    pub namespace: Option<String>,
+    #[serde(default = "default_archive_limit")]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_archive_limit() -> Option<usize> {
+    Some(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+}
+
+pub async fn list_archive(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ArchiveListQuery>,
+) -> impl IntoResponse {
+    // #943 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate every archived
+    // row in the deployment. Mirror the #946 list_agents pattern;
+    // sibling of archive_stats below.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "list_archive") {
+        return resp;
+    }
+    // Ultrareview #350: validate limit range. `usize` already precludes
+    // negative values at the serde layer, but `limit=0` silently
+    // returned an empty page — indistinguishable from "no results".
+    // Require 1..=1000 and reject 0 with a specific error.
+    if matches!(q.limit, Some(0)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "limit must be >= 1"})),
+        )
+            .into_response();
+    }
+
+    // v0.7.0 ARCH-2 FX-C2-batch5 (2026-05-27): route the postgres branch
+    // through the new `MemoryStore::list_archived` trait method (the
+    // SAL is now the canonical archive-list surface). The legacy
+    // `list_archived_via_store` downcast hatch still exists for
+    // out-of-tree callers but new routes ride the trait surface.
+    // Pre-batch5 the postgres branch dispatched through
+    // `list_archived_via_store`, which downcasted to `PostgresStore`
+    // via the `as_any_for_postgres` hatch.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let limit = q
+            .limit
+            .unwrap_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+            .clamp(1, crate::storage::LIST_MAX_LIMIT);
+        let offset = q.offset.unwrap_or(0);
+        return match app
+            .store
+            .list_archived(q.namespace.as_deref(), limit, offset)
+            .await
+        {
+            Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let limit = q
+        .limit
+        .unwrap_or(crate::storage::ARCHIVE_DEFAULT_PAGE_LIMIT)
+        .clamp(1, crate::storage::LIST_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+    // PERF-1 (FX-3): wrap rusqlite scan in `db_op`. archived_memories
+    // can carry hundreds of thousands of rows on long-running daemons;
+    // the LIMIT/OFFSET scan can take 50ms+ at the tail and would
+    // otherwise pin a tokio worker.
+    let namespace = q.namespace.clone();
+    let result = super::db_op(app.db.clone(), move |guard| {
+        db::list_archived(&guard.0, namespace.as_deref(), limit, offset)
+    })
+    .await;
+    match result {
+        Ok(items) => Json(json!({"archived": items, "count": items.len()})).into_response(),
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
+    }
+}
+
+pub async fn restore_archive(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
+    // state-change audit. Restoring a row pulls it from the archived
+    // table back into the live working set; this is a privileged admin
+    // operation that must produce a forensic-chain entry BEFORE the
+    // storage write.
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        crate::governance::action_labels::ARCHIVE_RESTORE,
+        "",
+        json!({ "id": &id }),
+    );
+    // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
+    // route through the SAL `archive_restore` trait method. Federation
+    // fanout for restore stays sqlite-only (the `broadcast_restore_quorum`
+    // path uses sqlite-coupled fed-tracker state); postgres-backed
+    // operators relying on multi-node consistency should poll peers.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        // QC P1 fix (2026-05-20): use the resolved `caller` (header)
+        // so the SAL #910 visibility filter applies — archive ops
+        // can only touch memories owned by the caller.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
+        return match app.store.archive_restore(&ctx, &id).await {
+            Ok(true) => {
+                // #950 SECURITY-medium (Track A QC sweep, 2026-05-20)
+                // — fire subscription dispatch on the postgres restore
+                // path. Re-fetch the restored row to anchor the event
+                // on its namespace; if the lookup fails, skip dispatch
+                // rather than firing with a synthetic namespace.
+                if let Ok(mem) = app.store.get(&ctx, &id).await {
+                    let mem_owner = mem
+                        .metadata
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    super::dispatch_event_postgres(
+                        &app,
+                        "memory_restore",
+                        &id,
+                        &mem.namespace,
+                        mem_owner.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
+                Json(
+                    json!({"restored": true, "id": id, (field_names::STORAGE_BACKEND): "postgres"}),
+                )
+                .into_response()
+            }
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": crate::errors::msg::NOT_FOUND_IN_ARCHIVE})),
+            )
+                .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    // #940 (security-high, 2026-05-20) — caller-vs-row-owner gate.
+    // Pre-#940 the sqlite branch called the owner-blind
+    // `db::restore_archived(&lock.0, &id)` and any authenticated HTTP
+    // caller could restore any other owner's archived rows back into
+    // the live working set. The postgres SAL branch above was already
+    // QC-P1-fixed (2026-05-20) to pass
+    // `CallerContext::for_agent(caller)`; this routes the sqlite
+    // branch through the caller-scoped variant for parity. A
+    // non-owner attempt returns 404 (not 403) so the surface cannot
+    // be used to enumerate other owners' archived ids — mirrors the
+    // #927 `get_memory` posture.
+    // PERF-1 (FX-3): wrap the rusqlite restore in `db_op`. The restore
+    // path does INSERT...SELECT + DELETE on archived_memories, then
+    // re-inserts the row into memories triggering FTS rebuild — all
+    // on the calling thread pre-fix.
+    let id_for_restore = id.clone();
+    let caller_for_restore = caller.clone();
+    let restored = match super::db_op(app.db.clone(), move |guard| {
+        db::restore_archived_for_caller(&guard.0, &id_for_restore, &caller_for_restore)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::handlers::errors::handler_error_500(&e);
+        }
+    };
+    if !restored {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": crate::errors::msg::NOT_FOUND_IN_ARCHIVE})),
+        )
+            .into_response();
+    }
+
+    // v0.6.2 (S29): broadcast the restore to peers so they move the row
+    // from `archived_memories` → `memories` in lockstep. Without this, a
+    // POST /api/v1/archive/{id}/restore on node-1 leaves node-2..4 with
+    // the row still archived, so node-4 never sees M1 re-enter the active
+    // set (the testbook-v3 S29 assertion). Same posture as
+    // `archive_by_ids`: on a quorum miss we short-circuit with 503 so
+    // operators can retry.
+    if let Some(fed) = app.federation.as_ref() {
+        match crate::federation::broadcast_restore_quorum(fed, &id).await {
+            Ok(tracker) => {
+                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                    // #869 — typed 503 envelope via the shared helper.
+                    let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                    return super::quorum_not_met_response(&payload);
+                }
+            }
+            Err(e) => {
+                // Local commit already landed — sync-daemon catches
+                // stragglers. Same posture as `fanout_or_503`.
+                tracing::warn!("restore fanout error (local committed): {e:?}");
+            }
+        }
+    }
+
+    Json(json!({"restored": true, "id": id})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PurgeQuery {
+    pub older_than_days: Option<i64>,
+}
+
+pub async fn purge_archive(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PurgeQuery>,
+) -> impl IntoResponse {
+    // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
+    // `archive_purge` permanently deletes archived memories; SOC2-grade
+    // deployments must prove "who deleted what when". Forensic-chain
+    // entry is emitted BEFORE the destructive write so the audit trail
+    // captures the intent even if the storage layer errors.
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+
+    // #936 (security-critical, 2026-05-20) — caller-vs-row-owner gate.
+    // Pre-#936 the SAL trait method took NO caller and the handler
+    // resolved the caller only for the audit emit; the destructive
+    // DELETE then ran without any owner constraint. Any authenticated
+    // caller could destroy every owner's archive corpus.
+    //
+    // Default posture: `CallerContext::for_agent(caller)` — the SAL
+    // constrains the DELETE to rows whose `metadata.agent_id`
+    // (or the inbox-target carve-out `metadata.target_agent_id`)
+    // matches the caller. A non-admin call with no matching rows
+    // returns 200 OK with `{purged: 0}` so the surface cannot be
+    // used to enumerate other owners' archived rows.
+    //
+    // Admin/operator path: when the caller appears in the
+    // operator-configured `[admin].agent_ids` allowlist the SAL is
+    // called with `bypass_visibility = true` (the SHIP-cluster
+    // `for_admin` posture) so the DELETE runs cross-tenant — the
+    // legitimate `archive_max_days` operator wipe surface.
+    let is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        crate::governance::action_labels::ARCHIVE_PURGE,
+        "",
+        json!({
+            (field_names::OLDER_THAN_DAYS): q.older_than_days,
+            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
+        }),
+    );
+
+    // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
+    // route through the SAL trait. Wire shape preserved: `{purged}`.
+    //
+    // v0.7.0 #1062 (Agent-2 #9) — use `for_admin_checked` (not the
+    // raw `for_admin` literal) so the admin posture is a typed
+    // dependency of the construction call. A future refactor that
+    // moves the construction earlier in the function (or removes
+    // the gate) cannot accidentally hand an admin context to a
+    // non-admin caller — `is_admin` MUST be threaded through.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = crate::store::CallerContext::for_admin_checked(caller.clone(), is_admin);
+        return match app.store.archive_purge(&ctx, q.older_than_days).await {
+            Ok(n) => Json(json!({
+                "purged": n,
+                (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
+                (field_names::STORAGE_BACKEND): "postgres",
+            }))
+            .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    // PERF-1 (FX-3): wrap the rusqlite DELETE in `db_op`. The purge
+    // can touch tens of thousands of archived rows; running it on the
+    // tokio worker pinned the runtime for the whole DELETE.
+    let caller_for_purge = caller.clone();
+    let older_than_days = q.older_than_days;
+    let purge_result = super::db_op(app.db.clone(), move |guard| {
+        if is_admin {
+            db::purge_archive(&guard.0, older_than_days)
+        } else {
+            db::purge_archive_for_caller(&guard.0, &caller_for_purge, older_than_days)
+        }
+    })
+    .await;
+    match purge_result {
+        Ok(n) => Json(json!({
+            "purged": n,
+            (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
+        }))
+        .into_response(),
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
+    }
+}
+
+pub async fn archive_stats(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // #943 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
+    // only gate. Pre-fix any caller could enumerate archive table
+    // size + per-reason counts + per-namespace stats. Sibling of
+    // list_archive above.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "archive_stats") {
+        return resp;
+    }
+    // v0.7.0 Wave-3 Continuation — postgres-backed daemons aggregate
+    // counts directly from the `archived_memories` table.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return match crate::store::postgres::archive_stats_via_store(&app.store).await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    // PERF-1 (FX-3): wrap the rusqlite aggregate scan in `db_op`.
+    // archive_stats reads multiple GROUP BY queries off
+    // archived_memories and is admin-only — low rate but high tail
+    // latency on a saturated archive table.
+    let result = super::db_op(app.db.clone(), move |guard| db::archive_stats(&guard.0)).await;
+    match result {
+        Ok(archive_stats) => Json(archive_stats).into_response(),
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
+    }
+}
+
+/// Request body for `POST /api/v1/archive` — S29 explicit archive.
+#[derive(Debug, Deserialize)]
+pub struct ArchiveByIdsBody {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST /api/v1/archive — explicit archive of the given memory ids
+/// (S29). For each id:
+///   1. Call `db::archive_memory` locally to soft-move the row.
+///   2. If federation is configured, broadcast via
+///      `broadcast_archive_quorum` so peers land in the same terminal
+///      state (row out of `memories`, row into `archived_memories`).
+///
+/// On a quorum miss for ANY id, short-circuit with 503 via the shared
+/// `fanout_or_503`-style payload. This matches the posture of the
+/// delete + consolidate fanout endpoints.
+///
+/// Response body:
+/// ```json
+/// {"archived": [id1, id2], "missing": [id3], "count": 2}
+/// ```
+/// where `missing` enumerates ids that had no live row locally (common
+/// during retries). The response never includes content/metadata — use
+/// `GET /api/v1/archive` to list archive entries.
+#[allow(clippy::too_many_lines)]
+pub async fn archive_by_ids(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ArchiveByIdsBody>,
+) -> impl IntoResponse {
+    // Bound the batch the same way bulk_create / sync_push do.
+    if body.ids.len() > MAX_BULK_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("archive limited to {} ids per request", MAX_BULK_SIZE)})),
+        )
+            .into_response();
+    }
+    // Validate all ids up-front so we never start mutating on a bad batch.
+    for id in &body.ids {
+        if let Err(e) = validate::validate_id(id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid id {id}: {e}")})),
+            )
+                .into_response();
+        }
+    }
+    let reason = body.reason.as_deref().unwrap_or("archive").to_string();
+
+    // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
+    // state-change audit. `archive_by_ids` performs a bulk soft-delete
+    // into the archived_memories table. Emit the forensic-chain entry
+    // BEFORE the storage writes so the audit trail captures the batch
+    // and the caller's identity regardless of partial-success behaviour.
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "archive_by_ids",
+        "",
+        json!({
+            "id_count": body.ids.len(),
+            "reason": &reason,
+        }),
+    );
+    let mut archived: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
+    // route through the SAL `archive_by_ids` trait method. The federation
+    // fanout stays sqlite-only; postgres operators relying on multi-node
+    // consistency should poll peers.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        // QC P1 fix (2026-05-20): use the resolved `caller` (header)
+        // so the SAL #910 visibility filter applies — archive ops
+        // can only touch memories owned by the caller.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone());
+        // Run per-id so we can split archived vs missing — the trait
+        // method bulk-archives but doesn't tell us which were missing,
+        // so we probe each via the count delta.
+        for id in &body.ids {
+            match app
+                .store
+                .archive_by_ids(&ctx, std::slice::from_ref(id), Some(&reason))
+                .await
+            {
+                Ok(1) => archived.push(id.clone()),
+                Ok(_) => missing.push(id.clone()),
+                Err(e) => return store_err_to_response(e),
+            }
+        }
+        // #950 SECURITY-medium (Track A QC sweep, 2026-05-20) — fire
+        // `memory_archive` per archived row on the postgres path. Each
+        // archive event is anchored on the (now-archived) memory id;
+        // for namespace anchoring we look the row up in archive via
+        // the SAL trait. If a follow-up `archive_get_by_id`-style read
+        // is unavailable on this trait surface, we fall back to an
+        // empty namespace + no owner (best-effort dispatch).
+        for id in &archived {
+            // The row no longer lives in `memories`; reading via
+            // app.store.get returns NotFound after the archive write.
+            // Fire the event with the caller as the agent_id and no
+            // namespace anchor — downstream subscribers match by
+            // event_type + memory_id, not namespace, for archive
+            // events.
+            super::dispatch_event_postgres(
+                &app,
+                crate::governance::OP_MEMORY_ARCHIVE,
+                id,
+                "",
+                Some(&caller),
+                None,
+            )
+            .await;
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "archived": archived,
+                "missing": missing,
+                "count": archived.len(),
+                "reason": reason,
+                (field_names::STORAGE_BACKEND): "postgres",
+            })),
+        )
+            .into_response();
+    }
+
+    for id in &body.ids {
+        // Local archive. Hold the lock only across this one call per id so
+        // we can release it before a potentially slow network fanout.
+        //
+        // #940 (security-high, 2026-05-20) — caller-vs-row-owner gate.
+        // Pre-#940 the sqlite branch called the owner-blind
+        // `db::archive_memory(&lock.0, id, ...)` and any authenticated
+        // HTTP caller could bulk-archive any other owner's live rows
+        // (cross-tenant denial-of-service primitive). The postgres SAL
+        // branch above was already QC-P1-fixed (2026-05-20) to pass
+        // `CallerContext::for_agent(caller)`; this routes the sqlite
+        // branch through the caller-scoped variant for parity. A
+        // non-owner id surfaces in `missing` (same semantics as a row
+        // that wasn't live locally) so the surface cannot be used to
+        // probe other owners' live ids.
+        let moved = {
+            let lock = app.db.lock().await;
+            match db::archive_memory_for_caller(&lock.0, id, Some(&reason), &caller) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("archive_by_ids: archive_memory({id}) failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+        if !moved {
+            // Row wasn't live locally — record as missing but keep going.
+            // Do NOT fan out (peers can't know to archive from a row they
+            // may have under a different state; the originator's local
+            // state is the trigger).
+            missing.push(id.clone());
+            continue;
+        }
+
+        // Fanout. Mirror the shape used by the other
+        // quorum-backed write endpoints (delete, consolidate) — on a
+        // miss, surface the `quorum_not_met` payload with 503 + Retry-After.
+        if let Some(fed) = app.federation.as_ref() {
+            match crate::federation::broadcast_archive_quorum(fed, id).await {
+                Ok(tracker) => {
+                    if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                        // #869 — typed 503 envelope via the shared helper.
+                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                        return super::quorum_not_met_response(&payload);
+                    }
+                }
+                Err(e) => {
+                    // Local commit already landed — sync-daemon catches
+                    // stragglers. Same posture as `fanout_or_503`.
+                    tracing::warn!("archive fanout error (local committed): {e:?}");
+                }
+            }
+        }
+        archived.push(id.clone());
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "archived": archived,
+            "missing": missing,
+            "count": archived.len(),
+            "reason": reason,
+        })),
+    )
+        .into_response()
+}

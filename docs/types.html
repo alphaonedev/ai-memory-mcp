@@ -1,7 +1,7 @@
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  Types atlas — every public Rust struct and enum in src/models.rs.
+  Types atlas — every public Rust struct and enum in src/models/.
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Types — every public struct and enum</title>
-<meta name="description" content="ai-memory v0.6.3.1 type reference. Every public Rust struct and enum exposed at the API/MCP/CLI boundaries. Tier, Memory, MemoryLink, GovernancePolicy, ApproverType, VectorClock, and 21 more.">
+<meta name="description" content="ai-memory v0.7.0 type reference. Every public Rust struct and enum exposed at the API/MCP/CLI boundaries. Tier, Memory, MemoryLink, GovernancePolicy, ApproverType, VectorClock, and 21 more.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/types.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -89,6 +89,17 @@ footer a{color:var(--text-muted)}
 .topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
 .topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
 .topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -98,11 +109,14 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Types</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -125,6 +139,7 @@ footer a{color:var(--text-muted)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -136,6 +151,9 @@ footer a{color:var(--text-muted)}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -145,23 +163,91 @@ footer a{color:var(--text-muted)}
           <a href="types.html" class="current">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -172,7 +258,7 @@ footer a{color:var(--text-muted)}
     <span class="pill">5 enums</span>
     <span class="pill">22 structs</span>
     <span class="pill">5 consts</span>
-    <span class="pill">v0.6.3 schema</span>
+    <span class="pill">v0.7.0 — Memory 26 fields / MemoryLink 6 relations</span>
   </div>
 </section>
 
@@ -234,37 +320,52 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     </div>
 
     <div class="ty k-struct" id="memory">
-      <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1</span></div>
+      <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · grew to 26 fields at v0.7.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index.</div>
+      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index. <strong>26 fields at v0.7.0</strong> (was 15 at v0.6.x; canonical truth in <code>src/models/memory.rs::Memory</code>, <code>FIELD_COUNT = 26</code>) — adds <code>reflection_depth</code> (Task 1/8 recursive learning), <code>memory_kind</code> (Batman Form-6 vocabulary), <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact), <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance), <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 calibration), and the <code>version</code> BIGINT (Gap-1 optimistic concurrency, schema v45).</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>UUIDv4 primary key.</td></tr>
         <tr><td class="fname">tier</td><td class="ftype">Tier</td><td class="fnote"><span class="flag req">REQ</span>One of <code>short</code> · <code>mid</code> · <code>long</code>.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>Hierarchical path; up to 8 segments; default <code>"global"</code>.</td></tr>
-        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–500 chars; required.</td></tr>
+        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–512 chars (<code>MAX_TITLE_LEN</code>); required.</td></tr>
         <tr><td class="fname">content</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–65 536 bytes (<code>MAX_CONTENT_SIZE</code>).</td></tr>
-        <tr><td class="fname">tags</td><td class="ftype">Vec&lt;String&gt;</td><td class="fnote"><span class="flag def">DEF</span>Default <code>[]</code>; max 32 tags, 64 chars each.</td></tr>
+        <tr><td class="fname">tags</td><td class="ftype">Vec&lt;String&gt;</td><td class="fnote"><span class="flag def">DEF</span>Default <code>[]</code>; max 50 tags (<code>MAX_TAGS_COUNT</code>), 128 bytes each (<code>MAX_TAG_LEN</code>).</td></tr>
         <tr><td class="fname">priority</td><td class="ftype">i32</td><td class="fnote"><span class="flag def">DEF</span>Default 5; range 1-10.</td></tr>
         <tr><td class="fname">confidence</td><td class="ftype">f64</td><td class="fnote"><span class="flag def">DEF</span>Default 1.0; range 0.0-1.0.</td></tr>
-        <tr><td class="fname">source</td><td class="ftype">String</td><td class="fnote"><span class="flag def">DEF</span>Default <code>"api"</code>; closed set: user · claude · hook · api · import.</td></tr>
+        <tr><td class="fname">source</td><td class="ftype">String</td><td class="fnote"><span class="flag def">DEF</span>Default <code>"api"</code>; closed set (<code>VALID_SOURCES</code>): user · nhi · claude (deprecated) · hook · api · cli · import · consolidation · system · chaos · notify.</td></tr>
         <tr><td class="fname">access_count</td><td class="ftype">i64</td><td class="fnote">Server-tracked; bumps on each <code>memory_get</code>/<code>memory_recall</code> hit.</td></tr>
         <tr><td class="fname">created_at</td><td class="ftype">String</td><td class="fnote">RFC3339; server-stamped.</td></tr>
         <tr><td class="fname">updated_at</td><td class="ftype">String</td><td class="fnote">RFC3339; updated on each <code>memory_update</code>.</td></tr>
         <tr><td class="fname">last_accessed_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339; <code>skip_serializing_if = None</code>.</td></tr>
         <tr><td class="fname">expires_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339; computed from <code>ttl_secs</code> or tier default.</td></tr>
         <tr><td class="fname">metadata</td><td class="ftype">serde_json::Value</td><td class="fnote"><span class="flag def">DEF</span>Default <code>{}</code>; carries <code>governance</code>, <code>scope</code>, <code>agent_id</code>, taxonomy fields.</td></tr>
+        <tr><td class="fname">reflection_depth</td><td class="ftype">i32</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Task 1/8</strong>: recursion depth in the substrate-native reflection tree. <code>0</code> for caller-minted (or legacy) rows; positive for reflection-pass outputs. Stored on <code>memories.reflection_depth</code> NOT NULL DEFAULT 0 (schema v29 sqlite / v31 postgres).</td></tr>
+        <tr><td class="fname">memory_kind</td><td class="ftype">MemoryKind</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 L1-1</strong>: Batman Form-6 typed discriminator (<code>observation</code> / <code>reflection</code> / <code>persona</code> / <code>concept</code> / <code>entity</code> / <code>claim</code> / <code>relation</code> / <code>event</code> / <code>conversation</code> / <code>decision</code>). Schema v30 column default <code>'observation'</code> for pre-v30 rows.</td></tr>
+        <tr><td class="fname">entity_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 QW-2</strong>: persona artefact subject. Populated only when <code>memory_kind == Persona</code>. Stored on <code>memories.entity_id</code> NULL (schema v36).</td></tr>
+        <tr><td class="fname">persona_version</td><td class="ftype">Option&lt;i32&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 QW-2</strong>: monotonic <code>(entity_id, namespace)</code> version counter; <code>PersonaGenerator::generate</code> bumps. Older rows remain queryable for audit/rollback.</td></tr>
+        <tr><td class="fname">citations</td><td class="ftype">Vec&lt;Citation&gt;</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Form 4 (#757)</strong>: fact-provenance citation array. Each entry: <code>{ uri, accessed_at, hash?, span? }</code>. Schema v38 column; legacy rows default to <code>'[]'</code>. Validator: <code>validate_citation</code>.</td></tr>
+        <tr><td class="fname">source_uri</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 4 (#757)</strong>: first-class URI pointer (<code>uri:</code> / <code>doc:</code> / <code>file:</code> schemes). Distinct from the role-label <code>source</code> column. Schema v38; validator: <code>validate_source_uri</code>.</td></tr>
+        <tr><td class="fname">source_span</td><td class="ftype">Option&lt;SourceSpan&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 4 (#757)</strong>: byte-range into the parent source body, JSON <code>{start, end}</code>. Populated by the WT-1-B atomisation writer per atom. Validator: <code>validate_source_span</code>.</td></tr>
+        <tr><td class="fname">confidence_source</td><td class="ftype">ConfidenceSource</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Form 5 (#758)</strong>: typed discriminator naming the provenance of <code>confidence</code>. Defaults to <code>CallerProvided</code>. Schema v39 sqlite / v38 postgres column default <code>'caller_provided'</code>.</td></tr>
+        <tr><td class="fname">confidence_signals</td><td class="ftype">Option&lt;ConfidenceSignals&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 5</strong>: JSON snapshot of the signals that produced an auto-derived or calibrated confidence. NULL on legacy rows and on <code>CallerProvided</code> writes.</td></tr>
+        <tr><td class="fname">confidence_decayed_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 5</strong>: RFC3339 stamp of the last decay-sweep touch. NULL on legacy / never-decayed rows.</td></tr>
+        <tr><td class="fname">version</td><td class="ftype">i64</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Provenance Gap 1 (#884, schema v45 sqlite)</strong>: optimistic-concurrency counter. Bumped on every <code>storage::update</code>; two writers against the same <code>expected_version</code> race; loser receives a typed <code>CONFLICT</code> envelope. Legacy rows land at <code>version = 1</code> via SQL <code>DEFAULT</code> + serde <code>default_memory_version</code>.</td></tr>
       </tbody></table>
     </div>
 
     <div class="ty k-struct" id="memorylink">
-      <div class="ty-head"><span class="ty-name">MemoryLink</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1</span></div>
+      <div class="ty-head"><span class="ty-name">MemoryLink</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · 6 relations at v0.7.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">A directed edge between two memories. The KG primitive — every typed-cognition / supersession relationship is one row in <code>memory_links</code>.</div>
+      <div class="ty-desc">A directed edge between two memories. The KG primitive — every typed-cognition / supersession relationship is one row in <code>memory_links</code>. <strong>6 <code>MemoryLinkRelation</code> variants at v0.7.0</strong> (was 4 at v0.6.x); canonical enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">source_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
         <tr><td class="fname">target_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
-        <tr><td class="fname">relation</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code>.</td></tr>
+        <tr><td class="fname">relation</td><td class="ftype">MemoryLinkRelation</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code> · <code>reflects_on</code> (v0.7.0 Task 1/8 recursive learning) · <code>derives_from</code> (v0.7.0 WT-1-A atomisation atom→parent, schema v36 sqlite / v35 postgres).</td></tr>
         <tr><td class="fname">created_at</td><td class="ftype">String</td><td class="fnote">RFC3339; server-stamped.</td></tr>
+        <tr><td class="fname">valid_from / valid_until</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.6.3 temporal validity window; <code>valid_until = None</code> means still valid.</td></tr>
+        <tr><td class="fname">observed_by</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>agent_id of the observer; powers per-agent visibility.</td></tr>
+        <tr><td class="fname">signature</td><td class="ftype">Option&lt;Vec&lt;u8&gt;&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 H4 — Ed25519 per-link attestation bytes.</td></tr>
+        <tr><td class="fname">attest_level</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 H4 — <code>unsigned</code> · <code>self_signed</code> · <code>peer_attested</code> · <code>signed_by_peer</code> · <code>daemon_signed</code>.</td></tr>
       </tbody></table>
     </div>
   </div>
@@ -281,7 +382,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">tier</td><td class="ftype">Tier</td><td class="fnote"><span class="flag def">DEF</span>Default <code>Mid</code>.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">String</td><td class="fnote"><span class="flag def">DEF</span>Default <code>"global"</code>.</td></tr>
-        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–500 chars.</td></tr>
+        <tr><td class="fname">title</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–512 chars (<code>MAX_TITLE_LEN</code>).</td></tr>
         <tr><td class="fname">content</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>1–65 536 bytes.</td></tr>
         <tr><td class="fname">tags</td><td class="ftype">Vec&lt;String&gt;</td><td class="fnote"><span class="flag def">DEF</span>Default <code>[]</code>.</td></tr>
         <tr><td class="fname">priority</td><td class="ftype">i32</td><td class="fnote"><span class="flag def">DEF</span>Default 5.</td></tr>
@@ -292,6 +393,11 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <tr><td class="fname">metadata</td><td class="ftype">Value</td><td class="fnote"><span class="flag def">DEF</span>Default <code>{}</code>.</td></tr>
         <tr><td class="fname">agent_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Auto-resolved by <code>identity</code> when omitted.</td></tr>
         <tr><td class="fname">scope</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>One of <code>VALID_SCOPES</code>; default <code>"private"</code>.</td></tr>
+        <tr><td class="fname">on_conflict / detect_conflicts / force</td><td class="ftype">Option&lt;String&gt; / Option&lt;bool&gt; / bool</td><td class="fnote"><span class="flag opt">OPT</span>Dedup-and-synthesis controls (Form 1): conflict disposition, contradiction probe, duplicate-gate override.</td></tr>
+        <tr><td class="fname">citations / source_uri / source_span</td><td class="ftype">Vec&lt;Citation&gt; / Option&lt;String&gt; / Option&lt;SourceSpan&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Form-4 fact provenance (#757).</td></tr>
+        <tr><td class="fname">kind</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Batman Form-6 <code>memory_kind</code> discriminator.</td></tr>
+        <tr><td class="fname">signature</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Layer-3 — caller-presented Ed25519 write attestation (verified against the agent's bound key).</td></tr>
+        <tr><td class="fname">created_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339 backdating for imports; server-stamped when omitted.</td></tr>
       </tbody></table>
     </div>
 
@@ -300,7 +406,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <div class="ty-derive"><code>#[derive(Debug, Deserialize)]</code></div>
       <div class="ty-desc">Body of <code>PUT /memories/:id</code> and <code>memory_update</code>. Every field is optional — only the present fields are mutated; the rest are preserved.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
-        <tr><td class="fname">title</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1–500 chars when set.</td></tr>
+        <tr><td class="fname">title</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1–512 chars (<code>MAX_TITLE_LEN</code>) when set.</td></tr>
         <tr><td class="fname">content</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1–65 536 bytes when set.</td></tr>
         <tr><td class="fname">tier</td><td class="ftype">Option&lt;Tier&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Promoting Mid→Long passes through governance.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Re-namespacing; depth ≤ 8.</td></tr>
@@ -308,7 +414,9 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <tr><td class="fname">priority</td><td class="ftype">Option&lt;i32&gt;</td><td class="fnote"><span class="flag opt">OPT</span>1-10 range.</td></tr>
         <tr><td class="fname">confidence</td><td class="ftype">Option&lt;f64&gt;</td><td class="fnote"><span class="flag opt">OPT</span>0.0-1.0 range.</td></tr>
         <tr><td class="fname">expires_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>RFC3339.</td></tr>
-        <tr><td class="fname">metadata</td><td class="ftype">Option&lt;Value&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Replaces metadata wholesale (not merged).</td></tr>
+        <tr><td class="fname">metadata</td><td class="ftype">Option&lt;Value&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Replaces metadata wholesale (not merged); <code>metadata.agent_id</code> is preserved.</td></tr>
+        <tr><td class="fname">source_uri</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.7.0 Form-4 provenance pointer update.</td></tr>
+        <tr><td class="fname">agent_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Caller identity for owner-write checks; the stored row's <code>metadata.agent_id</code> remains immutable.</td></tr>
       </tbody></table>
     </div>
 
@@ -326,7 +434,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     <div class="ty k-struct" id="forgetquery">
       <div class="ty-head"><span class="ty-name">ForgetQuery</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Deserialize)]</code></div>
-      <div class="ty-desc">Body of <code>POST /memories/forget</code> and <code>memory_forget</code>. Pattern-based delete; archives matched memories rather than hard-deleting.</div>
+      <div class="ty-desc">Body of <code>POST /api/v1/forget</code> and <code>memory_forget</code> (v0.7.0: route registered at /api/v1/forget, not /api/v1/memories/forget). Pattern-based delete; archives matched memories rather than hard-deleting.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">namespace</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Restricts the sweep to a namespace.</td></tr>
         <tr><td class="fname">pattern</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>FTS5 pattern; matches title+content.</td></tr>
@@ -376,7 +484,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     <div class="ty k-struct" id="recallquery">
       <div class="ty-head"><span class="ty-name">RecallQuery</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · budget_tokens Task 1.11</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Deserialize)]</code></div>
-      <div class="ty-desc">Query string for <code>GET /recall</code>. Hybrid 70/30 fusion (FTS5 + HNSW); optional context-budget pruning.</div>
+      <div class="ty-desc">Query string for <code>GET /recall</code>. Hybrid FTS5 + HNSW fusion with adaptive blending — semantic weight 0.50 (short content) → 0.15 (long content), cosine gate <code>RECALL_COSINE_GATE = 0.2</code>; optional context-budget pruning.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">context</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>Free-form context to retrieve against.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span></td></tr>
@@ -452,7 +560,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
       <div class="ty-desc">The outcome of a governance check. Callers <strong>MAY</strong> execute on <code>Allow</code>, <strong>MUST</strong> reject on <code>Deny</code>, and <strong>SHOULD</strong> queue + return the <code>pending_id</code> on <code>Pending</code>.</div>
       <div class="variants">
         <div class="v"><span class="vn">Allow</span><span class="vd">proceed with the action.</span></div>
-        <div class="v"><span class="vn">Deny(String)</span><span class="vd">reject; the wrapped string surfaces the reason to the caller.</span></div>
+        <div class="v"><span class="vn">Deny(GovernanceRefusal)</span><span class="vd">reject; the typed envelope carries the canonical wire message (<code>Display</code> reads <code>"&lt;action&gt; denied by governance: &lt;reason&gt;"</code>) plus the structured policy context (<code>denied_level</code>, <code>namespace</code>, <code>owner</code>, <code>agent_id</code>, <code>reason</code>). Wire shape byte-identical to the pre-#963 <code>Deny(String)</code> envelope; pattern-match consumers read <code>refusal.reason</code> for the bare string.</span></div>
         <div class="v"><span class="vn">Pending(String)</span><span class="vd">queued for approval; the caller receives the new <code>pending_id</code>.</span></div>
       </div>
     </div>
@@ -465,6 +573,7 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <div class="v"><span class="vn">Store</span><span class="vd">creating a new memory in a governed namespace.</span></div>
         <div class="v"><span class="vn">Delete</span><span class="vd">deleting an existing memory.</span></div>
         <div class="v"><span class="vn">Promote</span><span class="vd">tier promotion (Mid → Long).</span></div>
+        <div class="v"><span class="vn">Reflect</span><span class="vd">v0.7.0 L1-8 — <code>memory_reflect</code> approval gate; queued when the proposed reflection depth exceeds <code>require_approval_above_depth</code>.</span></div>
       </div>
     </div>
 
@@ -522,7 +631,7 @@ GovernancePolicy::default() // { write: Any, promote: Any, delete: Owner, approv
       <div class="ty-desc">Row returned by <code>db::list_pending_actions</code>. Mirrors the <code>pending_actions</code> table.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">id</td><td class="ftype">String</td><td class="fnote">UUID.</td></tr>
-        <tr><td class="fname">action_type</td><td class="ftype">String</td><td class="fnote"><code>store</code> · <code>delete</code> · <code>promote</code>.</td></tr>
+        <tr><td class="fname">action_type</td><td class="ftype">String</td><td class="fnote"><code>store</code> · <code>delete</code> · <code>promote</code> · <code>reflect</code> (v0.7.0).</td></tr>
         <tr><td class="fname">memory_id</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote">Set for delete/promote; null for pending stores.</td></tr>
         <tr><td class="fname">namespace</td><td class="ftype">String</td><td class="fnote"></td></tr>
         <tr><td class="fname">payload</td><td class="ftype">Value</td><td class="fnote">Action-shaped JSON for replay.</td></tr>
@@ -635,7 +744,7 @@ VectorClock::latest_from(&amp;self, peer_id: &amp;str) -&gt; Option&lt;&amp;str&
 
     <div class="ty k-const">
       <div class="ty-head"><span class="ty-name">VALID_AGENT_TYPES</span><span class="ty-kind const">const</span></div>
-      <div class="ty-desc">Closed set of agent types accepted by <code>POST /agents/register</code>. Persisted; extend carefully.</div>
+      <div class="ty-desc">Curated short-list of agent types accepted by <code>POST /agents/register</code>. NOT a hard closed set since red-team #235: any <code>ai:&lt;name&gt;</code> form matching <code>^ai:[A-Za-z0-9_.-]{1,60}$</code> is also accepted (max 64 bytes total), so operators can register future models without a code release.</div>
       <div class="snip">&amp;[
   "ai:claude-opus-4.6",
   "ai:claude-opus-4.7",
@@ -643,7 +752,8 @@ VectorClock::latest_from(&amp;self, peer_id: &amp;str) -&gt; Option&lt;&amp;str&
   "ai:grok-4.2",
   "human",
   "system",
-]</div>
+]
+// plus the open form: ai:&lt;alphanumeric _-.&gt; (validate_agent_type)</div>
     </div>
 
     <div class="ty k-const">
@@ -662,7 +772,7 @@ namespace_depth("alphaone/engineering/platform")    // 3</div>
 </section>
 
 <footer>
-  <p>ai-memory v0.6.3.1 · Apache 2.0 · src/<a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/models.rs">models.rs</a> is the source of truth · this page is a generated reference for AI clients integrating against the type contract</p>
+  <p>ai-memory v0.7.0 · Apache 2.0 · src/<a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/models/mod.rs">models.rs</a> is the source of truth · this page is a generated reference for AI clients integrating against the type contract</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="schema.html">Schema</a> · <a href="validators.html">Validators</a></p>
 </footer>
 

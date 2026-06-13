@@ -91,6 +91,18 @@ table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid 
 table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
 table td{color:var(--text-muted)}
 table tr:last-child td{border-bottom:none}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
 </style>
 </head>
 <body>
@@ -100,11 +112,14 @@ table tr:last-child td{border-bottom:none}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T5</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v063.html" style="color:#ffb86b">v0.6.3</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
           <a href="feature-matrix.html">Feature Matrix</a>
           <a href="data-flow.html">Data Flow</a>
           <a href="integrations.html">Integrations</a>
@@ -127,6 +142,7 @@ table tr:last-child td{border-bottom:none}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
       <div class="menu">
@@ -138,6 +154,9 @@ table tr:last-child td{border-bottom:none}
           <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
           <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
           <a href="architectures-t5.html" class="current">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
         </div>
       </div>
       <div class="menu">
@@ -147,23 +166,91 @@ table tr:last-child td{border-bottom:none}
           <a href="types.html">Types</a>
           <a href="validators.html">Validators</a>
           <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
           <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
         </div>
       </div>
       <div class="menu">
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence</a>
+          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
           <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
           <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
       <a href="credits.html">Credits</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Messaging</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.md">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.md">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
+        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
+        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
   </div>
 </nav>
 
@@ -182,7 +269,7 @@ table tr:last-child td{border-bottom:none}
 
 <section>
   <div class="container">
-    <p>This tier is <strong>vision territory</strong>. It is what ai-memory is being built toward. The honest framing: every primitive on every diagram below is either shipping in v0.6.3, on the v0.7 roadmap, or scoped explicitly for v1.0+ with the design documented in an ADR or roadmap doc. There is <strong>no fiction</strong> on this page — only the destination, drawn explicitly so the path is legible.</p>
+    <p>This tier is <strong>vision territory</strong>. It is what ai-memory is being built toward. The honest framing: every primitive on every diagram below is either shipped by v0.7.0, or scoped explicitly for v1.0+ with the design documented in an ADR or roadmap doc. There is <strong>no fiction</strong> on this page — only the destination, drawn explicitly so the path is legible.</p>
   </div>
 </section>
 
@@ -229,7 +316,7 @@ table tr:last-child td{border-bottom:none}
                 fill="url(#t5-attest-grad)" stroke="#f472b6" stroke-width="1.6" />
           <text x="470" y="55" text-anchor="middle" class="node-label" style="font-size: 13px">Federated identity &amp; attestation root</text>
           <text x="470" y="73" text-anchor="middle" class="sub-label">agent keypairs · signed memories · signed links</text>
-          <text x="470" y="88" text-anchor="middle" class="sub-label">memory_links.signature (v0.6.3 reserved · v0.7 wired)</text>
+          <text x="470" y="88" text-anchor="middle" class="sub-label">memory_links.signature (v0.7.0 WIRED with Ed25519 attestation)</text>
           <text x="470" y="103" text-anchor="middle" class="sub-label" font-weight="700" fill="#be185d">v1.0+ · zero-trust cross-org</text>
         </g>
 
@@ -319,7 +406,7 @@ table tr:last-child td{border-bottom:none}
       </svg>
 
       <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>inter-region sync (eventually consistent today, quorum v0.7)</span>
+        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>inter-region sync (HMAC-signed + nonce-required at v0.7.0)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #f472b6"></span>attested identity (v0.7 wired, v1.0 fleet-trust)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>consensus rail (v1.0+ vision)</span>
         <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>regional cluster (T4 pattern)</span>
@@ -343,24 +430,24 @@ table tr:last-child td{border-bottom:none}
     <p>At T1–T4, an agent's identity is <strong>claimed</strong> via <code>metadata.agent_id</code>. At T5 it must be <strong>proven</strong>.</p>
     <p>The plumbing is already in v0.6.3 schema:</p>
     <ul>
-      <li><code>memory_links.signature</code> column (schema v15) — reserved at v0.6.3, populated with claimed identity, will be cryptographically signed at v0.7.</li>
+      <li><code>memory_links.signature</code> column (schema v15) — reserved at v0.6.3 placeholder; populated at v0.7.0 with Ed25519 per-link attestation.</li>
       <li>The <code>observed_by</code> column on <code>memory_links</code> records which agent observed the relationship — paired with <code>signature</code> this becomes provable provenance.</li>
     </ul>
     <p>What's needed to reach the T5 trust model:</p>
     <ul>
-      <li>Agent keypair issuance and rotation.</li>
-      <li>Signature verification on every <code>sync_push</code> ingress — peers refuse incoming memories with bad signatures.</li>
+      <li>Agent keypair rotation (issuance shipped — Ed25519 keypairs at v0.7.0).</li>
+      <li>Per-row signature verification on every <code>sync_push</code> ingress — the push <em>envelope</em> is already verified at v0.7.0 (#791 <code>AI_MEMORY_FED_REQUIRE_SIG=1</code> default rejects missing/invalid <code>X-Memory-Sig</code>, plus #922 nonce anti-replay); per-row memory signatures across federation remain ahead.</li>
       <li>Revocation list distribution.</li>
       <li>Hardware-backed key custody for high-trust agents (TPM / Secure Enclave / Cloud KMS).</li>
     </ul>
-    <p>This is <strong>v1.0+ work</strong>. The schema reservation at v0.6.3 is the down-payment.</p>
+    <p>The remaining chain is <strong>v1.0+ work</strong>. The v0.6.3 schema reservation was the down-payment; v0.7.0 wired Ed25519 signing + envelope verification.</p>
 
     <h3>Distributed consensus for governance</h3>
     <p>At T3/T4, governance policies and pending decisions are <strong>eventually consistent</strong>. Two operators on partitioned sides of the cluster can both approve the same pending action. Last-write-wins resolves it on rejoin.</p>
     <p>At T5 — with millions of agents and cross-jurisdictional rules — that's not enough. A change to <code>org/eu/personal-data</code> policy under GDPR has to be <strong>strongly consistent</strong> before any agent in any region commits a write under the new rule. This is the use case for a Raft-class consensus log on the <strong>governance plane only</strong> (not on the memory write path — that stays eventually consistent for performance).</p>
     <p>The architectural separation:</p>
     <ul>
-      <li><strong>Memory writes</strong> — eventually consistent, quorum-bounded (v0.7 Track C).</li>
+      <li><strong>Memory writes</strong> — eventually consistent, quorum-bounded (shipped — Track C).</li>
       <li><strong>Governance writes</strong> — strongly consistent via consensus rail (v1.0+).</li>
     </ul>
     <p>Memories are append-mostly; governance is small, infrequent, and high-stakes. Different consistency models for different planes.</p>
@@ -378,7 +465,7 @@ table tr:last-child td{border-bottom:none}
     <p>What makes T5 a <strong>hive</strong> rather than just a big cluster:</p>
     <ul>
       <li><strong>Cross-region knowledge transfer</strong> — A discovery in NA can propagate (or be rejected) by every other region's policy engine within seconds.</li>
-      <li><strong>Temporal-validity KG replay</strong> — v0.6.3's <code>memory_kg_query(as_of=...)</code> plus the temporal columns (<code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>) means an agent can ask "what did the collective know at 14:23 UTC last Tuesday?" and get a deterministic answer across the fleet.</li>
+      <li><strong>Temporal-validity KG replay</strong> — v0.6.3's <code>memory_kg_query(valid_at=...)</code> plus the temporal columns (<code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>) means an agent can ask "what did the collective know at 14:23 UTC last Tuesday?" and get a deterministic answer across the fleet.</li>
       <li><strong>Point-in-time provenance</strong> — Every memory has a signed origin and a tracked validity window. A regulator's request "show me what informed this decision" returns a verifiable lineage.</li>
       <li><strong>Differential privacy on cross-tenant recall</strong> — Roadmap. The scope-visibility filter is the foundational primitive; DP noise on aggregated recalls is the v1.0+ cap.</li>
     </ul>
@@ -399,7 +486,7 @@ table tr:last-child td{border-bottom:none}
       <li><strong>Temporal-validity KG (v0.6.3)</strong> — <code>valid_from</code> / <code>valid_until</code> / <code>observed_by</code> columns on every link.</li>
       <li><strong>Capabilities introspection v2 (v0.6.3)</strong> — runtime trust assessment per node.</li>
       <li><strong>Hierarchical taxonomy (v0.6.3)</strong> — tree views over the global namespace tree.</li>
-      <li><strong><code>signature</code> column reserved (v0.6.3)</strong> — the schema down-payment for attestation.</li>
+      <li><strong><code>signature</code> column (reserved v0.6.3, populated v0.7.0)</strong> — the schema down-payment for attestation, now carrying Ed25519 per-link signatures.</li>
       <li><strong>Entity registry &amp; aliases (v0.6.3)</strong> — global entity identity, the substrate for cross-tenant identity resolution.</li>
     </ul>
   </div>
@@ -414,9 +501,9 @@ table tr:last-child td{border-bottom:none}
         <tr><th>Capability</th><th>Today</th><th>v0.7</th><th>v1.0+</th></tr>
       </thead>
       <tbody>
-        <tr><td>Quorum-write contract</td><td>—</td><td>Track C</td><td>—</td></tr>
-        <tr><td>Postgres + pgvector backbone</td><td>—</td><td>Track B</td><td>—</td></tr>
-        <tr><td>Cryptographic agent attestation</td><td>reserved</td><td>partial wiring</td><td>full chain</td></tr>
+        <tr><td>Quorum-write contract</td><td>shipped (v0.7.0)</td><td>Track C ✓</td><td>—</td></tr>
+        <tr><td>Postgres + pgvector backbone</td><td>shipped (v0.7.0, <code>sal-postgres</code>)</td><td>Track B ✓</td><td>—</td></tr>
+        <tr><td>Cryptographic agent attestation</td><td>wired (Ed25519, #626)</td><td>✓</td><td>full chain</td></tr>
         <tr><td>Distributed consensus (governance plane)</td><td>—</td><td>—</td><td>designed</td></tr>
         <tr><td>Gossip / DHT (many-node discovery)</td><td>—</td><td>—</td><td>designed</td></tr>
         <tr><td>Cross-region failover / quorum bounds</td><td>—</td><td>—</td><td>designed</td></tr>
@@ -451,18 +538,18 @@ table tr:last-child td{border-bottom:none}
     <span class="eyebrow">Source</span>
     <h2>Source-of-truth references.</h2>
     <ul>
-      <li><code>docs/ROADMAP-ladybug.md</code> — Track A (T1/T2 polish), B (Postgres), C (quorum), D (attestation)</li>
+      <li><code>ROADMAP.md</code> — Track A (T1/T2 polish), B (Postgres), C (quorum), D (attestation)</li>
       <li><code>docs/ADR-0001-quorum-replication.md</code> — quorum write design</li>
       <li><code>docs/ARCHITECTURAL_LIMITS.md</code> — honest ceiling on every dimension</li>
-      <li><code>src/models.rs</code> — <code>MemoryLink</code> (with v15 <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, <code>signature</code>)</li>
-      <li><code>src/db.rs</code> — schema v15 migration (entity_aliases, KG tables, temporal indexes)</li>
+      <li><code>src/models/</code> — <code>MemoryLink</code> (with v15 <code>valid_from</code>, <code>valid_until</code>, <code>observed_by</code>, <code>signature</code>)</li>
+      <li><code>src/storage/</code> — schema v15 migration (entity_aliases, KG tables, temporal indexes)</li>
       <li>v0.6.3 release notes — taxonomy, KG layer, capabilities v2, entity registry</li>
     </ul>
   </div>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.6.3.1 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.7.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

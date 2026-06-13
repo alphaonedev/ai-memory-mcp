@@ -130,9 +130,9 @@ pub const HOT_PATH_CLASS_DEADLINE_MS: u64 = 50;
 // event_class — the canonical mapping
 // ---------------------------------------------------------------------------
 
-/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 21
+/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 25
 /// variants — the compiler's exhaustiveness check enforces the table
-/// stays in sync if a 22nd event ever lands.
+/// stays in sync if a 26th event ever lands.
 #[must_use]
 pub fn event_class(event: HookEvent) -> EventClass {
     match event {
@@ -149,7 +149,16 @@ pub fn event_class(event: HookEvent) -> EventClass {
         | HookEvent::PostConsolidate
         | HookEvent::PreGovernanceDecision
         | HookEvent::PostGovernanceDecision
-        | HookEvent::PreArchive => EventClass::Write,
+        | HookEvent::PreArchive
+        // v0.7.0 Task 6/8: reflect lifecycle fires on the write
+        // path (the substrate inserts the new reflection memory +
+        // N reflects_on links inside a single transaction).
+        | HookEvent::PreReflect
+        | HookEvent::PostReflect
+        // v0.7.0 L1-7: compaction pipeline events are write-class
+        // (the pass may delete source rows and insert a summary).
+        | HookEvent::PreCompaction
+        | HookEvent::OnCompactionRollback => EventClass::Write,
         // Reads: query path. Hot.
         HookEvent::PreRecall
         | HookEvent::PostRecall
@@ -168,15 +177,56 @@ pub fn event_class(event: HookEvent) -> EventClass {
 /// The `match` mirrors [`event_class`] inverse-style; a single
 /// branch means the compiler inlines this to a constant load at
 /// every call site.
+///
+/// **Issue #1207 — macOS timing-budget multiplier.** When running on
+/// macOS under parallel `cargo test` load, `fork+exec` of even a tiny
+/// shell script regularly takes >1s on a stressed dev host (Apple
+/// Silicon m1/m2/m3 alike). The 1000ms `Index` class deadline races
+/// the spawn budget and the test surfaces as a timeout — independent
+/// of the EAGAIN/ENOMEM/EMFILE spawn-errno class the rest of #1207
+/// addresses. The `AI_MEMORY_TEST_TIMING_BUDGET_MULT` env var is a
+/// test-only multiplier (default `1`) that scales every class deadline
+/// at runtime so tests can opt into a wider budget without changing
+/// production behaviour. The factory test runner sets this to `3` on
+/// macOS via the `tests/hooks_executor_test.rs` setup; production
+/// daemons inherit the unset default.
+///
+/// Compiled out of release binaries entirely via `cfg(any(test,
+/// debug_assertions))`. Production runs see the hardcoded constants
+/// at zero overhead — the env-var read fires only for `cargo test`.
 #[must_use]
 pub fn class_deadline(class: EventClass) -> Duration {
-    Duration::from_millis(match class {
+    let base_ms = match class {
         EventClass::Write => WRITE_CLASS_DEADLINE_MS,
         EventClass::Read => READ_CLASS_DEADLINE_MS,
         EventClass::Index => INDEX_CLASS_DEADLINE_MS,
         EventClass::Transcript => TRANSCRIPT_CLASS_DEADLINE_MS,
         EventClass::HotPath => HOT_PATH_CLASS_DEADLINE_MS,
-    })
+    };
+    Duration::from_millis(base_ms.saturating_mul(test_timing_budget_mult()))
+}
+
+/// Test-only timing budget multiplier. Reads
+/// `AI_MEMORY_TEST_TIMING_BUDGET_MULT` from the environment on each
+/// call (no caching) so individual tests can set it just-in-time;
+/// defaults to `1` (production behaviour). Compiled out of release
+/// builds entirely. The env-var read is a few-microsecond syscall —
+/// negligible relative to even the tightest 50ms `HotPath` budget.
+#[cfg(any(test, debug_assertions))]
+fn test_timing_budget_mult() -> u64 {
+    std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| (1..=100).contains(&n))
+        .unwrap_or(1)
+}
+
+/// Production builds: always 1. Optimizer constant-folds the
+/// `saturating_mul` call above into a no-op.
+#[cfg(not(any(test, debug_assertions)))]
+#[inline(always)]
+fn test_timing_budget_mult() -> u64 {
+    1
 }
 
 /// Convenience wrapper: `class_deadline(event_class(event))`. Used
@@ -281,14 +331,15 @@ mod tests {
     use super::*;
 
     /// Every `HookEvent` variant must classify into exactly one
-    /// `EventClass`. Table-driven so adding a 21st variant without
+    /// `EventClass`. Table-driven so adding a 26th variant without
     /// updating the mapping fails this test (the compiler also
     /// flags the missing arm in `event_class`, but the assertion
     /// surface here is what an operator reading the test reads).
     #[test]
-    fn event_class_table_covers_all_21_variants() {
+    fn event_class_table_covers_all_25_variants() {
         let table = [
-            // Write — 13 variants.
+            // Write — 17 variants (Task 6/8 added pre_reflect + post_reflect;
+            // L1-7 added pre_compaction + on_compaction_rollback).
             (HookEvent::PreStore, EventClass::Write),
             (HookEvent::PostStore, EventClass::Write),
             (HookEvent::PreDelete, EventClass::Write),
@@ -302,6 +353,10 @@ mod tests {
             (HookEvent::PreGovernanceDecision, EventClass::Write),
             (HookEvent::PostGovernanceDecision, EventClass::Write),
             (HookEvent::PreArchive, EventClass::Write),
+            (HookEvent::PreReflect, EventClass::Write),
+            (HookEvent::PostReflect, EventClass::Write),
+            (HookEvent::PreCompaction, EventClass::Write),
+            (HookEvent::OnCompactionRollback, EventClass::Write),
             // Read — 4 variants.
             (HookEvent::PreRecall, EventClass::Read),
             (HookEvent::PostRecall, EventClass::Read),
@@ -318,8 +373,8 @@ mod tests {
 
         assert_eq!(
             table.len(),
-            21,
-            "G6+G10 mapping must cover exactly the 21 HookEvent variants"
+            25,
+            "v0.7.0 L1-7 mapping must cover exactly the 25 HookEvent variants"
         );
         for (event, expected) in table {
             assert_eq!(
@@ -425,5 +480,86 @@ mod tests {
         assert_eq!(timeout_violations_total(), 3);
         reset_timeout_violations_for_test();
         assert_eq!(timeout_violations_total(), 0);
+    }
+
+    // ---------- Issue #1207 — timing-budget multiplier --------------------
+
+    // The multiplier env var is process-global; serialize these tests
+    // behind a Mutex so they don't race each other under parallel
+    // cargo-test load.
+    fn timing_mult_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn with_mult<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
+        let _guard = timing_mult_lock();
+        let prior = std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT") },
+        }
+        let result = body();
+        match prior {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_TEST_TIMING_BUDGET_MULT") },
+        }
+        result
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_unset_defaults_to_one() {
+        with_mult(None, || {
+            assert_eq!(test_timing_budget_mult(), 1);
+            assert_eq!(
+                class_deadline(EventClass::Index),
+                Duration::from_millis(INDEX_CLASS_DEADLINE_MS),
+            );
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_valid_scales_class_deadline() {
+        with_mult(Some("5"), || {
+            assert_eq!(test_timing_budget_mult(), 5);
+            assert_eq!(
+                class_deadline(EventClass::Index),
+                Duration::from_millis(INDEX_CLASS_DEADLINE_MS * 5),
+            );
+            assert_eq!(
+                class_deadline(EventClass::Write),
+                Duration::from_millis(WRITE_CLASS_DEADLINE_MS * 5),
+            );
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_unparseable_falls_back_to_one() {
+        with_mult(Some("bogus-not-a-number"), || {
+            assert_eq!(test_timing_budget_mult(), 1);
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_below_range_falls_back_to_one() {
+        with_mult(Some("0"), || {
+            assert_eq!(test_timing_budget_mult(), 1);
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_above_range_falls_back_to_one() {
+        with_mult(Some("9999"), || {
+            assert_eq!(test_timing_budget_mult(), 1);
+        });
+    }
+
+    #[test]
+    fn issue_1207_timing_mult_boundary_at_one_and_hundred() {
+        with_mult(Some("1"), || assert_eq!(test_timing_budget_mult(), 1));
+        with_mult(Some("100"), || assert_eq!(test_timing_budget_mult(), 100));
     }
 }

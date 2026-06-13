@@ -23,14 +23,13 @@
 //! …and re-run this test. Drift between the spec and the substrate is
 //! exactly what this file is designed to surface.
 
-use ai_memory::config::{FeatureTier, TierConfig};
+use ai_memory::config::{FeatureTier, ResolvedModels, TierConfig};
 use ai_memory::mcp::handle_capabilities_with_conn_v3;
 use ai_memory::profile::Profile;
 use serde_json::Value;
 
-fn fresh_conn() -> rusqlite::Connection {
-    ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
-}
+mod common;
+use common::{describe_counts, fresh_conn};
 
 fn semantic_tier() -> TierConfig {
     FeatureTier::Semantic.config()
@@ -41,6 +40,7 @@ fn v3_response(profile: &Profile) -> Value {
     let conn = fresh_conn();
     handle_capabilities_with_conn_v3(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false,
         Some(&conn),
@@ -63,25 +63,21 @@ fn t0_describe_to_user_core_profile_canonical_phrasing() {
         .as_str()
         .expect("describe present");
 
-    // 43 = 50 user-relevant tools − 7 core. (50 = 51 total tools − 1
-    // always-on bootstrap.) The bootstrap (`memory_capabilities`) is
-    // excluded from BOTH the loaded and the unloaded count in
-    // `to_describe_to_user` (it's plumbing, not a feature). Total
-    // bumped from 43 to 44 in v0.7.0 I4 — Family::Graph gained
-    // `memory_replay`; to 45 in v0.7 H4 — Family::Graph gained
-    // `memory_verify`; to 46 in v0.7 B1 — Family::Core gained
-    // `memory_load_family`; to 48 in v0.7 K7 — Family::Power gained
-    // `memory_subscription_replay` + `memory_subscription_dlq_list`;
-    // to 49 in v0.7 J7 — Family::Graph gained `memory_find_paths`;
-    // to 50 in v0.7 B2 — Family::Core gained `memory_smart_load`;
-    // to 51 in v0.7 K8 — Family::Power gained `memory_quota_status`.
-    // Loaded under core bumped from 5 to 6 with B1 then to 7 with B2,
-    // so the preview now overflows the 5-name cap (ends in ", ...").
-    let expected = "I can directly use 7 memory tools right now \
-                    (store, recall, list, get, search, ...). 43 more \
-                    (update, delete, forget, gc, etc.) are available on demand — \
-                    I can load them if you ask for something that needs them, \
-                    or you can restart the server with a different profile.";
+    // Counts are SSOT-derived (see `describe_counts`): `n_loaded` is the
+    // substantive core surface (the original 5 + B1 `memory_load_family`
+    // + B2 `memory_smart_load`, overflowing the 5-name preview cap so it
+    // ends ", ..."); `n_unloaded` is every other family's tools minus the
+    // always-on bootstrap. The sentence is pinned verbatim; the two
+    // numbers float with `Family::tool_names` so a new tool in any family
+    // can't drift this test (no hardcoded tool-count literal).
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::core());
+    let expected = format!(
+        "I can directly use {n_loaded} memory tools right now \
+         (store, recall, list, get, search, ...). {n_unloaded} more \
+         (update, delete, forget, gc, etc.) are available on demand — \
+         I can load them if you ask for something that needs them, \
+         or you can restart the server with a different profile."
+    );
 
     assert_eq!(
         describe, expected,
@@ -93,16 +89,10 @@ fn t0_describe_to_user_core_profile_canonical_phrasing() {
 
 // ---------------------------------------------------------------------------
 // T0-A2-FULL — `to_describe_to_user` on `--profile full` uses the
-// "nothing more to load" closing form (excludes the always-on bootstrap
-// from the user-facing 50 count). Bumped from 42 to 43 in v0.7.0 I4 —
-// Family::Graph gained `memory_replay`; to 44 in v0.7 H4 —
-// Family::Graph gained `memory_verify`; to 45 in v0.7 B1 —
-// Family::Core gained `memory_load_family`; to 47 in v0.7 K7 —
-// Family::Power gained `memory_subscription_replay` +
-// `memory_subscription_dlq_list`; to 48 in v0.7 J7 —
-// Family::Graph gained `memory_find_paths`; to 49 in v0.7 B2 —
-// Family::Core gained `memory_smart_load`; to 50 in v0.7 K8 —
-// Family::Power gained `memory_quota_status`.
+// "nothing more to load" closing form. The "all N" count is the full
+// substantive surface (every family's tools minus the always-on
+// `memory_capabilities` bootstrap); it is SSOT-derived below, not a
+// literal, so adding a tool to any family floats it automatically.
 // ---------------------------------------------------------------------------
 #[test]
 fn t0_describe_to_user_full_profile_canonical_phrasing() {
@@ -111,9 +101,18 @@ fn t0_describe_to_user_full_profile_canonical_phrasing() {
         .as_str()
         .expect("describe present");
 
-    let expected = "I can directly use all 50 memory tools right now \
-                    (store, recall, list, get, search, ...). Nothing more to load — \
-                    the full memory surface is already active.";
+    // Under `full` every family loads, so the unloaded count is 0 and
+    // `n_loaded` is the entire substantive surface (bootstrap stripped).
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::full());
+    assert_eq!(
+        n_unloaded, 0,
+        "T0-A2-FULL: full profile must load every family"
+    );
+    let expected = format!(
+        "I can directly use all {n_loaded} memory tools right now \
+         (store, recall, list, get, search, ...). Nothing more to load — \
+         the full memory surface is already active."
+    );
 
     assert_eq!(
         describe, expected,
@@ -125,15 +124,10 @@ fn t0_describe_to_user_full_profile_canonical_phrasing() {
 
 // ---------------------------------------------------------------------------
 // T0-A2-GRAPH — `to_describe_to_user` on `--profile graph` uses the
-// preview-with-ellipsis form (5 of 18 loaded shown + ", ..."). Loaded
-// bumped from 13 to 14 in v0.7.0 I4 — Family::Graph gained
-// `memory_replay`; to 15 in v0.7 H4 — Family::Graph gained
-// `memory_verify`; to 16 in v0.7 B1 — Family::Core gained
-// `memory_load_family`; to 17 in v0.7 J7 — Family::Graph gained
-// `memory_find_paths`; to 18 in v0.7 B2 — Family::Core gained
-// `memory_smart_load`. Total bumped to 51 in v0.7 K8 — Family::Power
-// gained `memory_quota_status` (not loaded under graph profile, so
-// `more` count grows from 31 to 32).
+// preview-with-ellipsis form (5 loaded shown + ", ..."). Both the
+// loaded count and the "N more" unloaded count are SSOT-derived below
+// (see `describe_counts`), so a tool landing in any family floats them
+// automatically — no hardcoded literal to drift.
 // ---------------------------------------------------------------------------
 #[test]
 fn t0_describe_to_user_graph_profile_canonical_phrasing() {
@@ -142,11 +136,14 @@ fn t0_describe_to_user_graph_profile_canonical_phrasing() {
         .as_str()
         .expect("describe present");
 
-    let expected = "I can directly use 18 memory tools right now \
-                    (store, recall, list, get, search, ...). 32 more \
-                    (update, delete, forget, gc, etc.) are available on demand — \
-                    I can load them if you ask for something that needs them, \
-                    or you can restart the server with a different profile.";
+    let (n_loaded, n_unloaded) = describe_counts(&Profile::graph());
+    let expected = format!(
+        "I can directly use {n_loaded} memory tools right now \
+         (store, recall, list, get, search, ...). {n_unloaded} more \
+         (update, delete, forget, gc, etc.) are available on demand — \
+         I can load them if you ask for something that needs them, \
+         or you can restart the server with a different profile."
+    );
 
     assert_eq!(
         describe, expected,

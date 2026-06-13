@@ -1,0 +1,241 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Scoped LAN-parity test stack: 2 IronClaw daemons + 1 PG+AGE
+# container on a single shared Docker bridge, all on this node
+# (192.168.50.100 / Colima).
+#
+# Why this exists (operator-set 2026-05-19):
+#
+# - macOS Sequoia gates plain connect(2) to RFC1918 destinations for
+#   processes spawned under Claude Code (no NSLocalNetworkUsageDescription
+#   entitlement in the cask binary). That blocks libpq/psql/cargo SAL
+#   tests from reaching 192.168.50.1:5432 (the production pop-os PG).
+# - All traffic inside this compose is either Docker-bridge (172.31.79.x)
+#   or host-loopback (127.0.0.1:15432) — both exempt from the gate.
+# - The 2 IronClaw daemons exercise the federation / A2A peer-reach
+#   path; the PG+AGE container backs them via the in-bridge hostname
+#   `pg-age:5432`. The cargo SAL-postgres tests, run from the host,
+#   hit the same PG via 127.0.0.1:15432.
+# - Co-exists with infra/plan-c/docker-compose.yml: different subnet
+#   (172.31.79.0/24 vs 172.31.78.0/24), different container names
+#   (ic-parity-* vs ic-*), different host ports (19180/19181 vs
+#   19077/19078/19079, 15432 vs 5432).
+#
+# Quick-start:
+#
+#   cd /Users/fate/v07/v07-fixes
+#   docker compose -f infra/lan-parity-test/docker-compose.yml up -d --build
+#   # wait ~30s for pg-age healthcheck + IronClaw boot
+#   docker compose -f infra/lan-parity-test/docker-compose.yml ps
+#   AI_MEMORY_TEST_POSTGRES_URL='postgres://ai_memory:ai_memory_test@127.0.0.1:15432/ai_memory_test' \
+#   AI_MEMORY_NO_CONFIG=1 \
+#   cargo test --features sal,sal-postgres --release 2>&1 | tee .local-runs/lan-parity-2026-05-19.log
+#
+# Teardown (preserves images, drops volumes):
+#
+#   docker compose -f infra/lan-parity-test/docker-compose.yml down -v
+
+name: ai-memory-lan-parity
+
+services:
+  pg-age:
+    # Apache AGE on PostgreSQL 16 + pgvector — matches the production
+    # pop-os PG major version. AGE 1.6.0 is the most recent pinned
+    # release tag for PG16 as of 2025-09-18. pgvector is layered on
+    # top via Dockerfile.pg-age-vector because the bare apache/age
+    # image ships AGE but NOT pgvector, and the SAL postgres adapter
+    # (feature `sal-postgres` → `dep:pgvector`) requires the
+    # server-side `vector` type for embedding columns (#1065).
+    build:
+      context: .
+      dockerfile: Dockerfile.pg-age-vector
+    image: ai-memory-pg-age-vector:latest
+    container_name: ai-memory-lan-parity-pg-age
+    hostname: pg-age
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_memory
+      POSTGRES_PASSWORD: ai_memory_test
+      POSTGRES_DB: ai_memory_test
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Host-loopback exposure for cargo SAL-postgres tests from the
+      # host process tree. 127.0.0.1 binding (not 0.0.0.0) avoids
+      # advertising the test PG on the LAN.
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - pg-age-data:/var/lib/postgresql/data
+      - ./init-age.sql:/docker-entrypoint-initdb.d/01-init-age.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - ic-parity-mesh
+
+  ic-parity-alice:
+    # #926 (2026-05-20): switched from Dockerfile.plan-c (heavy,
+    # ~367 MB, carries test + bench pre-builds) to
+    # Dockerfile.tier2-trackb (slim, ~335 MB, daemon-only). The mesh
+    # exercises the federation / A2A peer-reach + SAL-postgres + AGE
+    # path; it does not need the in-image test/bench binaries that
+    # Dockerfile.plan-c bundles, so the slim image is the right
+    # default for the lan-parity smoke. Operators wanting the full
+    # plan-c image can override `dockerfile: Dockerfile.plan-c` via a
+    # compose overlay file.
+    build:
+      context: ../..
+      dockerfile: Dockerfile.tier2-trackb
+      args:
+        CARGO_FEATURES: sal-postgres
+    image: ai-memory-lan-parity:latest
+    container_name: ai-memory-lan-parity-alice
+    hostname: ic-parity-alice
+    restart: on-failure
+    depends_on:
+      pg-age:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # #926 (2026-05-20): break the peer-preflight chicken-and-egg.
+      # Without this flag alice's entrypoint dies with `[#878
+      # preflight] UNREACHABLE peer=http://ic-parity-bob:19077`
+      # before bob has booted — bob can't boot if it's waiting for
+      # alice. `depends_on` is necessary but not sufficient (TCP-up
+      # != HTTP-handler-ready). Setting the flag on BOTH services
+      # accepts the per-pair-of-daemons posture that no preflight
+      # check fires on boot; the federation broadcast loop discovers
+      # peers lazily on the first store/forward.
+      AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
+      AI_MEMORY_AGENT_ID: "ai:ic-parity-alice@lan-parity"
+      AI_MEMORY_TIER: autonomous
+      AI_MEMORY_LISTEN_HOST: "0.0.0.0"
+      AI_MEMORY_LISTEN_PORT: "19077"
+      # Intra-bridge hostname `pg-age` resolves via Docker's embedded
+      # DNS. Per-IronClaw schema in search_path keeps alice+bob data
+      # cleanly separated even though they share the same database.
+      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=disable"
+      AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
+      AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
+      # Operator directive 2026-05-31 (supersedes 2026-05-21 #1067 xAI
+      # Grok 4.3 wiring): IronClaw containers run with OpenRouter
+      # google/gemma-4-26b-a4b-it as the AI NHI brain. Cost+context
+      # rationale: $0.06/M-in + $0.33/M-out (vs $3 + $15 on xAI Grok 4.3,
+      # a 50-95× cost reduction); 262144-token context; 26B sparse-MoE
+      # quality is materially stronger than local 8B gemma4:e4b for
+      # long-context atomise/reflect/calibrate paths. Connectivity
+      # verified 2026-05-31 ~11:23 ET (HTTP 200, 2.2s latency).
+      # `OPENROUTER_API_KEY` comes from `~/.env` on this node;
+      # `:?` syntax fails compose with a clear error if the shell env
+      # hasn't sourced ~/.env first. Production operators run:
+      #   set -a; source ~/.env; set +a
+      #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d
+      AI_MEMORY_LLM_BACKEND: "openrouter"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-google/gemma-4-26b-a4b-it}"
+      # auto_tag historically used a separate fast/cheap model
+      # (gemma3:4b on Ollama, then grok-4.3 mini on xAI). On OpenRouter
+      # the same paid Gemma 4 26B model is cheap enough to use uniformly;
+      # operators with extreme cost concerns can override via env to
+      # google/gemma-4-26b-a4b-it:free (rate-limited) or any other model.
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-google/gemma-4-26b-a4b-it}"
+      # Kept for backward compat with anything that still reads OLLAMA_BASE_URL
+      # directly (e.g., tier-default fallback when AI_MEMORY_LLM_BACKEND unset
+      # in some future config path). Harmless when AI_MEMORY_LLM_BACKEND=openrouter.
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
+      # Daemon HTTP X-API-Key auth secret. Reuses the OpenRouter key as
+      # the high-entropy HTTP token (73-char random string is suitable
+      # as an API key). Operators wanting separate secrets set both
+      # OPENROUTER_API_KEY (LLM) and AI_MEMORY_API_KEY (HTTP) explicitly.
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}"
+      RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
+    volumes:
+      - ic-parity-alice-keys:/root/.config/ai-memory/keys
+      - ic-parity-alice-audit:/var/log/ai-memory/audit
+    ports:
+      - "127.0.0.1:19180:19077"
+    networks:
+      - ic-parity-mesh
+    healthcheck:
+      # Operator directive 2026-05-21: send X-API-Key on the healthcheck
+      # otherwise the auth middleware returns 401 and the container is
+      # reported `unhealthy` even though the daemon is fully functional.
+      # The `$$XAI_API_KEY` form double-escapes for compose-vs-shell
+      # interpolation: compose strips one `$`, the in-container shell
+      # uses the env-injected value (passed via the AI_MEMORY_API_KEY
+      # env var above so the in-container `curl` reads the same value
+      # the daemon authenticates against).
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 -H \"X-API-Key: $$AI_MEMORY_API_KEY\" http://127.0.0.1:19077/api/v1/capabilities"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  ic-parity-bob:
+    image: ai-memory-lan-parity:latest
+    container_name: ai-memory-lan-parity-bob
+    hostname: ic-parity-bob
+    restart: on-failure
+    depends_on:
+      pg-age:
+        condition: service_healthy
+      ic-parity-alice:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # #926 — see alice's block above for the rationale. Both
+      # services must skip preflight or the boot chain deadlocks.
+      AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
+      AI_MEMORY_AGENT_ID: "ai:ic-parity-bob@lan-parity"
+      AI_MEMORY_TIER: autonomous
+      AI_MEMORY_LISTEN_HOST: "0.0.0.0"
+      AI_MEMORY_LISTEN_PORT: "19077"
+      AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=disable"
+      AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
+      AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
+      # See alice's block for the 2026-05-31 OpenRouter Gemma 4 26B
+      # rationale (supersedes the #1067 xAI Grok 4.3 wiring).
+      AI_MEMORY_LLM_BACKEND: "openrouter"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-google/gemma-4-26b-a4b-it}"
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-google/gemma-4-26b-a4b-it}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
+      AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}"
+      RUST_LOG: "${RUST_LOG:-ai_memory=info,sqlx=warn}"
+    volumes:
+      - ic-parity-bob-keys:/root/.config/ai-memory/keys
+      - ic-parity-bob-audit:/var/log/ai-memory/audit
+    ports:
+      - "127.0.0.1:19181:19077"
+    networks:
+      - ic-parity-mesh
+    healthcheck:
+      # See alice's block for the X-API-Key healthcheck rationale.
+      test: ["CMD-SHELL", "curl -f -sS --max-time 3 -H \"X-API-Key: $$AI_MEMORY_API_KEY\" http://127.0.0.1:19077/api/v1/capabilities"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+networks:
+  # Distinct subnet from infra/plan-c (172.31.78.0/24) so the two
+  # composes can co-exist on the same Colima host without route
+  # collisions.
+  ic-parity-mesh:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.31.79.0/24
+
+volumes:
+  pg-age-data:
+  ic-parity-alice-keys:
+  ic-parity-alice-audit:
+  ic-parity-bob-keys:
+  ic-parity-bob-audit:

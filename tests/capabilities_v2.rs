@@ -24,17 +24,14 @@
 
 use ai_memory::config::{
     Capabilities, CapabilitiesV1, CapabilityFeatures, FeatureTier, RecallMode, RerankerMode,
-    TierConfig,
+    ResolvedModels, TierConfig,
 };
 use ai_memory::mcp::{CapabilitiesAccept, handle_capabilities_with_conn};
 use ai_memory::reranker::{BatchedReranker, CrossEncoder};
 use serde_json::Value;
 
-/// Build a fresh in-memory `rusqlite::Connection` so each test gets a
-/// clean DB state for the live-count overlays.
-fn fresh_conn() -> rusqlite::Connection {
-    ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
-}
+mod common;
+use common::fresh_conn;
 
 // ---------------------------------------------------------------------------
 // Cap-v2 reports recall_mode_active = "keyword_only" (now: disabled) when
@@ -53,6 +50,7 @@ fn cap_v2_reports_recall_mode_keyword_only_when_no_embedder() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,  // no reranker
         false, // no embedder loaded
         Some(&conn),
@@ -78,6 +76,7 @@ fn cap_v2_reports_reranker_off_when_disabled_at_startup() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None, // no reranker handle = "off"
         false,
         Some(&conn),
@@ -110,6 +109,7 @@ fn cap_v2_reports_reranker_lexical_fallback_when_neural_init_failed() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         Some(&lexical),
         true,
         Some(&conn),
@@ -145,6 +145,7 @@ fn cap_v2_omits_dropped_fields_in_v2_response() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true,
         Some(&conn),
@@ -181,15 +182,22 @@ fn cap_v2_omits_dropped_fields_in_v2_response() {
     );
 
     // Planned-feature objects (memory_reflection, compaction, transcripts).
-    assert_eq!(val["features"]["memory_reflection"]["planned"], true);
-    assert_eq!(val["features"]["memory_reflection"]["enabled"], false);
-    assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7+");
+    // v0.7.0 recursive-learning (issue #655) Tasks 1-6 shipped the
+    // primitive, so memory_reflection flips to
+    // `planned=false, enabled=true, version="v0.7.0"`. The other two
+    // planned-feature objects remain on the roadmap.
+    assert_eq!(val["features"]["memory_reflection"]["planned"], false);
+    assert_eq!(val["features"]["memory_reflection"]["enabled"], true);
+    assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7.0");
     assert_eq!(val["compaction"]["planned"], true);
     assert_eq!(val["compaction"]["enabled"], false);
     assert_eq!(val["compaction"]["version"], "v0.8+");
-    assert_eq!(val["transcripts"]["planned"], true);
+    // v0.7.0 #1324 — transcripts substrate shipped at v0.7.0
+    // (zstd-3 BLOB store + memory_replay tool). Capability flag now
+    // reads `planned: false, enabled: false` at zero-state.
+    assert_eq!(val["transcripts"]["planned"], false);
     assert_eq!(val["transcripts"]["enabled"], false);
-    assert_eq!(val["transcripts"]["version"], "v0.7+");
+    assert_eq!(val["transcripts"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +212,7 @@ fn cap_v1_compat_returns_legacy_shape_on_accept_header() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true,
         Some(&conn),
@@ -264,6 +273,7 @@ fn cap_v2_recall_mode_hybrid_when_embedder_loaded_on_semantic_tier() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         true, // embedder loaded
         Some(&conn),
@@ -290,6 +300,7 @@ fn cap_v2_recall_mode_degraded_when_embedder_configured_but_not_loaded() {
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn(
         &tier_config,
+        &ResolvedModels::from_tier_preset(&tier_config),
         None,
         false, // configured but not loaded — HF download failed, etc.
         Some(&conn),

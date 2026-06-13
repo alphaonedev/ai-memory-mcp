@@ -56,6 +56,7 @@
 //!   helper returns — exiting stays inline so this module is testable.
 
 use crate::cli::CliOutput;
+use crate::models::field_names;
 use crate::{db, models};
 use anyhow::Result;
 use models::{GovernanceDecision, GovernedAction};
@@ -103,11 +104,12 @@ pub fn enforce(
         payload,
     )? {
         GovernanceDecision::Allow => Ok(GovernanceOutcome::Allow),
-        GovernanceDecision::Deny(reason) => {
+        GovernanceDecision::Deny(refusal) => {
             writeln!(
                 out.stderr,
                 "{} denied by governance: {reason}",
-                action.as_str()
+                action.as_str(),
+                reason = refusal.reason,
             )?;
             Ok(GovernanceOutcome::Deny)
         }
@@ -125,8 +127,8 @@ pub fn enforce(
             if json_out {
                 let mut payload_obj = serde_json::json!({
                     "status": "pending",
-                    "pending_id": pending_id,
-                    "reason": "governance requires approval",
+                    (field_names::PENDING_ID): pending_id,
+                    "reason": crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
                     "action": action.as_str(),
                     "namespace": namespace,
                 });
@@ -161,7 +163,7 @@ pub fn enforce(
 mod tests {
     use super::*;
     use crate::cli::test_utils::{TestEnv, seed_memory};
-    use crate::models::{ApproverType, GovernanceLevel, GovernancePolicy};
+    use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
 
     /// v0.7.0 K3 — pin the gate to Enforce so this suite's
     /// historical Pending/Deny outcome assertions still drive the
@@ -214,6 +216,17 @@ mod tests {
             last_accessed_at: None,
             expires_at: None,
             metadata,
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
         };
         let standard_id = db::insert(&conn, &standard).unwrap();
         db::set_namespace_standard(&conn, namespace, &standard_id, None).unwrap();
@@ -253,11 +266,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Approve,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
+            core: CorePolicy {
+                write: GovernanceLevel::Approve,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -290,11 +307,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Approve,
-            approver: ApproverType::Human,
-            inherit: true,
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Approve,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -332,11 +353,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Any,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -373,11 +398,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Registered,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
+            core: CorePolicy {
+                write: GovernanceLevel::Registered,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();
@@ -411,11 +440,15 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
         let policy = GovernancePolicy {
-            write: GovernanceLevel::Approve,
-            promote: GovernanceLevel::Any,
-            delete: GovernanceLevel::Owner,
-            approver: ApproverType::Human,
-            inherit: true,
+            core: CorePolicy {
+                write: GovernanceLevel::Approve,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+            },
+            ..Default::default()
         };
         seed_governance_policy(&db_path, "gov-ns", policy, "alice");
         let conn = db::open(&db_path).unwrap();

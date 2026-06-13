@@ -37,8 +37,9 @@
 //! - `namespace`   — resolved namespace + how many memories matched
 
 use crate::cli::CliOutput;
-use crate::cli::helpers::{auto_namespace, human_age, id_short};
+use crate::cli::helpers::{human_age, id_short};
 use crate::config::AppConfig;
+use crate::models::field_names;
 use crate::{db, models, toon};
 use anyhow::Result;
 use clap::Args;
@@ -53,25 +54,42 @@ use std::time::Instant;
 /// recall pipeline expects. v0.6.3.1 (PR-9h / issue #487 PR #497 req #72).
 pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 
-/// Upper bound of the DB-schema range this binary supports. Mirrors
-/// `db::CURRENT_SCHEMA_VERSION` (27 in v0.7.0 — v21 from K2's
-/// `pending_actions` timeout-sweeper columns, v22 from I1's
-/// `memory_transcripts` BLOB store, v23 from H2's
-/// `memory_links.attest_level` column for outbound link signing, v24
-/// from I2's `memory_transcript_links` join table, v25 from I3's
-/// `memory_transcripts.archived_at` column backing the per-namespace
-/// TTL with archive→prune lifecycle, v26 from H5's append-only
-/// `signed_events` audit table backing the immutable attestation
-/// chain, v27 from K6's `subscription_events.correlation_id`
-/// column + `subscription_dlq` table backing A2A correlation IDs,
-/// ACK/retry semantics, and the dead-letter queue, and v28 from K8's
-/// `agent_quotas` table backing the per-agent rate-limit + storage-cap
-/// substrate (memories/day, storage bytes, links/day, with daily reset
-/// at UTC midnight) — all part of the attested-cortex epic). When a
-/// DB's `schema_version` exceeds this, the binary is too old for a
-/// newer DB and we surface a warning. v0.6.3.1 (PR-9h / issue #487 PR
-/// #497 req #72).
-pub const MAX_SUPPORTED_SCHEMA: u32 = 28;
+/// Upper bound of the DB-schema range this binary supports.
+///
+/// Derived from the schema-version SSOT
+/// [`crate::storage::migrations::current_schema_version()`] — NOT a
+/// hand-maintained literal. A binary supports DBs up to the schema its
+/// own migration ladder produces; the next schema bump therefore moves
+/// this bound automatically with no edit here. Both the sqlite and
+/// postgres ladders land at the same version in lockstep — see
+/// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
+/// `migrations/{sqlite,postgres}/` for the SQL.
+///
+/// **Current value: tracks `current_schema_version()` (v54 at v0.7.0
+/// release).** The const auto-resolves from the SSOT at
+/// `crate::storage::migrations::CURRENT_SCHEMA_VERSION`; this docstring
+/// names the v0.7.0-release tip for narrative continuity but the value
+/// will move on every schema bump WITHOUT requiring a docstring edit.
+/// For the canonical current value at any HEAD, run
+/// `ai-memory --version` (boot manifest prints the resolved schema)
+/// or grep `CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`. The
+/// `scripts/check-docs-vs-ssot.sh` drift gate keeps narrative anchors
+/// honest across operator-facing docs.
+///
+/// v0.7.0 ladder summary (v48 → v53):
+/// v48 added `federation_push_dlq` (#933); v49 added 14 nullable
+/// `archived_memories` columns (#1025); v50 extended `agent_quotas`
+/// PK with `namespace` (#1156); v51 added `federation_nonce_cache` (#1255
+/// / PR #1296); v52 added `transcript_line_dedup` backing #1389
+/// L4/RFC-0001 capture_turn; v53 scoped the `memories_au` FTS5 trigger
+/// to `(title, content, tags)` only (R5.F5.2 / #1418).
+///
+/// When a DB's `schema_version` exceeds this, the binary is too old
+/// for a newer DB and we surface a `warn-schema-unsupported` manifest
+/// header so the user knows to upgrade. v0.6.3.1 (PR-9h / issue #487
+/// PR #497 req #72).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub const MAX_SUPPORTED_SCHEMA: u32 = crate::storage::migrations::current_schema_version() as u32;
 
 /// Pure boundary check: `true` when `v` lies within
 /// `[MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA]`. Extracted so the
@@ -118,7 +136,7 @@ impl BootFormat {
         match s {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
-            "toon" | "toon-compact" | "toon_compact" => Ok(Self::Toon),
+            "toon" | "toon-compact" | crate::toon::FORMAT_TOON_COMPACT => Ok(Self::Toon),
             other => Err(anyhow::anyhow!(
                 "unknown --format value: {other} (expected: text | json | toon)"
             )),
@@ -175,7 +193,9 @@ fn resolve_namespace(args: &BootArgs) -> String {
     if let Some(ref cwd) = args.cwd {
         let _ = std::env::set_current_dir(cwd);
     }
-    auto_namespace()
+    // #1590 — configured [storage].default_namespace beats the git/cwd
+    // inference; unconfigured deployments keep the historical ladder.
+    crate::cli::helpers::resolve_namespace(None)
 }
 
 /// Pull the boot set from the DB. Two-stage:
@@ -290,7 +310,7 @@ impl BootStatus {
 /// failing boot.
 fn read_schema_version(conn: &rusqlite::Connection) -> (String, Option<u32>) {
     match conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
         [],
         |r| r.get::<_, i64>(0),
     ) {
@@ -324,7 +344,7 @@ fn count_live_memories(conn: &rusqlite::Connection) -> String {
 /// `<unavailable>` sentinel without branching downstream.
 ///
 /// Field semantics:
-/// - `version`         — `env!("CARGO_PKG_VERSION")` at compile time
+/// - `version`         — `crate::PKG_VERSION` at compile time
 /// - `db_path`         — resolved path the boot ran against
 /// - `schema_version`  — `vN` from the DB's `schema_version` table
 /// - `total_memories`  — count of live (non-expired) rows
@@ -373,19 +393,49 @@ impl BootManifest {
         latency_ms: u128,
         schema_supported: bool,
     ) -> Self {
-        // Resolve the *configured* tier. Boot doesn't materialize the
-        // embedder / LLM / reranker handles, so these reflect what would
-        // load — not what actually loaded.
+        // v0.7.x (#1146) — Boot reports the SAME resolved configuration
+        // that the live MCP / HTTP / CLI surfaces will use, instead of
+        // the compiled tier preset. The resolver folds CLI flags (none
+        // at boot time), AI_MEMORY_LLM_* env vars, the `[llm]` /
+        // `[embeddings]` / `[reranker]` config sections, the legacy
+        // flat fields, and the compiled fallback through the uniform
+        // precedence ladder. The banner emits `backend:model` so the
+        // operator can verify wiring at a glance (`llm=xai:grok-4.3`
+        // vs `llm=ollama:gemma3:4b` vs `llm=ollama:none`).
         let feature_tier = app_config.effective_tier(None);
-        let tier_config = feature_tier.config();
-        let embedder = tier_config
-            .embedding_model
-            .map_or_else(|| "none".to_string(), |m| m.hf_model_id().to_string());
-        let llm = tier_config
-            .llm_model
-            .map_or_else(|| "none".to_string(), |m| m.ollama_model_id().to_string());
-        let reranker = if tier_config.cross_encoder {
-            "ms-marco-MiniLM-L-6-v2".to_string()
+        let resolved_llm = app_config.resolve_llm(None, None, None);
+        let resolved_emb = app_config.resolve_embeddings();
+        let resolved_rer = app_config.resolve_reranker();
+
+        // Embedder: report the resolver's view UNLESS the tier preset
+        // disables embeddings entirely (keyword tier), in which case
+        // we keep the historical "none" string so existing scrapers
+        // continue to recognise a tier-disabled embedder posture.
+        let embedder = if feature_tier.config().embedding_model.is_none() {
+            "none".to_string()
+        } else {
+            resolved_emb.model.clone()
+        };
+
+        // LLM: `backend:model` provenance. On the Ollama-native wire
+        // shape we emit just the model (legacy banner shape) so
+        // existing grep'ing tools that match `llm=gemma3:4b` continue
+        // to work; on any OpenAI-compatible vendor the full
+        // `xai:grok-4.3` shape is emitted so the operator-facing
+        // disambiguation is loud. The vendor-literal check lives on
+        // `ResolvedLlm` (issue #1174 PR4 — substrate-vendor cleanup)
+        // so the banner code never re-names the backend.
+        let llm = if resolved_llm.is_ollama_native() {
+            resolved_llm.model.clone()
+        } else {
+            resolved_llm.display_label()
+        };
+
+        // Reranker: respect the resolver (which folds `[reranker]` +
+        // legacy `cross_encoder`); fall back to tier preset only when
+        // neither configured the field.
+        let reranker = if resolved_rer.enabled || feature_tier.config().cross_encoder {
+            resolved_rer.model.clone()
         } else {
             "none".to_string()
         };
@@ -413,14 +463,14 @@ impl BootManifest {
                 "db schema v{db_schema} unsupported by binary {bin_ver} \
                  (supports v{min}..v{max}); proceeding with degraded context. \
                  Run `ai-memory doctor` and consider upgrading.",
-                bin_ver = env!("CARGO_PKG_VERSION"),
+                bin_ver = crate::PKG_VERSION,
                 min = MIN_SUPPORTED_SCHEMA,
                 max = MAX_SUPPORTED_SCHEMA,
             ),
         };
 
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::PKG_VERSION.to_string(),
             db_path: db_path.display().to_string(),
             schema_version,
             total_memories,
@@ -551,7 +601,11 @@ pub fn run(
         return Ok(());
     }
 
-    let displayed_ns = if fell_back { "global" } else { &namespace };
+    let displayed_ns = if fell_back {
+        crate::DEFAULT_NAMESPACE
+    } else {
+        &namespace
+    };
     let status = if fell_back {
         BootStatus::InfoFallback
     } else {
@@ -682,14 +736,14 @@ fn emit_status_header(
                     "status": manifest.status.label(),
                     "version": manifest.version,
                     "db_path": manifest.db_path,
-                    "schema_version": manifest.schema_version,
+                    (field_names::SCHEMA_VERSION): manifest.schema_version,
                     "schema_supported": manifest.schema_supported,
-                    "total_memories": manifest.total_memories,
+                    (field_names::TOTAL_MEMORIES): manifest.total_memories,
                     "tier": manifest.tier,
                     "embedder": manifest.embedder,
                     "reranker": manifest.reranker,
                     "llm": manifest.llm,
-                    "latency_ms": manifest.latency_ms,
+                    (field_names::LATENCY_MS): manifest.latency_ms,
                     "namespace": manifest.namespace,
                     "count": manifest.count,
                     "note": manifest.note,
@@ -817,14 +871,14 @@ fn emit_json_with_status(
         "status": manifest.status.label(),
         "version": manifest.version,
         "db_path": manifest.db_path,
-        "schema_version": manifest.schema_version,
+        (field_names::SCHEMA_VERSION): manifest.schema_version,
         "schema_supported": manifest.schema_supported,
-        "total_memories": manifest.total_memories,
+        (field_names::TOTAL_MEMORIES): manifest.total_memories,
         "tier": manifest.tier,
         "embedder": manifest.embedder,
         "reranker": manifest.reranker,
         "llm": manifest.llm,
-        "latency_ms": manifest.latency_ms,
+        (field_names::LATENCY_MS): manifest.latency_ms,
         "namespace": manifest.namespace,
         "count": manifest.count,
         "note": manifest.note,
@@ -1238,6 +1292,12 @@ mod tests {
         let mut env = TestEnv::fresh();
         let id = seed_memory(&env.db_path, "other", "long-tier-row", "x");
         let conn = db::open(&env.db_path).unwrap();
+        // v0.7.0 #1036 (Agent-3 #7) — test fixture seed. The seed
+        // helper produces a default-tier row; this UPDATE flips it
+        // to long-tier so the boot fallback fires. Non-version-
+        // bumping is correct here because the test isolates a
+        // single freshly-seeded row in a fresh DB. Pinned by
+        // `tests/non_version_bumping_sites_1036.rs`.
         conn.execute(
             "UPDATE memories SET tier='long' WHERE id=?1",
             rusqlite::params![id],
@@ -1684,5 +1744,152 @@ mod tests {
             !stdout.contains(REDACTED_TITLE),
             "default config must NOT redact: {stdout}"
         );
+    }
+
+    // ---------- E1 coverage uplift -----------------------------------
+    // Targets: toon format (emit_toon + status header toon branch),
+    // --no-header + --format json (memories-only JSON path),
+    // resolve_namespace with --cwd override.
+
+    #[test]
+    fn boot_toon_format_emits_compact_body_with_header() {
+        // Drives emit_toon (lines 840-852) + the BootFormat::Toon arm
+        // (lines 609-625).
+        let _g = test_lock();
+        // SAFETY: process-wide env mutation; serialized by `_g`.
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-toon", "toon-row", "x");
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-toon".to_string());
+        args.format = "toon".to_string();
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        // Header should still appear (it's text/toon format).
+        assert!(stdout.contains("# ai-memory boot: ok"));
+        // The body is toon-encoded; the title field should still surface.
+        assert!(stdout.contains("toon-row"));
+    }
+
+    #[test]
+    fn boot_toon_format_no_header_emits_body_only() {
+        // Drives BootFormat::Toon + no_header=true (skips manifest emit).
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-toon-nh", "row-x", "x");
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-toon-nh".to_string());
+        args.format = "toon".to_string();
+        args.no_header = true;
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        assert!(!stdout.contains("# ai-memory boot"));
+        // Body still emits the title.
+        assert!(stdout.contains("row-x"));
+    }
+
+    #[test]
+    fn boot_json_no_header_emits_memories_only() {
+        // Drives the args.no_header arm inside the JSON format branch
+        // (lines 569-576).
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-json-nh", "json-nh-row", "x");
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.namespace = Some("ns-json-nh".to_string());
+        args.format = "json".to_string();
+        args.no_header = true;
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        // Only the `memories` key — no status, no manifest fields.
+        assert!(parsed.get("memories").is_some());
+        assert!(parsed.get("status").is_none());
+        assert!(parsed.get("version").is_none());
+    }
+
+    #[test]
+    fn boot_resolve_namespace_with_cwd_override() {
+        // Hits resolve_namespace's `set_current_dir(cwd)` branch
+        // (line 178). The override doesn't have to land on a git repo —
+        // the resolver swallows the result.
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = TestEnv::fresh();
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.cwd = Some(tmp.path().to_path_buf());
+        // namespace is None so resolve_namespace falls into the cwd branch.
+        let saved_cwd = std::env::current_dir().unwrap();
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        // Restore so subsequent tests aren't perturbed.
+        std::env::set_current_dir(&saved_cwd).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        // The header surfaces *some* namespace; we don't pin which.
+        assert!(stdout.contains("# ai-memory boot"));
+    }
+
+    #[test]
+    fn boot_redact_titles_json_output_replaces_titles() {
+        // Drives render_memories_for_emit's redact-clone arm (lines
+        // 646-652) under the JSON format path.
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-rj", "private-jt", "x");
+        let db_path = env.db_path.clone();
+        let cfg = config_with_boot(Some(true), Some(true));
+        let mut args = default_args();
+        args.namespace = Some("ns-rj".to_string());
+        args.format = "json".to_string();
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let memories = parsed["memories"].as_array().expect("memories array");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["title"].as_str().unwrap(), REDACTED_TITLE);
+    }
+
+    #[test]
+    fn boot_format_parse_unknown_value_propagates() {
+        // Drives BootFormat::parse's error arm.
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        let db_path = env.db_path.clone();
+        let cfg = default_config();
+        let mut args = default_args();
+        args.format = "xml".to_string();
+        let mut out = env.output();
+        let res = run(&db_path, &args, &cfg, &mut out);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("unknown --format"));
     }
 }

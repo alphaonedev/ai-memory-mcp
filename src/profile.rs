@@ -28,14 +28,18 @@
 //!   `memory_load_family`; v0.7 B2 added `memory_smart_load`).
 //!   Always loaded.
 //! - `graph` — adds the 11 KG/entity/replay/verify/find_paths tools. ~18 tools.
-//! - `admin` — adds lifecycle (5) + governance (8). ~20 tools.
+//! - `admin` — adds lifecycle (6) + governance (8). ~21 tools.
 //! - `power` — adds the 8 LLM-augmented + operator tools (consolidate,
 //!   auto_tag, …, plus the v0.7 K7 subscription-reliability pair).
 //!   ~15 tools.
-//! - `full` — every family. 51 tools (v0.6.3 baseline 43 + v0.7.0 I4 `memory_replay` + v0.7 H4 `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 `memory_smart_load` + v0.7 K7 `memory_subscription_replay` + `memory_subscription_dlq_list` + v0.7 J7 `memory_find_paths` + v0.7 K8 `memory_quota_status`).
+//! - `full` — every family. **74 advertised entries at v0.7.0**
+//!   (73 callable "memory tools" + the always-on `memory_capabilities`
+//!   bootstrap; `Profile::full().expected_tool_count()` is the
+//!   canonical assertion).
 //! - `custom` — comma-separated family list (`core,graph,archive` …).
 //!   `core` is implicitly added if missing — there's no profile that
-//!   ships *less than* the 5 core tools.
+//!   ships *less than* the 7 core tools at v0.7.0 (the original 5 +
+//!   `memory_load_family` + `memory_smart_load`).
 //!
 //! ## Custom-profile parsing edge cases
 //!
@@ -57,7 +61,7 @@
 
 use std::str::FromStr;
 
-/// A tool family. Source-anchored at `src/mcp.rs::tool_definitions()`
+/// A tool family. Source-anchored at `crate::mcp::registry::tool_definitions()`
 /// 2026-05-05. Counts must sum to 51 (the v0.6.3.1 baseline of 43 +
 /// v0.7.0 I4 `memory_replay` + v0.7 H4 `memory_verify` (both in
 /// `Family::Graph`) + v0.7 B1 `memory_load_family` and v0.7 B2
@@ -108,76 +112,177 @@ pub enum Family {
 /// always-on bootstrap so the runtime-discovery dance works out of the
 /// box on `--profile core`. Per RFC S27 and the v0.6.4-002 acceptance
 /// criteria.
-pub const ALWAYS_ON_TOOLS: &[&str] = &["memory_capabilities"];
+///
+/// v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep): the
+/// literal references the canonical const so this slice cannot drift
+/// from the dispatch table.
+///
+/// DOC-7 (med/low review batch) — semantic note: this is a sentinel
+/// list with `len == 1` at v0.7.0 (only `memory_capabilities`). The
+/// `&[…]` slice shape is intentionally extensible: future profile
+/// work may promote additional bootstrap-class tools (e.g.
+/// `memory_load_family`, `memory_smart_load`) into the always-on set,
+/// at which point [`Profile::core`] would need to subtract them from
+/// the per-family count to avoid double-counting. Today the family
+/// counts treat `memory_load_family` and `memory_smart_load` as core
+/// family members, NOT as always-on; promotion would require updating
+/// `Profile::expected_tool_count` arithmetic accordingly.
+pub const ALWAYS_ON_TOOLS: &[&str] = &[crate::mcp::registry::tool_names::MEMORY_CAPABILITIES];
 
 impl Family {
     /// Lookup the family that owns a given tool name. Source-anchored
-    /// at `src/mcp.rs::tool_definitions()` 2026-05-04. Every name listed
+    /// at `crate::mcp::registry::tool_definitions()` 2026-05-04. Every name listed
     /// in the v0.6.3.1 baseline is covered; `None` means the tool is
     /// either unknown to this enumeration or moved out of bounds (which
     /// should make `tool_definitions_returns_43_tools` red and force a
     /// reconciliation).
     #[must_use]
     pub fn for_tool(name: &str) -> Option<Self> {
+        // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — every
+        // match arm references a const from
+        // [`crate::mcp::registry::tool_names`] so the family routing
+        // table and the dispatch table cannot drift in name spelling.
+        use crate::mcp::registry::tool_names as tn;
         match name {
             // core (7 — v0.7 B1 added memory_load_family as the always-on
             // alternative to memory_recall when the agent already knows
             // which family taxonomy it wants; v0.7 B2 added
             // memory_smart_load as the intent-routed front door that
             // picks the best family for the caller).
-            "memory_store" | "memory_recall" | "memory_list" | "memory_get" | "memory_search"
-            | "memory_load_family" | "memory_smart_load" => Some(Self::Core),
-            // lifecycle (5)
-            "memory_update" | "memory_delete" | "memory_forget" | "memory_gc"
-            | "memory_promote" => Some(Self::Lifecycle),
+            tn::MEMORY_STORE | tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_GET
+            | tn::MEMORY_SEARCH | tn::MEMORY_LOAD_FAMILY | tn::MEMORY_SMART_LOAD => {
+                Some(Self::Core)
+            }
+            // lifecycle (6 — v0.7.0 #1389 L4 added memory_capture_turn, the
+            // host-volunteered idempotent turn-capture substrate primitive).
+            tn::MEMORY_UPDATE | tn::MEMORY_DELETE | tn::MEMORY_FORGET | tn::MEMORY_GC
+            | tn::MEMORY_PROMOTE | tn::MEMORY_CAPTURE_TURN => Some(Self::Lifecycle),
             // graph (11 — v0.7.0 I4 added memory_replay; v0.7 H4 added memory_verify;
             // v0.7 J7 added memory_find_paths)
-            "memory_kg_query"
-            | "memory_kg_timeline"
-            | "memory_kg_invalidate"
-            | "memory_link"
-            | "memory_get_links"
-            | "memory_entity_register"
-            | "memory_entity_get_by_alias"
-            | "memory_get_taxonomy"
-            | "memory_replay"
-            | "memory_verify"
-            | "memory_find_paths" => Some(Self::Graph),
+            tn::MEMORY_KG_QUERY
+            | tn::MEMORY_KG_TIMELINE
+            | tn::MEMORY_KG_INVALIDATE
+            | tn::MEMORY_LINK
+            | tn::MEMORY_GET_LINKS
+            | tn::MEMORY_ENTITY_REGISTER
+            | tn::MEMORY_ENTITY_GET_BY_ALIAS
+            | tn::MEMORY_GET_TAXONOMY
+            | tn::MEMORY_REPLAY
+            | tn::MEMORY_VERIFY
+            | tn::MEMORY_FIND_PATHS => Some(Self::Graph),
             // governance (8)
-            "memory_pending_list"
-            | "memory_pending_approve"
-            | "memory_pending_reject"
-            | "memory_namespace_set_standard"
-            | "memory_namespace_get_standard"
-            | "memory_namespace_clear_standard"
-            | "memory_subscribe"
-            | "memory_unsubscribe" => Some(Self::Governance),
-            // power (9 — v0.7 K7 added the subscription-reliability pair:
-            // `memory_subscription_replay` + `memory_subscription_dlq_list`;
-            // v0.7 K8 added `memory_quota_status` for the per-agent quota
-            // substrate. All operator/governance, not data-plane.)
-            "memory_consolidate"
-            | "memory_detect_contradiction"
-            | "memory_check_duplicate"
-            | "memory_auto_tag"
-            | "memory_expand_query"
-            | "memory_inbox"
-            | "memory_subscription_replay"
-            | "memory_subscription_dlq_list"
-            | "memory_quota_status" => Some(Self::Power),
-            // meta (5)
-            "memory_capabilities"
-            | "memory_agent_register"
-            | "memory_agent_list"
-            | "memory_session_start"
-            | "memory_stats" => Some(Self::Meta),
+            tn::MEMORY_PENDING_LIST
+            | tn::MEMORY_PENDING_APPROVE
+            | tn::MEMORY_PENDING_REJECT
+            | tn::MEMORY_NAMESPACE_SET_STANDARD
+            | tn::MEMORY_NAMESPACE_GET_STANDARD
+            | tn::MEMORY_NAMESPACE_CLEAR_STANDARD
+            | tn::MEMORY_SUBSCRIBE
+            | tn::MEMORY_UNSUBSCRIBE => Some(Self::Governance),
+            // power (23 — the actual count; v0.7 K7 added the
+            // subscription-reliability pair (`memory_subscription_replay`
+            // + `memory_subscription_dlq_list`); v0.7 K8 added
+            // `memory_quota_status`; v0.7.0 Task 4/8 added
+            // `memory_reflect`; v0.7.0 L2-2/L2-3 added
+            // `memory_reflection_origin` + `memory_dependents_of_invalidated`;
+            // v0.7.0 QW-1 added `memory_export_reflection`; v0.7.0 QW-2
+            // added `memory_persona` + `memory_persona_generate`; v0.7.0
+            // QW-3 follow-up added `memory_offload` + `memory_deref`;
+            // v0.7.0 WT-1-C added `memory_atomise`; v0.7.0 Form 3 added
+            // `memory_ingest_multistep`; v0.7.0 Form 5 added
+            // `memory_calibrate_confidence`; v0.7.0 #691 added
+            // `memory_check_agent_action` + `memory_rule_list`; v0.7.0
+            // #224/#311 added `memory_share`. All operator/governance,
+            // not data-plane. Pinned by `Family::expected_tool_count`
+            // (derived from this slice) and the
+            // `family_tool_names_cover_registry_all` test.
+            tn::MEMORY_CONSOLIDATE
+            | tn::MEMORY_DETECT_CONTRADICTION
+            | tn::MEMORY_CHECK_DUPLICATE
+            | tn::MEMORY_AUTO_TAG
+            | tn::MEMORY_EXPAND_QUERY
+            | tn::MEMORY_INBOX
+            | tn::MEMORY_SUBSCRIPTION_REPLAY
+            | tn::MEMORY_SUBSCRIPTION_DLQ_LIST
+            | tn::MEMORY_QUOTA_STATUS
+            | tn::MEMORY_REFLECT
+            | tn::MEMORY_REFLECTION_ORIGIN
+            // v0.7.0 QW-1 — file-backed reflection chain export.
+            // Operator-facing; substrate returns rendered content,
+            // agent harness owns the disk write.
+            | tn::MEMORY_EXPORT_REFLECTION
+            // v0.7.0 QW-2 — Persona-as-artifact. The read-only
+            // `memory_persona` lookup and the write-side
+            // `memory_persona_generate` regeneration both sit under
+            // Power. Tier-gating in the MCP dispatcher refuses the
+            // write-side surface unless smart+autonomous is enabled.
+            | tn::MEMORY_PERSONA
+            | tn::MEMORY_PERSONA_GENERATE
+            // v0.7.0 Form 5 (issue #758) — calibration sweep over the
+            // shadow-mode observation table. Operator-callable
+            // equivalent of `ai-memory calibrate confidence
+            // --from-shadow`. Lives in Power alongside the other
+            // operator-facing observability tools.
+            | tn::MEMORY_CALIBRATE_CONFIDENCE
+            // v0.7.0 L2-3 (issue #668) — read-side surface for the
+            // reflection invalidation propagation walker. Operator-
+            // facing inspector for the per-reflection dependent set
+            // that gets notified on Reflection→Reflection supersedes.
+            | tn::MEMORY_DEPENDENTS_OF_INVALIDATED
+            // v0.7.0 (issue #691) — substrate-level agent-action rules
+            // engine. Both tools live in Family::Power (governance /
+            // operator-facing, not data-plane). Mutation tools are
+            // explicitly NOT registered over MCP per design revision
+            // 2026-05-13 — operator uses CLI / HTTP with signed key.
+            | tn::MEMORY_CHECK_AGENT_ACTION
+            | tn::MEMORY_RULE_LIST
+            // v0.7.0 QW-3 follow-up — context-offload substrate primitive.
+            // The pair lives in Family::Power so the `power` (and `full`)
+            // profile surfaces them while keeping the keyword-tier
+            // `core` surface unchanged (semantic-tier+ exposure per the
+            // QW-3 brief).
+            | tn::MEMORY_OFFLOAD
+            | tn::MEMORY_DEREF
+            // v0.7.0 WT-1-C — curator-pass atomisation tool. Lives in
+            // the same family/profile group as memory_consolidate and
+            // memory_reflect (semantic+ tier; the keyword tier short-
+            // circuits with a tier-locked advisory envelope).
+            | tn::MEMORY_ATOMISE
+            // v0.7.0 Form 3 (issue #756) — multi-step ingest
+            // orchestrator. Lives at Family::Power alongside the other
+            // LLM-driven write-side tools; tier-gated to smart+ with
+            // the standard tier-locked advisory on keyword.
+            | tn::MEMORY_INGEST_MULTISTEP
+            // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
+            // Sync RFC pulled forward per operator directive
+            // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-level
+            // point-to-point copy into `_shared/<from>→<to>/`.
+            | tn::MEMORY_SHARE => Some(Self::Power),
+            // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
+            // memory_recall_observations).
+            tn::MEMORY_CAPABILITIES
+            | tn::MEMORY_AGENT_REGISTER
+            | tn::MEMORY_AGENT_LIST
+            | tn::MEMORY_SESSION_START
+            | tn::MEMORY_STATS
+            | tn::MEMORY_RECALL_OBSERVATIONS => Some(Self::Meta),
             // archive (4)
-            "memory_archive_list"
-            | "memory_archive_purge"
-            | "memory_archive_restore"
-            | "memory_archive_stats" => Some(Self::Archive),
-            // other (2)
-            "memory_list_subscriptions" | "memory_notify" => Some(Self::Other),
+            tn::MEMORY_ARCHIVE_LIST
+            | tn::MEMORY_ARCHIVE_PURGE
+            | tn::MEMORY_ARCHIVE_RESTORE
+            | tn::MEMORY_ARCHIVE_STATS => Some(Self::Archive),
+            // other (9 — 2 baseline + v0.7.0 L1-5 5 skill tools +
+            // v0.7.0 L2-6 memory_skill_promote_from_reflection (#671) +
+            // v0.7.0 L2-7 memory_skill_compositional_context (#672))
+            tn::MEMORY_LIST_SUBSCRIPTIONS
+            | tn::MEMORY_NOTIFY
+            | tn::MEMORY_SKILL_REGISTER
+            | tn::MEMORY_SKILL_LIST
+            | tn::MEMORY_SKILL_GET
+            | tn::MEMORY_SKILL_RESOURCE
+            | tn::MEMORY_SKILL_EXPORT
+            | tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION
+            | tn::MEMORY_SKILL_COMPOSITIONAL_CONTEXT => Some(Self::Other),
             _ => None,
         }
     }
@@ -189,7 +294,7 @@ impl Family {
             Self::Core => "core",
             Self::Lifecycle => "lifecycle",
             Self::Graph => "graph",
-            Self::Governance => "governance",
+            Self::Governance => crate::models::field_names::GOVERNANCE,
             Self::Power => "power",
             Self::Meta => "meta",
             Self::Archive => "archive",
@@ -213,124 +318,201 @@ impl Family {
         ]
     }
 
-    /// Expected tool count for this family. v0.6.4-002 will assert
-    /// that the actual `register_<family>` matches this constant.
+    /// Number of MCP tools advertised by this family.
+    ///
+    /// Derived from [`Family::tool_names`] — that slice is the single
+    /// source of truth for both the names AND the count. Adding a tool
+    /// to a family is therefore exactly one edit (append a `tn::*`
+    /// entry to the slice arm); every count that depends on it —
+    /// per-profile expectations, the full-profile total, the registry
+    /// lockstep — recomputes automatically. There are NO hand-maintained
+    /// per-family magic numbers here by design (the historical
+    /// `match self { Core => 7, … }` form drifted whenever a tool landed
+    /// without the matching count bump).
     #[must_use]
     pub const fn expected_tool_count(self) -> usize {
-        match self {
-            // Core: 5 baseline + memory_load_family (v0.7 B1) +
-            // memory_smart_load (v0.7 B2) = 7.
-            Self::Core => 7,
-            Self::Lifecycle | Self::Meta => 5,
-            // Graph: 8 baseline + memory_replay (v0.7.0 I4) + memory_verify (v0.7 H4) +
-            // memory_find_paths (v0.7 J7) = 11.
-            Self::Graph => 11,
-            Self::Governance => 8,
-            // Power: 6 baseline + 2 (v0.7 K7) + 1 (v0.7 K8 quota_status) = 9.
-            Self::Power => 9,
-            Self::Archive => 4,
-            Self::Other => 2,
-        }
+        self.tool_names().len()
     }
 
     /// v0.7.0 A2 — tool names belonging to this family. Forward of the
     /// `Family::for_tool` reverse map; source-anchored at
-    /// `src/mcp.rs::tool_definitions()` 2026-05-04 (same anchor as
+    /// `crate::mcp::registry::tool_definitions()` 2026-05-04 (same anchor as
     /// [`Family::for_tool`] and [`Family::expected_tool_count`]).
     /// Order is the order each tool appears in
     /// `tool_definitions_for_profile`'s registration walk, so an
     /// LLM-facing preview ("the first three tools loaded") aligns with
     /// the actual `tools/list` output.
     ///
-    /// The slice length must match [`Family::expected_tool_count`]; the
-    /// `family_tool_names_match_expected_count` unit test pins both in
-    /// sync.
+    /// This slice is the single source of truth for the family's tool
+    /// set. [`Family::expected_tool_count`] derives its return value
+    /// from `self.tool_names().len()`, and the
+    /// `family_tool_names_cover_registry_all` unit test pins the union
+    /// of all families against the canonical registry set.
     #[must_use]
     pub const fn tool_names(self) -> &'static [&'static str] {
+        // v0.7.x (issue #1174 PR1 — pm-v3.1 MCP tool name sweep) — every
+        // entry references a `pub const` from
+        // [`crate::mcp::registry::tool_names`] so the per-family lists,
+        // the dispatch table, and the registry iterator cannot drift
+        // in name spelling.
+        use crate::mcp::registry::tool_names as tn;
         match self {
             Self::Core => &[
-                "memory_store",
-                "memory_recall",
-                "memory_list",
-                "memory_get",
-                "memory_search",
+                tn::MEMORY_STORE,
+                tn::MEMORY_RECALL,
+                tn::MEMORY_LIST,
+                tn::MEMORY_GET,
+                tn::MEMORY_SEARCH,
                 // v0.7 B1 — always-on alternative to memory_recall when
                 // the agent already knows the Family taxonomy it wants.
-                "memory_load_family",
+                tn::MEMORY_LOAD_FAMILY,
                 // v0.7 B2 — intent-routed front door. Caller passes a
                 // free-text intent; the handler picks the best family
                 // from the cached descriptors and forwards to
                 // `memory_load_family`.
-                "memory_smart_load",
+                tn::MEMORY_SMART_LOAD,
             ],
             Self::Lifecycle => &[
-                "memory_update",
-                "memory_delete",
-                "memory_forget",
-                "memory_gc",
-                "memory_promote",
+                tn::MEMORY_UPDATE,
+                tn::MEMORY_DELETE,
+                tn::MEMORY_FORGET,
+                tn::MEMORY_GC,
+                tn::MEMORY_PROMOTE,
+                // v0.7.0 #1389 L4 — host-volunteered idempotent turn
+                // capture (RFC-0001). One memory row + one
+                // transcript_line_dedup row per host turn.
+                tn::MEMORY_CAPTURE_TURN,
             ],
             Self::Graph => &[
-                "memory_kg_query",
-                "memory_kg_timeline",
-                "memory_kg_invalidate",
-                "memory_link",
-                "memory_get_links",
-                "memory_entity_register",
-                "memory_entity_get_by_alias",
-                "memory_get_taxonomy",
+                tn::MEMORY_KG_QUERY,
+                tn::MEMORY_KG_TIMELINE,
+                tn::MEMORY_KG_INVALIDATE,
+                tn::MEMORY_LINK,
+                tn::MEMORY_GET_LINKS,
+                tn::MEMORY_ENTITY_REGISTER,
+                tn::MEMORY_ENTITY_GET_BY_ALIAS,
+                tn::MEMORY_GET_TAXONOMY,
                 // v0.7.0 I4 — traverses memory_transcript_links (I2) to
                 // reconstruct the source-transcript chain for a memory.
-                "memory_replay",
+                tn::MEMORY_REPLAY,
                 // v0.7 H4 — re-verifies a stored link's Ed25519
                 // signature on demand, returning attest_level.
-                "memory_verify",
+                tn::MEMORY_VERIFY,
                 // v0.7 J7 — enumerate up to N paths between two memories
                 // (BFS with cycle detection over memory_links).
-                "memory_find_paths",
+                tn::MEMORY_FIND_PATHS,
             ],
             Self::Governance => &[
-                "memory_pending_list",
-                "memory_pending_approve",
-                "memory_pending_reject",
-                "memory_namespace_set_standard",
-                "memory_namespace_get_standard",
-                "memory_namespace_clear_standard",
-                "memory_subscribe",
-                "memory_unsubscribe",
+                tn::MEMORY_PENDING_LIST,
+                tn::MEMORY_PENDING_APPROVE,
+                tn::MEMORY_PENDING_REJECT,
+                tn::MEMORY_NAMESPACE_SET_STANDARD,
+                tn::MEMORY_NAMESPACE_GET_STANDARD,
+                tn::MEMORY_NAMESPACE_CLEAR_STANDARD,
+                tn::MEMORY_SUBSCRIBE,
+                tn::MEMORY_UNSUBSCRIBE,
             ],
             Self::Power => &[
-                "memory_consolidate",
-                "memory_detect_contradiction",
-                "memory_check_duplicate",
-                "memory_auto_tag",
-                "memory_expand_query",
-                "memory_inbox",
+                tn::MEMORY_CONSOLIDATE,
+                tn::MEMORY_DETECT_CONTRADICTION,
+                tn::MEMORY_CHECK_DUPLICATE,
+                tn::MEMORY_AUTO_TAG,
+                tn::MEMORY_EXPAND_QUERY,
+                tn::MEMORY_INBOX,
                 // v0.7 K7 — operator/governance subscription-reliability
                 // tools. Replay reads back the audit row series for one
                 // subscription since an RFC3339 cursor; dlq_list inspects
                 // payloads that exhausted the [200ms, 1s, 5s] retry ladder.
-                "memory_subscription_replay",
-                "memory_subscription_dlq_list",
+                tn::MEMORY_SUBSCRIPTION_REPLAY,
+                tn::MEMORY_SUBSCRIPTION_DLQ_LIST,
                 // v0.7 K8 — per-agent quota status (memories/day, storage
                 // bytes, links/day). Operator-facing inspector for the K8
                 // rate-limit substrate.
-                "memory_quota_status",
+                tn::MEMORY_QUOTA_STATUS,
+                // v0.7.0 Task 4/8 (recursive learning, issue #655) —
+                // substrate-native reflection primitive. Inserts a
+                // reflection memory plus N `reflects_on` provenance
+                // links in a single atomic transaction.
+                tn::MEMORY_REFLECT,
+                // v0.7.0 L2-2 (S6-M1) — cross-peer reflection origin
+                // inspector. Returns peer_origin / signing_agent /
+                // original_depth / local_depth_at_arrival for a row.
+                tn::MEMORY_REFLECTION_ORIGIN,
+                // v0.7.0 L2-3 (issue #668) — invalidation propagation
+                // read-side inspector. Lists dependents flagged by
+                // the walker on Reflection→Reflection supersedes.
+                tn::MEMORY_DEPENDENTS_OF_INVALIDATED,
+                // v0.7.0 (issue #691) — substrate-level agent-action
+                // rules engine. Read-side surface; mutation tools are
+                // NOT registered over MCP (operator uses CLI / HTTP).
+                tn::MEMORY_CHECK_AGENT_ACTION,
+                tn::MEMORY_RULE_LIST,
+                // v0.7.0 QW-1 — file-backed reflection chain export
+                // companion. Renders the markdown / JSON envelope;
+                // does NOT write to disk (agent harness owns disk I/O).
+                tn::MEMORY_EXPORT_REFLECTION,
+                // v0.7.0 QW-3 follow-up — context-offload substrate
+                // primitive (offload + deref). Power-family registration
+                // gives semantic-tier+ exposure per the QW-3 brief; the
+                // handlers themselves live at src/mcp/tools/offload.rs.
+                tn::MEMORY_OFFLOAD,
+                tn::MEMORY_DEREF,
+                // v0.7.0 WT-1-C — curator-pass atomisation tool.
+                // Decomposes a coarse memory into 2-10 atomic
+                // propositions; archives the source. Lives in Power
+                // alongside memory_consolidate / memory_reflect.
+                tn::MEMORY_ATOMISE,
+                // v0.7.0 QW-2 — Persona-as-artifact. Read-only lookup
+                // + smart+ regeneration. Substrate writes the SQL row
+                // (and optionally the filesystem export via namespace
+                // policy); the agent never holds the keypair.
+                tn::MEMORY_PERSONA,
+                tn::MEMORY_PERSONA_GENERATE,
+                // v0.7.0 Form 3 (issue #756) — multi-step ingest
+                // orchestrator. Deterministic helpers + LLM stages
+                // with explicit-trust slots and prompt-cache reuse.
+                tn::MEMORY_INGEST_MULTISTEP,
+                // v0.7.0 Form 5 (issue #758) — calibration sweep over
+                // the shadow-mode observation table. Operator surface
+                // for tuning per-(namespace, source) confidence
+                // baselines.
+                tn::MEMORY_CALIBRATE_CONFIDENCE,
+                // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
+                // Sync RFC pulled forward per operator directive
+                // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-
+                // level point-to-point copy into `_shared/<from>→<to>/`.
+                tn::MEMORY_SHARE,
             ],
             Self::Meta => &[
-                "memory_capabilities",
-                "memory_agent_register",
-                "memory_agent_list",
-                "memory_session_start",
-                "memory_stats",
+                tn::MEMORY_CAPABILITIES,
+                tn::MEMORY_AGENT_REGISTER,
+                tn::MEMORY_AGENT_LIST,
+                tn::MEMORY_SESSION_START,
+                tn::MEMORY_STATS,
+                // v0.7.0 Gap 3 (#886) — read-side surface for the
+                // `recall_observations` ledger.
+                tn::MEMORY_RECALL_OBSERVATIONS,
             ],
             Self::Archive => &[
-                "memory_archive_list",
-                "memory_archive_purge",
-                "memory_archive_restore",
-                "memory_archive_stats",
+                tn::MEMORY_ARCHIVE_LIST,
+                tn::MEMORY_ARCHIVE_PURGE,
+                tn::MEMORY_ARCHIVE_RESTORE,
+                tn::MEMORY_ARCHIVE_STATS,
             ],
-            Self::Other => &["memory_list_subscriptions", "memory_notify"],
+            Self::Other => &[
+                tn::MEMORY_LIST_SUBSCRIPTIONS,
+                tn::MEMORY_NOTIFY,
+                // v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
+                tn::MEMORY_SKILL_REGISTER,
+                tn::MEMORY_SKILL_LIST,
+                tn::MEMORY_SKILL_GET,
+                tn::MEMORY_SKILL_RESOURCE,
+                tn::MEMORY_SKILL_EXPORT,
+                // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop.
+                tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
+                // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
+                tn::MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
+            ],
         }
     }
 }
@@ -346,7 +528,7 @@ impl FromStr for Family {
             "core" => Ok(Self::Core),
             "lifecycle" => Ok(Self::Lifecycle),
             "graph" => Ok(Self::Graph),
-            "governance" => Ok(Self::Governance),
+            crate::models::field_names::GOVERNANCE => Ok(Self::Governance),
             "power" => Ok(Self::Power),
             "meta" => Ok(Self::Meta),
             "archive" => Ok(Self::Archive),
@@ -358,7 +540,7 @@ impl FromStr for Family {
 
 /// A resolved tool profile — the set of families to register on the
 /// MCP server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Profile {
     families: Vec<Family>,
 }
@@ -374,9 +556,11 @@ impl Profile {
     /// **always-on** regardless of profile per RFC scenario S27. It is
     /// NOT in this family list because the registration filter
     /// (v0.6.4-002) injects it as a bootstrap tool outside the
-    /// profile-driven path. That keeps the "core profile = 5 tools"
-    /// claim accurate while still making the runtime-discovery dance
-    /// reachable.
+    /// profile-driven path. That keeps the "core profile = 7 tools at
+    /// v0.7.0" claim accurate (5 original + memory_load_family +
+    /// memory_smart_load) while still making the runtime-discovery
+    /// dance reachable. Cross-check with
+    /// `Profile::core().expected_tool_count()`.
     #[must_use]
     pub fn core() -> Self {
         Self {
@@ -395,9 +579,11 @@ impl Profile {
         }
     }
 
-    /// `admin` — core + lifecycle + governance. 20 tools (v0.7 B1
-    /// added `memory_load_family` to core; v0.7 B2 added
-    /// `memory_smart_load` to core).
+    /// `admin` — core + lifecycle + governance. 21 tools
+    /// (core 7 + lifecycle 6 + governance 8; v0.7 B1 added
+    /// `memory_load_family` to core; v0.7 B2 added
+    /// `memory_smart_load` to core; #1389 L4 added
+    /// `memory_capture_turn` to lifecycle, 20 → 21).
     #[must_use]
     pub fn admin() -> Self {
         Self {
@@ -405,8 +591,8 @@ impl Profile {
         }
     }
 
-    /// `power` — core + power. 15 tools (v0.7 B1 added
-    /// `memory_load_family` to core; v0.7 B2 added `memory_smart_load`
+    /// `power` — core + power. 30 tools (core 7 + power 23; v0.7 B1
+    /// added `memory_load_family` to core; v0.7 B2 added `memory_smart_load`
     /// to core; v0.7 K7 added the two subscription-reliability tools
     /// to `Family::Power`).
     #[must_use]
@@ -416,11 +602,11 @@ impl Profile {
         }
     }
 
-    /// `full` — every family. 51 tools (v0.6.3 baseline 43 + v0.7.0 I4
-    /// `memory_replay` + v0.7 H4 `memory_verify` + v0.7 B1
-    /// `memory_load_family` + v0.7 B2 `memory_smart_load` + v0.7 K7
-    /// `memory_subscription_replay` + `memory_subscription_dlq_list` +
-    /// v0.7 J7 `memory_find_paths` + v0.7 K8 `memory_quota_status`).
+    /// `full` — every family. The advertised entry count (callable
+    /// "memory tools" + the always-on `memory_capabilities` bootstrap)
+    /// is whatever `Profile::full().expected_tool_count()` returns —
+    /// that accessor, derived from the per-family `tool_names` slices,
+    /// is the canonical SSOT; no literal is restated here.
     #[must_use]
     pub fn full() -> Self {
         Self {
@@ -599,16 +785,21 @@ mod tests {
     }
 
     #[test]
-    fn family_expected_tool_counts_sum_to_51() {
-        let total: usize = Family::all().iter().map(|f| f.expected_tool_count()).sum();
+    fn family_tool_names_cover_registry_all() {
+        // Cross-module SSOT invariant (no magic number): the union of
+        // every family's `tool_names` slice must be exactly the
+        // canonical registry set `tool_names::ALL`. Both sides are
+        // hand-maintained name lists in different modules; pinning
+        // their lengths against each other catches a tool added to one
+        // side but not the other. The aggregate `--profile full` count
+        // is whatever this union holds — it is never asserted as a
+        // literal anywhere.
+        let family_total: usize = Family::all().iter().map(|f| f.tool_names().len()).sum();
         assert_eq!(
-            total, 51,
-            "v0.6.3.1 baseline (43) + v0.7.0 I4 `memory_replay` + v0.7 H4 \
-             `memory_verify` + v0.7 B1 `memory_load_family` + v0.7 B2 \
-             `memory_smart_load` + v0.7 K7 `memory_subscription_replay` \
-             + `memory_subscription_dlq_list` + v0.7 J7 `memory_find_paths` \
-             + v0.7 K8 `memory_quota_status` = 51. If this drifts, update \
-             Family::expected_tool_count and the family map docs together."
+            family_total,
+            crate::mcp::registry::tool_names::ALL.len(),
+            "per-family tool_names slices must cover exactly the registry ALL set; \
+             a tool was added to one side but not the other"
         );
     }
 
@@ -643,12 +834,11 @@ mod tests {
     // ---------- Profile named ----------
 
     #[test]
-    fn profile_core_has_seven_tools() {
+    fn profile_core_loads_only_core_family() {
         let p = Profile::core();
-        // v0.7 B1 — Core ships memory_load_family; v0.7 B2 — Core
-        // ships memory_smart_load. Total 7 (5 baseline + 2 always-on
-        // discovery tools).
-        assert_eq!(p.expected_tool_count(), 7);
+        // Core advertises exactly the Core family's tools — derived
+        // from the SSOT slice, never a literal.
+        assert_eq!(p.expected_tool_count(), Family::Core.tool_names().len());
         assert!(p.includes(Family::Core));
         // meta is NOT in core's family list — `memory_capabilities`
         // is bootstrapped separately as always-on per RFC S27. The
@@ -659,47 +849,61 @@ mod tests {
     }
 
     #[test]
-    fn profile_graph_has_eighteen_tools() {
+    fn profile_graph_loads_core_plus_graph() {
         let p = Profile::graph();
-        // v0.7 J7 — Graph now ships 11 tools (8 baseline + memory_replay
-        // [I4] + memory_verify [H4] + memory_find_paths [J7]); v0.7 B1
-        // added memory_load_family to core; v0.7 B2 added
-        // memory_smart_load to core (7 instead of 5).
-        assert_eq!(p.expected_tool_count(), 7 + 11);
+        // Graph = Core + Graph families; count derived from the SSOT
+        // slices so the v0.7 surface additions can't drift this test.
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Graph.tool_names().len()
+        );
         assert!(p.includes(Family::Graph));
     }
 
     #[test]
-    fn profile_admin_has_twenty_tools() {
+    fn profile_admin_loads_core_lifecycle_governance() {
         let p = Profile::admin();
-        // admin = core (7, with v0.7 B1 memory_load_family + v0.7 B2
-        // memory_smart_load) + lifecycle (5) + governance (8) = 20.
-        // Graph isn't in admin so the v0.7.0 I4 memory_replay addition
-        // doesn't change this count.
-        assert_eq!(p.expected_tool_count(), 7 + 5 + 8);
+        // admin = Core + Lifecycle + Governance families; count derived
+        // from the SSOT slices. Graph isn't in admin, and the #1389 L4
+        // memory_capture_turn addition to Lifecycle flows through
+        // automatically rather than needing a literal bump here.
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len()
+                + Family::Lifecycle.tool_names().len()
+                + Family::Governance.tool_names().len()
+        );
     }
 
     #[test]
-    fn profile_power_has_sixteen_tools() {
+    fn profile_power_loads_core_plus_power() {
         let p = Profile::power();
-        // v0.7 B1 + v0.7 B2 — Core now ships 7 tools (was 5).
-        // v0.7 K7 — Power got the subscription-reliability pair (+2 → 8).
-        // v0.7 K8 — Power got memory_quota_status (+1 → 9).
-        assert_eq!(p.expected_tool_count(), 7 + 9);
+        // Power = Core + Power families; count derived from the SSOT
+        // slices so every Power-family addition flows through here
+        // without a literal bump.
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Power.tool_names().len()
+        );
     }
 
     #[test]
-    fn profile_full_has_fifty_one_tools() {
+    fn profile_full_matches_registry_all() {
         let p = Profile::full();
-        // v0.7 K8 (post-B2/J7) — full surface = 43 baseline + memory_replay (I4) +
-        // memory_verify (H4) + memory_load_family (B1) + memory_smart_load (B2) +
-        // memory_subscription_replay (K7) + memory_subscription_dlq_list (K7) +
-        // memory_find_paths (J7) + memory_quota_status (K8) = 51.
-        assert_eq!(p.expected_tool_count(), 51);
+        // `--profile full` advertises every family. Its count is the
+        // canonical registry set `tool_names::ALL` — anchored on the
+        // SSOT, never a literal. This is the test that the #1389 L4
+        // memory_capture_turn addition flows through automatically.
+        assert_eq!(
+            p.expected_tool_count(),
+            crate::mcp::registry::tool_names::ALL.len()
+        );
 
-        // The K7+K8 additions live in Family::Power (operator/governance),
-        // so the `power` profile picks them up too.
-        assert_eq!(Profile::power().expected_tool_count(), 7 + 9);
+        // The `power` profile is Core + Power; same SSOT derivation.
+        assert_eq!(
+            Profile::power().expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Power.tool_names().len()
+        );
     }
 
     // ---------- Profile::parse ----------
@@ -721,15 +925,17 @@ mod tests {
 
     #[test]
     fn parse_custom_comma_list_dedup() {
-        // `core,graph` → core (7, after v0.7 B1 + B2) + graph (11,
-        // after v0.7 J7) = 18 tools. Meta is NOT included —
+        // `core,graph` → Core + Graph families. Meta is NOT included —
         // `memory_capabilities` is always-on bootstrapped outside the
-        // family map (v0.6.4-002).
+        // family map (v0.6.4-002). Count derived from the SSOT slices.
         let p = Profile::parse("core,graph").unwrap();
         assert!(p.includes(Family::Core));
         assert!(!p.includes(Family::Meta));
         assert!(p.includes(Family::Graph));
-        assert_eq!(p.expected_tool_count(), 18);
+        assert_eq!(
+            p.expected_tool_count(),
+            Family::Core.tool_names().len() + Family::Graph.tool_names().len()
+        );
     }
 
     #[test]
@@ -747,7 +953,7 @@ mod tests {
     #[test]
     fn parse_custom_implicitly_includes_core() {
         // Asking for just `archive` should still load core because
-        // there is no legitimate profile smaller than the 5 core tools.
+        // there is no legitimate profile smaller than the 7 core tools at v0.7.0.
         let p = Profile::parse("archive").unwrap();
         assert!(p.includes(Family::Core));
         assert!(p.includes(Family::Archive));
@@ -810,7 +1016,7 @@ mod tests {
 
     #[test]
     fn family_for_tool_resolves_every_baseline_name() {
-        // Source-anchored at src/mcp.rs::tool_definitions() — if any
+        // Source-anchored at crate::mcp::registry::tool_definitions() — if any
         // tool here is missing from `for_tool`, the family map is
         // out of sync and `--profile <family>` would silently miss it.
         let baseline = [
@@ -866,6 +1072,8 @@ mod tests {
             "memory_subscription_dlq_list",
             // power (v0.7 K8 addition — per-agent quota status)
             "memory_quota_status",
+            // power (v0.7.0 Task 4/8 — substrate-native reflection primitive)
+            "memory_reflect",
             // meta
             "memory_capabilities",
             "memory_agent_register",
@@ -880,15 +1088,51 @@ mod tests {
             // other
             "memory_list_subscriptions",
             "memory_notify",
+            // other (v0.7.0 L1-5 — Agent Skills substrate)
+            "memory_skill_register",
+            "memory_skill_list",
+            "memory_skill_get",
+            "memory_skill_resource",
+            "memory_skill_export",
+            // other (v0.7.0 L2-6 — issue #671: reflections become skills)
+            "memory_skill_promote_from_reflection",
+            // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
+            "memory_skill_compositional_context",
+            // v0.7.0 QW-1 — file-backed reflection chain export (Family::Power).
+            "memory_export_reflection",
+            // v0.7.0 QW-3 follow-up — context-offload substrate (Family::Power).
+            "memory_offload",
+            "memory_deref",
+            // v0.7.0 WT-1-C (curator-pass atomisation) — Family::Power.
+            "memory_atomise",
+            // v0.7.0 Form 3 (#756) — multi-step ingest orchestrator.
+            "memory_ingest_multistep",
+            // v0.7.0 Form 5 (issue #758) — calibration sweep over the
+            // shadow-mode observation table (Family::Power).
+            "memory_calibrate_confidence",
+            // v0.7.0 (issues #224 + #311) — Phase 3 Memory Sharing &
+            // Sync RFC pulled forward per operator directive
+            // `28860423-d12c-4959-bc8b-8fa9a94a33d9`.
+            "memory_share",
         ];
         assert_eq!(
             baseline.len(),
-            51,
+            66,
             "baseline list = 43 (v0.6.3.1) + 1 (v0.7.0 I4 memory_replay) + \
              1 (v0.7 H4 memory_verify) + 1 (v0.7 B1 memory_load_family) + \
              1 (v0.7 B2 memory_smart_load) + \
              2 (v0.7 K7 memory_subscription_replay + memory_subscription_dlq_list) + \
-             1 (v0.7 J7 memory_find_paths) + 1 (v0.7 K8 memory_quota_status) = 51"
+             1 (v0.7 J7 memory_find_paths) + 1 (v0.7 K8 memory_quota_status) + \
+             1 (v0.7.0 Task 4/8 memory_reflect) + \
+             5 (v0.7.0 L1-5 skill tools) + \
+             1 (v0.7.0 L2-6 memory_skill_promote_from_reflection) + \
+             1 (v0.7.0 L2-7 memory_skill_compositional_context) + \
+             1 (v0.7.0 QW-1 memory_export_reflection) + \
+             2 (v0.7.0 QW-3 follow-up memory_offload + memory_deref) + \
+             1 (v0.7.0 WT-1-C memory_atomise) + \
+             1 (v0.7.0 Form 3 memory_ingest_multistep) + \
+             1 (v0.7.0 Form 5 memory_calibrate_confidence) + \
+             1 (v0.7.0 issues #224 + #311 memory_share) = 66"
         );
         for name in baseline {
             assert!(

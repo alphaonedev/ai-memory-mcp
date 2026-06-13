@@ -1,0 +1,916 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! v0.7.0 Track D #933 — federation push DLQ + replay worker.
+//!
+//! ## What this module owns
+//!
+//! - The [`FederationDlqSink`] trait — abstract interface that
+//!   `broadcast_store_quorum` calls into on per-peer fanout failure to
+//!   record a `federation_push_dlq` row.
+//! - The [`spawn_replay_federation_push_dlq`] task — spawned alongside
+//!   the catchup loop in
+//!   `daemon_runtime::spawn_catchup_loop_with_store`. Polls the DLQ
+//!   every N seconds, re-attempts `post_once` against each peer, and
+//!   stamps `replayed_at` (or DELETEs) on Ack.
+//! - The [`federation_push_dlq_depth`] Prometheus gauge mirror — kept
+//!   live by the replay worker.
+//!
+//! ## Why a DLQ
+//!
+//! Pre-#933 the per-peer push tasks inside `broadcast_store_quorum`
+//! had no audit surface: if the leader's local commit succeeded but a
+//! peer was unreachable (or slow past the deadline), nothing recorded
+//! the missed push. On the peer's recovery the catchup loop pulled
+//! rows the peer was behind on but the leader never re-attempted the
+//! original push. Cross-recall consistency only worked when both
+//! daemons shared a postgres store (Track B finding #925 masked the
+//! gap). See the issue body for the full RCA.
+//!
+//! ## Contract surface
+//!
+//! - On a `Fail(reason)` or no-Ack-before-deadline per-peer outcome,
+//!   `broadcast_store_quorum` calls
+//!   [`FederationDlqSink::enqueue_push_failure`] with the memory id,
+//!   peer id, payload body, and the failure reason.
+//! - The sink writes a `federation_push_dlq` row (CREATE-or-bump-
+//!   attempt_count via the partial unique index).
+//! - The replay worker polls
+//!   [`FederationDlqSink::take_pending_dlq_rows`] every N seconds and
+//!   re-issues `post_once`. Successful Acks stamp `replayed_at` via
+//!   [`FederationDlqSink::mark_dlq_row_replayed`].
+//!
+//! ## What this module deliberately does NOT do
+//!
+//! - No reverse direction. The DLQ is leader → peer. Peer → leader is
+//!   covered by the existing catchup loop in `federation::receive`.
+//! - No unbounded retry. Rows retry up to [`MAX_REPLAY_ATTEMPTS`]
+//!   (~50 min at the default tick), then quarantine: the take query
+//!   excludes them (#1578) and the
+//!   `federation_push_dlq_quarantined` counter +
+//!   `federation_push_dlq_depth` gauge are the operator alert
+//!   surface. Quarantined rows are never silently dropped — the
+//!   data-layer drain procedure lives in docs/TROUBLESHOOTING.md
+//!   §federation-push-DLQ.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::FederationConfig;
+use super::sync::{AckOutcome, post_once};
+
+/// Tracing target for the push-DLQ enqueue + replay surface (this
+/// module plus the enqueue branch in `sync::broadcast_store_quorum`).
+/// #1558 tracing-target SSOT.
+pub(crate) const PUSH_DLQ_TRACE_TARGET: &str = "ai_memory::federation::push_dlq";
+
+/// A single pending DLQ row, surfaced to the replay worker.
+///
+/// `payload_json` is captured as the exact body the leader originally
+/// POSTed (so the replay re-POSTs the same shape regardless of whether
+/// the source memory row has been updated since), and `attempt_count`
+/// is the persisted retry counter (advisory only — the replay worker
+/// keeps trying regardless).
+#[derive(Debug, Clone)]
+pub struct FederationPushDlqRow {
+    pub id: i64,
+    pub memory_id: String,
+    pub peer_id: String,
+    pub payload_json: serde_json::Value,
+    pub attempt_count: i32,
+    pub last_error: String,
+}
+
+/// Abstract dead-letter-queue interface backing the
+/// `federation_push_dlq` table.
+///
+/// Concrete impls live in `src/db.rs` (sqlite legacy path) and
+/// `src/store/postgres.rs` (postgres SAL path). Both adapters were
+/// extended at v48 with the migration that ships this table.
+///
+/// The trait is intentionally small — three methods cover the full
+/// happy path (enqueue on failure, list pending for replay, mark
+/// success). No CLI surface ships at v0.7.0 (#1578); operator
+/// inspection/drain is direct SQL per docs/TROUBLESHOOTING.md
+/// §federation-push-DLQ.
+#[async_trait::async_trait]
+pub trait FederationDlqSink: Send + Sync {
+    /// Insert a new pending row OR bump `attempt_count` + refresh
+    /// `last_error` on an existing pending row for the same
+    /// `(memory_id, peer_id)`. Implementations MUST be safe to call
+    /// concurrently (the production call path inside
+    /// `broadcast_store_quorum` runs in a per-fanout task).
+    async fn enqueue_push_failure(
+        &self,
+        memory_id: &str,
+        peer_id: &str,
+        payload_json: &serde_json::Value,
+        last_error: &str,
+    ) -> Result<(), String>;
+
+    /// Return up to `limit` pending rows ordered by `failed_at` ASC
+    /// (oldest first so the replay worker drains the tail before
+    /// fresh failures). Empty vector = nothing to replay.
+    async fn take_pending_dlq_rows(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<FederationPushDlqRow>, String>;
+
+    /// Mark a DLQ row as replayed (the peer Acked). Implementations
+    /// may either DELETE the row or stamp `replayed_at`; the worker
+    /// doesn't care which.
+    async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String>;
+
+    /// Bump `attempt_count` + refresh `last_error` on an existing
+    /// pending row. Used by the replay worker when a retry attempt
+    /// itself fails (so operators can tell from `attempt_count` how
+    /// long the row has been stuck).
+    async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String>;
+
+    /// Return the current number of pending DLQ rows. Used by the
+    /// replay worker to maintain the `federation_push_dlq_depth`
+    /// Prometheus gauge.
+    async fn pending_dlq_count(&self) -> Result<i64, String>;
+}
+
+/// Spawn the federation push DLQ replay worker.
+///
+/// Runs alongside the catchup loop (also in `daemon_runtime`). Every
+/// `interval` ticks it:
+///
+/// 1. Reads up to `backlog.clamp(REPLAY_BATCH_SIZE, replay_max_batch())`
+///    pending rows from the sink (#1579 B5 adaptive batch — the
+///    fixed-64 take capped bulk drains at 128 rows/min/peer).
+/// 2. For each row, attempts `post_once` against the matching peer's
+///    `sync_push_url`. On `AckOutcome::Ack` it stamps `replayed_at`
+///    via `mark_dlq_row_replayed`. On any other outcome it bumps the
+///    row's `attempt_count` so operators alerting on the
+///    `federation_push_dlq_depth` gauge can tell which rows are
+///    repeatedly failing.
+/// 3. Updates the `ai_memory_federation_push_dlq_depth` Prometheus
+///    gauge to the current pending count.
+///
+/// Errors are logged at `tracing::warn` but never propagated — the
+/// worker is best-effort by design (same posture as the catchup
+/// loop).
+///
+/// Returns a `JoinHandle` so the bootstrap can hold it for the
+/// lifetime of the daemon (it intentionally never terminates).
+#[must_use]
+pub fn spawn_replay_federation_push_dlq(
+    config: FederationConfig,
+    sink: Arc<dyn FederationDlqSink>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Same upfront delay as the catchup loop so the first replay
+        // tick doesn't fire before the daemon's HTTP server has bound
+        // — avoids spurious "connection refused" on a fresh cluster
+        // boot if the peer is also coming up.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        loop {
+            replay_once(&config, sink.as_ref()).await;
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+/// Baseline batch size for one replay tick — also the floor of the
+/// #1579 B5 adaptive batch below. Tuned high enough to drain a
+/// steady-state backlog quickly (a peer down for an hour with a
+/// 100/min ingest rate accumulates ~6000 rows) but low enough that a
+/// single tick won't monopolise the runtime if every replay attempt
+/// itself succeeds against a peer that's now healthy.
+pub const REPLAY_BATCH_SIZE: usize = 64;
+
+/// #1579 B5 — env knob naming the upper cap of the adaptive replay
+/// batch. The fixed 64-row tick gave a drain ceiling of 128 rows/min/
+/// peer at the 30s cadence — a 62k-row backlog (the #1578 event) took
+/// 8+ hours to drain. The worker now scales the per-tick take to
+/// `backlog.clamp(REPLAY_BATCH_SIZE, cap)`; this env var overrides the
+/// compiled cap ([`DEFAULT_REPLAY_MAX_BATCH`]). Zero / garbage values
+/// fall through to the default (house style — a stray `0` can never
+/// wedge the drain). Quarantine semantics (`MAX_REPLAY_ATTEMPTS`, the
+/// #1578 `attempt_count` take-exclusion) are unchanged.
+pub const ENV_FED_DLQ_REPLAY_MAX_BATCH: &str = "AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH";
+
+/// #1579 B5 — compiled default for the adaptive replay-batch cap.
+/// 2048 rows/tick at the default 30s cadence = ~4096 rows/min/peer
+/// bulk-drain ceiling (vs the fixed-64 ceiling of 128/min), while
+/// bounding per-tick memory: DLQ payloads are single-memory push
+/// bodies (KB-scale), so a full cap-sized take stays in the low tens
+/// of MB even on a 62k-row backlog.
+pub const DEFAULT_REPLAY_MAX_BATCH: usize = 2048;
+
+/// #1579 B5 — resolve the adaptive replay-batch cap: env override
+/// ([`ENV_FED_DLQ_REPLAY_MAX_BATCH`]) > compiled default. Values that
+/// fail to parse, are zero, or undercut the [`REPLAY_BATCH_SIZE`]
+/// floor fall through to the default with a warn — the cap may never
+/// shrink the worker below its historical fixed batch.
+#[must_use]
+pub fn replay_max_batch() -> usize {
+    match std::env::var(ENV_FED_DLQ_REPLAY_MAX_BATCH) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) if v >= REPLAY_BATCH_SIZE => v,
+            _ => {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    raw = %raw,
+                    "ignoring {ENV_FED_DLQ_REPLAY_MAX_BATCH}={raw} (must be an integer >= \
+                     {REPLAY_BATCH_SIZE}); using default {DEFAULT_REPLAY_MAX_BATCH}"
+                );
+                DEFAULT_REPLAY_MAX_BATCH
+            }
+        },
+        Err(_) => DEFAULT_REPLAY_MAX_BATCH,
+    }
+}
+
+/// #1032 (HIGH, 2026-05-21) — quarantine threshold for DLQ rows.
+///
+/// Pre-#1032 the replay worker retried every pending row forever. A
+/// row that systematically rejects (peer-side schema validation
+/// refusal, leader-side key rotation invalidating the signature, or
+/// per-row size cap mismatch) would accumulate `attempt_count`
+/// indefinitely while the worker kept re-issuing HTTP POSTs to the
+/// peer every tick (network amplification) AND the `pending_dlq_count`
+/// gauge would never settle. Once `attempt_count >= MAX_REPLAY_ATTEMPTS`
+/// the row is *quarantined*: the take query EXCLUDES it (#1578 — the
+/// pre-fix exclusion happened only in-loop, so once a full batch of
+/// oldest rows hit the ceiling they starved the take set and the
+/// queue wedged), the `federation_push_dlq_quarantined` Prometheus
+/// counter increments, and the operator gets a tracing::warn line.
+/// No CLI drain ships at v0.7.0; the data-layer drain procedure is
+/// documented in docs/TROUBLESHOOTING.md §federation-push-DLQ.
+///
+/// 100 attempts at ~30-second tick cadence = ~50 minutes of retries
+/// before quarantine. That's generous for legitimate transient
+/// failures (peer restart, network blip) and tight enough to surface
+/// systematic-rejection footguns quickly.
+pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
+
+/// Drive one replay pass. Public so the integration test in
+/// `tests/federation_dlq_replay.rs` can advance the worker manually
+/// without waiting on the `tokio::time::sleep` cadence.
+pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink) {
+    // #1579 B5 — adaptive drain batch. Scale the per-tick take with
+    // the live backlog (`min(backlog, configurable cap)`, floored at
+    // the historical REPLAY_BATCH_SIZE) so a bulk backlog drains at
+    // thousands of rows/min instead of the fixed-64 ceiling of
+    // 128/min, while an idle queue keeps paying exactly one small
+    // SELECT per tick. A count error degrades to the legacy fixed
+    // batch — the worker stays best-effort.
+    let batch = match sink.pending_dlq_count().await {
+        Ok(backlog) => usize::try_from(backlog)
+            .unwrap_or(REPLAY_BATCH_SIZE)
+            .clamp(REPLAY_BATCH_SIZE, replay_max_batch()),
+        Err(e) => {
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                "replay_federation_push_dlq: pending count failed ({e}); \
+                 using fixed batch {REPLAY_BATCH_SIZE}"
+            );
+            REPLAY_BATCH_SIZE
+        }
+    };
+    let rows = match sink.take_pending_dlq_rows(batch).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                "replay_federation_push_dlq: failed to load pending rows: {e}"
+            );
+            return;
+        }
+    };
+
+    if rows.is_empty() {
+        // Still refresh the gauge — operators alert on it sitting at
+        // 0 long-term; an unreachable sink would otherwise leave the
+        // gauge stale.
+        refresh_depth_gauge(sink).await;
+        return;
+    }
+
+    tracing::info!(
+        target: PUSH_DLQ_TRACE_TARGET,
+        rows = rows.len(),
+        "federation: replay_federation_push_dlq draining {} row(s)",
+        rows.len(),
+    );
+
+    for row in rows {
+        // #1032 — skip rows that have exceeded the replay-attempt
+        // ceiling. The row stays in the DLQ (operator can inspect /
+        // drain manually) but the worker no longer wastes network
+        // bandwidth re-issuing POSTs that systematically fail.
+        if row.attempt_count >= MAX_REPLAY_ATTEMPTS {
+            crate::metrics::registry()
+                .federation_push_dlq_quarantined
+                .inc();
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                row_id = row.id,
+                peer_id = %row.peer_id,
+                memory_id = %row.memory_id,
+                attempt_count = row.attempt_count,
+                "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}); \
+                 no CLI drain surface ships at v0.7.0 — see docs/TROUBLESHOOTING.md \
+                 §federation-push-DLQ for the data-layer drain procedure (#1578)",
+                row.id,
+                row.attempt_count,
+            );
+            continue;
+        }
+
+        // Resolve the peer URL via the live FederationConfig. If the
+        // peer has been removed from the config since the DLQ row was
+        // written, log + bump attempt_count + leave the row for the
+        // operator to drain manually.
+        let Some(peer) = config.peers.iter().find(|p| p.id == row.peer_id) else {
+            let _ = sink
+                .bump_dlq_attempt(row.id, "peer no longer in FederationConfig")
+                .await;
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                row_id = row.id,
+                peer_id = %row.peer_id,
+                "replay: peer {} not in FederationConfig — leaving row pending",
+                row.peer_id,
+            );
+            continue;
+        };
+
+        let outcome = post_once(
+            &config.client,
+            &peer.sync_push_url,
+            &row.payload_json,
+            &row.memory_id,
+            Some(&row.memory_id),
+            config.api_key.as_deref(),
+            config.signing_key.as_deref(),
+        )
+        .await;
+
+        match outcome {
+            AckOutcome::Ack => {
+                if let Err(e) = sink.mark_dlq_row_replayed(row.id).await {
+                    tracing::warn!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        "replay: peer {} acked but mark_dlq_row_replayed failed: {e}",
+                        row.peer_id,
+                    );
+                } else {
+                    tracing::info!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        memory_id = %row.memory_id,
+                        peer_id = %row.peer_id,
+                        "replay: peer {} acked for {} (DLQ row {} cleared)",
+                        row.peer_id,
+                        row.memory_id,
+                        row.id,
+                    );
+                }
+            }
+            AckOutcome::IdDrift => {
+                // Peer received the row but rewrote the id —
+                // operator-visible divergence. Bump and keep row so
+                // the audit trail captures the drift.
+                let _ = sink
+                    .bump_dlq_attempt(row.id, "replay observed id_drift on peer ack")
+                    .await;
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    "replay: peer {} returned id_drift on row {} — leaving pending",
+                    row.peer_id,
+                    row.id,
+                );
+            }
+            AckOutcome::Fail(reason) => {
+                let _ = sink.bump_dlq_attempt(row.id, &reason).await;
+                tracing::debug!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    "replay: peer {} still failing on row {}: {reason}",
+                    row.peer_id,
+                    row.id,
+                );
+            }
+        }
+    }
+
+    refresh_depth_gauge(sink).await;
+}
+
+/// Refresh the `ai_memory_federation_push_dlq_depth` Prometheus gauge
+/// from the sink's live pending count.
+async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
+    match sink.pending_dlq_count().await {
+        Ok(depth) => {
+            crate::metrics::registry()
+                .federation_push_dlq_depth
+                .set(depth);
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                "replay: failed to refresh federation_push_dlq_depth: {e}"
+            );
+        }
+    }
+}
+
+/// Sqlite implementation of [`FederationDlqSink`] backed by the
+/// shared `handlers::Db` mutex-wrapped `rusqlite::Connection`.
+///
+/// All methods acquire the mutex for the duration of one SQL call so
+/// the sink stays compatible with the legacy single-connection
+/// posture. Concurrent callers serialise on the mutex; for v0.7.0 GA
+/// loads the per-failure SQL is microseconds so this is acceptable.
+pub struct SqliteDlqSink {
+    db: crate::handlers::Db,
+}
+
+impl SqliteDlqSink {
+    /// Build a new sink over the daemon's shared sqlite connection.
+    #[must_use]
+    pub fn new(db: crate::handlers::Db) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait]
+impl FederationDlqSink for SqliteDlqSink {
+    async fn enqueue_push_failure(
+        &self,
+        memory_id: &str,
+        peer_id: &str,
+        payload_json: &serde_json::Value,
+        last_error: &str,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let payload_str = payload_json.to_string();
+        let conn = self.db.lock().await;
+        // Use `ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS
+        // NULL DO UPDATE` so a flapping peer doesn't stack duplicate
+        // pending rows — bumps attempt_count + refreshes last_error
+        // instead. Partial unique index from the v48 migration backs
+        // this conflict target.
+        conn.0
+            .execute(
+                "INSERT INTO federation_push_dlq \
+                 (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5) \
+                 ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
+                 DO UPDATE SET \
+                   attempt_count = attempt_count + 1, \
+                   last_error    = excluded.last_error",
+                rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
+            )
+            .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
+        Ok(())
+    }
+
+    async fn take_pending_dlq_rows(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<FederationPushDlqRow>, String> {
+        let conn = self.db.lock().await;
+        let mut stmt = conn
+            .0
+            .prepare(
+                "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
+                 FROM federation_push_dlq \
+                 WHERE replayed_at IS NULL AND attempt_count < ?2 \
+                 ORDER BY failed_at ASC \
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("sqlite take_pending_dlq_rows prepare: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![limit as i64, MAX_REPLAY_ATTEMPTS],
+                |row| {
+                    let payload_str: String = row.get(3)?;
+                    let payload_json =
+                        serde_json::from_str(&payload_str).unwrap_or(serde_json::json!({}));
+                    Ok(FederationPushDlqRow {
+                        id: row.get(0)?,
+                        memory_id: row.get(1)?,
+                        peer_id: row.get(2)?,
+                        payload_json,
+                        attempt_count: row.get(4)?,
+                        last_error: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|e| format!("sqlite take_pending_dlq_rows query: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("sqlite take_pending_dlq_rows collect: {e}"))?;
+        Ok(rows)
+    }
+
+    async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.db.lock().await;
+        conn.0
+            .execute(
+                "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, id],
+            )
+            .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
+        Ok(())
+    }
+
+    async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
+        let conn = self.db.lock().await;
+        conn.0
+            .execute(
+                "UPDATE federation_push_dlq \
+                 SET attempt_count = attempt_count + 1, last_error = ?1 \
+                 WHERE id = ?2 AND replayed_at IS NULL",
+                rusqlite::params![last_error, id],
+            )
+            .map_err(|e| format!("sqlite bump_dlq_attempt: {e}"))?;
+        Ok(())
+    }
+
+    async fn pending_dlq_count(&self) -> Result<i64, String> {
+        let conn = self.db.lock().await;
+        conn.0
+            .query_row(
+                "SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
+    }
+}
+
+/// Postgres implementation of [`FederationDlqSink`] backed by the
+/// `PostgresStore`'s connection pool.
+///
+/// Only available under `--features sal-postgres` (which transitively
+/// enables `sal`).
+#[cfg(feature = "sal-postgres")]
+pub struct PostgresDlqSink {
+    store: std::sync::Arc<crate::store::postgres::PostgresStore>,
+}
+
+#[cfg(feature = "sal-postgres")]
+impl PostgresDlqSink {
+    /// Build a new sink over the daemon's `PostgresStore` handle.
+    #[must_use]
+    pub fn new(store: std::sync::Arc<crate::store::postgres::PostgresStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[cfg(feature = "sal-postgres")]
+#[async_trait::async_trait]
+impl FederationDlqSink for PostgresDlqSink {
+    async fn enqueue_push_failure(
+        &self,
+        memory_id: &str,
+        peer_id: &str,
+        payload_json: &serde_json::Value,
+        last_error: &str,
+    ) -> Result<(), String> {
+        let pool = self.store.pool();
+        sqlx::query(
+            "INSERT INTO federation_push_dlq \
+             (memory_id, peer_id, payload_json, attempt_count, last_error) \
+             VALUES ($1, $2, $3::jsonb, 1, $4) \
+             ON CONFLICT (memory_id, peer_id) WHERE replayed_at IS NULL \
+             DO UPDATE SET \
+               attempt_count = federation_push_dlq.attempt_count + 1, \
+               last_error    = EXCLUDED.last_error",
+        )
+        .bind(memory_id)
+        .bind(peer_id)
+        .bind(payload_json.to_string())
+        .bind(last_error)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres enqueue_push_failure: {e}"))?;
+        Ok(())
+    }
+
+    async fn take_pending_dlq_rows(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<FederationPushDlqRow>, String> {
+        let pool = self.store.pool();
+        let limit_i64: i64 = limit.try_into().unwrap_or(i64::MAX);
+        let rows: Vec<(i64, String, String, serde_json::Value, i32, String)> = sqlx::query_as(
+            "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
+             FROM federation_push_dlq \
+             WHERE replayed_at IS NULL AND attempt_count < $2 \
+             ORDER BY failed_at ASC \
+             LIMIT $1",
+        )
+        .bind(limit_i64)
+        .bind(MAX_REPLAY_ATTEMPTS)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("postgres take_pending_dlq_rows: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, memory_id, peer_id, payload_json, attempt_count, last_error)| {
+                    FederationPushDlqRow {
+                        id,
+                        memory_id,
+                        peer_id,
+                        payload_json,
+                        attempt_count,
+                        last_error,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+        let pool = self.store.pool();
+        sqlx::query("UPDATE federation_push_dlq SET replayed_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("postgres mark_dlq_row_replayed: {e}"))?;
+        Ok(())
+    }
+
+    async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
+        let pool = self.store.pool();
+        sqlx::query(
+            "UPDATE federation_push_dlq \
+             SET attempt_count = attempt_count + 1, last_error = $1 \
+             WHERE id = $2 AND replayed_at IS NULL",
+        )
+        .bind(last_error)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres bump_dlq_attempt: {e}"))?;
+        Ok(())
+    }
+
+    async fn pending_dlq_count(&self) -> Result<i64, String> {
+        let pool = self.store.pool();
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("postgres pending_dlq_count: {e}"))?;
+        Ok(row.0)
+    }
+}
+
+#[cfg(test)]
+mod replay_arm_tests {
+    //! Coverage for the `replay_once` decision arms that the
+    //! `tests/federation_dlq_replay.rs` integration suite does not reach
+    //! (quarantine skip, peer-no-longer-in-config, empty-queue gauge
+    //! refresh, pending-count-error fallback) plus the `replay_max_batch`
+    //! env resolver arms. A lightweight in-memory mock sink drives the
+    //! arms without any HTTP peer; the `Fail` arm is reached by pointing
+    //! the worker at a peer URL that refuses TCP.
+
+    use super::{
+        DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
+        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, replay_max_batch,
+        replay_once,
+    };
+    use crate::federation::{FederationConfig, PeerEndpoint};
+    use crate::replication::QuorumPolicy;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// In-memory mock sink that records which trait methods fired so the
+    /// test can assert the worker took the expected branch.
+    #[derive(Default)]
+    struct MockSink {
+        rows: Mutex<Vec<FederationPushDlqRow>>,
+        marked_replayed: Mutex<Vec<i64>>,
+        bumped: Mutex<Vec<(i64, String)>>,
+        count_should_err: bool,
+        take_should_err: bool,
+        take_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FederationDlqSink for MockSink {
+        async fn enqueue_push_failure(
+            &self,
+            memory_id: &str,
+            peer_id: &str,
+            payload_json: &serde_json::Value,
+            last_error: &str,
+        ) -> Result<(), String> {
+            self.rows.lock().unwrap().push(FederationPushDlqRow {
+                id: (self.rows.lock().unwrap().len() + 1) as i64,
+                memory_id: memory_id.to_string(),
+                peer_id: peer_id.to_string(),
+                payload_json: payload_json.clone(),
+                attempt_count: 1,
+                last_error: last_error.to_string(),
+            });
+            Ok(())
+        }
+
+        async fn take_pending_dlq_rows(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<FederationPushDlqRow>, String> {
+            self.take_calls.fetch_add(1, Ordering::SeqCst);
+            if self.take_should_err {
+                return Err("mock take error".to_string());
+            }
+            Ok(self.rows.lock().unwrap().clone())
+        }
+
+        async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+            self.marked_replayed.lock().unwrap().push(id);
+            Ok(())
+        }
+
+        async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
+            self.bumped
+                .lock()
+                .unwrap()
+                .push((id, last_error.to_string()));
+            Ok(())
+        }
+
+        async fn pending_dlq_count(&self) -> Result<i64, String> {
+            if self.count_should_err {
+                return Err("mock count error".to_string());
+            }
+            Ok(self.rows.lock().unwrap().len() as i64)
+        }
+    }
+
+    fn cfg_with_peer(peer_id: &str, url: &str) -> FederationConfig {
+        FederationConfig {
+            policy: QuorumPolicy::new(1, 1, Duration::from_millis(200), Duration::from_secs(30))
+                .unwrap(),
+            peers: vec![PeerEndpoint {
+                id: peer_id.to_string(),
+                sync_push_url: url.to_string(),
+            }],
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            sender_agent_id: "ai:cov3-dlq".to_string(),
+            api_key: None,
+            signing_key: None,
+            dlq_sink: None,
+        }
+    }
+
+    fn row(id: i64, peer_id: &str, attempt_count: i32) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: format!("mem-{id}"),
+            peer_id: peer_id.to_string(),
+            payload_json: serde_json::json!({"id": format!("mem-{id}")}),
+            attempt_count,
+            last_error: String::new(),
+        }
+    }
+
+    #[test]
+    fn replay_max_batch_env_arms() {
+        let _g = env_lock();
+        // SAFETY: env mutation under the test-scoped lock.
+        unsafe {
+            std::env::remove_var(ENV_FED_DLQ_REPLAY_MAX_BATCH);
+        }
+        assert_eq!(
+            replay_max_batch(),
+            DEFAULT_REPLAY_MAX_BATCH,
+            "unset → default"
+        );
+
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "5000");
+        }
+        assert_eq!(replay_max_batch(), 5000, "valid override honoured");
+
+        // Below the REPLAY_BATCH_SIZE floor → default with warn.
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "10");
+        }
+        assert_eq!(
+            replay_max_batch(),
+            DEFAULT_REPLAY_MAX_BATCH,
+            "below floor falls through"
+        );
+
+        // Garbage → default.
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, "not-a-number");
+        }
+        assert_eq!(
+            replay_max_batch(),
+            DEFAULT_REPLAY_MAX_BATCH,
+            "garbage → default"
+        );
+
+        // Exactly the floor is accepted.
+        unsafe {
+            std::env::set_var(ENV_FED_DLQ_REPLAY_MAX_BATCH, &REPLAY_BATCH_SIZE.to_string());
+        }
+        assert_eq!(replay_max_batch(), REPLAY_BATCH_SIZE, "floor accepted");
+
+        unsafe {
+            std::env::remove_var(ENV_FED_DLQ_REPLAY_MAX_BATCH);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_queue_only_refreshes_gauge() {
+        let sink = MockSink::default();
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert_eq!(sink.take_calls.load(Ordering::SeqCst), 1);
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+        assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quarantined_row_is_skipped() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(row(1, "peer-0", MAX_REPLAY_ATTEMPTS));
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        // Quarantined → neither replayed nor bumped; no POST attempted.
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+        assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_no_longer_in_config_bumps_and_leaves() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(row(7, "peer-gone", 1));
+        // Config has a DIFFERENT peer, so the row's peer is unresolvable.
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        let bumped = sink.bumped.lock().unwrap();
+        assert_eq!(bumped.len(), 1);
+        assert_eq!(bumped[0].0, 7);
+        assert!(bumped[0].1.contains("no longer in FederationConfig"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_peer_yields_fail_and_bumps() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(row(3, "peer-0", 1));
+        // TCP refused (port 1) → post_once returns Fail → bump.
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert!(
+            !sink.bumped.lock().unwrap().is_empty(),
+            "a failed POST must bump attempt_count"
+        );
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_count_error_degrades_to_fixed_batch() {
+        let mut sink = MockSink::default();
+        sink.count_should_err = true;
+        sink.rows.lock().unwrap().push(row(1, "peer-gone", 1));
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        // Count error → fixed batch; take still runs; peer-gone arm bumps.
+        replay_once(&cfg, &sink).await;
+        assert_eq!(sink.take_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn take_error_returns_early() {
+        let mut sink = MockSink::default();
+        sink.take_should_err = true;
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        // Take errored → early return, no replay/bump.
+        assert!(sink.marked_replayed.lock().unwrap().is_empty());
+        assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+}

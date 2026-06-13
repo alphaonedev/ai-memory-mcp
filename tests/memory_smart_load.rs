@@ -1,6 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::needless_update)]
+
 //! v0.7 Track B2 — `memory_smart_load` MCP tool integration tests.
 //!
 //! B2 ships an always-on intent-routed front door over
@@ -30,6 +32,7 @@
 
 use ai_memory::db;
 use ai_memory::mcp::handle_smart_load;
+use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, Tier};
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -65,6 +68,18 @@ fn seed_family_memory(
         last_accessed_at: None,
         expires_at: None,
         metadata: json!({"family": family}),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
     };
     db::insert(conn, &mem).expect("db::insert")
 }
@@ -88,6 +103,7 @@ fn smart_load_intent_matching_graph_routes_to_graph_family() {
     let resp: Value = handle_smart_load(
         &conn,
         &json!({"intent": "I'm about to debug a flaky test"}),
+        None,
         None,
     )
     .expect("memory_smart_load must succeed");
@@ -128,6 +144,7 @@ fn smart_load_intent_matching_lifecycle_routes_to_lifecycle_family() {
         &conn,
         &json!({"intent": "delete and forget the stale memories then promote the survivors"}),
         None,
+        None,
     )
     .expect("memory_smart_load must succeed");
 
@@ -154,7 +171,7 @@ fn smart_load_empty_intent_returns_core_fallback() {
     let core_id = seed_family_memory(&conn, "core-mem", "ns", "core", 5);
 
     let resp: Value =
-        handle_smart_load(&conn, &json!({"intent": "   "}), None).expect("must succeed");
+        handle_smart_load(&conn, &json!({"intent": "   "}), None, None).expect("must succeed");
 
     assert_eq!(resp["chosen_family"], "core");
     assert_eq!(
@@ -186,6 +203,7 @@ fn smart_load_embedder_unavailable_falls_back_to_core() {
         &conn,
         &json!({"intent": "blortzfribblequx zarflargle"}),
         None,
+        None,
     )
     .expect("must succeed even with no embedder + no descriptor match");
 
@@ -208,7 +226,7 @@ fn smart_load_embedder_unavailable_falls_back_to_core() {
 #[test]
 fn smart_load_missing_intent_arg_errors() {
     let conn = open_db();
-    let err = handle_smart_load(&conn, &json!({}), None).unwrap_err();
+    let err = handle_smart_load(&conn, &json!({}), None, None).unwrap_err();
     assert!(
         err.contains("intent"),
         "error must mention missing arg; got: {err}"
