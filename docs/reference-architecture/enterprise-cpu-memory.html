@@ -1,0 +1,460 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  Generated themed page for enterprise-cpu-memory.html (reference-architecture). Matches
+  the reference-architecture/index.html theme. Source: enterprise-cpu-memory.md.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory · Enterprise Reference Architecture — CPU + Memory Federated Nodes</title>
+<meta name="description" content="API embeddings on commodity CPU + memory nodes — no GPU, no Ollama, full semantic/autonomous tier. The #1598 reference shape for enterprise federated ai-memory deployments.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/enterprise-cpu-memory.html">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+/* three-leg accents (centerpiece) */
+--leg1:#6ee7ff;--leg2:#c8a2ff;--leg3:#ffb86b;
+/* three regions */
+--rg-nyc:#6ee7ff;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
+--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
+p{color:var(--text-muted)}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem}@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,215,0,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
+.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:860px;margin:0 auto 1rem}
+.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
+.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
+
+section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
+.lede{color:var(--text-muted);font-size:.95rem;max-width:860px;margin-bottom:2rem}
+section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
+
+/* stat strip */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:.5rem}
+.stat{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.25rem}
+.stat .n{font-family:var(--font-mono);font-size:1.7rem;font-weight:700;color:var(--text)}
+.stat .l{font-size:.78rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;margin-top:.2rem}
+
+.matrix{width:100%;border-collapse:separate;border-spacing:0;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:.86rem}
+.matrix th{background:var(--bg-elev);padding:.85rem 1rem;text-align:left;font-family:var(--font-mono);font-size:.74rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--border)}
+.matrix td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:top}
+.matrix tr:last-child td{border-bottom:none}
+.matrix .id{font-family:var(--font-mono);font-weight:700;color:var(--p3)}
+.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--warn);white-space:nowrap}
+.matrix code{font-size:.78rem}
+.scroll-x{overflow-x:auto;border-radius:12px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:1rem;margin-bottom:2rem}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.25rem;position:relative;overflow:hidden}
+.card::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:var(--p3)}
+.card.leg1::before{background:var(--leg1)}
+.card.leg2::before{background:var(--leg2)}
+.card.leg3::before{background:var(--leg3)}
+.card.gov::before{background:var(--gold)}
+.card.warnbar::before{background:var(--bad)}
+.card h3{font-family:var(--font-mono);font-size:1rem;margin-bottom:.5rem}
+.card .lbl{font-family:var(--font-mono);font-size:.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem}
+.card p{color:var(--text-muted);font-size:.88rem}
+.card .leg-tag{display:inline-block;font-family:var(--font-mono);font-size:.7rem;padding:.15rem .5rem;border-radius:999px;margin-bottom:.5rem}
+.card.leg1 .leg-tag{color:var(--leg1);border:1px solid var(--leg1)}
+.card.leg2 .leg-tag{color:var(--leg2);border:1px solid var(--leg2)}
+.card.leg3 .leg-tag{color:var(--leg3);border:1px solid var(--leg3)}
+.testpair{margin-top:.85rem;display:grid;gap:.5rem}
+.testpair .t{font-family:var(--font-mono);font-size:.78rem;padding:.55rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-code);color:var(--text-muted)}
+.testpair .t .tag{font-weight:700;letter-spacing:.04em;margin-right:.4rem}
+.testpair .t.pos .tag{color:var(--good)}
+.testpair .t.neg .tag{color:var(--bad)}
+.testpair .t .res{color:var(--warn);float:right}
+
+.snip{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);margin-top:.85rem;padding:.85rem 1rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;line-height:1.55;white-space:pre;overflow-x:auto}
+.snip .ok{color:var(--good)}.snip .err{color:var(--bad)}.snip .warn{color:var(--warn)}.snip .cm{color:var(--text-dim)}.snip .key{color:var(--p3)}.snip .val{color:var(--p2)}
+
+.step{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1.25rem;position:relative}
+.step::before{content:"";position:absolute;top:0;left:0;bottom:0;width:3px;background:var(--gold);border-radius:12px 0 0 12px}
+.step .num{font-family:var(--font-mono);color:var(--gold);font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.4rem;display:block}
+.step h3{font-family:var(--font-mono);font-size:1.1rem;margin-bottom:.5rem;color:var(--text)}
+.step p{color:var(--text-muted);font-size:.92rem;margin-bottom:.6rem}
+
+.warn-box{background:rgba(255,215,0,0.05);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
+.warn-box strong{color:var(--warn);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
+.honest-box{background:rgba(255,107,157,0.05);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
+.honest-box strong{color:var(--bad);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
+
+footer{padding:3rem 1.5rem 2.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
+footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
+
+.topnav .menu{position:relative;display:inline-block}
+.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
+.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
+.topnav .menu-btn.active{color:var(--text)}
+.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
+.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
+.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
+.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
+.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* ============ animated diagram ============ */
+.diagram-wrap{background:var(--bg-raised);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow:hidden}
+.diagram-wrap svg{display:block;width:100%;height:auto}
+.legend{display:flex;flex-wrap:wrap;gap:1rem 1.5rem;justify-content:center;margin-top:1rem;font-size:.8rem;color:var(--text-muted)}
+.legend .item{display:flex;align-items:center;gap:.45rem;font-family:var(--font-mono)}
+.legend .sw{width:26px;height:0;border-top:3px dashed currentColor;border-radius:2px}
+.legend .leg1c{color:var(--leg1)}.legend .leg2c{color:var(--leg2)}.legend .leg3c{color:var(--leg3)}
+.legend .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+/* keyframes: dash-march for encrypted flows, glow pulse, shield shimmer */
+@keyframes march{to{stroke-dashoffset:-32}}
+@keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
+@keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(110,231,255,0.25))}50%{filter:drop-shadow(0 0 7px rgba(110,231,255,0.55))}}
+@keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
+
+.flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
+.flow.leg1{stroke:var(--leg1);animation:march 1.3s linear infinite}
+.flow.leg2{stroke:var(--leg2);stroke-width:2.8;animation:march 1.6s linear infinite}
+.flow.leg3{stroke:var(--leg3);animation:march 1.1s linear infinite}
+/* thinner client link for NHI agent → regional peer (Leg-1 client role, not the quorum trunk) */
+.flow.agentlink{stroke:var(--leg1);stroke-width:1.4;stroke-dasharray:5 5;animation:march 1.5s linear infinite}
+.flow.shim{animation:march 1.3s linear infinite, shimmer 2.4s ease-in-out infinite}
+.flow.leg2.shim{animation:march 1.6s linear infinite, shimmer 2.8s ease-in-out infinite}
+.flow.leg3.shim{animation:march 1.1s linear infinite, shimmer 2.1s ease-in-out infinite}
+.glowpath{animation:pulse-glow 2.6s ease-in-out infinite}
+.peernode{animation:node-breathe 3.4s ease-in-out infinite}
+.shield{animation:shield-flicker 2.8s ease-in-out infinite}
+.svg-label{font-family:var(--font-mono);fill:var(--text-muted)}
+.svg-title{font-family:var(--font-mono);fill:var(--text)}
+@media(prefers-reduced-motion:reduce){
+  .flow,.flow.leg1,.flow.leg2,.flow.leg3,.flow.agentlink,.flow.shim,.flow.leg2.shim,.flow.leg3.shim,.glowpath,.peernode,.shield{animation:none}
+}
+@media(max-width:560px){.diagram-wrap{padding:.4rem}}
+</style>
+<style>
+.article{max-width:62rem;margin:0 auto;padding:2.5rem 1.5rem 4rem}
+.article h2{font-family:var(--font-mono);font-size:1.45rem;margin:2.4rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--border);color:var(--text)}
+.article h3{font-size:1.1rem;margin:1.6rem 0 .6rem;color:var(--text)}
+.article p{color:var(--text-muted);margin:.7rem 0}
+.article ul,.article ol{color:var(--text-muted);margin:.7rem 0 .7rem 1.4rem}
+.article li{margin:.3rem 0}
+.article a{color:var(--p1)}.article a:hover{text-decoration:underline}
+.article strong{color:var(--text)}
+.article code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px;color:var(--p2)}
+.article pre{background:var(--bg-code);border:1px solid var(--border);border-radius:10px;padding:1rem 1.1rem;overflow-x:auto;margin:1rem 0;line-height:1.5}
+.article pre code{background:none;padding:0;color:var(--text);font-size:.82rem;white-space:pre}
+.article blockquote{border-left:3px solid var(--p1);background:var(--bg-card);padding:.6rem 1rem;margin:1rem 0;border-radius:0 8px 8px 0;color:var(--text-muted)}
+.article table{width:100%;border-collapse:separate;border-spacing:0;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:.86rem;margin:1.2rem 0}
+.article th{background:var(--bg-elev);padding:.7rem 1rem;text-align:left;font-family:var(--font-mono);font-size:.74rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border)}
+.article td{padding:.65rem 1rem;border-bottom:1px solid var(--border);color:var(--text-muted);vertical-align:top}
+.article tr:last-child td{border-bottom:none}
+.article .table-wrap{overflow-x:auto}
+.hero.doc{padding:3rem 1.5rem 2rem;text-align:left}
+.hero.doc .container{max-width:62rem}
+.hero.doc h1{font-size:clamp(1.7rem,3.6vw,2.6rem);text-align:left;margin-bottom:.5rem}
+.hero.doc .tagline{margin:0;text-align:left;max-width:62rem}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
+    <div class="right">
+      <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="../whats-new-v07.html" style="color:#6ee7ff">v0.7.0</a>
+      <div class="menu">
+        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="../architectures.html">Overview</a>
+          <a href="../architectures-t1.html">T1 — Single Agent</a>
+          <a href="../architectures-t2.html">T2 — Many Agents</a>
+          <a href="../architectures-t3.html">T3 — Multi-Node Cluster</a>
+          <a href="../architectures-t4.html">T4 — Data-Center Swarm</a>
+          <a href="../architectures-t5.html">T5 — Global Hive</a>
+          <a href="./">Grand Slam — 3-Region Hive</a>
+          <a href="enterprise-cpu-memory.html" class="current">Enterprise — CPU+Memory Nodes</a>
+          <a href="enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Internals<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="../schema.html">Schema</a>
+          <a href="../types.html">Types</a>
+          <a href="../validators.html">Validators</a>
+          <a href="../governance.html">Governance</a>
+          <a href="../batman-active-mode.html">Batman Mode</a>
+          <a href="../encryption.html">Encryption</a>
+          <a href="../tracing.html">Tracing</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Compliance<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="../compliance/">Overview</a>
+          <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
+        </div>
+      </div>
+      <a href="../credits.html">Credits</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero doc">
+  <div class="container">
+    <span class="eyebrow">Reference Architecture</span>
+    <h1>Enterprise Reference Architecture: CPU + Memory Federated Nodes</h1>
+    <p class="tagline">API embeddings on commodity CPU + memory nodes — no GPU, no Ollama, full semantic/autonomous tier. The #1598 reference shape for enterprise federated ai-memory deployments.</p>
+  </div>
+</section>
+
+<main class="article">
+<p><strong>API embeddings on commodity CPU nodes — no GPU, no Ollama, full
+semantic/autonomous tier.</strong> This is the #1598 reference shape for
+enterprise federated deployments where the fleet is CPU + memory only
+(cloud VMs, droplets, containers, on-prem servers without
+accelerators). The embedder is wired to an embedding <strong>API</strong> — either
+a cloud vendor (the operator-selected reference is OpenRouter +
+<code>google/gemini-embedding-2</code>) or a self-hosted OpenAI-compatible
+serving stack for airgapped sites — so no node runs Ollama anywhere.</p>
+<p>The GPU sibling of this page is
+<a href="enterprise-cpu-memory-gpu.html">Enterprise Reference Architecture: CPU + Memory + GPU Federated Nodes</a>
+(local Ollama embeddings on GPU-equipped nodes). A
+when-to-choose-which table lives on that page. The visual catalog of
+all deployment topologies is
+<a href="../reference-architectures.md"><code>docs/reference-architectures.md</code></a>;
+capacity / cost / SLA planning is
+<a href="../enterprise-deployment.md"><code>docs/enterprise-deployment.md</code></a>.</p>
+<h2 id="topology">Topology</h2>
+<pre><code>                      federated mesh (N nodes, W-of-N quorum)
+   ┌────────────────────────────────────────────────────────────────────┐
+   │                                                                    │
+   │   node-a (CPU+RAM)          node-b (CPU+RAM)      node-c (CPU+RAM) │
+   │   ┌────────────────┐  mTLS  ┌────────────────┐    ┌──────────────┐ │
+   │   │ ai-memory serve│◀──────▶│ ai-memory serve│◀──▶│ ai-memory    │ │
+   │   │  sqlite/pg+AGE │ signed │  sqlite/pg+AGE │    │ serve        │ │
+   │   └───────┬────────┘  sync  └───────┬────────┘    └──────┬───────┘ │
+   │           │ HTTPS (Bearer)          │                    │         │
+   └───────────┼────────────────────────┼────────────────────┼─────────┘
+               ▼                        ▼                    ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │  Embedding API — ONE of:                                  │
+        │   • cloud: openrouter → google/gemini-embedding-2 (3072d) │
+        │   • airgapped: self-hosted TEI / vLLM / llama.cpp server  │
+        │     exposing OpenAI-compatible /v1/embeddings             │
+        └──────────────────────────────────────────────────────────┘
+
+   embeddings hop p50: ~80–300 ms (API)    federation: W=2 quorum, mTLS,
+                                           X-Memory-Sig + X-Memory-Nonce
+</code></pre>
+<p><strong>When to choose this.</strong> Your fleet is commodity CPU nodes (cloud
+VMs, containers, droplets) and you want full semantic recall +
+autonomous-tier features without provisioning GPUs. You accept an
+80–300 ms embedding hop (per store / per recall query embed) in
+exchange for zero accelerator cost and a fleet image with no model
+weights. Operator policy: <strong>Ollama runs only on GPU-equipped nodes</strong>
+— on a CPU-only fleet the <code>ai-memory doctor</code> "Embeddings Reachability
+(#1598)" section fires a GPU-policy WARN if <code>backend = ollama</code> is
+resolved, which this architecture never triggers.</p>
+<h2 id="shape-a-cloud-embeddings-openrouter-reference">Shape A — cloud embeddings (OpenRouter reference)</h2>
+<p>Operator-selected reference cloud model: <strong><code>google/gemini-embedding-2</code>
+via OpenRouter</strong> — 3072-dim, 8192-token context, ~$0.20/M tokens,
+Google AI Studio provider, USA. Policy constraints baked into this
+reference: <strong>USA models only</strong>, <strong>paid-tier only</strong> (no <code>:free</code> routes
+— paid routing avoids free-tier providers with data-retention/training
+terms).</p>
+<p><code>/etc/ai-memory/config.toml</code> (per node, identical across the fleet):</p>
+<pre><code class="language-toml">schema_version = 2
+tier = &quot;autonomous&quot;
+
+[llm]
+backend     = &quot;openrouter&quot;            # chat LLM — any #1067 alias works
+model       = &quot;x-ai/grok-4.3&quot;         # USA-vendor policy example
+api_key_env = &quot;OPENROUTER_API_KEY&quot;
+
+[embeddings]
+backend     = &quot;openrouter&quot;            # #1598 — API embeddings
+# base_url omitted — the openrouter alias pre-fills
+# https://openrouter.ai/api/v1
+model       = &quot;google/gemini-embedding-2&quot;   # native 3072-dim
+dim         = 768                     # #1598 fleet follow-up: explicit dim is
+                                      # sent as the wire `dimensions` param —
+                                      # gemini-embedding-2 truncates server-side
+                                      # (Matryoshka). REQUIRED posture for
+                                      # pgvector-backed federated fleets: ANN
+                                      # indexes cap at 2000 dims and the fleet
+                                      # schemas template vector(768). sqlite-only
+                                      # single nodes may omit dim (native 3072).
+api_key_file = &quot;/etc/ai-memory/keys/embed.key&quot;   # mode 0400 enforced;
+                                                 # or api_key_env
+backfill_batch = 100
+
+[reranker]
+enabled = true                        # cross-encoder runs on-CPU
+model   = &quot;ms-marco-MiniLM-L-6-v2&quot;
+
+[storage]
+default_namespace = &quot;fleet&quot;
+archive_on_gc     = true
+</code></pre>
+<h2 id="shape-b-self-hosted-airgapped-embeddings">Shape B — self-hosted / airgapped embeddings</h2>
+<p>For airgapped sites, serve an <strong>Apache-2.0 USA model</strong> behind an
+OpenAI-compatible <code>/v1/embeddings</code> endpoint on a shared CPU inference
+node (or per-rack):</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Dims</th>
+<th>License</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nomic-embed-text-v1.5</code></td>
+<td>768</td>
+<td>Apache 2.0</td>
+<td><strong>Zero re-embed</strong> for existing corpora — it is the compiled default model, so vectors are unchanged.</td>
+</tr>
+<tr>
+<td>Snowflake <code>arctic-embed</code> l / m / s</td>
+<td>1024 / 768 / 384</td>
+<td>Apache 2.0</td>
+<td>Pick by recall-quality vs. CPU budget.</td>
+</tr>
+<tr>
+<td>IBM <code>granite-embedding</code></td>
+<td>768 / 384</td>
+<td>Apache 2.0</td>
+<td>In <code>KNOWN_EMBEDDING_DIMS</code> (#1598).</td>
+</tr>
+</tbody>
+</table></div>
+<p>Serving stacks exposing OpenAI-compatible <code>/v1/embeddings</code>:
+<strong>HuggingFace text-embeddings-inference</strong> (Apache 2.0), <strong>vLLM</strong>
+(Apache 2.0), <strong>llama.cpp server</strong> (MIT).</p>
+<pre><code class="language-toml">[embeddings]
+backend  = &quot;openai-compatible&quot;        # generic escape hatch — base_url
+base_url = &quot;http://tei.internal:8080/v1&quot;   # REQUIRED for this backend
+model    = &quot;nomic-embed-text-v1.5&quot;    # 768d — zero re-embed migration
+# keyless internal endpoint: omit api_key_env / api_key_file entirely
+</code></pre>
+<p>Env-var equivalents (highest precedence; useful for container
+fleets): <code>AI_MEMORY_EMBED_BACKEND</code>, <code>AI_MEMORY_EMBED_BASE_URL</code>,
+<code>AI_MEMORY_EMBED_MODEL</code>, <code>AI_MEMORY_EMBED_API_KEY</code> (secret).</p>
+<h2 id="federation-skeleton">Federation skeleton</h2>
+<p>Identical to the standard hardened mesh — this architecture changes
+only the embedder leg. Per
+<a href="../federation.md"><code>docs/federation.md</code></a>:</p>
+<ul>
+<li><strong>Transport</strong> — TLS + mTLS fingerprint allowlist
+  (<code>ai-memory serve --tls-cert … --tls-key …
+  --mtls-allowlist /etc/ai-memory/peer-fingerprints.allow</code>).</li>
+<li><strong>Application</strong> — <code>--api-key</code> (X-API-Key on every endpoint except
+  <code>/api/v1/health</code>).</li>
+<li><strong>Identity / wire integrity</strong> — per-message Ed25519 signed sync
+  (<code>X-Memory-Sig</code> + <code>X-Memory-Nonce</code>; <code>AI_MEMORY_FED_REQUIRE_SIG=1</code> +
+  <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> are the v0.7.0 secure defaults),
+  peer enrollment (<code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1</code>).</li>
+<li><strong>Quorum</strong> — W-of-N writes (W = 2 for 2–3 peers; <code>ceil((N+1)/2)</code>
+  above that), vector-clock CRDT-lite merge, periodic catch-up pull.</li>
+</ul>
+<p><strong>Embedding-dim consistency is fleet-critical.</strong> Every federated peer
+MUST resolve the same embedding model/dim (this architecture pins
+<code>model = "google/gemini-embedding-2"</code> + <code>dim = 768</code> fleet-wide so
+pgvector <code>vector(768)</code> schemas and their HNSW indexes — capped at
+2000 dims by pgvector — keep serving ANN recall) — vectors from different
+models do not compare. Roll out a model change fleet-wide:
+(1) update <code>[embeddings]</code> on every node, (2) run
+<code>ai-memory reembed --dry-run</code> then <code>ai-memory reembed</code> per node,
+(3) verify with <code>ai-memory doctor</code> (the "Embeddings Reachability
+(#1598)" section reports the resolved backend/model/provenance).</p>
+<h2 id="sizing-notes">Sizing notes</h2>
+<ul>
+<li><strong>Embedding latency</strong> — 80–300 ms p50 per API embed call (cloud
+  vendor and network dependent; self-hosted TEI on a modern CPU node
+  typically lands at the low end for short inputs). This hop is on
+  the store path (one embed per memory) and on the semantic-recall
+  path (one embed per query). Budget it on top of the local recall
+  numbers in <a href="../performance.html"><code>docs/performance.html</code></a>.</li>
+<li><strong>Backfill / reembed throughput</strong> — bounded by the API rate limit,
+  not local CPU; tune <code>backfill_batch</code> (1–10000, default 100) and
+  <code>ai-memory reembed --batch</code> accordingly.</li>
+<li><strong>Reranker CPU cost</strong> — the autonomous-tier cross-encoder
+  (<code>ms-marco-MiniLM-L-6-v2</code>) runs in-process on CPU; budget one CPU
+  core burst per reranked recall on top of the embed hop. Disable
+  (<code>[reranker] enabled = false</code>) on the smallest nodes if recall p99
+  matters more than ranking quality.</li>
+<li><strong>No GPU, no model weights on fleet nodes</strong> — node images stay
+  small; the only embedding state on a node is its vector column.</li>
+</ul>
+<h2 id="security-posture">Security posture</h2>
+<ul>
+<li><strong>Key files 0400</strong> — <code>[embeddings].api_key_file</code> (like
+  <code>[llm].api_key_file</code>) is refused unless mode 0400 or stricter;
+  inline <code>api_key = "&lt;literal&gt;"</code> in config.toml is rejected at parse
+  time.</li>
+<li><strong>Paid-tier, no-training routing</strong> — the cloud reference uses paid
+  OpenRouter routes only (no <code>:free</code>), pinning providers whose terms
+  exclude training on inputs.</li>
+<li><strong>USA-vendor compliance hook</strong> — the reference model set is
+  USA-only (Google AI Studio via OpenRouter; Nomic / Snowflake / IBM
+  for self-host). Substitute per your compliance regime; the
+  <code>KNOWN_EMBEDDING_DIMS</code> table + <code>[embeddings].dim</code> override accept
+  any model.</li>
+<li><strong>Fail-closed degradation (#1593)</strong> — if the embedding API is
+  unreachable at boot or at request time, semantic recall degrades
+  loudly to keyword mode (stderr ERROR + <code>embedder_loaded = false</code> +
+  <code>recall_mode_active = "degraded"</code> in <code>memory_capabilities</code>, #1594).
+  The chat LLM client is never reused for embeddings.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="enterprise-cpu-memory-gpu.html">CPU + Memory + GPU sibling architecture</a>
+  — including the when-to-choose-which table.</li>
+<li><a href="../v0.7.0/release-notes.md"><code>docs/v0.7.0/release-notes.md</code> §"Substrate-native API embeddings"</a>
+  — the #1598 change inventory.</li>
+<li><a href="../CONFIG_SCHEMA.md"><code>docs/CONFIG_SCHEMA.md</code></a> — full <code>[embeddings]</code>
+  field reference + resolver precedence.</li>
+<li><a href="../federation.md"><code>docs/federation.md</code></a> — mTLS / X-API-Key / peer
+  attestation hardening; quorum tuning tables.</li>
+<li><a href="../enterprise-deployment.md"><code>docs/enterprise-deployment.md</code></a> —
+  tier-by-tier capacity / cost / SLA planning.</li>
+</ul>
+</main>
+
+<footer>
+  <div class="footer-links">
+    <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
+    <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
+    <a href="../batman-active-mode.html">Batman Mode</a>
+    <a href="../credits.html">Credits</a>
+    <a href="../whats-new-v07.html">v0.7.0</a>
+  </div>
+  <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
+  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.7.0 GA deliverable.</div>
+  <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem; margin-left:auto; margin-right:auto">
+    <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
+  </div>
+</footer>
+
+</body>
+</html>
