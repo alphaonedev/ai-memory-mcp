@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi-publish
-      url: https://pypi.org/project/ai-memory/
+      url: https://pypi.org/project/ai-memory-mcp/
     permissions:
       id-token: write
       contents: read
