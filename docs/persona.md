@@ -63,6 +63,28 @@ Three ways to trigger a generation:
    `tracing::warn!(target: "post_reflect.auto_persona", ...)` and never
    propagated to the caller's reflect response.
 
+### Binding a reflection to its entity (cadence trigger key)
+
+A reflection "mentions" an entity through the descriptor resolved at write
+time into the indexed `mentioned_entity_id` column (and re-resolved at
+cadence time by `resolve_entity_id`). Resolution order:
+
+1. **`metadata.entity_id`** (primary). The structured tag on the reflection
+   memory's metadata.
+2. **Top-level `entity_id` param** (#1665 convenience). `memory_reflect`
+   accepts a sibling `entity_id` string that desugars into
+   `metadata.entity_id` when you have not set it directly. If both are
+   supplied and differ, `metadata.entity_id` wins (a warn is logged); a
+   blank/whitespace value is ignored.
+3. **`[entity:X]` title marker** (fallback). An `[entity:<id>]` token in the
+   reflection title, for callers that have no structured id yet.
+
+Whitespace is trimmed and empty values are skipped consistently on both the
+write-time denormaliser (`crate::storage::extract_mentioned_entity_id`) and
+the cadence resolver (`resolve_entity_id`), so the same descriptor counts on
+both sides (#1665). `memory_store` does **not** honor `entity_id` — the
+binding is reflection-kind only.
+
 ## Provenance
 
 The substrate is the source of truth. Every persona row carries
