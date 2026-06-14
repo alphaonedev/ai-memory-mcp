@@ -1086,6 +1086,24 @@ fn remove_claude_code(obj: &mut Map<String, Value>) {
 /// follows automatically.
 const PRETOOL_HOOK_TOOL_NAME: &str = crate::mcp::registry::tool_names::MEMORY_CHECK_AGENT_ACTION;
 
+/// Tool-name matcher for the PreToolUse hook.
+///
+/// Scoped to the agent-external action surface the substrate rule
+/// engine actually models — `AgentAction` is `bash | filesystem_write
+/// | network_request | process_spawn | custom`
+/// (`crate::governance::agent_action::action_kinds`), and the harness
+/// only synthesizes a `kind` for Bash / Edit / Write tool dispatches.
+/// The Claude Code matcher is a regex, so `Edit` also covers
+/// `MultiEdit` / `NotebookEdit` by substring.
+///
+/// A bare `"*"` here (the pre-#1667 value) fired the hook on EVERY
+/// tool, including `mcp_tool` / read dispatches like
+/// `mcp__memory__memory_get`, for which the harness builds no
+/// `AgentAction` and therefore supplies no `kind` — tripping the
+/// `memory_check_agent_action` `required: ["kind"]` schema on every
+/// memory MCP call. See issue #1667.
+const PRETOOL_HOOK_MATCHER: &str = "Bash|Edit|Write";
+
 /// Build the PreToolUse entry the installer writes. Uses the
 /// type=`mcp_tool` form (vs `type=command`) so Claude Code dispatches
 /// over the MCP channel directly — no shell, no fork, no PATH
@@ -1096,7 +1114,7 @@ fn claude_code_pretool_entry() -> Value {
     serde_json::json!({
         MARKER_START_KEY: MARKER_PAYLOAD,
         MANAGED_KEYS_PROPERTY: ["matcher", "hooks"],
-        "matcher": "*",
+        "matcher": PRETOOL_HOOK_MATCHER,
         "hooks": [
             { "type": "mcp_tool", "tool": PRETOOL_HOOK_TOOL_NAME }
         ],
@@ -1156,7 +1174,7 @@ fn apply_claude_code_pretool(
     let conflicting: Vec<String> = arr
         .iter()
         .filter_map(pretool_conflict_matcher)
-        .filter(|m| m != "*")
+        .filter(|m| m != PRETOOL_HOOK_MATCHER)
         .collect();
     if !conflicting.is_empty() && !force {
         writeln!(
@@ -3171,7 +3189,9 @@ mod tests {
     #[test]
     fn pretool_entry_shape_matches_documented_form() {
         let v = claude_code_pretool_entry();
-        assert_eq!(v["matcher"], "*");
+        // Scoped to the modeled action surface, NOT "*" (issue #1667).
+        assert_eq!(PRETOOL_HOOK_MATCHER, "Bash|Edit|Write");
+        assert_eq!(v["matcher"], PRETOOL_HOOK_MATCHER);
         assert_eq!(v["hooks"][0]["type"], "mcp_tool");
         assert_eq!(v["hooks"][0]["tool"], PRETOOL_HOOK_TOOL_NAME);
         assert_eq!(v["hooks"][0]["tool"], "memory_check_agent_action");
@@ -3219,7 +3239,7 @@ mod tests {
         // Exactly one managed entry.
         assert_eq!(arr.len(), 1);
         let entry = &arr[0];
-        assert_eq!(entry["matcher"], "*");
+        assert_eq!(entry["matcher"], PRETOOL_HOOK_MATCHER);
         assert_eq!(entry["hooks"][0]["type"], "mcp_tool");
         assert_eq!(entry["hooks"][0]["tool"], "memory_check_agent_action");
         assert!(env.stdout_str().contains("installed PreToolUse hook ->"));
@@ -3256,7 +3276,7 @@ mod tests {
         // First entry is the operator's; second is ours.
         assert_eq!(arr[0]["matcher"], "Bash");
         assert_eq!(arr[0]["hooks"][0]["command"], "echo hi");
-        assert_eq!(arr[1]["matcher"], "*");
+        assert_eq!(arr[1]["matcher"], PRETOOL_HOOK_MATCHER);
         assert_eq!(arr[1]["hooks"][0]["tool"], "memory_check_agent_action");
     }
 
@@ -3319,9 +3339,9 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let arr = parsed["hooks"]["PreToolUse"].as_array().unwrap();
-        // Conflicting entry replaced with ours (matcher="*").
+        // Conflicting entry replaced with ours (scoped matcher, #1667).
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["matcher"], "*");
+        assert_eq!(arr[0]["matcher"], PRETOOL_HOOK_MATCHER);
         assert_eq!(arr[0]["hooks"][0]["tool"], "memory_check_agent_action");
         assert!(arr[0][MARKER_START_KEY].is_string());
     }

@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read path now applies the same trim + non-empty filter, and both sites
   route the metadata key through the new `field_names::ENTITY_ID` SSOT const.
 
+- **Managed Claude Code PreToolUse hook fired on every tool, spamming
+  `kind is required`**
+  ([#1667](https://github.com/alphaonedev/ai-memory-mcp/issues/1667)). The
+  installer wrote the PreToolUse guardrail with `matcher: "*"`, so Claude
+  Code invoked `memory_check_agent_action` before *every* tool dispatch —
+  including MCP / read tools (e.g. `mcp__memory__memory_get`) for which the
+  harness builds no `AgentAction` and supplies no `kind`. The tool's
+  `required: ["kind"]` input schema then rejected the call, logging
+  `PreToolUse:<tool> hook error / kind is required` on every memory MCP call
+  (non-fatal, but noisy). The managed matcher is now scoped to
+  `Bash|Edit|Write` via a single named `PRETOOL_HOOK_MATCHER` const — the
+  agent-external action surface the rule engine actually models
+  (`bash` / `filesystem_write`); the regex also substring-covers
+  `MultiEdit` / `NotebookEdit`. The `SessionStart` matcher is intentionally
+  left as `"*"` (it fires per session, not per tool dispatch). Re-running
+  `ai-memory install claude-code --apply` with the new binary cleanly
+  replaces a prior `"*"` managed entry.
+
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
 ### Moonshot-property declaration (ROADMAP §17 quality gate)

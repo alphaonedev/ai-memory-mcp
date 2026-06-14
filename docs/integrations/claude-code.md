@@ -252,10 +252,14 @@ proposed actions dispatch as Claude Code normally would.
 
 Claude Code's [`PreToolUse`](https://docs.claude.com/en/docs/claude-code/hooks)
 hook surface (`type=mcp_tool`) lets the harness invoke an MCP tool
-before every tool dispatch and gate on the response. The ai-memory hook
-calls `memory_check_agent_action` with a JSON-RPC payload of the
-proposed action (kind=`bash` for the Bash tool, kind=`filesystem_write`
-for Edit / Write, etc.) and honours the returned `decision`:
+before a matching tool dispatch and gate on the response. The installer
+scopes the managed entry with `matcher: "Bash|Edit|Write"` — the
+agent-external action surface the rule engine models (the Claude Code
+`matcher` is a regex over the tool name, so `Edit` also covers
+`MultiEdit` / `NotebookEdit`). The ai-memory hook calls
+`memory_check_agent_action` with a JSON-RPC payload of the proposed
+action (kind=`bash` for the Bash tool, kind=`filesystem_write` for
+Edit / Write) and honours the returned `decision`:
 
 | `decision` | Harness behaviour |
 |---|---|
@@ -263,9 +267,14 @@ for Edit / Write, etc.) and honours the returned `decision`:
 | `warn` | Tool dispatches normally + the warning row lands in `signed_events` (audit chain). The agent sees the `reason` in the tool's response context. |
 | `refuse` | Tool dispatch is BLOCKED. The agent sees `reason` + `rule_id` in the response context and must reroute (operator-approval workflow lives in K10, separate surface). |
 
-The `Read` tool is intentionally NOT gated — reads are non-mutating and
-don't produce external state changes. Other tools (WebFetch,
-mcp__-prefixed tools) translate as documented in
+Because the managed matcher is scoped to `Bash|Edit|Write`, the `Read`
+tool, `WebFetch`, and `mcp__`-prefixed tools are NOT gated by the managed
+entry — the harness builds no `AgentAction` (hence no `kind`) for them, so
+gating them via `matcher: "*"` only produced a spurious `kind is required`
+rejection on every such call (fixed in
+[#1667](https://github.com/alphaonedev/ai-memory-mcp/issues/1667)). An
+operator who wants to gate additional tools can widen the matcher by hand;
+the action-kind translation is documented in
 [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md).
 
 ### How to install
