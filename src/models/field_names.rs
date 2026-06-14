@@ -117,6 +117,11 @@ pub const EMBEDDINGS: &str = "embeddings";
 /// `embedding_dim` — wire/row field name (#1169 dim reporting; #1598
 /// `ResolvedEmbeddings` Debug field).
 pub const EMBEDDING_DIM: &str = "embedding_dim";
+/// `entity_id` — metadata key naming the entity a reflection is about
+/// (drives auto-persona cadence via the denormalised
+/// [`MENTIONED_ENTITY_ID`] column). Canonical spelling SSOT; the MCP
+/// param `crate::mcp::param_names::ENTITY_ID` aliases this const (#1665).
+pub const ENTITY_ID: &str = "entity_id";
 /// `event_types` — wire/row field name.
 pub const EVENT_TYPES: &str = "event_types";
 /// `excluded_for_scope` — wire/row field name.

@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — Patch 1 (unreleased)
+
+### Added
+
+- **`memory_reflect`: top-level `entity_id` convenience param**
+  ([#1665](https://github.com/alphaonedev/ai-memory-mcp/issues/1665)). The
+  tool now accepts an optional `entity_id` string that desugars into
+  `metadata.entity_id` at the MCP boundary, making the entity→auto-persona
+  binding discoverable from the tool schema instead of requiring a nested
+  metadata key. Precedence is metadata-wins (a differing nested
+  `metadata.entity_id` shadows the alias with a warn); a blank value is
+  ignored; the `[entity:X]` title marker remains the lower-precedence
+  fallback. Applied identically in both reflect parsers (stdio + SAL/HTTP)
+  and through the L1-8 pending→execute round-trip. `memory_store` is
+  intentionally unaffected (entity binding is reflection-kind only). This is
+  **not** a fix for "binding was broken" — `metadata.entity_id` already
+  worked; the param closes a discoverability gap.
+
+### Fixed
+
+- **Auto-persona cadence missed whitespace/empty `entity_id`**
+  ([#1665](https://github.com/alphaonedev/ai-memory-mcp/issues/1665)). The
+  cadence resolver `resolve_entity_id` read `metadata.entity_id` raw while
+  the write-time denormaliser `extract_mentioned_entity_id` trimmed and
+  empty-filtered it, so a padded/empty value bound a different descriptor on
+  the two sides and `count_entity_reflections` silently missed the row. The
+  read path now applies the same trim + non-empty filter, and both sites
+  route the metadata key through the new `field_names::ENTITY_ID` SSOT const.
+
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
 ### Moonshot-property declaration (ROADMAP §17 quality gate)
