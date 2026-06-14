@@ -4,11 +4,14 @@
   "description": "TypeScript SDK for the ai-memory HTTP API — persistent, tier-aware memory for AI agents.",
   "license": "Apache-2.0",
   "author": "AlphaOne LLC",
-  "homepage": "https://github.com/alphaone/ai-memory",
+  "homepage": "https://github.com/alphaonedev/ai-memory-mcp/tree/main/sdk/typescript",
   "repository": {
     "type": "git",
-    "url": "https://github.com/alphaone/ai-memory.git",
+    "url": "git+https://github.com/alphaonedev/ai-memory-mcp.git",
     "directory": "sdk/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/alphaonedev/ai-memory-mcp/issues"
   },
   "type": "module",
   "main": "./dist/index.js",
