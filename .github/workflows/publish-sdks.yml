@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi-publish
-      url: https://pypi.org/project/ai-memory/
+      url: https://pypi.org/project/ai-memory-mcp/
     permissions:
       id-token: write
       contents: read
@@ -74,6 +74,10 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: publish via npm Trusted Publisher (OIDC + provenance)
+      # Auth via the npm automation token (env-scoped secret on the
+      # npm-publish environment). id-token:write still enables --provenance.
+      - name: publish to npm (token auth + provenance)
         working-directory: sdk/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public
