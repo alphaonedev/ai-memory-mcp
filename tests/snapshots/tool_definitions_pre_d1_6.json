@@ -1046,6 +1046,10 @@
             "description": "Merged with system reflection_metadata; caller keys win.",
             "type": "object"
           },
+          "entity_id": {
+            "description": "v0.7.1 #1665 - entity this reflection is about; convenience alias for metadata.entity_id (metadata wins on conflict). Reflection-kind only; drives auto-persona cadence.",
+            "type": "string"
+          },
           "namespace": {
             "description": "Target namespace. Defaults to first source's namespace.",
             "type": "string"

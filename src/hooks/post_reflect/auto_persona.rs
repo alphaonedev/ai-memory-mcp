@@ -231,7 +231,18 @@ pub(crate) fn resolve_entity_id(
     };
     let metadata: serde_json::Value =
         serde_json::from_str(&metadata_str).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(eid) = metadata.get("entity_id").and_then(|v| v.as_str()) {
+    // v0.7.1 #1665 — trim + non-empty filter to match the write-time
+    // denormaliser `crate::storage::extract_mentioned_entity_id`. Without
+    // this, a whitespace/empty `metadata.entity_id` bound a different
+    // (or empty) descriptor here than the indexed `mentioned_entity_id`
+    // column, so `count_entity_reflections` (WHERE mentioned_entity_id = ?)
+    // silently missed the row and persona cadence never fired.
+    if let Some(eid) = metadata
+        .get(crate::models::field_names::ENTITY_ID)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         return Ok(Some(eid.to_string()));
     }
     // `[entity:X]` marker in the title — operators frequently tag
@@ -369,6 +380,35 @@ mod tests {
             version: 1,
         };
         db::insert(conn, &mem).unwrap()
+    }
+
+    // v0.7.1 #1665 — read-side trim parity with the write-time extractor
+    // `crate::storage::extract_mentioned_entity_id`. A whitespace-padded
+    // metadata.entity_id must resolve to the SAME trimmed descriptor that
+    // lands in the indexed `mentioned_entity_id` column, or
+    // `count_entity_reflections` (WHERE mentioned_entity_id = ?) misses it.
+    #[test]
+    fn resolve_entity_id_trims_whitespace_metadata() {
+        let (conn, _dir, _path) = fresh_db();
+        let id = seed_reflection(&conn, "team/alpha", "r", "b", Some("  ent-9  "));
+        let got = resolve_entity_id(&conn, &id).expect("resolve ok");
+        assert_eq!(got.as_deref(), Some("ent-9"));
+    }
+
+    #[test]
+    fn resolve_entity_id_empty_metadata_falls_through_to_marker() {
+        let (conn, _dir, _path) = fresh_db();
+        // Empty (whitespace) metadata.entity_id is ignored; the [entity:X]
+        // title marker is the lower-precedence fallback.
+        let id = seed_reflection(
+            &conn,
+            "team/alpha",
+            "about [entity:fallback] x",
+            "b",
+            Some("   "),
+        );
+        let got = resolve_entity_id(&conn, &id).expect("resolve ok");
+        assert_eq!(got.as_deref(), Some("fallback"));
     }
 
     fn enable_cadence(conn: &Connection, ns: &str, n: u32, export: bool) {

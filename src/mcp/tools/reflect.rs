@@ -84,6 +84,48 @@ pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String 
     }
 }
 
+/// v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
+/// into the canonical `metadata.entity_id` key.
+///
+/// Precedence is **metadata-wins**: when `metadata.entity_id` is already
+/// present and non-blank it is left untouched, and a differing top-level
+/// alias is logged at warn-level (shadowed). A blank / whitespace-only
+/// `top_level` is treated as absent (mirrors the trim+non-empty filter the
+/// write-time extractor applies in `crate::storage::extract_mentioned_entity_id`
+/// and the runtime resolver in `crate::hooks::post_reflect::auto_persona::resolve_entity_id`).
+///
+/// Called by BOTH reflect parsers ([`parse_reflect_input`] for the SAL/HTTP
+/// path and [`handle_reflect`] for the stdio path) before the
+/// [`db::ReflectInput`] is built, so the binding rides through identically
+/// on every backend AND through the L1-8 pending → execute round-trip (the
+/// payload serialises the already-desugared `input.metadata`).
+fn fold_entity_id_into_metadata(metadata: &mut Value, top_level: Option<&str>) {
+    let Some(alias) = top_level.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let existing = metadata
+        .get(field_names::ENTITY_ID)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match existing {
+        Some(present) => {
+            if present != alias {
+                tracing::warn!(
+                    target: "mcp.reflect",
+                    "top-level entity_id alias shadowed by metadata.entity_id (using metadata)"
+                );
+            }
+        }
+        None => {
+            if !metadata.is_object() {
+                *metadata = serde_json::json!({});
+            }
+            metadata[field_names::ENTITY_ID] = Value::String(alias.to_string());
+        }
+    }
+}
+
 /// Parse a `memory_reflect` request `Value` into a [`db::ReflectInput`]
 /// plus the optional caller-asserted `depth` (#1325). Shared by the
 /// sqlite MCP path ([`handle_reflect`]) and the postgres SAL HTTP path
@@ -135,7 +177,7 @@ pub(crate) fn parse_reflect_input(
                 .collect()
         })
         .unwrap_or_default();
-    let metadata = if params["metadata"].is_object() {
+    let mut metadata = if params["metadata"].is_object() {
         params["metadata"].clone()
     } else {
         serde_json::json!({})
@@ -157,6 +199,10 @@ pub(crate) fn parse_reflect_input(
     });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
+    // v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
+    // into `metadata.entity_id` before building the input, so the binding
+    // is identical across both reflect parsers and the L1-8 round-trip.
+    fold_entity_id_into_metadata(&mut metadata, params[param_names::ENTITY_ID].as_str());
     let input = db::ReflectInput {
         source_ids,
         title,
@@ -228,7 +274,7 @@ pub fn handle_reflect(
                 .collect()
         })
         .unwrap_or_default();
-    let metadata = if params["metadata"].is_object() {
+    let mut metadata = if params["metadata"].is_object() {
         params["metadata"].clone()
     } else {
         serde_json::json!({})
@@ -268,6 +314,11 @@ pub fn handle_reflect(
     });
     let agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
+
+    // v0.7.1 #1665 — desugar the top-level `entity_id` convenience param
+    // into `metadata.entity_id` before building the input, so the binding
+    // is identical across both reflect parsers and the L1-8 round-trip.
+    fold_entity_id_into_metadata(&mut metadata, params[param_names::ENTITY_ID].as_str());
 
     let input = db::ReflectInput {
         source_ids,
@@ -363,8 +414,8 @@ pub fn handle_reflect(
                     // call when the approver resolves the pending row.
                     //
                     // v0.7.x (issue #1176): `metadata` MUST be included
-                    // — `execute_reflect_from_payload` at
-                    // `src/storage/mod.rs:8685` reads
+                    // — `execute_reflect_from_payload` (`src/storage/mod.rs`,
+                    // fn `execute_reflect_from_payload`) reads
                     // `payload["metadata"]` to rebuild the
                     // `ReflectInput.metadata` field, which the
                     // substrate then merges with the canonical
@@ -546,9 +597,22 @@ pub struct ReflectRequest {
     #[serde(default)]
     pub agent_id: Option<String>,
 
-    /// Merged with system reflection_metadata; caller keys win.
+    /// Merged with system reflection_metadata; caller keys win. The
+    /// `entity_id` key here binds the reflection to an entity (drives
+    /// auto-persona cadence); set it directly or via the top-level
+    /// `entity_id` convenience param below (#1665).
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+
+    /// v0.7.1 #1665 — entity this reflection is about. Convenience alias
+    /// for `metadata.entity_id`: it sets that key when you have not. If
+    /// both are supplied and differ, `metadata.entity_id` wins (a warn is
+    /// logged); a blank/whitespace value is ignored. A `[entity:X]` title
+    /// marker remains the lower-precedence fallback. Reflection-kind only;
+    /// drives auto-persona cadence (the generator counts reflections whose
+    /// denormalised `mentioned_entity_id` equals this).
+    #[serde(default)]
+    pub entity_id: Option<String>,
 
     /// v0.7.0 #1325 — caller-asserted reflection depth (cap-style).
     /// When set, MUST equal max(source_depths)+1 or the call is
@@ -748,6 +812,168 @@ mod tests {
             version: 1,
         };
         db::insert(conn, &mem).expect("insert")
+    }
+
+    // ── v0.7.1 #1665 — top-level entity_id desugar coverage ─────────
+    #[test]
+    fn fold_entity_id_absent_is_noop() {
+        let mut md = json!({"agent_id": "ai:x"});
+        fold_entity_id_into_metadata(&mut md, None);
+        assert!(md.get(crate::models::field_names::ENTITY_ID).is_none());
+    }
+
+    #[test]
+    fn fold_entity_id_blank_is_noop() {
+        let mut md = json!({});
+        fold_entity_id_into_metadata(&mut md, Some("   "));
+        assert!(md.get(crate::models::field_names::ENTITY_ID).is_none());
+    }
+
+    #[test]
+    fn fold_entity_id_inserts_trimmed_when_absent() {
+        let mut md = json!({});
+        fold_entity_id_into_metadata(&mut md, Some("  acme  "));
+        assert_eq!(md[crate::models::field_names::ENTITY_ID], json!("acme"));
+    }
+
+    #[test]
+    fn fold_entity_id_metadata_wins_on_conflict() {
+        let mut md = json!({"entity_id": "real"});
+        fold_entity_id_into_metadata(&mut md, Some("alias"));
+        assert_eq!(md[crate::models::field_names::ENTITY_ID], json!("real"));
+    }
+
+    #[test]
+    fn fold_entity_id_replaces_non_object_metadata() {
+        let mut md = json!(null);
+        fold_entity_id_into_metadata(&mut md, Some("acme"));
+        assert_eq!(md[crate::models::field_names::ENTITY_ID], json!("acme"));
+    }
+
+    // #1665 audit follow-up — the common shape: a caller-set
+    // metadata.entity_id with NO top-level param must be left intact (the
+    // None early-return must not blank an existing binding).
+    #[test]
+    fn fold_entity_id_none_preserves_existing_metadata() {
+        let mut md = json!({"entity_id": "real", "agent_id": "ai:x"});
+        fold_entity_id_into_metadata(&mut md, None);
+        assert_eq!(md[crate::models::field_names::ENTITY_ID], json!("real"));
+        assert_eq!(md["agent_id"], json!("ai:x"));
+    }
+
+    // #1665 audit follow-up — a non-string top-level entity_id (number /
+    // bool / object) yields `as_str() == None` in both parsers, so it is
+    // ignored rather than coerced.
+    #[test]
+    fn parse_reflect_input_non_string_entity_id_ignored() {
+        let params = json!({
+            "source_ids": ["a"], "title": "t", "content": "c",
+            "entity_id": 42,
+        });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        assert!(
+            input
+                .metadata
+                .get(crate::models::field_names::ENTITY_ID)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_reflect_input_top_level_entity_id_binds_metadata() {
+        let params = json!({
+            "source_ids": ["a"], "title": "t", "content": "c",
+            "entity_id": "ent-1",
+        });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        assert_eq!(
+            input.metadata[crate::models::field_names::ENTITY_ID],
+            json!("ent-1")
+        );
+    }
+
+    #[test]
+    fn parse_reflect_input_nested_metadata_entity_id_wins() {
+        let params = json!({
+            "source_ids": ["a"], "title": "t", "content": "c",
+            "entity_id": "alias",
+            "metadata": {"entity_id": "real"},
+        });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        assert_eq!(
+            input.metadata[crate::models::field_names::ENTITY_ID],
+            json!("real")
+        );
+    }
+
+    #[test]
+    fn parse_reflect_input_blank_entity_id_ignored() {
+        let params = json!({
+            "source_ids": ["a"], "title": "t", "content": "c",
+            "entity_id": "   ",
+        });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        assert!(
+            input
+                .metadata
+                .get(crate::models::field_names::ENTITY_ID)
+                .is_none()
+        );
+    }
+
+    // Integration: top-level entity_id flows through handle_reflect (stdio
+    // parser) into the denormalised `mentioned_entity_id` column that
+    // `count_entity_reflections` reads for auto-persona cadence — proving
+    // the param → metadata → extractor → indexed-column chain end-to-end.
+    #[test]
+    fn handle_reflect_top_level_entity_id_populates_mentioned_column() {
+        let (conn, tmp) = fresh_db();
+        let src = seed_observation(&conn, "team/alpha", "seed");
+        let out = handle_reflect(
+            &conn,
+            tmp.path(),
+            &json!({
+                "source_ids": [src], "title": "refl", "content": "body",
+                "namespace": "team/alpha", "entity_id": "  ent-42  ",
+            }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("reflect ok");
+        let id = out["id"].as_str().expect("id");
+        let mem = db::get(&conn, id).expect("get").expect("exists");
+        assert_eq!(
+            mem.metadata[crate::models::field_names::ENTITY_ID],
+            json!("ent-42"),
+            "stored metadata.entity_id must be the trimmed top-level value"
+        );
+        let mentioned: Option<String> = conn
+            .query_row(
+                "SELECT mentioned_entity_id FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .expect("query mentioned_entity_id");
+        assert_eq!(
+            mentioned.as_deref(),
+            Some("ent-42"),
+            "denormalised mentioned_entity_id must match for cadence counting"
+        );
+    }
+
+    // Backward-compat: omitting entity_id leaves metadata untouched.
+    #[test]
+    fn parse_reflect_input_omitted_entity_id_no_key() {
+        let params = json!({ "source_ids": ["a"], "title": "t", "content": "c" });
+        let (input, _) = parse_reflect_input(&params, None).expect("parse ok");
+        assert!(
+            input
+                .metadata
+                .get(crate::models::field_names::ENTITY_ID)
+                .is_none()
+        );
     }
 
     // Validation: source_ids missing.
