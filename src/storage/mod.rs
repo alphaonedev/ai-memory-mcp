@@ -592,7 +592,7 @@ pub(crate) fn extract_mentioned_entity_id(mem: &Memory) -> Option<String> {
     // Step 1: structured metadata.entity_id tag.
     if let Some(eid) = mem
         .metadata
-        .get("entity_id")
+        .get(field_names::ENTITY_ID)
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
