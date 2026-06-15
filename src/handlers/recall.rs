@@ -518,9 +518,39 @@ async fn recall_response(
                 if let Err(e) = app.store.touch_after_recall(&touch_ids).await {
                     tracing::warn!("recall (postgres): touch_after_recall failed: {e}");
                 }
+                // #1705 — populate the recall_observations ledger via the
+                // SAL trait so postgres-backed daemons record recalls (the
+                // write side was sqlite/MCP-only pre-#1705, so a postgres
+                // daemon never logged a recall). Best-effort: a ledger error
+                // never blocks the recall response. The recall_id is echoed
+                // so a caller can cite it on a later memory_store / link.
+                let recall_id = uuid::Uuid::new_v4().to_string();
+                {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let candidates: Vec<(String, String, i64, f64)> = scored_pairs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (m, s))| (m.id.clone(), mode.to_string(), (i + 1) as i64, *s))
+                        .collect();
+                    if let Err(e) = app
+                        .store
+                        .record_recall_observation(
+                            &recall_id,
+                            &candidates,
+                            as_agent.or(caller_principal),
+                            namespace,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "recall (postgres): record_recall_observation failed (non-fatal): {e}"
+                        );
+                    }
+                }
                 let mut resp = json!({
                     "memories": scored,
                     "count": scored.len(),
+                    "recall_id": recall_id,
                     (field_names::TOKENS_USED): 0,
                     "mode": mode,
                     (field_names::STORAGE_BACKEND): "postgres",
