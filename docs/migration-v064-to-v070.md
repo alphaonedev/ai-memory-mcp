@@ -341,7 +341,7 @@ the AGE projection prime, and the cutover dance.
    ai-memory schema-init \
      --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
    ```
-   Opening the store walks the postgres ladder up to schema v55
+   Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
 5. **Verify schema parity:**
    ```bash
@@ -365,7 +365,7 @@ the AGE projection prime, and the cutover dance.
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
 Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
-the SAL boundary is byte-stable across both backends at schema v55.
+the SAL boundary is byte-stable across both backends at schema v57.
 
 ---
 
@@ -425,7 +425,7 @@ And new tables (opt-in / empty if you never use the feature): `signed_events` (V
 
 **6.11 `version`** (v45, Provenance Gap 1 / #884). Optimistic-concurrency counter. Bumped on every `memory_update`. Two callers writing against the same `expected_version` race one winner; the loser receives a typed CONFLICT envelope naming the current version. v0.6.4 was last-writer-wins and quietly destroyed concurrent edits.
 
-The bump-by-bump v34 → v55 narrative lives in
+The bump-by-bump v34 → v57 narrative lives in
 [`MIGRATION_v0.7.md` §"Upgrade steps"](MIGRATION_v0.7.md).
 
 ---
@@ -622,17 +622,17 @@ directly) fails because it expects a v0.7.0 column that isn't there.
 
 **Cause:** The schema migration didn't run. Most likely you copied the
 v0.7.0 binary in place but never started it against the DB, OR the
-migration aborted partway and the daemon never reached v55.
+migration aborted partway and the daemon never reached v57.
 
 **Fix:**
 ```bash
 sqlite3 ~/.local/share/ai-memory/ai-memory.db 'SELECT MAX(version) FROM schema_version;'
 # If <55: rerun (serve runs in the foreground by default):
 ai-memory serve 2>&1 | tee ~/.local/share/ai-memory/migrate.log
-# Watch the log for migration completion; halt only after schema_version=55.
+# Watch the log for migration completion; halt only after schema_version=57.
 ```
 
-### 9.3 "schema_version=55 but column missing" (very rare)
+### 9.3 "schema_version=57 but column missing" (very rare)
 
 **Symptom:** `SELECT MAX(version) FROM schema_version;` reports `55` but a SELECT against one of
 the new columns errors out.
@@ -771,7 +771,7 @@ require v0.7.0.
 ### Q2. Is the migration reversible?
 
 **Yes, via file restore.** The schema ladder is idempotent on replay but
-not in-place reversible — once you reach `schema_version=55`, the columns
+not in-place reversible — once you reach `schema_version=57`, the columns
 exist and the data has been backfilled. Rollback means restoring the
 pre-upgrade `.bak.pre-v07` file (per §7). Don't delete the backup until
 you've soaked v0.7.0 for at least a week.

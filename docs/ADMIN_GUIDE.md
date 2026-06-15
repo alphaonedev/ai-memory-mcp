@@ -45,7 +45,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 88 HTTP route registrations (75 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 89 HTTP route registrations (75 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
