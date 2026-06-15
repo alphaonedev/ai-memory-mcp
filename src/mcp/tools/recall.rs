@@ -593,6 +593,8 @@ fn record_recall_observations(
     recall_id: &str,
     memories_json: &[Value],
     retriever: &str,
+    agent_id: Option<&str>,
+    namespace: Option<&str>,
 ) {
     if !observations::table_exists(conn) {
         return;
@@ -622,7 +624,9 @@ fn record_recall_observations(
             });
         }
     }
-    if let Err(e) = observations::record_recall(conn, recall_id, &candidates) {
+    if let Err(e) =
+        observations::record_recall_with_identity(conn, recall_id, &candidates, agent_id, namespace)
+    {
         tracing::warn!(
             target: "observations",
             recall_id = %recall_id,
@@ -1063,6 +1067,8 @@ pub fn handle_recall_dto(
                         &recall_id,
                         &memories,
                         crate::models::RECALL_MODE_HYBRID_RERANK,
+                        caller,
+                        namespace,
                     );
                     let mut resp = json!({
                         "recall_id": recall_id,
@@ -1087,7 +1093,9 @@ pub fn handle_recall_dto(
                     session_tracker,
                 );
                 let memories = scored_memories(results, conn);
-                record_recall_observations(conn, &recall_id, &memories, "hybrid");
+                record_recall_observations(
+                    conn, &recall_id, &memories, "hybrid", caller, namespace,
+                );
                 let mut resp = json!({
                     "recall_id": recall_id,
                     "memories": memories,
@@ -1146,7 +1154,7 @@ pub fn handle_recall_dto(
         session_tracker,
     );
     let memories = scored_memories(results, conn);
-    record_recall_observations(conn, &recall_id, &memories, "keyword");
+    record_recall_observations(conn, &recall_id, &memories, "keyword", caller, namespace);
     let mut resp = json!({
         "recall_id": recall_id,
         "memories": memories,
