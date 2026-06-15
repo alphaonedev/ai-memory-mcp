@@ -3930,8 +3930,15 @@ pub async fn bootstrap_serve(
         } else {
             tracing::warn!("serve: neural cross-encoder unavailable, using lexical fallback");
         }
-        crate::runtime_context::RuntimeContext::global()
-            .install_reranker(Arc::new(crate::reranker::BatchedReranker::new(ce)));
+        // #1691/n14 — apply the operator-configured score floor
+        // (env > [reranker].score_floor > Off) on the HTTP recall reranker
+        // too, matching the MCP build site.
+        crate::runtime_context::RuntimeContext::global().install_reranker(Arc::new(
+            crate::reranker::BatchedReranker::with_score_floor(
+                ce,
+                app_config.resolve_reranker_score_floor(),
+            ),
+        ));
     }
 
     if std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")

@@ -1372,6 +1372,39 @@ impl Default for RerankerScoreFloor {
 }
 
 impl RerankerScoreFloor {
+    /// #1691/n14 — parse an operator config / env string into a score
+    /// floor so the (previously dead) [`BatchedReranker::with_score_floor`]
+    /// capability is reachable from `[reranker].score_floor` and
+    /// `AI_MEMORY_RERANK_SCORE_FLOOR`.
+    ///
+    /// Grammar (case-insensitive, whitespace-trimmed):
+    /// - `off` → [`RerankerScoreFloor::Off`]
+    /// - `absolute:<f>` (alias `abs:<f>`) → [`RerankerScoreFloor::Absolute`]
+    /// - `relative:<f>` (aliases `rel:<f>`, `relative_to_top:<f>`) →
+    ///   [`RerankerScoreFloor::RelativeToTop`]
+    ///
+    /// Returns `None` on any unparseable value so resolvers fall through
+    /// to the next precedence layer. The numeric is clamped to
+    /// `[0.0, 1.0]` at [`apply`](Self::apply) time, so an out-of-range
+    /// value still parses (and is clamped on use) rather than erroring.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("off") {
+            return Some(Self::Off);
+        }
+        let (kind, value) = s.split_once(':')?;
+        let v: f64 = value.trim().parse().ok()?;
+        if !v.is_finite() {
+            return None;
+        }
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "absolute" | "abs" => Some(Self::Absolute(v)),
+            "relative" | "rel" | "relative_to_top" => Some(Self::RelativeToTop(v)),
+            _ => None,
+        }
+    }
+
     /// Apply the floor in-place to a pre-sorted (descending) vector
     /// of `(Memory, blended_score)` candidates. The implementation is
     /// extracted as a free helper so unit tests can pin the cutoff
@@ -2582,6 +2615,43 @@ mod tests {
     }
 
     // ---------- Issue #1319 — reranker score floor (calibration) -----------
+
+    #[test]
+    fn issue_1691_n14_score_floor_parse_grammar() {
+        // #1691/n14 — the config/env parser that finally makes the
+        // with_score_floor capability operator-reachable.
+        assert_eq!(
+            RerankerScoreFloor::parse("off"),
+            Some(RerankerScoreFloor::Off)
+        );
+        assert_eq!(
+            RerankerScoreFloor::parse("  OFF "),
+            Some(RerankerScoreFloor::Off)
+        );
+        assert_eq!(
+            RerankerScoreFloor::parse("absolute:0.3"),
+            Some(RerankerScoreFloor::Absolute(0.3))
+        );
+        assert_eq!(
+            RerankerScoreFloor::parse("ABS: 0.25"),
+            Some(RerankerScoreFloor::Absolute(0.25))
+        );
+        assert_eq!(
+            RerankerScoreFloor::parse("relative:0.5"),
+            Some(RerankerScoreFloor::RelativeToTop(0.5))
+        );
+        assert_eq!(
+            RerankerScoreFloor::parse("relative_to_top:0.8"),
+            Some(RerankerScoreFloor::RelativeToTop(0.8))
+        );
+        // Unparseable values fall through (resolver then uses the next
+        // precedence layer / the Off default).
+        assert_eq!(RerankerScoreFloor::parse(""), None);
+        assert_eq!(RerankerScoreFloor::parse("absolute"), None);
+        assert_eq!(RerankerScoreFloor::parse("absolute:notanumber"), None);
+        assert_eq!(RerankerScoreFloor::parse("bogus:0.5"), None);
+        assert_eq!(RerankerScoreFloor::parse("absolute:inf"), None);
+    }
 
     /// Issue #1319 — `RerankerScoreFloor::Off` is the default and a
     /// no-op. Pre-#1319 callers see byte-identical output through the
