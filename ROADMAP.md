@@ -278,7 +278,7 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 | Region coverage | 93.11% (v0.6.3 baseline; trending up) | evidence.html |
 | Function coverage | 92.55% (v0.6.3 baseline; trending up) | evidence.html |
 | Platform CI matrix | ubuntu-latest, macos-latest, windows-latest, iOS sim, Android emulator | evidence.html, mobile-runtime.yml |
-| Schema version (v0.7.0 release HEAD) | **v57** (sqlite) / **v57** (postgres) — `CURRENT_SCHEMA_VERSION = 57` in `src/storage/migrations.rs` and `src/store/postgres.rs`. Ladder: v15→v19 (v0.6.3.1) → v20 (v0.6.4 audit log) → v22 (v0.7.0 RC) → v29 (recursive-learning Task 1/8) → v30 (L1-1) → v33 (L2 wave `memory_links.relation` CHECK) → v34 (V-4 closeout #698) → v35-v48 (provenance / DLQ / archive carry-forward) → v49 (archived_memories full column carry, #1025) → v50 (per-namespace K8 quota dimension extension, #1156) → v51 (federation_nonces persistence, #1255 / PR #1296) → v52 (`transcript_line_dedup` table backing #1389 L1+L2+L4 layered-capture architecture — composite `(host_pubkey_b64, line_sha256)` key + `memory_id` FK into `memories(id)`) → v53 (scope `memories_au` FTS5 sync trigger to `(title, content, tags)` only — R5.F5.2 / #1418) → v54 (tier-default expiry backfill on legacy NULL-expiry mid/short rows — #1466) → v55 (federation-catchup `updated_at` index — sargable rewrite of `list_memories_updated_since` + sqlite `idx_memories_updated_at`; postgres no new index because `memories_updated_at_idx` DESC already serves it — #1476) → v56 (composite list/archive ordering indexes `idx_memories_list_order` / `idx_memories_ns_list_order` / `idx_archived_ns_archived_at`, paired with the sargable `storage::list` rewrite — #1579 A2+B6d; postgres `migrate_v56()` is a version-stamp no-op) → v57 (postgres stored generated `tsv` tsvector column + `memories_tsv_gin` GIN index, paired with the search/recall/contradiction query rewrite to match AND rank on the precomputed column instead of re-computing the tsvector per matched row — #1579 B2; sqlite version-stamp no-op). Lockstep enforced by `tests/postgres_schema_parity.rs::schema_versions_match_across_adapters`; test-side SSOT via `ai_memory::storage::current_schema_version_for_tests()` per #1311. | release/v0.7.0 HEAD |
+| Schema version (v0.7.1 release HEAD) | **v57** (sqlite) / **v57** (postgres) — `CURRENT_SCHEMA_VERSION = 57` in `src/storage/migrations.rs` and `src/store/postgres.rs`. Ladder: v15→v19 (v0.6.3.1) → v20 (v0.6.4 audit log) → v22 (v0.7.0 RC) → v29 (recursive-learning Task 1/8) → v30 (L1-1) → v33 (L2 wave `memory_links.relation` CHECK) → v34 (V-4 closeout #698) → v35-v48 (provenance / DLQ / archive carry-forward) → v49 (archived_memories full column carry, #1025) → v50 (per-namespace K8 quota dimension extension, #1156) → v51 (federation_nonces persistence, #1255 / PR #1296) → v52 (`transcript_line_dedup` table backing #1389 L1+L2+L4 layered-capture architecture — composite `(host_pubkey_b64, line_sha256)` key + `memory_id` FK into `memories(id)`) → v53 (scope `memories_au` FTS5 sync trigger to `(title, content, tags)` only — R5.F5.2 / #1418) → v54 (tier-default expiry backfill on legacy NULL-expiry mid/short rows — #1466) → v55 (federation-catchup `updated_at` index — sargable rewrite of `list_memories_updated_since` + sqlite `idx_memories_updated_at`; postgres no new index because `memories_updated_at_idx` DESC already serves it — #1476) → v56 (composite list/archive ordering indexes `idx_memories_list_order` / `idx_memories_ns_list_order` / `idx_archived_ns_archived_at`, paired with the sargable `storage::list` rewrite — #1579 A2+B6d; postgres `migrate_v56()` is a version-stamp no-op) → v57 (postgres stored generated `tsv` tsvector column + `memories_tsv_gin` GIN index, paired with the search/recall/contradiction query rewrite to match AND rank on the precomputed column instead of re-computing the tsvector per matched row — #1579 B2; sqlite version-stamp no-op). Lockstep enforced by `tests/postgres_schema_parity.rs::schema_versions_match_across_adapters`; test-side SSOT via `ai_memory::storage::current_schema_version_for_tests()` per #1311. | release/v0.7.1 HEAD |
 
 > **Doc-vs-substrate qualifier.** Schema versions can advance ahead of this document during in-flight work; the doc is updated at every layer §22 gate.
 
@@ -349,7 +349,7 @@ CI guard: `bench --baseline performance/baseline.json` fails any PR that exceeds
 - **74 MCP tools at `--profile full`** (count pinned by `Profile::full().expected_tool_count()` in `src/profile.rs`; the callable/bootstrap split is whatever that constant declares, plus the always-on `memory_capabilities`). 7 at `--profile core`.
 - **89 production HTTP route registrations** / 75 unique URL paths.
 - **82 CLI subcommands** under `--features sal`/`sal-postgres`; 80 in default build (the 2-variant gap is `Migrate` + `SchemaInit`, both `#[cfg(feature = "sal")]`; grown to 80/82 via #1598 `Reembed`; pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=80` / `EXPECTED_CLI_SUBCOMMANDS_SAL=82` + `tests/cli_subcommand_count_invariant.rs`).
-- **25 hook lifecycle events** (20 baseline + 5 v0.7.0 additions: `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`, `OnCompactionRollback` per `src/hooks/events.rs::HookEvent`).
+- **25 hook lifecycle events** (17 baseline + 3 transcript-capture additions `PreArchive`/`PreTranscriptStore`/`PostTranscriptStore` + 5 reflection/compaction additions `PreRecallExpand`/`PreReflect`/`PostReflect`/`PreCompaction`/`OnCompactionRollback` — per `src/hooks/events.rs::HookEvent`; 17+3+5=25).
 - **7 Agent Skills tools** (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`) — **load-bearing for §2.4 (improvable across model generations)**.
 - **4 feature tiers:** keyword · semantic · smart · autonomous.
 - **3 memory tiers:** short (6 h) · mid (7 d) · long (permanent).
@@ -401,7 +401,11 @@ A six-agent parallel audit of v0.6.3 produced 22 distinct findings. Categorized 
 
 ### 10.3 Capabilities-JSON theater (closed at v0.6.3.1 Capabilities v2, all entries now honest)
 
-Original entries (`memory_reflection`, `permissions.mode`, `approval.default_timeout_seconds`, `approval.subscribers`, `hooks.by_event`, `rule_summary`, `compaction.enabled`, `transcripts.enabled`) — all addressed; v3 envelope at v0.7.0 reports live state.
+Original entries (`memory_reflection`, `permissions.mode`, `approval.default_timeout_seconds`, `approval.subscribers`, `hooks.by_event`, `rule_summary`, `compaction.enabled`, `transcripts.enabled`) — all addressed. The v3 envelope's **v2-era dynamic blocks** (permissions, approval, hooks, rule_summary, compaction, transcripts) report live runtime state; its **v3 L3-5 capability blocks** (e.g. `curator_mode`, forensic) are compile-time presence anchors that can diverge from runtime availability on a default (non-sal) build — see §10.3.1.
+
+#### 10.3.1 v3 capability-block honesty (v0.7.1 audit follow-up)
+
+The v3 L3-5 blocks report compile-time-static presence, so on the default `sqlite-bundled` build three surfaces over-report: `curator_mode` advertises reflection though `curator --reflect` hard-bails ([#1672](https://github.com/alphaonedev/ai-memory-mcp/issues/1672)); the `verify_link`/`find_paths` HTTP routes return 501 ([#1673](https://github.com/alphaonedev/ai-memory-mcp/issues/1673)); and `db_schema_version` returns 0 ([#1674](https://github.com/alphaonedev/ai-memory-mcp/issues/1674)). The MCP/CLI surfaces of those ops work on default sqlite. Tracked for v0.8.0 capability-gating fixes; closes the §10.3 honesty discipline forward to the v3 block families.
 
 ### 10.4 Substantive gaps and bugs — status at v0.7.0
 
@@ -488,6 +492,7 @@ L4 is the architecturally clean removal of the entire problem class: hosts volun
 **Explicitly NOT v0.7.1 — deferred to v0.8.0 (§11.4):**
 - **SAL capability-bit honesty (#302 item 6)** — `SqliteStore::capabilities()` does not advertise `TRANSACTIONS` / `ATOMIC_MULTI_WRITE` even though `reflect`/`consolidate` are internally atomic (single-connection `BEGIN IMMEDIATE … COMMIT`), because the SAL trait exposes no `begin_transaction()` handle yet — `src/store/sqlite.rs:63-72`. Re-add the bits once a real transaction handle is wired through the mutex-guarded `rusqlite::Connection`. Strengthens §2.5 (attested — honest capability envelope; the v0.6.3.1 Capabilities-v2 honesty discipline, §10.3).
 - **Unsigned-write / permissive-default attestation hardening** — [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464) (the two claimed-by-design edges from §9.7).
+- **Default-build (non-sal) surface honesty** — on the default `sqlite-bundled` build the `curator_mode` capability over-reports ([#1672](https://github.com/alphaonedev/ai-memory-mcp/issues/1672)), the `verify_link`/`find_paths` HTTP routes 501 ([#1673](https://github.com/alphaonedev/ai-memory-mcp/issues/1673)), and `db_schema_version` returns 0 ([#1674](https://github.com/alphaonedev/ai-memory-mcp/issues/1674)); the MCP/CLI surfaces of those ops work on default sqlite. See §10.3.1. Strengthens §2.5.
 - **R4 standalone `curator` daemon** — §11.4 Pillar 2.5.
 
 ### 11.4 v0.8.0 — Distributed Coordination Substrate — Q4 2026
@@ -583,7 +588,7 @@ MCP tools (5): `memory_routine_create`, `memory_routine_freeze`, `memory_routine
 
 #### Pillar 2.5 — Compaction Pipeline
 
-**Strengthens §2.4 (improvable) + §2.3 (stoppable via Stage-6 rollback).** Six-stage with verify+rollback (dedupe → cluster → eligibility → summarize → persist → verify). Bounded compaction subagent. New hook events `pre_compaction` and `on_compaction_rollback` (already shipped in v0.7.0 layer-1 work). Cosine clustering primary; Jaccard pre-filter. Size-pressure GC. **R4 — `ai-memory curator` standalone daemon CLI.** Effort: ~5 sessions.
+**Strengthens §2.4 (improvable) + §2.3 (stoppable via Stage-6 rollback).** Six-stage with verify+rollback ([#664](https://github.com/alphaonedev/ai-memory-mcp/issues/664)) (dedupe → cluster → eligibility → summarize → persist → verify). Bounded compaction subagent. New hook events `pre_compaction` and `on_compaction_rollback` (already shipped in v0.7.0 layer-1 work). Cosine clustering primary; Jaccard pre-filter. Size-pressure GC. **R4 — `ai-memory curator` standalone daemon CLI.** Effort: ~5 sessions.
 
 #### Pillar 3 — CRDTs
 
@@ -715,6 +720,17 @@ v0.7.0 grand-slam ships 25 lifecycle events. v0.8.0 adds 10 events for coordinat
 | `pre_checkpoint_create` | Before checkpoint write | Allow / Deny |
 | `post_checkpoint_resolve` | After checkpoint resolved | Notify only |
 | `pre_routine_run` | Before routine instantiation | Allow / Modify(parameters) / Deny |
+
+#### v0.8.0 carried-forward hardening deferrals (v0.7.1-audit-homed)
+
+Surfaced by the v0.7.1 adversarial audit as real deferrals that previously lacked a roadmap home; landed here so none is silently dropped:
+
+- **Outbound TLS server-cert pinning** (`--peer-fingerprint`) for federation push/pull beyond the mTLS allowlist — [#1678](https://github.com/alphaonedev/ai-memory-mcp/issues/1678). Composes with the §11.6 E2E-encryption line. Strengthens §2.5 + §2.1.
+- **At-rest signing-keypair persistence/rotation** hardening — [#1679](https://github.com/alphaonedev/ai-memory-mcp/issues/1679). Strengthens §2.5.
+- **Legacy v0.6.x flat config-field removal** ([#1175](https://github.com/alphaonedev/ai-memory-mcp/issues/1175)) + retirement of the `source='claude'` back-compat allowlist arm.
+- **Deprecated `crate::db` alias removal** — the `pub use storage as db` shim retires at v0.8.0.
+- **Receiver-side accept/reject share workflow** — the inbound half of the #1095 share primitive.
+- **Reflection max-depth literal-`3` consolidation** — single named const for the advertised cap + governance default ([#1680](https://github.com/alphaonedev/ai-memory-mcp/issues/1680)).
 
 #### Schema migration — v57 → vN
 
@@ -848,7 +864,7 @@ All prior-roadmap commitments either shipped, are scheduled, are cut, or are tra
 | `budget_tokens` parameter | 1d | ✅ shipped v0.6.3.1 |
 | Hierarchy-aware recall | 1d | ✅ shipped |
 | `memory_graph_query` (multi-hop) | 2 | ✅ shipped as `memory_kg_query` |
-| `memory_find_paths` | 2 | ✅ shipped v0.7 Bucket 2 |
+| `memory_find_paths` | 2 | ✅ shipped v0.7 Bucket 2 (MCP+CLI on default sqlite; HTTP route sal-gated — 501 on default build, [#1673](https://github.com/alphaonedev/ai-memory-mcp/issues/1673)) |
 | Auto link inference (R3) | 2 | ✅ shipped v0.7 Bucket 0 (`post_store` hook) |
 | Temporal reasoning | 2 | ✅ shipped |
 | CRDT-lite merge rules, vector clock | 3a | 🔜 v0.8 Pillar 3 |
