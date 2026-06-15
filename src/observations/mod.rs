@@ -342,7 +342,17 @@ pub fn try_mark_consumed_from_params(
         return;
     };
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    if let Err(e) = mark_consumed(conn, &recall_id, &refs, consumed_by) {
+    // #1705 — the citing agent (this store/link request's `agent_id`) gates
+    // the flip via [`mark_consumed_guarded`]: a row only flips when its
+    // stamped `agent_id` is NULL (legacy / unbound) or equals this agent,
+    // so a replayed `recall_id` cited by a different agent cannot pump
+    // another agent's consumed signal.
+    let consuming_agent = params
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Err(e) = mark_consumed_guarded(conn, &recall_id, &refs, consumed_by, consuming_agent) {
         tracing::warn!(
             target: "observations",
             recall_id = %recall_id,
@@ -609,5 +619,61 @@ mod tests {
         // Consumed=false ⇒ the remaining two.
         let only_pending = list_observations(&conn, None, Some(false), None, None, 10).unwrap();
         assert_eq!(only_pending.len(), 2);
+    }
+
+    #[test]
+    fn guarded_consume_rejects_cross_agent_replay() {
+        // #1705 — record with an identity, then prove the guard: a
+        // different agent citing the recall_id flips nothing; the owning
+        // agent flips the row.
+        let conn = fresh();
+        seed_memory(&conn, "m1");
+        seed_memory(&conn, "consumer");
+        record_recall_with_identity(
+            &conn,
+            "r1",
+            &[Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            }],
+            Some("alice"),
+            Some("ns/a"),
+        )
+        .unwrap();
+
+        // Wrong agent → rejected (0 flipped), row stays unconsumed.
+        let replay = mark_consumed_guarded(&conn, "r1", &["m1"], "consumer", Some("bob")).unwrap();
+        assert_eq!(replay, 0, "cross-agent replay rejected");
+        assert_eq!(
+            list_observations(&conn, Some("r1"), Some(true), None, None, 10)
+                .unwrap()
+                .len(),
+            0,
+            "no consumed row after a rejected replay"
+        );
+
+        // Owning agent → flips.
+        let ok = mark_consumed_guarded(&conn, "r1", &["m1"], "consumer", Some("alice")).unwrap();
+        assert_eq!(ok, 1, "owning agent flips the row");
+
+        // Unbound (NULL agent_id) rows flip for any caller.
+        record_recall_with_identity(
+            &conn,
+            "r2",
+            &[Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.8,
+            }],
+            None,
+            None,
+        )
+        .unwrap();
+        let unbound =
+            mark_consumed_guarded(&conn, "r2", &["m1"], "consumer", Some("anyone")).unwrap();
+        assert_eq!(unbound, 1, "NULL-agent (unbound) row flips for any caller");
     }
 }

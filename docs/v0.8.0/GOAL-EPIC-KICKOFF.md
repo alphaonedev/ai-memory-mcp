@@ -36,7 +36,7 @@ v0.8.0 **expands** the substrate's reach from single-agent + small-swarm into **
 
 ## 2. Codegraph-first mandate (operator directive — applies to the ENTIRE initiative)
 
-- **The codegraph index MUST be current before any planning/impact query.** It was re-synced 2026-06-15 (`codegraph sync .` → 31 files / 4,140 nodes). Re-run `codegraph sync .` after any batch of edits; the file-watcher debounces ~500 ms but a cold session must sync first. Verify with `codegraph status`.
+- **The codegraph index MUST be kept current and leveraged throughout the EPIC (standing operator directive 2026-06-15).** Per-iteration loop discipline: run `codegraph sync .` (incremental) **after each unit's edits and before the next unit's structural queries**, and `codegraph status` to verify. It was re-synced 2026-06-15 (`codegraph sync .` → 31 files / 4,140 nodes). A cold session must sync first (pass `projectPath: /home/fate_two/v07/v07-f5` to codegraph tools — the MCP server may launch outside the workspace).
 - **Use codegraph as the L1 structural tool for every change**: `codegraph_explore` (one call returns verbatim source grouped by file — Read-equivalent, the primary tool), `codegraph_search` (locate a symbol), `codegraph_callers`/`codegraph_callees`/`codegraph_impact` (blast radius before editing handler/SAL/trait surface). Do NOT re-verify codegraph hits with grep.
 - **C8 safeguard:** after any task touching handler/SAL/trait code, run `scripts/qc-codegraph-precheck.sh` (HARD-BLOCK on new `CallerContext::for_agent("…")` / `for_admin` literals outside the allowlist, dangling callers, missing `headers: HeaderMap`).
 - Complementary tools: rust-analyzer LSP (exact symbol uses), ai-memory `memory_recall` (what prior sessions learned).
