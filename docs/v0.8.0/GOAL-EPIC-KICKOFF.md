@@ -56,7 +56,7 @@ A 7-agent codegraph assessment (2026-06-15) found the §11.4 effort framing wron
 | vLLM (§11.4.C) net-new transport | **Already reachable** via `openai-compatible` (`llm.rs:676`). | +5 is serving-infra/docs/attest-tie-in, NOT plumbing. Reconcile #1677. |
 | #1680, #1685 open | **Already fixed** (`reranker.rs:369`; `mcp/mod.rs:2786`). #1672 also closed. | Verify-and-close; correct ROADMAP §24 doc-drift. |
 
-**Honest effort: ~88–98 sessions** (58.5 core + 22–28 §22 PE + 4–8 §5 decorrelation + 3–4 hardening), not 58.5. The cutline (§7) is a real release-shaping tool.
+**Honest effort: ~60–70 sessions** (58.5 core + 4–8 §5 decorrelation + 3–4 hardening). **Correction (operator audit, 2026-06-15):** the §22 Policy-Engine "audit-trail closeout" is NOT a v0.8.0 work-stream — epic **#697 is CLOSED** (2026-05-18, `171cc7543`, via `src/governance/audit.rs`); the Policy Engine itself shipped at v0.7.0 (Option B PE-1/2/3) and was MCP-hardened at v0.7.1 (#1583/#1685). The earlier "~88–98 / +22–28 §22" figure was based on the **stale ROADMAP §22 text** (it still lists V08-PE-1..8 against the closed #697 — a doc-drift defect to fix). Only a handful of OPTIONAL micro-hardening edge-cases remain (Phase 6 below), all cutline-deferrable. The cutline (§7) is a real release-shaping tool.
 
 ---
 
@@ -107,7 +107,7 @@ For each Pillar-1 primitive (signals, checkpoints, routines, actions) and each n
 
 **PHASE 5 — Capture follow-ons.** **#1390** SDK shims → **#1391** IDE coverage → **#1393** decision-detector (needs vLLM).
 
-**PHASE 6 — §22 Policy-Engine closeout** (epic **#697**). PE-1 `--enforce` / PE-5 escalation / PE-8 `verify-audit-trail` CLI **[all PROTECTED]**; PE-2 `AgentAction::Read` gating; PE-4 persistent queue; PE-3 eBPF **[defer-8.1]**; PE-6/PE-7 **[defer-9]**. Close the Bash/Custom egress-sink gap + SEC-2/#1686 secure-default composition.
+**PHASE 6 — Policy-Engine OPTIONAL residual hardening** (NOT a committed work-stream; the engine + its audit-trail closeout #697 are DONE). The §22 V08-PE-1..8 list in the ROADMAP is stale (points at the closed #697). Only these edge-cases remain unbuilt, none tracked by an open issue, all cutline-deferrable — **re-file individually IF the operator wants them**, do not assume them in-scope: `--enforce` mandatory-hook profile (V08-PE-1); `AgentAction::Read` gating (V08-PE-2 — no `Read` variant today); persistent/crash-durable audit queue (V08-PE-4); `ai-memory verify-audit-trail` CLI alias over the already-shipped `verify_chain` (V08-PE-8, low-effort); eBPF subprocess gate [defer-8.1]; TPM/refuse-default [defer-9]. **First task: reconcile the stale ROADMAP §22 to mark #697 closed.**
 
 **PHASE 7 — §5 decorrelation enforcement** (COMMITTED; depends on Phase 3). N≥3 multi-reflector quorum at consolidation-time (primary) + empirical probes (secondary); **#1464** federation-receive per-write attestation; #1171 panel adjudicates the mechanism; strategic record #1698/#1704. **Carry a sizing placeholder — ROADMAP leaves this unsized.**
 
