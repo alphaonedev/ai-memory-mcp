@@ -3288,6 +3288,126 @@ pub(crate) fn install_governance_pre_write_hook(
     }
 }
 
+/// #1685 — shared installer for the wire-action egress gate
+/// ([`crate::governance::wire_check::GOVERNANCE_PRE_ACTION`]) so BOTH the HTTP
+/// daemon (`serve`) and the MCP stdio loop (`run_mcp_server`) install the SAME
+/// closure. Before this, only `serve` installed it, leaving the `skill_export`
+/// (FilesystemWrite) and LLM (NetworkRequest) egress sinks fail-OPEN on the MCP
+/// surface — the primary NHI interface. Process-wide `OnceLock`, so a second
+/// install (in-process serve+mcp) is a logged no-op. Mirrors
+/// [`install_governance_pre_write_hook`]; the gate covers the agent-EXTERNAL
+/// variants that have an egress sink today (FilesystemWrite/NetworkRequest/
+/// ProcessSpawn; Bash + Custom have none yet — v0.8 #1695).
+pub(crate) fn install_governance_pre_action_hook(
+    db_path: &Path,
+    deferred_audit_queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    rule_cache: &Arc<crate::governance::rule_cache::RuleCache>,
+    hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+) {
+    use crate::governance::agent_action::{
+        AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
+    };
+    let rules_db_path = db_path.to_path_buf();
+    let cache_for_wire_check = Arc::clone(rule_cache);
+    let queue_for_wire_check = deferred_audit_queue.clone();
+    let conn_for_wire_check = hook_consultation_conn;
+    let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
+        move |action: &AgentAction| -> std::result::Result<(), String> {
+            let Some(conn_arc) = conn_for_wire_check.as_ref() else {
+                // #1455 — FAIL-CLOSED when the consultation connection is
+                // unavailable; a daemon-internal wire action is higher-stakes
+                // than a storage write, so degrading to ALLOW would be the
+                // worst place to fail open.
+                return governance_consultation_unavailable(
+                    &queue_for_wire_check,
+                    WIRE_ACTION_ACTOR,
+                    action,
+                    &rules_db_path,
+                    "wire_check",
+                );
+            };
+            let conn_guard = match conn_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "wire_check: consultation connection mutex poisoned; \
+                         recovering inner connection and continuing"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let conn_for_check: &rusqlite::Connection = &conn_guard;
+            match check_agent_action_deferred_cached(
+                conn_for_check,
+                Some(&cache_for_wire_check),
+                WIRE_ACTION_ACTOR,
+                action,
+                &queue_for_wire_check,
+            ) {
+                Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                    tracing::info!(
+                        "wire_check refused action kind={} rule_id={} reason={} \
+                         (chain-logged via deferred audit queue)",
+                        action.kind(),
+                        rule_id,
+                        reason,
+                    );
+                    Err(reason)
+                }
+                Err(e) => {
+                    // #1054 — same fail-CLOSED posture as the storage hook;
+                    // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
+                    let reason = format!("governance:consultation_failed: {e}");
+                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let synthetic_refusal = RuleDecision::Refuse {
+                        rule_id: "governance:consultation_failed".to_string(),
+                        reason: reason.clone(),
+                    };
+                    queue_for_wire_check.submit_refusal(
+                        WIRE_ACTION_ACTOR,
+                        action,
+                        &synthetic_refusal,
+                    );
+                    if fail_open {
+                        tracing::warn!(
+                            "wire_check: rule consultation failed: {}; \
+                             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                             degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
+                            e,
+                            action.kind(),
+                        );
+                        Ok(())
+                    } else {
+                        tracing::warn!(
+                            "wire_check: rule consultation failed: {}; failing CLOSED \
+                             for this action ({}) (post-#1054 secure default — set \
+                             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                            e,
+                            action.kind(),
+                        );
+                        Err(reason)
+                    }
+                }
+            }
+        },
+    ));
+    if install_result.is_err() {
+        tracing::debug!(
+            "wire_check pre-action hook already installed (process-wide OnceLock); \
+             the existing hook remains active for this daemon"
+        );
+    } else {
+        tracing::info!(
+            "wire_check pre-action hook installed (agent-action gate active for \
+             FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom \
+             have no egress sink yet — structural coverage tracked v0.8 #1695)"
+        );
+    }
+}
+
 /// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
 /// where a governance hook's rule-consultation connection could not be
 /// opened at install time. Chain-logs a synthetic
@@ -3628,125 +3748,14 @@ pub async fn bootstrap_serve(
     // hooks, LLM, skill_export) where there is no per-request agent
     // identity bound to the action; the storage hook's
     // `substrate:pre_write_hook` fallback uses the same shape.
-    {
-        use crate::governance::agent_action::{
-            AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
-        };
-        let rules_db_path = db_path.to_path_buf();
-        let cache_for_wire_check = Arc::clone(&rule_cache);
-        let queue_for_wire_check = deferred_audit_queue.clone();
-        // v0.7.0 #1017 — share the same long-lived consultation
-        // connection introduced above. Hook installs are serial so
-        // there's no race on the Arc clone.
-        let conn_for_wire_check = hook_consultation_conn.clone();
-        let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
-            move |action: &AgentAction| -> std::result::Result<(), String> {
-                let Some(conn_arc) = conn_for_wire_check.as_ref() else {
-                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the
-                    // consultation connection is unavailable, mirroring
-                    // the storage hook above. A daemon-internal wire
-                    // action (federation push, hooks spawn, LLM call,
-                    // skill_export filesystem write) is HIGHER-stakes
-                    // than a storage write, so degrading to ALLOW on a
-                    // missing rules DB would be the worst place to fail
-                    // open. Same secure default + escape hatch.
-                    return governance_consultation_unavailable(
-                        &queue_for_wire_check,
-                        WIRE_ACTION_ACTOR,
-                        action,
-                        &rules_db_path,
-                        "wire_check",
-                    );
-                };
-                let conn_guard = match conn_arc.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "wire_check: consultation connection mutex poisoned; \
-                             recovering inner connection and continuing"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let conn_for_check: &rusqlite::Connection = &conn_guard;
-                match check_agent_action_deferred_cached(
-                    conn_for_check,
-                    Some(&cache_for_wire_check),
-                    WIRE_ACTION_ACTOR,
-                    action,
-                    &queue_for_wire_check,
-                ) {
-                    Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
-                    Ok(RuleDecision::Refuse { rule_id, reason }) => {
-                        tracing::info!(
-                            "wire_check refused action kind={} rule_id={} reason={} \
-                             (chain-logged via deferred audit queue)",
-                            action.kind(),
-                            rule_id,
-                            reason,
-                        );
-                        Err(reason)
-                    }
-                    Err(e) => {
-                        // v0.7.0 #1054 (Agent-2 #4) — same fail-CLOSED
-                        // posture as the storage hook above. Wire-check
-                        // refusals for daemon-internal actions
-                        // (federation push, hooks spawn, LLM call,
-                        // skill_export) are higher-stakes than storage
-                        // refusals — fail-open here would let a
-                        // consultation race smuggle a refused
-                        // network/filesystem/process action through
-                        // the gate. Same env-var escape hatch:
-                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
-                        let reason = format!("governance:consultation_failed: {e}");
-                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        let synthetic_refusal = RuleDecision::Refuse {
-                            rule_id: "governance:consultation_failed".to_string(),
-                            reason: reason.clone(),
-                        };
-                        queue_for_wire_check.submit_refusal(
-                            WIRE_ACTION_ACTOR,
-                            action,
-                            &synthetic_refusal,
-                        );
-                        if fail_open {
-                            tracing::warn!(
-                                "wire_check: rule consultation failed: {}; \
-                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
-                                 degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
-                                e,
-                                action.kind(),
-                            );
-                            Ok(())
-                        } else {
-                            tracing::warn!(
-                                "wire_check: rule consultation failed: {}; failing CLOSED \
-                                 for this action ({}) (post-#1054 secure default — set \
-                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
-                                e,
-                                action.kind(),
-                            );
-                            Err(reason)
-                        }
-                    }
-                }
-            },
-        ));
-        if install_result.is_err() {
-            tracing::debug!(
-                "wire_check pre-action hook already installed (process-wide OnceLock); \
-                 the existing hook remains active for this daemon"
-            );
-        } else {
-            tracing::info!(
-                "wire_check pre-action hook installed (agent-action gate active for \
-                 FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom \
-                 have no egress sink yet — structural coverage tracked v0.8 #1695)"
-            );
-        }
-    }
+    // #1685 — wire-action egress gate, via the shared installer (also called
+    // by run_mcp_server, so the MCP surface is no longer fail-open).
+    install_governance_pre_action_hook(
+        db_path,
+        &deferred_audit_queue,
+        &rule_cache,
+        hook_consultation_conn.clone(),
+    );
 
     // Issue #219: build the embedder + HNSW index up front so HTTP write
     // paths can populate them. Previously the daemon never constructed an

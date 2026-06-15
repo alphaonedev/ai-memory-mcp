@@ -2776,6 +2776,17 @@ pub fn run_mcp_server(
         db_path,
         &mcp_governance_queue,
         &mcp_rule_cache,
+        mcp_hook_conn.clone(),
+    );
+    // #1685 — also install the wire-action egress gate on the MCP surface.
+    // Previously ONLY `serve` (HTTP) installed GOVERNANCE_PRE_ACTION, so the
+    // skill_export (FilesystemWrite) + LLM (NetworkRequest) egress sinks
+    // fail-OPEN under `ai-memory mcp` — the primary NHI interface. Same shared
+    // installer + the same long-lived consultation connection.
+    crate::daemon_runtime::install_governance_pre_action_hook(
+        db_path,
+        &mcp_governance_queue,
+        &mcp_rule_cache,
         mcp_hook_conn,
     );
 
