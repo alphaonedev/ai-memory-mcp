@@ -10962,26 +10962,63 @@ impl MemoryStore for PostgresStore {
         if crate::confidence::decay::decay_enabled() {
             #[allow(clippy::cast_precision_loss)]
             let secs_per_day = crate::SECS_PER_DAY as f64;
-            let result = sqlx::query(
-                "UPDATE memories SET
-                    confidence = LEAST(GREATEST(
-                        confidence * POWER(2.0, -(
-                            GREATEST(EXTRACT(EPOCH FROM
-                                (NOW() - COALESCE(confidence_decayed_at::timestamptz,
-                                                  created_at))), 0.0)
-                            / $2) / $3),
-                        0.0), 1.0),
-                    confidence_source = $4,
-                    confidence_decayed_at = $5
-                 WHERE id = ANY($1)",
-            )
-            .bind(ids)
-            .bind(secs_per_day)
-            .bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
-            .bind(crate::models::ConfidenceSource::Decayed.as_str())
-            .bind(Utc::now().to_rfc3339())
-            .execute(&self.pool)
-            .await;
+            let now_stamp = Utc::now().to_rfc3339();
+            let source = crate::models::ConfidenceSource::Decayed.as_str();
+            // n15 — when per-namespace half-life overrides are configured,
+            // the divisor becomes a `CASE namespace ... ELSE default END`
+            // so the postgres bulk path applies the SAME per-namespace
+            // half-life the sqlite per-id path does (no backend drift).
+            // The common case (no overrides) keeps the original simple
+            // single-half-life UPDATE. QueryBuilder makes the dynamic
+            // CASE injection-safe (every namespace + half-life is a bind).
+            let result = if let Some(overrides) =
+                crate::confidence::decay::namespace_half_life_overrides()
+            {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "UPDATE memories SET confidence = LEAST(GREATEST(confidence * POWER(2.0, -(\
+                     GREATEST(EXTRACT(EPOCH FROM (NOW() - COALESCE(confidence_decayed_at::timestamptz, \
+                     created_at))), 0.0) / ",
+                );
+                qb.push_bind(secs_per_day);
+                qb.push(") / (CASE namespace");
+                for (ns, hl) in overrides {
+                    qb.push(" WHEN ");
+                    qb.push_bind(ns.clone());
+                    qb.push(" THEN ");
+                    qb.push_bind(*hl);
+                }
+                qb.push(" ELSE ");
+                qb.push_bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS);
+                qb.push(" END))), 0.0), 1.0), confidence_source = ");
+                qb.push_bind(source);
+                qb.push(", confidence_decayed_at = ");
+                qb.push_bind(now_stamp.clone());
+                qb.push(" WHERE id = ANY(");
+                qb.push_bind(ids);
+                qb.push(")");
+                qb.build().execute(&self.pool).await
+            } else {
+                sqlx::query(
+                    "UPDATE memories SET
+                        confidence = LEAST(GREATEST(
+                            confidence * POWER(2.0, -(
+                                GREATEST(EXTRACT(EPOCH FROM
+                                    (NOW() - COALESCE(confidence_decayed_at::timestamptz,
+                                                      created_at))), 0.0)
+                                / $2) / $3),
+                            0.0), 1.0),
+                        confidence_source = $4,
+                        confidence_decayed_at = $5
+                     WHERE id = ANY($1)",
+                )
+                .bind(ids)
+                .bind(secs_per_day)
+                .bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+                .bind(source)
+                .bind(now_stamp)
+                .execute(&self.pool)
+                .await
+            };
             if let Err(e) = result {
                 tracing::warn!(
                     target: TRACE_TARGET,

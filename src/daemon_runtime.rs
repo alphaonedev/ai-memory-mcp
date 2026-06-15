@@ -849,6 +849,14 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // (serve / mcp / CLI) applies it. Idempotent — first writer wins,
     // same as the mmap seeding above.
     crate::reranker::set_rerank_max_seq(app_config.resolve_reranker().max_seq_tokens);
+    // n15 — seed the process-wide per-namespace confidence-decay
+    // half-life overrides from `[curator.confidence_decay_half_life_days]`.
+    // `apply_decay_touch` (the recall-time decay updater on any subcommand
+    // path) resolves the per-namespace half-life through this global.
+    // Idempotent — first writer wins, same as the seeding above.
+    crate::confidence::decay::set_namespace_half_life_overrides(
+        app_config.confidence_decay_half_life_overrides(),
+    );
     // #1590 — seed the process-wide operator-configured default
     // namespace (Some ONLY when `[storage].default_namespace` — or the
     // legacy flat field — was explicitly set). Every write surface
