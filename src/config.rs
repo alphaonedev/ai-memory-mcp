@@ -6108,6 +6108,7 @@ impl AppConfig {
             "llm",
             config_keys::SECTION_EMBEDDINGS,
             "reranker",
+            "curator",
             "storage",
             "limits",
         ];
@@ -8483,6 +8484,7 @@ legacy_scoring = false
             "llm",
             "embeddings",
             "reranker",
+            "curator",
             "storage",
             "limits",
         ];
