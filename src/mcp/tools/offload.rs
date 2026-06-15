@@ -54,6 +54,35 @@ pub fn handle_offload(
     let namespace = resolve_namespace(params);
     let ttl_seconds = params.get(param_names::TTL_SECONDS).and_then(Value::as_u64);
 
+    // #1690 — pure-MCP (`ai-memory mcp`) deployments never run the
+    // serve-only background offload TTL sweep
+    // (`background::offload_ttl_sweep` is wired into `bootstrap_serve`
+    // only), so a TTL'd blob written over stdio MCP would otherwise never
+    // be reaped. Opportunistically reap expired blobs on each offload
+    // write: connection-local (the MCP loop owns a plain synchronous
+    // `rusqlite::Connection` with no tokio runtime to spawn a background
+    // task), bounded by `MAX_PER_RUN`, and self-cleaning — every new
+    // offload sheds the rows that expired since the last one, so the
+    // table can never grow unbounded on a write-active MCP DB. No
+    // inter-delete sleep is needed (the stdio loop is single-threaded, no
+    // concurrent writer to yield to). Best-effort: a sweep error must NOT
+    // fail the offload write.
+    let now_unix = chrono::Utc::now().timestamp();
+    match crate::offload::sweep_expired(
+        conn,
+        now_unix,
+        crate::background::offload_ttl_sweep::MAX_PER_RUN,
+        std::time::Duration::ZERO,
+    ) {
+        Ok(0) => {}
+        Ok(n) => {
+            tracing::debug!("memory_offload: opportunistic TTL sweep reaped {n} expired blob(s)");
+        }
+        Err(e) => {
+            tracing::warn!("memory_offload: opportunistic TTL sweep failed (non-fatal): {e}");
+        }
+    }
+
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
         .offload(content, &namespace, ttl_seconds, agent_id)
@@ -227,6 +256,57 @@ mod tests {
         let conn = fresh_conn();
         let err = handle_deref(&conn, &json!({}), "ai:alice").unwrap_err();
         assert!(err.contains("ref_id"));
+    }
+
+    #[test]
+    fn issue_1690_offload_opportunistically_reaps_expired_blobs() {
+        // #1690 — pure-MCP deployments have no background sweep, so
+        // handle_offload must reap expired blobs on write or the table
+        // grows unbounded. Seed an ALREADY-EXPIRED row directly
+        // (stored_at far in the past + a tiny ttl), then a fresh offload
+        // must delete it while landing the new blob.
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO offloaded_blobs
+                (ref_id, namespace, content_zstd, content_sha256,
+                 stored_at, ttl_seconds, agent_id, signature_b64)
+             VALUES ('stale-ref', 'mcp/test', X'00', 'deadbeef', 1000, 60, 'ai:alice', '')",
+            [],
+        )
+        .expect("seed expired blob");
+        // Sanity: the expired row is present before the next offload.
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM offloaded_blobs WHERE ref_id = 'stale-ref'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1);
+
+        let off = handle_offload(
+            &conn,
+            &json!({"content": "fresh blob", "namespace": "mcp/test"}),
+            "ai:alice",
+        )
+        .expect("offload");
+        let new_ref = off["ref_id"].as_str().expect("ref_id").to_string();
+
+        // The expired blob was reaped by the opportunistic sweep …
+        let stale_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM offloaded_blobs WHERE ref_id = 'stale-ref'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_left, 0,
+            "#1690: expired blob must be reaped on offload write"
+        );
+        // … and the new blob landed and is still deref-able.
+        let back = handle_deref(&conn, &json!({"ref_id": new_ref}), "ai:alice").expect("deref");
+        assert_eq!(back["content"].as_str(), Some("fresh blob"));
     }
 
     #[test]

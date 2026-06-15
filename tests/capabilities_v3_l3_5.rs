@@ -78,7 +78,13 @@ fn cap_v3_l3_5_response_carries_reflection_block() {
         ai_memory::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP
     );
     assert_eq!(r["attestation"], "Ed25519");
+    // #1672 — curator_mode is honest about the sal feature gate: `curator
+    // --reflect` is sal-gated, so a non-`sal` build reports
+    // "requires_sal_feature" rather than the misleading "implemented".
+    #[cfg(feature = "sal")]
     assert_eq!(r["curator_mode"], "implemented");
+    #[cfg(not(feature = "sal"))]
+    assert_eq!(r["curator_mode"], "requires_sal_feature");
 }
 
 #[test]
@@ -227,7 +233,11 @@ fn cap_v3_l3_5_reflection_struct_anchors_real_constants() {
         ai_memory::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP
     );
     assert_eq!(r.attestation, "Ed25519");
+    // #1672 — honest per the sal feature gate (see the JSON-shape test above).
+    #[cfg(feature = "sal")]
     assert_eq!(r.curator_mode, "implemented");
+    #[cfg(not(feature = "sal"))]
+    assert_eq!(r.curator_mode, "requires_sal_feature");
 }
 
 #[test]

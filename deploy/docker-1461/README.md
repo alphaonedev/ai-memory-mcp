@@ -93,7 +93,7 @@ CA and per-peer keys are minted once and reused on re-runs for stable trust.
 | 10   | `10_build.sh`       | build PG/AGE/pgvector + `ai-memory` daemon images (`sal,sal-postgres`)       |
 | 40   | `40_tls.sh`         | campaign CA + per-peer server/client leaf certs + mTLS allowlist fan-out     |
 | 45   | `45_zero_touch.sh`  | mint campaign CA + per-peer credential; export trust bundle; wire peer-enrollment env (O(1) trust) |
-| 50   | `50_up.sh`          | `docker compose up`; PG schema-init (v55); start the quorum mesh; health-gate|
+| 50   | `50_up.sh`          | `docker compose up`; PG schema-init (v57); start the quorum mesh; health-gate|
 
 > **Step 45 (zero-touch first-party trust)** is the application-identity layer
 > that sits *inside* the mTLS transport (step 40). It mints a campaign CA, issues
@@ -105,7 +105,7 @@ CA and per-peer keys are minted once and reused on re-runs for stable trust.
 
 ## What "reproducible" means here
 
-- **Pinned artifacts** (`provision/lib.sh`): version `0.7.0`, schema `v55`,
+- **Pinned artifacts** (`provision/lib.sh`): version `0.7.0`, schema `v57`,
   `EMBED_DIM=768`, `apache/age:release_PG18_1.7.0` bumped to PostgreSQL `18.4`
   (pinned `PG_APT_VERSION`) + pgvector (pinned `PGVECTOR_APT_VERSION`),
   embedder/LLM model ids,
@@ -139,7 +139,7 @@ status}`) + a human PASS/FAIL table on stdout; exit `0` iff every check is green
 Checks: binary `--version` + container `docker-health` + single-instance (every
 peer, in-container via `docker exec`); `/api/v1/health` (`status`, `version`,
 `embedder_ready`, `federation_enabled`), `storage_backend == postgres`,
-`db_schema_version == 55` (every peer, over mTLS); and a fleet
+`db_schema_version == 57` (every peer, over mTLS); and a fleet
 **federation-convergence** probe that writes a collective-scope marker to peer-1
 and reads it back by id on peer-2 over the encrypted path.
 

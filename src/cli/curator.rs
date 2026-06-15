@@ -514,13 +514,15 @@ async fn run_reflect(
     let llm = build_curator_llm(feature_tier);
 
     // Single-namespace invocations bypass the per-namespace `enabled`
-    // gate (operator explicitly asked). `--all-namespaces` defers to
-    // the gate predicate, which conservatively returns `false` for
-    // every namespace until the per-namespace config-file wiring
-    // lands (v0.7.1). Operators who want to fan out today can script
-    // a loop of `--namespace <each>` invocations.
+    // gate (operator explicitly asked). #1671 — `--all-namespaces` now
+    // consults the per-namespace `[curator.reflection_namespaces]`
+    // config: a namespace participates only when it carries
+    // `enabled = true`. Absent / disabled namespaces are skipped, so the
+    // fan-out is opt-in (and `--all-namespaces` is no longer an inert
+    // no-op once the operator enables namespaces in config).
     let scope_single = args.namespace.is_some();
-    let enabled_check = |_ns: &str| -> bool { scope_single };
+    let enabled_check =
+        |ns: &str| -> bool { scope_single || app_config.reflection_namespace_enabled(ns) };
 
     let report = run_reflection_pass_with_optional_llm(
         store.as_ref(),

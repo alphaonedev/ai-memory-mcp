@@ -2776,6 +2776,17 @@ pub fn run_mcp_server(
         db_path,
         &mcp_governance_queue,
         &mcp_rule_cache,
+        mcp_hook_conn.clone(),
+    );
+    // #1685 — also install the wire-action egress gate on the MCP surface.
+    // Previously ONLY `serve` (HTTP) installed GOVERNANCE_PRE_ACTION, so the
+    // skill_export (FilesystemWrite) + LLM (NetworkRequest) egress sinks
+    // fail-OPEN under `ai-memory mcp` — the primary NHI interface. Same shared
+    // installer + the same long-lived consultation connection.
+    crate::daemon_runtime::install_governance_pre_action_hook(
+        db_path,
+        &mcp_governance_queue,
+        &mcp_rule_cache,
         mcp_hook_conn,
     );
 
@@ -3021,7 +3032,14 @@ pub fn run_mcp_server(
         } else {
             eprintln!("ai-memory: using lexical cross-encoder fallback");
         }
-        Some(BatchedReranker::new(ce))
+        // #1691/n14 — apply the operator-configured score floor
+        // (env > [reranker].score_floor > Off) instead of the hardcoded
+        // Off the bare `new` constructor used; this is what makes the
+        // with_score_floor capability reachable on the MCP recall path.
+        Some(BatchedReranker::with_score_floor(
+            ce,
+            app_config.resolve_reranker_score_floor(),
+        ))
     } else {
         None
     };
@@ -13071,6 +13089,34 @@ mod tests {
         assert!(core_entry.callable_now);
         let non_core = tools.iter().find(|t| t.family != "core").unwrap();
         assert!(!non_core.callable_now);
+    }
+
+    #[test]
+    fn issue_1673_n13_unknown_caller_does_not_falsely_deny_callable_now() {
+        // #1673/n13 — with an active allowlist but NO resolved caller agent_id
+        // (the HTTP capabilities surface passes None), callable_now must follow
+        // `loaded` rather than collapsing to a misleading per-agent deny via
+        // the empty-aid wildcard path.
+        use crate::config::McpConfig;
+        use crate::mcp::build_capabilities_tools;
+        use crate::profile::Profile;
+        use std::collections::HashMap;
+        let mut allowlist = HashMap::new();
+        allowlist.insert("alice".to_string(), vec!["core".to_string()]);
+        let cfg = McpConfig {
+            allowlist: Some(allowlist),
+            ..McpConfig::default()
+        };
+        let tools = build_capabilities_tools(&Profile::full(), Some(&cfg), None);
+        // Every LOADED tool reports callable_now (honest "loaded" view for an
+        // unknown caller) — not a false deny.
+        for t in tools.iter().filter(|t| t.loaded) {
+            assert!(
+                t.callable_now,
+                "loaded tool {} must be callable_now for an unknown caller",
+                t.name
+            );
+        }
     }
 
     /// build_agent_permitted_families — empty allowlist table returns

@@ -219,7 +219,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <div class="stat"><div class="n">9</div><div class="l">Federated peers</div></div>
       <div class="stat"><div class="n">W=2</div><div class="l">Sync quorum + eventual convergence</div></div>
       <div class="stat"><div class="n">3</div><div class="l">Encryption legs</div></div>
-      <div class="stat"><div class="n">v55</div><div class="l">Schema (lockstep)</div></div>
+      <div class="stat"><div class="n">v57</div><div class="l">Schema (lockstep)</div></div>
     </div>
   </div>
 </section>
@@ -634,7 +634,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <table class="matrix">
       <thead><tr><th>#</th><th>NSA recommendation</th><th>Observable live-hive test</th><th>Result</th></tr></thead>
       <tbody>
-        <tr><td class="id">a</td><td>Choose supported MCP projects</td><td>live <code>/api/v1/health</code> reports pinned version 0.7.0 + schema 55 on every node</td><td class="res">PASS — /api/v1/health reports pinned version 0.7.0 + schema 55 on every node</td></tr>
+        <tr><td class="id">a</td><td>Choose supported MCP projects</td><td>live <code>/api/v1/health</code> reports pinned version 0.7.0 + schema 57 on every node</td><td class="res">PASS — /api/v1/health reports pinned version 0.7.0 + schema 57 on every node</td></tr>
         <tr><td class="id">b</td><td>Design for boundaries</td><td>namespace isolation + per-region VPC substrate boundary + fail-CLOSED defaults verified live</td><td class="res">PASS — namespace isolation + per-region VPC substrate boundary + fail-CLOSED defaults verified live</td></tr>
         <tr><td class="id">c</td><td>Validate parameters</td><td>malformed / out-of-range write rejected with typed validation error</td><td class="res">PASS — malformed / out-of-range write rejected with typed RequestValidator error</td></tr>
         <tr><td class="id">d</td><td>Constrain &amp; sandbox tool execution</td><td>Form-7 governance gate live (R001–R004 enabled); permissions=enforce</td><td class="res">PASS — governance gate live (permissions=enforce, attestation required, fail-closed) on every MCP write path</td></tr>
@@ -716,13 +716,13 @@ make down                              <span class="cm"># tear it all down</span
       <div class="card">
         <div class="lbl">Pinned stack</div>
         <h3 style="font-family:var(--font-mono)">single-source constants</h3>
-        <p>PostgreSQL <code>18.4-1.pgdg24.04+1</code> · Apache AGE <code>1.7.0</code> · pgvector <code>0.8.2</code> · schema <code>v55</code> · golden binary <code>sha256</code>-asserted · <code>nomic-embed-text</code> 768-dim CPU embedder. Installed natively — no Docker anywhere on the fleet.</p>
+        <p>PostgreSQL <code>18.4-1.pgdg24.04+1</code> · Apache AGE <code>1.7.0</code> · pgvector <code>0.8.2</code> · schema <code>v57</code> · golden binary <code>sha256</code>-asserted · <code>nomic-embed-text</code> 768-dim CPU embedder. Installed natively — no Docker anywhere on the fleet.</p>
       </div>
     </div>
 
     <div class="warn-box">
       <strong>What "reproducible" means here</strong>
-      Pinned artifacts (golden binary <code>sha256</code> / version <code>0.7.0</code> / schema <code>v55</code> / pinned pgdg <code>.deb</code>s / pinned Ollama release) are single-source named constants in <code>provision/lib.sh</code>, overridable by env for forks. The seed corpus is pinned by <code>sha256</code> in <code>CORPUS_MANIFEST.json</code>; every tunable knob is a named constant, not a magic literal. The campaign CA + per-node keys are generated once and reused on re-runs for stable trust. <code>make validate</code> exercises the live fleet over the real TLS+mTLS path and emits a JSON + tabular report under <code>.local-runs/do-1461/reports/</code>; the committed baseline artifact set is the attested Atlas Corpus baseline under <code>deploy/do-1461/atlas/results/</code>. Reference: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/deploy/do-1461/README.md">deploy/do-1461/README.md</a>.
+      Pinned artifacts (golden binary <code>sha256</code> / version <code>0.7.0</code> / schema <code>v57</code> / pinned pgdg <code>.deb</code>s / pinned Ollama release) are single-source named constants in <code>provision/lib.sh</code>, overridable by env for forks. The seed corpus is pinned by <code>sha256</code> in <code>CORPUS_MANIFEST.json</code>; every tunable knob is a named constant, not a magic literal. The campaign CA + per-node keys are generated once and reused on re-runs for stable trust. <code>make validate</code> exercises the live fleet over the real TLS+mTLS path and emits a JSON + tabular report under <code>.local-runs/do-1461/reports/</code>; the committed baseline artifact set is the attested Atlas Corpus baseline under <code>deploy/do-1461/atlas/results/</code>. Reference: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/deploy/do-1461/README.md">deploy/do-1461/README.md</a>.
     </div>
 
     <div class="warn-box">

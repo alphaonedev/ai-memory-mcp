@@ -33,6 +33,47 @@ pub fn decay_enabled() -> bool {
     std::env::var(ENV_DECAY).is_ok_and(|v| v == "1")
 }
 
+/// n15 — process-global per-namespace confidence-decay half-life
+/// overrides (days), seeded once at boot from
+/// `[curator.confidence_decay_half_life_days]`
+/// (`AppConfig::confidence_decay_half_life_overrides`). `apply_decay_touch`
+/// is a `&Connection`-bound free fn with no `AppConfig` in scope, so the
+/// override is resolved through this global rather than threaded through
+/// every recall-touch caller — the same boot-seeded-global pattern as
+/// `crate::reranker::set_rerank_max_seq` and the quota defaults.
+static NAMESPACE_HALF_LIFE: std::sync::OnceLock<std::collections::HashMap<String, f64>> =
+    std::sync::OnceLock::new();
+
+/// n15 — seed the per-namespace half-life overrides once at boot.
+/// First-writer-wins (`OnceLock`); a re-seed is silently ignored.
+pub fn set_namespace_half_life_overrides(overrides: std::collections::HashMap<String, f64>) {
+    let _ = NAMESPACE_HALF_LIFE.set(overrides);
+}
+
+/// n15 — borrow the boot-seeded per-namespace half-life overrides when
+/// any were configured (and non-empty). The sqlite per-id decay path
+/// uses [`half_life_for_namespace`]; the postgres bulk-decay path uses
+/// this to build a per-namespace `CASE` so both backends apply the same
+/// override. `None` (the common case) → both backends use the compiled
+/// default and the simple single-half-life path.
+#[must_use]
+pub fn namespace_half_life_overrides() -> Option<&'static std::collections::HashMap<String, f64>> {
+    NAMESPACE_HALF_LIFE.get().filter(|m| !m.is_empty())
+}
+
+/// n15 — resolve the half-life (days) for `namespace`: the boot-seeded
+/// override when present + finite + `> 0`, else
+/// [`crate::confidence::DEFAULT_HALF_LIFE_DAYS`].
+#[must_use]
+pub fn half_life_for_namespace(namespace: &str) -> f64 {
+    NAMESPACE_HALF_LIFE
+        .get()
+        .and_then(|m| m.get(namespace))
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+}
+
 /// Compute a decayed confidence value.
 ///
 /// `base` is the stored value; `age_days` is the time elapsed since
@@ -58,10 +99,11 @@ pub fn decayed(base: f64, age_days: f64, half_life_days: f64) -> f64 {
 
 /// Substrate-side decay touch fired from `touch_after_recall` when
 /// `AI_MEMORY_CONFIDENCE_DECAY=1`. Reads the row's current
-/// `confidence`, `created_at`, and `confidence_decayed_at`, computes
-/// the decayed value via [`decayed`] using
-/// [`crate::confidence::DEFAULT_HALF_LIFE_DAYS`] (per-namespace
-/// half-life override is a future-Cluster knob), and writes back the
+/// `confidence`, `created_at`, `confidence_decayed_at`, and
+/// `namespace`, computes the decayed value via [`decayed`] using the
+/// per-namespace half-life resolved by [`half_life_for_namespace`]
+/// (n15 — `[curator.confidence_decay_half_life_days]` override >
+/// [`crate::confidence::DEFAULT_HALF_LIFE_DAYS`]), and writes back the
 /// new value, the `'decayed'` source marker, and a fresh
 /// `confidence_decayed_at` timestamp.
 ///
@@ -80,15 +122,18 @@ pub fn apply_decay_touch(conn: &Connection, id: &str) -> rusqlite::Result<bool> 
     // anchor is `confidence_decayed_at` when present (subsequent
     // decays compute from the last decay timestamp, not creation),
     // falling back to `created_at` for first-touch rows.
-    let row: Option<(f64, String, Option<String>)> = conn
+    // n15 — read `namespace` too so the per-namespace half-life override
+    // (boot-seeded from `[curator.confidence_decay_half_life_days]`) can
+    // be resolved per row instead of always using the compiled default.
+    let row: Option<(f64, String, Option<String>, String)> = conn
         .query_row(
-            "SELECT confidence, created_at, confidence_decayed_at
+            "SELECT confidence, created_at, confidence_decayed_at, namespace
              FROM memories WHERE id = ?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .ok();
-    let Some((current_confidence, created_at, decayed_at)) = row else {
+    let Some((current_confidence, created_at, decayed_at, namespace)) = row else {
         return Ok(false);
     };
 
@@ -98,10 +143,11 @@ pub fn apply_decay_touch(conn: &Connection, id: &str) -> rusqlite::Result<bool> 
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or(now);
     let age_days = (now - anchor).num_seconds() as f64 / crate::SECS_PER_DAY as f64;
+    // n15 — per-namespace half-life override > compiled default.
     let new_value = decayed(
         current_confidence,
         age_days,
-        crate::confidence::DEFAULT_HALF_LIFE_DAYS,
+        half_life_for_namespace(&namespace),
     );
     let stamp = now.to_rfc3339();
     // v0.7.0 #1036 (Agent-3 #7) — intentionally non-version-bumping
@@ -155,6 +201,17 @@ mod tests {
     #[test]
     fn negative_age_treated_as_zero() {
         assert!((decayed(0.7, -5.0, 30.0) - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn n15_half_life_for_unseeded_namespace_is_default() {
+        // n15 — a namespace with no seeded override resolves to the
+        // compiled default. Uses a sentinel namespace no other test
+        // seeds, so the assertion is order-independent against the
+        // process-global OnceLock (the seed→read value logic is covered
+        // deterministically by the AppConfig resolver tests).
+        let hl = half_life_for_namespace("__n15_definitely_unseeded_namespace__");
+        assert!((hl - crate::confidence::DEFAULT_HALF_LIFE_DAYS).abs() < f64::EPSILON);
     }
 
     #[test]

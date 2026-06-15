@@ -264,7 +264,7 @@ All three interfaces share the same storage layer (`src/storage/`) and validatio
 - **MCP stdio (`src/mcp/mod.rs::run_mcp_server`)** uses a plain `rusqlite::Connection` — no `Arc`, no `Mutex`. The stdio loop is a length-capped `read_until(b'\n')` reader (post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was `for line in stdin.lock().lines()`) — synchronous, single-threaded by JSON-RPC stdio protocol design (one request in, one response out), so concurrent dispatch is impossible at the protocol level and a mutex would be useless. The audit invariant is pinned by three tests in `src/mcp/mod.rs::tests::issue_965_audit_*`. The Wave-1 codebase-analysis claim that MCP serialises on `Arc<Mutex<Connection>>` (issue #842 Tier-B5 / #965) was factually incorrect; #965 closed with audit evidence rather than a no-op pool refactor.
 - **CLI** opens its own `rusqlite::Connection` per command invocation — no sharing at all.
 
-The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
+The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path. **MCP stdio is structurally sqlite-only (#1675/n24):** `--store-url` is wired on `serve` (HTTP) and `curator` only — `ai-memory mcp` always opens a local rusqlite `Connection`, so the SAL abstraction's postgres path is reachable via the HTTP surface (or an MCP-over-HTTP proxy), not the stdio MCP loop. Postgres-backed deployments serve MCP clients through the HTTP daemon, not `ai-memory mcp`.
 
 ### Key Modules
 
@@ -454,6 +454,7 @@ script (Docker / Plan C deployments).
 | 74 | `AI_MEMORY_EMBED_MODEL` | string | unset (falls through to `[embeddings].model` > legacy `embedding_model` > compiled `nomic-embed-text-v1.5`) | CLI/daemon/MCP (embedder init + `doctor` + `reembed`) | config | **[#1598, v0.7.x]** Embedding model id passed verbatim to the embed endpoint (e.g. `google/gemini-embedding-2` on openrouter, `nomic-embed-text` on ollama). Legacy aliases (`nomic_embed_v15`, `mini_lm_l6_v2`) are canonicalised. The vector dim resolves from `crate::config::KNOWN_EMBEDDING_DIMS`; models outside the table need `[embeddings].dim`. Source: `crate::config::ENV_EMBED_MODEL`. |
 | 75 | `AI_MEMORY_EMBED_API_KEY` | string | unset | CLI/daemon/MCP (embedder init + `doctor` + `reembed`) | **secret** | **[#1598, v0.7.x]** Bearer auth secret for API embedding backends — the embeddings sibling of `AI_MEMORY_LLM_API_KEY` (#33) and the highest-precedence layer of the embed API-key ladder: this env > per-vendor alias env (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, … per `src/llm.rs::alias_api_key_env_vars`) > `[embeddings].api_key_env` > `[embeddings].api_key_file` (mode 0400 enforced). Inline `[embeddings].api_key = "<literal>"` is REJECTED at parse time (mirrors `[llm].api_key`). Not needed for `ollama` / keyless self-hosted endpoints. Never echoed. Source: `crate::config::ENV_EMBED_API_KEY`. |
 | 76 | `AI_MEMORY_RERANK_MAX_SEQ` | usize (1-512) | `256` (`RERANK_MAX_SEQ_DEFAULT`) | CLI/daemon/MCP (autonomous-tier recall) | config | **[#1604, v0.7.x]** Tokenized-length cap for **rerank** inputs (the #1597 batched cross-encoder forward in `src/reranker.rs::neural_score_pairs`), tighter than the model-architecture ceiling `CROSS_ENCODER_MAX_SEQ = 512` that other cross-encoder consumers keep. The #1588 dogfood re-run measured warm autonomous recall at ~4.0 s on a long-content corpus vs ~0.5 s on short rows — the [20, 512] candle CPU forward was the cost; BERT attention is O(n²) in sequence length, so the 256 default cuts the forward ~4×. Resolves through `AppConfig::resolve_reranker()` (env > `[reranker].max_seq_tokens` > compiled default) and is seeded process-wide at boot via `crate::reranker::set_rerank_max_seq`. Zero / unparseable / above-ceiling values fall through. Source: `crate::config::ENV_RERANK_MAX_SEQ`. |
+| 77 | `AI_MEMORY_RERANK_SCORE_FLOOR` | enum-string | `off` (`RerankerScoreFloor::Off`) | CLI/daemon/MCP (autonomous-tier recall) | config | **[#1691/n14, v0.7.x]** Recall-reranker score floor — drops low-confidence rerank candidates so noise-band paraphrase matches do not surface (the #1319 calibration knob, finally operator-reachable). Value grammar (case-insensitive): `off` \| `absolute:<f>` (drop below an absolute blended score) \| `relative:<f>` / `relative_to_top:<f>` (drop below `top_score * f`); the numeric is clamped to `[0.0, 1.0]` at apply time. Resolves through `AppConfig::resolve_reranker_score_floor()` (env > `[reranker].score_floor` > compiled default `Off`) and is fed to `BatchedReranker::with_score_floor` at BOTH the `serve` (HTTP recall, #1691) and `mcp` reranker build sites, closing the dead-config gap where `with_score_floor` was never reachable. Unparseable values fall through layer by layer. Source: `crate::config::ENV_RERANK_SCORE_FLOOR` + `crate::reranker::RerankerScoreFloor::parse`. |
 | — | `RUST_LOG` | tracing filter | unset (= `info`) | all | config | Standard `tracing-subscriber` filter (e.g. `RUST_LOG=ai_memory=debug`). Not an `AI_MEMORY_*` var — listed for completeness. **Post-#1562 (2026-06-09):** the postgres SAL adapter emits under the literal targets `store::postgres` / `store::postgres::kg` (and `schema-init` under `schema_init`), so an `ai_memory=debug` filter does NOT match those events — add `store::postgres=debug` explicitly. |
 
 **Regression tests.** Precedence + secret-classification invariants
@@ -533,6 +534,20 @@ model   = "ms-marco-MiniLM-L-6-v2"
 max_seq_tokens = 256   # #1604 rerank input-sequence cap; 1..=512 (model
                        # ceiling), compiled default 256. Env override:
                        # AI_MEMORY_RERANK_MAX_SEQ.
+
+[curator]
+# #1671/n15 (v0.7.1) — per-namespace curator config.
+# `curator --reflect --all-namespaces` reflects ONLY namespaces listed
+# here with enabled = true (a single `--namespace <ns>` bypasses the
+# gate). Without this, --all-namespaces was an inert no-op.
+[curator.reflection_namespaces."team/eng"]
+enabled   = true
+max_depth = 5                        # optional per-ns reflection-depth cap
+# Per-namespace confidence-decay half-life override, days (n15). Absent
+# → DEFAULT_HALF_LIFE_DAYS (30). Only consulted when decay is enabled
+# (AI_MEMORY_CONFIDENCE_DECAY=1). Honoured on BOTH sqlite + postgres.
+[curator.confidence_decay_half_life_days]
+"team/eng" = 14.0
 
 [storage]
 default_namespace = "alphaone"

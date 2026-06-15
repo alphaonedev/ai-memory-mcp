@@ -1,0 +1,319 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  Release v0.7.1 — the hardening patch over v0.7.0 `attested-cortex`.
+  A 26-task adversarial-audit EPIC (#1683) closing crash/data-loss,
+  atomicity, knowledge-graph-correctness, governance, recall-quality and
+  capability-honesty gaps, validated on a live DigitalOcean PostgreSQL 18
+  + Apache AGE + pgvector agent-to-agent federation run.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Release v0.7.1 — hardening patch | ai-memory</title>
+<meta name="description" content="ai-memory v0.7.1 is the hardening patch over v0.7.0 (attested-cortex): a 26-task adversarial-audit EPIC (#1683) fixing a critical HNSW NaN recall crash, federation catch-up row-loss, persona/synthesis atomicity, knowledge-graph invalidated-edge filtering on both the CTE and Apache AGE paths, GC/offload/nonce-cache growth, the HTTP recall cross-encoder reranker, per-namespace curator config, and capability honesty — validated on a live DigitalOcean PostgreSQL 18 + Apache AGE + pgvector agent-to-agent federation run. Schema unchanged at v57; 74 MCP tools / 89 routes / 80-82 CLI; all gates green.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/release-v0.7.1.html">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#2ea043;--warn:#ffb86b;--bad:#f85149;--prog:#c8a2ff;--accent:#6ee7ff;--green:#2ea043;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1200px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}a:hover{filter:brightness(1.2)}
+code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
+pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:1rem;overflow-x:auto;margin:1rem 0}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em;color:#fff}
+h1{font-size:clamp(2.2rem,5vw,3.6rem);line-height:1.05;letter-spacing:-0.04em;margin-bottom:1rem}
+h2{font-size:1.85rem;margin-bottom:.6rem;margin-top:0}
+h3{font-size:1.15rem;margin-bottom:.5rem}
+p{color:var(--text-muted);margin-bottom:1rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.hero{padding:6rem 1.5rem 4rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%),radial-gradient(ellipse at bottom,rgba(200,162,255,0.06),transparent 70%);border-bottom:1px solid var(--border)}
+.hero .badge{display:inline-block;padding:.4rem 1rem;background:rgba(46,160,67,0.1);border:1px solid var(--good);color:var(--good);border-radius:999px;font-family:var(--font-mono);font-size:.85rem;margin-bottom:1.5rem}
+.hero .subtitle{font-size:1.2rem;color:var(--text-muted);max-width:780px;margin:0 auto 2rem}
+.hero .meta{display:flex;justify-content:center;gap:2rem;color:var(--text-dim);font-family:var(--font-mono);font-size:.85rem;flex-wrap:wrap}
+section{padding:5rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.75rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:1rem;padding:.25rem .65rem;border:1px solid var(--border-hl);border-radius:999px}
+.lede{color:var(--text-muted);font-size:1.05rem;max-width:820px;margin-bottom:2rem}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1.25rem}
+.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.25rem}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;position:relative}
+.card.cyan{border-top:3px solid var(--p1)}
+.card.amber{border-top:3px solid var(--p2)}
+.card.violet{border-top:3px solid var(--p3)}
+.card.green{border-top:3px solid var(--good)}
+.card.red{border-top:3px solid var(--bad)}
+.card h3{margin-bottom:.65rem}
+.card p{font-size:.92rem;color:var(--text-muted);margin-bottom:.75rem}
+.card .tag{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;color:var(--text-muted);text-transform:uppercase;margin-bottom:.5rem;display:block}
+.numstat{text-align:center;padding:1rem}
+.numstat .num{font-size:2.2rem;font-weight:800;color:var(--p1);display:block;line-height:1.1}
+.numstat .label{font-size:.78rem;color:var(--text-muted);display:block;margin-top:.25rem}
+table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.92rem}
+th,td{text-align:left;padding:.65rem .85rem;border-bottom:1px solid var(--border);color:var(--text-muted)}
+th{color:#fff;font-weight:600;background:var(--bg-elev);font-size:.85rem}
+tr:hover{background:rgba(110,231,255,0.03)}
+ul.checked{list-style:none;padding-left:0}
+ul.checked li{padding-left:1.5rem;position:relative;margin:.35rem 0;color:var(--text-muted);font-size:.92rem}
+ul.checked li::before{content:"✓";position:absolute;left:0;color:var(--good);font-weight:800}
+.cta-row{display:flex;gap:1rem;flex-wrap:wrap;justify-content:center;margin-top:2rem}
+.cta-row a{padding:.7rem 1.25rem;border-radius:10px;font-weight:600;font-size:.92rem;border:1px solid var(--p1);color:var(--p1)}
+.cta-row a.solid{background:var(--good);color:#000;border-color:var(--good)}
+.cta-row a.amber{border-color:var(--p2);color:var(--p2)}
+.cta-row a.violet{border-color:var(--p3);color:var(--p3)}
+.callout{border-left:3px solid var(--p2);background:rgba(255,184,107,0.06);padding:1rem 1.25rem;border-radius:0 10px 10px 0;margin:1.25rem 0}
+.callout .clabel{display:block;font-family:var(--font-mono);font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--p2);margin-bottom:.4rem;font-weight:700}
+.callout p{font-size:.92rem;color:var(--text-muted);margin-bottom:.5rem}
+.callout p:last-child{margin-bottom:0}
+.status{display:inline-block;font-family:var(--font-mono);font-size:.78rem;padding:.1rem .5rem;border-radius:999px;letter-spacing:.04em}
+.status.ok{color:var(--good);border:1px solid var(--good)}
+footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer a{color:var(--text-dim)}
+footer a:hover{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a class="home-link" href="index.html">ai-memory&trade;</a>
+    <div class="right">
+      <a href="index.html">Home</a>
+      <a href="architectures.html">Tiers T1&rarr;T5</a>
+      <a href="release-v0.7.1.html" class="active">v0.7.1</a>
+      <a href="whats-new-v07.html">v0.7.0</a>
+      <a href="v0.7/compatibility-matrix.html" style="color:#c8a2ff">Compat matrix</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <span class="badge">v0.7.1 &middot; attested-cortex &middot; hardening patch</span>
+    <h1>Hardened.<br>Postgres&middot;AGE A2A-validated.</h1>
+    <p class="subtitle">
+      v0.7.1 is the hardening patch line over v0.7.0 (<code>attested-cortex</code>). A
+      26-task, adversarial-audit-driven EPIC (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1683">#1683</a>)
+      closes a <strong>critical recall crash</strong>, federation catch-up row-loss, persona &amp;
+      synthesis <strong>atomicity</strong> gaps, knowledge-graph invalidated-edge correctness on
+      both the CTE <em>and</em> Apache AGE paths, unbounded GC/offload/nonce-cache growth, and
+      recall-quality &amp; capability-honesty gaps &mdash; then proved it on a live
+      <strong>DigitalOcean PostgreSQL&nbsp;18 + Apache&nbsp;AGE + pgvector agent-to-agent
+      federation</strong> run.
+    </p>
+    <div class="meta">
+      <span>26-task EPIC #1683</span>
+      <span>schema v57 (unchanged)</span>
+      <span>PG18 + AGE + pgvector A2A ✓</span>
+      <span>5613 + 6034 tests / 0 failed</span>
+    </div>
+    <div class="cta-row">
+      <a class="solid" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">📋 Full changelog</a>
+      <a class="amber" href="https://github.com/alphaonedev/ai-memory-mcp/issues/1683">📐 EPIC #1683</a>
+      <a class="violet" href="whats-new-v07.html">📖 v0.7.0 features</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/INSTALL.md">⬇ Install</a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">What v0.7.1 is</span>
+    <h2>A patch you can trust the substrate under load.</h2>
+    <p class="lede">
+      v0.7.0 made the substrate articulate and cryptographically attested. v0.7.1 makes it
+      <strong>not break under you</strong>: every fix below was found by a full-spectrum codegraph
+      + ai-memory NHI audit (31 confirmed findings, zero fabricated citations) or by exercising
+      the real PostgreSQL&nbsp;+&nbsp;Apache&nbsp;AGE backend on live DigitalOcean droplets. No
+      net-new feature surface, no schema migration &mdash; this is hardening. The advertised
+      surface is identical to v0.7.0's: <strong>74</strong> MCP tools at <code>--profile full</code>,
+      <strong>89</strong> production HTTP route registrations (<strong>75</strong> unique paths),
+      <strong>80</strong> CLI subcommands (<strong>82</strong> under <code>--features sal</code>),
+      schema <strong>v57</strong>.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">The hardening</span>
+    <h2>What changed.</h2>
+    <div class="grid-3" style="margin-top:1.5rem">
+      <div class="card red">
+        <span class="tag">crash / data-loss</span>
+        <h3>No more recall panic</h3>
+        <p><strong>#1684 (critical):</strong> a <code>NaN</code>/non-finite HNSW cosine distance hit
+        <code>partial_cmp().unwrap()</code> and panicked the MCP/HTTP process mid-recall. Distances now
+        floor to <code>f32::MAX</code> and sorts use <code>total_cmp</code>.</p>
+        <p><strong>#1687:</strong> federation catch-up advances its watermark only on a successful,
+        non-halted apply &mdash; a transient error no longer silently skips a row.</p>
+        <p><strong>#1692:</strong> the HNSW semantic branch detects vector-dimension mismatch and skips
+        (counting) instead of scoring across incompatible spaces.</p>
+      </div>
+      <div class="card cyan">
+        <span class="tag">atomicity</span>
+        <h3>All-or-nothing writes</h3>
+        <p><strong>#1688:</strong> persona generation (insert + links + metadata) is now transactional.</p>
+        <p><strong>#1700:</strong> the online <code>memory_store</code> synthesis apply (N updates + N
+        deletes + insert) is wrapped in a transaction with deferred vector-index ops &mdash; a
+        mid-sequence failure can no longer leave a partially-merged cluster.</p>
+      </div>
+      <div class="card violet">
+        <span class="tag">knowledge graph</span>
+        <h3>Retracted edges stay retracted</h3>
+        <p><strong>#1689:</strong> current-view traversals exclude invalidated edges on the postgres
+        <code>find_paths</code> CTE <em>and</em> the Apache&nbsp;AGE <code>kg_query</code> /
+        <code>find_paths</code> Cypher paths &mdash; a retracted link no longer influences results,
+        matching the sqlite default. Verified by a live-AGE semantic test.</p>
+      </div>
+      <div class="card green">
+        <span class="tag">bounded growth</span>
+        <h3>GC actually runs</h3>
+        <p><strong>#1690:</strong> the <code>offloaded_blobs</code> TTL sweep and
+        <code>recall_observations</code> pruner are wired into <code>serve</code>; pure-MCP deployments
+        reap expired offload blobs on write; and the <code>federation_nonce_cache</code> disk mirror is
+        pruned on eviction + bounded on hydration &mdash; closing an unbounded-growth class.</p>
+      </div>
+      <div class="card amber">
+        <span class="tag">governance</span>
+        <h3>Gates that don't have holes</h3>
+        <p><strong>#1685:</strong> the <code>GOVERNANCE_PRE_ACTION</code> agent-action gate installs on
+        the MCP surface, not just HTTP.</p>
+        <p><strong>#1686:</strong> <code>rules keygen</code> warns when it disables enabled unsigned rules.</p>
+        <p><strong>rules migrate-on-open:</strong> <code>ai-memory rules</code> now migrates a fresh db
+        on open, fixing Form-7 governance bootstrap on fresh postgres-backed peers.</p>
+      </div>
+      <div class="card cyan">
+        <span class="tag">recall quality</span>
+        <h3>Same ranking on every transport</h3>
+        <p><strong>#1691:</strong> HTTP recall now runs the autonomous-tier cross-encoder reranker on the
+        hybrid path (sqlite &amp; postgres), so a recall ranks identically over MCP, CLI and HTTP.</p>
+        <p><strong>n14:</strong> a new <code>[reranker].score_floor</code> /
+        <code>AI_MEMORY_RERANK_SCORE_FLOOR</code> knob wires the previously-dead score-floor calibration.</p>
+      </div>
+      <div class="card violet">
+        <span class="tag">config</span>
+        <h3>Per-namespace curator</h3>
+        <p><strong>#1671 / n15:</strong> a new <code>[curator]</code> section makes
+        <code>curator --reflect --all-namespaces</code> honor a per-namespace
+        <code>reflection_pass.enabled</code> gate (previously inert), and lets the confidence-decay sweep
+        apply a per-namespace half-life on both the sqlite and postgres paths.</p>
+      </div>
+      <div class="card green">
+        <span class="tag">honesty</span>
+        <h3>Capabilities that don't lie</h3>
+        <p><strong>#1672 / #1673 / #1674:</strong> <code>curator_mode</code> reports the SAL feature gate
+        honestly, <code>callable_now</code> is honest for an unknown caller, and the non-<code>sal</code>
+        build reports the live <code>db_schema_version</code> instead of a hardcoded <code>0</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Validated on real infrastructure</span>
+    <h2>PostgreSQL 18 + Apache AGE + pgvector, A2A federation.</h2>
+    <p class="lede">
+      v0.7.1 was provisioned to live DigitalOcean droplets &mdash; two ai-memory daemon peers federating
+      over TLS+mTLS against a shared PostgreSQL&nbsp;18.4 / Apache&nbsp;AGE&nbsp;1.7.0 / pgvector&nbsp;0.8.2
+      substrate &mdash; and exercised end-to-end. The run itself surfaced (and fixed) a real substrate bug
+      (the <code>rules</code> CLI not migrating a fresh db) and three deployment-harness defects.
+    </p>
+    <div class="grid-3" style="margin-bottom:1.5rem">
+      <div class="numstat"><span class="num">29/29</span><span class="label">baseline verification checks green</span></div>
+      <div class="numstat"><span class="num">39/41</span><span class="label">full-spectrum A2A checks green (0 fail)</span></div>
+      <div class="numstat"><span class="num">v57</span><span class="label">schema confirmed on both peers</span></div>
+    </div>
+    <div class="grid-2">
+      <div class="card green">
+        <h3>What passed</h3>
+        <ul class="checked">
+          <li><code>storage_backend=postgres</code>, <code>db_schema_version=57</code> on both peers</li>
+          <li>PG 18.4 / AGE 1.7.0 / pgvector 0.8.2, AGE graph present</li>
+          <li>federation write &rarr; convergence over TLS+mTLS</li>
+          <li>mTLS rejects rogue/absent client certs; api-key &amp; admin gating</li>
+          <li>zero-touch CA enrollment; fail-closed 401 on unenrolled peers</li>
+          <li>unsigned-write 403 (attestation gate live); replay refused; signed-events chain intact</li>
+          <li>private + namespace isolation; curator active, no crash-loop</li>
+        </ul>
+      </div>
+      <div class="card cyan">
+        <h3>Found &amp; fixed by the run</h3>
+        <p><strong>Substrate:</strong> <code>ai-memory rules</code> opened the db without migrations, so a
+        fresh db had no <code>governance_rules</code> table &mdash; breaking Form-7 governance bootstrap on
+        fresh postgres peers. Now migrates on open (with a regression test).</p>
+        <p><strong>Harness (deploy/do-1461):</strong> a <code>serve</code> unit passing both
+        <code>--db</code> and <code>--store-url</code> (mutually exclusive in v0.7.1); governance
+        provisioning ordered before the daemon/schema existed; a VPC CIDR collision. All fixed.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Release gates</span>
+    <h2>Green on both feature sets.</h2>
+    <div class="grid-3" style="margin-top:1.5rem">
+      <div class="numstat"><span class="num">5613</span><span class="label">default tests passed</span></div>
+      <div class="numstat"><span class="num">6034</span><span class="label">sal-postgres tests passed</span></div>
+      <div class="numstat"><span class="num">0</span><span class="label">failed</span></div>
+    </div>
+    <p style="text-align:center;margin-top:1rem">
+      <span class="status ok">cargo fmt --check</span>&nbsp;
+      <span class="status ok">clippy -D warnings -D pedantic (default + sal-postgres)</span>&nbsp;
+      <span class="status ok">cargo audit</span>
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Install</span>
+    <h2>Get v0.7.1.</h2>
+    <pre><code># crates.io
+cargo install ai-memory --version =0.7.1 --locked
+
+# Docker (GHCR)
+docker pull ghcr.io/alphaonedev/ai-memory:0.7.1</code></pre>
+    <p>Drop-in over v0.7.0 &mdash; no schema migration, no config changes required. The full
+    upgrade matrix lives in the
+    <a href="v0.7/compatibility-matrix.html">compatibility matrix</a>, and every change is itemized in
+    the <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">changelog</a>.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="index.html">Home</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="whats-new-v07.html">v0.7.0 features</a>
+      <a href="v0.7/compatibility-matrix.html">Compat matrix</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/INSTALL.md">Install Guide</a>
+    </div>
+    <p>
+      <strong>ai-memory&trade;</strong> v0.7.1 &mdash; AI-Agnostic MCP Memory Server &middot; hardening patch over codename <code>attested-cortex</code>
+    </p>
+    <p style="margin-top:.5rem">
+      Copyright &copy; 2026 <strong>AlphaOne LLC</strong>. ai-memory is a trademark of AlphaOne LLC (USPTO Serial No.&nbsp;99761257).
+    </p>
+    <p style="margin-top:.25rem;font-size:.78rem">
+      Licensed under the <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/LICENSE">Apache License, Version 2.0</a>.
+      Built with Rust, SQLite, FTS5, Postgres (optional Apache AGE), and Axum. Works with Claude, ChatGPT, Grok, Llama, OpenClaw 🦞, and any MCP-compatible AI.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -112,7 +112,7 @@ the host config.
 **Schema-drift detection.** From v0.6.3.1, boot also surfaces a
 `# ai-memory boot: warn` header when the DB's `schema_version` lies
 outside the binary's supported range. At v0.7.0 the canonical
-schema is **v55** (verified via `CURRENT_SCHEMA_VERSION` in
+schema is **v57** (verified via `CURRENT_SCHEMA_VERSION` in
 `src/storage/migrations.rs`); the ladder runs v33 → v55 with 21
 in-process migrations applied on first daemon start. An agent or
 human running an older `ai-memory` binary against a newer DB (or
@@ -131,7 +131,7 @@ no black-box behaviour:
 ```text
 # ai-memory boot: ok
 #   version:    0.7.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v55, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=v57, 161 memories)
 #   tier:       autonomous (embedder=nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=xai:grok-4.3)
 #   latency:    12ms
 #   namespace:  ai-memory-mcp (loaded 10 memories)
@@ -252,10 +252,14 @@ proposed actions dispatch as Claude Code normally would.
 
 Claude Code's [`PreToolUse`](https://docs.claude.com/en/docs/claude-code/hooks)
 hook surface (`type=mcp_tool`) lets the harness invoke an MCP tool
-before every tool dispatch and gate on the response. The ai-memory hook
-calls `memory_check_agent_action` with a JSON-RPC payload of the
-proposed action (kind=`bash` for the Bash tool, kind=`filesystem_write`
-for Edit / Write, etc.) and honours the returned `decision`:
+before a matching tool dispatch and gate on the response. The installer
+scopes the managed entry with `matcher: "Bash|Edit|Write"` — the
+agent-external action surface the rule engine models (the Claude Code
+`matcher` is a regex over the tool name, so `Edit` also covers
+`MultiEdit` / `NotebookEdit`). The ai-memory hook calls
+`memory_check_agent_action` with a JSON-RPC payload of the proposed
+action (kind=`bash` for the Bash tool, kind=`filesystem_write` for
+Edit / Write) and honours the returned `decision`:
 
 | `decision` | Harness behaviour |
 |---|---|
@@ -263,9 +267,14 @@ for Edit / Write, etc.) and honours the returned `decision`:
 | `warn` | Tool dispatches normally + the warning row lands in `signed_events` (audit chain). The agent sees the `reason` in the tool's response context. |
 | `refuse` | Tool dispatch is BLOCKED. The agent sees `reason` + `rule_id` in the response context and must reroute (operator-approval workflow lives in K10, separate surface). |
 
-The `Read` tool is intentionally NOT gated — reads are non-mutating and
-don't produce external state changes. Other tools (WebFetch,
-mcp__-prefixed tools) translate as documented in
+Because the managed matcher is scoped to `Bash|Edit|Write`, the `Read`
+tool, `WebFetch`, and `mcp__`-prefixed tools are NOT gated by the managed
+entry — the harness builds no `AgentAction` (hence no `kind`) for them, so
+gating them via `matcher: "*"` only produced a spurious `kind is required`
+rejection on every such call (fixed in
+[#1667](https://github.com/alphaonedev/ai-memory-mcp/issues/1667)). An
+operator who wants to gate additional tools can widen the matcher by hand;
+the action-kind translation is documented in
 [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md).
 
 ### How to install

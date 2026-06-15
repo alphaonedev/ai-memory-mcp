@@ -592,7 +592,7 @@ pub(crate) fn extract_mentioned_entity_id(mem: &Memory) -> Option<String> {
     // Step 1: structured metadata.entity_id tag.
     if let Some(eid) = mem
         .metadata
-        .get("entity_id")
+        .get(field_names::ENTITY_ID)
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -8501,6 +8501,31 @@ fn semantic_phase(
         for (id, cosine) in hit_meta {
             let Some(mem) = fetched.get(&id) else {
                 continue;
+            };
+            // #1692 — the HNSW distance was computed by `cosine_distance` over
+            // the stored vector, which silently TRUNCATES when the query/stored
+            // dims differ (after an embedder swap): a wrong-but-finite cosine
+            // that the >0.2 gate lets through, ranking garbage while
+            // `dim_mismatch_count` stays 0. Recompute against the stored
+            // embedding with the checked comparator (the same #1584-guarded
+            // path the FTS + linear-scan branches use) and count + skip a
+            // dimension mismatch instead of trusting `hit.distance`. For a
+            // same-dim hit the checked cosine equals `1.0 - hit.distance`
+            // (both reduce to the dot product), so valid hits are unchanged.
+            let cosine = match get_embedding(conn, &id) {
+                Ok(Some(stored)) => match crate::embeddings::Embedder::cosine_similarity_checked(
+                    query_embedding,
+                    &stored,
+                ) {
+                    crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                    crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                        *dim_mismatch_count += 1;
+                        continue;
+                    }
+                },
+                // Legacy row with no stored embedding (or a fetch error): fall
+                // back to the HNSW distance-derived cosine rather than dropping.
+                _ => cosine,
             };
             if let Some(ns) = namespace {
                 if prep.hierarchy_active {

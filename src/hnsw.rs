@@ -217,7 +217,15 @@ pub struct EmbeddingPoint(pub Vec<f32>);
 #[inline]
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    1.0 - dot
+    let dist = 1.0 - dot;
+    // #1684 — a NaN/±Inf component (local seed/insert paths bypass
+    // `federation::sanitize_shipped_vector`) makes `dist` non-finite; NaN is
+    // UNORDERED under `partial_cmp`, which previously aborted the sort via
+    // `.unwrap()` on `None` and killed the single-threaded MCP process.
+    // Collapse non-finite to `f32::MAX` so a poisoned row ranks LAST instead of
+    // corrupting (or crashing) the candidate set. Mirrors the finite-or-floor
+    // defense in `Embedder::cosine_similarity` (src/embeddings.rs).
+    if dist.is_finite() { dist } else { f32::MAX }
 }
 
 impl instant_distance::Point for EmbeddingPoint {
@@ -822,7 +830,9 @@ impl VectorIndex {
                 distance: cosine_distance(&query_point.0, emb),
             });
         }
-        overflow_hits.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        // #1684 — total_cmp is total over f32 (no panic even if a NaN slips
+        // past the cosine_distance floor); deterministic ordering.
+        overflow_hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
 
         results.extend(overflow_hits);
 
@@ -830,8 +840,8 @@ impl VectorIndex {
         let mut seen = std::collections::HashSet::new();
         results.retain(|hit| seen.insert(hit.id.clone()));
 
-        // Sort by distance and truncate
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        // Sort by distance and truncate (#1684 — total_cmp, panic-free)
+        results.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         results.truncate(k);
         results
     }
@@ -1178,6 +1188,35 @@ mod tests {
         let idx = VectorIndex::empty();
         let results = idx.search(&[1.0, 0.0, 0.0], 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn issue_1684_nan_vector_does_not_panic_and_ranks_last() {
+        // Pre-#1684: a NaN distance made `partial_cmp` return `None` and
+        // `.unwrap()` panicked inside `sort_by`, aborting the single-threaded
+        // MCP process. Post-fix the poison vector ranks last and search returns.
+        let idx = VectorIndex::empty();
+        idx.insert("good".into(), make_embedding(&[1.0, 0.0, 0.0]));
+        idx.insert("poison".into(), vec![f32::NAN, 0.0, 0.0]);
+        let hits = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);
+        let good = hits.iter().position(|h| h.id == "good");
+        assert!(good.is_some(), "good vector must be returned");
+        if let Some(poison) = hits.iter().position(|h| h.id == "poison") {
+            assert!(
+                good.unwrap() < poison,
+                "non-finite-distance poison vector must rank after the good vector"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_1684_cosine_distance_non_finite_collapses_to_max() {
+        assert_eq!(cosine_distance(&[f32::NAN, 1.0], &[1.0, 1.0]), f32::MAX);
+        assert_eq!(
+            cosine_distance(&[f32::INFINITY, 0.0], &[1.0, 0.0]),
+            f32::MAX
+        );
+        assert!(cosine_distance(&[1.0, 0.0], &[1.0, 0.0]).is_finite());
     }
 
     #[test]

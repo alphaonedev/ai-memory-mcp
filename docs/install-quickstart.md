@@ -42,7 +42,7 @@ Pick the row that matches your machine. If you're not sure, the
 | **macOS / Linux** — pre-built binary (recommended) | `curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh \| sh` | Downloads the right binary for your CPU, drops it in `~/.cargo/bin` or `~/.local/bin`. No Rust toolchain needed. |
 | **macOS / Linux** — Homebrew tap | `brew install alphaonedev/tap/ai-memory` | The Homebrew tap is owned by AlphaOne. If the tap is not yet live in your region or the formula lags the latest release, fall back to the curl one-liner above or `cargo install ai-memory`. |
 | **Linux / any Unix** — cargo | `cargo install ai-memory` | Needs the Rust toolchain (`rustup`) installed first. Build takes ~2 minutes on a modern laptop. |
-| **Linux** — Docker | `docker pull ghcr.io/alphaonedev/ai-memory:0.7.0` then `docker run --rm -v ai-memory-data:/data ghcr.io/alphaonedev/ai-memory:0.7.0 --version` *(the image's entrypoint is the `ai-memory` binary — pass subcommands/flags directly)* | Zero-toolchain install. The image carries the binary and ships ready to run as a daemon. |
+| **Linux** — Docker | `docker pull ghcr.io/alphaonedev/ai-memory:0.7.1` then `docker run --rm -v ai-memory-data:/data ghcr.io/alphaonedev/ai-memory:0.7.1 --version` *(the image's entrypoint is the `ai-memory` binary — pass subcommands/flags directly)* | Zero-toolchain install. The image carries the binary and ships ready to run as a daemon. |
 | **Fedora / RHEL** — COPR | `sudo dnf copr enable alpha-one-ai/ai-memory && sudo dnf install ai-memory` | Official RPM channel. |
 | **Arch / Manjaro** — AUR | `paru -S ai-memory` *(or your AUR helper of choice)* | Community-maintained, tracking upstream. |
 | **Windows** — PowerShell (pre-built binary) | `irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 \| iex` | Drops `ai-memory.exe` into your `%USERPROFILE%\.local\bin` (or equivalent). |
@@ -275,7 +275,7 @@ client's config and restores the pre-install backup if one exists.
 | curl one-liner | `rm ~/.local/bin/ai-memory` (or wherever `which ai-memory` reports) |
 | Homebrew | `brew uninstall alphaonedev/tap/ai-memory && brew untap alphaonedev/tap` |
 | cargo | `cargo uninstall ai-memory` |
-| Docker | `docker rmi ghcr.io/alphaonedev/ai-memory:0.7.0` |
+| Docker | `docker rmi ghcr.io/alphaonedev/ai-memory:0.7.1` |
 | DNF (COPR) | `sudo dnf remove ai-memory && sudo dnf copr disable alpha-one-ai/ai-memory` |
 | AUR | `paru -R ai-memory` (or your AUR helper's remove command) |
 | Windows installer | `Remove-Item $env:USERPROFILE\.local\bin\ai-memory.exe` |

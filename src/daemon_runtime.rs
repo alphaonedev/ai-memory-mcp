@@ -849,6 +849,14 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // (serve / mcp / CLI) applies it. Idempotent — first writer wins,
     // same as the mmap seeding above.
     crate::reranker::set_rerank_max_seq(app_config.resolve_reranker().max_seq_tokens);
+    // n15 — seed the process-wide per-namespace confidence-decay
+    // half-life overrides from `[curator.confidence_decay_half_life_days]`.
+    // `apply_decay_touch` (the recall-time decay updater on any subcommand
+    // path) resolves the per-namespace half-life through this global.
+    // Idempotent — first writer wins, same as the seeding above.
+    crate::confidence::decay::set_namespace_half_life_overrides(
+        app_config.confidence_decay_half_life_overrides(),
+    );
     // #1590 — seed the process-wide operator-configured default
     // namespace (Some ONLY when `[storage].default_namespace` — or the
     // legacy flat field — was explicitly set). Every write surface
@@ -2623,6 +2631,17 @@ pub fn spawn_gc_loop_with_shadow_retention(
                 Ok(_) => {}
                 Err(e) => tracing::warn!("shadow observation gc failed: {e}"),
             }
+            // #1690 — recall_observations retention sweep. The pruner
+            // (observations::gc::prune, honouring AI_MEMORY_OBSERVATIONS_TTL_DAYS
+            // — CLAUDE.md env #42) previously had NO production caller, so the
+            // recall-observation ledger grew unbounded with recall traffic.
+            match crate::observations::gc::prune(&lock.0) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("gc: pruned {n} expired recall_observations");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("recall_observations gc failed: {e}"),
+            }
         }
     })
 }
@@ -3277,6 +3296,126 @@ pub(crate) fn install_governance_pre_write_hook(
     }
 }
 
+/// #1685 — shared installer for the wire-action egress gate
+/// ([`crate::governance::wire_check::GOVERNANCE_PRE_ACTION`]) so BOTH the HTTP
+/// daemon (`serve`) and the MCP stdio loop (`run_mcp_server`) install the SAME
+/// closure. Before this, only `serve` installed it, leaving the `skill_export`
+/// (FilesystemWrite) and LLM (NetworkRequest) egress sinks fail-OPEN on the MCP
+/// surface — the primary NHI interface. Process-wide `OnceLock`, so a second
+/// install (in-process serve+mcp) is a logged no-op. Mirrors
+/// [`install_governance_pre_write_hook`]; the gate covers the agent-EXTERNAL
+/// variants that have an egress sink today (FilesystemWrite/NetworkRequest/
+/// ProcessSpawn; Bash + Custom have none yet — v0.8 #1695).
+pub(crate) fn install_governance_pre_action_hook(
+    db_path: &Path,
+    deferred_audit_queue: &crate::governance::deferred_audit::DeferredAuditQueue,
+    rule_cache: &Arc<crate::governance::rule_cache::RuleCache>,
+    hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+) {
+    use crate::governance::agent_action::{
+        AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
+    };
+    let rules_db_path = db_path.to_path_buf();
+    let cache_for_wire_check = Arc::clone(rule_cache);
+    let queue_for_wire_check = deferred_audit_queue.clone();
+    let conn_for_wire_check = hook_consultation_conn;
+    let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
+        move |action: &AgentAction| -> std::result::Result<(), String> {
+            let Some(conn_arc) = conn_for_wire_check.as_ref() else {
+                // #1455 — FAIL-CLOSED when the consultation connection is
+                // unavailable; a daemon-internal wire action is higher-stakes
+                // than a storage write, so degrading to ALLOW would be the
+                // worst place to fail open.
+                return governance_consultation_unavailable(
+                    &queue_for_wire_check,
+                    WIRE_ACTION_ACTOR,
+                    action,
+                    &rules_db_path,
+                    "wire_check",
+                );
+            };
+            let conn_guard = match conn_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "wire_check: consultation connection mutex poisoned; \
+                         recovering inner connection and continuing"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let conn_for_check: &rusqlite::Connection = &conn_guard;
+            match check_agent_action_deferred_cached(
+                conn_for_check,
+                Some(&cache_for_wire_check),
+                WIRE_ACTION_ACTOR,
+                action,
+                &queue_for_wire_check,
+            ) {
+                Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                    tracing::info!(
+                        "wire_check refused action kind={} rule_id={} reason={} \
+                         (chain-logged via deferred audit queue)",
+                        action.kind(),
+                        rule_id,
+                        reason,
+                    );
+                    Err(reason)
+                }
+                Err(e) => {
+                    // #1054 — same fail-CLOSED posture as the storage hook;
+                    // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
+                    let reason = format!("governance:consultation_failed: {e}");
+                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let synthetic_refusal = RuleDecision::Refuse {
+                        rule_id: "governance:consultation_failed".to_string(),
+                        reason: reason.clone(),
+                    };
+                    queue_for_wire_check.submit_refusal(
+                        WIRE_ACTION_ACTOR,
+                        action,
+                        &synthetic_refusal,
+                    );
+                    if fail_open {
+                        tracing::warn!(
+                            "wire_check: rule consultation failed: {}; \
+                             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
+                             degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
+                            e,
+                            action.kind(),
+                        );
+                        Ok(())
+                    } else {
+                        tracing::warn!(
+                            "wire_check: rule consultation failed: {}; failing CLOSED \
+                             for this action ({}) (post-#1054 secure default — set \
+                             AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
+                            e,
+                            action.kind(),
+                        );
+                        Err(reason)
+                    }
+                }
+            }
+        },
+    ));
+    if install_result.is_err() {
+        tracing::debug!(
+            "wire_check pre-action hook already installed (process-wide OnceLock); \
+             the existing hook remains active for this daemon"
+        );
+    } else {
+        tracing::info!(
+            "wire_check pre-action hook installed (agent-action gate active for \
+             FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom \
+             have no egress sink yet — structural coverage tracked v0.8 #1695)"
+        );
+    }
+}
+
 /// v0.7.0 #1455 (SEC, MED) — shared fail-CLOSED handler for the case
 /// where a governance hook's rule-consultation connection could not be
 /// opened at install time. Chain-logs a synthetic
@@ -3617,124 +3756,14 @@ pub async fn bootstrap_serve(
     // hooks, LLM, skill_export) where there is no per-request agent
     // identity bound to the action; the storage hook's
     // `substrate:pre_write_hook` fallback uses the same shape.
-    {
-        use crate::governance::agent_action::{
-            AgentAction, Decision as RuleDecision, check_agent_action_deferred_cached,
-        };
-        let rules_db_path = db_path.to_path_buf();
-        let cache_for_wire_check = Arc::clone(&rule_cache);
-        let queue_for_wire_check = deferred_audit_queue.clone();
-        // v0.7.0 #1017 — share the same long-lived consultation
-        // connection introduced above. Hook installs are serial so
-        // there's no race on the Arc clone.
-        let conn_for_wire_check = hook_consultation_conn.clone();
-        let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
-            move |action: &AgentAction| -> std::result::Result<(), String> {
-                let Some(conn_arc) = conn_for_wire_check.as_ref() else {
-                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the
-                    // consultation connection is unavailable, mirroring
-                    // the storage hook above. A daemon-internal wire
-                    // action (federation push, hooks spawn, LLM call,
-                    // skill_export filesystem write) is HIGHER-stakes
-                    // than a storage write, so degrading to ALLOW on a
-                    // missing rules DB would be the worst place to fail
-                    // open. Same secure default + escape hatch.
-                    return governance_consultation_unavailable(
-                        &queue_for_wire_check,
-                        WIRE_ACTION_ACTOR,
-                        action,
-                        &rules_db_path,
-                        "wire_check",
-                    );
-                };
-                let conn_guard = match conn_arc.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "wire_check: consultation connection mutex poisoned; \
-                             recovering inner connection and continuing"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let conn_for_check: &rusqlite::Connection = &conn_guard;
-                match check_agent_action_deferred_cached(
-                    conn_for_check,
-                    Some(&cache_for_wire_check),
-                    WIRE_ACTION_ACTOR,
-                    action,
-                    &queue_for_wire_check,
-                ) {
-                    Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
-                    Ok(RuleDecision::Refuse { rule_id, reason }) => {
-                        tracing::info!(
-                            "wire_check refused action kind={} rule_id={} reason={} \
-                             (chain-logged via deferred audit queue)",
-                            action.kind(),
-                            rule_id,
-                            reason,
-                        );
-                        Err(reason)
-                    }
-                    Err(e) => {
-                        // v0.7.0 #1054 (Agent-2 #4) — same fail-CLOSED
-                        // posture as the storage hook above. Wire-check
-                        // refusals for daemon-internal actions
-                        // (federation push, hooks spawn, LLM call,
-                        // skill_export) are higher-stakes than storage
-                        // refusals — fail-open here would let a
-                        // consultation race smuggle a refused
-                        // network/filesystem/process action through
-                        // the gate. Same env-var escape hatch:
-                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
-                        let reason = format!("governance:consultation_failed: {e}");
-                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        let synthetic_refusal = RuleDecision::Refuse {
-                            rule_id: "governance:consultation_failed".to_string(),
-                            reason: reason.clone(),
-                        };
-                        queue_for_wire_check.submit_refusal(
-                            WIRE_ACTION_ACTOR,
-                            action,
-                            &synthetic_refusal,
-                        );
-                        if fail_open {
-                            tracing::warn!(
-                                "wire_check: rule consultation failed: {}; \
-                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
-                                 degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
-                                e,
-                                action.kind(),
-                            );
-                            Ok(())
-                        } else {
-                            tracing::warn!(
-                                "wire_check: rule consultation failed: {}; failing CLOSED \
-                                 for this action ({}) (post-#1054 secure default — set \
-                                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
-                                e,
-                                action.kind(),
-                            );
-                            Err(reason)
-                        }
-                    }
-                }
-            },
-        ));
-        if install_result.is_err() {
-            tracing::debug!(
-                "wire_check pre-action hook already installed (process-wide OnceLock); \
-                 the existing hook remains active for this daemon"
-            );
-        } else {
-            tracing::info!(
-                "wire_check pre-action hook installed (agent-action gate active for \
-                 FilesystemWrite/NetworkRequest/ProcessSpawn/Bash/Custom)"
-            );
-        }
-    }
+    // #1685 — wire-action egress gate, via the shared installer (also called
+    // by run_mcp_server, so the MCP surface is no longer fail-open).
+    install_governance_pre_action_hook(
+        db_path,
+        &deferred_audit_queue,
+        &rule_cache,
+        hook_consultation_conn.clone(),
+    );
 
     // Issue #219: build the embedder + HNSW index up front so HTTP write
     // paths can populate them. Previously the daemon never constructed an
@@ -3889,6 +3918,37 @@ pub async fn bootstrap_serve(
         tokio::sync::RwLock<Option<Vec<(crate::profile::Family, Vec<f32>)>>>,
     > = Arc::new(tokio::sync::RwLock::new(None));
     let embedder_arc = Arc::new(embedder);
+
+    // #1691 — build + install the cross-encoder reranker for the HTTP
+    // daemon so the HTTP recall surface applies the SAME neural rerank
+    // stage the MCP/CLI recall paths run (the prior n23 NOTE in
+    // handlers/recall.rs documented the gap). Gated on the resolved tier
+    // enabling the cross-encoder, mirroring the MCP boot path
+    // (`run_mcp_server`). Installed into the process-global
+    // RuntimeContext (interior `OnceLock`) so no AppState field-shape
+    // change is needed; the recall handler reads it via
+    // `app.runtime.reranker()`. Keyword/semantic/smart tiers leave the
+    // slot empty and recall runs without the rerank stage, exactly as
+    // before.
+    if tier_config.cross_encoder {
+        tracing::info!("serve: loading neural cross-encoder (#1691 HTTP recall rerank)");
+        let ce = crate::reranker::CrossEncoder::new_neural();
+        if ce.is_neural() {
+            tracing::info!("serve: neural cross-encoder ready (batched)");
+        } else {
+            tracing::warn!("serve: neural cross-encoder unavailable, using lexical fallback");
+        }
+        // #1691/n14 — apply the operator-configured score floor
+        // (env > [reranker].score_floor > Off) on the HTTP recall reranker
+        // too, matching the MCP build site.
+        crate::runtime_context::RuntimeContext::global().install_reranker(Arc::new(
+            crate::reranker::BatchedReranker::with_score_floor(
+                ce,
+                app_config.resolve_reranker_score_floor(),
+            ),
+        ));
+    }
+
     if std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")
         .ok()
         .as_deref()
@@ -4296,6 +4356,15 @@ pub async fn bootstrap_serve(
         app_config.archive_max_days,
         shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
+    ));
+
+    // #1690 — offloaded_blobs TTL sweep. `offload_ttl_sweep::spawn` existed but
+    // was never pushed into the bootstrap spawn list, so offloaded blobs grew
+    // unbounded (the module doc-comment claiming it was "spawned by
+    // bootstrap_serve" was false until this wiring). Daily cadence.
+    task_handles.push(crate::background::offload_ttl_sweep::spawn(
+        db_state.clone(),
+        crate::background::offload_ttl_sweep::DEFAULT_INTERVAL,
     ));
 
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
@@ -6157,14 +6226,14 @@ mod tests {
         // the deferred-audit supervisor + gc + wal_checkpoint +
         // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
         // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
-        // daily-counter reset sweep). v0.7 B3-fix2 gates the
-        // family-descriptor embedding precompute behind
-        // `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF) so
-        // it does not contend with HTTP request-path embeds under
+        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep).
+        // v0.7 B3-fix2 gates the family-descriptor embedding precompute
+        // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
+        // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to six when the
+        // for the rationale. The task count reverts to seven when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 6);
+        assert_eq!(bs.task_handles.len(), 7);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();
