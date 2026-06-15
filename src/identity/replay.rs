@@ -492,6 +492,38 @@ pub struct FederationNonceCache {
     db_path: Option<PathBuf>,
 }
 
+/// #1690 — prune the on-disk `federation_nonce_cache` to the newest
+/// `per_peer_cap` rows per peer (deleting the rest), bounding the table
+/// to the same ceiling the in-memory cache enforces. Idempotent: on an
+/// already-bounded table it deletes zero rows. Extracted as a free fn so
+/// it is testable with a small cap without seeding 10k rows. The window
+/// `ROW_NUMBER() OVER (PARTITION BY peer_id ORDER BY last_touch DESC)`
+/// keeps the most-recently-touched rows; the WITHOUT-ROWID PK
+/// `(peer_id, fingerprint)` keys the delete.
+///
+/// # Errors
+/// Propagates the underlying `rusqlite` error on SQL failure.
+fn prune_nonce_cache_to_per_peer_cap(
+    conn: &rusqlite::Connection,
+    per_peer_cap: usize,
+) -> rusqlite::Result<usize> {
+    #[allow(clippy::cast_possible_wrap)]
+    let cap = per_peer_cap as i64;
+    conn.execute(
+        "DELETE FROM federation_nonce_cache
+         WHERE (peer_id, fingerprint) IN (
+             SELECT peer_id, fingerprint FROM (
+                 SELECT peer_id, fingerprint,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY peer_id ORDER BY last_touch DESC
+                        ) AS rn
+                 FROM federation_nonce_cache
+             ) WHERE rn > ?1
+         )",
+        rusqlite::params![cap],
+    )
+}
+
 impl FederationNonceCache {
     /// Fresh empty cache. In-memory only — the cache resets on every
     /// daemon restart. Prefer [`Self::new_with_db_persistence`] in
@@ -601,6 +633,36 @@ impl FederationNonceCache {
             slot.last_touch = touch_u64;
         }
         drop(guard);
+        // `rows` was consumed by the `for` loop above; dropping `stmt`
+        // releases its borrow on `conn` before the prune `execute`.
+        drop(stmt);
+
+        // #1690 — repair legacy on-disk bloat from the pre-delete-on-evict
+        // era. Before the eviction-prune fix, the table grew without
+        // bound; delete-on-evict stops FURTHER growth but never shrinks
+        // rows belonging to peers that have since gone silent, so such a
+        // DB would re-scan all of them on every boot. The in-memory cap
+        // above already bounds RAM (per-peer overflow is dropped on
+        // load), so this one-time prune converges the DISK to the same
+        // bound: keep the newest `FEDERATION_NONCE_CAPACITY_PER_PEER`
+        // rows per peer, delete the rest. Idempotent — on an
+        // already-bounded table it deletes zero rows. WITHOUT ROWID PK is
+        // (peer_id, fingerprint), so the window prune keys on that pair.
+        match prune_nonce_cache_to_per_peer_cap(&conn, FEDERATION_NONCE_CAPACITY_PER_PEER) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                target: "ai_memory::identity::replay",
+                "FederationNonceCache: pruned {n} over-cap disk row(s) on hydration \
+                 (#1690 legacy-bloat repair); disk now bounded to the per-peer cap"
+            ),
+            Err(e) => tracing::warn!(
+                target: "ai_memory::identity::replay",
+                err = %e,
+                "FederationNonceCache: hydration over-cap prune failed (non-fatal; in-memory \
+                 cache still bounded)"
+            ),
+        }
+
         // Advance the in-process touch counter past every observed
         // last_touch so the next insert is monotonic.
         self.touch_counter
@@ -1056,6 +1118,63 @@ mod federation_nonce_cache_tests {
             "#1690: an outer-LRU peer eviction must delete every disk row for that peer \
              (peer-x's 2 rows gone, peer-y + peer-z remain)"
         );
+    }
+
+    #[test]
+    fn issue_1690_prune_nonce_cache_keeps_newest_per_peer() {
+        // #1690 — the hydration-time legacy-bloat repair keeps the newest
+        // `cap` rows per peer and deletes the rest. Tested with a small
+        // cap so we don't seed 10k rows.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = crate::db::open(tmp.path()).expect("open + migrate");
+        // peer-a: 4 rows (last_touch 1..4); peer-b: 2 rows (5..6).
+        for (peer, touch) in [
+            ("peer-a", 1),
+            ("peer-a", 2),
+            ("peer-a", 3),
+            ("peer-a", 4),
+            ("peer-b", 5),
+            ("peer-b", 6),
+        ] {
+            let fp = FederationNonceCache::fingerprint(peer, &format!("n{touch}"));
+            conn.execute(
+                "INSERT INTO federation_nonce_cache (peer_id, fingerprint, last_touch, inserted_at)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z')",
+                rusqlite::params![peer, fp.as_slice(), touch],
+            )
+            .unwrap();
+        }
+        // Prune to cap=2 per peer: peer-a drops its 2 oldest (touch 1,2),
+        // peer-b is already within cap (untouched).
+        let deleted = prune_nonce_cache_to_per_peer_cap(&conn, 2).expect("prune");
+        assert_eq!(deleted, 2, "#1690: peer-a's 2 over-cap rows deleted");
+        let a_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM federation_nonce_cache WHERE peer_id='peer-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM federation_nonce_cache WHERE peer_id='peer-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_left, 2, "peer-a bounded to cap");
+        assert_eq!(b_left, 2, "peer-b within cap, untouched");
+        // The newest peer-a rows (touch 3,4) survived; the oldest (1,2) went.
+        let min_touch_a: i64 = conn
+            .query_row(
+                "SELECT MIN(last_touch) FROM federation_nonce_cache WHERE peer_id='peer-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(min_touch_a, 3, "the oldest rows were the ones pruned");
+        // Idempotent: a second prune deletes nothing.
+        assert_eq!(prune_nonce_cache_to_per_peer_cap(&conn, 2).unwrap(), 0);
     }
 
     /// #1255 — graceful degradation: persistence open errors do NOT

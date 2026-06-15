@@ -390,6 +390,113 @@ async fn kg_query_equivalence() {
 }
 
 // ---------------------------------------------------------------------------
+// #1689 — AGE current-view traversals exclude invalidated edges.
+//
+// Semantic regression for the #1689 fix: kg_invalidate SETs valid_until
+// on the edge (it does NOT delete it), so a current-view kg_query /
+// find_paths MUST filter it out. The builder-string unit tests in
+// src/store/postgres.rs pin that the filter TEXT is present; THIS test
+// proves the filter actually WORKS against a live AGE instance — and
+// that the AGE result matches the CTE result (which already filters).
+// Pre-fix, the unfiltered AGE branch would still return the invalidated
+// edge's target and diverge from the CTE, failing this test.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn issue_1689_age_excludes_invalidated_edges() {
+    let Some(url) = postgres_url().or_else(age_url) else {
+        eprintln!("skip: neither AI_MEMORY_TEST_POSTGRES_URL nor AI_MEMORY_TEST_AGE_URL set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skip: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+
+    let (ids, ns) = fixture_graph_ids("issue-1689");
+    insert_fixture_memories(&store, &ids, &ns).await;
+    insert_fixture_links(&url, &ids).await;
+
+    // The only related_to edge INTO node 1 is 0->1 (see fixture_edges),
+    // so invalidating it removes node 1 from the related_to-reachable
+    // set of node 0 on a correct current-view traversal.
+    if !age_extension_present(&store) {
+        eprintln!("skip AGE half: kg_backend resolved to CTE (extension not installed)");
+        return;
+    }
+    let age_url_resolved = age_url().unwrap_or_else(|| url.clone());
+    if let Err(e) = project_fixture_into_age(&age_url_resolved, &ids).await {
+        eprintln!("skip AGE half: failed to project fixture into memory_graph: {e}");
+        return;
+    }
+
+    // Baseline: node 1 IS reachable from node 0 before invalidation.
+    let before = match store.kg_query_cypher(&ids[0], 3).await {
+        Ok(rs) => rs,
+        Err(e) => {
+            eprintln!("skip AGE half: kg_query_cypher returned {e}");
+            return;
+        }
+    };
+    assert!(
+        before.iter().any(|r| r.target_id == ids[1]),
+        "baseline: node 1 must be reachable from node 0 before invalidation"
+    );
+
+    // Invalidate the 0->1 related_to edge with a PAST valid_until.
+    // kg_invalidate_cypher mirrors the SET into both the AGE edge and the
+    // relational memory_links row, so both backends see the retraction.
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+    store
+        .kg_invalidate_cypher(&ids[0], &ids[1], "related_to", Some(&past))
+        .await
+        .expect("kg_invalidate_cypher 0->1");
+
+    // Current-view AGE traversal must now EXCLUDE the 0->1 edge, so node
+    // 1 is no longer a direct (depth-1) target. (#1689 — pre-fix the
+    // unfiltered AGE branch would still return it.)
+    let after_age = store
+        .kg_query_cypher(&ids[0], 3)
+        .await
+        .expect("kg_query_cypher after invalidate");
+    let reached_1_at_depth_1 = after_age
+        .iter()
+        .any(|r| r.target_id == ids[1] && r.depth == 1);
+    assert!(
+        !reached_1_at_depth_1,
+        "#1689: AGE current-view kg_query must NOT return the invalidated 0->1 edge"
+    );
+
+    // And the AGE current view must match the CTE current view (which
+    // already excludes invalidated edges) — the strongest cross-check.
+    let after_cte = store
+        .kg_query_cte(&ids[0], 3)
+        .await
+        .expect("kg_query_cte after invalidate");
+    assert_eq!(
+        sort_query_rows(after_cte),
+        sort_query_rows(after_age),
+        "#1689: AGE and CTE current-view traversals must agree after an edge is invalidated"
+    );
+
+    // find_paths current view must likewise not route through the
+    // retracted edge: the shortest 0->1 path was the direct edge; after
+    // invalidation any surviving 0->1 path must be strictly longer than 1
+    // hop (or absent). Pre-fix the AGE find_paths would still return the
+    // 1-hop path.
+    let paths = store
+        .find_paths_cypher(&ids[0], &ids[1], Some(4), Some(10))
+        .await
+        .expect("find_paths_cypher after invalidate");
+    assert!(
+        paths.iter().all(|p| p.len() != 2),
+        "#1689: AGE find_paths must not return the invalidated direct 0->1 edge (a 2-node path)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // J3 — kg_timeline equivalence.
 // ---------------------------------------------------------------------------
 
