@@ -3910,6 +3910,30 @@ pub async fn bootstrap_serve(
         tokio::sync::RwLock<Option<Vec<(crate::profile::Family, Vec<f32>)>>>,
     > = Arc::new(tokio::sync::RwLock::new(None));
     let embedder_arc = Arc::new(embedder);
+
+    // #1691 — build + install the cross-encoder reranker for the HTTP
+    // daemon so the HTTP recall surface applies the SAME neural rerank
+    // stage the MCP/CLI recall paths run (the prior n23 NOTE in
+    // handlers/recall.rs documented the gap). Gated on the resolved tier
+    // enabling the cross-encoder, mirroring the MCP boot path
+    // (`run_mcp_server`). Installed into the process-global
+    // RuntimeContext (interior `OnceLock`) so no AppState field-shape
+    // change is needed; the recall handler reads it via
+    // `app.runtime.reranker()`. Keyword/semantic/smart tiers leave the
+    // slot empty and recall runs without the rerank stage, exactly as
+    // before.
+    if tier_config.cross_encoder {
+        tracing::info!("serve: loading neural cross-encoder (#1691 HTTP recall rerank)");
+        let ce = crate::reranker::CrossEncoder::new_neural();
+        if ce.is_neural() {
+            tracing::info!("serve: neural cross-encoder ready (batched)");
+        } else {
+            tracing::warn!("serve: neural cross-encoder unavailable, using lexical fallback");
+        }
+        crate::runtime_context::RuntimeContext::global()
+            .install_reranker(Arc::new(crate::reranker::BatchedReranker::new(ce)));
+    }
+
     if std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")
         .ok()
         .as_deref()
