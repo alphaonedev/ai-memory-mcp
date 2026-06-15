@@ -461,7 +461,7 @@ The first proposal (single recover-on-boot mechanism) was correctly identified a
 
 L4 is the architecturally clean removal of the entire problem class: hosts volunteer each conversation turn through MCP-protocol flow rather than the substrate scraping their internal formats. The substrate ships the SERVER side + the RFC + the host-adapter shims in v0.7.0; vendor adoption proceeds at vendor pace AFTER v0.7.0 ships. L1-L3 cover hosts that haven't adopted yet.
 
-[#1392](https://github.com/alphaonedev/ai-memory-mcp/issues/1392) (MCP-protocol-extension RFC, was a v0.8 deferral) is closed as superseded by this expanded #1389 scope. L1 + L2 + L3 + L4-server-side ALL ship in v0.7.0; only the multi-vendor L4 adoption work happens post-ship. See §11.4.H below for what remains in v0.8 (SDK shims, IDE plugin coverage, decision-detector).
+[#1392](https://github.com/alphaonedev/ai-memory-mcp/issues/1392) (MCP-protocol-extension RFC, was a v0.8 deferral) is closed as superseded by this expanded #1389 scope. L1 + L2 + L4-server-side ship in v0.7.0; the L3 substrate watcher is deferred to v0.7.x (per the §11.3 status note + §11.3.1 + §24, pending operator `notify`-dependency approval), and only the multi-vendor L4 adoption work happens post-ship. See §11.3.1 for the v0.7.1 patch line and §11.4.H below for what remains in v0.8 (SDK shims, IDE plugin coverage, decision-detector).
 
 **Strengthens (all seven properties advance):**
 - §2.1 endpoint-resident: mobile cross-compile gate, iOS/Android artifacts.
@@ -473,6 +473,22 @@ L4 is the architecturally clean removal of the entire problem class: hosts volun
 - §2.7 LLM-agnostic: [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) provider-agnostic substrate landed.
 
 **The v0.7.0 ship is the first version where all seven properties can be named at the load-bearing-composition layer.** This is the strategic anchor for everything downstream.
+
+### 11.3.1 v0.7.1 — Patch line — IN FLIGHT (`release/v0.7.1`)
+
+**Status:** the v0.7.1 patch line is an **active release branch** (`release/v0.7.1`), not a future milestone — the running fleet binary is already `ai-memory 0.7.1`. It carries post-v0.7.0 publish fixes, one in-flight correctness remediation, and the small config-wiring follow-ups the v0.7.0 source explicitly tagged "v0.7.1 follow-up." No new §2-property surface; this line **hardens what v0.7.0 shipped** rather than extending scope. (Prior to this revision the roadmap jumped v0.7.0 → v0.8.0 with no home for these items.)
+
+**Scope:**
+- **SDK / package publish fixes** — npm token-auth publish + lockfile commit + idempotent PyPI ([#1663](https://github.com/alphaonedev/ai-memory-mcp/issues/1663), [#1664](https://github.com/alphaonedev/ai-memory-mcp/issues/1664)). Closes the gap where PyPI `0.7.0` was live but npm was never published. **Merged to `main`.**
+- **`entity_id` remediation** — in-flight metadata entity-binding correctness pass on `release/v0.7.1`.
+- **Curator reflection-pass namespace wiring** — load the per-namespace `reflection_pass.enabled` standard from config so `ai-memory curator --reflect --all-namespaces` actually fans out. At v0.7.0 the `--all-namespaces` path is an **inert no-op** (the enabled-gate returns `false` for every namespace until this wiring lands; single `--namespace <ns>` is the only working path) — `src/cli/curator.rs:466-473, 516-523`. This is the source's own "v0.7.1 follow-up" deferral. Strengthens §2.4 (improvable — autonomous reflection synthesis across namespaces).
+- **L3 substrate watcher** — the filesystem-notify capture daemon (the one #1389 layer deferred from v0.7.0) lands in the v0.7.x line, pending operator `notify`-dependency approval (§11.3 status note + §24). Strengthens §2.2 (coherent across mid-session crashes).
+- **Docs:** §18 CLI-rationale note corrected to state `curator --reflect` requires `--features sal` (this patch).
+
+**Explicitly NOT v0.7.1 — deferred to v0.8.0 (§11.4):**
+- **SAL capability-bit honesty (#302 item 6)** — `SqliteStore::capabilities()` does not advertise `TRANSACTIONS` / `ATOMIC_MULTI_WRITE` even though `reflect`/`consolidate` are internally atomic (single-connection `BEGIN IMMEDIATE … COMMIT`), because the SAL trait exposes no `begin_transaction()` handle yet — `src/store/sqlite.rs:63-72`. Re-add the bits once a real transaction handle is wired through the mutex-guarded `rusqlite::Connection`. Strengthens §2.5 (attested — honest capability envelope; the v0.6.3.1 Capabilities-v2 honesty discipline, §10.3).
+- **Unsigned-write / permissive-default attestation hardening** — [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464) (the two claimed-by-design edges from §9.7).
+- **R4 standalone `curator` daemon** — §11.4 Pillar 2.5.
 
 ### 11.4 v0.8.0 — Distributed Coordination Substrate — Q4 2026
 
@@ -947,7 +963,7 @@ Plus per-release:
 - Public-surface landing pages (ship-gate, A2A-gate) auto-update from result JSON.
 - **NEW: §2 property contribution declared per release.** Each release's CHANGELOG.md must name which of the seven properties (§2.1–§2.7) the release strengthens, with code anchors. If a release strengthens none, the release proposal must be re-evaluated against the §3 scope test before merge.
 - **NEW for major versions: heterogeneous AI NHI panel review** ([#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) methodology) on strategic-layer claims before tag. Single-evaluator strategic claims are not procurement-defensible; heterogeneous-evaluator strategic claims are.
-- **CLI design rationale.** For why the CLI exposes some MCP tools as flat verbs and others through actor-named higher-level verbs, see [`docs/cli-design-rationale.md`](docs/cli-design-rationale.md). The asymmetry between `ai-memory store` / `ai-memory recall` (flat) and `ai-memory curator --reflect` / `ai-memory consolidate` (actor-named) preserves the §2.6 bias-displacement architectural distinction at the operator interface.
+- **CLI design rationale.** For why the CLI exposes some MCP tools as flat verbs and others through actor-named higher-level verbs, see [`docs/cli-design-rationale.md`](docs/cli-design-rationale.md). The asymmetry between `ai-memory store` / `ai-memory recall` (flat) and `ai-memory curator --reflect` / `ai-memory consolidate` (actor-named) preserves the §2.6 bias-displacement architectural distinction at the operator interface. **Build note (#302-adjacent):** `curator --reflect` (the LLM-backed reflection-*synthesis* pass) is `#[cfg(feature = "sal")]`-gated — it runs over the SAL `MemoryStore` trait, so it requires a binary built `--features sal` **and** a configured LLM client. The default `sqlite-bundled` build hard-bails with `curator --reflect requires a binary built with --features sal` (`src/cli/curator.rs:548-560`). `--features sal` stays pure SQLite (it brings the trait + `SqliteStore` adapter; `sal-postgres` is the Postgres backend), so this is a build-flag precondition, not a Postgres requirement. Distinct from the ungated `ai-memory reflect` *write primitive* (#655), which ships in every build.
 
 ---
 
