@@ -264,7 +264,7 @@ All three interfaces share the same storage layer (`src/storage/`) and validatio
 - **MCP stdio (`src/mcp/mod.rs::run_mcp_server`)** uses a plain `rusqlite::Connection` — no `Arc`, no `Mutex`. The stdio loop is a length-capped `read_until(b'\n')` reader (post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was `for line in stdin.lock().lines()`) — synchronous, single-threaded by JSON-RPC stdio protocol design (one request in, one response out), so concurrent dispatch is impossible at the protocol level and a mutex would be useless. The audit invariant is pinned by three tests in `src/mcp/mod.rs::tests::issue_965_audit_*`. The Wave-1 codebase-analysis claim that MCP serialises on `Arc<Mutex<Connection>>` (issue #842 Tier-B5 / #965) was factually incorrect; #965 closed with audit evidence rather than a no-op pool refactor.
 - **CLI** opens its own `rusqlite::Connection` per command invocation — no sharing at all.
 
-The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path.
+The v0.7 SAL trait (under `src/store/`) abstracts sqlite vs. postgres+AGE adapters; `ai-memory serve --store-url postgres://…` selects the postgres path. **MCP stdio is structurally sqlite-only (#1675/n24):** `--store-url` is wired on `serve` (HTTP) and `curator` only — `ai-memory mcp` always opens a local rusqlite `Connection`, so the SAL abstraction's postgres path is reachable via the HTTP surface (or an MCP-over-HTTP proxy), not the stdio MCP loop. Postgres-backed deployments serve MCP clients through the HTTP daemon, not `ai-memory mcp`.
 
 ### Key Modules
 
