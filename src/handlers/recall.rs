@@ -242,10 +242,13 @@ pub async fn recall_memories_post(
 /// v0.7.0 Wave-3 Continuation — when `app.storage_backend` is
 /// `Postgres`, dispatch through `app.store.search` for keyword recall.
 /// The full hybrid (FTS + semantic + adaptive blend + session-recency boost
-/// + touch ops) pipeline remains sqlite-only in v0.7.0. NOTE (n23): the HTTP
-/// surface does NOT run the autonomous-tier cross-encoder reranker — that
-/// stage is MCP/CLI-only today; wiring it into HTTP recall is tracked under
-/// #1691. Postgres deployments
+/// + touch ops) pipeline remains sqlite-only in v0.7.0. #1691: the HTTP
+/// surface now runs the autonomous-tier cross-encoder reranker on the
+/// hybrid path (sqlite AND postgres SAL) when the resolved tier enables
+/// the cross-encoder — the reranker is built at `serve` boot and read via
+/// `app.runtime.reranker()`, so the envelope reports `hybrid+rerank`
+/// exactly as the MCP/CLI recall paths do (closing the prior n23 gap).
+/// Postgres deployments
 /// fall back to keyword-only recall through the postgres `to_tsvector`
 /// FTS surface, which is functionally equivalent for the keyword half
 /// and surfaces a `mode=keyword` envelope so clients can detect the
@@ -269,6 +272,35 @@ pub async fn recall_memories_post(
 /// All other knobs (namespace, limit, tags, since/until, budget,
 /// has_citations, source_uri_prefix, session_id, as_agent) come
 /// off the DTO directly.
+/// #1691 — apply the autonomous-tier cross-encoder rerank stage on the
+/// hybrid recall path, unifying the sqlite and postgres-SAL HTTP recall
+/// branches with the MCP/CLI recall pipeline.
+///
+/// No-op (returns `pairs` and `mode` unchanged) on keyword-only recall
+/// (`mode != "hybrid"`, i.e. the embedder produced no semantic component)
+/// or when no reranker was installed at `serve` boot (`reranker` is
+/// `None` — every non-autonomous tier, and all unit-test `AppState`
+/// scaffolds). On the hybrid path with a reranker present it re-scores
+/// the `(query, content)` pairs via the batched cross-encoder and returns
+/// the [`RECALL_MODE_HYBRID_RERANK`] label so the response envelope
+/// advertises the stage exactly as the MCP recall path does.
+///
+/// [`RECALL_MODE_HYBRID_RERANK`]: crate::models::RECALL_MODE_HYBRID_RERANK
+fn maybe_apply_rerank<'m>(
+    reranker: Option<&crate::reranker::BatchedReranker>,
+    mode: &'m str,
+    context: &str,
+    pairs: Vec<(crate::models::Memory, f64)>,
+) -> (Vec<(crate::models::Memory, f64)>, &'m str) {
+    match reranker {
+        Some(ce) if mode == "hybrid" => (
+            ce.rerank(context, pairs),
+            crate::models::RECALL_MODE_HYBRID_RERANK,
+        ),
+        _ => (pairs, mode),
+    }
+}
+
 async fn recall_response(
     app: &AppState,
     req: &RecallRequest,
@@ -399,6 +431,15 @@ async fn recall_response(
                     scored_pairs,
                     has_citations,
                     source_uri_prefix,
+                );
+                // #1691 — cross-encoder rerank on the hybrid path
+                // (postgres SAL), mirroring the MCP recall pipeline
+                // (crate::mcp::tools::recall). See [`maybe_apply_rerank`].
+                let (scored_pairs, mode) = maybe_apply_rerank(
+                    app.runtime.reranker().map(std::convert::AsRef::as_ref),
+                    mode,
+                    context,
+                    scored_pairs,
                 );
                 // v0.7.x Form 6 — apply post-fetch kinds filter on the
                 // postgres SAL branch. OR-of-kinds within the param.
@@ -643,6 +684,16 @@ async fn recall_response(
             // no DB connection needed. The lock is already dropped.
             let r =
                 crate::cli::recall::apply_form4_recall_filters(r, has_citations, source_uri_prefix);
+            // #1691 — cross-encoder rerank on the hybrid path (sqlite),
+            // mirroring the MCP recall pipeline (crate::mcp::tools::recall).
+            // See [`maybe_apply_rerank`]; closes the prior n23
+            // "HTTP does NOT run the reranker" gap.
+            let (r, mode) = maybe_apply_rerank(
+                app.runtime.reranker().map(std::convert::AsRef::as_ref),
+                mode,
+                context,
+                r,
+            );
             // v0.7.x Form 6 — apply post-fetch kinds filter on the
             // sqlite branch. Cheap because recall already capped
             // r.len() at limit.min(50).
@@ -737,5 +788,47 @@ async fn recall_response(
             crate::handlers::wire_format::memories_response(format, resp)
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
+    }
+}
+
+#[cfg(test)]
+mod issue_1691_rerank_tests {
+    //! #1691 — the cross-encoder rerank wrapper that unifies HTTP recall
+    //! with the MCP recall pipeline. These pin the gating + mode-flip
+    //! logic; the rerank reordering itself is covered by the
+    //! `BatchedReranker::rerank` tests in `src/reranker.rs`.
+    use super::maybe_apply_rerank;
+    use crate::models::{Memory, RECALL_MODE_HYBRID_RERANK};
+    use crate::reranker::{BatchedReranker, CrossEncoder};
+
+    fn empty() -> Vec<(Memory, f64)> {
+        Vec::new()
+    }
+
+    #[test]
+    fn no_reranker_is_noop_even_on_hybrid() {
+        // Non-autonomous tiers / test scaffolds install no reranker; the
+        // mode must NOT flip and the candidate set is returned untouched.
+        let (pairs, mode) = maybe_apply_rerank(None, "hybrid", "ctx", empty());
+        assert!(pairs.is_empty());
+        assert_eq!(mode, "hybrid", "mode must not flip without a reranker");
+    }
+
+    #[test]
+    fn reranker_skipped_on_keyword_mode() {
+        // Keyword-only recall (no semantic component) is never reranked,
+        // even when a reranker is installed.
+        let r = BatchedReranker::new(CrossEncoder::new());
+        let (_, mode) = maybe_apply_rerank(Some(&r), "keyword", "ctx", empty());
+        assert_eq!(mode, "keyword", "keyword-only recall must not be reranked");
+    }
+
+    #[test]
+    fn reranker_flips_mode_on_hybrid() {
+        // Hybrid path + installed reranker → the envelope advertises the
+        // rerank stage via the canonical mode label, matching MCP.
+        let r = BatchedReranker::new(CrossEncoder::new());
+        let (_, mode) = maybe_apply_rerank(Some(&r), "hybrid", "ctx", empty());
+        assert_eq!(mode, RECALL_MODE_HYBRID_RERANK);
     }
 }
