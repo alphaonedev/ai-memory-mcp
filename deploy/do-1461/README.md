@@ -156,7 +156,7 @@ SSH command line.
 | 05   | `05_wait_ssh.sh`        | block until every node accepts SSH                               |
 | 10   | `10_binary.sh`          | fan out the golden binary to every node; assert version + sha   |
 | 15   | `15_tls.sh`             | one campaign CA + per-node leaf certs (peer **and** EACH region's pg server cert, whose SAN pins that region's pg private VPC IP) + mTLS allowlist fan-out — **before** PG so each cert exists before its pg starts |
-| 20   | `20_pg_age.sh`          | install + start the native PG18.4/AGE1.7.0/pgvector substrate on EACH region's pg node (hostssl-only, region-VPC bind); render init SQL from `lib.sh` per region (extensions + AGE graph + within-region `ic_peer_1..K` schemas + grants). Peers AUTO-MIGRATE their own v55 tables on `serve` — no `schema-init` step |
+| 20   | `20_pg_age.sh`          | install + start the native PG18.4/AGE1.7.0/pgvector substrate on EACH region's pg node (hostssl-only, region-VPC bind); render init SQL from `lib.sh` per region (extensions + AGE graph + within-region `ic_peer_1..K` schemas + grants). Peers AUTO-MIGRATE their own v57 tables on `serve` — no `schema-init` step |
 | 25   | `25_ollama_embed.sh`    | per-peer CPU Ollama sidecar serving `nomic-embed-text` (768-dim) |
 | 30   | `30_config.sh`          | render + push per-role `config.toml` + secret EnvironmentFile    |
 | 45   | `45_zero_touch.sh`      | mint campaign CA + per-peer credential; fan out keys/bundle/cred; wire peer-enrollment env (O(1) trust) |
@@ -194,7 +194,7 @@ SSH command line.
 ## What "reproducible" means here
 
 - **Pinned artifacts** (`provision/lib.sh`): binary `sha256`, version `0.7.0`,
-  schema `v55`, the pinned native Ollama release (`$OLLAMA_VERSION`), and the
+  schema `v57`, the pinned native Ollama release (`$OLLAMA_VERSION`), and the
   pinned pgdg apt `.deb`s — **PostgreSQL 18.4** (`$PG_APT_VERSION`), **Apache AGE
   1.7.0** (`$AGE_APT_VERSION`), **pgvector 0.8.2** (`$PGVECTOR_APT_VERSION`),
   installed NATIVELY (no Docker anywhere on the fleet) — plus embedder/LLM model
@@ -240,7 +240,7 @@ runs on every peer. These controls are asserted LIVE over the wire by the
 - a human PASS/FAIL table on stdout; exit status `0` iff every check is green.
 
 Checks: binary `sha256` + `--version` (every node); `/api/v1/health`,
-`storage_backend == postgres`, `db_schema_version == 55`, single-instance, and
+`storage_backend == postgres`, `db_schema_version == 57`, single-instance, and
 systemd-active (every peer); **pg-node upstream-stack assertions** (the live
 server reports PostgreSQL `18.4`, Apache AGE `1.7.0`, pgvector `0.8.2`; the AGE
 graph is present; and every daemon→PG backend is TLS — `>=1 ssl, 0 plaintext`);
