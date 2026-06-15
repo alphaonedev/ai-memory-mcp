@@ -2623,6 +2623,17 @@ pub fn spawn_gc_loop_with_shadow_retention(
                 Ok(_) => {}
                 Err(e) => tracing::warn!("shadow observation gc failed: {e}"),
             }
+            // #1690 — recall_observations retention sweep. The pruner
+            // (observations::gc::prune, honouring AI_MEMORY_OBSERVATIONS_TTL_DAYS
+            // — CLAUDE.md env #42) previously had NO production caller, so the
+            // recall-observation ledger grew unbounded with recall traffic.
+            match crate::observations::gc::prune(&lock.0) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("gc: pruned {n} expired recall_observations");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("recall_observations gc failed: {e}"),
+            }
         }
     })
 }
@@ -4296,6 +4307,15 @@ pub async fn bootstrap_serve(
         app_config.archive_max_days,
         shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
+    ));
+
+    // #1690 — offloaded_blobs TTL sweep. `offload_ttl_sweep::spawn` existed but
+    // was never pushed into the bootstrap spawn list, so offloaded blobs grew
+    // unbounded (the module doc-comment claiming it was "spawned by
+    // bootstrap_serve" was false until this wiring). Daily cadence.
+    task_handles.push(crate::background::offload_ttl_sweep::spawn(
+        db_state.clone(),
+        crate::background::offload_ttl_sweep::DEFAULT_INTERVAL,
     ));
 
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
