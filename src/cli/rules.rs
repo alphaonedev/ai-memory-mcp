@@ -402,6 +402,28 @@ pub fn run(
             let resolved =
                 resolve_keygen_out_path(out_path.as_deref(), &key_dir, key_dir_overridden)?;
             let fingerprint = keygen_operator(&resolved, force, out)?;
+            // #1686 — generating an operator key flips the substrate to
+            // attest-active (`resolve_operator_pubkey().is_some()`), which makes
+            // `enforced_rule_passes` SKIP every enabled rule that is not
+            // operator-signed. The --force path warns about prior operator-signed
+            // rules going invalid, but a FRESH keygen silently disables any
+            // enabled-but-unsigned seed rules. Warn loudly so the operator knows
+            // to run `rules sign-seed`.
+            if let Ok(rules) = rules_store::list(&conn) {
+                let dormant = rules
+                    .iter()
+                    .filter(|r| r.enabled && r.attest_level != OPERATOR_SIGNED_LEVEL)
+                    .count();
+                if dormant > 0 {
+                    writeln!(
+                        out.stderr,
+                        "WARNING: {dormant} enabled rule(s) are not operator-signed. \
+                         Generating this operator key activates signature enforcement, so \
+                         those rules will be SKIPPED at load time until you run \
+                         `ai-memory rules sign-seed`."
+                    )?;
+                }
+            }
             let payload = serde_json::json!({
                 "path": resolved.display().to_string(),
                 "public_path": format!("{}.pub", resolved.display()),
