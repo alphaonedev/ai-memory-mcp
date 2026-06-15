@@ -241,8 +241,11 @@ pub async fn recall_memories_post(
 ///
 /// v0.7.0 Wave-3 Continuation — when `app.storage_backend` is
 /// `Postgres`, dispatch through `app.store.search` for keyword recall.
-/// The full hybrid (FTS + semantic + adaptive blend + reranker + touch
-/// ops) pipeline remains sqlite-only in v0.7.0; postgres deployments
+/// The full hybrid (FTS + semantic + adaptive blend + session-recency boost
+/// + touch ops) pipeline remains sqlite-only in v0.7.0. NOTE (n23): the HTTP
+/// surface does NOT run the autonomous-tier cross-encoder reranker — that
+/// stage is MCP/CLI-only today; wiring it into HTTP recall is tracked under
+/// #1691. Postgres deployments
 /// fall back to keyword-only recall through the postgres `to_tsvector`
 /// FTS surface, which is functionally equivalent for the keyword half
 /// and surfaces a `mode=keyword` envelope so clients can detect the

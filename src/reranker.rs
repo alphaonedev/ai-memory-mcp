@@ -1687,9 +1687,11 @@ impl BatchedReranker {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// v0.7.0 #1319 — expose the configured score floor for the
-    /// `memory_capabilities` reporter and for operator-facing
-    /// diagnostics.
+    /// v0.7.0 #1319 — accessor for the configured score floor, used by
+    /// operator-facing diagnostics. NOTE (n22): the `memory_capabilities`
+    /// envelope does not currently surface this value; wiring the floor
+    /// through config and exposing it in capabilities is tracked under
+    /// #1319 / n14.
     #[must_use]
     pub fn score_floor(&self) -> RerankerScoreFloor {
         self.score_floor
