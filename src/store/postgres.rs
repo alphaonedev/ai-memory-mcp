@@ -4760,15 +4760,22 @@ impl PostgresStore {
         // variable-length pattern (Cypher does NOT accept a parameter
         // there); we already clamped it via `validate_depth` so the
         // value is a small bounded integer with no injection surface.
-        // The start id is parameterised through AGE's `$vars` JSON.
-        let cypher = format!(
-            "MATCH p = (a)-[r:related_to*1..{max_depth}]->(b) \
-             WHERE a.id = $start_id \
-             RETURN b.id AS target_id, \
-                    last(r).relation AS relation, \
-                    length(r) AS depth, \
-                    reduce(s = a.id, n IN nodes(p)[1..] | s + '->' + n.id) AS path"
-        );
+        // The start id + the as-of cut-off are parameterised through
+        // AGE's `$vars` JSON.
+        let cypher = build_kg_query_current_view_cypher(max_depth);
+
+        // #1689 — current-view traversal MUST exclude invalidated edges.
+        // `kg_invalidate_cypher` SETs `r.valid_until` (it does NOT delete
+        // the edge), so without this filter a current-view query returns
+        // edges that were already invalidated — the same defect the CTE
+        // path carried. The cut-off is the relational-mirror's RFC3339
+        // form (`to_rfc3339`, `+00:00` offset) so the agtype string
+        // comparison matches the dual-written value byte-for-byte.
+        // Defense in depth: if a given AGE build rejects the
+        // `relationships()`/`ALL()` predicate, the dispatcher's
+        // `is_age_runtime_failure` arm in `kg_query_with_history` falls
+        // back to the already-correct `kg_query_cte_filtered`.
+        let now_stamp = Utc::now().to_rfc3339();
 
         // v0.7.0 Wave-3 Continuation 5 — AGE rejects `$1::agtype` (the
         // third arg to `cypher()` must be a bare Param node, not a
@@ -4776,7 +4783,7 @@ impl PostgresStore {
         // agtype constant; `source_id` is UUID-validated upstream so
         // this is safe. The dollar-quoted string body uses `$$`; the
         // params literal lives outside it.
-        let params_lit = age_params_literal(&[("start_id", source_id)]);
+        let params_lit = age_params_literal(&[("start_id", source_id), ("now", &now_stamp)]);
         let sql = format!(
             "SELECT target_id, relation, depth, path FROM cypher('memory_graph', $$ {cypher} $$, \
              {params_lit}) AS (target_id agtype, relation agtype, depth agtype, path agtype)"
@@ -5852,23 +5859,27 @@ impl PostgresStore {
         assert_age_id_safe(source_id).map_err(|detail| StoreError::InvalidInput { detail })?;
         assert_age_id_safe(target_id).map_err(|detail| StoreError::InvalidInput { detail })?;
 
-        // #1689 — NOTE: this AGE (Apache-AGE/cypher) traversal does NOT yet
-        // filter invalidated edges (no `valid_until` predicate). The DEFAULT
-        // CTE path (`find_paths_cte` above) now excludes them, matching sqlite
-        // and `kg_query_cte_filtered`; the AGE branch is opt-in (apache-age
-        // feature). Closing it requires the AGE relationship to carry
-        // `valid_until` as a property — verify against a live AGE instance
-        // before adding `WHERE ALL(r IN relationships(p) WHERE ...)`, since a
-        // filter on a missing property would silently drop all paths. Tracked
-        // under #1689 (AGE-edge-property follow-up).
+        // #1689 — current-view path-finding MUST exclude invalidated edges,
+        // matching sqlite `db::find_paths`, `find_paths_cte` (both UNION arms),
+        // and `kg_query_cypher`. `kg_invalidate_cypher` SETs `r.valid_until`
+        // on the edge (it does NOT delete it), so the
+        // `ALL(e IN relationships(p) ...)` guard drops any path that traverses
+        // an invalidated edge. The `IS NULL OR` arm is load-bearing: this
+        // traversal matches UNTYPED edges, and relations that never carry an
+        // invalidation (e.g. `supersedes`, or a never-retracted `related_to`)
+        // have NO `valid_until` property — `IS NULL` keeps them, so the filter
+        // can never silently drop uninvalidated paths. The cut-off is inlined
+        // as an RFC3339 `+00:00` literal (find_paths uses the 2-arg `cypher()`
+        // form — see the param-binding note above — so it cannot bind `$now`);
+        // `to_rfc3339()` output contains no single quote, so no injection
+        // surface. Defense in depth: if an AGE build rejects the
+        // `relationships()`/`ALL()` predicate, the `find_paths` dispatcher's
+        // `is_age_runtime_failure` arm falls back to the correct
+        // `find_paths_cte`.
+        let now_stamp = Utc::now().to_rfc3339();
         let sql = format!(
-            "SELECT path FROM cypher('memory_graph', $$ \
-             MATCH p = (a)-[*1..{depth}]-(b) \
-             WHERE a.id = '{source_id}' AND b.id = '{target_id}' \
-             RETURN nodes(p) AS path \
-             ORDER BY length(p) ASC \
-             LIMIT {cap} \
-             $$) AS (path agtype)"
+            "SELECT path FROM cypher('memory_graph', $$ {} $$) AS (path agtype)",
+            build_find_paths_current_view_cypher(source_id, target_id, depth, cap, &now_stamp)
         );
         // #1482 — per-call-unique cypher text (inlined source/target
         // ids + depth + cap); run unnamed so it never enters the
@@ -7629,6 +7640,69 @@ fn assert_age_id_safe(id: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// #1689 — builds the current-view `kg_query` Cypher body for the AGE
+/// backend, including the per-edge temporal-validity filter that
+/// excludes invalidated edges (`r.valid_until` SET by
+/// `kg_invalidate_cypher`).
+///
+/// `max_depth` is interpolated into the variable-length pattern (Cypher
+/// forbids a parameter there); it is clamped by `validate_depth` upstream
+/// so it carries no injection surface. The start id and the `$now`
+/// as-of cut-off are bound through AGE's `$vars` JSON
+/// (`age_params_literal`), never interpolated.
+///
+/// The `ALL(e IN relationships(p) ...)` guard drops any path that
+/// traverses an edge whose `valid_until` is non-null and not in the
+/// future, mirroring the relational CTE's
+/// `valid_until IS NULL OR valid_until > NOW()` filter. The comparison
+/// is a lexicographic agtype string compare against an RFC3339 `+00:00`
+/// stamp, which orders chronologically because the invalidate write
+/// path stores `valid_until` in the same `to_rfc3339` form.
+fn build_kg_query_current_view_cypher(max_depth: usize) -> String {
+    format!(
+        "MATCH p = (a)-[r:related_to*1..{max_depth}]->(b) \
+         WHERE a.id = $start_id \
+           AND ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > $now) \
+         RETURN b.id AS target_id, \
+                last(r).relation AS relation, \
+                length(r) AS depth, \
+                reduce(s = a.id, n IN nodes(p)[1..] | s + '->' + n.id) AS path"
+    )
+}
+
+/// #1689 — builds the current-view `find_paths` Cypher body for the AGE
+/// backend, including the per-edge temporal-validity filter that excludes
+/// invalidated edges.
+///
+/// `find_paths` uses the 2-arg `cypher()` form (AGE rejects the params dict
+/// in the 3-arg form for this shape — see the call-site note), so the
+/// source/target ids and the `now` cut-off are INLINED into the Cypher text.
+/// The ids are `assert_age_id_safe`-validated at the call site and `now` is
+/// an `Utc::now().to_rfc3339()` stamp (no single quote), so the inlined
+/// literals carry no injection surface.
+///
+/// The traversal matches UNTYPED edges (`-[*1..depth]-`); the
+/// `e.valid_until IS NULL` arm keeps every edge that was never invalidated
+/// (relations like `supersedes`, or never-retracted `related_to`, have no
+/// `valid_until` property), so the filter only drops genuinely-invalidated
+/// edges — it can never silently drop uninvalidated paths.
+fn build_find_paths_current_view_cypher(
+    source_id: &str,
+    target_id: &str,
+    depth: usize,
+    cap: usize,
+    now_stamp: &str,
+) -> String {
+    format!(
+        "MATCH p = (a)-[*1..{depth}]-(b) \
+         WHERE a.id = '{source_id}' AND b.id = '{target_id}' \
+           AND ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > '{now_stamp}') \
+         RETURN nodes(p) AS path \
+         ORDER BY length(p) ASC \
+         LIMIT {cap}"
+    )
 }
 
 fn age_params_literal(pairs: &[(&str, &str)]) -> String {
@@ -15088,6 +15162,80 @@ mod tests {
         );
         // Empty dict is harmless (AGE accepts an empty params object).
         assert_eq!(age_params_literal(&[]), "'{}'::agtype");
+    }
+
+    #[test]
+    fn issue_1689_kg_query_cypher_excludes_invalidated_edges() {
+        // #1689 — the AGE current-view kg_query body MUST carry a
+        // per-edge temporal-validity guard so invalidated edges (which
+        // `kg_invalidate_cypher` SETs `valid_until` on rather than
+        // deleting) never appear in a current-view traversal. This pins
+        // the query text without needing a live AGE instance; the
+        // dispatcher's CTE fallback covers the runtime-rejection case.
+        let depth = 3usize;
+        let cypher = build_kg_query_current_view_cypher(depth);
+        assert!(
+            cypher.contains(
+                "ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > $now)"
+            ),
+            "current-view kg_query Cypher missing the valid_until guard: {cypher}"
+        );
+        // The bounded depth is interpolated, not parameterised.
+        assert!(
+            cypher.contains(&format!("related_to*1..{depth}")),
+            "depth not interpolated: {cypher}"
+        );
+        // The start id stays a bound `$vars` param, never interpolated.
+        assert!(
+            cypher.contains("a.id = $start_id"),
+            "start id not parameterised: {cypher}"
+        );
+    }
+
+    #[test]
+    fn issue_1689_find_paths_cypher_excludes_invalidated_edges() {
+        // #1689 — the AGE current-view find_paths body MUST carry the same
+        // per-edge temporal-validity guard as kg_query / the CTE path, so a
+        // retracted link no longer influences path-finding. find_paths inlines
+        // its ids + cut-off (2-arg cypher form), so the guard compares against
+        // an inlined RFC3339 literal rather than a `$now` param.
+        //
+        // These are arbitrary INPUT fixtures fed to the builder; the
+        // assertions below prove the builder round-trips each input verbatim
+        // into the emitted Cypher (the format text — `a.id =`, `[*1..N]`,
+        // `LIMIT` — is the generic openCypher the builder produces).
+        let (src, dst, depth, cap, now) = (
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            4usize,
+            10usize,
+            "2026-06-15T00:00:00+00:00",
+        );
+        let cypher = build_find_paths_current_view_cypher(src, dst, depth, cap, now);
+        assert!(
+            cypher.contains(&format!(
+                "ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > '{now}')"
+            )),
+            "find_paths Cypher missing the valid_until guard: {cypher}"
+        );
+        // Bounded depth interpolated into the untyped variable-length pattern.
+        assert!(
+            cypher.contains(&format!("[*1..{depth}]")),
+            "depth not interpolated: {cypher}"
+        );
+        // Source/target ids inlined (2-arg cypher form) and the cap applied.
+        assert!(
+            cypher.contains(&format!("a.id = '{src}'")),
+            "source id not inlined: {cypher}"
+        );
+        assert!(
+            cypher.contains(&format!("b.id = '{dst}'")),
+            "target id not inlined: {cypher}"
+        );
+        assert!(
+            cypher.contains(&format!("LIMIT {cap}")),
+            "cap not applied: {cypher}"
+        );
     }
 
     #[test]
