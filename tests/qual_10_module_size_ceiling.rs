@@ -322,7 +322,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // provenance). Measured 17_666 + 154 headroom; all closed audit
     // findings with regression tests; the module-split follow-on is
     // tracked under #650-class work for v0.8.
-    ("src/store/postgres.rs", 17_820),
+    // 2026-06-15 (v0.8.0 #1705) — bumped 17_820 → 17_960: migrate_v58
+    // (recall_observations agent_id + namespace identity columns) +
+    // inline DDL. NOTE: the base was already 17_899 (v0.7.1 grew this
+    // module past 17_820 without a lockstep bump — pre-existing QUAL-10
+    // drift greened here). The 17.9k-LOC module split is the highest-
+    // priority manageability target tracked under the v0.8.0 EPIC #1709.
+    ("src/store/postgres.rs", 17_960),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -363,7 +369,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 4,013 ms → 1,206 ms recall regression and the knob follows the
     // mandated uniform resolver ladder; zero speculative surface.
     // Measured post-fix LOC: 10_081. 10_180 = 10_081 + 99 headroom.
-    ("src/config.rs", 10_180),
+    // 2026-06-15 (v0.8.0) — bumped 10_180 → 10_360: pre-existing v0.7.1
+    // drift (config.rs grew to 10_354 via the #1671 curator + #1691
+    // reranker-score-floor knobs without a lockstep bump — NOT touched
+    // by #1705; greened here so the QUAL-10 gate is enforceable again).
+    // Sectioned-config split tracked under v0.8.0 EPIC #1709.
+    ("src/config.rs", 10_360),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -476,7 +487,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // idempotent` regression test pushed the file to 3_769. Growth
     // justified: one schema bump + its replay/idempotency coverage.
     // 3_800 = 3_769 + 31 headroom.
-    ("src/storage/migrations.rs", 3_800),
+    // 2026-06-15 (v0.8.0 #1705) — bumped 3_800 → 3_850: the in-code v58
+    // recall_observations identity-column migration arm (probe-guarded
+    // ALTER/CREATE, SQLite has no ADD COLUMN IF NOT EXISTS).
+    ("src/storage/migrations.rs", 3_850),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

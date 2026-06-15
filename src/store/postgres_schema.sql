@@ -801,6 +801,10 @@ CREATE TABLE IF NOT EXISTS recall_observations (
     observed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     consumed_at            TIMESTAMPTZ NULL,
     consumed_by_memory_id  TEXT        NULL REFERENCES memories(id) ON DELETE CASCADE,
+    -- v0.8.0 #1705 — identity binding (recalling agent + namespace); see
+    -- migrate_v58. Existing schemas pick these up via migrate_v58().
+    agent_id               TEXT        NULL,
+    namespace              TEXT        NULL,
     PRIMARY KEY (recall_id, memory_id)
 );
 
@@ -810,6 +814,10 @@ CREATE INDEX IF NOT EXISTS idx_recall_observations_memory_id
     ON recall_observations(memory_id);
 CREATE INDEX IF NOT EXISTS idx_recall_observations_observed_at
     ON recall_observations(observed_at);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id
+    ON recall_observations(agent_id);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace
+    ON recall_observations(namespace);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- F6 Gap 1 (v0.7.0) — SAL knowledge-graph SQL views.
