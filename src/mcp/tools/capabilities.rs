@@ -684,6 +684,16 @@ pub fn build_capabilities_tools(
         // configured but denies the family, callable_now collapses to
         // false regardless of loaded.
         let allowed = match mcp_config {
+            // #1673/n13 — when there is no resolved caller agent_id (the HTTP
+            // capabilities surface passes None), the per-agent allowlist cannot
+            // make an honest decision: `allowlist_decision(None, ..)` coerces
+            // `aid=""` -> wildcard-or-Deny, which mis-reports callable_now
+            // (allowlisted callers would see false, non-allowlisted true).
+            // Report callable_now from `loaded` alone for an unknown caller.
+            // The MCP surface always resolves a concrete agent_id, so per-agent
+            // gating is unchanged there; ENFORCING the allowlist on the HTTP
+            // surface (which has its own auth model) is tracked for v0.8 (#1695).
+            Some(_) if agent_id.is_none() => true,
             Some(cfg) => match cfg.allowlist_decision(agent_id, family_name) {
                 AllowlistDecision::Disabled | AllowlistDecision::Allow => true,
                 AllowlistDecision::Deny => false,

@@ -13073,6 +13073,34 @@ mod tests {
         assert!(!non_core.callable_now);
     }
 
+    #[test]
+    fn issue_1673_n13_unknown_caller_does_not_falsely_deny_callable_now() {
+        // #1673/n13 — with an active allowlist but NO resolved caller agent_id
+        // (the HTTP capabilities surface passes None), callable_now must follow
+        // `loaded` rather than collapsing to a misleading per-agent deny via
+        // the empty-aid wildcard path.
+        use crate::config::McpConfig;
+        use crate::mcp::build_capabilities_tools;
+        use crate::profile::Profile;
+        use std::collections::HashMap;
+        let mut allowlist = HashMap::new();
+        allowlist.insert("alice".to_string(), vec!["core".to_string()]);
+        let cfg = McpConfig {
+            allowlist: Some(allowlist),
+            ..McpConfig::default()
+        };
+        let tools = build_capabilities_tools(&Profile::full(), Some(&cfg), None);
+        // Every LOADED tool reports callable_now (honest "loaded" view for an
+        // unknown caller) — not a false deny.
+        for t in tools.iter().filter(|t| t.loaded) {
+            assert!(
+                t.callable_now,
+                "loaded tool {} must be callable_now for an unknown caller",
+                t.name
+            );
+        }
+    }
+
     /// build_agent_permitted_families — empty allowlist table returns
     /// None (the early-return path).
     #[test]
