@@ -5,9 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.1] — Patch 1 (unreleased)
+## [0.7.1] — 2026-06-15
+
+Hardening patch line over v0.7.0 (`attested-cortex`). A 26-task,
+adversarial-audit-driven EPIC ([#1683](https://github.com/alphaonedev/ai-memory-mcp/issues/1683))
+closing crash / data-loss, atomicity, knowledge-graph-correctness, governance,
+recall-quality, and capability-honesty gaps surfaced by a full-spectrum
+codegraph + ai-memory NHI audit, plus the substrate + deployment-harness bugs
+caught by a live DigitalOcean **PostgreSQL 18 + Apache AGE + pgvector
+agent-to-agent (A2A) federation** validation run. No schema change (stays at
+**v57**); the advertised surface is unchanged (74 MCP tools at `--profile full`,
+89 production HTTP route registrations / 75 unique paths, 80 CLI subcommands /
+82 under `--features sal`). All four gates green on both feature sets
+(default 5613 tests / sal-postgres 6034 / 0 failed, `clippy -D pedantic`, fmt,
+`cargo audit`).
 
 ### Added
+
+- **HTTP recall runs the autonomous-tier cross-encoder reranker**
+  ([#1691](https://github.com/alphaonedev/ai-memory-mcp/issues/1691)). The HTTP
+  recall surface now applies the same neural cross-encoder rerank stage on the
+  hybrid path (sqlite **and** postgres-SAL) that the MCP/CLI paths run, via a
+  process-global `RuntimeContext` reranker built at `serve` boot — so a recall
+  no longer ranks differently by transport. The envelope reports
+  `hybrid+rerank`.
+- **Operator-configurable reranker score floor** (`#1691`/n14). A new
+  `[reranker].score_floor` config field + `AI_MEMORY_RERANK_SCORE_FLOOR` env
+  var (`off` | `absolute:<f>` | `relative:<f>`) wire the previously-dead
+  `RerankerScoreFloor` calibration capability through to every reranker build
+  site.
+- **Per-namespace curator config** (`[curator]` section,
+  [#1671](https://github.com/alphaonedev/ai-memory-mcp/issues/1671)/n15).
+  `[curator.reflection_namespaces]` makes `curator --reflect --all-namespaces`
+  honor a per-namespace `reflection_pass.enabled` gate (previously an inert
+  no-op), and `[curator.confidence_decay_half_life_days]` lets the
+  confidence-decay sweep apply a per-namespace half-life on both the sqlite
+  per-row and postgres bulk paths.
 
 - **`memory_reflect`: top-level `entity_id` convenience param**
   ([#1665](https://github.com/alphaonedev/ai-memory-mcp/issues/1665)). The
@@ -51,6 +84,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left as `"*"` (it fires per session, not per tool dispatch). Re-running
   `ai-memory install claude-code --apply` with the new binary cleanly
   replaces a prior `"*"` managed entry.
+
+- **CRITICAL: HNSW non-finite distance crashed recall**
+  ([#1684](https://github.com/alphaonedev/ai-memory-mcp/issues/1684)). A `NaN`
+  / non-finite cosine distance fed `partial_cmp().unwrap()` in the vector-index
+  sort, panicking the MCP/HTTP process mid-recall. Non-finite distances now
+  floor to `f32::MAX` and sorts use `total_cmp`; the seed-path is finiteness-checked.
+- **Federation catch-up could silently drop a row on a failed apply**
+  ([#1687](https://github.com/alphaonedev/ai-memory-mcp/issues/1687)). The
+  catch-up watermark now advances only on a successful, non-halted apply across
+  all three branches, so a transient apply error no longer skips the row on the
+  next pass.
+- **Persona generation + online synthesis made atomic**
+  ([#1688](https://github.com/alphaonedev/ai-memory-mcp/issues/1688),
+  [#1700](https://github.com/alphaonedev/ai-memory-mcp/issues/1700)). Persona
+  insert+links+metadata and the `memory_store` synthesis apply (N updates + N
+  deletes + insert) are wrapped in transactions so a mid-sequence failure can no
+  longer leave a half-written persona / partially-merged cluster.
+- **HNSW semantic recall detected dimension mismatch instead of returning garbage**
+  ([#1692](https://github.com/alphaonedev/ai-memory-mcp/issues/1692)). The HNSW
+  branch recomputes cosine via `cosine_similarity_checked` and skips (counting)
+  dimension-mismatched rows rather than scoring across incompatible vector spaces.
+- **GC pruners wired + offload TTL reaped on every surface**
+  ([#1690](https://github.com/alphaonedev/ai-memory-mcp/issues/1690)). The
+  `offloaded_blobs` TTL sweep and `recall_observations` pruner are now spawned in
+  the `serve` bootstrap; the MCP `memory_offload` path opportunistically reaps
+  expired blobs (pure-MCP deployments run no background sweep); and the
+  `federation_nonce_cache` disk mirror is pruned on eviction + bounded on
+  hydration, closing an unbounded-growth class.
+- **MCP surface installs the `GOVERNANCE_PRE_ACTION` hook**
+  ([#1685](https://github.com/alphaonedev/ai-memory-mcp/issues/1685)). The
+  agent-action governance gate now installs on the MCP stdio surface, not just
+  HTTP `serve`.
+- **`rules keygen` warns when it disables enabled unsigned rules**
+  ([#1686](https://github.com/alphaonedev/ai-memory-mcp/issues/1686)).
+- **`rules` CLI migrates the db on open**
+  ([#1690](https://github.com/alphaonedev/ai-memory-mcp/issues/1690)-adjacent;
+  surfaced by the DigitalOcean A2A run). `ai-memory rules <verb>` opened the db
+  with a raw connection that skipped migrations, so on a fresh db
+  `governance_rules` did not exist (`rules_store::list: prepare — no such table`),
+  breaking Form-7 governance bootstrap on fresh (especially postgres-backed)
+  fleet peers. It now opens via the migrating path like every other command.
+- **Knowledge-graph traversals exclude invalidated edges**
+  ([#1689](https://github.com/alphaonedev/ai-memory-mcp/issues/1689)). The
+  postgres `find_paths` CTE and the Apache-AGE `kg_query` / `find_paths` Cypher
+  current-view traversals now filter `valid_until`, matching the sqlite + CTE
+  default so a retracted link no longer influences current-view results.
+- **Capability honesty**
+  ([#1672](https://github.com/alphaonedev/ai-memory-mcp/issues/1672),
+  [#1673](https://github.com/alphaonedev/ai-memory-mcp/issues/1673),
+  [#1674](https://github.com/alphaonedev/ai-memory-mcp/issues/1674)).
+  `curator_mode` reports the SAL feature gate honestly, `callable_now` is honest
+  for an unknown caller, and the non-`sal` build reports the live
+  `db_schema_version` instead of a hardcoded `0`.
+- **do-1461 DigitalOcean A2A harness** (surfaced + fixed during the postgres+AGE
+  validation run). The `serve` unit passed both `--db` and `--store-url` (v0.7.1
+  rejects the pair) → postgres peers pass only `--store-url`; provisioning ran
+  the Batman governance step before the daemon/postgres schema existed →
+  reordered so the daemon (schema auto-migrate) comes first and the secure-env
+  battery is re-shipped after; VPC CIDR collision avoided.
+
+### Documentation
+
+- **100% schema-version + surface-count drift sweep** across living docs + the
+  GitHub Pages site: schema **v57**, **89** route registrations / **75** unique
+  paths, **80**/**82** CLI subcommands, **74** MCP tools — reconciled to the code
+  SSOT constants; frozen `docs/v0.7.0/**` release/audit artifacts preserved as
+  historical record.
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
