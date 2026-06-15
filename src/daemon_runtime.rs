@@ -3742,7 +3742,8 @@ pub async fn bootstrap_serve(
         } else {
             tracing::info!(
                 "wire_check pre-action hook installed (agent-action gate active for \
-                 FilesystemWrite/NetworkRequest/ProcessSpawn/Bash/Custom)"
+                 FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom \
+                 have no egress sink yet — structural coverage tracked v0.8 #1695)"
             );
         }
     }
