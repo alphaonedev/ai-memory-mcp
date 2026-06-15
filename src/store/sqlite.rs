@@ -743,6 +743,44 @@ impl MemoryStore for SqliteStore {
             .map_err(box_err)
     }
 
+    async fn record_recall_observation(
+        &self,
+        recall_id: &str,
+        candidates: &[(String, String, i64, f64)],
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let cands: Vec<crate::observations::Candidate<'_>> = candidates
+            .iter()
+            .map(
+                |(memory_id, retriever, rank, score)| crate::observations::Candidate {
+                    memory_id,
+                    retriever,
+                    rank: *rank,
+                    score: *score,
+                },
+            )
+            .collect();
+        crate::observations::record_recall(&conn, recall_id, &cands).map_err(box_err)
+    }
+
+    async fn mark_recall_consumed(
+        &self,
+        recall_id: &str,
+        cited_memory_ids: &[String],
+        consumed_by: &str,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let refs: Vec<&str> = cited_memory_ids.iter().map(String::as_str).collect();
+        crate::observations::mark_consumed(&conn, recall_id, &refs, consumed_by).map_err(box_err)
+    }
+
+    async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1))).to_rfc3339();
+        crate::observations::gc::prune_before(&conn, &cutoff).map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
