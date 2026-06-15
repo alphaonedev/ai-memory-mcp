@@ -5708,9 +5708,15 @@ impl PostgresStore {
                 SELECT edges.next_id, t.depth + 1, t.path || edges.next_id
                 FROM traversal t
                 JOIN (
+                    -- #1689 — exclude invalidated edges from traversal so a
+                    -- retracted link no longer influences path-finding, matching
+                    -- the sqlite find_paths current-view default and pg
+                    -- kg_query_cte_filtered. Both UNION arms get the filter.
                     SELECT source_id AS from_id, target_id AS next_id FROM memory_links
+                    WHERE valid_until IS NULL OR valid_until > NOW()
                     UNION
                     SELECT target_id AS from_id, source_id AS next_id FROM memory_links
+                    WHERE valid_until IS NULL OR valid_until > NOW()
                 ) edges ON edges.from_id = t.current_id
                 WHERE t.depth < $3
                   AND NOT (edges.next_id = ANY(t.path))
@@ -5846,6 +5852,15 @@ impl PostgresStore {
         assert_age_id_safe(source_id).map_err(|detail| StoreError::InvalidInput { detail })?;
         assert_age_id_safe(target_id).map_err(|detail| StoreError::InvalidInput { detail })?;
 
+        // #1689 — NOTE: this AGE (Apache-AGE/cypher) traversal does NOT yet
+        // filter invalidated edges (no `valid_until` predicate). The DEFAULT
+        // CTE path (`find_paths_cte` above) now excludes them, matching sqlite
+        // and `kg_query_cte_filtered`; the AGE branch is opt-in (apache-age
+        // feature). Closing it requires the AGE relationship to carry
+        // `valid_until` as a property — verify against a live AGE instance
+        // before adding `WHERE ALL(r IN relationships(p) WHERE ...)`, since a
+        // filter on a missing property would silently drop all paths. Tracked
+        // under #1689 (AGE-edge-property follow-up).
         let sql = format!(
             "SELECT path FROM cypher('memory_graph', $$ \
              MATCH p = (a)-[*1..{depth}]-(b) \
