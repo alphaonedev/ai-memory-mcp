@@ -6178,14 +6178,14 @@ mod tests {
         // the deferred-audit supervisor + gc + wal_checkpoint +
         // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
         // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
-        // daily-counter reset sweep). v0.7 B3-fix2 gates the
-        // family-descriptor embedding precompute behind
-        // `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF) so
-        // it does not contend with HTTP request-path embeds under
+        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep).
+        // v0.7 B3-fix2 gates the family-descriptor embedding precompute
+        // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
+        // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to six when the
+        // for the rationale. The task count reverts to seven when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 6);
+        assert_eq!(bs.task_handles.len(), 7);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();
