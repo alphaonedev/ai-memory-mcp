@@ -30,6 +30,7 @@ PROV_STEPS := \
   25_ollama_embed.sh \
   30_config.sh \
   45_zero_touch.sh \
+  50_federation.sh \
   46_batman.sh \
   50_federation.sh
 

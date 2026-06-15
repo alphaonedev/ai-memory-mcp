@@ -9,11 +9,15 @@ locals {
   regions = distinct([for n in values(var.nodes) : n.region])
 
   # DO VPC ip_range must be unique per account, so each region gets its own
-  # deterministic, non-overlapping /16: 10.<10+sorted_index>.0.0/16. Sorting
-  # makes the assignment a stable pure function of the region set (nyc3 -> 10.10,
-  # sfo2 -> 10.11, …) so re-plans don't churn already-created VPCs.
+  # deterministic, non-overlapping /16: 10.<30+sorted_index>.0.0/16. Sorting
+  # makes the assignment a stable pure function of the region set (nyc3 -> 10.30,
+  # sfo2 -> 10.31, …) so re-plans don't churn already-created VPCs.
+  # NOTE (transient, 2026-06-15 DO A2A run): base shifted 10->30 to avoid a
+  # collision with two leftover "default" (undeletable) VPCs from a prior
+  # 15-node run still holding 10.10 (fra1) + 10.12 (sgp1). Revert to 10 once
+  # those orphans are cleared from the account.
   region_cidr = {
-    for idx, r in sort(local.regions) : r => "10.${10 + idx}.0.0/16"
+    for idx, r in sort(local.regions) : r => "10.${30 + idx}.0.0/16"
   }
 }
 
