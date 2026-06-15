@@ -11765,6 +11765,67 @@ impl MemoryStore for PostgresStore {
         Ok(out)
     }
 
+    async fn record_recall_observation(
+        &self,
+        recall_id: &str,
+        candidates: &[(String, String, i64, f64)],
+    ) -> StoreResult<usize> {
+        // #1705 — delegates to the inherent twin (no longer dead code).
+        self.recall_observation_insert(recall_id, candidates).await
+    }
+
+    async fn mark_recall_consumed(
+        &self,
+        recall_id: &str,
+        cited_memory_ids: &[String],
+        consumed_by: &str,
+    ) -> StoreResult<usize> {
+        // #1705 — postgres twin of `crate::observations::mark_consumed`.
+        // Idempotent: only flips rows still `consumed = FALSE`.
+        if cited_memory_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin mark_recall_consumed tx", e))?;
+        let mut flipped: usize = 0;
+        for mid in cited_memory_ids {
+            let n = sqlx::query(
+                "UPDATE recall_observations
+                    SET consumed = TRUE, consumed_at = $1, consumed_by_memory_id = $2
+                  WHERE recall_id = $3 AND memory_id = $4 AND consumed = FALSE",
+            )
+            .bind(now)
+            .bind(consumed_by)
+            .bind(recall_id)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("mark recall_observation consumed", e))?
+            .rows_affected();
+            flipped += usize::try_from(n).unwrap_or(0);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit mark_recall_consumed tx", e))?;
+        Ok(flipped)
+    }
+
+    async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
+        // #1705 — inlined (avoids the inherent same-name collision).
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1));
+        let n = sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("recall_observation_gc (trait)", e))?
+            .rows_affected();
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed

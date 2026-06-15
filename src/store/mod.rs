@@ -1404,6 +1404,39 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1705 (v0.8.0) — recall-observation ledger WRITE, promoted to the
+    /// SAL so postgres-backed daemons populate the ledger (pre-#1705 the
+    /// write side was sqlite-only free-fns, so a postgres daemon never
+    /// recorded recalls). `candidates` = `(memory_id, retriever, rank,
+    /// score)`. Returns rows inserted. Default `Ok(0)` so a non-ledger /
+    /// in-memory adapter round-trips cleanly.
+    async fn record_recall_observation(
+        &self,
+        _recall_id: &str,
+        _candidates: &[(String, String, i64, f64)],
+    ) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// #1705 — flip the `consumed` flag for every cited memory under a
+    /// recall id (the downstream-usage signal). Idempotent (only flips
+    /// rows still `consumed = 0`). Returns rows flipped. Default `Ok(0)`.
+    async fn mark_recall_consumed(
+        &self,
+        _recall_id: &str,
+        _cited_memory_ids: &[String],
+        _consumed_by: &str,
+    ) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// #1705 — TTL prune of the `recall_observations` ledger (postgres
+    /// twin of `crate::observations::gc::prune`). Deletes rows older than
+    /// `ttl_days`. Returns rows pruned. Default `Ok(0)`.
+    async fn recall_observation_gc(&self, _ttl_days: i64) -> StoreResult<usize> {
+        Ok(0)
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///

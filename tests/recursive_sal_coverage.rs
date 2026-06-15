@@ -140,6 +140,41 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         obs.is_empty(),
         "no observations exist for a recall_id this test never wrote"
     );
+
+    // #1705 — record_recall_observation / mark_recall_consumed /
+    // recall_observation_gc round-trip through the SAL trait, exercised on
+    // BOTH adapters (this is the write-side parity the ledger lacked: pre-
+    // #1705 a postgres daemon never populated the ledger). Uses base_id as
+    // both the recalled candidate and the consuming memory; rid is unique
+    // so the read filter is deterministic on the shared CI database.
+    let rid = format!("sal-cov-rec-{}", uuid_like());
+    let wrote = store
+        .record_recall_observation(&rid, &[(base_id.clone(), "hybrid".to_string(), 1, 0.9)])
+        .await
+        .expect("record_recall_observation ok");
+    assert_eq!(wrote, 1, "one ledger row written via the SAL trait");
+    let listed = store
+        .list_recall_observations(Some(&rid), None, None, None, 10)
+        .await
+        .expect("list after record ok");
+    assert_eq!(listed.len(), 1, "the written row is listed");
+    assert!(!listed[0].consumed, "fresh row is unconsumed");
+    let flipped = store
+        .mark_recall_consumed(&rid, &[base_id.clone()], &base_id)
+        .await
+        .expect("mark_recall_consumed ok");
+    assert_eq!(flipped, 1, "the cited row flipped to consumed");
+    let consumed = store
+        .list_recall_observations(Some(&rid), Some(true), None, None, 10)
+        .await
+        .expect("list consumed ok");
+    assert_eq!(consumed.len(), 1, "the consumed row lists under consumed=true");
+    // A 10-year TTL prunes nothing recent (and nothing co-resident is that old).
+    let pruned = store
+        .recall_observation_gc(3650)
+        .await
+        .expect("recall_observation_gc ok");
+    assert_eq!(pruned, 0, "recent row not pruned by a 10-year TTL");
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent
