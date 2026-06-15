@@ -1212,7 +1212,10 @@ mod tests {
     #[test]
     fn issue_1684_cosine_distance_non_finite_collapses_to_max() {
         assert_eq!(cosine_distance(&[f32::NAN, 1.0], &[1.0, 1.0]), f32::MAX);
-        assert_eq!(cosine_distance(&[f32::INFINITY, 0.0], &[1.0, 0.0]), f32::MAX);
+        assert_eq!(
+            cosine_distance(&[f32::INFINITY, 0.0], &[1.0, 0.0]),
+            f32::MAX
+        );
         assert!(cosine_distance(&[1.0, 0.0], &[1.0, 0.0]).is_finite());
     }
 
