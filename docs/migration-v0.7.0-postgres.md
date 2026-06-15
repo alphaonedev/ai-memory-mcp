@@ -96,7 +96,7 @@ ai-memory schema-init \
 ```
 
 Idempotent on rerun. Exit code 0 + the human summary reporting
-`schema_version: 55` is the success signal (pass `--json` for the
+`schema_version: 57` is the success signal (pass `--json` for the
 machine-parseable report, which also carries `age_projection_created`
 and `embedding_dim`):
 
@@ -107,7 +107,7 @@ schema initialized at <url>
   views: <count>
   functions: <count>
   extensions: [<list>]
-  schema_version: 55
+  schema_version: 57
 ```
 
 ## Step 2 — Dry-run the migration

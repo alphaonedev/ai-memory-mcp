@@ -6,7 +6,7 @@
 
 1. **MCP tool server** -- stdio JSON-RPC server exposing 74 advertised entries at `--profile full` (73 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 88 route registrations / 75 unique URL paths at v0.7.0 (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 89 route registrations / 75 unique URL paths at v0.7.0 (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
@@ -382,7 +382,7 @@ Added in schema migration v3 -> v4 (shown in its original 16-column shape). Stor
 
 ### `schema_version` table
 
-Tracks migration state. Current version: **55** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
+Tracks migration state. Current version: **57** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
 
 ## Recall Scoring Formula
 
@@ -833,7 +833,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (88 route registrations / 75 unique URL paths at v0.7.0).
+Start the HTTP daemon (89 route registrations / 75 unique URL paths at v0.7.0).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077

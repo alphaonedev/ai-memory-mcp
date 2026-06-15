@@ -1057,6 +1057,12 @@
               "null"
             ]
           },
+          "entity_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metadata": {},
           "namespace": {
             "type": [

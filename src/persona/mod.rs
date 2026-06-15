@@ -409,6 +409,19 @@ impl<'a> PersonaGenerator<'a> {
             version: 1,
         };
 
+        // #1688 — the persona write is documented as atomic (see the "atomic
+        // invariant" note above) but its writes previously ran un-wrapped, so a
+        // mid-sequence failure left an orphaned / mis-attested persona row.
+        // Wrap the memory insert + N derived_from links + the metadata patch
+        // (none of which use an inner transaction) in one unit; the guard rolls
+        // back on any early `?` (Transaction's Drop default). `generate()` is a
+        // top-level call so there is no nesting. The signed_events emit is
+        // committed-after (it self-transacts via append_signed_event).
+        let persona_tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin persona write transaction")?;
+
         let persona_id = db::insert(self.conn, &persona_mem)
             .with_context(|| format!("inserting persona for {entity_id} v{version}"))?;
 
@@ -512,6 +525,16 @@ impl<'a> PersonaGenerator<'a> {
                 rusqlite::params![new_metadata_str, &now, &persona_id],
             )
             .context("patch persona metadata with signature/attest_level")?;
+
+        // #1688 — commit the insert + links + attest_level/signature patch as
+        // ONE unit before emitting the audit event. A failure anywhere above
+        // rolls all of them back (no orphaned / mis-attested row). The
+        // signed_events emit below self-transacts, so it runs AFTER commit: a
+        // failed emit leaves the persona durably correct but un-audited — the
+        // lesser of the two failure modes.
+        persona_tx
+            .commit()
+            .context("commit persona write transaction")?;
 
         emit_persona_generated_event(
             self.conn,

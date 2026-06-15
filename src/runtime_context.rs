@@ -98,6 +98,18 @@ pub struct RuntimeContext {
     /// the in-memory shape lets the encryption substrate land without
     /// forcing a key-rotation tool design decision in the same patch.
     pub keypair_cache: Arc<Mutex<HashMap<String, crate::encryption::Keypair>>>,
+
+    /// #1691 — process-global cross-encoder reranker for the autonomous
+    /// tier. Installed once at `serve` boot (HTTP daemon) when the
+    /// resolved tier enables the cross-encoder, so the HTTP recall
+    /// handler applies the SAME neural rerank stage the MCP/CLI recall
+    /// paths already run (closing the documented HTTP-skips-rerank drift,
+    /// formerly the n23 NOTE in `handlers/recall.rs`). Empty on
+    /// keyword/semantic/smart tiers and in tests — recall then runs
+    /// without the rerank stage. Interior `OnceLock` keeps
+    /// `RuntimeContext: Default` so no `AppState` construction site has to
+    /// change to carry the handle.
+    pub reranker: OnceLock<Arc<crate::reranker::BatchedReranker>>,
 }
 
 impl std::fmt::Debug for RuntimeContext {
@@ -123,6 +135,14 @@ impl std::fmt::Debug for RuntimeContext {
             .field("audit", &self.audit)
             .field("recall_tracker", &"<recall_tracker>")
             .field("keypair_cache", &"<keypair_cache>")
+            .field(
+                "reranker",
+                &if self.reranker.get().is_some() {
+                    "<reranker>"
+                } else {
+                    "<unset>"
+                },
+            )
             .finish()
     }
 }
@@ -233,6 +253,24 @@ impl RuntimeContext {
     pub fn global_arc() -> Arc<RuntimeContext> {
         Arc::clone(Self::global_arc_ref())
     }
+
+    /// #1691 — install the process-global cross-encoder reranker. First
+    /// writer wins (`OnceLock` semantics); subsequent installs are
+    /// silently ignored. Called once at `serve` boot via interior
+    /// mutability on the singleton — the same `set_*`-on-the-global
+    /// pattern the other extracted statics use, so no `AppState`
+    /// construction site changes.
+    pub fn install_reranker(&self, reranker: Arc<crate::reranker::BatchedReranker>) {
+        let _ = self.reranker.set(reranker);
+    }
+
+    /// #1691 — borrow the installed cross-encoder reranker, if any.
+    /// `None` on non-autonomous tiers and in tests, where HTTP recall
+    /// runs without the neural rerank stage.
+    #[must_use]
+    pub fn reranker(&self) -> Option<&Arc<crate::reranker::BatchedReranker>> {
+        self.reranker.get()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +280,26 @@ impl RuntimeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_and_read_reranker_on_fresh_context() {
+        // #1691 — the reranker slot is empty on a fresh context (every
+        // non-autonomous tier + all test scaffolds), installs once, and
+        // is first-writer-wins. Exercised on a FRESH instance so it never
+        // pollutes the process-global singleton other tests share.
+        let ctx = RuntimeContext::default();
+        assert!(ctx.reranker().is_none(), "fresh context has no reranker");
+        ctx.install_reranker(Arc::new(crate::reranker::BatchedReranker::new(
+            crate::reranker::CrossEncoder::new(),
+        )));
+        assert!(ctx.reranker().is_some(), "reranker present after install");
+        // First-writer-wins (OnceLock): a second install is ignored and
+        // does not panic.
+        ctx.install_reranker(Arc::new(crate::reranker::BatchedReranker::new(
+            crate::reranker::CrossEncoder::new(),
+        )));
+        assert!(ctx.reranker().is_some());
+    }
 
     #[test]
     fn runtime_context_default_is_constructible() {

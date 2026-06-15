@@ -137,7 +137,19 @@ const SQLITE_RELATIONAL_TABLES: &[&str] = &[
     "subscription_events",
     "subscription_dlq",
     "agent_quotas",
+    // #1689/n19 — v52 transcript_line_dedup is created on BOTH adapters
+    // (sqlite migration 0044 + postgres migrate_v52), so the parity assertion
+    // MUST cover it.
+    "transcript_line_dedup",
 ];
+
+/// #1689/n19 — sqlite/daemon-local tables the Postgres adapter intentionally
+/// does NOT mirror, so they are EXCLUDED from the parity assertion above.
+/// `federation_nonce_cache` (v51) is daemon-local replay state: postgres
+/// `migrate_v51` is a deliberate version-stamp no-op, so the table exists only
+/// on the sqlite side. Documented here so a future reader does not "fix" the
+/// gap by adding it to `SQLITE_RELATIONAL_TABLES` (which would fail the test).
+const SQLITE_ONLY_DAEMON_LOCAL_TABLES: &[&str] = &["federation_nonce_cache"];
 
 /// `Postgres`-only relations (added for the F6 SAL surfaces).
 /// Documented here so the parity test is explicit about which rows
@@ -189,6 +201,15 @@ async fn schema_versions_match_across_adapters() {
 
 #[tokio::test]
 async fn postgres_covers_every_sqlite_relational_table() {
+    // #1689/n19 — guard the intentional exclusion: daemon-local sqlite-only
+    // tables must NEVER be added to the parity set (postgres deliberately
+    // lacks them). Runs unconditionally, even when no live PG is configured.
+    for t in SQLITE_ONLY_DAEMON_LOCAL_TABLES {
+        assert!(
+            !SQLITE_RELATIONAL_TABLES.contains(t),
+            "{t} is daemon-local sqlite-only (postgres migrate_v51 is a no-op) and must not be in the parity set"
+        );
+    }
     let Some(url) = postgres_url() else {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
@@ -269,7 +290,16 @@ async fn sqlite_only_artefacts_documented() {
     //   - `scope_idx` / `agent_id_idx` as VIRTUAL columns.
     //     Postgres equivalent: STORED generated columns — same
     //     semantics, slightly more disk space, no per-read recomputation.
+    //   - The `SQLITE_ONLY_DAEMON_LOCAL_TABLES` relational tables
+    //     (#1689/n19) — daemon-local replay state (`federation_nonce_cache`,
+    //     v51) that postgres deliberately does NOT mirror (`migrate_v51` is
+    //     a version-stamp no-op), so they are EXCLUDED from
+    //     `SQLITE_RELATIONAL_TABLES` and the `postgres_covers_*` parity
+    //     assertion. The exclusion is guarded in that test.
     //
     // No assertions; the test passes as documentation.
-    eprintln!("SQLite-only constructs documented (FTS5 vtable + sync triggers)");
+    eprintln!(
+        "SQLite-only constructs documented (FTS5 vtable + sync triggers + {} daemon-local table(s))",
+        SQLITE_ONLY_DAEMON_LOCAL_TABLES.len()
+    );
 }

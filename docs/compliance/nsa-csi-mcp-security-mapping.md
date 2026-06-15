@@ -2,7 +2,7 @@
 
 **Document classification:** Public-facing, procurement-grade.
 **Date:** 2026-05-23.
-**ai-memory version:** v0.7.0 (sqlite + postgres schema **v55**, lockstep).
+**ai-memory version:** v0.7.0 (sqlite + postgres schema **v57**, lockstep).
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json) (27 capabilities, every claim codegraph-verified at commit `4add7a8528d4c16d696b391ec6e2890269669a84`).
 **Companion document:** [`docs/compliance/honest-limitations.md`](honest-limitations.md) — what the substrate does NOT defend against.
 
@@ -87,7 +87,7 @@ The NSA document warns that MCP servers exposed to high-volume or adversarial qu
 
 ### 3.9 Tool parameter injection (NSA concern i, real-world issue)
 
-The NSA document cites tool-parameter injection as a recurring real-world failure class — an attacker embeds adversarial parameters in a tool-invocation payload that the MCP server does not adequately validate. ai-memory's defense is the `RequestValidator` DTO-bundled validation surface introduced under #966 (`pub struct RequestValidator` at `src/validate.rs:1027`). Every wire-entry layer — 88 HTTP routes, 74 MCP tools, 80 CLI subcommands (sal) / 78 (default) — routes DTO-bundling validation through `RequestValidator::validate_create`, `validate_update`, `validate_memory`, `validate_link_triple`, `validate_consolidate`, `validate_id_and_namespace`, `validate_owner_write`, `validate_confidence_and_priority`. The typed `ValidationError { field, reason }` carries explicit field attribution while preserving byte-equal wire-side error messages via a `Display` impl that mirrors the legacy `bail!` shape. Single-field free functions (`validate_id`, `validate_namespace`, `validate_agent_id`, `validate_source_uri`, `validate_citation`, `validate_source_span`) remain the lowest-level primitive. Adding a new cross-field invariant is one struct method addition rather than three audited per-surface edits.
+The NSA document cites tool-parameter injection as a recurring real-world failure class — an attacker embeds adversarial parameters in a tool-invocation payload that the MCP server does not adequately validate. ai-memory's defense is the `RequestValidator` DTO-bundled validation surface introduced under #966 (`pub struct RequestValidator` at `src/validate.rs:1027`). Every wire-entry layer — 89 HTTP routes, 74 MCP tools, 82 CLI subcommands (sal) / 80 (default) — routes DTO-bundling validation through `RequestValidator::validate_create`, `validate_update`, `validate_memory`, `validate_link_triple`, `validate_consolidate`, `validate_id_and_namespace`, `validate_owner_write`, `validate_confidence_and_priority`. The typed `ValidationError { field, reason }` carries explicit field attribution while preserving byte-equal wire-side error messages via a `Display` impl that mirrors the legacy `bail!` shape. Single-field free functions (`validate_id`, `validate_namespace`, `validate_agent_id`, `validate_source_uri`, `validate_citation`, `validate_source_span`) remain the lowest-level primitive. Adding a new cross-field invariant is one struct method addition rather than three audited per-surface edits.
 
 ### 3.10 Tool invocation path confusion (NSA concern j, real-world issue)
 

@@ -650,6 +650,65 @@ fn test_rerank_max_seq_env_overrides_config_and_default() {
 }
 
 // ---------------------------------------------------------------------------
+// 8c. #1691/n14 — AI_MEMORY_RERANK_SCORE_FLOOR env var overrides the
+//     [reranker].score_floor config field through
+//     AppConfig::resolve_reranker_score_floor(); unparseable values fall
+//     through layer by layer to the compiled default (Off).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_rerank_score_floor_env_overrides_config_and_default() {
+    use ai_memory::config::RerankerSection;
+    use ai_memory::reranker::RerankerScoreFloor;
+
+    let cfg = AppConfig {
+        reranker: Some(RerankerSection {
+            score_floor: Some("absolute:0.3".to_string()),
+            ..RerankerSection::default()
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env unset → config wins over compiled default ----
+    let guard_a = MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_RERANK_SCORE_FLOOR, None)]);
+    assert_eq!(
+        cfg.resolve_reranker_score_floor(),
+        RerankerScoreFloor::Absolute(0.3),
+        "[reranker].score_floor must beat the compiled default",
+    );
+    drop(guard_a);
+
+    // ---- Branch B: env beats config ----
+    let guard_b = MultiEnvVarGuard::apply(&[(
+        ai_memory::config::ENV_RERANK_SCORE_FLOOR,
+        Some("relative:0.5"),
+    )]);
+    assert_eq!(
+        cfg.resolve_reranker_score_floor(),
+        RerankerScoreFloor::RelativeToTop(0.5),
+        "AI_MEMORY_RERANK_SCORE_FLOOR env MUST beat [reranker] config",
+    );
+    drop(guard_b);
+
+    // ---- Branch C: garbage env falls through to config; the compiled
+    //                default (Off) backstops when no layer is usable ----
+    for bad in ["garbage", "absolute:nope", "bogus:0.5"] {
+        let guard =
+            MultiEnvVarGuard::apply(&[(ai_memory::config::ENV_RERANK_SCORE_FLOOR, Some(bad))]);
+        assert_eq!(
+            cfg.resolve_reranker_score_floor(),
+            RerankerScoreFloor::Absolute(0.3),
+            "inadmissible env value {bad:?} must fall through to the [reranker] section",
+        );
+        assert_eq!(
+            AppConfig::default().resolve_reranker_score_floor(),
+            RerankerScoreFloor::Off,
+            "no usable env/config layer must bottom out on the compiled default (Off)",
+        );
+        drop(guard);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 9. #1598 — AI_MEMORY_EMBED_{BACKEND,BASE_URL,MODEL,API_KEY} env vars
 //    override the [embeddings] config section through
 //    AppConfig::resolve_embeddings() (env-var table rows #72-75).

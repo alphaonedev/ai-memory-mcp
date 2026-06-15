@@ -36,7 +36,7 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends have **schema parity at v55** as of v0.7.0
+The two backends have **schema parity at v57** as of v0.7.0
 (`CURRENT_SCHEMA_VERSION = 57` on both ladders) — every feature that
 works on sqlite works on postgres.
 
@@ -206,7 +206,7 @@ What it does (see `src/cli/schema_init.rs`):
    afterwards; `embedding_dim_migrated: true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 55`) or the `--json` report.
+   `schema_version: 57`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -624,7 +624,7 @@ endpoint availability:
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
 
-Schema parity at v55 means `ai-memory migrate` sqlite → postgres
+Schema parity at v57 means `ai-memory migrate` sqlite → postgres
 carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both

@@ -159,7 +159,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.2** | `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v56** | `EXPECTED_SCHEMA=56`; postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 56` (`src/storage/migrations.rs`) |
+| ai-memory postgres schema | **v57** | `EXPECTED_SCHEMA=57`; postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 57` (`src/storage/migrations.rs`) |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)

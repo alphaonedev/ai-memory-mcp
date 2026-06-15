@@ -213,12 +213,13 @@ impl Default for ReflectionPassConfig {
 ///
 /// Operates over the SAL [`MemoryStore`] trait (issue #1548) so it runs
 /// against the SQLite *or* Postgres adapter; gated on the `sal` feature
-/// (the trait itself is `sal`-gated). Wired into the curator's
-/// `--reflect` CLI mode via [`run_reflection_pass`] and the
-/// `--store-url --daemon` upkeep sweep; not yet wired into the autonomy
-/// loop's per-cycle sweep (that's a v0.7.1+ pivot once the operator has
-/// had a chance to run the pass manually and vet the proposed
-/// reflections).
+/// (the trait itself is `sal`-gated). Invoked from BOTH the curator's
+/// `--reflect` CLI mode AND the `--store-url --daemon` upkeep sweep — both
+/// call [`run_reflection_pass`], so the pass runs identically on a one-shot
+/// CLI invocation and on each daemon cycle. It is NOT yet wired into the
+/// (non-`--store-url`) autonomy loop's per-cycle sweep (that's a v0.7.1+
+/// pivot once the operator has run the pass manually and vetted the
+/// proposed reflections).
 #[cfg(feature = "sal")]
 pub(crate) struct ReflectionPass<'a> {
     /// SAL store handle. Reads through [`MemoryStore::list`] /

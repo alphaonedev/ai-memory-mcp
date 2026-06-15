@@ -20,6 +20,7 @@ A flat `ai-memory reflect` CLI verb would expose the substrate primitive to the 
 The CLI surfaces reflection only through actor-named higher-level verbs that name what is happening:
 
 - **`ai-memory curator --reflect`** — fires a curator pass. The curator uses `models.llm` (the configured second LLM, decorrelated from the producing LLM by deployment discipline) to reflect on memories in the namespace. This is the bias-displaced path.
+  - **Build requirement (#1675).** `curator --reflect` (the LLM-backed reflection-synthesis pass) is `#[cfg(feature = "sal")]`-gated — it runs over the SAL `MemoryStore` trait, so it requires a binary built `--features sal` **and** a configured LLM client. The default `sqlite-bundled` build hard-bails with `curator --reflect requires a binary built with --features sal` (`src/cli/curator.rs:548-560`). `--features sal` stays pure SQLite (it brings the trait + `SqliteStore` adapter; `sal-postgres` is the Postgres backend), so this is a build-flag precondition, not a Postgres requirement. Distinct from the ungated `ai-memory reflect` *write primitive* (#655), which ships in every build.
 - **`ai-memory consolidate`** — substrate-side merge of multiple source memories into a synthesized memory. Uses the curator path internally.
 - **`ai-memory export-reflections`** — file-backed export of existing reflection chains for audit, archival, or pipeline handoff.
 - **`ai-memory verify-reflection-chain`** — external verifier walking `reflects_on` edges. Audits chain integrity, not writes.

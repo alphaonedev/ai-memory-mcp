@@ -121,7 +121,23 @@ pub async fn get_capabilities(
         }
     };
     #[cfg(not(feature = "sal"))]
-    let db_schema_version: i64 = 0;
+    let db_schema_version: i64 = {
+        // #1674 — the non-sal build previously hard-coded 0, mis-reporting the
+        // shipping default binary's schema as un-migrated while §24 advertises
+        // lockstep v57. Read the live MAX(version) from the schema_version
+        // table — exactly what the sqlite SAL adapter does
+        // (SqliteStore::schema_version via SELECT_SCHEMA_VERSION_SQL). Falls
+        // back to 0 only when the table is empty (fresh pre-migration DB) so
+        // the endpoint never 500s on a cold-start race.
+        let lock = app.db.lock().await;
+        lock.0
+            .query_row(
+                crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    };
 
     match result {
         Ok(mut v) => {

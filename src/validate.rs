@@ -1090,9 +1090,9 @@ pub fn validate_consolidate(
 // validate namespace + validate agent_id + ..." sequence in its own
 // handler entry. The mechanical-line duplication grew alongside the
 // substrate's wire surface (at v0.7.0:
-// `EXPECTED_PRODUCTION_ROUTES_COUNT=87` HTTP routes +
+// `EXPECTED_PRODUCTION_ROUTES_COUNT=89` HTTP routes +
 // `Profile::full().expected_tool_count()=74` MCP tools +
-// `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=78` / `_SAL=80` CLI subcommands —
+// `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=80` / `_SAL=82` CLI subcommands —
 // see SSOT consts in `src/lib.rs`). Refactoring
 // per-call validation chains to a single fluent surface lets all
 // three caller layers (HTTP handlers, MCP tools, CLI subcommands)
@@ -1180,10 +1180,10 @@ impl std::error::Error for ValidationError {}
 /// Validate parameters** per the NSA Cybersecurity Information document
 /// on MCP security (U/OO/6030316-26 \| PP-26-1834, May 2026, Version
 /// 1.0). Every wire-entry layer — HTTP routes
-/// (`EXPECTED_PRODUCTION_ROUTES_COUNT=87` in `src/lib.rs`), MCP
+/// (`EXPECTED_PRODUCTION_ROUTES_COUNT=89` in `src/lib.rs`), MCP
 /// tools (`Profile::full().expected_tool_count()=74` per
 /// `src/profile.rs`), CLI subcommands
-/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT=78` / `_SAL=80` in `src/lib.rs`)
+/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT=80` / `_SAL=82` in `src/lib.rs`)
 /// — routes DTO-bundling validation through
 /// `RequestValidator` so adding a new cross-field invariant is one
 /// struct-method edit rather than 3+ audited per-surface edits. The

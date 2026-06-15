@@ -227,7 +227,16 @@ pub fn run(
     json: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let conn = rusqlite::Connection::open(db_path)
+    // Open via the migrating path (`crate::db::open` runs apply_migrations)
+    // rather than a raw `rusqlite::Connection::open`, so the `rules` verbs
+    // work against a FRESH db — the `governance_rules` table is created on
+    // open like every other db-opening CLI command. Pre-fix, a standalone
+    // `ai-memory rules <verb>` against a never-migrated db failed with
+    // `rules_store::list: prepare — no such table: governance_rules`; this
+    // broke Form-7 governance bootstrap on fresh (esp. postgres-backed)
+    // fleet peers where the daemon — which would otherwise have migrated the
+    // local sqlite — has not yet started. Surfaced by the do-1461 A2A run.
+    let conn = crate::db::open(db_path)
         .with_context(|| format!("rules: open db at {}", db_path.display()))?;
     let key_dir = resolve_key_dir(args.key_dir.as_deref())?;
 
@@ -402,6 +411,28 @@ pub fn run(
             let resolved =
                 resolve_keygen_out_path(out_path.as_deref(), &key_dir, key_dir_overridden)?;
             let fingerprint = keygen_operator(&resolved, force, out)?;
+            // #1686 — generating an operator key flips the substrate to
+            // attest-active (`resolve_operator_pubkey().is_some()`), which makes
+            // `enforced_rule_passes` SKIP every enabled rule that is not
+            // operator-signed. The --force path warns about prior operator-signed
+            // rules going invalid, but a FRESH keygen silently disables any
+            // enabled-but-unsigned seed rules. Warn loudly so the operator knows
+            // to run `rules sign-seed`.
+            if let Ok(rules) = rules_store::list(&conn) {
+                let dormant = rules
+                    .iter()
+                    .filter(|r| r.enabled && r.attest_level != OPERATOR_SIGNED_LEVEL)
+                    .count();
+                if dormant > 0 {
+                    writeln!(
+                        out.stderr,
+                        "WARNING: {dormant} enabled rule(s) are not operator-signed. \
+                         Generating this operator key activates signature enforcement, so \
+                         those rules will be SKIPPED at load time until you run \
+                         `ai-memory rules sign-seed`."
+                    )?;
+                }
+            }
             let payload = serde_json::json!({
                 "path": resolved.display().to_string(),
                 "public_path": format!("{}.pub", resolved.display()),
@@ -445,7 +476,10 @@ pub fn run(
                 None
             });
             if let Some(db_path) = db {
-                let conn2 = rusqlite::Connection::open(&db_path).with_context(|| {
+                // Migrating open (see the note on the top-level `conn`): the
+                // `--db` sign-seed override must also create the schema on a
+                // fresh path.
+                let conn2 = crate::db::open(&db_path).with_context(|| {
                     format!("rules.sign-seed: open db at {}", db_path.display())
                 })?;
                 sign_seed_rules(&conn2, resolved_key.as_deref(), json, out)?;
@@ -2716,6 +2750,39 @@ mod tests {
         );
         // Restore so tempdir cleanup works.
         std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn list_on_fresh_unmigrated_db_succeeds() {
+        // Regression (do-1461 A2A run, 2026-06-15): `ai-memory rules list`
+        // against a FRESH, never-migrated db must migrate-on-open and
+        // succeed — NOT fail with `rules_store::list: prepare — no such
+        // table: governance_rules`. Pre-fix the rules CLI used a raw
+        // `rusqlite::Connection::open` that skipped migrations, which broke
+        // Form-7 governance bootstrap on fresh fleet peers (especially
+        // postgres-backed ones) where the daemon — which would have
+        // migrated the local sqlite — has not started yet.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fresh-never-migrated.db");
+        assert!(!db_path.exists(), "db must not exist before the rules call");
+        let args = RulesArgs {
+            key_dir: None,
+            action: RulesAction::List,
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        run(&db_path, args, true, &mut out).expect("rules list must succeed on a fresh db");
+        // Migrations created + seeded governance_rules → the list verb prints
+        // the seed rules (R001..R004) rather than erroring on a missing table.
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(
+            s.contains("\"verb\":\"rules.list\"") && s.contains("R001"),
+            "expected the seeded rules from the migrated fresh db, got: {s}"
+        );
     }
 
     /// Set up a key_dir holding the layout-2 singleton-file pair

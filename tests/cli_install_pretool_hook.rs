@@ -33,6 +33,13 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// Expected `matcher` on the managed PreToolUse entry the installer
+/// writes — the scoped action surface (`Bash|Edit|Write`), NOT `"*"`
+/// (issue #1667). Black-box pin of the external contract; mirrors the
+/// crate-private `cli::install::PRETOOL_HOOK_MATCHER` const, which this
+/// separate test crate cannot reference directly.
+const MANAGED_PRETOOL_MATCHER: &str = "Bash|Edit|Write";
+
 /// Returns an `assert_cmd::Command` for `ai-memory install claude-code`
 /// with `AI_MEMORY_NO_CONFIG=1` so tests don't accidentally load the
 /// host's `~/.config/ai-memory/config.toml`.
@@ -77,7 +84,8 @@ fn install_writes_hook_to_fresh_settings_json() {
     let arr = parsed["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     let entry = &arr[0];
-    assert_eq!(entry["matcher"], "*");
+    // Scoped to the modeled action surface, NOT "*" (issue #1667).
+    assert_eq!(entry["matcher"], MANAGED_PRETOOL_MATCHER);
     assert_eq!(entry["hooks"][0]["type"], "mcp_tool");
     assert_eq!(entry["hooks"][0]["tool"], "memory_check_agent_action");
 }
@@ -136,7 +144,7 @@ fn install_appends_to_existing_pretooluse_array() {
     assert_eq!(arr[0]["matcher"], "Bash");
     assert_eq!(arr[0]["hooks"][0]["command"], "echo hi");
     // Ours appended at the end.
-    assert_eq!(arr[1]["matcher"], "*");
+    assert_eq!(arr[1]["matcher"], MANAGED_PRETOOL_MATCHER);
     assert_eq!(arr[1]["hooks"][0]["tool"], "memory_check_agent_action");
 }
 
@@ -195,7 +203,7 @@ fn install_with_force_overwrites() {
     let parsed = read_json(&cfg);
     let arr = parsed["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(arr.len(), 1, "conflicting entry replaced with ours");
-    assert_eq!(arr[0]["matcher"], "*");
+    assert_eq!(arr[0]["matcher"], MANAGED_PRETOOL_MATCHER);
     assert_eq!(arr[0]["hooks"][0]["tool"], "memory_check_agent_action");
 }
 
