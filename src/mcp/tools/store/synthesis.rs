@@ -274,6 +274,21 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     let primary_update = outcome.updates.first().cloned();
     let (primary_id, _) = primary_update.as_ref()?;
 
+    // #1700 — apply the whole synthesis merge atomically. db::update /
+    // db::insert / db::delete / create_link_signed are all transaction-free, so
+    // one BEGIN IMMEDIATE wraps the candidate updates + provenance rows +
+    // supersedes links + deletes; a CORE write failure (update/delete) rolls
+    // the entire merge back instead of leaving a half-synthesised store.
+    // Vector-index mutations are in-memory and DEFERRED until after COMMIT so a
+    // rollback can never leave the index out of sync with the DB.
+    if conn
+        .execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+        .is_err()
+    {
+        return None;
+    }
+    let mut deferred_index_ops: Vec<(String, Vec<f32>)> = Vec::new();
+
     // Issue #1239 — counter into `outcome.updates` so subsequent
     // iterations of a multi-update verdict (COR-5) mint distinct ids
     // for their provenance rows instead of colliding on `mem.id` PK.
@@ -307,18 +322,19 @@ pub(super) fn apply_synthesis_updates_and_deletes(
             Err(e) => {
                 tracing::warn!(
                     target: "synthesis",
-                    "synthesis update failed for {cand_id}: {e}",
+                    "synthesis update failed for {cand_id}: {e}; rolling back merge",
                 );
-                continue;
+                let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+                return None;
             }
         };
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&target.title, &merged_content);
             if let Ok(embedding) = emb.embed(&text) {
                 let _ = db::set_embedding(conn, cand_id, &embedding);
-                if let Some(idx) = vector_index {
-                    idx.remove(cand_id);
-                    idx.insert(cand_id.to_string(), embedding);
+                if vector_index.is_some() {
+                    // #1700 — defer the in-memory index swap until after COMMIT.
+                    deferred_index_ops.push((cand_id.to_string(), embedding));
                 }
             }
         }
@@ -400,8 +416,26 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         if let Err(e) = db::delete(conn, del_id) {
             tracing::warn!(
                 target: "synthesis",
-                "synthesis delete failed for {del_id}: {e}",
+                "synthesis delete failed for {del_id}: {e}; rolling back merge",
             );
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+            return None;
+        }
+    }
+
+    // #1700 — all core writes succeeded; commit the merge as one unit, then
+    // apply the deferred in-memory vector-index swaps (the DB is now durable).
+    if conn
+        .execute_batch(crate::storage::connection::SQL_COMMIT)
+        .is_err()
+    {
+        let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+        return None;
+    }
+    if let Some(idx) = vector_index {
+        for (id, embedding) in deferred_index_ops {
+            idx.remove(&id);
+            idx.insert(id, embedding);
         }
     }
 
