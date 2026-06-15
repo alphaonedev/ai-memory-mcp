@@ -159,6 +159,7 @@ Post SHIP-RECOMMENDED on #1709 + a high-priority memory when ALL hold; the tag-c
 - Pillar 4: **#1488** (+ **#1580** fold-in, **#1471** assess) · Policy Engine: **#697** (+ **#1686**, SEC-2)
 - Capture: **#1390 / #1391 / #1393** · Inference: **#1677** reconcile · SAL parity: **#1693 / #1694** (+ #1670, #302)
 - Federation hardening: **#1464** (+ **#1544**) · **#1678** TLS-pin · **#1679** keypair-rotation · recall-feedback: **#1705 → #1706 → #1707**
+- Carried-forward hardening (ROADMAP §11.4 deferrals, also via absorbed #1695): **#1670/#302** SqliteStore TRANSACTIONS/ATOMIC_MULTI_WRITE capability bits · legacy v0.6.x flat-config removal + `source='claude'` allowlist retirement (**#1175**) · **`crate::db`** alias (`pub use storage as db`) removal · **#1095** receiver-side accept/reject share workflow (inbound half) · **#1680** reflection-depth const (already fixed — verify-close)
 - Strategic: **#1698** (DeepMind) · **#1704** (DecentMem) · §5 decorrelation panel **#1171**
 - ⚠️ scope-test flag: **#1463** (logging sinks — declare a §2 property or relocate)
 
