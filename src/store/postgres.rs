@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 57;
+const CURRENT_SCHEMA_VERSION: i32 = 58;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1299,8 +1299,11 @@ impl PostgresStore {
         if current_version < 56 {
             self.migrate_v56().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 57 {
             self.migrate_v57().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v58().await?;
         }
 
         Ok(())
@@ -2559,6 +2562,60 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v57 applied (#1579 B2: stored generated tsv column + memories_tsv_gin; dropped expression index memories_content_fts)"
+        );
+        Ok(())
+    }
+
+    /// v58 (#1705, v0.8.0) — recall_observations identity binding.
+    /// Adds the additive nullable `agent_id` + `namespace` columns (+
+    /// their indexes) the ledger SAL-parity work stamps so the consume
+    /// flip can reject cross-agent recall_id replay and derived utility
+    /// is per-(memory, namespace) scoped. Postgres twin of
+    /// `migrations/sqlite/0048_v58_recall_observations_identity.sql`.
+    /// Pure additive `ADD COLUMN IF NOT EXISTS` — idempotent + replay-safe
+    /// (fresh schemas carry the columns inline in `postgres_schema.sql`).
+    async fn migrate_v58(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v58 tx", e))?;
+
+        sqlx::query("ALTER TABLE recall_observations ADD COLUMN IF NOT EXISTS agent_id TEXT")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v58 add recall_observations.agent_id", e))?;
+
+        sqlx::query("ALTER TABLE recall_observations ADD COLUMN IF NOT EXISTS namespace TEXT")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v58 add recall_observations.namespace", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id \
+             ON recall_observations(agent_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v58 create idx_recall_observations_agent_id", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace \
+             ON recall_observations(namespace)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v58 create idx_recall_observations_namespace", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v58 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v58 applied (#1705: recall_observations agent_id + namespace identity columns)"
         );
         Ok(())
     }

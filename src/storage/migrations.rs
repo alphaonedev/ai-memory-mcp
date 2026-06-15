@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 57).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 58).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -603,7 +603,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 57;
+const CURRENT_SCHEMA_VERSION: i64 = 58;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2490,9 +2490,54 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // is nothing to precompute on this backend — the per-matched-
         // row tsvector recompute the postgres arm eliminates never
         // existed here. No DDL; the unconditional stamp below records
-        // CURRENT_SCHEMA_VERSION (= 57) so the lockstep pin holds
-        // (the inverse of the v55 arm, where SQLite added an index and
-        // postgres stamped a no-op).
+        // CURRENT_SCHEMA_VERSION so the lockstep pin holds (the inverse
+        // of the v55 arm, where SQLite added an index and postgres
+        // stamped a no-op).
+
+        if version < 58 {
+            // v0.8.0 #1705 — recall_observations identity binding:
+            // additive nullable `agent_id` + `namespace` columns (+ their
+            // indexes) so the ledger SAL-parity work stamps the recalling
+            // agent + namespace and rejects cross-agent recall_id replay.
+            // SQLite has no `ADD COLUMN IF NOT EXISTS`, so probe each
+            // column for replay-safety; probe the table first because
+            // synthetic fixtures may stamp a version without replaying
+            // the 0038 table-create (the v56 archived_memories precedent).
+            let cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(recall_observations)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v58: recall_observations table absent (test fixture); \
+                     skipping identity columns"
+                );
+            } else {
+                if !cols.contains("agent_id") {
+                    conn.execute(
+                        "ALTER TABLE recall_observations ADD COLUMN agent_id TEXT",
+                        [],
+                    )?;
+                }
+                if !cols.contains("namespace") {
+                    conn.execute(
+                        "ALTER TABLE recall_observations ADD COLUMN namespace TEXT",
+                        [],
+                    )?;
+                }
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id \
+                     ON recall_observations(agent_id)",
+                    [],
+                )?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace \
+                     ON recall_observations(namespace)",
+                    [],
+                )?;
+            }
+        }
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
