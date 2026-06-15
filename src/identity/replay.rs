@@ -621,7 +621,14 @@ impl FederationNonceCache {
     /// be a 500 on every federated push. The in-memory cap still
     /// holds, so a persistence outage degrades gracefully to
     /// pre-#1255 behaviour (replay window opens on next restart).
-    fn persist_fingerprint(&self, peer_id: &str, fp: &[u8; 32], last_touch: u64) {
+    fn persist_fingerprint_and_evict(
+        &self,
+        peer_id: &str,
+        fp: &[u8; 32],
+        last_touch: u64,
+        evicted_fp: Option<&[u8; 32]>,
+        evicted_peer: Option<&str>,
+    ) {
         let Some(path) = self.db_path.as_deref() else {
             return;
         };
@@ -663,6 +670,40 @@ impl FederationNonceCache {
                  (#1255 graceful degradation)",
             );
         }
+        // #1690 — delete-on-evict: prune the disk rows the in-memory LRU
+        // just evicted so the table stays bounded by the same ceiling as
+        // the in-memory cache. Best-effort on the SAME connection as the
+        // INSERT above; a failed DELETE only leaves a dead row (the
+        // in-memory cap still bounds the replay check), so it is
+        // warn-logged and swallowed like the INSERT.
+        if let Some(efp) = evicted_fp {
+            if let Err(e) = conn.execute(
+                "DELETE FROM federation_nonce_cache WHERE peer_id = ?1 AND fingerprint = ?2",
+                rusqlite::params![peer_id, efp.as_slice()],
+            ) {
+                tracing::warn!(
+                    target: "ai_memory::identity::replay",
+                    peer_id = %peer_id,
+                    err = %e,
+                    "FederationNonceCache: evicted-fingerprint delete failed; disk row lingers \
+                     (#1690 graceful degradation)",
+                );
+            }
+        }
+        if let Some(ep) = evicted_peer {
+            if let Err(e) = conn.execute(
+                "DELETE FROM federation_nonce_cache WHERE peer_id = ?1",
+                rusqlite::params![ep],
+            ) {
+                tracing::warn!(
+                    target: "ai_memory::identity::replay",
+                    evicted_peer = %ep,
+                    err = %e,
+                    "FederationNonceCache: evicted-peer delete failed; disk rows linger \
+                     (#1690 graceful degradation)",
+                );
+            }
+        }
     }
 
     /// Check + record `(peer_id, nonce)`.
@@ -673,6 +714,17 @@ impl FederationNonceCache {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // #1690 — capture in-memory evictions so the disk mirror is
+        // pruned in lockstep (delete-on-evict). Without this the disk
+        // `federation_nonce_cache` table grew unbounded: every Fresh
+        // nonce INSERTs a row, but the in-memory LRU evictions (per-peer
+        // FIFO + outer peer-slot LRU) never deleted the disk counterpart,
+        // so a long-lived high-throughput peer accumulated millions of
+        // dead rows while the in-memory cache stayed bounded. Both
+        // deletes ride the SAME connection-open as the persist below
+        // (see `persist_fingerprint_and_evict`), so the hot-path disk
+        // I/O rate is unchanged.
+        let mut evicted_peer: Option<String> = None;
         // v0.7.0 #1038 — bound the outer HashMap to
         // `FEDERATION_NONCE_MAX_PEERS`. When the incoming peer is a
         // NEW entry AND the map is at the ceiling, evict the
@@ -695,6 +747,7 @@ impl FederationNonceCache {
                      room. Operator-visible via peer_evictions_since_boot() (#1038).",
                     FEDERATION_NONCE_MAX_PEERS,
                 );
+                evicted_peer = Some(evict_id);
             }
         }
         let touch = self.touch_counter.fetch_add(1, Ordering::Relaxed);
@@ -704,10 +757,12 @@ impl FederationNonceCache {
         if slot.seen.contains(&fp) {
             return ReplayDecision::Replay;
         }
+        let mut evicted_fp: Option<[u8; 32]> = None;
         if slot.order.len() >= FEDERATION_NONCE_CAPACITY_PER_PEER {
             // Keep `seen` + `order` in lockstep on FIFO eviction.
             if let Some(evicted) = slot.order.pop_front() {
                 slot.seen.remove(&evicted);
+                evicted_fp = Some(evicted);
             }
         }
         slot.order.push_back(fp);
@@ -718,10 +773,18 @@ impl FederationNonceCache {
         // opens its own connection (no shared state).
         drop(guard);
         // #1255 — persist the new fingerprint to disk so a daemon
-        // restart doesn't re-open the replay window. Persistence
-        // failures are warn-logged and swallowed (graceful
-        // degradation to the in-memory-only pre-#1255 posture).
-        self.persist_fingerprint(peer_id, &fp, touch);
+        // restart doesn't re-open the replay window. #1690 — and prune
+        // the rows the in-memory cache just evicted so the disk mirror
+        // stays bounded. Both ride one connection-open; failures are
+        // warn-logged and swallowed (graceful degradation to the
+        // in-memory-only pre-#1255 posture).
+        self.persist_fingerprint_and_evict(
+            peer_id,
+            &fp,
+            touch,
+            evicted_fp.as_ref(),
+            evicted_peer.as_deref(),
+        );
         ReplayDecision::Fresh
     }
 
@@ -938,6 +1001,60 @@ mod federation_nonce_cache_tests {
         assert!(
             cache_b.len_for_peer("peer-1255") >= 1,
             "#1255: hydrated cache must retain the persisted fingerprint count"
+        );
+    }
+
+    /// #1690 — delete-on-evict keeps the disk `federation_nonce_cache`
+    /// table bounded by the same ceiling as the in-memory LRU. Pre-fix
+    /// the table was INSERT-only, so a long-lived high-throughput peer
+    /// grew it without bound while the in-memory cache stayed capped.
+    /// Drives the private persist+evict path directly (the per-peer FIFO
+    /// cap is 10k and the outer cap is 1024, both too large to trigger
+    /// via `record_and_check` in a unit test) and counts disk rows.
+    #[test]
+    fn issue_1690_eviction_prunes_disk_mirror() {
+        fn disk_row_count(path: &std::path::Path) -> i64 {
+            let conn = crate::db::open(path).expect("open nonce db");
+            conn.query_row("SELECT COUNT(*) FROM federation_nonce_cache", [], |r| {
+                r.get(0)
+            })
+            .expect("count rows")
+        }
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let db_path = tmp.path().to_path_buf();
+        let cache = FederationNonceCache::new_with_db_persistence(&db_path)
+            .expect("open + migrate nonce db");
+
+        // Two fresh fingerprints for one peer → two disk rows.
+        let fp_a = FederationNonceCache::fingerprint("peer-x", "nonce-a");
+        let fp_b = FederationNonceCache::fingerprint("peer-x", "nonce-b");
+        cache.persist_fingerprint_and_evict("peer-x", &fp_a, 1, None, None);
+        cache.persist_fingerprint_and_evict("peer-x", &fp_b, 2, None, None);
+        assert_eq!(disk_row_count(&db_path), 2, "two inserts → two rows");
+
+        // Per-peer FIFO eviction: inserting fp_c while evicting fp_a must
+        // delete fp_a's disk row → still 2 rows (fp_b + fp_c), not 3.
+        let fp_c = FederationNonceCache::fingerprint("peer-x", "nonce-c");
+        cache.persist_fingerprint_and_evict("peer-x", &fp_c, 3, Some(&fp_a), None);
+        assert_eq!(
+            disk_row_count(&db_path),
+            2,
+            "#1690: a per-peer FIFO eviction must delete the evicted disk row"
+        );
+
+        // Add a second peer, then an outer-LRU peer eviction of peer-x
+        // must wipe ALL of peer-x's disk rows.
+        let fp_y = FederationNonceCache::fingerprint("peer-y", "n");
+        cache.persist_fingerprint_and_evict("peer-y", &fp_y, 4, None, None);
+        assert_eq!(disk_row_count(&db_path), 3, "peer-y row added → three rows");
+        let fp_z = FederationNonceCache::fingerprint("peer-z", "n");
+        cache.persist_fingerprint_and_evict("peer-z", &fp_z, 5, None, Some("peer-x"));
+        assert_eq!(
+            disk_row_count(&db_path),
+            2,
+            "#1690: an outer-LRU peer eviction must delete every disk row for that peer \
+             (peer-x's 2 rows gone, peer-y + peer-z remain)"
         );
     }
 
