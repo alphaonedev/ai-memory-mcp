@@ -1252,7 +1252,15 @@ impl CapabilityReflection {
             depth_bounded: true,
             max_default: crate::reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP,
             attestation: "Ed25519".to_string(),
-            curator_mode: IMPLEMENTED.to_string(),
+            // #1672 — the curator reflection pass (`curator --reflect`) is
+            // `#[cfg(feature = "sal")]`-gated; on the default sqlite-bundled
+            // build it hard-bails (`cli/curator.rs:548-560`), so reporting
+            // `"implemented"` over-reports the surface. Gate the honest value.
+            curator_mode: if cfg!(feature = "sal") {
+                IMPLEMENTED.to_string()
+            } else {
+                CURATOR_MODE_REQUIRES_SAL.to_string()
+            },
         }
     }
 }
@@ -1336,6 +1344,10 @@ fn default_capability_skills() -> CapabilitySkills {
 /// const so the 18 matrix cells share a single spelling (pm-v3.1
 /// hardcoded-literal gate, #1558 wave 4).
 const IMPLEMENTED: &str = "implemented";
+
+/// #1672 — honest `curator_mode` value on non-`sal` builds, where the curator
+/// reflection pass (`curator --reflect`) is compiled to a hard-bail companion.
+const CURATOR_MODE_REQUIRES_SAL: &str = "requires_sal_feature";
 
 /// v0.7.0 L3-5 — forensic-evidence capability surface.
 ///
@@ -8709,6 +8721,18 @@ legacy_scoring = false
         let helper = default_capability_reflection();
         let current = CapabilityReflection::current();
         assert_eq!(format!("{helper:?}"), format!("{current:?}"));
+    }
+
+    #[test]
+    fn issue_1672_curator_mode_honest_per_sal_feature() {
+        // curator --reflect is sal-gated; curator_mode must report the honest
+        // value for the build feature set, not a blanket "implemented".
+        let cm = CapabilityReflection::current().curator_mode;
+        if cfg!(feature = "sal") {
+            assert_eq!(cm, IMPLEMENTED);
+        } else {
+            assert_eq!(cm, CURATOR_MODE_REQUIRES_SAL);
+        }
     }
 
     #[test]
