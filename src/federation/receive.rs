@@ -44,6 +44,17 @@ fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Displa
     tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
 }
 
+/// #1687 — advance the per-peer catchup watermark for a row that just applied
+/// successfully, but never while `halted` (set once any earlier row in the
+/// batch failed to apply). Guarantees `sync_state` is never moved past an
+/// un-persisted row — which would silently drop it from every future delta.
+#[inline]
+fn advance_catchup_watermark(latest_ts: &mut Option<String>, halted: bool, row_ts: &str) {
+    if !halted && latest_ts.as_deref().is_none_or(|cur| row_ts > cur) {
+        *latest_ts = Some(row_ts.to_string());
+    }
+}
+
 /// v0.6.0.1 (#320) — post-partition catchup poller.
 ///
 /// Previously a node rejoining the mesh after SIGSTOP / network blip / restart
@@ -238,6 +249,9 @@ pub(super) async fn catchup_once_with_store(
 
         let mut applied = 0usize;
         let mut latest_ts: Option<String> = None;
+        // #1687 — once an apply fails, stop advancing the catchup watermark so
+        // sync_state never moves past an un-persisted row.
+        let mut catchup_halted = false;
 
         // v0.7.0 M3 — when a SAL store handle is supplied (postgres-
         // backed daemons) we dispatch each row through
@@ -265,15 +279,18 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
-                if latest_ts
-                    .as_deref()
-                    .is_none_or(|cur| mem.updated_at.as_str() > cur)
-                {
-                    latest_ts = Some(mem.updated_at.clone());
-                }
+                // #1687 — advance the catchup watermark ONLY for rows that
+                // durably applied, halting at the first failure, so sync_state
+                // never moves past an un-persisted row (which would silently
+                // drop it from every future delta). Idempotent upserts make
+                // re-fetching post-failure rows next cycle harmless.
                 match store.apply_remote_memory(&ctx, &mem).await {
-                    Ok(_) => applied += 1,
+                    Ok(_) => {
+                        applied += 1;
+                        advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                    }
                     Err(e) => {
+                        catchup_halted = true;
                         tracing::warn!(
                             "catchup: apply_remote_memory failed for peer {}: {e}",
                             peer.id
@@ -300,14 +317,14 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
-                if latest_ts
-                    .as_deref()
-                    .is_none_or(|cur| mem.updated_at.as_str() > cur)
-                {
-                    latest_ts = Some(mem.updated_at.clone());
-                }
-                if crate::db::insert_if_newer(&lock.0, &mem).is_ok() {
-                    applied += 1;
+                // #1687 — advance the catchup watermark only on a successful
+                // insert and halt at the first failure (see the SAL branch).
+                match crate::db::insert_if_newer(&lock.0, &mem) {
+                    Ok(_) => {
+                        applied += 1;
+                        advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                    }
+                    Err(_) => catchup_halted = true,
                 }
             }
             if let Some(ts) = latest_ts.as_deref()
@@ -405,6 +422,9 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
 
         let mut applied = 0usize;
         let mut latest_ts: Option<String> = None;
+        // #1687 — once an apply fails, stop advancing the catchup watermark so
+        // sync_state never moves past an un-persisted row.
+        let mut catchup_halted = false;
         {
             let lock = db.lock().await;
             for raw in &memories {
@@ -418,14 +438,14 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
-                if latest_ts
-                    .as_deref()
-                    .is_none_or(|cur| mem.updated_at.as_str() > cur)
-                {
-                    latest_ts = Some(mem.updated_at.clone());
-                }
-                if crate::db::insert_if_newer(&lock.0, &mem).is_ok() {
-                    applied += 1;
+                // #1687 — advance the catchup watermark only on a successful
+                // insert and halt at the first failure (see the SAL branch).
+                match crate::db::insert_if_newer(&lock.0, &mem) {
+                    Ok(_) => {
+                        applied += 1;
+                        advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                    }
+                    Err(_) => catchup_halted = true,
                 }
             }
             if let Some(ts) = latest_ts.as_deref()
@@ -547,4 +567,35 @@ pub(super) fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod issue_1687_tests {
+    use super::advance_catchup_watermark;
+
+    #[test]
+    fn advances_on_success_monotonically_when_not_halted() {
+        let mut ts = None;
+        advance_catchup_watermark(&mut ts, false, "2026-06-15T00:00:01Z");
+        assert_eq!(ts.as_deref(), Some("2026-06-15T00:00:01Z"));
+        advance_catchup_watermark(&mut ts, false, "2026-06-15T00:00:02Z");
+        assert_eq!(ts.as_deref(), Some("2026-06-15T00:00:02Z"));
+        // an older ts never moves the watermark backward
+        advance_catchup_watermark(&mut ts, false, "2026-06-15T00:00:01Z");
+        assert_eq!(ts.as_deref(), Some("2026-06-15T00:00:02Z"));
+    }
+
+    #[test]
+    fn does_not_advance_past_a_failed_row_once_halted() {
+        // row1 ok -> t1; row2 FAILED (caller sets halted); row3 ok but later ts
+        // -> watermark MUST stay at t1 so row2 is re-fetched next delta (#1687).
+        let mut ts = None;
+        advance_catchup_watermark(&mut ts, false, "t1");
+        advance_catchup_watermark(&mut ts, true, "t3");
+        assert_eq!(
+            ts.as_deref(),
+            Some("t1"),
+            "watermark must stop at the last pre-failure success"
+        );
+    }
 }
