@@ -1410,22 +1410,30 @@ pub trait MemoryStore: Send + Sync {
     /// recorded recalls). `candidates` = `(memory_id, retriever, rank,
     /// score)`. Returns rows inserted. Default `Ok(0)` so a non-ledger /
     /// in-memory adapter round-trips cleanly.
+    /// `agent_id` + `namespace` (v58) stamp the recalling identity so the
+    /// consume flip can reject cross-agent `recall_id` replay.
     async fn record_recall_observation(
         &self,
         _recall_id: &str,
         _candidates: &[(String, String, i64, f64)],
+        _agent_id: Option<&str>,
+        _namespace: Option<&str>,
     ) -> StoreResult<usize> {
         Ok(0)
     }
 
     /// #1705 — flip the `consumed` flag for every cited memory under a
     /// recall id (the downstream-usage signal). Idempotent (only flips
-    /// rows still `consumed = 0`). Returns rows flipped. Default `Ok(0)`.
+    /// rows still `consumed = 0`). `consuming_agent` enforces the
+    /// cross-agent replay guard: a row only flips when its stored
+    /// `agent_id` is NULL or equals `consuming_agent`. Returns rows
+    /// flipped. Default `Ok(0)`.
     async fn mark_recall_consumed(
         &self,
         _recall_id: &str,
         _cited_memory_ids: &[String],
         _consumed_by: &str,
+        _consuming_agent: Option<&str>,
     ) -> StoreResult<usize> {
         Ok(0)
     }

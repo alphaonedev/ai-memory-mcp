@@ -132,6 +132,83 @@ pub fn mark_consumed(
     Ok(flipped)
 }
 
+/// #1705 — identity-stamping variant of [`record_recall`]: writes the
+/// v58 `agent_id` + `namespace` columns alongside each ledger row so the
+/// consume flip can reject cross-agent `recall_id` replay and derived
+/// utility is per-`(memory, namespace)` scoped. Used by the SAL trait
+/// write path. `INSERT OR IGNORE` keeps the same idempotency contract as
+/// [`record_recall`].
+///
+/// # Errors
+/// Returns the underlying `rusqlite::Error` on SQL failure.
+pub fn record_recall_with_identity(
+    conn: &Connection,
+    recall_id: &str,
+    candidates: &[Candidate<'_>],
+    agent_id: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<usize> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO recall_observations \
+                (recall_id, memory_id, retriever, rank, score, agent_id, namespace) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let mut written = 0_usize;
+    for c in candidates {
+        written += stmt.execute(params![
+            recall_id,
+            c.memory_id,
+            c.retriever,
+            c.rank,
+            c.score,
+            agent_id,
+            namespace
+        ])?;
+    }
+    Ok(written)
+}
+
+/// #1705 — replay-guarded variant of [`mark_consumed`]: a row only flips
+/// when its stored `agent_id` is NULL (legacy / unbound) OR equals
+/// `consuming_agent`, so a replayed `recall_id` cited by a different
+/// agent cannot pump another agent's consumed signal. When
+/// `consuming_agent` is `None`, only unbound (NULL-`agent_id`) rows flip
+/// — the safe default for an unidentified caller. Otherwise identical to
+/// [`mark_consumed`] (idempotent; only flips rows still `consumed = 0`).
+///
+/// # Errors
+/// Returns the underlying `rusqlite::Error` on SQL failure.
+pub fn mark_consumed_guarded(
+    conn: &Connection,
+    recall_id: &str,
+    cited_memory_ids: &[&str],
+    consumed_by: &str,
+    consuming_agent: Option<&str>,
+) -> Result<usize> {
+    if cited_memory_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare_cached(
+        "UPDATE recall_observations \
+            SET consumed = 1, \
+                consumed_at = ?1, \
+                consumed_by_memory_id = ?2 \
+          WHERE recall_id = ?3 \
+            AND memory_id = ?4 \
+            AND consumed = 0 \
+            AND (agent_id IS NULL OR agent_id = ?5)",
+    )?;
+    let mut flipped = 0_usize;
+    for mid in cited_memory_ids {
+        flipped += stmt.execute(params![now, consumed_by, recall_id, mid, consuming_agent])?;
+    }
+    Ok(flipped)
+}
+
 /// One row of `recall_observations` as it travels over the read-side
 /// MCP `memory_recall_observations` tool. Mirrors the SQL columns 1:1
 /// plus a derived `consumed` boolean (the SQL column is an INTEGER
