@@ -3361,6 +3361,8 @@ impl PostgresStore {
         &self,
         recall_id: &str,
         candidates: &[(String, String, i64, f64)],
+        agent_id: Option<&str>,
+        namespace: Option<&str>,
     ) -> StoreResult<usize> {
         if candidates.is_empty() {
             return Ok(0);
@@ -3374,8 +3376,8 @@ impl PostgresStore {
         for (memory_id, retriever, rank, score) in candidates {
             let n = sqlx::query(
                 "INSERT INTO recall_observations
-                    (recall_id, memory_id, retriever, rank, score)
-                 VALUES ($1, $2, $3, $4, $5)
+                    (recall_id, memory_id, retriever, rank, score, agent_id, namespace)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (recall_id, memory_id) DO NOTHING",
             )
             .bind(recall_id)
@@ -3383,6 +3385,8 @@ impl PostgresStore {
             .bind(retriever)
             .bind(rank)
             .bind(score)
+            .bind(agent_id)
+            .bind(namespace)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("insert recall_observation", e))?
@@ -11769,9 +11773,12 @@ impl MemoryStore for PostgresStore {
         &self,
         recall_id: &str,
         candidates: &[(String, String, i64, f64)],
+        agent_id: Option<&str>,
+        namespace: Option<&str>,
     ) -> StoreResult<usize> {
         // #1705 — delegates to the inherent twin (no longer dead code).
-        self.recall_observation_insert(recall_id, candidates).await
+        self.recall_observation_insert(recall_id, candidates, agent_id, namespace)
+            .await
     }
 
     async fn mark_recall_consumed(
@@ -11779,9 +11786,12 @@ impl MemoryStore for PostgresStore {
         recall_id: &str,
         cited_memory_ids: &[String],
         consumed_by: &str,
+        consuming_agent: Option<&str>,
     ) -> StoreResult<usize> {
-        // #1705 — postgres twin of `crate::observations::mark_consumed`.
-        // Idempotent: only flips rows still `consumed = FALSE`.
+        // #1705 — postgres twin of `crate::observations::mark_consumed_guarded`.
+        // Idempotent: only flips rows still `consumed = FALSE`; the
+        // `(agent_id IS NULL OR agent_id = $5)` guard rejects cross-agent
+        // recall_id replay (NULL → unbound legacy row flips for any caller).
         if cited_memory_ids.is_empty() {
             return Ok(0);
         }
@@ -11796,12 +11806,14 @@ impl MemoryStore for PostgresStore {
             let n = sqlx::query(
                 "UPDATE recall_observations
                     SET consumed = TRUE, consumed_at = $1, consumed_by_memory_id = $2
-                  WHERE recall_id = $3 AND memory_id = $4 AND consumed = FALSE",
+                  WHERE recall_id = $3 AND memory_id = $4 AND consumed = FALSE
+                    AND (agent_id IS NULL OR agent_id = $5)",
             )
             .bind(now)
             .bind(consumed_by)
             .bind(recall_id)
             .bind(mid)
+            .bind(consuming_agent)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("mark recall_observation consumed", e))?
