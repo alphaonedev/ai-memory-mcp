@@ -9,7 +9,7 @@
 [![Ship Gate](https://img.shields.io/badge/ship_gate-green-brightgreen)](https://alphaonedev.github.io/ai-memory-ship-gate/)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
-**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v55). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md).
+**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md).
 
 **📦 [Release v0.7.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.7.0)** ·
 **📊 [A2A gate (umbrella spec)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)** ·

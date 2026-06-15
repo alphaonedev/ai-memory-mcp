@@ -40,7 +40,7 @@ action required for the database itself.
 | **LLM backends** | Local Ollama only | **15 vendor aliases** + generic OpenAI-compatible (#1067): ollama, openai, xai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, openai-compatible |
 | **Config schema** | Flat fields (`llm_model`, `ollama_url`, ...) | **Sectioned v2** (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`) — see [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). Legacy v1 continues to work with deprecation WARN; removed in v0.8.0. |
 | **Secret handling** | Inline `api_key = "..."` accepted | **REJECTED at parse time** (#1146). Use `api_key_env` (env var reference) or `api_key_file` (mode 0400 enforced). |
-| **DB schema** | v20 | v55 (35 version bumps bridge the gap, auto-applied on first open) |
+| **DB schema** | v20 | v57 (37 version bumps bridge the gap, auto-applied on first open) |
 | **Memory struct** | 15 fields | 26 fields (added reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, version) |
 | **MemoryLink variants** | 4 (related_to, supersedes, contradicts, derived_from) | 6 (+ reflects_on, derives_from) |
 | **MCP tools at `--profile full`** | ~60 | **74** (73 callable + memory_capabilities bootstrap) |
@@ -101,7 +101,7 @@ The `LLM Reachability (#1146)` section reports the resolved
 HTTP status. If you see WARN or CRIT there, see
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §"no LLM client configured".
 
-**That's it.** The DB schema walks v20 → v55 automatically when
+**That's it.** The DB schema walks v20 → v57 automatically when
 the v0.7.0 binary opens the DB. Your legacy config.toml's flat
 fields have been rewritten to the v2 sectioned shape; a
 timestamped backup lives next to the original.
