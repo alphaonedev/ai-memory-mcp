@@ -3032,7 +3032,14 @@ pub fn run_mcp_server(
         } else {
             eprintln!("ai-memory: using lexical cross-encoder fallback");
         }
-        Some(BatchedReranker::new(ce))
+        // #1691/n14 — apply the operator-configured score floor
+        // (env > [reranker].score_floor > Off) instead of the hardcoded
+        // Off the bare `new` constructor used; this is what makes the
+        // with_score_floor capability reachable on the MCP recall path.
+        Some(BatchedReranker::with_score_floor(
+            ce,
+            app_config.resolve_reranker_score_floor(),
+        ))
     } else {
         None
     };

@@ -3457,6 +3457,16 @@ pub struct RerankerSection {
     /// (`crate::reranker::CROSS_ENCODER_MAX_SEQ`) fall through.
     /// Overridable via `AI_MEMORY_RERANK_MAX_SEQ`.
     pub max_seq_tokens: Option<usize>,
+
+    /// #1691/n14 — recall-reranker score floor: drops low-confidence
+    /// rerank candidates below a threshold so noise-band paraphrase
+    /// matches do not surface. Value grammar (case-insensitive):
+    /// `off` (default) | `absolute:<f>` (drop below an absolute blended
+    /// score) | `relative:<f>` (drop below `top_score * f`). Parsed via
+    /// [`crate::reranker::RerankerScoreFloor::parse`] and fed to
+    /// [`crate::reranker::BatchedReranker::with_score_floor`] at every
+    /// reranker build site. Overridable via `AI_MEMORY_RERANK_SCORE_FLOOR`.
+    pub score_floor: Option<String>,
 }
 
 /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
@@ -3997,6 +4007,15 @@ pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
 /// `[reranker]` section, then to the compiled default
 /// (`crate::reranker::RERANK_MAX_SEQ_DEFAULT`).
 pub const ENV_RERANK_MAX_SEQ: &str = "AI_MEMORY_RERANK_MAX_SEQ";
+
+/// #1691/n14 — env override for the recall-reranker score floor.
+/// Value grammar (case-insensitive): `off` | `absolute:<f>` |
+/// `relative:<f>` (see [`crate::reranker::RerankerScoreFloor::parse`]).
+/// Highest-precedence layer of the score-floor ladder
+/// (env > `[reranker].score_floor` > compiled default
+/// [`crate::reranker::RerankerScoreFloor::Off`]). Unparseable values
+/// fall through to the next layer.
+pub const ENV_RERANK_SCORE_FLOOR: &str = "AI_MEMORY_RERANK_SCORE_FLOOR";
 
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
@@ -6681,6 +6700,34 @@ impl AppConfig {
             max_seq_tokens,
             source,
         }
+    }
+
+    /// #1691/n14 — resolve the recall-reranker score floor. Uniform
+    /// ladder: `AI_MEMORY_RERANK_SCORE_FLOOR` env > `[reranker].score_floor`
+    /// config > compiled default ([`crate::reranker::RerankerScoreFloor::Off`]).
+    /// Unparseable values at any layer fall through to the next.
+    ///
+    /// Kept as a dedicated resolver (rather than a field on
+    /// [`ResolvedReranker`]) because [`crate::reranker::RerankerScoreFloor`]
+    /// carries an `f64` and is therefore `PartialEq`-only, while
+    /// `ResolvedReranker` / `ResolvedModels` derive `Eq`. Fed to
+    /// [`crate::reranker::BatchedReranker::with_score_floor`] at the
+    /// `serve` and `mcp` reranker build sites so the score-floor
+    /// capability is finally operator-reachable (it was dead config
+    /// before #1691/n14).
+    #[must_use]
+    pub fn resolve_reranker_score_floor(&self) -> crate::reranker::RerankerScoreFloor {
+        std::env::var(ENV_RERANK_SCORE_FLOOR)
+            .ok()
+            .as_deref()
+            .and_then(crate::reranker::RerankerScoreFloor::parse)
+            .or_else(|| {
+                self.reranker
+                    .as_ref()
+                    .and_then(|r| r.score_floor.as_deref())
+                    .and_then(crate::reranker::RerankerScoreFloor::parse)
+            })
+            .unwrap_or(crate::reranker::RerankerScoreFloor::Off)
     }
 
     /// v0.7.x (issue #1168) — bundle the three model-resolver outputs
