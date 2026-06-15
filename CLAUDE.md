@@ -535,6 +535,20 @@ max_seq_tokens = 256   # #1604 rerank input-sequence cap; 1..=512 (model
                        # ceiling), compiled default 256. Env override:
                        # AI_MEMORY_RERANK_MAX_SEQ.
 
+[curator]
+# #1671/n15 (v0.7.1) — per-namespace curator config.
+# `curator --reflect --all-namespaces` reflects ONLY namespaces listed
+# here with enabled = true (a single `--namespace <ns>` bypasses the
+# gate). Without this, --all-namespaces was an inert no-op.
+[curator.reflection_namespaces."team/eng"]
+enabled   = true
+max_depth = 5                        # optional per-ns reflection-depth cap
+# Per-namespace confidence-decay half-life override, days (n15). Absent
+# → DEFAULT_HALF_LIFE_DAYS (30). Only consulted when decay is enabled
+# (AI_MEMORY_CONFIDENCE_DECAY=1). Honoured on BOTH sqlite + postgres.
+[curator.confidence_decay_half_life_days]
+"team/eng" = 14.0
+
 [storage]
 default_namespace = "alphaone"
 archive_on_gc     = true

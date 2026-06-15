@@ -2994,6 +2994,16 @@ pub struct AppConfig {
     /// selection. Resolved via [`AppConfig::resolve_reranker`].
     pub reranker: Option<RerankerSection>,
 
+    /// #1671/n15 (v0.7.1) — `[curator]` per-namespace curator config.
+    /// Carries the per-namespace `reflection_pass.enabled` gate that
+    /// `curator --reflect --all-namespaces` consults (#1671 — without it
+    /// `--all-namespaces` reflected nothing) and the per-namespace
+    /// `confidence_decay_half_life_days` override the confidence-decay
+    /// sweep consults (n15). Resolved via
+    /// [`AppConfig::reflection_namespace_enabled`] and
+    /// [`AppConfig::confidence_decay_half_life_for`].
+    pub curator: Option<CuratorSection>,
+
     /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
     /// Carries `default_namespace`, `archive_on_gc`, `archive_max_days`,
     /// `max_memory_mb` (folded from the previously-flat top-level
@@ -3467,6 +3477,48 @@ pub struct RerankerSection {
     /// [`crate::reranker::BatchedReranker::with_score_floor`] at every
     /// reranker build site. Overridable via `AI_MEMORY_RERANK_SCORE_FLOOR`.
     pub score_floor: Option<String>,
+}
+
+/// #1671/n15 (v0.7.1) — `[curator]` sectioned per-namespace curator
+/// configuration.
+///
+/// Wire format:
+/// ```toml
+/// # Per-namespace reflection-pass gate (#1671). `curator --reflect
+/// # --all-namespaces` reflects ONLY namespaces listed here with
+/// # `enabled = true`; a single `--namespace <ns>` invocation bypasses
+/// # the gate (operator asked explicitly).
+/// [curator.reflection_namespaces."team/eng"]
+/// enabled = true
+/// max_depth = 5
+///
+/// # Per-namespace confidence-decay half-life override, in days (n15).
+/// # Absent → the compiled DEFAULT_HALF_LIFE_DAYS (30). Only consulted
+/// # when the decay feature is enabled (AI_MEMORY_CONFIDENCE_DECAY=1).
+/// [curator.confidence_decay_half_life_days]
+/// "team/eng" = 14.0
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CuratorSection {
+    /// #1671 — per-namespace reflection-pass overrides keyed by
+    /// namespace. `curator --reflect --all-namespaces` participates ONLY
+    /// for namespaces present here with `enabled = true`; absent /
+    /// disabled namespaces are skipped (the conservative default that
+    /// kept `--all-namespaces` a safe no-op before this wiring). Reuses
+    /// the curator's own
+    /// [`crate::curator::reflection_pass::ReflectionPassConfig`].
+    #[serde(default)]
+    pub reflection_namespaces: Option<
+        std::collections::HashMap<String, crate::curator::reflection_pass::ReflectionPassConfig>,
+    >,
+
+    /// n15 — per-namespace confidence-decay half-life override (days),
+    /// keyed by namespace. Absent / non-finite / non-positive → the
+    /// compiled [`crate::confidence::DEFAULT_HALF_LIFE_DAYS`]. Only
+    /// consulted when confidence decay is enabled
+    /// (`AI_MEMORY_CONFIDENCE_DECAY=1`).
+    #[serde(default)]
+    pub confidence_decay_half_life_days: Option<std::collections::HashMap<String, f64>>,
 }
 
 /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
@@ -6730,6 +6782,56 @@ impl AppConfig {
             .unwrap_or(crate::reranker::RerankerScoreFloor::Off)
     }
 
+    /// #1671 — whether `curator --reflect --all-namespaces` should
+    /// reflect `namespace`. True ONLY when
+    /// `[curator.reflection_namespaces."<ns>"]` exists with
+    /// `enabled = true`. The conservative default is `false` (no config
+    /// → no fan-out), matching the pre-#1671 inert-but-safe posture where
+    /// `--all-namespaces` reflected nothing. A single `--namespace <ns>`
+    /// invocation bypasses this gate at the call site.
+    #[must_use]
+    pub fn reflection_namespace_enabled(&self, namespace: &str) -> bool {
+        self.curator
+            .as_ref()
+            .and_then(|c| c.reflection_namespaces.as_ref())
+            .and_then(|m| m.get(namespace))
+            .is_some_and(|cfg| cfg.enabled)
+    }
+
+    /// n15 — resolve the confidence-decay half-life (days) for
+    /// `namespace`: `[curator.confidence_decay_half_life_days."<ns>"]`
+    /// when present, finite, and `> 0`, else the compiled
+    /// [`crate::confidence::DEFAULT_HALF_LIFE_DAYS`].
+    #[must_use]
+    pub fn confidence_decay_half_life_for(&self, namespace: &str) -> f64 {
+        self.curator
+            .as_ref()
+            .and_then(|c| c.confidence_decay_half_life_days.as_ref())
+            .and_then(|m| m.get(namespace))
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+    }
+
+    /// n15 — snapshot the per-namespace confidence-decay half-life
+    /// overrides for boot-time seeding into the process-global resolver
+    /// ([`crate::confidence::decay::set_namespace_half_life_overrides`]),
+    /// keeping only finite, positive values. Empty when no `[curator]`
+    /// overrides are configured.
+    #[must_use]
+    pub fn confidence_decay_half_life_overrides(&self) -> std::collections::HashMap<String, f64> {
+        self.curator
+            .as_ref()
+            .and_then(|c| c.confidence_decay_half_life_days.as_ref())
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| v.is_finite() && **v > 0.0)
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// v0.7.x (issue #1168) — bundle the three model-resolver outputs
     /// into a single [`ResolvedModels`] triple for the capabilities
     /// surface (MCP `memory_capabilities`, HTTP `GET /api/v1/capabilities`).
@@ -8325,6 +8427,7 @@ legacy_scoring = false
             llm: Some(LlmSection::default()),
             embeddings: Some(EmbeddingsSection::default()),
             reranker: Some(RerankerSection::default()),
+            curator: Some(CuratorSection::default()),
             storage: Some(StorageSection::default()),
             limits: Some(LimitsSection::default()),
         };
@@ -10022,6 +10125,94 @@ max_page_size = 1000000
         assert!(resolved.enabled);
         assert_eq!(resolved.model, "ms-marco-MiniLM-L-6-v2");
         assert_eq!(resolved.source, ConfigSource::Legacy);
+    }
+
+    #[test]
+    fn curator_reflection_namespace_enabled_1671() {
+        use std::collections::HashMap;
+        // No [curator] section → conservative default false (the
+        // pre-#1671 inert-but-safe --all-namespaces posture).
+        let bare = AppConfig::default();
+        assert!(!bare.reflection_namespace_enabled("team/eng"));
+
+        let mut ns_map = HashMap::new();
+        ns_map.insert(
+            "team/eng".to_string(),
+            crate::curator::reflection_pass::ReflectionPassConfig {
+                enabled: true,
+                max_depth: None,
+            },
+        );
+        ns_map.insert(
+            "team/ops".to_string(),
+            crate::curator::reflection_pass::ReflectionPassConfig {
+                enabled: false,
+                max_depth: None,
+            },
+        );
+        let cfg = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: Some(ns_map),
+                confidence_decay_half_life_days: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            cfg.reflection_namespace_enabled("team/eng"),
+            "#1671: enabled=true namespace participates"
+        );
+        assert!(
+            !cfg.reflection_namespace_enabled("team/ops"),
+            "#1671: enabled=false namespace is skipped"
+        );
+        assert!(
+            !cfg.reflection_namespace_enabled("team/unlisted"),
+            "#1671: namespace with no entry is skipped"
+        );
+    }
+
+    #[test]
+    fn curator_confidence_decay_half_life_resolver_n15() {
+        use std::collections::HashMap;
+        // No config → compiled default.
+        let bare = AppConfig::default();
+        assert!(
+            (bare.confidence_decay_half_life_for("team/eng")
+                - crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+                .abs()
+                < f64::EPSILON
+        );
+
+        let mut hl = HashMap::new();
+        hl.insert("team/eng".to_string(), 14.0_f64);
+        hl.insert("team/bad".to_string(), -5.0_f64); // non-positive → falls through
+        hl.insert("team/nan".to_string(), f64::NAN); // non-finite → falls through
+        let cfg = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: Some(hl),
+            }),
+            ..AppConfig::default()
+        };
+        assert!((cfg.confidence_decay_half_life_for("team/eng") - 14.0).abs() < f64::EPSILON);
+        assert!(
+            (cfg.confidence_decay_half_life_for("team/bad")
+                - crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+                .abs()
+                < f64::EPSILON,
+            "n15: non-positive override falls through to the default"
+        );
+        assert!(
+            (cfg.confidence_decay_half_life_for("team/nan")
+                - crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+                .abs()
+                < f64::EPSILON,
+            "n15: non-finite override falls through to the default"
+        );
+        // The boot-seed snapshot keeps only the admissible entries.
+        let snap = cfg.confidence_decay_half_life_overrides();
+        assert_eq!(snap.len(), 1, "only the finite positive entry survives");
+        assert!((snap["team/eng"] - 14.0).abs() < f64::EPSILON);
     }
 
     /// #1604 — rerank sequence-cap ladder: env >
