@@ -1575,6 +1575,19 @@ impl PostgresStore {
     /// `src/offload/mod.rs`. Mirrors SQLite schema v35. Pure
     /// idempotent CREATE TABLE / CREATE INDEX — no application-side
     /// backfill.
+    ///
+    /// #1690 (verified non-gap): this table is created for schema
+    /// PARITY only and carries NO live rows on a postgres-backed
+    /// deployment. `ContextOffloader` (`src/offload/mod.rs`) is bound to
+    /// a rusqlite `Connection` and is reachable solely from the MCP
+    /// `memory_offload` / `memory_deref` tools — which are structurally
+    /// sqlite-only (#1675/n24) — with NO HTTP route and NO `MemoryStore`
+    /// trait method. So offload blobs only ever land in the sqlite
+    /// connection, where `crate::offload::sweep_expired` (wired into the
+    /// `serve` bootstrap via `background::offload_ttl_sweep`) prunes
+    /// them. There is therefore no postgres offload data to sweep and no
+    /// postgres SAL offload-sweep method is needed; if a future HTTP/SAL
+    /// offload write path lands, it must add one here.
     async fn migrate_v34(&self) -> StoreResult<()> {
         let mut tx = self
             .pool
