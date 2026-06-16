@@ -394,6 +394,87 @@ const fn provenance_tier(
     }
 }
 
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — as-of QUANTIZATION bucket (seconds)
+/// for the [`scheduled_validity`] recompute. Quantizing the wall clock to
+/// the nearest hour floor is what makes the decoration DETERMINISTIC: two
+/// recalls that land in the same hour bucket compute a byte-identical
+/// `scheduled_validity` from the same `(anchor, created_at, as_of)` triple,
+/// so the §2.6 Invariant-1 determinism property holds at the decoration
+/// surface (the decoration is never a ranking key, but it must still be
+/// stable for the same input bucket). Reuses the crate-level
+/// [`crate::SECS_PER_HOUR`] const — NO inline `3600`.
+const VALIDITY_AS_OF_BUCKET_SECS: i64 = crate::SECS_PER_HOUR;
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — the "expiring" cutoff as a fraction
+/// of the scheduled-validity window remaining. When the remaining lifetime
+/// (`anchor - as_of`) is at or below this fraction of the total scheduled
+/// window (`anchor - created_at`) — but still positive — the row maps to
+/// `expiring` rather than `valid`. Named const so the threshold is a single
+/// greppable knob (no inline magic number).
+const SCHEDULED_VALIDITY_EXPIRING_FRACTION: f64 = 0.2;
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — the ordered `scheduled_validity`
+/// vocabulary surfaced as a recall-row decoration. SSOT wire strings for
+/// [`scheduled_validity`]; defined once so the ≥3-site literal-duplication
+/// ratchet (`scripts/check-hardcoded-literals.sh`) stays green and the
+/// ordered set is greppable. Ordering (most life remaining → none):
+/// `valid` > `expiring` > `expired`.
+const SCHEDULED_VALIDITY_VALID: &str = "valid";
+const SCHEDULED_VALIDITY_EXPIRING: &str = "expiring";
+const SCHEDULED_VALIDITY_EXPIRED: &str = "expired";
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — deterministic scheduled-fact validity
+/// recomputed from the memory's ANCHOR. PURE: no DB query, no LLM, no
+/// learned model, branch-free over the parsed inputs. The recompute is a
+/// pure function of stored fields + a QUANTIZED as-of bucket, so two reads
+/// over the same `(anchor, created_at, as_of-bucket)` produce a
+/// byte-identical result.
+///
+/// "Scheduled-fact" / "anchor" mapping: there is no dedicated anchor column
+/// on [`Memory`]. The scheduled-validity HORIZON is
+/// [`Memory::effective_expires_at`](crate::models::Memory::effective_expires_at)
+/// — the explicit `expires_at` when set, else `created_at + tier TTL — and
+/// the validity START is `created_at`. The window is `[created_at, anchor)`.
+///
+/// `anchor` and `created_at` are RFC3339 strings (the on-row wire form);
+/// `as_of_secs` is the QUANTIZED unix-second as-of bucket from
+/// [`VALIDITY_AS_OF_BUCKET_SECS`]. Mapping:
+///   * `as_of >= anchor`                                  → `expired`
+///   * unparsable inputs / non-positive window            → `expired`
+///     (fail-closed: a row we cannot reason about is treated as past its
+///     scheduled validity rather than asserted `valid`)
+///   * remaining-fraction `(anchor - as_of)/(anchor - created_at)`
+///     at or below [`SCHEDULED_VALIDITY_EXPIRING_FRACTION`]              → `expiring`
+///   * else                                               → `valid`
+///
+/// This is **decoration only** — never a ranking key, never written back,
+/// `m.confidence` untouched. Mirrors [`freshness_state`]'s pure style but
+/// QUANTIZED (freshness_state stays un-quantized; this is the new
+/// deterministic-anchor field).
+fn scheduled_validity(anchor: &str, created_at: &str, as_of_secs: i64) -> &'static str {
+    let Ok(anchor_dt) = chrono::DateTime::parse_from_rfc3339(anchor) else {
+        return SCHEDULED_VALIDITY_EXPIRED;
+    };
+    let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return SCHEDULED_VALIDITY_EXPIRED;
+    };
+    let anchor_secs = anchor_dt.timestamp();
+    let start_secs = start_dt.timestamp();
+    let total = anchor_secs - start_secs;
+    let remaining = anchor_secs - as_of_secs;
+    if remaining <= 0 || total <= 0 {
+        return SCHEDULED_VALIDITY_EXPIRED;
+    }
+    // Both are positive i64 second counts; the ratio is in (0.0, 1.0].
+    #[allow(clippy::cast_precision_loss)]
+    let remaining_fraction = remaining as f64 / total as f64;
+    if remaining_fraction <= SCHEDULED_VALIDITY_EXPIRING_FRACTION {
+        SCHEDULED_VALIDITY_EXPIRING
+    } else {
+        SCHEDULED_VALIDITY_VALID
+    }
+}
+
 /// FX-4 / PERF-2 (2026-05-26) — batched lookup of the strongest
 /// attestation level across every link incident on each `memory_id`
 /// in `ids`. v0.8.0 #1709 §2.5 T0 — this is now the SOLE attestation
@@ -532,6 +613,15 @@ pub fn decorate_memory_many(
     }
     let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
     let attest_map = latest_link_attest_level_many(conn, &ids);
+    // v0.8.0 #1709 §2.5 T4 (D1-anchor) — read the process-wide decay flag
+    // ONCE for the whole batch and quantize the wall clock to the as-of
+    // bucket ONCE, so every row in this recall decorates against the same
+    // deterministic `as_of`. Read pattern matches the rest of the codebase
+    // (`crate::confidence::decay::decay_enabled` is the canonical
+    // `AI_MEMORY_CONFIDENCE_DECAY=1` accessor).
+    let decay_enabled = crate::confidence::decay::decay_enabled();
+    let validity_as_of_secs =
+        (chrono::Utc::now().timestamp() / VALIDITY_AS_OF_BUCKET_SECS) * VALIDITY_AS_OF_BUCKET_SECS;
     rows.iter()
         .map(|(mem, score)| {
             let mut val = serde_json::to_value(mem).unwrap_or_default();
@@ -569,6 +659,22 @@ pub fn decorate_memory_many(
                 "provenance_tier".to_string(),
                 json!(provenance_tier(mem.confidence_source, attest_level)),
             );
+            // v0.8.0 #1709 §2.5 T4 (D1-anchor) — deterministic
+            // scheduled-fact validity recomputed from the row's ANCHOR
+            // (`effective_expires_at`), emitted ONLY when confidence-decay
+            // is enabled AND the row has an anchor. No anchor (long-tier,
+            // no explicit expiry) or decay-off ⇒ field absent (no noise).
+            // Decoration only — never a ranking key, never written back.
+            if decay_enabled && let Some(anchor) = mem.effective_expires_at() {
+                obj.insert(
+                    "scheduled_validity".to_string(),
+                    json!(scheduled_validity(
+                        &anchor,
+                        &mem.created_at,
+                        validity_as_of_secs
+                    )),
+                );
+            }
             val
         })
         .collect()
@@ -1954,5 +2060,199 @@ mod tests {
             provenance_tier(ConfidenceSource::AutoDerived, Some(AttestLevel::SelfSigned)),
             "curator_derived"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // v0.8.0 #1709 §2.5 T4 (D1-anchor) — scheduled_validity decoration
+    // -------------------------------------------------------------------
+
+    /// Process-wide serial guard for the env-mutating `scheduled_validity`
+    /// decorator tests, so toggling `AI_MEMORY_CONFIDENCE_DECAY` in one
+    /// test never races another test in this binary reading the flag.
+    fn decay_env_lock() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    // PURE-function unit tests — no env, no DB, fully deterministic.
+
+    #[test]
+    fn scheduled_validity_fresh_anchor_is_valid() {
+        // created at t=0, anchor 100h out, as_of right at the start ⇒ full
+        // window remaining ⇒ valid.
+        let created = "2026-01-01T00:00:00+00:00";
+        let start = chrono::DateTime::parse_from_rfc3339(created)
+            .unwrap()
+            .timestamp();
+        let anchor = (chrono::DateTime::parse_from_rfc3339(created).unwrap()
+            + chrono::Duration::hours(100))
+        .to_rfc3339();
+        assert_eq!(scheduled_validity(&anchor, created, start), "valid");
+    }
+
+    #[test]
+    fn scheduled_validity_near_anchor_is_expiring() {
+        // 100h window; as_of leaves only 10h (10% <= 20% cutoff) ⇒ expiring.
+        let created = "2026-01-01T00:00:00+00:00";
+        let created_dt = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+        let anchor_dt = created_dt + chrono::Duration::hours(100);
+        let anchor = anchor_dt.to_rfc3339();
+        let as_of = (anchor_dt - chrono::Duration::hours(10)).timestamp();
+        assert_eq!(scheduled_validity(&anchor, created, as_of), "expiring");
+    }
+
+    #[test]
+    fn scheduled_validity_at_or_past_anchor_is_expired() {
+        let created = "2026-01-01T00:00:00+00:00";
+        let created_dt = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+        let anchor_dt = created_dt + chrono::Duration::hours(100);
+        let anchor = anchor_dt.to_rfc3339();
+        // exactly at the anchor (remaining == 0) ⇒ expired.
+        assert_eq!(
+            scheduled_validity(&anchor, created, anchor_dt.timestamp()),
+            "expired"
+        );
+        // past the anchor ⇒ expired.
+        assert_eq!(
+            scheduled_validity(
+                &anchor,
+                created,
+                (anchor_dt + chrono::Duration::hours(1)).timestamp()
+            ),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn scheduled_validity_unparsable_or_degenerate_fails_closed_to_expired() {
+        // unparsable anchor / created ⇒ expired (fail-closed).
+        assert_eq!(
+            scheduled_validity("not-a-date", "2026-01-01T00:00:00+00:00", 0),
+            "expired"
+        );
+        assert_eq!(
+            scheduled_validity("2026-01-01T00:00:00+00:00", "nope", 0),
+            "expired"
+        );
+        // non-positive window (anchor == created) ⇒ expired.
+        let same = "2026-01-01T00:00:00+00:00";
+        let ts = chrono::DateTime::parse_from_rfc3339(same)
+            .unwrap()
+            .timestamp();
+        assert_eq!(scheduled_validity(same, same, ts - 1), "expired");
+    }
+
+    #[test]
+    fn scheduled_validity_is_deterministic_within_an_as_of_bucket() {
+        // Two evaluations with the SAME quantized as-of bucket are
+        // byte-identical — the §2.6 determinism property at the decoration
+        // surface. (The pure fn already guarantees this; this pins it.)
+        let created = "2026-01-01T00:00:00+00:00";
+        let anchor = (chrono::DateTime::parse_from_rfc3339(created).unwrap()
+            + chrono::Duration::hours(50))
+        .to_rfc3339();
+        let raw_now = chrono::Utc::now().timestamp();
+        let bucket = (raw_now / VALIDITY_AS_OF_BUCKET_SECS) * VALIDITY_AS_OF_BUCKET_SECS;
+        let a = scheduled_validity(&anchor, created, bucket);
+        let b = scheduled_validity(&anchor, created, bucket);
+        assert_eq!(a, b, "same as-of bucket ⇒ identical scheduled_validity");
+    }
+
+    // Decorator integration — env-gated + anchor-gated emission.
+
+    fn mem_with_expiry(title: &str, expires_at: Option<&str>) -> Memory {
+        let mut m = make_mem(title, "scheduled validity decoration content", "sv");
+        // Short tier so a None expires_at still backfills an anchor via
+        // effective_expires_at (created_at + 6h); Long tier has no TTL so
+        // it is the "no anchor" case.
+        m.tier = Tier::Short;
+        m.expires_at = expires_at.map(str::to_string);
+        m
+    }
+
+    #[test]
+    fn decorate_emits_scheduled_validity_only_when_decay_on_and_anchor_present() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+
+        // Anchor in the far future (explicit expires_at) ⇒ valid when on.
+        let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let rows = vec![(mem_with_expiry("sv-valid", Some(&future)), 1.0_f64)];
+
+        // Flag OFF ⇒ field ABSENT.
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+        let off = decorate_memory_many(&rows, true, &conn);
+        assert!(
+            off[0]
+                .as_object()
+                .unwrap()
+                .get("scheduled_validity")
+                .is_none(),
+            "decay flag OFF ⇒ no scheduled_validity field"
+        );
+
+        // Flag ON + anchor present ⇒ field PRESENT and == "valid".
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let on = decorate_memory_many(&rows, true, &conn);
+        assert_eq!(
+            on[0].get("scheduled_validity").and_then(|v| v.as_str()),
+            Some("valid"),
+            "decay ON + future anchor ⇒ scheduled_validity=valid"
+        );
+
+        // Determinism: a second decorate in the same as-of hour bucket is
+        // byte-identical for the scheduled_validity field.
+        let on2 = decorate_memory_many(&rows, true, &conn);
+        assert_eq!(
+            on[0].get("scheduled_validity"),
+            on2[0].get("scheduled_validity"),
+            "two reads in the same as-of bucket ⇒ identical scheduled_validity"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+    }
+
+    #[test]
+    fn decorate_scheduled_validity_expired_for_past_anchor() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let rows = vec![(mem_with_expiry("sv-expired", Some(&past)), 1.0_f64)];
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let out = decorate_memory_many(&rows, true, &conn);
+        assert_eq!(
+            out[0].get("scheduled_validity").and_then(|v| v.as_str()),
+            Some("expired"),
+            "past anchor ⇒ scheduled_validity=expired"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+    }
+
+    #[test]
+    fn decorate_no_scheduled_validity_when_no_anchor() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+        // Long tier + no explicit expiry ⇒ effective_expires_at is None ⇒
+        // no anchor ⇒ field absent even with decay ON.
+        let mut m = make_mem("sv-no-anchor", "no anchor content", "sv");
+        m.tier = Tier::Long;
+        m.expires_at = None;
+        let rows = vec![(m, 1.0_f64)];
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let out = decorate_memory_many(&rows, true, &conn);
+        assert!(
+            out[0]
+                .as_object()
+                .unwrap()
+                .get("scheduled_validity")
+                .is_none(),
+            "no anchor (long tier, no expiry) ⇒ no scheduled_validity field"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
     }
 }
