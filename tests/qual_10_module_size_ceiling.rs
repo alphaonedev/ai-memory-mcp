@@ -176,7 +176,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coordination-action MCP tools (transition/list/add_edge/edges)
     // added their dispatch wrappers + table arms + the expanded
     // `use action::{…}` import, landing the file at 14_481.
-    ("src/mcp/mod.rs", 14_550),
+    // 2026-06-16 (#1709 Pillar 1, signed-signal batch) — bumped
+    // 14_550 → 14_620: the 5 new `memory_signal_*` MCP tools
+    // (send/read/inbox/thread/ack) added the `#[path]` mod decl, the
+    // `use signal::{…}` import, 5 dispatch wrappers, and 5 dispatch-table
+    // arms, landing the file at 14_560. 14_620 = 14_560 + 60 headroom.
+    ("src/mcp/mod.rs", 14_620),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —

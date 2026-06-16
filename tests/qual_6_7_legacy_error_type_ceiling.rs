@@ -78,7 +78,14 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 /// changing the shared dispatch signature — a separate migration, not
 /// a per-tool choice. Net acknowledged addition: +6 (4 lease handlers
 /// landed this batch; +2 slack).
-const QUAL_6_CEILING: usize = 96;
+///
+/// 2026-06-16 — raised 96 → 101 for the v0.8.0 #1709 Pillar-1
+/// signed-signal handler family in `src/mcp/tools/signal.rs`: the 5
+/// `memory_signal_*` MCP handlers (send/read/inbox/thread/ack) each
+/// return `Result<Value, String>` for the same uniform `McpTool`
+/// dispatch-contract reason as the action/lease family above. Net
+/// acknowledged addition: +5.
+const QUAL_6_CEILING: usize = 101;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

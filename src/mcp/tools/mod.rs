@@ -10,6 +10,9 @@ pub(super) mod recall;
 // v0.8.0 Pillar 1 (#1709) — `memory_action_create` + `memory_action_get`
 // MCP tools over the `crate::actions` coordination-action substrate.
 pub(super) mod action;
+// v0.8.0 Pillar 1 (#1709) — `memory_signal_*` MCP tools over the
+// `crate::signals` signed-signal coordination substrate.
+pub(super) mod signal;
 // v0.7.0 Gap 3 (#886) — read-side surface for the recall-consumption
 // observation ledger. Returns recent rows from `recall_observations`
 // filtered by recall_id, consumed flag, and a time window.
@@ -114,6 +117,11 @@ pub(super) use self::{
     action::handle_lease_get,
     action::handle_lease_release,
     action::handle_lease_renew,
+    signal::handle_signal_ack,
+    signal::handle_signal_inbox,
+    signal::handle_signal_read,
+    signal::handle_signal_send,
+    signal::handle_signal_thread,
     recall::handle_recall,
     recall::handle_recall_with_pre_recall_hook,
     recall_observations::handle_recall_observations,
