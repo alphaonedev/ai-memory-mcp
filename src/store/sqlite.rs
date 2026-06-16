@@ -991,6 +991,70 @@ impl MemoryStore for SqliteStore {
         crate::signals::mark_acked(&conn, id, now).map_err(box_err)
     }
 
+    async fn checkpoint_create(
+        &self,
+        _ctx: &CallerContext,
+        cp: &crate::models::Checkpoint,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::insert(&conn, cp).map_err(box_err)
+    }
+
+    async fn checkpoint_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::get(&conn, id).map_err(box_err)
+    }
+
+    async fn checkpoint_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::list(&conn, namespace, state, limit).map_err(box_err)
+    }
+
+    async fn checkpoint_resolve(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        state: crate::models::CheckpointState,
+        resolved_by: &str,
+        resolution: Option<&str>,
+        resolution_note: Option<&str>,
+        resolved_at: i64,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::resolve(
+            &conn,
+            id,
+            state,
+            resolved_by,
+            resolution,
+            resolution_note,
+            resolved_at,
+        )
+        .map_err(box_err)
+    }
+
+    async fn checkpoint_query(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        condition_type: Option<crate::models::ConditionType>,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::query(&conn, namespace, condition_type, state, limit).map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)

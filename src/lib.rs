@@ -468,6 +468,10 @@ pub mod bench;
 // loop for `offloaded_blobs`; future v0.8.0 substrate tasks land
 // here without churning `daemon_runtime`.
 pub mod background;
+// v0.8.0 Pillar 1 (#1709) — attested-checkpoint sqlite free-functions
+// (mirrors `crate::signals`); backs the SAL `checkpoint_*` surface + the
+// future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
+pub mod checkpoints;
 pub mod cli;
 pub mod color;
 /// v0.7.0 Form 5 (issue #758) — auto-confidence + shadow-mode +

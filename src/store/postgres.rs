@@ -7523,6 +7523,65 @@ fn pg_row_to_signal(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Sig
     })
 }
 
+/// #1709 Pillar 1 — `checkpoints` by-id SELECT (canonical column order
+/// matching [`pg_row_to_checkpoint`]). One definition shared by the by-id
+/// reads.
+const PG_CHECKPOINT_SELECT_BY_ID: &str = "SELECT id, namespace, title, condition_type, condition, state, created_by, resolved_by, \
+     resolution, resolution_note, signature, resolver_pubkey, created_at, deadline_at, \
+     resolved_at, metadata FROM checkpoints WHERE id = $1";
+
+/// Map a postgres row (the checkpoint column order) to a
+/// [`crate::models::Checkpoint`]. JSON columns (`condition`, `metadata`) are
+/// TEXT (parity with sqlite); the Ed25519 `signature` / `resolver_pubkey`
+/// columns are nullable BYTEA → `Vec<u8>` (NULL collapses to an empty vec
+/// for an unattested row); epoch columns are BIGINT → `i64` / `Option<i64>`.
+/// Shared by `checkpoint_get` / `checkpoint_list` / `checkpoint_query` /
+/// `checkpoint_resolve`.
+fn pg_row_to_checkpoint(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Checkpoint> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let condition_type: String = r
+        .try_get("condition_type")
+        .map_err(|e| g("checkpoint.condition_type", e))?;
+    let condition: String = r
+        .try_get("condition")
+        .map_err(|e| g("checkpoint.condition", e))?;
+    let state: String = r.try_get("state").map_err(|e| g("checkpoint.state", e))?;
+    let metadata: String = r
+        .try_get("metadata")
+        .map_err(|e| g("checkpoint.metadata", e))?;
+    Ok(crate::models::Checkpoint {
+        id: r.try_get("id").map_err(|e| g("checkpoint.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("checkpoint.namespace", e))?,
+        title: r.try_get("title").map_err(|e| g("checkpoint.title", e))?,
+        condition_type: crate::models::ConditionType::from_str(&condition_type).unwrap_or_default(),
+        condition: serde_json::from_str(&condition).unwrap_or(serde_json::Value::Null),
+        state: crate::models::CheckpointState::from_str(&state).unwrap_or_default(),
+        created_by: r
+            .try_get(crate::models::field_names::CREATED_BY)
+            .map_err(|e| g("checkpoint.created_by", e))?,
+        resolved_by: r.try_get("resolved_by").ok(),
+        resolution: r.try_get("resolution").ok(),
+        resolution_note: r.try_get("resolution_note").ok(),
+        signature: r
+            .try_get::<Option<Vec<u8>>, _>("signature")
+            .map_err(|e| g("checkpoint.signature", e))?
+            .unwrap_or_default(),
+        resolver_pubkey: r
+            .try_get::<Option<Vec<u8>>, _>("resolver_pubkey")
+            .map_err(|e| g("checkpoint.resolver_pubkey", e))?
+            .unwrap_or_default(),
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("checkpoint.created_at", e))?,
+        deadline_at: r.try_get("deadline_at").ok(),
+        resolved_at: r.try_get("resolved_at").ok(),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
+}
+
 /// ARCH-1 — Postgres-side adapter for the substrate
 /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
 ///
@@ -12569,6 +12628,150 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("signal_ack", e))?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn checkpoint_create(
+        &self,
+        _ctx: &CallerContext,
+        cp: &crate::models::Checkpoint,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns (condition, metadata) stored as TEXT
+        // (parity with sqlite); signature/resolver_pubkey are BYTEA, persisted
+        // verbatim (empty for an unattested checkpoint).
+        sqlx::query(
+            "INSERT INTO checkpoints \
+                (id, namespace, title, condition_type, condition, state, created_by, \
+                 resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                 created_at, deadline_at, resolved_at, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+        )
+        .bind(&cp.id)
+        .bind(&cp.namespace)
+        .bind(&cp.title)
+        .bind(cp.condition_type.as_str())
+        .bind(cp.condition.to_string())
+        .bind(cp.state.as_str())
+        .bind(&cp.created_by)
+        .bind(&cp.resolved_by)
+        .bind(&cp.resolution)
+        .bind(&cp.resolution_note)
+        .bind(&cp.signature)
+        .bind(&cp.resolver_pubkey)
+        .bind(cp.created_at)
+        .bind(cp.deadline_at)
+        .bind(cp.resolved_at)
+        .bind(cp.metadata.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("checkpoint_create", e))?;
+        Ok(cp.id.clone())
+    }
+
+    async fn checkpoint_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        sqlx::query(PG_CHECKPOINT_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_get", e))?
+            .as_ref()
+            .map(pg_row_to_checkpoint)
+            .transpose()
+    }
+
+    async fn checkpoint_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                    resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                    created_at, deadline_at, resolved_at, metadata \
+               FROM checkpoints WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(st) = state {
+            qb.push(crate::checkpoints::SQL_AND_STATE_EQ)
+                .push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::checkpoints::SQL_ORDER_BY_CREATED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_list", e))?;
+        rows.iter().map(pg_row_to_checkpoint).collect()
+    }
+
+    async fn checkpoint_resolve(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        state: crate::models::CheckpointState,
+        resolved_by: &str,
+        resolution: Option<&str>,
+        resolution_note: Option<&str>,
+        resolved_at: i64,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let row = sqlx::query(
+            "UPDATE checkpoints SET state = $1, resolved_by = $2, resolution = $3, \
+                resolution_note = $4, resolved_at = $5 WHERE id = $6 \
+             RETURNING id, namespace, title, condition_type, condition, state, created_by, \
+                       resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                       created_at, deadline_at, resolved_at, metadata",
+        )
+        .bind(state.as_str())
+        .bind(resolved_by)
+        .bind(resolution)
+        .bind(resolution_note)
+        .bind(resolved_at)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("checkpoint_resolve", e))?;
+        row.as_ref().map(pg_row_to_checkpoint).transpose()
+    }
+
+    async fn checkpoint_query(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        condition_type: Option<crate::models::ConditionType>,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                    resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                    created_at, deadline_at, resolved_at, metadata \
+               FROM checkpoints WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(ct) = condition_type {
+            qb.push(" AND condition_type = ")
+                .push_bind(ct.as_str().to_string());
+        }
+        if let Some(st) = state {
+            qb.push(crate::checkpoints::SQL_AND_STATE_EQ)
+                .push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::checkpoints::SQL_ORDER_BY_CREATED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_query", e))?;
+        rows.iter().map(pg_row_to_checkpoint).collect()
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
