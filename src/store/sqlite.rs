@@ -793,6 +793,76 @@ impl MemoryStore for SqliteStore {
         crate::observations::gc::prune_before(&conn, &cutoff).map_err(box_err)
     }
 
+    async fn action_create(
+        &self,
+        _ctx: &CallerContext,
+        action: &crate::models::Action,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        conn.execute(
+            "INSERT INTO actions \
+                (id, namespace, kind, state, title, payload, priority, agent_id, \
+                 claimed_by, vector_clock, metadata, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                action.id,
+                action.namespace,
+                action.kind,
+                action.state.as_str(),
+                action.title,
+                action.payload.to_string(),
+                action.priority,
+                action.agent_id,
+                action.claimed_by,
+                action.vector_clock.to_string(),
+                action.metadata.to_string(),
+                action.created_at,
+                action.updated_at,
+            ],
+        )
+        .map_err(box_err)?;
+        Ok(action.id.clone())
+    }
+
+    async fn action_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        let row = conn
+            .query_row(
+                "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                        claimed_by, vector_clock, metadata, created_at, updated_at \
+                   FROM actions WHERE id = ?1",
+                rusqlite::params![id],
+                |r| {
+                    Ok(crate::models::Action {
+                        id: r.get(0)?,
+                        namespace: r.get(1)?,
+                        kind: r.get(2)?,
+                        state: crate::models::ActionState::from_str(&r.get::<_, String>(3)?)
+                            .unwrap_or_default(),
+                        title: r.get(4)?,
+                        payload: serde_json::from_str(&r.get::<_, String>(5)?)
+                            .unwrap_or(serde_json::Value::Null),
+                        priority: r.get(6)?,
+                        agent_id: r.get(7)?,
+                        claimed_by: r.get(8)?,
+                        vector_clock: serde_json::from_str(&r.get::<_, String>(9)?)
+                            .unwrap_or(serde_json::Value::Null),
+                        metadata: serde_json::from_str(&r.get::<_, String>(10)?)
+                            .unwrap_or(serde_json::Value::Null),
+                        created_at: r.get(11)?,
+                        updated_at: r.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(box_err)?;
+        Ok(row)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)

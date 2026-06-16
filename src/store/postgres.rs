@@ -11908,6 +11908,85 @@ impl MemoryStore for PostgresStore {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
+    async fn action_create(
+        &self,
+        _ctx: &CallerContext,
+        action: &crate::models::Action,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns stored as TEXT (parity with sqlite).
+        sqlx::query(
+            "INSERT INTO actions \
+                (id, namespace, kind, state, title, payload, priority, agent_id, \
+                 claimed_by, vector_clock, metadata, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&action.id)
+        .bind(&action.namespace)
+        .bind(&action.kind)
+        .bind(action.state.as_str())
+        .bind(&action.title)
+        .bind(action.payload.to_string())
+        .bind(action.priority)
+        .bind(&action.agent_id)
+        .bind(&action.claimed_by)
+        .bind(action.vector_clock.to_string())
+        .bind(action.metadata.to_string())
+        .bind(action.created_at)
+        .bind(action.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_create", e))?;
+        Ok(action.id.clone())
+    }
+
+    async fn action_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        use sqlx::Row;
+        let Some(r) = sqlx::query(
+            "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                    claimed_by, vector_clock, metadata, created_at, updated_at \
+               FROM actions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_get", e))?
+        else {
+            return Ok(None);
+        };
+        let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+        let state: String = r.try_get("state").map_err(|e| g("action.state", e))?;
+        let payload: String = r.try_get("payload").map_err(|e| g("action.payload", e))?;
+        let vector_clock: String = r
+            .try_get("vector_clock")
+            .map_err(|e| g("action.vector_clock", e))?;
+        let metadata: String = r.try_get("metadata").map_err(|e| g("action.metadata", e))?;
+        Ok(Some(crate::models::Action {
+            id: r.try_get("id").map_err(|e| g("action.id", e))?,
+            namespace: r
+                .try_get("namespace")
+                .map_err(|e| g("action.namespace", e))?,
+            kind: r.try_get("kind").map_err(|e| g("action.kind", e))?,
+            state: crate::models::ActionState::from_str(&state).unwrap_or_default(),
+            title: r.try_get("title").map_err(|e| g("action.title", e))?,
+            payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+            priority: r.try_get("priority").map_err(|e| g("action.priority", e))?,
+            agent_id: r.try_get("agent_id").ok(),
+            claimed_by: r.try_get("claimed_by").ok(),
+            vector_clock: serde_json::from_str(&vector_clock).unwrap_or(serde_json::Value::Null),
+            metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+            created_at: r
+                .try_get(crate::models::field_names::CREATED_AT)
+                .map_err(|e| g("action.created_at", e))?,
+            updated_at: r
+                .try_get("updated_at")
+                .map_err(|e| g("action.updated_at", e))?,
+        }))
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed

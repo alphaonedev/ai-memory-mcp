@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 
+pub mod action;
 pub mod audit;
 pub mod capture_turn;
 pub mod field_names;
@@ -14,6 +15,8 @@ pub mod reflection;
 pub mod skill;
 pub mod tag;
 
+#[allow(unused_imports)]
+pub use action::*;
 #[allow(unused_imports)]
 pub use audit::*;
 pub use capture_turn::*;

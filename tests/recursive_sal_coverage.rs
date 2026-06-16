@@ -203,6 +203,48 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .await
         .expect("recall_observation_gc ok");
     assert_eq!(pruned, 0, "recent row not pruned by a 10-year TTL");
+
+    // #1709 Pillar 1 — action_create / action_get round-trip through the SAL
+    // trait, on BOTH adapters (the v59 coordination substrate).
+    let aid = format!("sal-cov-act-{}", uuid_like());
+    let action = ai_memory::models::Action {
+        id: aid.clone(),
+        namespace: TEST_NS.to_string(),
+        kind: "test.coordinate".to_string(),
+        state: ai_memory::models::ActionState::Pending,
+        title: "sal-cov action".to_string(),
+        payload: serde_json::json!({"k": "v"}),
+        priority: 7,
+        agent_id: Some(TEST_AGENT.to_string()),
+        claimed_by: None,
+        vector_clock: serde_json::json!({TEST_AGENT: 1}),
+        metadata: serde_json::json!({}),
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+    };
+    let created_id = store
+        .action_create(&ctx, &action)
+        .await
+        .expect("action_create ok");
+    assert_eq!(created_id, aid);
+    let got = store
+        .action_get(&ctx, &aid)
+        .await
+        .expect("action_get ok")
+        .expect("action present after create");
+    assert_eq!(got.id, aid);
+    assert_eq!(got.namespace, TEST_NS);
+    assert_eq!(got.kind, "test.coordinate");
+    assert_eq!(got.state, ai_memory::models::ActionState::Pending);
+    assert_eq!(got.priority, 7);
+    assert_eq!(got.agent_id.as_deref(), Some(TEST_AGENT));
+    assert_eq!(got.payload, serde_json::json!({"k": "v"}));
+    // Unknown id → None (not an error).
+    let missing = store
+        .action_get(&ctx, "sal-cov-act-does-not-exist")
+        .await
+        .expect("action_get unknown ok");
+    assert!(missing.is_none(), "unknown action id yields None");
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

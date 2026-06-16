@@ -1445,6 +1445,31 @@ pub trait MemoryStore: Send + Sync {
         Ok(0)
     }
 
+    /// #1709 Pillar 1 — create a coordination action (the v59 `actions`
+    /// table). Returns the action id. Default `UnsupportedCapability` so a
+    /// non-coordination adapter signals the gap rather than silently no-op.
+    async fn action_create(
+        &self,
+        _ctx: &CallerContext,
+        _action: &crate::models::Action,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a coordination action by id. `Ok(None)` when
+    /// the action does not exist. Default `UnsupportedCapability`.
+    async fn action_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///
