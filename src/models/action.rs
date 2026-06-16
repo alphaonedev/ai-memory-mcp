@@ -110,6 +110,60 @@ pub struct Action {
     pub updated_at: i64,
 }
 
+/// Typed dependency-DAG edge kind between two coordination actions
+/// (the `action_edges.edge_type` column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeType {
+    /// `from` requires `to` to complete first.
+    Requires,
+    /// `from` unlocks `to` on completion.
+    Unlocks,
+    /// `from` blocks `to` while active.
+    Blocks,
+    /// `to` is gated by an external condition on `from`.
+    GatedBy,
+    /// `from` and `to` are siblings (no ordering).
+    Sibling,
+}
+
+impl EdgeType {
+    /// Canonical wire/DB spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Requires => "requires",
+            Self::Unlocks => "unlocks",
+            Self::Blocks => "blocks",
+            Self::GatedBy => "gated_by",
+            Self::Sibling => "sibling",
+        }
+    }
+
+    /// Parse a DB/wire spelling. `None` on an unknown value.
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "requires" => Some(Self::Requires),
+            "unlocks" => Some(Self::Unlocks),
+            "blocks" => Some(Self::Blocks),
+            "gated_by" => Some(Self::GatedBy),
+            "sibling" => Some(Self::Sibling),
+            _ => None,
+        }
+    }
+}
+
+/// A typed edge in the action dependency DAG. Mirrors the v59
+/// `action_edges` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionEdge {
+    pub from_action: String,
+    pub to_action: String,
+    pub edge_type: EdgeType,
+    pub created_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +200,20 @@ mod tests {
         // Terminal classification.
         assert!(Done.is_terminal() && Failed.is_terminal() && Abandoned.is_terminal());
         assert!(!Pending.is_terminal() && !Claimed.is_terminal() && !InProgress.is_terminal());
+    }
+
+    #[test]
+    fn edge_type_roundtrips_str() {
+        for e in [
+            EdgeType::Requires,
+            EdgeType::Unlocks,
+            EdgeType::Blocks,
+            EdgeType::GatedBy,
+            EdgeType::Sibling,
+        ] {
+            assert_eq!(EdgeType::from_str(e.as_str()), Some(e));
+        }
+        assert_eq!(EdgeType::from_str("gated_by"), Some(EdgeType::GatedBy));
+        assert_eq!(EdgeType::from_str("bogus"), None);
     }
 }

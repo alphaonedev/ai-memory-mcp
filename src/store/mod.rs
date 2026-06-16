@@ -1504,6 +1504,34 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 Pillar 1 — add a typed dependency-DAG edge between two actions.
+    /// Idempotent: the `(from, to, edge_type)` primary key dedups a repeated
+    /// declaration. Default `UnsupportedCapability`.
+    async fn action_add_edge(
+        &self,
+        _ctx: &CallerContext,
+        _from_action: &str,
+        _to_action: &str,
+        _edge_type: crate::models::EdgeType,
+        _now: i64,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — every edge touching `action_id` (inbound + outbound
+    /// union), for the per-node DAG view. Default `UnsupportedCapability`.
+    async fn action_edges_for(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+    ) -> StoreResult<Vec<crate::models::ActionEdge>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///

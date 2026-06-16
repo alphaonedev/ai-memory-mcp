@@ -299,6 +299,72 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         listed.iter().any(|a| a.id == aid),
         "the claimed action appears in the namespace+state-filtered list"
     );
+
+    // #1709 — action DAG edges: create a second action, add a typed edge,
+    // and verify action_edges_for surfaces it (both adapters).
+    let aid2 = format!("sal-cov-act2-{}", uuid_like());
+    store
+        .action_create(
+            &ctx,
+            &ai_memory::models::Action {
+                id: aid2.clone(),
+                namespace: TEST_NS.to_string(),
+                kind: "test.coordinate".to_string(),
+                state: ai_memory::models::ActionState::Pending,
+                title: "sal-cov action 2".to_string(),
+                payload: serde_json::json!({}),
+                priority: 5,
+                agent_id: Some(TEST_AGENT.to_string()),
+                claimed_by: None,
+                vector_clock: serde_json::json!({}),
+                metadata: serde_json::json!({}),
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_000,
+            },
+        )
+        .await
+        .expect("action_create 2 ok");
+    store
+        .action_add_edge(
+            &ctx,
+            &aid,
+            &aid2,
+            ai_memory::models::EdgeType::Requires,
+            1_700_000_400,
+        )
+        .await
+        .expect("action_add_edge ok");
+    // Idempotent — re-adding the same edge is a no-op (PK dedup).
+    store
+        .action_add_edge(
+            &ctx,
+            &aid,
+            &aid2,
+            ai_memory::models::EdgeType::Requires,
+            1_700_000_401,
+        )
+        .await
+        .expect("action_add_edge idempotent ok");
+    let edges = store
+        .action_edges_for(&ctx, &aid)
+        .await
+        .expect("action_edges_for ok");
+    let mine = edges
+        .iter()
+        .find(|e| e.from_action == aid && e.to_action == aid2)
+        .expect("the requires edge is surfaced for the from-node");
+    assert_eq!(mine.edge_type, ai_memory::models::EdgeType::Requires);
+    // The same edge is visible from the to-node (inbound union).
+    let inbound = store
+        .action_edges_for(&ctx, &aid2)
+        .await
+        .expect("action_edges_for inbound ok");
+    assert!(
+        inbound
+            .iter()
+            .any(|e| e.from_action == aid && e.to_action == aid2),
+        "edge is visible from the to-node (inbound)"
+    );
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent
