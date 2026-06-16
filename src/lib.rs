@@ -459,6 +459,7 @@ pub mod approvals;
 // long-form memories into atomic propositions with full provenance
 // (atom_of FK, derives_from edge, signed_events trail). The first
 // downstream consumer landing on the WT-1-A schema v36 foundation.
+pub mod actions;
 pub mod atomisation;
 pub mod audit;
 pub mod autonomy;
