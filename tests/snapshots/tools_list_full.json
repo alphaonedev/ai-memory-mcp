@@ -1668,6 +1668,130 @@
       "name": "memory_signal_ack"
     },
     {
+      "description": "Create a pending",
+      "inputSchema": {
+        "properties": {
+          "condition": {},
+          "condition_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deadline_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "namespace": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_create"
+    },
+    {
+      "description": "Resolve a checkpoint",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_by": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resolved_by",
+          "state"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_resolve"
+    },
+    {
+      "description": "Query checkpoints by",
+      "inputSchema": {
+        "properties": {
+          "condition_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_query"
+    },
+    {
+      "description": "Fetch a checkpoint by id and",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_verify"
+    },
+    {
       "description": "Scan",
       "inputSchema": {
         "properties": {

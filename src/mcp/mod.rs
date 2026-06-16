@@ -413,6 +413,10 @@ mod auto_tag;
 mod capabilities;
 #[path = "tools/signal.rs"]
 mod signal;
+// v0.8.0 Pillar 1 (#1709) — `memory_checkpoint_*` MCP tools over the
+// `crate::checkpoints` attested-checkpoint coordination substrate.
+#[path = "tools/checkpoint.rs"]
+mod checkpoint;
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001
 // (`docs/rfc/RFC-0001-mcp-turn-capture.md`). Substrate-side handler
 // for the protocol-level fix that closes the #1388 substrate failure
@@ -978,6 +982,11 @@ use signal::{
     handle_signal_ack, handle_signal_inbox, handle_signal_read, handle_signal_send,
     handle_signal_thread,
 };
+// v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination handlers.
+use checkpoint::{
+    handle_checkpoint_create, handle_checkpoint_query, handle_checkpoint_resolve,
+    handle_checkpoint_verify,
+};
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
 // `handle_list_subscriptions` are also `pub use`-exported above; the
@@ -1314,6 +1323,28 @@ fn dispatch_memory_signal_thread(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_ack`.
 fn dispatch_memory_signal_ack(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_signal_ack(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_create`.
+fn dispatch_memory_checkpoint_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_create(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_resolve`. Threads
+/// the active daemon keypair so the resolution is `self_signed` when a signing
+/// key is available, `unsigned` otherwise.
+fn dispatch_memory_checkpoint_resolve(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_resolve(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_query`.
+fn dispatch_memory_checkpoint_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_query(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_verify`.
+fn dispatch_memory_checkpoint_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_verify(ctx.conn, ctx.arguments)
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2004,6 +2035,24 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
             dispatch_memory_signal_thread
         ),
         register_mcp_tool!(tool_names::MEMORY_SIGNAL_ACK, dispatch_memory_signal_ack),
+        // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+        // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_CREATE,
+            dispatch_memory_checkpoint_create
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_RESOLVE,
+            dispatch_memory_checkpoint_resolve
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_QUERY,
+            dispatch_memory_checkpoint_query
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_VERIFY,
+            dispatch_memory_checkpoint_verify
+        ),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
         register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),

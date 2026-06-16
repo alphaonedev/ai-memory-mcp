@@ -2753,6 +2753,168 @@
         "type": "object"
       },
       "name": "memory_signal_ack"
+    },
+    {
+      "description": "Create a pending attested-checkpoint coordination gate (#1709).",
+      "docs": "Pillar 1 (#1709): create a checkpoint in the pending state, gated on an external condition.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_create`.",
+        "properties": {
+          "condition": {
+            "default": null,
+            "description": "JSON condition spec for the gate. Defaults to `{}`."
+          },
+          "condition_type": {
+            "default": null,
+            "description": "Condition type (`approval` / `external_signal` / `condition_predicate` / `deadline`). Defaults to `approval`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "default": null,
+            "description": "Agent id that created the checkpoint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deadline_at": {
+            "default": null,
+            "description": "Epoch-seconds deadline after which the checkpoint may expire.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "default": null,
+            "description": "Arbitrary JSON metadata. Defaults to `{}`."
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "title"
+        ],
+        "title": "CheckpointCreateRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_create"
+    },
+    {
+      "description": "Resolve a checkpoint (resolved/rejected), Ed25519-attested when signing (#1709).",
+      "docs": "Pillar 1 (#1709): resolve a checkpoint; the resolution self-signs when a signing keypair is available.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_resolve`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "resolution": {
+            "default": null,
+            "description": "Structured resolution payload (free-form string).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution_note": {
+            "default": null,
+            "description": "Human-readable note explaining the resolution.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_by": {
+            "type": "string"
+          },
+          "state": {
+            "description": "Resolution state \u2014 one of `resolved` / `rejected`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resolved_by",
+          "state"
+        ],
+        "title": "CheckpointResolveRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_resolve"
+    },
+    {
+      "description": "Query checkpoints by namespace/condition_type/state, newest-first (#1709).",
+      "docs": "Pillar 1 (#1709): list a namespace's checkpoints, optionally narrowed by condition_type and state.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_query`.",
+        "properties": {
+          "condition_type": {
+            "default": null,
+            "description": "Narrow to a single condition type when set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "default": null,
+            "description": "Narrow to a single lifecycle state when set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "CheckpointQueryRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_query"
+    },
+    {
+      "description": "Fetch a checkpoint by id and verify its attested resolution (#1709).",
+      "docs": "Pillar 1 (#1709): fetch a checkpoint and verify its Ed25519 attested-resolution signature.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_verify`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "CheckpointVerifyRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_verify"
     }
   ],
   "toolsVersion": "2026-05-06"

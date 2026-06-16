@@ -85,7 +85,14 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 /// return `Result<Value, String>` for the same uniform `McpTool`
 /// dispatch-contract reason as the action/lease family above. Net
 /// acknowledged addition: +5.
-const QUAL_6_CEILING: usize = 101;
+///
+/// 2026-06-16 — raised 101 → 105 for the v0.8.0 #1709 Pillar-1
+/// attested-checkpoint handler family in `src/mcp/tools/checkpoint.rs`:
+/// the 4 `memory_checkpoint_*` MCP handlers (create/resolve/query/verify)
+/// each return `Result<Value, String>` for the same uniform `McpTool`
+/// dispatch-contract reason as the action/lease/signal families above.
+/// Net acknowledged addition: +4.
+const QUAL_6_CEILING: usize = 105;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

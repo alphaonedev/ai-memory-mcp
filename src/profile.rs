@@ -279,7 +279,13 @@ impl Family {
             | tn::MEMORY_SIGNAL_READ
             | tn::MEMORY_SIGNAL_INBOX
             | tn::MEMORY_SIGNAL_THREAD
-            | tn::MEMORY_SIGNAL_ACK => Some(Self::Power),
+            | tn::MEMORY_SIGNAL_ACK
+            // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+            // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+            | tn::MEMORY_CHECKPOINT_CREATE
+            | tn::MEMORY_CHECKPOINT_RESOLVE
+            | tn::MEMORY_CHECKPOINT_QUERY
+            | tn::MEMORY_CHECKPOINT_VERIFY => Some(Self::Power),
             // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
             // memory_recall_observations).
             tn::MEMORY_CAPABILITIES
@@ -526,6 +532,12 @@ impl Family {
                 tn::MEMORY_SIGNAL_INBOX,
                 tn::MEMORY_SIGNAL_THREAD,
                 tn::MEMORY_SIGNAL_ACK,
+                // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+                // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+                tn::MEMORY_CHECKPOINT_CREATE,
+                tn::MEMORY_CHECKPOINT_RESOLVE,
+                tn::MEMORY_CHECKPOINT_QUERY,
+                tn::MEMORY_CHECKPOINT_VERIFY,
             ],
             Self::Meta => &[
                 tn::MEMORY_CAPABILITIES,
