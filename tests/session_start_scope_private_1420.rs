@@ -214,6 +214,22 @@ async fn http_session_start_owner_sees_own_row() {
         "alice DOES see her own private row; got: {mems:?}"
     );
     assert_eq!(mems[0]["title"].as_str(), Some("alice-private"));
+    // v0.8.0 #1709 §2.5 T2 — session_start rows now carry the same verbose
+    // provenance decoration as MCP / HTTP recall (provenance_tier +
+    // confidence_tier + freshness_state), routed through decorate_memory_many.
+    assert!(
+        mems[0]["provenance_tier"].is_string(),
+        "T2: session_start row carries provenance_tier; got: {:?}",
+        mems[0]
+    );
+    assert!(
+        mems[0]["confidence_tier"].is_string(),
+        "T2: session_start row carries confidence_tier"
+    );
+    assert!(
+        mems[0]["freshness_state"].is_string(),
+        "T2: session_start row carries freshness_state"
+    );
 }
 
 #[tokio::test]
