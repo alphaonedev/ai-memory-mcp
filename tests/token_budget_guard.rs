@@ -62,7 +62,11 @@ use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tok
 /// future field additions; partial compensation comes from D1.7
 /// (#988) when the trimmer's allow-list filtering of schemars
 /// metadata lands.
-const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 17_000;
+///
+/// **v0.8.0 #1709 update.** Adding the `memory_action_create` +
+/// `memory_action_get` Pillar-1 tools nudged the measured verbose
+/// total to ~17K; ceiling re-raised to 18K to restore ~1K headroom.
+const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 18_000;
 
 /// Hard ceiling for the trimmed wire (`tools/list`) catalog.
 ///

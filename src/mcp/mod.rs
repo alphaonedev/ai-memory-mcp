@@ -401,6 +401,8 @@ fn prompt_content(name: &str, params: &Value) -> Result<Value, String> {
 // Registry is already declared above (pub(super) mod registry;).
 // tools/ directory: each file = one tool module under mcp.
 
+#[path = "tools/action.rs"]
+mod action;
 #[path = "tools/agent.rs"]
 mod agent;
 #[path = "tools/archive.rs"]
@@ -963,6 +965,8 @@ pub fn skill_compositional_context_for_tests(
 // L1-5 / L2-6 regression suites and the CLI/HTTP surfaces can drive
 // them directly without going through the stdio JSON-RPC layer.
 use store::handle_store;
+// v0.8.0 Pillar 1 (#1709) — coordination-action create/get handlers.
+use action::{handle_action_create, handle_action_get};
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
 // `handle_list_subscriptions` are also `pub use`-exported above; the
@@ -1222,6 +1226,16 @@ fn dispatch_memory_recall(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 /// `memory_recall_observations` tool.
 fn dispatch_memory_recall_observations(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_recall_observations(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_create`.
+fn dispatch_memory_action_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_create(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_get`.
+fn dispatch_memory_action_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_get(ctx.conn, ctx.arguments)
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1869,6 +1883,12 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         register_mcp_tool!(tool_names::MEMORY_AGENT_LIST, dispatch_memory_agent_list),
         register_mcp_tool!(tool_names::MEMORY_NOTIFY, dispatch_memory_notify),
         register_mcp_tool!(tool_names::MEMORY_SHARE, dispatch_memory_share),
+        // v0.8.0 Pillar 1 (#1709) — coordination-action create/get.
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_CREATE,
+            dispatch_memory_action_create
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ACTION_GET, dispatch_memory_action_get),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
         register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),

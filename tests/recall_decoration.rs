@@ -452,7 +452,7 @@ fn gap7_token_budget_guard_still_passes_post_decoration() {
         "Gap 7 regression: trimmed full-profile total {trimmed} exceeds the 11000-token ceiling"
     );
     assert!(
-        verbose <= 17_000,
-        "Gap 7 regression: verbose full-profile total {verbose} exceeds the 17000-token ceiling"
+        verbose <= 18_000,
+        "Gap 7 regression: verbose full-profile total {verbose} exceeds the 18000-token ceiling"
     );
 }

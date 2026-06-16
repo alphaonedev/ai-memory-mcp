@@ -1039,7 +1039,7 @@
             "type": "string"
           },
           "depth": {
-            "description": "v0.7.0 #1325 — caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
+            "description": "v0.7.0 #1325 \u2014 caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
             "type": "integer"
           },
           "metadata": {
@@ -2290,7 +2290,7 @@
             "type": "string"
           },
           "role": {
-            "description": "Speaker classification — `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
+            "description": "Speaker classification \u2014 `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
             "type": "string"
           },
           "timestamp_iso": {
@@ -2311,6 +2311,70 @@
         "type": "object"
       },
       "name": "memory_capture_turn"
+    },
+    {
+      "description": "Create a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): insert a pending coordination action into the action DAG.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_create`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "payload": {
+            "default": null
+          },
+          "priority": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "namespace",
+          "title"
+        ],
+        "title": "ActionCreateRequest",
+        "type": "object"
+      },
+      "name": "memory_action_create"
+    },
+    {
+      "description": "Fetch a coordination action by id (#1709).",
+      "docs": "Pillar 1 (#1709): return one coordination action by id, or null when absent.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_get`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ActionGetRequest",
+        "type": "object"
+      },
+      "name": "memory_action_get"
     }
   ],
   "toolsVersion": "2026-05-06"

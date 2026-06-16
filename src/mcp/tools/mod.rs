@@ -7,6 +7,9 @@
 
 pub(super) mod store;
 pub(super) mod recall;
+// v0.8.0 Pillar 1 (#1709) — `memory_action_create` + `memory_action_get`
+// MCP tools over the `crate::actions` coordination-action substrate.
+pub(super) mod action;
 // v0.7.0 Gap 3 (#886) — read-side surface for the recall-consumption
 // observation ledger. Returns recent rows from `recall_observations`
 // filtered by recall_id, consumed flag, and a time window.
@@ -101,6 +104,8 @@ pub(super) mod share;
 // internal tools:: submodule structure.
 pub(super) use self::{
     store::handle_store,
+    action::handle_action_create,
+    action::handle_action_get,
     recall::handle_recall,
     recall::handle_recall_with_pre_recall_hook,
     recall_observations::handle_recall_observations,
