@@ -745,6 +745,57 @@
       "name": "memory_share"
     },
     {
+      "description": "Create a coordination action",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {},
+          "namespace": {
+            "type": "string"
+          },
+          "payload": {},
+          "priority": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "namespace",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_create"
+    },
+    {
+      "description": "Fetch a coordination action by",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_get"
+    },
+    {
       "description": "Scan",
       "inputSchema": {
         "properties": {

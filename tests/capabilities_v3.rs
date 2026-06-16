@@ -610,7 +610,7 @@ fn cap_v3_a3_allowlist_on_agent_denied_callable_now_false() {
 // memory_skill_get, memory_skill_resource, memory_skill_export.)
 // ---------------------------------------------------------------------------
 #[test]
-fn cap_v3_response_carries_tools_array_with_73_entries() {
+fn cap_v3_response_carries_tools_array_with_full_profile_entries() {
     let tier_config = semantic_tier();
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(

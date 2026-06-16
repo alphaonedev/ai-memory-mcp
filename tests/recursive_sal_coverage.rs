@@ -72,6 +72,10 @@ fn reflect_input(source_ids: Vec<String>, title: &str) -> ai_memory::db::Reflect
 /// Drive the three trait methods against an arbitrary `MemoryStore` and
 /// assert the recursive-learning contract holds. Backend-agnostic so the
 /// sqlite and postgres tests share one body.
+// One sequential walk of the entire SAL surface (memories, links, recall
+// ledger, action substrate, leases); splitting it would obscure the
+// single-store contract it pins, so the length lint is allowed here.
+#[allow(clippy::too_many_lines)]
 async fn exercise_sal_surface(store: &dyn MemoryStore) {
     let ctx = CallerContext::for_admin(TEST_AGENT);
 
@@ -172,7 +176,7 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     let replay = store
         .mark_recall_consumed(
             &rid,
-            &[base_id.clone()],
+            std::slice::from_ref(&base_id),
             &base_id,
             Some("other-agent-sal-cov"),
         )
@@ -184,7 +188,12 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     );
     // The owning agent's citation flips it.
     let flipped = store
-        .mark_recall_consumed(&rid, &[base_id.clone()], &base_id, Some(TEST_AGENT))
+        .mark_recall_consumed(
+            &rid,
+            std::slice::from_ref(&base_id),
+            &base_id,
+            Some(TEST_AGENT),
+        )
         .await
         .expect("mark_recall_consumed ok");
     assert_eq!(flipped, 1, "the owning agent's citation flips the row");

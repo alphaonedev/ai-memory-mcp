@@ -33,7 +33,7 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-/// Expected `matcher` on the managed PreToolUse entry the installer
+/// Expected `matcher` on the managed `PreToolUse` entry the installer
 /// writes — the scoped action surface (`Bash|Edit|Write`), NOT `"*"`
 /// (issue #1667). Black-box pin of the external contract; mirrors the
 /// crate-private `cli::install::PRETOOL_HOOK_MATCHER` const, which this

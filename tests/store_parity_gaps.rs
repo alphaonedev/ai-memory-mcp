@@ -702,6 +702,8 @@ mod postgres_side {
                     (m1.id.clone(), "hybrid".to_string(), 1, 0.9),
                     (m2.id.clone(), "hybrid".to_string(), 2, 0.8),
                 ],
+                None,
+                None,
             )
             .await
             .expect("insert observations");
@@ -709,7 +711,12 @@ mod postgres_side {
 
         // Idempotency: ON CONFLICT DO NOTHING.
         let again = pg
-            .recall_observation_insert("pg-g3-r1", &[(m1.id.clone(), "hybrid".to_string(), 1, 0.9)])
+            .recall_observation_insert(
+                "pg-g3-r1",
+                &[(m1.id.clone(), "hybrid".to_string(), 1, 0.9)],
+                None,
+                None,
+            )
             .await
             .expect("idempotent replay");
         assert_eq!(again, 0);

@@ -458,7 +458,7 @@ async fn recall_observation_insert_dedup_and_gc() {
     // First insert writes one row (the (recall_id, memory_id) pkey
     // collapses the two retriever rows into one ON CONFLICT DO NOTHING).
     let written = store
-        .recall_observation_insert(&recall_id, &candidates)
+        .recall_observation_insert(&recall_id, &candidates, None, None)
         .await
         .expect("recall_observation_insert");
     assert_eq!(
@@ -468,14 +468,14 @@ async fn recall_observation_insert_dedup_and_gc() {
 
     // Re-insert the same candidates → all conflict → zero new rows.
     let again = store
-        .recall_observation_insert(&recall_id, &candidates)
+        .recall_observation_insert(&recall_id, &candidates, None, None)
         .await
         .expect("recall_observation_insert idempotent");
     assert_eq!(again, 0, "re-insert is a full ON CONFLICT no-op");
 
     // Empty-candidate slice is an early-return no-op (no tx opened).
     let empty = store
-        .recall_observation_insert(&recall_id, &[])
+        .recall_observation_insert(&recall_id, &[], None, None)
         .await
         .expect("recall_observation_insert empty");
     assert_eq!(empty, 0);

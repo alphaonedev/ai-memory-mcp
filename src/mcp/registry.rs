@@ -34,6 +34,10 @@ use serde_json::{Value, json};
 /// `memory_<lower_snake>` so the call site reads naturally
 /// (`tool_names::MEMORY_STORE => …` ⇒ `"memory_store" => …`).
 pub mod tool_names {
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action create.
+    pub const MEMORY_ACTION_CREATE: &str = "memory_action_create";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action fetch-by-id.
+    pub const MEMORY_ACTION_GET: &str = "memory_action_get";
     pub const MEMORY_AGENT_LIST: &str = "memory_agent_list";
     pub const MEMORY_AGENT_REGISTER: &str = "memory_agent_register";
     pub const MEMORY_ARCHIVE_LIST: &str = "memory_archive_list";
@@ -125,6 +129,8 @@ pub mod tool_names {
     /// without re-typing it.
     #[allow(dead_code)]
     pub const ALL: &[&str] = &[
+        MEMORY_ACTION_CREATE,
+        MEMORY_ACTION_GET,
         MEMORY_AGENT_LIST,
         MEMORY_AGENT_REGISTER,
         MEMORY_ARCHIVE_LIST,
@@ -271,6 +277,8 @@ pub mod tool_names {
         /// `Claude Desktop reload` time.
         #[test]
         fn const_values_byte_equal_to_historical_wire_strings() {
+            assert_eq!(MEMORY_ACTION_CREATE, "memory_action_create");
+            assert_eq!(MEMORY_ACTION_GET, "memory_action_get");
             assert_eq!(MEMORY_AGENT_LIST, "memory_agent_list");
             assert_eq!(MEMORY_AGENT_REGISTER, "memory_agent_register");
             assert_eq!(MEMORY_ARCHIVE_LIST, "memory_archive_list");
@@ -628,6 +636,9 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::ingest_multistep::IngestMultistepTool>(),
         RegisteredTool::of::<crate::mcp::atomise::AtomiseTool>(),
         RegisteredTool::of::<crate::mcp::share::ShareTool>(),
+        // v0.8.0 Pillar 1 (#1709) — coordination-action create/get.
+        RegisteredTool::of::<crate::mcp::action::ActionCreateTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionGetTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
