@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 58;
+const CURRENT_SCHEMA_VERSION: i32 = 59;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1302,8 +1302,11 @@ impl PostgresStore {
         if current_version < 57 {
             self.migrate_v57().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 58 {
             self.migrate_v58().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v59().await?;
         }
 
         Ok(())
@@ -2616,6 +2619,73 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v58 applied (#1705: recall_observations agent_id + namespace identity columns)"
+        );
+        Ok(())
+    }
+
+    /// v59 (#1709, v0.8.0 Pillar 1) — distributed coordination substrate
+    /// foundation: additive `actions` / `action_edges` / `leases` tables
+    /// (state machine + typed dependency DAG + lease/heartbeat). Postgres
+    /// twin of `migrations/sqlite/0049_v59_action_substrate.sql`. Pure
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` — idempotent + replay-safe (fresh
+    /// schemas carry these inline in `postgres_schema.sql`).
+    async fn migrate_v59(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v59 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS actions (
+                id           TEXT        NOT NULL PRIMARY KEY,
+                namespace    TEXT        NOT NULL,
+                kind         TEXT        NOT NULL,
+                state        TEXT        NOT NULL DEFAULT 'pending',
+                title        TEXT        NOT NULL DEFAULT '',
+                payload      TEXT        NOT NULL DEFAULT '{}',
+                priority     BIGINT      NOT NULL DEFAULT 5,
+                agent_id     TEXT,
+                claimed_by   TEXT,
+                vector_clock TEXT        NOT NULL DEFAULT '{}',
+                metadata     TEXT        NOT NULL DEFAULT '{}',
+                created_at   BIGINT      NOT NULL,
+                updated_at   BIGINT      NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_actions_ns_state ON actions(namespace, state)",
+            "CREATE INDEX IF NOT EXISTS idx_actions_state_priority ON actions(state, priority DESC)",
+            "CREATE TABLE IF NOT EXISTS action_edges (
+                from_action TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+                to_action   TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+                edge_type   TEXT   NOT NULL,
+                created_at  BIGINT NOT NULL,
+                PRIMARY KEY (from_action, to_action, edge_type)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_action_edges_to ON action_edges(to_action)",
+            "CREATE TABLE IF NOT EXISTS leases (
+                action_id    TEXT   NOT NULL PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,
+                holder       TEXT   NOT NULL,
+                acquired_at  BIGINT NOT NULL,
+                expires_at   BIGINT NOT NULL,
+                heartbeat_at BIGINT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v59 action-substrate DDL", e))?;
+        }
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v59 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v59 applied (#1709 Pillar 1: actions + action_edges + leases coordination substrate)"
         );
         Ok(())
     }

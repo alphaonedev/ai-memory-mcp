@@ -141,6 +141,12 @@ const SQLITE_RELATIONAL_TABLES: &[&str] = &[
     // (sqlite migration 0044 + postgres migrate_v52), so the parity assertion
     // MUST cover it.
     "transcript_line_dedup",
+    // #1709 (v0.8.0 Pillar 1) — the coordination-substrate foundation tables,
+    // created on BOTH adapters at v59 (sqlite migration 0049 + postgres
+    // migrate_v59), so the parity assertion covers them.
+    "actions",
+    "action_edges",
+    "leases",
 ];
 
 /// #1689/n19 — sqlite/daemon-local tables the Postgres adapter intentionally
