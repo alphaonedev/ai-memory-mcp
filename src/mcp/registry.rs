@@ -81,6 +81,14 @@ pub mod tool_names {
     pub const MEMORY_KG_INVALIDATE: &str = "memory_kg_invalidate";
     pub const MEMORY_KG_QUERY: &str = "memory_kg_query";
     pub const MEMORY_KG_TIMELINE: &str = "memory_kg_timeline";
+    /// v0.8.0 Pillar 1 (#1709) — acquire a single-holder lease on an action.
+    pub const MEMORY_LEASE_ACQUIRE: &str = "memory_lease_acquire";
+    /// v0.8.0 Pillar 1 (#1709) — read the lease on an action.
+    pub const MEMORY_LEASE_GET: &str = "memory_lease_get";
+    /// v0.8.0 Pillar 1 (#1709) — release an owned lease on an action.
+    pub const MEMORY_LEASE_RELEASE: &str = "memory_lease_release";
+    /// v0.8.0 Pillar 1 (#1709) — heartbeat-renew an owned lease on an action.
+    pub const MEMORY_LEASE_RENEW: &str = "memory_lease_renew";
     pub const MEMORY_LINK: &str = "memory_link";
     pub const MEMORY_LIST: &str = "memory_list";
     pub const MEMORY_LIST_SUBSCRIPTIONS: &str = "memory_list_subscriptions";
@@ -176,6 +184,10 @@ pub mod tool_names {
         MEMORY_KG_INVALIDATE,
         MEMORY_KG_QUERY,
         MEMORY_KG_TIMELINE,
+        MEMORY_LEASE_ACQUIRE,
+        MEMORY_LEASE_GET,
+        MEMORY_LEASE_RELEASE,
+        MEMORY_LEASE_RENEW,
         MEMORY_LINK,
         MEMORY_LIST,
         MEMORY_LIST_SUBSCRIPTIONS,
@@ -330,6 +342,10 @@ pub mod tool_names {
             assert_eq!(MEMORY_KG_INVALIDATE, "memory_kg_invalidate");
             assert_eq!(MEMORY_KG_QUERY, "memory_kg_query");
             assert_eq!(MEMORY_KG_TIMELINE, "memory_kg_timeline");
+            assert_eq!(MEMORY_LEASE_ACQUIRE, "memory_lease_acquire");
+            assert_eq!(MEMORY_LEASE_GET, "memory_lease_get");
+            assert_eq!(MEMORY_LEASE_RELEASE, "memory_lease_release");
+            assert_eq!(MEMORY_LEASE_RENEW, "memory_lease_renew");
             assert_eq!(MEMORY_LINK, "memory_link");
             assert_eq!(MEMORY_LIST, "memory_list");
             assert_eq!(MEMORY_LIST_SUBSCRIPTIONS, "memory_list_subscriptions");
@@ -660,6 +676,12 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::action::ActionListTool>(),
         RegisteredTool::of::<crate::mcp::action::ActionAddEdgeTool>(),
         RegisteredTool::of::<crate::mcp::action::ActionEdgesTool>(),
+        // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
+        // (acquire/renew/release/get) over the `crate::actions` substrate.
+        RegisteredTool::of::<crate::mcp::action::LeaseAcquireTool>(),
+        RegisteredTool::of::<crate::mcp::action::LeaseRenewTool>(),
+        RegisteredTool::of::<crate::mcp::action::LeaseReleaseTool>(),
+        RegisteredTool::of::<crate::mcp::action::LeaseGetTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.

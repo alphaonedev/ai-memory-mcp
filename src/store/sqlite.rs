@@ -63,22 +63,10 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
 // a bare Connection). Referenced below as `crate::actions::{ACTION_SELECT_SQL,
 // row_to_action}`.
 
-/// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical column order for
-/// [`sqlite_row_to_lease`]). Shared by every lease read.
-const LEASE_SELECT_BY_ID_SQL: &str = "SELECT action_id, holder, acquired_at, expires_at, heartbeat_at \
-     FROM leases WHERE action_id = ?1";
-
-/// Map a `rusqlite` row (the [`LEASE_SELECT_BY_ID_SQL`] column order) to a
-/// [`crate::models::Lease`].
-fn sqlite_row_to_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Lease> {
-    Ok(crate::models::Lease {
-        action_id: r.get(0)?,
-        holder: r.get(1)?,
-        acquired_at: r.get(2)?,
-        expires_at: r.get(3)?,
-        heartbeat_at: r.get(4)?,
-    })
-}
+// #1709 Pillar 1 — the `leases` SELECT column list + row mapping + the four
+// lease operations live in `crate::actions` (shared with the MCP
+// `memory_lease_*` handlers, which hold a bare Connection). Referenced below
+// as `crate::actions::{LEASE_SELECT_BY_ID_SQL, row_to_lease, lease_*}`.
 
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
@@ -896,36 +884,14 @@ impl MemoryStore for SqliteStore {
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
         let conn = self.state.lock().await;
-        // A non-expired lease held by a different holder blocks acquisition.
-        let existing: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT holder, expires_at FROM leases WHERE action_id = ?1",
-                rusqlite::params![action_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(box_err)?;
-        if let Some((h, exp)) = existing
-            && exp > now
-            && h != holder
+        match crate::actions::lease_acquire(&conn, action_id, holder, now, expires_at)
+            .map_err(box_err)?
         {
-            return Err(StoreError::Conflict {
+            crate::actions::LeaseAcquire::Conflict => Err(StoreError::Conflict {
                 id: action_id.to_string(),
-            });
+            }),
+            crate::actions::LeaseAcquire::Acquired(l) => Ok(l),
         }
-        conn.execute(
-            "INSERT OR REPLACE INTO leases \
-                (action_id, holder, acquired_at, expires_at, heartbeat_at) \
-             VALUES (?1, ?2, ?3, ?4, ?3)",
-            rusqlite::params![action_id, holder, now, expires_at],
-        )
-        .map_err(box_err)?;
-        conn.query_row(
-            LEASE_SELECT_BY_ID_SQL,
-            rusqlite::params![action_id],
-            sqlite_row_to_lease,
-        )
-        .map_err(box_err)
     }
 
     async fn lease_renew(
@@ -937,24 +903,11 @@ impl MemoryStore for SqliteStore {
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
         let conn = self.state.lock().await;
-        let n = conn
-            .execute(
-                "UPDATE leases SET expires_at = ?1, heartbeat_at = ?2 \
-                  WHERE action_id = ?3 AND holder = ?4",
-                rusqlite::params![expires_at, now, action_id, holder],
-            )
-            .map_err(box_err)?;
-        if n == 0 {
-            return Err(StoreError::NotFound {
+        crate::actions::lease_renew(&conn, action_id, holder, now, expires_at)
+            .map_err(box_err)?
+            .ok_or(StoreError::NotFound {
                 id: action_id.to_string(),
-            });
-        }
-        conn.query_row(
-            LEASE_SELECT_BY_ID_SQL,
-            rusqlite::params![action_id],
-            sqlite_row_to_lease,
-        )
-        .map_err(box_err)
+            })
     }
 
     async fn lease_release(
@@ -964,13 +917,7 @@ impl MemoryStore for SqliteStore {
         holder: &str,
     ) -> StoreResult<bool> {
         let conn = self.state.lock().await;
-        let n = conn
-            .execute(
-                "DELETE FROM leases WHERE action_id = ?1 AND holder = ?2",
-                rusqlite::params![action_id, holder],
-            )
-            .map_err(box_err)?;
-        Ok(n > 0)
+        crate::actions::lease_release(&conn, action_id, holder).map_err(box_err)
     }
 
     async fn lease_get(
@@ -979,13 +926,7 @@ impl MemoryStore for SqliteStore {
         action_id: &str,
     ) -> StoreResult<Option<crate::models::Lease>> {
         let conn = self.state.lock().await;
-        conn.query_row(
-            LEASE_SELECT_BY_ID_SQL,
-            rusqlite::params![action_id],
-            sqlite_row_to_lease,
-        )
-        .optional()
-        .map_err(box_err)
+        crate::actions::lease_get(&conn, action_id).map_err(box_err)
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {

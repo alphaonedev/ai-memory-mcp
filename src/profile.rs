@@ -266,7 +266,13 @@ impl Family {
             | tn::MEMORY_ACTION_TRANSITION
             | tn::MEMORY_ACTION_LIST
             | tn::MEMORY_ACTION_ADD_EDGE
-            | tn::MEMORY_ACTION_EDGES => Some(Self::Power),
+            | tn::MEMORY_ACTION_EDGES
+            // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
+            // (acquire/renew/release/get) over the action DAG.
+            | tn::MEMORY_LEASE_ACQUIRE
+            | tn::MEMORY_LEASE_RENEW
+            | tn::MEMORY_LEASE_RELEASE
+            | tn::MEMORY_LEASE_GET => Some(Self::Power),
             // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
             // memory_recall_observations).
             tn::MEMORY_CAPABILITIES
@@ -500,6 +506,12 @@ impl Family {
                 tn::MEMORY_ACTION_LIST,
                 tn::MEMORY_ACTION_ADD_EDGE,
                 tn::MEMORY_ACTION_EDGES,
+                // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
+                // (acquire/renew/release/get) over the action DAG.
+                tn::MEMORY_LEASE_ACQUIRE,
+                tn::MEMORY_LEASE_RENEW,
+                tn::MEMORY_LEASE_RELEASE,
+                tn::MEMORY_LEASE_GET,
             ],
             Self::Meta => &[
                 tn::MEMORY_CAPABILITIES,

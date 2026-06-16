@@ -887,6 +887,92 @@
       "name": "memory_action_edges"
     },
     {
+      "description": "Acquire a single-holder lease",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_acquire"
+    },
+    {
+      "description": "Heartbeat-renew an owned lease",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_renew"
+    },
+    {
+      "description": "Release an owned lease on a",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_release"
+    },
+    {
+      "description": "Read the lease on a",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_get"
+    },
+    {
       "description": "Scan",
       "inputSchema": {
         "properties": {

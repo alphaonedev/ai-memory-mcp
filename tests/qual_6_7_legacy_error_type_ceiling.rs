@@ -66,7 +66,19 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 
 /// QUAL-6 ceiling: 81 sites at v2-review time + slack for in-batch
 /// additions. Tighten in lockstep with handler-family migration.
-const QUAL_6_CEILING: usize = 90;
+///
+/// 2026-06-16 — raised 90 → 96 for the v0.8.0 #1709 Pillar-1
+/// coordination handler family in `src/mcp/tools/action.rs`: the 8
+/// `memory_action_*` + `memory_lease_*` MCP handlers each return
+/// `Result<Value, String>` to match the uniform `McpTool` dispatch
+/// contract (`DispatchFn = fn(&ToolDispatchCtx) -> Result<Value,
+/// String>`) that every one of the ~81 existing handlers already
+/// uses. Adopting `MemoryError`/anyhow for this family alone would
+/// make it inconsistent with the established surface and require
+/// changing the shared dispatch signature — a separate migration, not
+/// a per-tool choice. Net acknowledged addition: +6 (4 lease handlers
+/// landed this batch; +2 slack).
+const QUAL_6_CEILING: usize = 96;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

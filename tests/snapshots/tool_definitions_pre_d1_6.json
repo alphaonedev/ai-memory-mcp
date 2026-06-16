@@ -2489,6 +2489,112 @@
         "type": "object"
       },
       "name": "memory_action_edges"
+    },
+    {
+      "description": "Acquire a single-holder lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_acquire`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "default": null,
+            "description": "Lease lifetime in seconds (default 60). `expires_at` is computed internally as `now + ttl_secs`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "title": "LeaseAcquireRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_acquire"
+    },
+    {
+      "description": "Heartbeat-renew an owned lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_renew`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "default": null,
+            "description": "New lease lifetime in seconds (default 60). `expires_at` is computed internally as `now + ttl_secs`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "title": "LeaseRenewRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_renew"
+    },
+    {
+      "description": "Release an owned lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): release an owned lease; reports whether a row was removed.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_release`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "title": "LeaseReleaseRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_release"
+    },
+    {
+      "description": "Read the lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): return the lease on an action, or null when none is held.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_get`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id"
+        ],
+        "title": "LeaseGetRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_get"
     }
   ],
   "toolsVersion": "2026-05-06"

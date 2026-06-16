@@ -968,7 +968,8 @@ use store::handle_store;
 // v0.8.0 Pillar 1 (#1709) — coordination-action create/get handlers.
 use action::{
     handle_action_add_edge, handle_action_create, handle_action_edges, handle_action_get,
-    handle_action_list, handle_action_transition,
+    handle_action_list, handle_action_transition, handle_lease_acquire, handle_lease_get,
+    handle_lease_release, handle_lease_renew,
 };
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
@@ -1259,6 +1260,26 @@ fn dispatch_memory_action_add_edge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, S
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_edges`.
 fn dispatch_memory_action_edges(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_action_edges(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_acquire`.
+fn dispatch_memory_lease_acquire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_acquire(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_renew`.
+fn dispatch_memory_lease_renew(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_renew(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_release`.
+fn dispatch_memory_lease_release(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_release(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_get`.
+fn dispatch_memory_lease_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_get(ctx.conn, ctx.arguments)
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1925,6 +1946,17 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
             tool_names::MEMORY_ACTION_EDGES,
             dispatch_memory_action_edges
         ),
+        // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface.
+        register_mcp_tool!(
+            tool_names::MEMORY_LEASE_ACQUIRE,
+            dispatch_memory_lease_acquire
+        ),
+        register_mcp_tool!(tool_names::MEMORY_LEASE_RENEW, dispatch_memory_lease_renew),
+        register_mcp_tool!(
+            tool_names::MEMORY_LEASE_RELEASE,
+            dispatch_memory_lease_release
+        ),
+        register_mcp_tool!(tool_names::MEMORY_LEASE_GET, dispatch_memory_lease_get),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
         register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),
