@@ -417,6 +417,10 @@ mod signal;
 // `crate::checkpoints` attested-checkpoint coordination substrate.
 #[path = "tools/checkpoint.rs"]
 mod checkpoint;
+// v0.8.0 Pillar 1 (#1709) — `memory_routine_*` MCP tools over the
+// `crate::routines` parameterised action+edge template substrate.
+#[path = "tools/routine.rs"]
+mod routine;
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001
 // (`docs/rfc/RFC-0001-mcp-turn-capture.md`). Substrate-side handler
 // for the protocol-level fix that closes the #1388 substrate failure
@@ -987,6 +991,11 @@ use checkpoint::{
     handle_checkpoint_create, handle_checkpoint_query, handle_checkpoint_resolve,
     handle_checkpoint_verify,
 };
+// v0.8.0 Pillar 1 (#1709) — routine coordination handlers.
+use routine::{
+    handle_routine_create, handle_routine_freeze, handle_routine_list, handle_routine_run,
+    handle_routine_status,
+};
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
 // `handle_list_subscriptions` are also `pub use`-exported above; the
@@ -1345,6 +1354,33 @@ fn dispatch_memory_checkpoint_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_verify`.
 fn dispatch_memory_checkpoint_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_checkpoint_verify(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_create`.
+fn dispatch_memory_routine_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_create(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_freeze`. Threads the
+/// active daemon keypair so the freeze is `self_signed` when a signing key is
+/// available, `unsigned` otherwise.
+fn dispatch_memory_routine_freeze(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_freeze(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_run`.
+fn dispatch_memory_routine_run(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_run(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_status`.
+fn dispatch_memory_routine_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_status(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_list`.
+fn dispatch_memory_routine_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_list(ctx.conn, ctx.arguments)
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2052,6 +2088,25 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         register_mcp_tool!(
             tool_names::MEMORY_CHECKPOINT_VERIFY,
             dispatch_memory_checkpoint_verify
+        ),
+        // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+        // (create/freeze/run/status/list) over the `crate::routines` substrate.
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_CREATE,
+            dispatch_memory_routine_create
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_FREEZE,
+            dispatch_memory_routine_freeze
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ROUTINE_RUN, dispatch_memory_routine_run),
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_STATUS,
+            dispatch_memory_routine_status
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_LIST,
+            dispatch_memory_routine_list
         ),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),

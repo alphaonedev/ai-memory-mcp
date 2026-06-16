@@ -118,6 +118,16 @@ pub mod tool_names {
     pub const MEMORY_REFLECT: &str = "memory_reflect";
     pub const MEMORY_REFLECTION_ORIGIN: &str = "memory_reflection_origin";
     pub const MEMORY_REPLAY: &str = "memory_replay";
+    /// v0.8.0 Pillar 1 (#1709) — create a draft routine (action+edge template).
+    pub const MEMORY_ROUTINE_CREATE: &str = "memory_routine_create";
+    /// v0.8.0 Pillar 1 (#1709) — freeze a routine (Draft → Frozen, attested).
+    pub const MEMORY_ROUTINE_FREEZE: &str = "memory_routine_freeze";
+    /// v0.8.0 Pillar 1 (#1709) — list a namespace's routines by state.
+    pub const MEMORY_ROUTINE_LIST: &str = "memory_routine_list";
+    /// v0.8.0 Pillar 1 (#1709) — materialise a frozen routine under arguments.
+    pub const MEMORY_ROUTINE_RUN: &str = "memory_routine_run";
+    /// v0.8.0 Pillar 1 (#1709) — fetch a routine run by id.
+    pub const MEMORY_ROUTINE_STATUS: &str = "memory_routine_status";
     pub const MEMORY_RULE_LIST: &str = "memory_rule_list";
     pub const MEMORY_SEARCH: &str = "memory_search";
     pub const MEMORY_SESSION_START: &str = "memory_session_start";
@@ -226,6 +236,11 @@ pub mod tool_names {
         MEMORY_REFLECT,
         MEMORY_REFLECTION_ORIGIN,
         MEMORY_REPLAY,
+        MEMORY_ROUTINE_CREATE,
+        MEMORY_ROUTINE_FREEZE,
+        MEMORY_ROUTINE_LIST,
+        MEMORY_ROUTINE_RUN,
+        MEMORY_ROUTINE_STATUS,
         MEMORY_RULE_LIST,
         MEMORY_SEARCH,
         MEMORY_SESSION_START,
@@ -402,6 +417,11 @@ pub mod tool_names {
             assert_eq!(MEMORY_REFLECT, "memory_reflect");
             assert_eq!(MEMORY_REFLECTION_ORIGIN, "memory_reflection_origin");
             assert_eq!(MEMORY_REPLAY, "memory_replay");
+            assert_eq!(MEMORY_ROUTINE_CREATE, "memory_routine_create");
+            assert_eq!(MEMORY_ROUTINE_FREEZE, "memory_routine_freeze");
+            assert_eq!(MEMORY_ROUTINE_LIST, "memory_routine_list");
+            assert_eq!(MEMORY_ROUTINE_RUN, "memory_routine_run");
+            assert_eq!(MEMORY_ROUTINE_STATUS, "memory_routine_status");
             assert_eq!(MEMORY_RULE_LIST, "memory_rule_list");
             assert_eq!(MEMORY_SEARCH, "memory_search");
             assert_eq!(MEMORY_SESSION_START, "memory_session_start");
@@ -726,6 +746,13 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::checkpoint::CheckpointResolveTool>(),
         RegisteredTool::of::<crate::mcp::checkpoint::CheckpointQueryTool>(),
         RegisteredTool::of::<crate::mcp::checkpoint::CheckpointVerifyTool>(),
+        // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+        // (create/freeze/run/status/list) over the `crate::routines` substrate.
+        RegisteredTool::of::<crate::mcp::routine::RoutineCreateTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineFreezeTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineRunTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineStatusTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineListTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.

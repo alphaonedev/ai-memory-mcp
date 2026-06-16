@@ -265,12 +265,12 @@ mod tests {
         // the next field-addition without re-bumping. Floor stays at 5K
         // to catch a wiring break that drops the catalog entirely.
         assert!(
-            (5_000..=20_000).contains(&total),
+            (5_000..=22_000).contains(&total),
             "full-profile total {total} tokens is outside the measured \
-             cl100k_base range (5K-20K, post-#987 D1.6; upper bound raised \
-             17K->18K->20K across the v0.8.0 #1709 Pillar-1 memory_action_* + \
-             memory_lease_* tool additions, measured ~18.2K at 84 tools). If \
-             the schema grew intentionally, update \
+             cl100k_base range (5K-22K, post-#987 D1.6; upper bound raised \
+             17K->18K->20K->22K across the v0.8.0 #1709 Pillar-1 memory_action_* + \
+             memory_lease_* + memory_routine_* tool additions, measured ~20.6K at \
+             98 tools). If the schema grew intentionally, update \
              `tests/token_budget_guard.rs::VERBOSE_FULL_PROFILE_CEILING_TOKENS` \
              AND this bound together."
         );

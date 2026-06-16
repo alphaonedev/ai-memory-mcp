@@ -69,7 +69,12 @@ use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tok
 /// `edges` DAG tools + the `memory_lease_acquire`/`renew`/`release`/`get`
 /// lease tools brought the 84-tool catalog to ~18.2K, so the ceiling is
 /// re-raised to 20K to restore ~1.8K headroom.
-const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 20_000;
+///
+/// 2026-06-16 — re-raised 20K -> 22K for the v0.8.0 #1709 Pillar-1
+/// `memory_routine_*` tool family (create/freeze/run/status/list): the
+/// 98-tool catalog measures ~20.6K, so the ceiling moves to 22K to
+/// restore ~1.4K headroom.
+const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 22_000;
 
 /// Hard ceiling for the trimmed wire (`tools/list`) catalog.
 ///

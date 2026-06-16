@@ -16,6 +16,9 @@ pub(super) mod signal;
 // v0.8.0 Pillar 1 (#1709) — `memory_checkpoint_*` MCP tools over the
 // `crate::checkpoints` attested-checkpoint coordination substrate.
 pub(super) mod checkpoint;
+// v0.8.0 Pillar 1 (#1709) — `memory_routine_*` MCP tools over the
+// `crate::routines` parameterised action+edge template substrate.
+pub(super) mod routine;
 // v0.7.0 Gap 3 (#886) — read-side surface for the recall-consumption
 // observation ledger. Returns recent rows from `recall_observations`
 // filtered by recall_id, consumed flag, and a time window.
@@ -129,6 +132,11 @@ pub(super) use self::{
     checkpoint::handle_checkpoint_query,
     checkpoint::handle_checkpoint_resolve,
     checkpoint::handle_checkpoint_verify,
+    routine::handle_routine_create,
+    routine::handle_routine_freeze,
+    routine::handle_routine_list,
+    routine::handle_routine_run,
+    routine::handle_routine_status,
     recall::handle_recall,
     recall::handle_recall_with_pre_recall_hook,
     recall_observations::handle_recall_observations,
