@@ -6,6 +6,7 @@ use serde_json::Value;
 pub mod action;
 pub mod audit;
 pub mod capture_turn;
+pub mod checkpoint;
 pub mod field_names;
 pub mod link;
 pub mod memory;
@@ -21,6 +22,8 @@ pub use action::*;
 #[allow(unused_imports)]
 pub use audit::*;
 pub use capture_turn::*;
+#[allow(unused_imports)]
+pub use checkpoint::*;
 pub use link::*;
 pub use memory::*;
 pub use namespace::*;

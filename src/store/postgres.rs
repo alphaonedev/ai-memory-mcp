@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 60;
+const CURRENT_SCHEMA_VERSION: i32 = 61;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1308,8 +1308,11 @@ impl PostgresStore {
         if current_version < 59 {
             self.migrate_v59().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 60 {
             self.migrate_v60().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v61().await?;
         }
 
         Ok(())
@@ -2747,6 +2750,55 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v60 applied (#1709 Pillar 1: signals signed-signal storage foundation)"
+        );
+        Ok(())
+    }
+
+    async fn migrate_v61(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v61 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS checkpoints (
+                id              TEXT NOT NULL PRIMARY KEY,
+                namespace       TEXT NOT NULL,
+                title           TEXT NOT NULL,
+                condition_type  TEXT NOT NULL,
+                condition       TEXT   NOT NULL DEFAULT '{}',
+                state           TEXT NOT NULL,
+                created_by      TEXT NOT NULL,
+                resolved_by     TEXT,
+                resolution      TEXT,
+                resolution_note TEXT,
+                signature       BYTEA,
+                resolver_pubkey BYTEA,
+                created_at      BIGINT NOT NULL,
+                deadline_at     BIGINT,
+                resolved_at     BIGINT,
+                metadata        TEXT   NOT NULL DEFAULT '{}'
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_ns_state ON checkpoints(namespace, state, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_condition_type ON checkpoints(condition_type)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_deadline ON checkpoints(deadline_at)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v61 attested-checkpoints DDL", e))?;
+        }
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v61 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v61 applied (#1709 Pillar 1: checkpoints attested-checkpoint storage foundation)"
         );
         Ok(())
     }

@@ -151,6 +151,10 @@ const SQLITE_RELATIONAL_TABLES: &[&str] = &[
     // created on BOTH adapters at v60 (sqlite migration 0050 + postgres
     // migrate_v60), so the parity assertion covers it.
     "signals",
+    // #1709 (v0.8.0 Pillar 1) — the attested-checkpoints storage foundation
+    // table, created on BOTH adapters at v61 (sqlite migration 0051 + postgres
+    // migrate_v61), so the parity assertion covers it.
+    "checkpoints",
 ];
 
 /// #1689/n19 — sqlite/daemon-local tables the Postgres adapter intentionally
