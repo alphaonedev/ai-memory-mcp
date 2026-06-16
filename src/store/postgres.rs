@@ -7333,6 +7333,31 @@ fn pg_row_to_action(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Act
     })
 }
 
+/// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical order for
+/// [`pg_row_to_lease`]).
+const PG_LEASE_SELECT_BY_ID: &str = "SELECT action_id, holder, acquired_at, expires_at, heartbeat_at FROM leases WHERE action_id = $1";
+
+/// Map a postgres row to a [`crate::models::Lease`].
+fn pg_row_to_lease(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Lease> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    Ok(crate::models::Lease {
+        action_id: r
+            .try_get("action_id")
+            .map_err(|e| g("lease.action_id", e))?,
+        holder: r.try_get("holder").map_err(|e| g("lease.holder", e))?,
+        acquired_at: r
+            .try_get("acquired_at")
+            .map_err(|e| g("lease.acquired_at", e))?,
+        expires_at: r
+            .try_get("expires_at")
+            .map_err(|e| g("lease.expires_at", e))?,
+        heartbeat_at: r
+            .try_get("heartbeat_at")
+            .map_err(|e| g("lease.heartbeat_at", e))?,
+    })
+}
+
 /// ARCH-1 — Postgres-side adapter for the substrate
 /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
 ///
@@ -12128,6 +12153,123 @@ impl MemoryStore for PostgresStore {
                 })
             })
             .collect()
+    }
+
+    async fn lease_acquire(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin lease_acquire tx", e))?;
+        let existing: Option<(String, i64)> =
+            sqlx::query_as("SELECT holder, expires_at FROM leases WHERE action_id = $1 FOR UPDATE")
+                .bind(action_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("lease_acquire select", e))?;
+        if let Some((h, exp)) = existing
+            && exp > now
+            && h != holder
+        {
+            return Err(StoreError::Conflict {
+                id: action_id.to_string(),
+            });
+        }
+        sqlx::query(
+            "INSERT INTO leases (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+             VALUES ($1, $2, $3, $4, $3) \
+             ON CONFLICT (action_id) DO UPDATE SET holder = EXCLUDED.holder, \
+                acquired_at = EXCLUDED.acquired_at, expires_at = EXCLUDED.expires_at, \
+                heartbeat_at = EXCLUDED.heartbeat_at",
+        )
+        .bind(action_id)
+        .bind(holder)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("lease_acquire upsert", e))?;
+        let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
+            .bind(action_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("lease_acquire refetch", e))?;
+        let lease = pg_row_to_lease(&row)?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit lease_acquire", e))?;
+        Ok(lease)
+    }
+
+    async fn lease_renew(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let n = sqlx::query(
+            "UPDATE leases SET expires_at = $1, heartbeat_at = $2 \
+              WHERE action_id = $3 AND holder = $4",
+        )
+        .bind(expires_at)
+        .bind(now)
+        .bind(action_id)
+        .bind(holder)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("lease_renew", e))?
+        .rows_affected();
+        if n == 0 {
+            return Err(StoreError::NotFound {
+                id: action_id.to_string(),
+            });
+        }
+        let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
+            .bind(action_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_renew refetch", e))?;
+        pg_row_to_lease(&row)
+    }
+
+    async fn lease_release(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+    ) -> StoreResult<bool> {
+        let n = sqlx::query("DELETE FROM leases WHERE action_id = $1 AND holder = $2")
+            .bind(action_id)
+            .bind(holder)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_release", e))?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn lease_get(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Option<crate::models::Lease>> {
+        sqlx::query(PG_LEASE_SELECT_BY_ID)
+            .bind(action_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_get", e))?
+            .as_ref()
+            .map(pg_row_to_lease)
+            .transpose()
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
