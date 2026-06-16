@@ -1,8 +1,10 @@
-# Memory-Kind Vocabulary (Form 6, issue #759)
+# Memory-Kind Vocabulary (Form 6, issue #759; Pillar 2, issue #1709)
 
 v0.7.x extends the substrate's `MemoryKind` enum from the original
 three lifecycle variants (`Observation` / `Reflection` / `Persona`)
-with the seven-variant Batman taxonomy extension. The full set is now:
+with the seven-variant Batman taxonomy extension, and v0.8.0
+(Pillar 2, #1709) adds the three-variant typed-cognition cluster. The
+full set is now **13 kinds**:
 
 | variant | purpose |
 | --- | --- |
@@ -16,11 +18,18 @@ with the seven-variant Batman taxonomy extension. The full set is now:
 | `event`       | temporally-bounded happening. |
 | `conversation`| captured dialogue turn. |
 | `decision`    | choice point with rationale (L1-6 reservation). |
+| `goal`        | a desired end-state / objective (Pillar 2 typed-cognition, #1709). |
+| `plan`        | an ordered strategy to reach a goal (Pillar 2 typed-cognition, #1709). |
+| `step`        | a single executable unit within a plan (Pillar 2 typed-cognition, #1709). |
 
 The first three are the v0.7.0 lifecycle variants and are unchanged.
-The seven new variants give downstream readers a richer
+The next seven (Form 6) give downstream readers a richer
 filter-by-kind surface aligned with the Batman framework's exemplar
-(Tolaria's frontmatter-as-type schema).
+(Tolaria's frontmatter-as-type schema). The final three
+(`goal` / `plan` / `step`, v0.8.0 #1709) are the Pillar-2
+typed-cognition kinds: a `goal` names a desired end-state, a `plan`
+is the ordered strategy to reach it, and a `step` is one executable
+unit within that plan.
 
 ## Schema impact: none
 
@@ -166,7 +175,7 @@ regardless of profile because `memory_capabilities` is on the
 {
   "vocabulary": ["observation", "reflection", "persona", "concept",
                  "entity", "claim", "relation", "event",
-                 "conversation", "decision"],
+                 "conversation", "decision", "goal", "plan", "step"],
   "recall_filter": "implemented",
   "cli_filter": "implemented",
   "auto_classify": "implemented",

@@ -540,11 +540,14 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
 
-    /// L1-1 (v0.7.0) — the set of typed memory kinds this binary
-    /// supports.  Always `["observation", "reflection"]` for v0.7.0;
-    /// Goal/Plan/Step/Decision land in L1-6/v0.8.0.  Callers that want
-    /// to enumerate valid values for a `memory_kind` filter should
-    /// consult this field rather than hardcoding the list.
+    /// L1-1 (v0.7.0) — the legacy lifecycle hint surfaced on older
+    /// capabilities envelopes (`["observation", "reflection"]`). The
+    /// authoritative, complete accepted vocabulary lives on the Form-6
+    /// `memory_kind_vocab` block (compile-anchored to
+    /// [`crate::models::MemoryKind::all`]) — including the Form-6
+    /// Batman variants (#759) and the v0.8.0 Goal/Plan/Step
+    /// typed-cognition kinds (#1709). Callers should consult that block
+    /// rather than hardcoding the list.
     ///
     /// `#[serde(default)]` keeps older capabilities consumers that
     /// don't know the field from breaking.
@@ -1598,10 +1601,11 @@ fn default_capability_atomisation() -> CapabilityAtomisation {
 /// Field → implementation anchor map:
 ///
 /// - `vocabulary`: the complete enumerated vocabulary the substrate
-///   accepts on the `memory_kind` column. Always
+///   accepts on the `memory_kind` column. The Form-6 v0.7.x set
 ///   `["observation", "reflection", "persona", "concept", "entity",
-///   "claim", "relation", "event", "conversation", "decision"]` in
-///   v0.7.x — anchored at compile time by
+///   "claim", "relation", "event", "conversation", "decision"]`
+///   extended at v0.8.0 (#1709) with the typed-cognition cluster
+///   `"goal", "plan", "step"` — anchored at compile time by
 ///   [`crate::models::MemoryKind::all`].
 /// - `recall_filter`: MCP `memory_recall` and HTTP recall accept a
 ///   `kinds` parameter (CSV string or JSON array). `"implemented"`

@@ -27,6 +27,14 @@ const KIND_REFLECTION: &str = "reflection";
 /// `memory_kind TEXT` column — no schema migration is required
 /// because the column has no CHECK constraint. Old rows with no
 /// kind read as `Observation` (the SQL `DEFAULT 'observation'`).
+///
+/// v0.8.0 Pillar 2 (#1709) — typed-cognition extension. The
+/// `Goal | Plan | Step` variants give the substrate first-class
+/// vocabulary for an agent's typed cognition: a `Goal` is a desired
+/// end-state, a `Plan` is the ordered strategy to reach it, and a
+/// `Step` is one executable unit within that plan. Like the Form-6
+/// variants they serialize as snake_case strings on the same
+/// `memory_kind TEXT` column with no migration required.
 /// A future-schema variant a binary doesn't recognise reads as
 /// `Observation` via the `unwrap_or_default()` chain in
 /// `row_to_memory` (forward-compat).
@@ -87,6 +95,23 @@ pub enum MemoryKind {
     /// rationale / alternatives, but the variant lands now so
     /// callers can start typing decisions.
     Decision,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition: a desired
+    /// end-state / objective the agent is working toward. Distinct
+    /// from `Decision` (a committed choice) in that a `Goal` names the
+    /// target, not the path to it; a `Plan` enumerates that path and a
+    /// `Step` is one executable unit within it.
+    Goal,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition: an ordered strategy
+    /// to reach a `Goal`. A `Plan` decomposes an objective into the
+    /// sequence of `Step`s the agent intends to execute; downstream
+    /// readers can filter to plans to reconstruct an agent's intended
+    /// course of action.
+    Plan,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition: a single executable
+    /// unit within a `Plan`. The finest-grained typed-cognition atom —
+    /// one actionable item whose completion advances the parent `Plan`
+    /// toward its `Goal`.
+    Step,
 }
 
 impl MemoryKind {
@@ -104,6 +129,9 @@ impl MemoryKind {
             Self::Event => "event",
             Self::Conversation => "conversation",
             Self::Decision => "decision",
+            Self::Goal => "goal",
+            Self::Plan => "plan",
+            Self::Step => "step",
         }
     }
 
@@ -123,6 +151,9 @@ impl MemoryKind {
             "event" => Some(Self::Event),
             "conversation" => Some(Self::Conversation),
             "decision" => Some(Self::Decision),
+            "goal" => Some(Self::Goal),
+            "plan" => Some(Self::Plan),
+            "step" => Some(Self::Step),
             _ => None,
         }
     }
@@ -143,6 +174,9 @@ impl MemoryKind {
             Self::Event,
             Self::Conversation,
             Self::Decision,
+            Self::Goal,
+            Self::Plan,
+            Self::Step,
         ]
     }
 
@@ -995,8 +1029,9 @@ pub struct CreateMemory {
     /// v0.7.x Form 6 (#1385) — Batman-taxonomy memory-kind selector for
     /// the new row. Accepts any [`MemoryKind`] wire token
     /// (`observation` | `reflection` | `persona` | `concept` | `entity`
-    /// | `claim` | `relation` | `event` | `conversation` | `decision`).
-    /// Unknown values are silently ignored (treated as omission) for
+    /// | `claim` | `relation` | `event` | `conversation` | `decision`
+    /// | `goal` | `plan` | `step`). Unknown values are silently
+    /// ignored (treated as omission) for
     /// forward-compat with future variants, mirroring the MCP
     /// `memory_store` `params["kind"]` contract at
     /// `src/mcp/tools/store/validation.rs:207-213`. Absent / unknown
@@ -1916,10 +1951,28 @@ mod tests {
             ("event", MemoryKind::Event),
             ("conversation", MemoryKind::Conversation),
             ("decision", MemoryKind::Decision),
+            ("goal", MemoryKind::Goal),
+            ("plan", MemoryKind::Plan),
+            ("step", MemoryKind::Step),
         ] {
             assert_eq!(MemoryKind::from_str(s), Some(v));
             assert_eq!(v.as_str(), s);
             assert_eq!(format!("{v}"), s);
+        }
+    }
+
+    #[test]
+    fn memory_kind_pillar2_goal_plan_step_round_trip() {
+        // v0.8.0 Pillar 2 (#1709) — the typed-cognition cluster
+        // round-trips as_str ↔ from_str and is covered by all().
+        for (s, v) in [
+            ("goal", MemoryKind::Goal),
+            ("plan", MemoryKind::Plan),
+            ("step", MemoryKind::Step),
+        ] {
+            assert_eq!(MemoryKind::from_str(s), Some(v));
+            assert_eq!(v.as_str(), s);
+            assert!(MemoryKind::all().contains(&v));
         }
     }
 
@@ -1933,11 +1986,16 @@ mod tests {
     #[test]
     fn memory_kind_all_enumerates_in_declaration_order() {
         let all = MemoryKind::all();
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 13);
         assert_eq!(all[0], MemoryKind::Observation);
         assert_eq!(all[1], MemoryKind::Reflection);
         assert_eq!(all[2], MemoryKind::Persona);
         assert_eq!(all[9], MemoryKind::Decision);
+        // v0.8.0 Pillar 2 (#1709) — the typed-cognition cluster lands
+        // after the Form-6 vocabulary, in declaration order.
+        assert_eq!(all[10], MemoryKind::Goal);
+        assert_eq!(all[11], MemoryKind::Plan);
+        assert_eq!(all[12], MemoryKind::Step);
     }
 
     #[test]
