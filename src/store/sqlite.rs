@@ -1091,9 +1091,10 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         id: &str,
         frozen_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Routine>> {
         let conn = self.state.lock().await;
-        crate::routines::routine_freeze(&conn, id, frozen_at).map_err(box_err)
+        crate::routines::routine_freeze(&conn, id, frozen_at, keypair).map_err(box_err)
     }
 
     async fn routine_run_create(

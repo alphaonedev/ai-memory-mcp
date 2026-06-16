@@ -648,6 +648,118 @@ pub fn sign_checkpoint_resolution(
     Ok(sig.to_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — SignableRoutineFreeze + sign_routine_freeze
+// ---------------------------------------------------------------------------
+
+/// The fields a routine *freeze* signature commits to — the regulatory-hold
+/// FREEZE-ATTESTATION answering "this exact immutable template was frozen by X
+/// at T".
+///
+/// Decoupled from [`crate::models::Routine`] on purpose (same rationale as
+/// [`SignableSignal`] / [`SignableCheckpointResolution`]): a frozen routine is
+/// immutable, so the signature commits to the *frozen* surface only — the
+/// routine's identity (`routine_id` / `namespace` / `name`), the content of its
+/// template + parameters (each hashed to 32 bytes so the signed payload stays
+/// bounded regardless of JSON length — the same bound `SignableSignal` uses for
+/// `body_sha256`), and the freeze timestamp. The mutable lifecycle column
+/// `state` is excluded because the freeze attestation is meaningful only for a
+/// `frozen` row. A captured signature cannot be replayed onto a different
+/// routine, a tampered template, or a back-/forward-dated freeze.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableRoutineFreeze<'a> {
+    /// The routine's id (UUIDv4). Pinned so a signature minted for one routine
+    /// cannot be replayed onto another.
+    pub routine_id: &'a str,
+    /// Namespace the routine lives within.
+    pub namespace: &'a str,
+    /// The routine's name.
+    pub name: &'a str,
+    /// SHA-256 (32 bytes) over the canonical template JSON string's UTF-8
+    /// bytes. Bounds the signed payload size and binds the exact frozen
+    /// template — any template tamper after freeze breaks verification.
+    pub template_sha256: &'a [u8; 32],
+    /// SHA-256 (32 bytes) over the canonical parameters JSON string's UTF-8
+    /// bytes. Binds the exact frozen parameter set.
+    pub parameters_sha256: &'a [u8; 32],
+    /// Epoch-seconds freeze timestamp. Inside the signed surface so a captured
+    /// signature cannot be replayed to back- or forward-date a freeze.
+    pub frozen_at: i64,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable routine-freeze
+/// fields.
+///
+/// Same construction discipline as [`canonical_cbor_signal`]: a
+/// `BTreeMap<&str, ciborium::Value>` sorts the keys by construction, both
+/// SHA-256 hashes encode as CBOR `bytes`, and `frozen_at` encodes as a CBOR
+/// integer. Encoding the same `SignableRoutineFreeze` twice (or on a different
+/// host) produces identical bytes — the precondition Ed25519 needs.
+///
+/// # Errors
+///
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, surfaced as a `Result` so
+/// callers don't have to choose between panicking and silently signing a
+/// truncated payload.
+pub fn canonical_cbor_routine_freeze(r: &SignableRoutineFreeze<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert(
+        "routine_id",
+        ciborium::Value::Text(r.routine_id.to_string()),
+    );
+    map.insert("namespace", ciborium::Value::Text(r.namespace.to_string()));
+    map.insert("name", ciborium::Value::Text(r.name.to_string()));
+    map.insert(
+        "template_sha256",
+        ciborium::Value::Bytes(r.template_sha256.to_vec()),
+    );
+    map.insert(
+        "parameters_sha256",
+        ciborium::Value::Bytes(r.parameters_sha256.to_vec()),
+    );
+    map.insert(
+        "frozen_at",
+        ciborium::Value::Integer(ciborium::value::Integer::from(r.frozen_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableRoutineFreeze")?;
+    Ok(out)
+}
+
+/// Sign a routine freeze with `keypair`'s private key.
+///
+/// Encodes the freeze attestation via [`canonical_cbor_routine_freeze`], then
+/// runs Ed25519 over the resulting bytes. Returns the 64-byte signature, ready
+/// to drop into the `signature` BLOB column on the `routines` table.
+///
+/// # Errors
+/// - `keypair.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_routine_freeze(
+    keypair: &AgentKeypair,
+    freeze: &SignableRoutineFreeze<'_>,
+) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign routine freeze",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_routine_freeze(freeze)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,6 +1581,121 @@ mod tests {
         let r = resolution_fixture();
         let sig_bytes = sign_checkpoint_resolution(&alice, &r).unwrap();
         let payload = canonical_cbor_checkpoint_resolution(&r).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — SignableRoutineFreeze
+    // -----------------------------------------------------------------
+
+    fn routine_freeze_fixture<'a>(
+        template: &'a [u8; 32],
+        parameters: &'a [u8; 32],
+    ) -> SignableRoutineFreeze<'a> {
+        SignableRoutineFreeze {
+            routine_id: "rt-001",
+            namespace: "_rt",
+            name: "deploy",
+            template_sha256: template,
+            parameters_sha256: parameters,
+            frozen_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_routine_freeze_differs_on_field_change() {
+        // Any change in the frozen surface must change the byte output —
+        // otherwise a freeze could be silently re-attributed or its template
+        // swapped under a stale signature.
+        let template = body_hash_fixture(0x40);
+        let parameters = body_hash_fixture(0x41);
+        let base = routine_freeze_fixture(&template, &parameters);
+        let altered = SignableRoutineFreeze {
+            name: "rollback",
+            ..base.clone()
+        };
+        let a = canonical_cbor_routine_freeze(&base).expect("encode base");
+        let b = canonical_cbor_routine_freeze(&altered).expect("encode altered");
+        assert_ne!(a, b, "different name must produce different bytes");
+
+        // The template hash is bound too — a tampered template breaks the bytes.
+        let other_template = body_hash_fixture(0x99);
+        let altered_template = SignableRoutineFreeze {
+            template_sha256: &other_template,
+            ..base.clone()
+        };
+        let c = canonical_cbor_routine_freeze(&altered_template).expect("encode altered_template");
+        assert_ne!(a, c, "different template hash must produce different bytes");
+
+        // And the freeze timestamp is bound.
+        let altered_at = SignableRoutineFreeze {
+            frozen_at: 1_700_009_999,
+            ..base.clone()
+        };
+        let d = canonical_cbor_routine_freeze(&altered_at).expect("encode altered_at");
+        assert_ne!(a, d, "different frozen_at must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_routine_freeze_is_byte_stable() {
+        let template = body_hash_fixture(0x42);
+        let parameters = body_hash_fixture(0x43);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let bytes = canonical_cbor_routine_freeze(&r).expect("encode");
+        assert!(!bytes.is_empty());
+        assert_eq!(
+            bytes,
+            canonical_cbor_routine_freeze(&r).expect("re-encode"),
+            "deterministic CBOR must be byte-stable"
+        );
+    }
+
+    #[test]
+    fn sign_routine_freeze_round_trip() {
+        let kp = keypair::generate("agent-author").expect("generate");
+        let template = body_hash_fixture(0x44);
+        let parameters = body_hash_fixture(0x45);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig_bytes = sign_routine_freeze(&kp, &r).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_routine_freeze(&r).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_routine_freeze_refuses_public_only_keypair() {
+        let kp = keypair::generate("agent-author").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "agent-author".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let template = body_hash_fixture(0x46);
+        let parameters = body_hash_fixture(0x47);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let err = sign_routine_freeze(&pub_only, &r).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_routine_freeze_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's freeze signature must not
+        // verify under Bob's public key.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let template = body_hash_fixture(0x48);
+        let parameters = body_hash_fixture(0x49);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig_bytes = sign_routine_freeze(&alice, &r).unwrap();
+        let payload = canonical_cbor_routine_freeze(&r).unwrap();
         let mut sig_arr = [0u8; 64];
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);

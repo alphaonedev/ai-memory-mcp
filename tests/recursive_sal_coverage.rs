@@ -660,12 +660,18 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     );
 
     let frozen_rt = store
-        .routine_freeze(&ctx, &rid, 1_700_005_100)
+        .routine_freeze(&ctx, &rid, 1_700_005_100, Some(&kp))
         .await
         .expect("routine_freeze ok")
         .expect("freeze returns the updated row");
     assert_eq!(frozen_rt.state, RoutineState::Frozen);
     assert_eq!(frozen_rt.frozen_at, Some(1_700_005_100));
+    // The signed freeze row verifies (Ed25519 FREEZE-ATTESTATION over the
+    // canonical frozen template).
+    assert!(
+        ai_memory::routines::verify(&frozen_rt),
+        "the attested routine freeze must verify after a store round-trip"
+    );
 
     let run_id = format!("sal-cov-run-{}", uuid_like());
     let run = RoutineRun {
