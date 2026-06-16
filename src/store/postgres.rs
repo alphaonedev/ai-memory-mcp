@@ -12077,6 +12077,59 @@ impl MemoryStore for PostgresStore {
         rows.iter().map(pg_row_to_action).collect()
     }
 
+    async fn action_add_edge(
+        &self,
+        _ctx: &CallerContext,
+        from_action: &str,
+        to_action: &str,
+        edge_type: crate::models::EdgeType,
+        now: i64,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO action_edges (from_action, to_action, edge_type, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (from_action, to_action, edge_type) DO NOTHING",
+        )
+        .bind(from_action)
+        .bind(to_action)
+        .bind(edge_type.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_add_edge", e))?;
+        Ok(())
+    }
+
+    async fn action_edges_for(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Vec<crate::models::ActionEdge>> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT from_action, to_action, edge_type, created_at FROM action_edges \
+              WHERE from_action = $1 OR to_action = $1 ORDER BY created_at ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_edges_for", e))?;
+        rows.iter()
+            .map(|r| {
+                let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+                let et: String = r.try_get("edge_type").map_err(|e| g("edge.edge_type", e))?;
+                Ok(crate::models::ActionEdge {
+                    from_action: r.try_get("from_action").map_err(|e| g("edge.from", e))?,
+                    to_action: r.try_get("to_action").map_err(|e| g("edge.to", e))?,
+                    edge_type: crate::models::EdgeType::from_str(&et)
+                        .unwrap_or(crate::models::EdgeType::Sibling),
+                    created_at: r
+                        .try_get(crate::models::field_names::CREATED_AT)
+                        .map_err(|e| g("edge.created_at", e))?,
+                })
+            })
+            .collect()
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed

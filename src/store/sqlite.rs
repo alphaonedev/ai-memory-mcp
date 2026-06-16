@@ -947,6 +947,54 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
+    async fn action_add_edge(
+        &self,
+        _ctx: &CallerContext,
+        from_action: &str,
+        to_action: &str,
+        edge_type: crate::models::EdgeType,
+        now: i64,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO action_edges (from_action, to_action, edge_type, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![from_action, to_action, edge_type.as_str(), now],
+        )
+        .map_err(box_err)?;
+        Ok(())
+    }
+
+    async fn action_edges_for(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Vec<crate::models::ActionEdge>> {
+        let conn = self.state.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_action, to_action, edge_type, created_at FROM action_edges \
+                  WHERE from_action = ?1 OR to_action = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(box_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![action_id], |r| {
+                Ok(crate::models::ActionEdge {
+                    from_action: r.get(0)?,
+                    to_action: r.get(1)?,
+                    edge_type: crate::models::EdgeType::from_str(&r.get::<_, String>(2)?)
+                        .unwrap_or(crate::models::EdgeType::Sibling),
+                    created_at: r.get(3)?,
+                })
+            })
+            .map_err(box_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(box_err)?);
+        }
+        Ok(out)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
