@@ -466,15 +466,15 @@ fn parse_openai_embeddings_batch(body: &Value, expected_len: usize) -> Result<Ve
     Ok(out.into_iter().flatten().collect())
 }
 
-const QUERY_EXPANSION_PROMPT: &str = r"You are a search query expander. Given a search query, generate 5-8 additional search terms that are semantically related. Return ONLY the terms, one per line, no numbering or explanation.
+const QUERY_EXPANSION_PROMPT: &str = r"Expand the search query below into 5 to 8 closely related search terms. Output only the terms — one per line, with no numbering, bullets, or commentary.
 
 Query: {query}";
 
-const SUMMARIZE_PROMPT: &str = r"Summarize the following memories into a single concise paragraph. Preserve all key facts, decisions, and technical details.
+const SUMMARIZE_PROMPT: &str = r"Condense the memories below into one tight paragraph that retains every key fact, decision, and technical detail.
 
 {memories}";
 
-const AUTO_TAG_PROMPT: &str = r"Generate 3-5 short tags for categorizing this memory. Return ONLY the tags, one per line, lowercase, no symbols.
+const AUTO_TAG_PROMPT: &str = r"Produce 3 to 5 concise categorization tags for the memory below. Output only the tags — one per line, lowercase, with no punctuation or symbols.
 
 Title: {title}
 Content: {content}";
