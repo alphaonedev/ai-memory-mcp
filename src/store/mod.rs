@@ -1724,9 +1724,16 @@ pub trait MemoryStore: Send + Sync {
 
     /// #1709 Pillar 1 — resolve a checkpoint: set state + `resolved_by` +
     /// `resolution` + `resolution_note` + `resolved_at`. Returns the resolved
-    /// row, or `None` when the id does not exist. The attested-resolution
-    /// signing logic lands in a subsequent unit — this surface persists the
-    /// resolution fields verbatim. Default `UnsupportedCapability`.
+    /// row, or `None` when the id does not exist.
+    ///
+    /// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the resolved row's
+    /// canonical RESOLUTION (the separation-of-duties attestation) is
+    /// Ed25519-signed and the 64-byte signature + 32-byte resolver public key
+    /// are persisted into the `signature` / `resolver_pubkey` columns in the
+    /// same write — mirroring the [`MemoryStore::signal_send`] signed path. A
+    /// `None` (or public-only) keypair leaves the attestation columns empty
+    /// (unattested), so [`crate::checkpoints::verify`] returns `false` for that
+    /// row. Default `UnsupportedCapability`.
     async fn checkpoint_resolve(
         &self,
         _ctx: &CallerContext,
@@ -1736,6 +1743,7 @@ pub trait MemoryStore: Send + Sync {
         _resolution: Option<&str>,
         _resolution_note: Option<&str>,
         _resolved_at: i64,
+        _keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Checkpoint>> {
         Err(StoreError::UnsupportedCapability {
             capability: CAP_CHECKPOINTS.to_string(),

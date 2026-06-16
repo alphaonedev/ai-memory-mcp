@@ -541,8 +541,10 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
 
     // #1709 Pillar 1 — checkpoint_create / checkpoint_get / checkpoint_list /
     // checkpoint_resolve round-trip through the SAL surface on BOTH adapters
-    // (the v61 attested-checkpoints substrate). signature / resolver_pubkey
-    // stay empty (unattested) — the signing logic lands in a later unit.
+    // (the v61 attested-checkpoints substrate). The SIGNED resolution path is
+    // exercised: the test keypair attests the resolution on resolve, and the
+    // returned row is asserted to verify (Ed25519 over the canonical
+    // RESOLUTION).
     let cid = format!("sal-cov-cp-{}", uuid_like());
     let checkpoint = Checkpoint {
         id: cid.clone(),
@@ -598,6 +600,7 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             Some("approved"),
             None,
             1_700_004_100,
+            Some(&kp),
         )
         .await
         .expect("checkpoint_resolve ok")
@@ -606,6 +609,11 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     assert_eq!(resolved_cp.resolved_by.as_deref(), Some(TEST_AGENT));
     assert_eq!(resolved_cp.resolution.as_deref(), Some("approved"));
     assert_eq!(resolved_cp.resolved_at, Some(1_700_004_100));
+    // The signed resolution row verifies (Ed25519 over the canonical RESOLUTION).
+    assert!(
+        ai_memory::checkpoints::verify(&resolved_cp),
+        "the attested checkpoint resolution must verify after a store round-trip"
+    );
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

@@ -17,8 +17,60 @@
 //! with empty `signature` / `resolver_pubkey` is simply unattested; the
 //! attested-resolution signing logic lands in a subsequent unit.
 
+use crate::identity::keypair::AgentKeypair;
+use crate::identity::sign::{SignableCheckpointResolution, sign_checkpoint_resolution};
+use crate::identity::verify::verify_checkpoint_resolution;
 use crate::models::{Checkpoint, CheckpointState, ConditionType};
 use rusqlite::{Connection, OptionalExtension, params};
+
+/// Build the [`SignableCheckpointResolution`] view of a [`Checkpoint`] — the
+/// immutable-once-resolved fields the resolution signature commits to,
+/// borrowing from `cp`. Shared by [`sign_resolution_into`] (outbound) and
+/// [`verify`] (inbound) so both commit to byte-identical canonical bytes —
+/// the same shared-view discipline [`crate::signals::signable`] uses for the
+/// signed-signal surface.
+fn resolution_signable(cp: &Checkpoint) -> SignableCheckpointResolution<'_> {
+    SignableCheckpointResolution {
+        checkpoint_id: &cp.id,
+        namespace: &cp.namespace,
+        state: cp.state.as_str(),
+        resolved_by: cp.resolved_by.as_deref().unwrap_or(""),
+        resolution: cp.resolution.as_deref(),
+        resolved_at: cp.resolved_at.unwrap_or(0),
+    }
+}
+
+/// Sign `cp`'s resolution in place with `keypair`'s private key.
+///
+/// Builds the [`SignableCheckpointResolution`] view, signs the canonical CBOR
+/// via [`sign_checkpoint_resolution`], then sets `cp.signature` to the 64-byte
+/// signature and `cp.resolver_pubkey` to the signer's 32 public-key bytes.
+/// Mirrors [`crate::signals::sign_into`] for the signed-signal surface.
+///
+/// # Errors
+/// Returns the [`sign_checkpoint_resolution`] error when `keypair` is
+/// public-only (`can_sign() == false`) or the CBOR encode fails.
+pub fn sign_resolution_into(cp: &mut Checkpoint, keypair: &AgentKeypair) -> anyhow::Result<()> {
+    let sig = sign_checkpoint_resolution(keypair, &resolution_signable(cp))?;
+    cp.signature = sig;
+    cp.resolver_pubkey = keypair.public.to_bytes().to_vec();
+    Ok(())
+}
+
+/// Verify a checkpoint's Ed25519 attested-resolution signature against its
+/// embedded `resolver_pubkey`.
+///
+/// Returns `false` for an unattested checkpoint (empty `signature` OR empty
+/// `resolver_pubkey`) and for any signature that does not validate against the
+/// re-derived canonical resolution bytes. Never panics. Mirrors
+/// [`crate::signals::verify`].
+#[must_use]
+pub fn verify(cp: &Checkpoint) -> bool {
+    if cp.signature.is_empty() || cp.resolver_pubkey.is_empty() {
+        return false;
+    }
+    verify_checkpoint_resolution(&resolution_signable(cp), &cp.signature, &cp.resolver_pubkey)
+}
 
 /// SELECT column list for the `checkpoints` table, in the canonical order
 /// [`row_to_checkpoint`] expects. One definition shared by every checkpoint
@@ -191,8 +243,22 @@ pub fn query(
 /// `resolution_note` + `resolved_at`. Returns the resolved row, or `None`
 /// if the id does not exist.
 ///
+/// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the resolved row's
+/// canonical RESOLUTION (the separation-of-duties attestation: who resolved
+/// this checkpoint, to what, when) is Ed25519-signed and the 64-byte signature
+/// + 32-byte resolver public key are persisted into the `signature` /
+/// `resolver_pubkey` columns in the same write — mirroring how
+/// [`crate::signals::signal_send`] signs a signal row before insert. A `None`
+/// (or public-only) keypair leaves `signature` / `resolver_pubkey` empty
+/// (unattested), so [`verify`] returns `false` for that row.
+///
 /// # Errors
-/// Propagates the `rusqlite` update/query error.
+/// Propagates the `rusqlite` update/query error. A signing failure (CBOR
+/// encode) surfaces as a `rusqlite` SQL error path is NOT taken — signing is
+/// only attempted for a `can_sign()` keypair over a fixed-shape input, which
+/// is infallible in practice; an encode error is mapped to a SQL misuse error
+/// so the resolve fails closed rather than persisting an unsigned row that the
+/// caller believed was signed.
 pub fn resolve(
     conn: &Connection,
     id: &str,
@@ -201,6 +267,7 @@ pub fn resolve(
     resolution: Option<&str>,
     resolution_note: Option<&str>,
     resolved_at: i64,
+    keypair: Option<&AgentKeypair>,
 ) -> rusqlite::Result<Option<Checkpoint>> {
     let n = conn.execute(
         "UPDATE checkpoints SET state = ?1, resolved_by = ?2, resolution = ?3, \
@@ -217,7 +284,27 @@ pub fn resolve(
     if n == 0 {
         return Ok(None);
     }
-    get(conn, id)
+    let Some(mut row) = get(conn, id)? else {
+        return Ok(None);
+    };
+    // Sign the resolution + persist the attestation columns when a signing
+    // keypair is supplied — done after the resolution-field UPDATE so the
+    // signable view reads the final resolved state/resolved_by/resolution/
+    // resolved_at.
+    if let Some(kp) = keypair {
+        if kp.can_sign() {
+            sign_resolution_into(&mut row, kp).map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                    "checkpoint resolution sign failed: {e:#}"
+                ))))
+            })?;
+            conn.execute(
+                "UPDATE checkpoints SET signature = ?1, resolver_pubkey = ?2 WHERE id = ?3",
+                params![row.signature, row.resolver_pubkey, id],
+            )?;
+        }
+    }
+    Ok(Some(row))
 }
 
 #[cfg(test)]
@@ -335,6 +422,7 @@ mod tests {
             Some("approved"),
             Some("looks good"),
             1_700_000_500,
+            None,
         )
         .unwrap()
         .expect("resolve returns the updated row");
@@ -361,11 +449,125 @@ mod tests {
             None,
             None,
             1_700_000_500,
+            None,
         )
         .unwrap();
         assert!(
             missing.is_none(),
             "resolving a missing checkpoint yields None"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — attested-resolution sign + verify
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_signed_then_verifies() {
+        let conn = fresh();
+        insert(&conn, &sample("s1")).unwrap();
+        let kp = crate::identity::keypair::generate("agent-approver").expect("generate");
+        let resolved = resolve(
+            &conn,
+            "s1",
+            CheckpointState::Resolved,
+            "agent-approver",
+            Some("approved"),
+            Some("looks good"),
+            1_700_000_500,
+            Some(&kp),
+        )
+        .unwrap()
+        .expect("resolve returns the updated row");
+        // The returned row carries the attestation and verifies.
+        assert_eq!(
+            resolved.signature.len(),
+            64,
+            "Ed25519 signature is 64 bytes"
+        );
+        assert_eq!(resolved.resolver_pubkey.len(), 32, "pubkey is 32 bytes");
+        assert!(verify(&resolved), "signed resolution must verify");
+
+        // The persisted row (re-read) also carries + verifies the attestation.
+        let got = get(&conn, "s1").unwrap().expect("present");
+        assert_eq!(got.signature, resolved.signature);
+        assert_eq!(got.resolver_pubkey, resolved.resolver_pubkey);
+        assert!(verify(&got), "persisted signed resolution must verify");
+    }
+
+    #[test]
+    fn verify_false_after_resolution_tamper() {
+        let conn = fresh();
+        insert(&conn, &sample("t1")).unwrap();
+        let kp = crate::identity::keypair::generate("agent-approver").expect("generate");
+        let mut resolved = resolve(
+            &conn,
+            "t1",
+            CheckpointState::Resolved,
+            "agent-approver",
+            Some("approved"),
+            None,
+            1_700_000_500,
+            Some(&kp),
+        )
+        .unwrap()
+        .expect("resolve returns the updated row");
+        assert!(verify(&resolved), "baseline signed resolution verifies");
+        // Tamper with the resolution verdict after signing.
+        resolved.resolution = Some("rejected".to_string());
+        assert!(
+            !verify(&resolved),
+            "a mutated resolution must not verify under the original signature"
+        );
+    }
+
+    #[test]
+    fn verify_false_for_unsigned_resolution() {
+        let conn = fresh();
+        insert(&conn, &sample("u1")).unwrap();
+        // No keypair → unsigned path: signature/resolver_pubkey stay empty.
+        let resolved = resolve(
+            &conn,
+            "u1",
+            CheckpointState::Resolved,
+            "agent-approver",
+            Some("approved"),
+            None,
+            1_700_000_500,
+            None,
+        )
+        .unwrap()
+        .expect("resolve returns the updated row");
+        assert!(resolved.signature.is_empty());
+        assert!(resolved.resolver_pubkey.is_empty());
+        assert!(!verify(&resolved), "an unsigned resolution must not verify");
+    }
+
+    #[test]
+    fn resolve_with_public_only_keypair_stays_unsigned() {
+        let conn = fresh();
+        insert(&conn, &sample("p1")).unwrap();
+        let kp = crate::identity::keypair::generate("agent-approver").unwrap();
+        let pub_only = crate::identity::keypair::AgentKeypair {
+            agent_id: "agent-approver".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let resolved = resolve(
+            &conn,
+            "p1",
+            CheckpointState::Resolved,
+            "agent-approver",
+            Some("approved"),
+            None,
+            1_700_000_500,
+            Some(&pub_only),
+        )
+        .unwrap()
+        .expect("resolve returns the updated row");
+        // can_sign() == false → unattested, exactly like the None path.
+        assert!(resolved.signature.is_empty());
+        assert!(resolved.resolver_pubkey.is_empty());
+        assert!(!verify(&resolved));
     }
 }
