@@ -7483,6 +7483,35 @@ const PG_ACTION_SELECT_BY_ID: &str = "SELECT id, namespace, kind, state, title, 
      priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
      FROM actions WHERE id = $1";
 
+/// #1709 §11.4 Pillar-1 FRONTIER — the UNBLOCKED `WHERE`-tail shared by the
+/// postgres `action_frontier` / `action_next` reads. `$1` is the namespace.
+/// Byte-for-byte the same predicate the sqlite `crate::actions::frontier`
+/// uses (see `crate::actions::frontier_where_tail`): a pending action is
+/// UNBLOCKED iff every `requires` / `gated_by` prerequisite is `done` and no
+/// still-active `blocks` edge targets it.
+fn pg_frontier_where_tail() -> String {
+    use crate::models::{ActionState, EdgeType};
+    format!(
+        "a.namespace = $1 AND a.state = '{pending}' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.to_action \
+             WHERE e.from_action = a.id \
+               AND e.edge_type IN ('{requires}', '{gated_by}') \
+               AND b.state <> '{done}') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.from_action \
+             WHERE e.to_action = a.id AND e.edge_type = '{blocks}' \
+               AND b.state NOT IN ('{done}', '{failed}', '{abandoned}'))",
+        pending = ActionState::Pending.as_str(),
+        requires = EdgeType::Requires.as_str(),
+        gated_by = EdgeType::GatedBy.as_str(),
+        done = ActionState::Done.as_str(),
+        blocks = EdgeType::Blocks.as_str(),
+        failed = ActionState::Failed.as_str(),
+        abandoned = ActionState::Abandoned.as_str(),
+    )
+}
+
 /// Map a postgres row (the action column order) to an
 /// [`crate::models::Action`]. JSON columns are TEXT (parity with sqlite).
 /// Shared by `action_get` / `action_transition` / `action_list`.
@@ -12542,6 +12571,59 @@ impl MemoryStore for PostgresStore {
                 })
             })
             .collect()
+    }
+
+    async fn action_frontier(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                    claimed_by, vector_clock, metadata, created_at, updated_at \
+               FROM actions a WHERE {} \
+              ORDER BY a.priority DESC, a.created_at ASC LIMIT $2",
+            pg_frontier_where_tail()
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(lim)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_frontier", e))?;
+        rows.iter().map(pg_row_to_action).collect()
+    }
+
+    async fn action_next(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        agent_id: Option<&str>,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        let owner_clause = if agent_id.is_some() {
+            " AND (a.agent_id = $2 OR a.agent_id IS NULL)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                    claimed_by, vector_clock, metadata, created_at, updated_at \
+               FROM actions a WHERE {}{owner_clause} \
+              ORDER BY a.priority DESC, a.created_at ASC LIMIT 1",
+            pg_frontier_where_tail()
+        );
+        let mut q = sqlx::query(&sql).bind(namespace);
+        if let Some(a) = agent_id {
+            q = q.bind(a);
+        }
+        q.fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_next", e))?
+            .as_ref()
+            .map(pg_row_to_action)
+            .transpose()
     }
 
     async fn lease_acquire(

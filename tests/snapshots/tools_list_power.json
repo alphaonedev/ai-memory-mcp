@@ -887,6 +887,49 @@
       "name": "memory_action_edges"
     },
     {
+      "description": "Rank the UNBLOCKED",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_frontier"
+    },
+    {
+      "description": "Return the top UNBLOCKED",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_next"
+    },
+    {
       "description": "Acquire a single-holder lease",
       "inputSchema": {
         "properties": {
