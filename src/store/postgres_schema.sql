@@ -973,3 +973,35 @@ CREATE TABLE IF NOT EXISTS leases (
     heartbeat_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — signed-signals storage foundation. signals
+-- (typed, Ed25519-signed inter-agent messages). Mirrors
+-- migrations/sqlite/0050_v60_signed_signals.sql. Fresh schemas carry this
+-- inline; existing schemas pick it up via migrate_v60(). Epoch columns are
+-- BIGINT, the Ed25519 signature/sender_pubkey columns are BYTEA, and
+-- `reference_ids` is renamed from the ROADMAP's `references` (SQL reserved
+-- word).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS signals (
+    id              TEXT NOT NULL PRIMARY KEY,
+    namespace       TEXT NOT NULL,
+    from_agent      TEXT NOT NULL,
+    to_agent        TEXT,                          -- NULL = broadcast within namespace
+    subject         TEXT NOT NULL,
+    body            TEXT NOT NULL,                 -- JSON-typed payload
+    signal_type     TEXT NOT NULL,                 -- authorize|notify|request|response|broadcast
+    in_reply_to     TEXT REFERENCES signals(id),
+    correlation_id  TEXT,
+    reference_ids   TEXT   NOT NULL DEFAULT '[]',  -- JSON array; renamed from ROADMAP `references` (reserved word)
+    created_at      BIGINT NOT NULL,
+    expires_at      BIGINT,
+    delivered_at    BIGINT,
+    read_at         BIGINT,
+    acknowledged_at BIGINT,
+    signature       BYTEA  NOT NULL,               -- Ed25519 over canonical content
+    sender_pubkey   BYTEA  NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_namespace ON signals(namespace, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_to_agent ON signals(to_agent, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_correlation ON signals(correlation_id);

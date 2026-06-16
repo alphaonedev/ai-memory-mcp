@@ -147,6 +147,10 @@ const SQLITE_RELATIONAL_TABLES: &[&str] = &[
     "actions",
     "action_edges",
     "leases",
+    // #1709 (v0.8.0 Pillar 1) — the signed-signals storage foundation table,
+    // created on BOTH adapters at v60 (sqlite migration 0050 + postgres
+    // migrate_v60), so the parity assertion covers it.
+    "signals",
 ];
 
 /// #1689/n19 — sqlite/daemon-local tables the Postgres adapter intentionally

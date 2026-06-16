@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 59).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 60).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -603,7 +603,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 59;
+const CURRENT_SCHEMA_VERSION: i64 = 60;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1086,6 +1086,10 @@ const MIGRATION_V56_SQLITE: &str =
 // EXISTS — replay-safe.
 const MIGRATION_V59_SQLITE: &str =
     include_str!("../../migrations/sqlite/0049_v59_action_substrate.sql");
+// v0.8.0 Pillar 1 (#1709) — signed-signals storage foundation table
+// (`signals`). Additive CREATE TABLE/INDEX IF NOT EXISTS — replay-safe.
+const MIGRATION_V60_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0050_v60_signed_signals.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2550,6 +2554,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // tables (state machine + typed DAG + lease/heartbeat). Pure
             // `CREATE TABLE/INDEX IF NOT EXISTS` — replay-safe.
             conn.execute_batch(MIGRATION_V59_SQLITE)?;
+        }
+
+        if version < 60 {
+            // v0.8.0 Pillar 1 (#1709) — signed-signals storage foundation:
+            // additive `signals` table (typed, Ed25519-signed inter-agent
+            // messages). Pure `CREATE TABLE/INDEX IF NOT EXISTS` — replay-safe.
+            conn.execute_batch(MIGRATION_V60_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
