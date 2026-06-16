@@ -14,7 +14,10 @@
 // an empty test target.
 #![cfg(feature = "sal")]
 
-use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Signal, SignalType, Tier};
+use ai_memory::models::{
+    Checkpoint, CheckpointState, ConditionType, ConfidenceSource, Memory, MemoryKind, Signal,
+    SignalType, Tier,
+};
 use ai_memory::store::{CallerContext, MemoryStore};
 use std::sync::Arc;
 
@@ -535,6 +538,74 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             .acknowledged_at,
         Some(1_700_003_100)
     );
+
+    // #1709 Pillar 1 — checkpoint_create / checkpoint_get / checkpoint_list /
+    // checkpoint_resolve round-trip through the SAL surface on BOTH adapters
+    // (the v61 attested-checkpoints substrate). signature / resolver_pubkey
+    // stay empty (unattested) — the signing logic lands in a later unit.
+    let cid = format!("sal-cov-cp-{}", uuid_like());
+    let checkpoint = Checkpoint {
+        id: cid.clone(),
+        namespace: TEST_NS.to_string(),
+        title: "sal-cov checkpoint".to_string(),
+        condition_type: ConditionType::Approval,
+        condition: serde_json::json!({}),
+        state: CheckpointState::Pending,
+        created_by: TEST_AGENT.to_string(),
+        resolved_by: None,
+        resolution: None,
+        resolution_note: None,
+        signature: vec![],
+        resolver_pubkey: vec![],
+        created_at: 1_700_004_000,
+        deadline_at: None,
+        resolved_at: None,
+        metadata: serde_json::json!({}),
+    };
+    let created_cp = store
+        .checkpoint_create(&ctx, &checkpoint)
+        .await
+        .expect("checkpoint_create ok");
+    assert_eq!(created_cp, cid);
+
+    let got_cp = store
+        .checkpoint_get(&ctx, &cid)
+        .await
+        .expect("checkpoint_get ok")
+        .expect("checkpoint present");
+    assert_eq!(got_cp.namespace, TEST_NS);
+    assert_eq!(got_cp.title, "sal-cov checkpoint");
+    assert_eq!(got_cp.condition_type, ConditionType::Approval);
+    assert_eq!(got_cp.state, CheckpointState::Pending);
+    assert_eq!(got_cp.created_by, TEST_AGENT);
+    assert!(got_cp.resolved_at.is_none());
+
+    let cp_list = store
+        .checkpoint_list(&ctx, TEST_NS, Some(CheckpointState::Pending), 10)
+        .await
+        .expect("checkpoint_list ok");
+    assert!(
+        cp_list.iter().any(|c| c.id == cid),
+        "the pending checkpoint is in the namespace+state-filtered list"
+    );
+
+    let resolved_cp = store
+        .checkpoint_resolve(
+            &ctx,
+            &cid,
+            CheckpointState::Resolved,
+            TEST_AGENT,
+            Some("approved"),
+            None,
+            1_700_004_100,
+        )
+        .await
+        .expect("checkpoint_resolve ok")
+        .expect("resolve returns the updated row");
+    assert_eq!(resolved_cp.state, CheckpointState::Resolved);
+    assert_eq!(resolved_cp.resolved_by.as_deref(), Some(TEST_AGENT));
+    assert_eq!(resolved_cp.resolution.as_deref(), Some("approved"));
+    assert_eq!(resolved_cp.resolved_at, Some(1_700_004_100));
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

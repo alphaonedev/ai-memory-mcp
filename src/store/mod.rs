@@ -343,6 +343,13 @@ impl BoxBackendError {
 /// Convenience alias — every trait method returns this.
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// #1709 Pillar 1 — capability tag returned by the default (unsupported)
+/// `checkpoint_*` trait methods. One named const referenced at every default
+/// arm (the sibling `"SIGNALS"` / `"ACTIONS"` / `"LEASES"` tags stay bare
+/// literals because they are under the 10-char no-hardcoded-literal gate
+/// threshold; `"CHECKPOINTS"` is 11 chars and must be a named const).
+const CAP_CHECKPOINTS: &str = "CHECKPOINTS";
+
 /// #1624 — shared integrity finding-checks for [`MemoryStore::verify`]
 /// so both adapters report IDENTICAL findings for identical rows.
 /// Union of the two pre-#1624 checkers (sqlite: title/content/agent_id;
@@ -1669,6 +1676,85 @@ pub trait MemoryStore: Send + Sync {
     async fn signal_ack(&self, _ctx: &CallerContext, _id: &str, _now: i64) -> StoreResult<bool> {
         Err(StoreError::UnsupportedCapability {
             capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — create a checkpoint (the v61 `checkpoints` table,
+    /// conditional coordination gates whose resolution is Ed25519-attested).
+    /// The `signature` / `resolver_pubkey` byte vectors on `cp` are persisted
+    /// verbatim — empty for an unattested (pre-resolution) checkpoint. Returns
+    /// the checkpoint id. Default `UnsupportedCapability`.
+    async fn checkpoint_create(
+        &self,
+        _ctx: &CallerContext,
+        _cp: &crate::models::Checkpoint,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a checkpoint by id. `Ok(None)` when the
+    /// checkpoint does not exist. Default `UnsupportedCapability`.
+    async fn checkpoint_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list a namespace's checkpoints, newest-first, capped
+    /// at `limit`. When `state` is `Some`, narrows to that lifecycle state;
+    /// when `None`, returns every checkpoint in the namespace. Default
+    /// `UnsupportedCapability`.
+    async fn checkpoint_list(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _state: Option<crate::models::CheckpointState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — resolve a checkpoint: set state + `resolved_by` +
+    /// `resolution` + `resolution_note` + `resolved_at`. Returns the resolved
+    /// row, or `None` when the id does not exist. The attested-resolution
+    /// signing logic lands in a subsequent unit — this surface persists the
+    /// resolution fields verbatim. Default `UnsupportedCapability`.
+    async fn checkpoint_resolve(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _state: crate::models::CheckpointState,
+        _resolved_by: &str,
+        _resolution: Option<&str>,
+        _resolution_note: Option<&str>,
+        _resolved_at: i64,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — query a namespace's checkpoints narrowed by an
+    /// optional `condition_type` AND an optional `state`, newest-first, capped
+    /// at `limit`. Default `UnsupportedCapability`.
+    async fn checkpoint_query(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _condition_type: Option<crate::models::ConditionType>,
+        _state: Option<crate::models::CheckpointState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
         })
     }
 
