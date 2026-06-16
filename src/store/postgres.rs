@@ -12268,6 +12268,15 @@ impl MemoryStore for PostgresStore {
             .transpose()
     }
 
+    async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        let res = sqlx::query("DELETE FROM leases WHERE expires_at <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_sweep_expired", e))?;
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed

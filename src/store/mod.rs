@@ -1591,6 +1591,17 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 Pillar 1 — reclaim (delete) every lease whose `expires_at <= now`,
+    /// releasing the action for a fresh holder. Returns the count reclaimed.
+    /// Driven by the [`crate::background::lease_sweep`] background loop. Default
+    /// `UnsupportedCapability`.
+    async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        let _ = now;
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///

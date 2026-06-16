@@ -929,6 +929,11 @@ impl MemoryStore for SqliteStore {
         crate::actions::lease_get(&conn, action_id).map_err(box_err)
     }
 
+    async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        crate::actions::sweep_expired_leases(&conn, now).map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
