@@ -406,6 +406,139 @@ pub fn sign_write(keypair: &AgentKeypair, write: &SignableWrite<'_>) -> Result<V
     Ok(sig.to_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — SignableSignal + sign_signal
+// ---------------------------------------------------------------------------
+//
+// Mirrors the `SignableLink` / `SignablePersona` / `SignableWrite` shapes: a
+// single, audited surface for the IMMUTABLE fields a signal signature commits
+// to, encoded via RFC 8949 §4.2.1 deterministic CBOR. The mutable lifecycle
+// columns (`delivered_at`, `read_at`, `acknowledged_at`, `expires_at`) are
+// deliberately EXCLUDED — they are stamped after the signal is sent, so
+// committing to them would invalidate the signature on first delivery. The
+// JSON body is hashed (SHA-256) BEFORE entering the envelope so the signed
+// payload stays bounded (32 bytes) regardless of body length — the same bound
+// `SignablePersona` / `SignableWrite` use for `body_md_sha256` /
+// `content_sha256`.
+
+/// The immutable fields a signal signature commits to.
+///
+/// Decoupled from [`crate::models::Signal`] on purpose: the signed bundle pins
+/// exactly the identity-bearing surface of a signal (who, where, what subject,
+/// what payload, what type, what threading, when) WITHOUT the mutable delivery
+/// lifecycle columns — so the verifier can re-derive the bytes directly from a
+/// persisted row at any lifecycle stage, and the canonical encoder has a
+/// single audited shape to commit to.
+///
+/// `body_sha256` is the SHA-256 of the UTF-8 bytes of the signal body's
+/// canonical JSON string (`Signal::body.to_string()`). Hashing it before
+/// signing keeps the canonical payload bounded regardless of body length — a
+/// multi-kilobyte JSON payload would otherwise dominate the signed envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableSignal<'a> {
+    /// The signal's id (UUIDv4). Pinned so a signature minted for one signal
+    /// cannot be replayed onto another.
+    pub id: &'a str,
+    /// Namespace the signal was sent within.
+    pub namespace: &'a str,
+    /// Sending agent. The identity-bearing field the signature attests: the
+    /// signer held the keypair bound to this `from_agent`.
+    pub from_agent: &'a str,
+    /// Recipient agent, or `None` for a namespace broadcast.
+    pub to_agent: Option<&'a str>,
+    /// Free-text subject line.
+    pub subject: &'a str,
+    /// SHA-256 (32 bytes) over the signal body's canonical JSON string's
+    /// UTF-8 bytes. Bounds the signed payload size.
+    pub body_sha256: &'a [u8; 32],
+    /// Canonical signal-type spelling (`SignalType::as_str`). Pinned so a
+    /// signature minted for one type cannot be replayed onto another.
+    pub signal_type: &'a str,
+    /// Threads a `response` back onto its `request`, or `None`.
+    pub in_reply_to: Option<&'a str>,
+    /// Groups a signal into a conversation thread, or `None`.
+    pub correlation_id: Option<&'a str>,
+    /// Epoch-seconds creation timestamp. Inside the signed surface so a
+    /// captured signature cannot be replayed to back- or forward-date a
+    /// signal.
+    pub created_at: i64,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable signal fields.
+///
+/// The encoded shape is a CBOR map keyed by the field names below. Map keys
+/// are emitted in sort order (per RFC 8949 §4.2.1 "Core Deterministic
+/// Encoding"), `Option::None` is encoded as CBOR `null`, `created_at` as a
+/// CBOR integer, and the body hash as CBOR `bytes`. Encoding the same
+/// `SignableSignal` twice (or on a different host) produces identical bytes —
+/// the precondition Ed25519 needs.
+///
+/// # Errors
+///
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, but surfaced as a `Result` so
+/// callers don't have to choose between panicking and silently signing a
+/// truncated payload.
+pub fn canonical_cbor_signal(s: &SignableSignal<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("id", ciborium::Value::Text(s.id.to_string()));
+    map.insert("namespace", ciborium::Value::Text(s.namespace.to_string()));
+    map.insert(
+        "from_agent",
+        ciborium::Value::Text(s.from_agent.to_string()),
+    );
+    map.insert("to_agent", text_or_null(s.to_agent));
+    map.insert("subject", ciborium::Value::Text(s.subject.to_string()));
+    map.insert(
+        "body_sha256",
+        ciborium::Value::Bytes(s.body_sha256.to_vec()),
+    );
+    map.insert(
+        "signal_type",
+        ciborium::Value::Text(s.signal_type.to_string()),
+    );
+    map.insert("in_reply_to", text_or_null(s.in_reply_to));
+    map.insert(field_names::CORRELATION_ID, text_or_null(s.correlation_id));
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Integer(ciborium::value::Integer::from(s.created_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableSignal")?;
+    Ok(out)
+}
+
+/// Sign `signal` with `keypair`'s private key.
+///
+/// Encodes the signal via [`canonical_cbor_signal`], then runs Ed25519 over the
+/// resulting bytes. Returns the 64-byte signature, ready to drop into the
+/// `signature` BLOB column on the `signals` table.
+///
+/// # Errors
+///
+/// - `keypair.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_signal(keypair: &AgentKeypair, signal: &SignableSignal<'_>) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign signal",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_signal(signal)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1094,180 @@ mod tests {
         let a = canonical_cbor_persona(&v1).expect("encode v1");
         let b = canonical_cbor_persona(&v2).expect("encode v2");
         assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — SignableSignal + sign_signal
+    // -----------------------------------------------------------------
+
+    fn signal_fixture<'a>(body: &'a [u8; 32]) -> SignableSignal<'a> {
+        SignableSignal {
+            id: "sig-001",
+            namespace: "team/alpha",
+            from_agent: "ai:curator",
+            to_agent: Some("ai:planner"),
+            subject: "deploy approval",
+            body_sha256: body,
+            signal_type: "request",
+            in_reply_to: None,
+            correlation_id: Some("corr-7"),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_signal_is_deterministic() {
+        // Three distinct permutations of the SignableSignal literal must
+        // collapse to identical bytes because the BTreeMap key-sort runs at
+        // encode time. Catches a regression where a future refactor swaps the
+        // BTreeMap for a HashMap or drops the explicit sort.
+        let body = body_hash_fixture(0x30);
+        let id = "sig-001";
+        let namespace = "team/alpha";
+        let from_agent = "ai:curator";
+        let to_agent = Some("ai:planner");
+        let subject = "deploy approval";
+        let signal_type = "request";
+        let in_reply_to: Option<&str> = None;
+        let correlation_id = Some("corr-7");
+        let created_at = 1_700_000_000_i64;
+
+        let perm1 = SignableSignal {
+            id,
+            namespace,
+            from_agent,
+            to_agent,
+            subject,
+            body_sha256: &body,
+            signal_type,
+            in_reply_to,
+            correlation_id,
+            created_at,
+        };
+        let perm2 = SignableSignal {
+            created_at,
+            correlation_id,
+            in_reply_to,
+            signal_type,
+            body_sha256: &body,
+            subject,
+            to_agent,
+            from_agent,
+            namespace,
+            id,
+        };
+        let perm3 = SignableSignal {
+            subject,
+            id,
+            created_at,
+            namespace,
+            body_sha256: &body,
+            signal_type,
+            from_agent,
+            correlation_id,
+            to_agent,
+            in_reply_to,
+        };
+
+        let b1 = canonical_cbor_signal(&perm1).expect("encode perm1");
+        let b2 = canonical_cbor_signal(&perm2).expect("encode perm2");
+        let b3 = canonical_cbor_signal(&perm3).expect("encode perm3");
+        assert_eq!(b1, b2);
+        assert_eq!(b2, b3);
+        assert_eq!(b1, canonical_cbor_signal(&perm1).expect("re-encode"));
+    }
+
+    #[test]
+    fn canonical_cbor_signal_differs_on_field_change() {
+        let body = body_hash_fixture(0x31);
+        let base = signal_fixture(&body);
+        // Flip the subject — a different subject must produce different bytes.
+        let altered = SignableSignal {
+            subject: "deploy rejection",
+            ..base.clone()
+        };
+        let a = canonical_cbor_signal(&base).expect("encode base");
+        let b = canonical_cbor_signal(&altered).expect("encode altered");
+        assert_ne!(a, b, "different subject must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_signal_differs_on_body_hash_change() {
+        let body = body_hash_fixture(0x32);
+        let base = signal_fixture(&body);
+        let other = body_hash_fixture(0x88);
+        let altered = SignableSignal {
+            body_sha256: &other,
+            ..base.clone()
+        };
+        let a = canonical_cbor_signal(&base).expect("encode base");
+        let b = canonical_cbor_signal(&altered).expect("encode altered");
+        assert_ne!(a, b, "different body hash must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_signal_handles_all_optionals_none() {
+        let body = body_hash_fixture(0x33);
+        let signal = SignableSignal {
+            id: "s",
+            namespace: "n",
+            from_agent: "a",
+            to_agent: None,
+            subject: "subj",
+            body_sha256: &body,
+            signal_type: "broadcast",
+            in_reply_to: None,
+            correlation_id: None,
+            created_at: 0,
+        };
+        let bytes = canonical_cbor_signal(&signal).expect("encode");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes, canonical_cbor_signal(&signal).expect("re-encode"));
+    }
+
+    #[test]
+    fn sign_signal_round_trip() {
+        let kp = keypair::generate("ai:curator").expect("generate");
+        let body = body_hash_fixture(0x34);
+        let signal = signal_fixture(&body);
+        let sig_bytes = sign_signal(&kp, &signal).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_signal(&signal).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_signal_refuses_public_only_keypair() {
+        let kp = keypair::generate("ai:curator").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "ai:curator".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let body = body_hash_fixture(0x35);
+        let signal = signal_fixture(&body);
+        let err = sign_signal(&pub_only, &signal).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_signal_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's signature must not verify
+        // under Bob's public key.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let body = body_hash_fixture(0x36);
+        let signal = signal_fixture(&body);
+        let sig_bytes = sign_signal(&alice, &signal).unwrap();
+        let payload = canonical_cbor_signal(&signal).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
     }
 }

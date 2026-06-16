@@ -455,8 +455,10 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     );
 
     // #1709 Pillar 1 — signal_send / signal_get / signal_inbox / signal_ack
-    // round-trip through the SAL surface on BOTH adapters. No Ed25519 signing
-    // yet: signature/sender_pubkey are empty byte vectors.
+    // round-trip through the SAL surface on BOTH adapters. The SIGNED path is
+    // exercised here: a test keypair signs the signal on send, and the row
+    // read back via signal_get is asserted to verify (Ed25519 over canonical
+    // signal content).
     let sid = format!("sal-cov-sig-{}", uuid_like());
     let signal = Signal {
         id: sid.clone(),
@@ -477,11 +479,12 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         signature: vec![],
         sender_pubkey: vec![],
     };
-    let sent = store
-        .signal_send(&ctx, &signal)
+    let kp = ai_memory::identity::keypair::generate(TEST_AGENT).expect("generate keypair");
+    let attest = store
+        .signal_send(&ctx, &signal, Some(&kp))
         .await
         .expect("signal_send ok");
-    assert_eq!(sent, sid);
+    assert_eq!(attest, "self_signed", "signed send reports self_signed");
 
     let got_sig = store
         .signal_get(&ctx, &sid)
@@ -493,6 +496,11 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     assert_eq!(got_sig.to_agent.as_deref(), Some(TEST_AGENT));
     assert_eq!(got_sig.signal_type, SignalType::Notify);
     assert!(got_sig.acknowledged_at.is_none());
+    // The signed row read back from the store verifies its Ed25519 signature.
+    assert!(
+        ai_memory::signals::verify(&got_sig),
+        "the signed signal row must verify after a store round-trip"
+    );
 
     let inbox = store
         .signal_inbox(&ctx, TEST_NS, Some(TEST_AGENT), 10)

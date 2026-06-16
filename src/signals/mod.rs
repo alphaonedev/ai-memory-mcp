@@ -10,12 +10,83 @@
 //! split [`crate::actions`] uses for the coordination-action surface. The
 //! postgres adapter keeps its own sqlx-native path in `crate::store::postgres`.
 //!
-//! No Ed25519 signing happens here: `signature` / `sender_pubkey` are stored
-//! and read back as caller-provided byte vectors (empty `Vec` for now). The
-//! signing / verification logic lands in a subsequent unit.
+//! v0.8.0 Pillar-1 (#1709) signing: [`sign_into`] populates a [`Signal`]'s
+//! `signature` (64-byte Ed25519 over the canonical signal content) +
+//! `sender_pubkey` (the signer's 32-byte public key); [`verify`] re-derives
+//! the same canonical bytes and checks the signature. The persistence
+//! free-functions above store / read those byte vectors verbatim — a signal
+//! written with empty `signature` / `sender_pubkey` is simply unsigned.
 
+use crate::identity::keypair::AgentKeypair;
+use crate::identity::sign::{SignableSignal, sign_signal};
+use crate::identity::verify::verify_signal;
 use crate::models::{Signal, SignalType};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+
+/// SHA-256 over the signal body's canonical JSON string's UTF-8 bytes. This is
+/// the bounded payload the signature commits to (the same bound the persona /
+/// write signers use for their body hashes), so the signed envelope stays
+/// ~200 bytes regardless of body length.
+fn body_sha256(signal: &Signal) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(signal.body.to_string().as_bytes());
+    hasher.finalize().into()
+}
+
+/// Build the [`SignableSignal`] view of a [`Signal`] — the immutable fields the
+/// signature commits to, borrowing from `signal` and the precomputed
+/// `body_hash`. Shared by [`sign_into`] (outbound) and [`verify`] (inbound) so
+/// both commit to byte-identical canonical bytes.
+fn signable<'a>(signal: &'a Signal, body_hash: &'a [u8; 32]) -> SignableSignal<'a> {
+    SignableSignal {
+        id: &signal.id,
+        namespace: &signal.namespace,
+        from_agent: &signal.from_agent,
+        to_agent: signal.to_agent.as_deref(),
+        subject: &signal.subject,
+        body_sha256: body_hash,
+        signal_type: signal.signal_type.as_str(),
+        in_reply_to: signal.in_reply_to.as_deref(),
+        correlation_id: signal.correlation_id.as_deref(),
+        created_at: signal.created_at,
+    }
+}
+
+/// Sign `signal` in place with `keypair`'s private key.
+///
+/// Hashes the body, builds the [`SignableSignal`] view, signs the canonical
+/// CBOR via [`sign_signal`], then sets `signal.signature` to the 64-byte
+/// signature and `signal.sender_pubkey` to the signer's 32 public-key bytes.
+///
+/// # Errors
+/// Returns the [`sign_signal`] error when `keypair` is public-only
+/// (`can_sign() == false`) or the CBOR encode fails.
+pub fn sign_into(signal: &mut Signal, keypair: &AgentKeypair) -> anyhow::Result<()> {
+    let body_hash = body_sha256(signal);
+    let sig = sign_signal(keypair, &signable(signal, &body_hash))?;
+    signal.signature = sig;
+    signal.sender_pubkey = keypair.public.to_bytes().to_vec();
+    Ok(())
+}
+
+/// Verify a signal's Ed25519 signature against its embedded `sender_pubkey`.
+///
+/// Returns `false` for an unsigned signal (empty `signature` OR empty
+/// `sender_pubkey`) and for any signature that does not validate against the
+/// re-derived canonical bytes. Never panics.
+#[must_use]
+pub fn verify(signal: &Signal) -> bool {
+    if signal.signature.is_empty() || signal.sender_pubkey.is_empty() {
+        return false;
+    }
+    let body_hash = body_sha256(signal);
+    verify_signal(
+        &signable(signal, &body_hash),
+        &signal.signature,
+        &signal.sender_pubkey,
+    )
+}
 
 /// SELECT column list for the `signals` table, in the canonical order
 /// [`row_to_signal`] expects. One definition shared by every signal read.
@@ -307,5 +378,68 @@ mod tests {
 
         // A missing row never flips.
         assert!(!mark_delivered(&conn, "missing", 1_700_000_070).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — sign_into / verify
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sign_into_then_verify_round_trips() {
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let mut signal = sample("signed-1");
+        // Unsigned out of the gate.
+        assert!(!verify(&signal), "unsigned signal must not verify");
+
+        sign_into(&mut signal, &kp).expect("sign_into ok");
+        assert_eq!(signal.signature.len(), 64, "Ed25519 signature is 64 bytes");
+        assert_eq!(signal.sender_pubkey.len(), 32, "pubkey is 32 bytes");
+        assert!(verify(&signal), "freshly-signed signal must verify");
+    }
+
+    #[test]
+    fn tampering_subject_after_signing_fails_verify() {
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let mut signal = sample("signed-2");
+        sign_into(&mut signal, &kp).expect("sign_into ok");
+        assert!(verify(&signal));
+        // Mutate a signed field — the signature no longer matches.
+        signal.subject = "tampered subject".to_string();
+        assert!(!verify(&signal), "tampered subject must fail verify");
+    }
+
+    #[test]
+    fn unsigned_signal_does_not_verify() {
+        let signal = sample("unsigned-1");
+        // sample() leaves signature + sender_pubkey empty.
+        assert!(signal.signature.is_empty());
+        assert!(signal.sender_pubkey.is_empty());
+        assert!(!verify(&signal), "empty-signature signal must not verify");
+    }
+
+    #[test]
+    fn sign_into_refuses_public_only_keypair() {
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let pub_only = crate::identity::keypair::AgentKeypair {
+            agent_id: "ai:curator".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let mut signal = sample("signed-3");
+        let err = sign_into(&mut signal, &pub_only).unwrap_err();
+        assert!(format!("{err:#}").contains("no private key"));
+    }
+
+    #[test]
+    fn signed_signal_survives_db_round_trip() {
+        // sign_into → insert → get → verify still holds: the stored byte
+        // vectors round-trip losslessly.
+        let conn = fresh();
+        let kp = crate::identity::keypair::generate("ai:curator").expect("generate");
+        let mut signal = sample("signed-db");
+        sign_into(&mut signal, &kp).expect("sign_into ok");
+        insert(&conn, &signal).unwrap();
+        let got = get(&conn, "signed-db").unwrap().expect("present");
+        assert!(verify(&got), "signal read back from the DB must verify");
     }
 }
