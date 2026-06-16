@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 61;
+const CURRENT_SCHEMA_VERSION: i32 = 62;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1311,8 +1311,11 @@ impl PostgresStore {
         if current_version < 60 {
             self.migrate_v60().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 61 {
             self.migrate_v61().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v62().await?;
         }
 
         Ok(())
@@ -2799,6 +2802,75 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v61 applied (#1709 Pillar 1: checkpoints attested-checkpoint storage foundation)"
+        );
+        Ok(())
+    }
+
+    /// v0.8.0 Pillar 1 (#1709) — routines storage foundation: additive
+    /// `routines` / `routine_runs` tables (parameterised action+edge
+    /// templates that can be frozen into an immutable, regulatory-hold
+    /// form, and their per-argument-binding materialisations). Postgres
+    /// twin of `migrations/sqlite/0052_v62_routines.sql`. Pure
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` — idempotent + replay-safe (fresh
+    /// schemas carry the tables inline in `postgres_schema.sql`). Epoch
+    /// columns are `BIGINT`, the Ed25519 freeze-attestation `signature` /
+    /// `signer_pubkey` columns are `BYTEA` (nullable — populated only once a
+    /// routine is frozen), and `routine_runs.routine_id` carries the
+    /// documented FK back to `routines(id)`.
+    async fn migrate_v62(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v62 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS routines (
+                id            TEXT NOT NULL PRIMARY KEY,
+                namespace     TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                template      TEXT NOT NULL,
+                parameters    TEXT   NOT NULL DEFAULT '[]',
+                state         TEXT NOT NULL,
+                created_by    TEXT NOT NULL,
+                created_at    BIGINT NOT NULL,
+                frozen_at     BIGINT,
+                signature     BYTEA,
+                signer_pubkey BYTEA,
+                metadata      TEXT   NOT NULL DEFAULT '{}'
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_routines_ns_state ON routines(namespace, state, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_routines_name ON routines(name)",
+            "CREATE TABLE IF NOT EXISTS routine_runs (
+                id                 TEXT NOT NULL PRIMARY KEY,
+                routine_id         TEXT NOT NULL REFERENCES routines(id),
+                namespace          TEXT NOT NULL,
+                arguments          TEXT   NOT NULL DEFAULT '{}',
+                state              TEXT NOT NULL,
+                created_action_ids TEXT   NOT NULL DEFAULT '[]',
+                started_at         BIGINT NOT NULL,
+                finished_at        BIGINT,
+                error              TEXT,
+                metadata           TEXT   NOT NULL DEFAULT '{}'
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_routine_runs_ns_state ON routine_runs(namespace, state)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v62 routines DDL", e))?;
+        }
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v62 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v62 applied (#1709 Pillar 1: routines/routine_runs storage foundation)"
         );
         Ok(())
     }

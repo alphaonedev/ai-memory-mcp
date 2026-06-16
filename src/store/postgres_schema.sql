@@ -1036,3 +1036,45 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS idx_checkpoints_ns_state ON checkpoints(namespace, state, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_condition_type ON checkpoints(condition_type);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_deadline ON checkpoints(deadline_at);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — routines storage foundation. routines
+-- (parameterised action+edge templates that can be frozen into an
+-- immutable, regulatory-hold form) + routine_runs (one materialisation of
+-- a routine under a concrete argument binding). Mirrors
+-- migrations/sqlite/0052_v62_routines.sql. Fresh schemas carry these
+-- inline; existing schemas pick them up via migrate_v62(). Epoch columns
+-- are BIGINT, the Ed25519 freeze-attestation signature/signer_pubkey
+-- columns are BYTEA (nullable — populated only once a routine is frozen).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS routines (
+    id            TEXT NOT NULL PRIMARY KEY,
+    namespace     TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    template      TEXT NOT NULL,                 -- JSON: action + edge declarations w/ {{parameter}} placeholders
+    parameters    TEXT   NOT NULL DEFAULT '[]',  -- JSON array of declared parameter names
+    state         TEXT NOT NULL,                 -- draft | frozen (frozen = immutable, regulatory hold)
+    created_by    TEXT NOT NULL,
+    created_at    BIGINT NOT NULL,
+    frozen_at     BIGINT,
+    signature     BYTEA,                          -- future freeze-attestation (caller-provided/empty for now)
+    signer_pubkey BYTEA,
+    metadata      TEXT   NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_routines_ns_state ON routines(namespace, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routines_name ON routines(name);
+
+CREATE TABLE IF NOT EXISTS routine_runs (
+    id                 TEXT NOT NULL PRIMARY KEY,
+    routine_id         TEXT NOT NULL REFERENCES routines(id),
+    namespace          TEXT NOT NULL,
+    arguments          TEXT   NOT NULL DEFAULT '{}',  -- JSON: {{parameter}} -> value bindings for this run
+    state              TEXT NOT NULL,                 -- pending | running | completed | failed
+    created_action_ids TEXT   NOT NULL DEFAULT '[]',  -- JSON array of action ids this run materialized
+    started_at         BIGINT NOT NULL,
+    finished_at        BIGINT,
+    error              TEXT,
+    metadata           TEXT   NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routine_runs_ns_state ON routine_runs(namespace, state);
