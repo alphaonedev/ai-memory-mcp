@@ -357,7 +357,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // Measured 18_962 + 138 headroom; new SAL surface for postgres-backed
     // daemons. The 19k-LOC module split remains the highest-priority
     // manageability target under EPIC #1709.
-    ("src/store/postgres.rs", 19_100),
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 ROUTINES SAL surface) — bumped
+    // 19_100 → 19_500: PG_ROUTINE_SELECT_BY_ID + pg_row_to_routine +
+    // PG_ROUTINE_RUN_SELECT_BY_ID + pg_row_to_routine_run + the 8 sqlx-native
+    // routine_* trait methods (routine_create / routine_get / routine_list /
+    // routine_freeze / routine_run_create / routine_run_get / routine_runs_for
+    // / routine_run_set_state). Measured 19_367 + 133 headroom; new SAL
+    // surface for postgres-backed daemons. The 19k-LOC module split remains
+    // the highest-priority manageability target under EPIC #1709.
+    ("src/store/postgres.rs", 19_500),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

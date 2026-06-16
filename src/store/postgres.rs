@@ -7654,6 +7654,103 @@ fn pg_row_to_checkpoint(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models:
     })
 }
 
+/// #1709 Pillar 1 — `routines` by-id SELECT (canonical column order matching
+/// [`pg_row_to_routine`]). One definition shared by the by-id reads.
+const PG_ROUTINE_SELECT_BY_ID: &str = "SELECT id, namespace, name, template, parameters, state, created_by, created_at, \
+     frozen_at, signature, signer_pubkey, metadata FROM routines WHERE id = $1";
+
+/// Map a postgres row (the routine column order) to a
+/// [`crate::models::Routine`]. JSON columns (`template`, `parameters`,
+/// `metadata`) are TEXT (parity with sqlite); the Ed25519 `signature` /
+/// `signer_pubkey` columns are nullable BYTEA → `Vec<u8>` (NULL collapses to
+/// an empty vec for an unfrozen row); epoch columns are BIGINT → `i64` /
+/// `Option<i64>`. Shared by `routine_get` / `routine_list` / `routine_freeze`.
+fn pg_row_to_routine(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Routine> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let template: String = r
+        .try_get("template")
+        .map_err(|e| g("routine.template", e))?;
+    let parameters: String = r
+        .try_get("parameters")
+        .map_err(|e| g("routine.parameters", e))?;
+    let state: String = r.try_get("state").map_err(|e| g("routine.state", e))?;
+    let metadata: String = r
+        .try_get("metadata")
+        .map_err(|e| g("routine.metadata", e))?;
+    Ok(crate::models::Routine {
+        id: r.try_get("id").map_err(|e| g("routine.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("routine.namespace", e))?,
+        name: r.try_get("name").map_err(|e| g("routine.name", e))?,
+        template: serde_json::from_str(&template).unwrap_or(serde_json::Value::Null),
+        parameters: serde_json::from_str(&parameters).unwrap_or(serde_json::Value::Null),
+        state: crate::models::RoutineState::from_str(&state).unwrap_or_default(),
+        created_by: r
+            .try_get(crate::models::field_names::CREATED_BY)
+            .map_err(|e| g("routine.created_by", e))?,
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("routine.created_at", e))?,
+        frozen_at: r.try_get("frozen_at").ok(),
+        signature: r
+            .try_get::<Option<Vec<u8>>, _>("signature")
+            .map_err(|e| g("routine.signature", e))?
+            .unwrap_or_default(),
+        signer_pubkey: r
+            .try_get::<Option<Vec<u8>>, _>("signer_pubkey")
+            .map_err(|e| g("routine.signer_pubkey", e))?
+            .unwrap_or_default(),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// #1709 Pillar 1 — `routine_runs` by-id SELECT (canonical column order
+/// matching [`pg_row_to_routine_run`]). One definition shared by the by-id
+/// reads.
+const PG_ROUTINE_RUN_SELECT_BY_ID: &str = "SELECT id, routine_id, namespace, arguments, state, created_action_ids, \
+     started_at, finished_at, error, metadata FROM routine_runs WHERE id = $1";
+
+/// Map a postgres row (the routine-run column order) to a
+/// [`crate::models::RoutineRun`]. JSON columns (`arguments`,
+/// `created_action_ids`, `metadata`) are TEXT (parity with sqlite); epoch
+/// columns are BIGINT → `i64` / `Option<i64>`. Shared by `routine_run_get` /
+/// `routine_runs_for` / `routine_run_set_state`.
+fn pg_row_to_routine_run(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::RoutineRun> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let arguments: String = r
+        .try_get("arguments")
+        .map_err(|e| g("routine_run.arguments", e))?;
+    let state: String = r.try_get("state").map_err(|e| g("routine_run.state", e))?;
+    let created_action_ids: String = r
+        .try_get("created_action_ids")
+        .map_err(|e| g("routine_run.created_action_ids", e))?;
+    let metadata: String = r
+        .try_get("metadata")
+        .map_err(|e| g("routine_run.metadata", e))?;
+    Ok(crate::models::RoutineRun {
+        id: r.try_get("id").map_err(|e| g("routine_run.id", e))?,
+        routine_id: r
+            .try_get("routine_id")
+            .map_err(|e| g("routine_run.routine_id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("routine_run.namespace", e))?,
+        arguments: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
+        state: crate::models::RoutineRunState::from_str(&state).unwrap_or_default(),
+        created_action_ids: serde_json::from_str(&created_action_ids)
+            .unwrap_or(serde_json::Value::Null),
+        started_at: r
+            .try_get("started_at")
+            .map_err(|e| g("routine_run.started_at", e))?,
+        finished_at: r.try_get("finished_at").ok(),
+        error: r.try_get("error").ok(),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
+}
+
 /// ARCH-1 — Postgres-side adapter for the substrate
 /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
 ///
@@ -12870,6 +12967,213 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("checkpoint_query", e))?;
         rows.iter().map(pg_row_to_checkpoint).collect()
+    }
+
+    async fn routine_create(
+        &self,
+        _ctx: &CallerContext,
+        r: &crate::models::Routine,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns (template, parameters, metadata)
+        // stored as TEXT (parity with sqlite); signature/signer_pubkey are
+        // BYTEA, persisted verbatim (empty for an unfrozen Draft routine).
+        sqlx::query(
+            "INSERT INTO routines \
+                (id, namespace, name, template, parameters, state, created_by, \
+                 created_at, frozen_at, signature, signer_pubkey, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(&r.id)
+        .bind(&r.namespace)
+        .bind(&r.name)
+        .bind(r.template.to_string())
+        .bind(r.parameters.to_string())
+        .bind(r.state.as_str())
+        .bind(&r.created_by)
+        .bind(r.created_at)
+        .bind(r.frozen_at)
+        .bind(&r.signature)
+        .bind(&r.signer_pubkey)
+        .bind(r.metadata.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_create", e))?;
+        Ok(r.id.clone())
+    }
+
+    async fn routine_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        sqlx::query(PG_ROUTINE_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_get", e))?
+            .as_ref()
+            .map(pg_row_to_routine)
+            .transpose()
+    }
+
+    async fn routine_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::RoutineState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Routine>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, name, template, parameters, state, created_by, \
+                    created_at, frozen_at, signature, signer_pubkey, metadata \
+               FROM routines WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(st) = state {
+            qb.push(crate::checkpoints::SQL_AND_STATE_EQ)
+                .push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::checkpoints::SQL_ORDER_BY_CREATED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_list", e))?;
+        rows.iter().map(pg_row_to_routine).collect()
+    }
+
+    async fn routine_freeze(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        frozen_at: i64,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        // Only flip a Draft → Frozen (set frozen_at on the transition); an
+        // already-frozen routine keeps its original frozen_at. The UPDATE is a
+        // no-op on a frozen / missing row, so RETURNING yields no row in those
+        // cases — fall back to a by-id fetch so an already-frozen routine
+        // still returns Some (idempotent), and a truly-missing id → None.
+        let updated = sqlx::query(
+            "UPDATE routines SET state = $1, frozen_at = $2 \
+             WHERE id = $3 AND state = $4 \
+             RETURNING id, namespace, name, template, parameters, state, created_by, \
+                       created_at, frozen_at, signature, signer_pubkey, metadata",
+        )
+        .bind(crate::models::RoutineState::Frozen.as_str())
+        .bind(frozen_at)
+        .bind(id)
+        .bind(crate::models::RoutineState::Draft.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_freeze", e))?;
+        match updated {
+            Some(row) => pg_row_to_routine(&row).map(Some),
+            // No Draft row updated — either already frozen (return it) or
+            // absent (None). Disambiguate via a by-id fetch.
+            None => self.routine_get(_ctx, id).await,
+        }
+    }
+
+    async fn routine_run_create(
+        &self,
+        _ctx: &CallerContext,
+        run: &crate::models::RoutineRun,
+    ) -> StoreResult<String> {
+        sqlx::query(
+            "INSERT INTO routine_runs \
+                (id, routine_id, namespace, arguments, state, created_action_ids, \
+                 started_at, finished_at, error, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&run.id)
+        .bind(&run.routine_id)
+        .bind(&run.namespace)
+        .bind(run.arguments.to_string())
+        .bind(run.state.as_str())
+        .bind(run.created_action_ids.to_string())
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(&run.error)
+        .bind(run.metadata.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_run_create", e))?;
+        Ok(run.id.clone())
+    }
+
+    async fn routine_run_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        sqlx::query(PG_ROUTINE_RUN_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_run_get", e))?
+            .as_ref()
+            .map(pg_row_to_routine_run)
+            .transpose()
+    }
+
+    async fn routine_runs_for(
+        &self,
+        _ctx: &CallerContext,
+        routine_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::RoutineRun>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, routine_id, namespace, arguments, state, created_action_ids, \
+                    started_at, finished_at, error, metadata \
+               FROM routine_runs WHERE routine_id = ",
+        );
+        qb.push_bind(routine_id.to_string());
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::routines::SQL_ORDER_BY_STARTED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_runs_for", e))?;
+        rows.iter().map(pg_row_to_routine_run).collect()
+    }
+
+    async fn routine_run_set_state(
+        &self,
+        _ctx: &CallerContext,
+        run_id: &str,
+        state: crate::models::RoutineRunState,
+        finished_at: Option<i64>,
+        created_action_ids: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        // COALESCE-style partial update: each optional column is overwritten
+        // only when the corresponding argument is `Some`, so a state-only
+        // advance never clobbers a previously-set column. RETURNING yields the
+        // updated row, or no row when the id is absent (→ None).
+        let action_ids_json = created_action_ids.map(std::string::ToString::to_string);
+        let row = sqlx::query(
+            "UPDATE routine_runs SET \
+                state = $1, \
+                finished_at = COALESCE($2, finished_at), \
+                created_action_ids = COALESCE($3, created_action_ids), \
+                error = COALESCE($4, error) \
+             WHERE id = $5 \
+             RETURNING id, routine_id, namespace, arguments, state, created_action_ids, \
+                       started_at, finished_at, error, metadata",
+        )
+        .bind(state.as_str())
+        .bind(finished_at)
+        .bind(action_ids_json)
+        .bind(error)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_run_set_state", e))?;
+        row.as_ref().map(pg_row_to_routine_run).transpose()
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {

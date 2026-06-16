@@ -635,6 +635,10 @@ pub mod reranker;
 // `reranker::global_session_recall_tracker`, …) delegates here so the
 // wire / chain / cache semantics stay byte-equivalent.
 pub mod runtime_context;
+// v0.8.0 Pillar 1 (#1709) — routine + routine-run sqlite free-functions
+// (mirrors `crate::checkpoints`); backs the SAL `routine_*` surface + the
+// future MCP `memory_routine_*` handlers over a bare rusqlite Connection.
+pub mod routines;
 // v0.8.0 Pillar 1 (#1709) — signed-signal sqlite free-functions (mirrors
 // `crate::actions`); backs the SAL `signal_*` surface + the future MCP
 // `memory_signal_*` handlers over a bare rusqlite Connection.
