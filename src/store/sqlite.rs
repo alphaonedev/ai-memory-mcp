@@ -1057,6 +1057,87 @@ impl MemoryStore for SqliteStore {
         crate::checkpoints::query(&conn, namespace, condition_type, state, limit).map_err(box_err)
     }
 
+    async fn routine_create(
+        &self,
+        _ctx: &CallerContext,
+        r: &crate::models::Routine,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_insert(&conn, r).map_err(box_err)
+    }
+
+    async fn routine_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_get(&conn, id).map_err(box_err)
+    }
+
+    async fn routine_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::RoutineState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Routine>> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_list(&conn, namespace, state, limit).map_err(box_err)
+    }
+
+    async fn routine_freeze(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        frozen_at: i64,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_freeze(&conn, id, frozen_at).map_err(box_err)
+    }
+
+    async fn routine_run_create(
+        &self,
+        _ctx: &CallerContext,
+        run: &crate::models::RoutineRun,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::routines::run_insert(&conn, run).map_err(box_err)
+    }
+
+    async fn routine_run_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        let conn = self.state.lock().await;
+        crate::routines::run_get(&conn, id).map_err(box_err)
+    }
+
+    async fn routine_runs_for(
+        &self,
+        _ctx: &CallerContext,
+        routine_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::RoutineRun>> {
+        let conn = self.state.lock().await;
+        crate::routines::runs_for(&conn, routine_id, limit).map_err(box_err)
+    }
+
+    async fn routine_run_set_state(
+        &self,
+        _ctx: &CallerContext,
+        run_id: &str,
+        state: crate::models::RoutineRunState,
+        finished_at: Option<i64>,
+        created_action_ids: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        let conn = self.state.lock().await;
+        crate::routines::run_set_state(&conn, run_id, state, finished_at, created_action_ids, error)
+            .map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)

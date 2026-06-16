@@ -15,8 +15,8 @@
 #![cfg(feature = "sal")]
 
 use ai_memory::models::{
-    Checkpoint, CheckpointState, ConditionType, ConfidenceSource, Memory, MemoryKind, Signal,
-    SignalType, Tier,
+    Checkpoint, CheckpointState, ConditionType, ConfidenceSource, Memory, MemoryKind, Routine,
+    RoutineRun, RoutineRunState, RoutineState, Signal, SignalType, Tier,
 };
 use ai_memory::store::{CallerContext, MemoryStore};
 use std::sync::Arc;
@@ -614,6 +614,101 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         ai_memory::checkpoints::verify(&resolved_cp),
         "the attested checkpoint resolution must verify after a store round-trip"
     );
+
+    // #1709 Pillar 1 — routine_create / routine_get / routine_list /
+    // routine_freeze + routine_run_create / routine_run_get /
+    // routine_run_set_state round-trip through the SAL surface on BOTH
+    // adapters (the v62 routines substrate).
+    let rid = format!("sal-cov-rt-{}", uuid_like());
+    let routine = Routine {
+        id: rid.clone(),
+        namespace: TEST_NS.to_string(),
+        name: "r1".to_string(),
+        template: serde_json::json!({ "actions": [] }),
+        parameters: serde_json::json!([]),
+        state: RoutineState::Draft,
+        created_by: TEST_AGENT.to_string(),
+        created_at: 1_700_005_000,
+        frozen_at: None,
+        signature: vec![],
+        signer_pubkey: vec![],
+        metadata: serde_json::json!({}),
+    };
+    let created_rt = store
+        .routine_create(&ctx, &routine)
+        .await
+        .expect("routine_create ok");
+    assert_eq!(created_rt, rid);
+
+    let got_rt = store
+        .routine_get(&ctx, &rid)
+        .await
+        .expect("routine_get ok")
+        .expect("routine present");
+    assert_eq!(got_rt.namespace, TEST_NS);
+    assert_eq!(got_rt.name, "r1");
+    assert_eq!(got_rt.state, RoutineState::Draft);
+    assert_eq!(got_rt.created_by, TEST_AGENT);
+
+    let rt_list = store
+        .routine_list(&ctx, TEST_NS, Some(RoutineState::Draft), 10)
+        .await
+        .expect("routine_list ok");
+    assert!(
+        rt_list.iter().any(|r| r.id == rid),
+        "the draft routine is in the namespace+state-filtered list"
+    );
+
+    let frozen_rt = store
+        .routine_freeze(&ctx, &rid, 1_700_005_100)
+        .await
+        .expect("routine_freeze ok")
+        .expect("freeze returns the updated row");
+    assert_eq!(frozen_rt.state, RoutineState::Frozen);
+    assert_eq!(frozen_rt.frozen_at, Some(1_700_005_100));
+
+    let run_id = format!("sal-cov-run-{}", uuid_like());
+    let run = RoutineRun {
+        id: run_id.clone(),
+        routine_id: rid.clone(),
+        namespace: TEST_NS.to_string(),
+        arguments: serde_json::json!({}),
+        state: RoutineRunState::Pending,
+        created_action_ids: serde_json::json!([]),
+        started_at: 1_700_005_000,
+        finished_at: None,
+        error: None,
+        metadata: serde_json::json!({}),
+    };
+    let created_run = store
+        .routine_run_create(&ctx, &run)
+        .await
+        .expect("routine_run_create ok");
+    assert_eq!(created_run, run_id);
+
+    let got_run = store
+        .routine_run_get(&ctx, &run_id)
+        .await
+        .expect("routine_run_get ok")
+        .expect("run present");
+    assert_eq!(got_run.routine_id, rid);
+    assert_eq!(got_run.state, RoutineRunState::Pending);
+
+    let completed_run = store
+        .routine_run_set_state(
+            &ctx,
+            &run_id,
+            RoutineRunState::Completed,
+            Some(1_700_005_200),
+            Some(&serde_json::json!(["a1"])),
+            None,
+        )
+        .await
+        .expect("routine_run_set_state ok")
+        .expect("set_state returns the updated row");
+    assert_eq!(completed_run.state, RoutineRunState::Completed);
+    assert_eq!(completed_run.finished_at, Some(1_700_005_200));
+    assert_eq!(completed_run.created_action_ids, serde_json::json!(["a1"]));
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

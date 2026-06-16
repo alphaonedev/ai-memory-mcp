@@ -1766,6 +1766,120 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 Pillar 1 — create a routine (the v62 `routines` table,
+    /// parameterised action+edge templates that can be frozen into an
+    /// immutable, regulatory-hold form). The `signature` / `signer_pubkey`
+    /// byte vectors on `r` are persisted verbatim — empty for an unfrozen
+    /// (Draft) routine. Returns the routine id. Default `UnsupportedCapability`.
+    async fn routine_create(
+        &self,
+        _ctx: &CallerContext,
+        _r: &crate::models::Routine,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a routine by id. `Ok(None)` when the routine
+    /// does not exist. Default `UnsupportedCapability`.
+    async fn routine_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list a namespace's routines, newest-first, capped at
+    /// `limit`. When `state` is `Some`, narrows to that lifecycle state; when
+    /// `None`, returns every routine in the namespace. Default
+    /// `UnsupportedCapability`.
+    async fn routine_list(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _state: Option<crate::models::RoutineState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Routine>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — freeze a routine (Draft → Frozen, sets `frozen_at`).
+    /// Idempotent on an already-frozen routine (the `frozen_at` is left
+    /// as-is). Returns the routine, or `None` when the id does not exist.
+    /// Default `UnsupportedCapability`.
+    async fn routine_freeze(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _frozen_at: i64,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — create a routine run (the v62 `routine_runs` table,
+    /// one materialisation of a routine under a concrete argument binding).
+    /// Returns the run id. Default `UnsupportedCapability`.
+    async fn routine_run_create(
+        &self,
+        _ctx: &CallerContext,
+        _run: &crate::models::RoutineRun,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a routine run by id. `Ok(None)` when the run
+    /// does not exist. Default `UnsupportedCapability`.
+    async fn routine_run_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list a routine's runs, newest-first (by `started_at`),
+    /// capped at `limit`. Default `UnsupportedCapability`.
+    async fn routine_runs_for(
+        &self,
+        _ctx: &CallerContext,
+        _routine_id: &str,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::RoutineRun>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — advance a run's lifecycle: set `state` plus, when
+    /// `Some`, `finished_at` / `created_action_ids` / `error` (a `None`
+    /// argument leaves that column untouched). Returns the updated run, or
+    /// `None` when the id does not exist. Default `UnsupportedCapability`.
+    async fn routine_run_set_state(
+        &self,
+        _ctx: &CallerContext,
+        _run_id: &str,
+        _state: crate::models::RoutineRunState,
+        _finished_at: Option<i64>,
+        _created_action_ids: Option<&serde_json::Value>,
+        _error: Option<&str>,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///
