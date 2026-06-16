@@ -959,7 +959,9 @@ pub struct CapabilityHooks {
     /// enumerating the enum.
     ///
     /// History: G2 shipped 20; G10 added the 21st; Task 6/8 added
-    /// the 22nd + 23rd; L1-7 adds the 24th + 25th → total **25**.
+    /// the 22nd + 23rd; L1-7 added the 24th + 25th; v0.8.0 #1709 adds
+    /// the 26th + 27th (`pre_signal_send`, `post_signal_ack`) →
+    /// total **27**.
     #[serde(default = "default_hook_events_count")]
     pub hook_events_count: usize,
     /// v0.7-polish SEC-15 / COR-11 (issue #780): mirror of the
@@ -983,7 +985,7 @@ pub struct CapabilityHooks {
 /// Compile-time count of `HookEvent` variants.  Updated here when new
 /// variants land; the corresponding enum exhaustiveness check in
 /// `src/hooks/timeouts.rs` enforces the count at test time.
-pub const HOOK_EVENTS_COUNT: usize = 25;
+pub const HOOK_EVENTS_COUNT: usize = 27;
 
 fn default_hook_events_count() -> usize {
     HOOK_EVENTS_COUNT

@@ -363,7 +363,10 @@ pub fn is_pre_event(event: HookEvent) -> bool {
         | HookEvent::PreReflect
         // v0.7.0 L1-7: pre_compaction fires before the cluster is
         // processed by a CompactionPass — Deny aborts the cluster.
-        | HookEvent::PreCompaction => true,
+        | HookEvent::PreCompaction
+        // v0.8.0 #1709: pre_signal_send fires before a signed signal
+        // is persisted — Modify rewrites the delta, Deny refuses it.
+        | HookEvent::PreSignalSend => true,
 
         // ---- post-/on- events: `Modify` decisions are degraded to Allow --
         HookEvent::PostStore
@@ -377,7 +380,9 @@ pub fn is_pre_event(event: HookEvent) -> bool {
         | HookEvent::OnIndexEviction
         | HookEvent::PostTranscriptStore
         | HookEvent::PostReflect
-        | HookEvent::OnCompactionRollback => false,
+        | HookEvent::OnCompactionRollback
+        // v0.8.0 #1709: post_signal_ack is notify-only.
+        | HookEvent::PostSignalAck => false,
     }
 }
 
@@ -667,6 +672,7 @@ mod tests {
             HookEvent::PreRecallExpand,
             HookEvent::PreReflect,
             HookEvent::PreCompaction,
+            HookEvent::PreSignalSend,
         ] {
             assert!(is_pre_event(ev), "expected {ev:?} to be a pre- event");
         }
@@ -685,6 +691,7 @@ mod tests {
             HookEvent::PostTranscriptStore,
             HookEvent::PostReflect,
             HookEvent::OnCompactionRollback,
+            HookEvent::PostSignalAck,
         ] {
             assert!(!is_pre_event(ev), "expected {ev:?} to be a post-/on- event");
         }

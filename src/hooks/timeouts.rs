@@ -130,9 +130,9 @@ pub const HOT_PATH_CLASS_DEADLINE_MS: u64 = 50;
 // event_class — the canonical mapping
 // ---------------------------------------------------------------------------
 
-/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 25
+/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 27
 /// variants — the compiler's exhaustiveness check enforces the table
-/// stays in sync if a 26th event ever lands.
+/// stays in sync if a 28th event ever lands.
 #[must_use]
 pub fn event_class(event: HookEvent) -> EventClass {
     match event {
@@ -158,7 +158,14 @@ pub fn event_class(event: HookEvent) -> EventClass {
         // v0.7.0 L1-7: compaction pipeline events are write-class
         // (the pass may delete source rows and insert a summary).
         | HookEvent::PreCompaction
-        | HookEvent::OnCompactionRollback => EventClass::Write,
+        | HookEvent::OnCompactionRollback
+        // v0.8.0 Pillar-1 #1709: signed-signal events. PreSignalSend
+        // is a write-path decision hook (the signal is persisted to
+        // the append-only signal log); PostSignalAck is notify-only
+        // but shares the write-class budget because EventClass has no
+        // dedicated notify class (same posture as PostReflect).
+        | HookEvent::PreSignalSend
+        | HookEvent::PostSignalAck => EventClass::Write,
         // Reads: query path. Hot.
         HookEvent::PreRecall
         | HookEvent::PostRecall
@@ -331,15 +338,16 @@ mod tests {
     use super::*;
 
     /// Every `HookEvent` variant must classify into exactly one
-    /// `EventClass`. Table-driven so adding a 26th variant without
+    /// `EventClass`. Table-driven so adding a 28th variant without
     /// updating the mapping fails this test (the compiler also
     /// flags the missing arm in `event_class`, but the assertion
     /// surface here is what an operator reading the test reads).
     #[test]
-    fn event_class_table_covers_all_25_variants() {
+    fn event_class_table_covers_all_27_variants() {
         let table = [
-            // Write — 17 variants (Task 6/8 added pre_reflect + post_reflect;
-            // L1-7 added pre_compaction + on_compaction_rollback).
+            // Write — 19 variants (Task 6/8 added pre_reflect + post_reflect;
+            // L1-7 added pre_compaction + on_compaction_rollback;
+            // v0.8.0 #1709 added pre_signal_send + post_signal_ack).
             (HookEvent::PreStore, EventClass::Write),
             (HookEvent::PostStore, EventClass::Write),
             (HookEvent::PreDelete, EventClass::Write),
@@ -357,6 +365,8 @@ mod tests {
             (HookEvent::PostReflect, EventClass::Write),
             (HookEvent::PreCompaction, EventClass::Write),
             (HookEvent::OnCompactionRollback, EventClass::Write),
+            (HookEvent::PreSignalSend, EventClass::Write),
+            (HookEvent::PostSignalAck, EventClass::Write),
             // Read — 4 variants.
             (HookEvent::PreRecall, EventClass::Read),
             (HookEvent::PostRecall, EventClass::Read),
@@ -373,8 +383,8 @@ mod tests {
 
         assert_eq!(
             table.len(),
-            25,
-            "v0.7.0 L1-7 mapping must cover exactly the 25 HookEvent variants"
+            27,
+            "v0.8.0 #1709 mapping must cover exactly the 27 HookEvent variants"
         );
         for (event, expected) in table {
             assert_eq!(
