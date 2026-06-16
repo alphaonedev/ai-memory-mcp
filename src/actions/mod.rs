@@ -361,6 +361,15 @@ pub fn lease_get(
         .optional()
 }
 
+/// Reclaim (delete) every lease whose `expires_at <= now`, releasing the
+/// action for a fresh holder. Returns the number of leases reclaimed.
+///
+/// # Errors
+/// Propagates the `rusqlite` delete error.
+pub fn sweep_expired_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM leases WHERE expires_at <= ?1", params![now])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,5 +561,30 @@ mod tests {
         assert!(lease_get(&conn, "lease-1").unwrap().is_none());
         // Release on an already-absent lease is false.
         assert!(!lease_release(&conn, "lease-1", "holder-a").unwrap());
+    }
+
+    #[test]
+    fn sweep_expired_leases_reclaims_only_expired() {
+        let conn = fresh();
+        let now = 1_700_000_000;
+        create(&conn, &sample("sweep-1")).unwrap();
+
+        // Acquire a lease whose deadline is already in the past.
+        match lease_acquire(&conn, "sweep-1", "holder", now, now - 1).unwrap() {
+            LeaseAcquire::Acquired(l) => assert_eq!(l.expires_at, now - 1),
+            LeaseAcquire::Conflict => panic!("expected Acquired"),
+        }
+
+        // The sweep reclaims exactly the one expired lease.
+        assert_eq!(sweep_expired_leases(&conn, now).unwrap(), 1);
+        assert!(lease_get(&conn, "sweep-1").unwrap().is_none());
+
+        // A non-expired lease (expires_at = now + 1000) is NOT swept.
+        match lease_acquire(&conn, "sweep-1", "holder", now, now + 1000).unwrap() {
+            LeaseAcquire::Acquired(_) => {}
+            LeaseAcquire::Conflict => panic!("expected Acquired"),
+        }
+        assert_eq!(sweep_expired_leases(&conn, now).unwrap(), 0);
+        assert!(lease_get(&conn, "sweep-1").unwrap().is_some());
     }
 }

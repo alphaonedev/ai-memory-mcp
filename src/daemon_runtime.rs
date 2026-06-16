@@ -4367,6 +4367,12 @@ pub async fn bootstrap_serve(
         crate::background::offload_ttl_sweep::DEFAULT_INTERVAL,
     ));
 
+    // #1709 Pillar-1 — reclaim expired action leases.
+    task_handles.push(crate::background::lease_sweep::spawn(
+        db_state.clone(),
+        crate::background::lease_sweep::DEFAULT_INTERVAL,
+    ));
+
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
     // file grows until SQLite's auto-checkpoint fires (every 1000 pages by
     // default) — which is inconsistent timing and can leave the file at
@@ -6222,18 +6228,19 @@ mod tests {
         assert!(bs.app_state.embedder.is_none());
         let vi = bs.app_state.vector_index.lock().await;
         assert!(vi.is_none());
-        // Six task handles spawned (v0.7 policy-engine item 3 added
+        // Eight task handles spawned (v0.7 policy-engine item 3 added
         // the deferred-audit supervisor + gc + wal_checkpoint +
         // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
         // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
-        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep).
+        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep +
+        // #1709 Pillar-1 expired-lease reclaim sweep).
         // v0.7 B3-fix2 gates the family-descriptor embedding precompute
         // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
         // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to seven when the
+        // for the rationale. The task count reverts to eight when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 7);
+        assert_eq!(bs.task_handles.len(), 8);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();

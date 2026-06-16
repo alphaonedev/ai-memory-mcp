@@ -432,6 +432,27 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .await
         .expect("re-acquire after release ok");
     assert_eq!(reacquire.holder, "holder-B");
+
+    // #1709 Pillar 1 — the background lease-sweeper reclaims expired leases.
+    // Acquire a lease whose deadline is already in the past, then sweep at a
+    // `now` after it: at least the one expired lease is reclaimed and gone.
+    store
+        .lease_acquire(&ctx, &aid, "holder-C", 1_700_002_000, 1_700_002_000 - 1)
+        .await
+        .expect("acquire expired-deadline lease ok");
+    let reclaimed = store
+        .lease_sweep_expired(1_700_002_000)
+        .await
+        .expect("lease_sweep_expired ok");
+    assert!(reclaimed >= 1, "the expired lease is reclaimed");
+    assert!(
+        store
+            .lease_get(&ctx, &aid)
+            .await
+            .expect("lease_get after sweep ok")
+            .is_none(),
+        "no lease after sweep"
+    );
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

@@ -9,4 +9,5 @@
 //! short-term-context auto-cadence) layers on without churning the
 //! daemon_runtime spawn surface.
 
+pub mod lease_sweep;
 pub mod offload_ttl_sweep;
