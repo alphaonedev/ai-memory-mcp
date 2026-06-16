@@ -57,8 +57,25 @@ fn local_runs_db() -> std::path::PathBuf {
 }
 
 fn spawn_mcp(db_path: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
+    // Hermetic key-dir isolation. `resolve_operator_pubkey()` searches the
+    // default key dir (and `AI_MEMORY_KEY_DIR`), so on an operator's own
+    // host — where the real `operator.key.pub` lives at the default path —
+    // the L1-6 matrix flips: an `enabled = 1` but UNSIGNED governance rule
+    // (what this test seeds) is correctly dropped as misconfiguration once
+    // a verifying key is present, and the write is no longer refused. CI
+    // has no operator key so it stays in pre-L1-6 mode and the rule fires;
+    // the host leak made this test pass in CI but fail on the dev box.
+    // Point `AI_MEMORY_KEY_DIR` at an EMPTY project-local dir so the test
+    // is pre-L1-6 (no operator key) regardless of host, which is the mode
+    // that proves the hook is installed: the unsigned rule enforces.
+    let key_dir = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!("keys-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&key_dir).ok();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_KEY_DIR", &key_dir)
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -200,18 +217,27 @@ fn mcp_store_is_refused_by_agent_action_rule_1583() {
     );
 
     let blob = serde_json::to_string(&resp).unwrap();
-    // The refusal surfaces either as a JSON-RPC error or as an
-    // isError/refusal-shaped tool result; both carry the rule reason or
-    // a governance refusal marker. Assert the write did NOT silently
-    // succeed (pre-#1583 behavior) and that a governance refusal is
-    // present.
-    let refused = blob.contains("#1583")
-        || blob.to_lowercase().contains("refus")
-        || blob.to_lowercase().contains("governance");
+    // Assert the STRUCTURED refusal shape, not a loose substring of the
+    // whole blob: a successful store echoes the request `title` back, and
+    // a title containing "refus" (as ours does) would satisfy a naive
+    // `blob.contains("refus")`, masking a non-refused write. The refusal
+    // surfaces as a tool result with `isError = true` whose text carries
+    // the `GOVERNANCE_REFUSED` marker (or as a JSON-RPC `error`); a
+    // success has neither.
+    let is_error = resp
+        .get("result")
+        .and_then(|r| r.get("isError"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let jsonrpc_error = resp.get("error").is_some();
+    let carries_refusal_marker = blob.contains("GOVERNANCE_REFUSED");
+    let refused = (is_error || jsonrpc_error) && carries_refusal_marker;
     assert!(
         refused,
         "#1583: MCP memory_store must be refused by the seeded memory_write \
-         agent-action rule (the pre-write hook must be installed on MCP); got: {blob}"
+         agent-action rule (the pre-write hook must be installed on MCP, and \
+         the test must run pre-L1-6 with no operator key so the unsigned rule \
+         enforces); got: {blob}"
     );
 
     // Defense-in-depth: confirm the row did NOT land in the DB.
