@@ -411,6 +411,8 @@ mod archive;
 mod auto_tag;
 #[path = "tools/capabilities.rs"]
 mod capabilities;
+#[path = "tools/signal.rs"]
+mod signal;
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001
 // (`docs/rfc/RFC-0001-mcp-turn-capture.md`). Substrate-side handler
 // for the protocol-level fix that closes the #1388 substrate failure
@@ -971,6 +973,11 @@ use action::{
     handle_action_list, handle_action_transition, handle_lease_acquire, handle_lease_get,
     handle_lease_release, handle_lease_renew,
 };
+// v0.8.0 Pillar 1 (#1709) — signed-signal coordination handlers.
+use signal::{
+    handle_signal_ack, handle_signal_inbox, handle_signal_read, handle_signal_send,
+    handle_signal_thread,
+};
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
 // `handle_list_subscriptions` are also `pub use`-exported above; the
@@ -1280,6 +1287,33 @@ fn dispatch_memory_lease_release(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_get`.
 fn dispatch_memory_lease_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_lease_get(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_send`. Threads the
+/// active daemon keypair so an outbound signal is `self_signed` when a
+/// signing key is available, `unsigned` otherwise.
+fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_send(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_read`.
+fn dispatch_memory_signal_read(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_read(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_inbox`.
+fn dispatch_memory_signal_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_inbox(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_thread`.
+fn dispatch_memory_signal_thread(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_thread(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_ack`.
+fn dispatch_memory_signal_ack(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_ack(ctx.conn, ctx.arguments)
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1957,6 +1991,19 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
             dispatch_memory_lease_release
         ),
         register_mcp_tool!(tool_names::MEMORY_LEASE_GET, dispatch_memory_lease_get),
+        // v0.8.0 Pillar 1 (#1709) — signed-signal coordination surface
+        // (send/read/inbox/thread/ack) over the `crate::signals` substrate.
+        register_mcp_tool!(tool_names::MEMORY_SIGNAL_SEND, dispatch_memory_signal_send),
+        register_mcp_tool!(tool_names::MEMORY_SIGNAL_READ, dispatch_memory_signal_read),
+        register_mcp_tool!(
+            tool_names::MEMORY_SIGNAL_INBOX,
+            dispatch_memory_signal_inbox
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SIGNAL_THREAD,
+            dispatch_memory_signal_thread
+        ),
+        register_mcp_tool!(tool_names::MEMORY_SIGNAL_ACK, dispatch_memory_signal_ack),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
         register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),

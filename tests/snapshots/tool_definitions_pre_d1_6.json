@@ -2595,6 +2595,164 @@
         "type": "object"
       },
       "name": "memory_lease_get"
+    },
+    {
+      "description": "Send a typed, optionally Ed25519-signed inter-agent signal (#1709).",
+      "docs": "Pillar 1 (#1709): create a signal; self-signed when a signing keypair is available.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_send`.",
+        "properties": {
+          "body": {
+            "default": null
+          },
+          "correlation_id": {
+            "default": null,
+            "description": "Correlation id grouping a thread of signals.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_agent": {
+            "type": "string"
+          },
+          "in_reply_to": {
+            "default": null,
+            "description": "Threads a `response` back onto its `request` signal id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "reference_ids": {
+            "default": null,
+            "description": "JSON array of related signal / memory ids."
+          },
+          "signal_type": {
+            "default": null,
+            "description": "Signal kind (`authorize` / `notify` / `request` / `response` / `broadcast`). Defaults to `notify`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "to_agent": {
+            "default": null,
+            "description": "Recipient agent id. Omit for a namespace-wide broadcast.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_agent",
+          "namespace",
+          "subject"
+        ],
+        "title": "SignalSendRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_send"
+    },
+    {
+      "description": "Read one signal by id, mark it read, and report verify status (#1709).",
+      "docs": "Pillar 1 (#1709): fetch a signal, stamp read_at, and verify its Ed25519 signature.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_read`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "SignalReadRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_read"
+    },
+    {
+      "description": "List signals for a namespace/recipient \u2014 direct + broadcast (#1709).",
+      "docs": "Pillar 1 (#1709): the recipient inbox \u2014 direct messages plus namespace broadcasts, newest-first.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_inbox`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "to_agent": {
+            "default": null,
+            "description": "Recipient agent id. When set, returns direct messages to this agent plus namespace broadcasts; when omitted, returns every signal in the namespace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "SignalInboxRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_inbox"
+    },
+    {
+      "description": "List a signal correlation thread, oldest-first (#1709).",
+      "docs": "Pillar 1 (#1709): return every signal sharing a correlation_id in thread order.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_thread`.",
+        "properties": {
+          "correlation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "correlation_id"
+        ],
+        "title": "SignalThreadRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_thread"
+    },
+    {
+      "description": "Acknowledge a signal by id (#1709).",
+      "docs": "Pillar 1 (#1709): stamp acknowledged_at on a signal; reports whether this call set it.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_ack`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "SignalAckRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_ack"
     }
   ],
   "toolsVersion": "2026-05-06"

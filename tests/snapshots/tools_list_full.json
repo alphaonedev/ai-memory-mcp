@@ -1546,6 +1546,128 @@
       "name": "memory_lease_get"
     },
     {
+      "description": "Send a typed, optionally",
+      "inputSchema": {
+        "properties": {
+          "body": {},
+          "correlation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_agent": {
+            "type": "string"
+          },
+          "in_reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "reference_ids": {},
+          "signal_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "to_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_agent",
+          "namespace",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_send"
+    },
+    {
+      "description": "Read one signal by id, mark it",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_read"
+    },
+    {
+      "description": "List signals for a",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "to_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_inbox"
+    },
+    {
+      "description": "List a signal correlation",
+      "inputSchema": {
+        "properties": {
+          "correlation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "correlation_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_thread"
+    },
+    {
+      "description": "Acknowledge a signal by id",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_ack"
+    },
+    {
       "description": "Scan",
       "inputSchema": {
         "properties": {

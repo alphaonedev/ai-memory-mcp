@@ -114,6 +114,11 @@ pub mod tool_names {
     pub const MEMORY_SEARCH: &str = "memory_search";
     pub const MEMORY_SESSION_START: &str = "memory_session_start";
     pub const MEMORY_SHARE: &str = "memory_share";
+    pub const MEMORY_SIGNAL_ACK: &str = "memory_signal_ack";
+    pub const MEMORY_SIGNAL_INBOX: &str = "memory_signal_inbox";
+    pub const MEMORY_SIGNAL_READ: &str = "memory_signal_read";
+    pub const MEMORY_SIGNAL_SEND: &str = "memory_signal_send";
+    pub const MEMORY_SIGNAL_THREAD: &str = "memory_signal_thread";
     pub const MEMORY_SKILL_COMPOSITIONAL_CONTEXT: &str = "memory_skill_compositional_context";
     pub const MEMORY_SKILL_EXPORT: &str = "memory_skill_export";
     pub const MEMORY_SKILL_GET: &str = "memory_skill_get";
@@ -213,6 +218,11 @@ pub mod tool_names {
         MEMORY_SEARCH,
         MEMORY_SESSION_START,
         MEMORY_SHARE,
+        MEMORY_SIGNAL_ACK,
+        MEMORY_SIGNAL_INBOX,
+        MEMORY_SIGNAL_READ,
+        MEMORY_SIGNAL_SEND,
+        MEMORY_SIGNAL_THREAD,
         MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
         MEMORY_SKILL_EXPORT,
         MEMORY_SKILL_GET,
@@ -380,6 +390,11 @@ pub mod tool_names {
             assert_eq!(MEMORY_SEARCH, "memory_search");
             assert_eq!(MEMORY_SESSION_START, "memory_session_start");
             assert_eq!(MEMORY_SHARE, "memory_share");
+            assert_eq!(MEMORY_SIGNAL_ACK, "memory_signal_ack");
+            assert_eq!(MEMORY_SIGNAL_INBOX, "memory_signal_inbox");
+            assert_eq!(MEMORY_SIGNAL_READ, "memory_signal_read");
+            assert_eq!(MEMORY_SIGNAL_SEND, "memory_signal_send");
+            assert_eq!(MEMORY_SIGNAL_THREAD, "memory_signal_thread");
             assert_eq!(
                 MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
                 "memory_skill_compositional_context"
@@ -682,6 +697,13 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::action::LeaseRenewTool>(),
         RegisteredTool::of::<crate::mcp::action::LeaseReleaseTool>(),
         RegisteredTool::of::<crate::mcp::action::LeaseGetTool>(),
+        // v0.8.0 Pillar 1 (#1709) — signed-signal coordination surface
+        // (send/read/inbox/thread/ack) over the `crate::signals` substrate.
+        RegisteredTool::of::<crate::mcp::signal::SignalSendTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalReadTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalInboxTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalThreadTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalAckTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
