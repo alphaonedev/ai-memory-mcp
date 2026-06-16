@@ -20,13 +20,13 @@ exercising this repo's binary.
 | TLS | optional | harness | `TLS_MODE=mtls` requires `/etc/ai-memory-a2a/tls/server.pem`; `TLS_MODE=off` is acceptable for harness-only smoke runs (no real-world peer exposure). |
 | identity | `AI_MEMORY_AGENT_ID` env | harness boot | every harness-spawned `ai-memory` process MUST set a unique `AI_MEMORY_AGENT_ID` (see CLAUDE.md §Agent Identity for the resolution ladder). |
 
-## v0.7.0 substrate guarantees the harness can rely on
+## v0.8.0 substrate guarantees the harness can rely on
 
-- 74 MCP tools at `--profile full`; 7 at `--profile core` + always-on
+- 93 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
 - 89 production HTTP routes (75 unique URL paths) registered.
-- Schema v57 (single logical version across sqlite + postgres at v0.7.0
-  release HEAD; see `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
+- Schema v61 (single logical version across sqlite + postgres at
+  v0.8.0-dev HEAD; see `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
   and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).
 - Per-message Ed25519 federation signing (`X-Memory-Sig` header).
 - Per-peer attestation via `x-peer-id` header on every push.
