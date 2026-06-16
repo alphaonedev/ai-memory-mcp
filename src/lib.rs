@@ -42,6 +42,15 @@ pub const MILLIS_PER_SEC: u64 = 1_000;
 /// decimal places via `(score * FACTOR).round() / FACTOR`.
 pub const SCORE_DISPLAY_ROUND_FACTOR: f64 = 1000.0;
 
+/// Default ceiling for reflection recursion depth — the single source of
+/// truth for BOTH the governance-enforced max
+/// ([`models::namespace::GovernancePolicy::effective_max_reflection_depth`])
+/// AND the reflection-aware reranker boost cap
+/// ([`reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP`], a re-export of this).
+/// #1680 — these were previously two independent literal `3`s; hoisted
+/// here so the advertised cap and the governance default can never drift.
+pub const DEFAULT_REFLECTION_MAX_DEPTH_CAP: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner B finding F-B7) — byte-unit
 // consts so substrate-wide size math is grep-able and refactor-safe.

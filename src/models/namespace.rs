@@ -953,7 +953,12 @@ impl GovernancePolicy {
     /// then call this accessor on the result.
     #[must_use]
     pub fn effective_max_reflection_depth(&self) -> u32 {
-        self.core.max_reflection_depth.unwrap_or(3)
+        // #1680 — the governance default and the reranker's advertised cap
+        // share ONE const at the crate root (no more two independent
+        // literal `3`s that could drift).
+        self.core
+            .max_reflection_depth
+            .unwrap_or(crate::DEFAULT_REFLECTION_MAX_DEPTH_CAP)
     }
 
     /// v0.7.0 QW-1 — resolve the file-backed-export policy. Returns

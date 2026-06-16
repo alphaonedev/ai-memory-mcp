@@ -360,13 +360,14 @@ pub const DEFAULT_REFLECTION_BOOST: f32 = 1.2;
 /// observations, so a small per-depth bump is justified.
 pub const DEFAULT_REFLECTION_PER_DEPTH_INCREMENT: f32 = 0.05;
 
-/// v0.7.0 L2-8 — default depth cap mirrored from
-/// [`GovernancePolicy::effective_max_reflection_depth`]. Past this depth
-/// the per-depth multiplier stops growing; reflections deeper than the
-/// cap still receive the cap-evaluated boost (operator policy may refuse
-/// the write entirely, but the reranker side never produces an unbounded
-/// multiplier).
-pub const DEFAULT_REFLECTION_MAX_DEPTH_CAP: u32 = 3;
+// v0.7.0 L2-8 — default depth cap. Past this depth the per-depth
+// multiplier stops growing; reflections deeper than the cap still receive
+// the cap-evaluated boost (operator policy may refuse the write entirely,
+// but the reranker side never produces an unbounded multiplier). #1680 —
+// re-exported from the crate root so this reranker cap and the governance
+// default (`GovernancePolicy::effective_max_reflection_depth`) share ONE
+// definition and can never drift.
+pub use crate::DEFAULT_REFLECTION_MAX_DEPTH_CAP;
 
 /// v0.7.0 L2-8 — configuration for the reflection-aware reranker boost.
 ///
