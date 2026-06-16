@@ -54,12 +54,16 @@ pub const CANONICAL_NAME: &str = crate::models::field_names::CANONICAL_NAME;
 pub const CAPABILITIES: &str = crate::models::field_names::CAPABILITIES;
 pub const CITATIONS: &str = "citations";
 pub const CLAIMED_BY: &str = "claimed_by";
+pub const CONDITION: &str = "condition";
+pub const CONDITION_TYPE: &str = "condition_type";
 pub const CONFIDENCE: &str = crate::models::field_names::CONFIDENCE;
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
 pub const CONTEXT: &str = "context";
 pub const CORRELATION_ID: &str = crate::models::field_names::CORRELATION_ID;
 pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
+pub const CREATED_BY: &str = "created_by";
+pub const DEADLINE_AT: &str = "deadline_at";
 pub const DEPTH: &str = "depth";
 pub const DRY_RUN: &str = "dry_run";
 pub const EDGE_TYPE: &str = "edge_type";
@@ -115,6 +119,9 @@ pub const REFERENCE_IDS: &str = "reference_ids";
 pub const REFLECTION_ID: &str = "reflection_id";
 pub const RELATION: &str = "relation";
 pub const REMEMBER: &str = "remember";
+pub const RESOLUTION: &str = "resolution";
+pub const RESOLUTION_NOTE: &str = "resolution_note";
+pub const RESOLVED_BY: &str = "resolved_by";
 pub const RESOURCE_PATH: &str = "resource_path";
 pub const SCOPE: &str = "scope";
 pub const SECRET: &str = "secret";
@@ -183,11 +190,15 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CAPABILITIES,
     CITATIONS,
     CLAIMED_BY,
+    CONDITION,
+    CONDITION_TYPE,
     CONFIDENCE,
     CONSUMED,
     CONTENT,
     CONTEXT,
     CREATED_AT,
+    CREATED_BY,
+    DEADLINE_AT,
     DEPTH,
     DRY_RUN,
     EDGE_TYPE,
@@ -240,6 +251,9 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     REFLECTION_ID,
     RELATION,
     REMEMBER,
+    RESOLUTION,
+    RESOLUTION_NOTE,
+    RESOLVED_BY,
     RESOURCE_PATH,
     SCOPE,
     SECRET,
@@ -292,7 +306,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            109,
+            116,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

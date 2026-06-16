@@ -61,6 +61,14 @@ pub mod tool_names {
     pub const MEMORY_CAPTURE_TURN: &str = "memory_capture_turn";
     pub const MEMORY_CHECK_AGENT_ACTION: &str = "memory_check_agent_action";
     pub const MEMORY_CHECK_DUPLICATE: &str = "memory_check_duplicate";
+    /// v0.8.0 Pillar 1 (#1709) — create a pending attested checkpoint.
+    pub const MEMORY_CHECKPOINT_CREATE: &str = "memory_checkpoint_create";
+    /// v0.8.0 Pillar 1 (#1709) — query checkpoints by ns/condition/state.
+    pub const MEMORY_CHECKPOINT_QUERY: &str = "memory_checkpoint_query";
+    /// v0.8.0 Pillar 1 (#1709) — resolve a checkpoint (attested).
+    pub const MEMORY_CHECKPOINT_RESOLVE: &str = "memory_checkpoint_resolve";
+    /// v0.8.0 Pillar 1 (#1709) — verify a checkpoint's attested resolution.
+    pub const MEMORY_CHECKPOINT_VERIFY: &str = "memory_checkpoint_verify";
     pub const MEMORY_CONSOLIDATE: &str = "memory_consolidate";
     pub const MEMORY_DELETE: &str = "memory_delete";
     pub const MEMORY_DEPENDENTS_OF_INVALIDATED: &str = "memory_dependents_of_invalidated";
@@ -169,6 +177,10 @@ pub mod tool_names {
         MEMORY_CAPTURE_TURN,
         MEMORY_CHECK_AGENT_ACTION,
         MEMORY_CHECK_DUPLICATE,
+        MEMORY_CHECKPOINT_CREATE,
+        MEMORY_CHECKPOINT_QUERY,
+        MEMORY_CHECKPOINT_RESOLVE,
+        MEMORY_CHECKPOINT_VERIFY,
         MEMORY_CONSOLIDATE,
         MEMORY_DELETE,
         MEMORY_DEPENDENTS_OF_INVALIDATED,
@@ -329,6 +341,10 @@ pub mod tool_names {
             assert_eq!(MEMORY_CAPABILITIES, "memory_capabilities");
             assert_eq!(MEMORY_CHECK_AGENT_ACTION, "memory_check_agent_action");
             assert_eq!(MEMORY_CHECK_DUPLICATE, "memory_check_duplicate");
+            assert_eq!(MEMORY_CHECKPOINT_CREATE, "memory_checkpoint_create");
+            assert_eq!(MEMORY_CHECKPOINT_QUERY, "memory_checkpoint_query");
+            assert_eq!(MEMORY_CHECKPOINT_RESOLVE, "memory_checkpoint_resolve");
+            assert_eq!(MEMORY_CHECKPOINT_VERIFY, "memory_checkpoint_verify");
             assert_eq!(MEMORY_CONSOLIDATE, "memory_consolidate");
             assert_eq!(MEMORY_DELETE, "memory_delete");
             assert_eq!(
@@ -704,6 +720,12 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::signal::SignalInboxTool>(),
         RegisteredTool::of::<crate::mcp::signal::SignalThreadTool>(),
         RegisteredTool::of::<crate::mcp::signal::SignalAckTool>(),
+        // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+        // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointCreateTool>(),
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointResolveTool>(),
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointQueryTool>(),
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointVerifyTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
