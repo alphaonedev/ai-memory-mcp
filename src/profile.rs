@@ -267,6 +267,9 @@ impl Family {
             | tn::MEMORY_ACTION_LIST
             | tn::MEMORY_ACTION_ADD_EDGE
             | tn::MEMORY_ACTION_EDGES
+            // v0.8.0 Pillar 1 (#1709 §11.4) — FRONTIER surface.
+            | tn::MEMORY_ACTION_FRONTIER
+            | tn::MEMORY_ACTION_NEXT
             // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
             // (acquire/renew/release/get) over the action DAG.
             | tn::MEMORY_LEASE_ACQUIRE
@@ -526,6 +529,10 @@ impl Family {
                 tn::MEMORY_ACTION_LIST,
                 tn::MEMORY_ACTION_ADD_EDGE,
                 tn::MEMORY_ACTION_EDGES,
+                // v0.8.0 Pillar 1 (#1709 §11.4) — FRONTIER surface
+                // (ranked unblocked actions + the next action to do).
+                tn::MEMORY_ACTION_FRONTIER,
+                tn::MEMORY_ACTION_NEXT,
                 // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
                 // (acquire/renew/release/get) over the action DAG.
                 tn::MEMORY_LEASE_ACQUIRE,

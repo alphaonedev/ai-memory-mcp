@@ -1539,6 +1539,38 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 §11.4 Pillar-1 FRONTIER — the ranked UNBLOCKED frontier: every
+    /// pending action in `namespace` whose `requires` / `gated_by`
+    /// prerequisites are all `done` and that no still-active `blocks` edge
+    /// holds, ordered `priority DESC, created_at ASC` and capped at `limit`.
+    /// Default `UnsupportedCapability`.
+    async fn action_frontier(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 §11.4 Pillar-1 FRONTIER — the single highest-ranked UNBLOCKED
+    /// action a caller should pick up next (the top of the frontier query).
+    /// When `agent_id` is `Some`, the candidate set is narrowed to actions
+    /// with no owner OR owned by the caller. `Ok(None)` when the frontier is
+    /// empty. Default `UnsupportedCapability`.
+    async fn action_next(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _agent_id: Option<&str>,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
     /// #1709 Pillar 1 — acquire a lease on an action. `Conflict` when a
     /// non-expired lease is held by a DIFFERENT holder; an expired lease (or
     /// the caller's own) is reclaimed. Sets `acquired_at` + `heartbeat_at` to

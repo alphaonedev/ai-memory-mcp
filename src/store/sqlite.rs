@@ -875,6 +875,26 @@ impl MemoryStore for SqliteStore {
         crate::actions::edges_for(&conn, action_id).map_err(box_err)
     }
 
+    async fn action_frontier(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        crate::actions::frontier(&conn, namespace, limit).map_err(box_err)
+    }
+
+    async fn action_next(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        agent_id: Option<&str>,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        crate::actions::next_action(&conn, namespace, agent_id).map_err(box_err)
+    }
+
     async fn lease_acquire(
         &self,
         _ctx: &CallerContext,

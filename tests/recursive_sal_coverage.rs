@@ -457,6 +457,58 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         "no lease after sweep"
     );
 
+    // #1709 §11.4 Pillar-1 FRONTIER — a fresh pending action with no blocking
+    // edges is UNBLOCKED, so it appears in action_frontier and action_next
+    // returns it (both adapters).
+    let fid = format!("sal-cov-frontier-{}", uuid_like());
+    store
+        .action_create(
+            &ctx,
+            &ai_memory::models::Action {
+                id: fid.clone(),
+                namespace: TEST_NS.to_string(),
+                kind: "test.coordinate".to_string(),
+                state: ai_memory::models::ActionState::Pending,
+                title: "sal-cov frontier action".to_string(),
+                payload: serde_json::json!({}),
+                priority: 7,
+                agent_id: None,
+                claimed_by: None,
+                vector_clock: serde_json::json!({}),
+                metadata: serde_json::json!({}),
+                created_at: 1_700_004_000,
+                updated_at: 1_700_004_000,
+            },
+        )
+        .await
+        .expect("action_create frontier ok");
+    let frontier = store
+        .action_frontier(&ctx, TEST_NS, 50)
+        .await
+        .expect("action_frontier ok");
+    assert!(
+        frontier.iter().any(|a| a.id == fid),
+        "the unblocked pending action appears in the frontier"
+    );
+    let next = store
+        .action_next(&ctx, TEST_NS, None)
+        .await
+        .expect("action_next ok")
+        .expect("action_next returns a row when the frontier is non-empty");
+    assert_eq!(
+        next.namespace, TEST_NS,
+        "action_next returns an action in the requested namespace"
+    );
+    // The unowned action is reachable for an arbitrary caller too.
+    let next_owned = store
+        .action_next(&ctx, TEST_NS, Some("sal-cov-some-agent"))
+        .await
+        .expect("action_next owned ok");
+    assert!(
+        next_owned.is_some(),
+        "the unowned action is visible to any caller"
+    );
+
     // #1709 Pillar 1 — signal_send / signal_get / signal_inbox / signal_ack
     // round-trip through the SAL surface on BOTH adapters. The SIGNED path is
     // exercised here: a test keypair signs the signal on send, and the row

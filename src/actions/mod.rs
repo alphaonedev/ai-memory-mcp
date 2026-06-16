@@ -192,6 +192,95 @@ pub fn list(
     Ok(out)
 }
 
+/// The FRONTIER `WHERE`-tail shared by [`frontier`] and [`next_action`]
+/// (#1709 §11.4 Pillar-1 frontier surface). A pending action is UNBLOCKED iff
+/// every `requires` / `gated_by` prerequisite is `done` AND no `blocks` edge
+/// from a still-active blocker targets it. The two `NOT EXISTS` sub-queries
+/// encode that predicate (directionality per the `EdgeType` docs in
+/// `src/models/action.rs`):
+/// - prerequisites/gates: an edge FROM the candidate TO a target that is not
+///   `done` keeps the candidate blocked;
+/// - blockers: a `blocks` edge whose `to_action` is the candidate, from a
+///   blocker that is not yet terminal (`done`/`failed`/`abandoned`), keeps it
+///   blocked.
+///
+/// `?1` is the namespace; the caller appends the ordering + limit binds.
+fn frontier_where_tail() -> String {
+    use crate::models::{ActionState, EdgeType};
+    format!(
+        "a.namespace = ?1 AND a.state = '{pending}' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.to_action \
+             WHERE e.from_action = a.id \
+               AND e.edge_type IN ('{requires}', '{gated_by}') \
+               AND b.state <> '{done}') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.from_action \
+             WHERE e.to_action = a.id AND e.edge_type = '{blocks}' \
+               AND b.state NOT IN ('{done}', '{failed}', '{abandoned}'))",
+        pending = ActionState::Pending.as_str(),
+        requires = EdgeType::Requires.as_str(),
+        gated_by = EdgeType::GatedBy.as_str(),
+        done = ActionState::Done.as_str(),
+        blocks = EdgeType::Blocks.as_str(),
+        failed = ActionState::Failed.as_str(),
+        abandoned = ActionState::Abandoned.as_str(),
+    )
+}
+
+/// #1709 §11.4 — the ranked UNBLOCKED frontier: every pending action in
+/// `namespace` whose prerequisites/gates are all `done` and that no active
+/// blocker holds, ordered `priority DESC, created_at ASC` and capped at
+/// `limit`. This is the FRONTIER query — see [`frontier_where_tail`] for the
+/// exact UNBLOCKED predicate.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+pub fn frontier(conn: &Connection, namespace: &str, limit: usize) -> rusqlite::Result<Vec<Action>> {
+    let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql = format!(
+        "{ACTION_SELECT_SQL} a WHERE {} ORDER BY a.priority DESC, a.created_at ASC LIMIT ?2",
+        frontier_where_tail()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![namespace, lim], row_to_action)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// #1709 §11.4 — the single highest-ranked UNBLOCKED action a caller should
+/// pick up next: the top row of the [`frontier`] query (`LIMIT 1`). When
+/// `agent_id` is `Some`, the candidate set is narrowed to actions with no
+/// owner OR owned by the caller (`agent_id IS NULL OR agent_id = ?agent`) so
+/// each agent only sees work it may claim. `None` when the frontier is empty.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+pub fn next_action(
+    conn: &Connection,
+    namespace: &str,
+    agent_id: Option<&str>,
+) -> rusqlite::Result<Option<Action>> {
+    let mut sql = format!("{ACTION_SELECT_SQL} a WHERE {}", frontier_where_tail());
+    if agent_id.is_some() {
+        sql.push_str(" AND (a.agent_id = ?2 OR a.agent_id IS NULL)");
+    }
+    sql.push_str(" ORDER BY a.priority DESC, a.created_at ASC LIMIT 1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(namespace.to_string())];
+    if let Some(a) = agent_id {
+        binds.push(Box::new(a.to_string()));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_row(
+        rusqlite::params_from_iter(binds.iter().map(|b| &**b)),
+        row_to_action,
+    )
+    .optional()
+}
+
 /// Insert a typed DAG edge between two actions. `INSERT OR IGNORE` so a
 /// duplicate `(from, to, type)` triple is a no-op.
 ///
@@ -473,6 +562,123 @@ mod tests {
         let claimed = list(&conn, None, Some(ActionState::Claimed), 50).unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].id, "l1");
+    }
+
+    #[test]
+    fn frontier_ranks_by_priority_and_respects_dependency_edges() {
+        use crate::models::EdgeType;
+        let conn = fresh();
+        // A (prio 5) + B (prio 9), both pending in the same ns.
+        let mut a = sample("A");
+        a.priority = 5;
+        create(&conn, &a).unwrap();
+        let mut b = sample("B");
+        b.priority = 9;
+        create(&conn, &b).unwrap();
+
+        // Priority order: B (9) before A (5).
+        let f = frontier(&conn, "_act", 50).unwrap();
+        assert_eq!(
+            f.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+            vec!["B", "A"],
+            "frontier ranks by priority DESC"
+        );
+
+        // A requires a still-pending C → A drops off the frontier; B stays.
+        let mut c = sample("C");
+        c.priority = 1;
+        create(&conn, &c).unwrap();
+        add_edge(&conn, "A", "C", EdgeType::Requires, 1_700_000_000).unwrap();
+        let f = frontier(&conn, "_act", 50).unwrap();
+        let ids: Vec<&str> = f.iter().map(|x| x.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"A"),
+            "A is blocked by pending prerequisite C"
+        );
+        assert!(ids.contains(&"B"), "B is unaffected");
+
+        // C reaches Done (via claimed → in_progress → done) → A reappears.
+        transition(&conn, "C", ActionState::Claimed, None, 1_700_000_010).unwrap();
+        transition(&conn, "C", ActionState::InProgress, None, 1_700_000_020).unwrap();
+        transition(&conn, "C", ActionState::Done, None, 1_700_000_030).unwrap();
+        let f = frontier(&conn, "_act", 50).unwrap();
+        let ids: Vec<&str> = f.iter().map(|x| x.id.as_str()).collect();
+        assert!(
+            ids.contains(&"A"),
+            "A reappears once prerequisite C is done"
+        );
+    }
+
+    #[test]
+    fn frontier_honors_active_blocks_edge() {
+        use crate::models::EdgeType;
+        let conn = fresh();
+        // B2 blocks A2 while B2 is active → A2 is not on the frontier.
+        let a2 = sample("A2");
+        create(&conn, &a2).unwrap();
+        let b2 = sample("B2");
+        create(&conn, &b2).unwrap();
+        add_edge(&conn, "B2", "A2", EdgeType::Blocks, 1_700_000_000).unwrap();
+        let ids: Vec<String> = frontier(&conn, "_act", 50)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.id)
+            .collect();
+        assert!(
+            !ids.contains(&"A2".to_string()),
+            "active blocker B2 hides A2"
+        );
+
+        // B2 reaches a terminal state → A2 surfaces.
+        transition(&conn, "B2", ActionState::Claimed, None, 1_700_000_010).unwrap();
+        transition(&conn, "B2", ActionState::InProgress, None, 1_700_000_020).unwrap();
+        transition(&conn, "B2", ActionState::Done, None, 1_700_000_030).unwrap();
+        let ids: Vec<String> = frontier(&conn, "_act", 50)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.id)
+            .collect();
+        assert!(ids.contains(&"A2".to_string()), "terminal blocker frees A2");
+    }
+
+    #[test]
+    fn next_action_returns_top_and_filters_by_agent() {
+        let conn = fresh();
+        // A (prio 5, owned by agent-x) + B (prio 9, owned by agent-y).
+        let mut a = sample("A");
+        a.priority = 5;
+        a.agent_id = Some("agent-x".to_string());
+        create(&conn, &a).unwrap();
+        let mut b = sample("B");
+        b.priority = 9;
+        b.agent_id = Some("agent-y".to_string());
+        create(&conn, &b).unwrap();
+        // An unowned, lower-priority C.
+        let mut c = sample("C");
+        c.priority = 1;
+        c.agent_id = None;
+        create(&conn, &c).unwrap();
+
+        // No agent filter → the top of the frontier (B, prio 9).
+        let top = next_action(&conn, "_act", None)
+            .unwrap()
+            .expect("a next action");
+        assert_eq!(top.id, "B");
+
+        // agent-x sees only its own (A) + the unowned C → A wins on priority.
+        let mine = next_action(&conn, "_act", Some("agent-x"))
+            .unwrap()
+            .expect("agent-x has work");
+        assert_eq!(
+            mine.id, "A",
+            "B is owned by agent-y, so A is the top for agent-x"
+        );
+
+        // An agent with no owned and only the unowned row gets C.
+        let other = next_action(&conn, "_act", Some("agent-z"))
+            .unwrap()
+            .expect("agent-z sees the unowned action");
+        assert_eq!(other.id, "C");
     }
 
     #[test]

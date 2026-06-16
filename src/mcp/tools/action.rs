@@ -221,6 +221,60 @@ pub fn handle_action_edges(conn: &rusqlite::Connection, params: &Value) -> Resul
     }))
 }
 
+/// MCP handler for `memory_action_frontier`. Returns the ranked UNBLOCKED
+/// frontier (#1709 §11.4) for a namespace: pending actions whose
+/// `requires` / `gated_by` prerequisites are all `done` and that no active
+/// `blocks` edge holds, ordered `priority DESC, created_at ASC`, capped at
+/// `limit` (default 20).
+///
+/// # Errors
+/// Returns the stringified `rusqlite` error on query failure.
+pub fn handle_action_frontier(
+    conn: &rusqlite::Connection,
+    params: &Value,
+) -> Result<Value, String> {
+    let namespace = params
+        .get(param_names::NAMESPACE)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let limit = params
+        .get(param_names::LIMIT)
+        .and_then(Value::as_i64)
+        .unwrap_or(20);
+    let limit = usize::try_from(limit).unwrap_or(20);
+    let actions = crate::actions::frontier(conn, namespace, limit).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "actions": serde_json::to_value(&actions).map_err(|e| e.to_string())?,
+    }))
+}
+
+/// MCP handler for `memory_action_next`. Returns the single highest-ranked
+/// UNBLOCKED action a caller should pick up next (#1709 §11.4) — the top of
+/// the frontier query. When `agent_id` is supplied, the candidate set is
+/// narrowed to actions with no owner OR owned by the caller. The `action`
+/// field is `null` when the frontier is empty.
+///
+/// # Errors
+/// Returns the stringified `rusqlite` error on query failure.
+pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let namespace = params
+        .get(param_names::NAMESPACE)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let agent_id = params
+        .get(param_names::AGENT_ID)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let found =
+        crate::actions::next_action(conn, namespace, agent_id).map_err(|e| e.to_string())?;
+    let action = match found {
+        Some(a) => serde_json::to_value(&a).map_err(|e| e.to_string())?,
+        None => Value::Null,
+    };
+    Ok(json!({ "action": action }))
+}
+
 /// MCP handler for `memory_lease_acquire`. Acquires a single-holder lease
 /// on an action via [`crate::actions::lease_acquire`]. The `expires_at`
 /// timestamp is computed internally from `ttl_secs` (default 60) so callers
@@ -417,6 +471,29 @@ pub struct ActionEdgesRequest {
     pub id: String,
 }
 
+/// v0.8.0 Pillar 1 (#1709 §11.4) — request body for `memory_action_frontier`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct ActionFrontierRequest {
+    pub namespace: String,
+
+    /// Max rows to return (default 20).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// v0.8.0 Pillar 1 (#1709 §11.4) — request body for `memory_action_next`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct ActionNextRequest {
+    pub namespace: String,
+
+    /// When set, narrow the candidate set to actions with no owner OR owned
+    /// by this agent.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_acquire`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
@@ -593,6 +670,50 @@ impl McpTool for ActionEdgesTool {
     }
 }
 
+/// v0.8.0 Pillar 1 (#1709 §11.4) — `McpTool` impl for `memory_action_frontier`.
+#[allow(dead_code)]
+pub struct ActionFrontierTool;
+
+impl McpTool for ActionFrontierTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_ACTION_FRONTIER
+    }
+    fn description() -> &'static str {
+        "Rank the UNBLOCKED coordination-action frontier (#1709)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 1 (#1709 §11.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<ActionFrontierRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Power.name()
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709 §11.4) — `McpTool` impl for `memory_action_next`.
+#[allow(dead_code)]
+pub struct ActionNextTool;
+
+impl McpTool for ActionNextTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_ACTION_NEXT
+    }
+    fn description() -> &'static str {
+        "Return the top UNBLOCKED coordination action to do next (#1709)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 1 (#1709 §11.4): the single highest-ranked unblocked action; optionally narrowed to the caller's owned/unowned work."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<ActionNextRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Power.name()
+    }
+}
+
 /// v0.8.0 Pillar 1 (#1709) — `McpTool` impl for `memory_lease_acquire`.
 #[allow(dead_code)]
 pub struct LeaseAcquireTool;
@@ -733,6 +854,22 @@ mod d1_6_1709_tests {
         assert_eq!(ActionEdgesTool::family(), "power");
         assert!(!ActionEdgesTool::description().is_empty());
         assert!(!ActionEdgesTool::docs().is_empty());
+    }
+
+    #[test]
+    fn action_frontier_tool_metadata() {
+        assert_eq!(ActionFrontierTool::name(), "memory_action_frontier");
+        assert_eq!(ActionFrontierTool::family(), "power");
+        assert!(!ActionFrontierTool::description().is_empty());
+        assert!(!ActionFrontierTool::docs().is_empty());
+    }
+
+    #[test]
+    fn action_next_tool_metadata() {
+        assert_eq!(ActionNextTool::name(), "memory_action_next");
+        assert_eq!(ActionNextTool::family(), "power");
+        assert!(!ActionNextTool::description().is_empty());
+        assert!(!ActionNextTool::docs().is_empty());
     }
 
     #[test]
@@ -978,5 +1115,65 @@ mod handler_tests {
             .as_i64()
             .expect("created_at present");
         assert!(created_at > 0);
+    }
+
+    #[test]
+    fn frontier_and_next_over_mcp() {
+        let conn = fresh();
+        // A pending action with no blocking edges is on the frontier; a
+        // second action requiring a still-pending prerequisite is not.
+        let a = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "ready", "priority": 9 }),
+        )
+        .expect("create A ok");
+        let a_id = a[param_names::ID].as_str().expect("id A").to_string();
+
+        let blocked = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "blocked", "priority": 5 }),
+        )
+        .expect("create blocked ok");
+        let blocked_id = blocked[param_names::ID]
+            .as_str()
+            .expect("id blocked")
+            .to_string();
+        let prereq = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "prereq", "priority": 1 }),
+        )
+        .expect("create prereq ok");
+        let prereq_id = prereq[param_names::ID].as_str().expect("id prereq");
+        handle_action_add_edge(
+            &conn,
+            &json!({ "from_action": blocked_id, "to_action": prereq_id, "edge_type": "requires" }),
+        )
+        .expect("add requires edge ok");
+
+        // Frontier finds the ready action, not the blocked one.
+        let f =
+            handle_action_frontier(&conn, &json!({ "namespace": "_act" })).expect("frontier ok");
+        let ids: Vec<&str> = f["actions"]
+            .as_array()
+            .expect("actions array")
+            .iter()
+            .filter_map(|a| a["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&a_id.as_str()),
+            "the ready action is on the frontier"
+        );
+        assert!(
+            !ids.contains(&blocked_id.as_str()),
+            "the blocked action is absent from the frontier"
+        );
+
+        // next returns the top frontier row (A, priority 9).
+        let n = handle_action_next(&conn, &json!({ "namespace": "_act" })).expect("next ok");
+        assert_eq!(n["action"]["id"].as_str(), Some(a_id.as_str()));
+
+        // An empty namespace yields a null next action.
+        let empty = handle_action_next(&conn, &json!({ "namespace": "_empty" })).expect("next ok");
+        assert!(empty["action"].is_null());
     }
 }

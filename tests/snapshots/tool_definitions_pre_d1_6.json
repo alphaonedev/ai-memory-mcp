@@ -3054,6 +3054,61 @@
         "type": "object"
       },
       "name": "memory_routine_list"
+    },
+    {
+      "description": "Rank the UNBLOCKED coordination-action frontier (#1709).",
+      "docs": "Pillar 1 (#1709 \u00a711.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709 \u00a711.4) \u2014 request body for `memory_action_frontier`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "description": "Max rows to return (default 20).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "ActionFrontierRequest",
+        "type": "object"
+      },
+      "name": "memory_action_frontier"
+    },
+    {
+      "description": "Return the top UNBLOCKED coordination action to do next (#1709).",
+      "docs": "Pillar 1 (#1709 \u00a711.4): the single highest-ranked unblocked action; optionally narrowed to the caller's owned/unowned work.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709 \u00a711.4) \u2014 request body for `memory_action_next`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "description": "When set, narrow the candidate set to actions with no owner OR owned by this agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "ActionNextRequest",
+        "type": "object"
+      },
+      "name": "memory_action_next"
     }
   ],
   "toolsVersion": "2026-05-06"

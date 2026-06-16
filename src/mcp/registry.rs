@@ -40,10 +40,14 @@ pub mod tool_names {
     pub const MEMORY_ACTION_CREATE: &str = "memory_action_create";
     /// v0.8.0 Pillar 1 (#1709) — coordination-action DAG edge list.
     pub const MEMORY_ACTION_EDGES: &str = "memory_action_edges";
+    /// v0.8.0 Pillar 1 (#1709 §11.4) — ranked UNBLOCKED action frontier.
+    pub const MEMORY_ACTION_FRONTIER: &str = "memory_action_frontier";
     /// v0.8.0 Pillar 1 (#1709) — coordination-action fetch-by-id.
     pub const MEMORY_ACTION_GET: &str = "memory_action_get";
     /// v0.8.0 Pillar 1 (#1709) — coordination-action query by namespace/state.
     pub const MEMORY_ACTION_LIST: &str = "memory_action_list";
+    /// v0.8.0 Pillar 1 (#1709 §11.4) — the single top UNBLOCKED action to do next.
+    pub const MEMORY_ACTION_NEXT: &str = "memory_action_next";
     /// v0.8.0 Pillar 1 (#1709) — coordination-action state-guarded transition.
     pub const MEMORY_ACTION_TRANSITION: &str = "memory_action_transition";
     pub const MEMORY_AGENT_LIST: &str = "memory_agent_list";
@@ -171,8 +175,10 @@ pub mod tool_names {
         MEMORY_ACTION_ADD_EDGE,
         MEMORY_ACTION_CREATE,
         MEMORY_ACTION_EDGES,
+        MEMORY_ACTION_FRONTIER,
         MEMORY_ACTION_GET,
         MEMORY_ACTION_LIST,
+        MEMORY_ACTION_NEXT,
         MEMORY_ACTION_TRANSITION,
         MEMORY_AGENT_LIST,
         MEMORY_AGENT_REGISTER,
@@ -341,8 +347,10 @@ pub mod tool_names {
             assert_eq!(MEMORY_ACTION_ADD_EDGE, "memory_action_add_edge");
             assert_eq!(MEMORY_ACTION_CREATE, "memory_action_create");
             assert_eq!(MEMORY_ACTION_EDGES, "memory_action_edges");
+            assert_eq!(MEMORY_ACTION_FRONTIER, "memory_action_frontier");
             assert_eq!(MEMORY_ACTION_GET, "memory_action_get");
             assert_eq!(MEMORY_ACTION_LIST, "memory_action_list");
+            assert_eq!(MEMORY_ACTION_NEXT, "memory_action_next");
             assert_eq!(MEMORY_ACTION_TRANSITION, "memory_action_transition");
             assert_eq!(MEMORY_AGENT_LIST, "memory_agent_list");
             assert_eq!(MEMORY_AGENT_REGISTER, "memory_agent_register");
@@ -727,6 +735,10 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::action::ActionListTool>(),
         RegisteredTool::of::<crate::mcp::action::ActionAddEdgeTool>(),
         RegisteredTool::of::<crate::mcp::action::ActionEdgesTool>(),
+        // v0.8.0 Pillar 1 (#1709 §11.4) — the FRONTIER surface: ranked
+        // unblocked actions + the single next action to pick up.
+        RegisteredTool::of::<crate::mcp::action::ActionFrontierTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionNextTool>(),
         // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
         // (acquire/renew/release/get) over the `crate::actions` substrate.
         RegisteredTool::of::<crate::mcp::action::LeaseAcquireTool>(),

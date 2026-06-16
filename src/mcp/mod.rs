@@ -977,9 +977,9 @@ pub fn skill_compositional_context_for_tests(
 use store::handle_store;
 // v0.8.0 Pillar 1 (#1709) — coordination-action create/get handlers.
 use action::{
-    handle_action_add_edge, handle_action_create, handle_action_edges, handle_action_get,
-    handle_action_list, handle_action_transition, handle_lease_acquire, handle_lease_get,
-    handle_lease_release, handle_lease_renew,
+    handle_action_add_edge, handle_action_create, handle_action_edges, handle_action_frontier,
+    handle_action_get, handle_action_list, handle_action_next, handle_action_transition,
+    handle_lease_acquire, handle_lease_get, handle_lease_release, handle_lease_renew,
 };
 // v0.8.0 Pillar 1 (#1709) — signed-signal coordination handlers.
 use signal::{
@@ -1285,6 +1285,16 @@ fn dispatch_memory_action_add_edge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, S
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_edges`.
 fn dispatch_memory_action_edges(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_action_edges(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709 §11.4) — dispatch for `memory_action_frontier`.
+fn dispatch_memory_action_frontier(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_frontier(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709 §11.4) — dispatch for `memory_action_next`.
+fn dispatch_memory_action_next(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_next(ctx.conn, ctx.arguments)
 }
 
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_acquire`.
@@ -2047,6 +2057,12 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
             tool_names::MEMORY_ACTION_EDGES,
             dispatch_memory_action_edges
         ),
+        // v0.8.0 Pillar 1 (#1709 §11.4) — FRONTIER surface.
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_FRONTIER,
+            dispatch_memory_action_frontier
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ACTION_NEXT, dispatch_memory_action_next),
         // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface.
         register_mcp_tool!(
             tool_names::MEMORY_LEASE_ACQUIRE,
