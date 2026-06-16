@@ -365,6 +365,64 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             .any(|e| e.from_action == aid && e.to_action == aid2),
         "edge is visible from the to-node (inbound)"
     );
+
+    // #1709 — lease lifecycle on the action (both adapters).
+    let lease = store
+        .lease_acquire(&ctx, &aid, "holder-A", 1_700_001_000, 1_700_001_060)
+        .await
+        .expect("lease_acquire ok");
+    assert_eq!(lease.holder, "holder-A");
+    assert_eq!(lease.expires_at, 1_700_001_060);
+    // A different holder cannot acquire while the lease is live.
+    let conflict = store
+        .lease_acquire(&ctx, &aid, "holder-B", 1_700_001_001, 1_700_001_061)
+        .await;
+    assert!(conflict.is_err(), "a live lease blocks a different holder");
+    // The holder renews (extends expiry + bumps heartbeat).
+    let renewed = store
+        .lease_renew(&ctx, &aid, "holder-A", 1_700_001_030, 1_700_001_090)
+        .await
+        .expect("lease_renew ok");
+    assert_eq!(renewed.expires_at, 1_700_001_090);
+    assert_eq!(renewed.heartbeat_at, 1_700_001_030);
+    // A non-holder cannot renew.
+    assert!(
+        store
+            .lease_renew(&ctx, &aid, "holder-B", 1_700_001_031, 1_700_001_100)
+            .await
+            .is_err(),
+        "a non-holder renew is rejected"
+    );
+    // get reflects the renewed lease.
+    let got = store
+        .lease_get(&ctx, &aid)
+        .await
+        .expect("lease_get ok")
+        .expect("lease present");
+    assert_eq!(got.holder, "holder-A");
+    assert_eq!(got.expires_at, 1_700_001_090);
+    // Release by the holder; then the lease is gone.
+    assert!(
+        store
+            .lease_release(&ctx, &aid, "holder-A")
+            .await
+            .expect("lease_release ok"),
+        "the held lease is released"
+    );
+    assert!(
+        store
+            .lease_get(&ctx, &aid)
+            .await
+            .expect("lease_get after release ok")
+            .is_none(),
+        "no lease after release"
+    );
+    // After release, a different holder can acquire.
+    let reacquire = store
+        .lease_acquire(&ctx, &aid, "holder-B", 1_700_001_200, 1_700_001_260)
+        .await
+        .expect("re-acquire after release ok");
+    assert_eq!(reacquire.holder, "holder-B");
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

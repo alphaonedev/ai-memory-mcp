@@ -164,6 +164,18 @@ pub struct ActionEdge {
     pub created_at: i64,
 }
 
+/// A lease on a coordination action (the v59 `leases` table) — single-holder
+/// (PK on `action_id`), heartbeat-renewed, and swept on expiry. A lease whose
+/// `expires_at <= now` is reclaimable by any holder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lease {
+    pub action_id: String,
+    pub holder: String,
+    pub acquired_at: i64,
+    pub expires_at: i64,
+    pub heartbeat_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -87,6 +87,23 @@ fn sqlite_row_to_action(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models
     })
 }
 
+/// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical column order for
+/// [`sqlite_row_to_lease`]). Shared by every lease read.
+const LEASE_SELECT_BY_ID_SQL: &str = "SELECT action_id, holder, acquired_at, expires_at, heartbeat_at \
+     FROM leases WHERE action_id = ?1";
+
+/// Map a `rusqlite` row (the [`LEASE_SELECT_BY_ID_SQL`] column order) to a
+/// [`crate::models::Lease`].
+fn sqlite_row_to_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Lease> {
+    Ok(crate::models::Lease {
+        action_id: r.get(0)?,
+        holder: r.get(1)?,
+        acquired_at: r.get(2)?,
+        expires_at: r.get(3)?,
+        heartbeat_at: r.get(4)?,
+    })
+}
+
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
     fn capabilities(&self) -> Capabilities {
@@ -993,6 +1010,107 @@ impl MemoryStore for SqliteStore {
             out.push(r.map_err(box_err)?);
         }
         Ok(out)
+    }
+
+    async fn lease_acquire(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let conn = self.state.lock().await;
+        // A non-expired lease held by a different holder blocks acquisition.
+        let existing: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT holder, expires_at FROM leases WHERE action_id = ?1",
+                rusqlite::params![action_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(box_err)?;
+        if let Some((h, exp)) = existing
+            && exp > now
+            && h != holder
+        {
+            return Err(StoreError::Conflict {
+                id: action_id.to_string(),
+            });
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO leases \
+                (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+             VALUES (?1, ?2, ?3, ?4, ?3)",
+            rusqlite::params![action_id, holder, now, expires_at],
+        )
+        .map_err(box_err)?;
+        conn.query_row(
+            LEASE_SELECT_BY_ID_SQL,
+            rusqlite::params![action_id],
+            sqlite_row_to_lease,
+        )
+        .map_err(box_err)
+    }
+
+    async fn lease_renew(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let conn = self.state.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE leases SET expires_at = ?1, heartbeat_at = ?2 \
+                  WHERE action_id = ?3 AND holder = ?4",
+                rusqlite::params![expires_at, now, action_id, holder],
+            )
+            .map_err(box_err)?;
+        if n == 0 {
+            return Err(StoreError::NotFound {
+                id: action_id.to_string(),
+            });
+        }
+        conn.query_row(
+            LEASE_SELECT_BY_ID_SQL,
+            rusqlite::params![action_id],
+            sqlite_row_to_lease,
+        )
+        .map_err(box_err)
+    }
+
+    async fn lease_release(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM leases WHERE action_id = ?1 AND holder = ?2",
+                rusqlite::params![action_id, holder],
+            )
+            .map_err(box_err)?;
+        Ok(n > 0)
+    }
+
+    async fn lease_get(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Option<crate::models::Lease>> {
+        let conn = self.state.lock().await;
+        conn.query_row(
+            LEASE_SELECT_BY_ID_SQL,
+            rusqlite::params![action_id],
+            sqlite_row_to_lease,
+        )
+        .optional()
+        .map_err(box_err)
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {

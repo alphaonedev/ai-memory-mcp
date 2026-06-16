@@ -1532,6 +1532,65 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 Pillar 1 — acquire a lease on an action. `Conflict` when a
+    /// non-expired lease is held by a DIFFERENT holder; an expired lease (or
+    /// the caller's own) is reclaimed. Sets `acquired_at` + `heartbeat_at` to
+    /// `now`; `expires_at` is the caller-computed deadline. Default
+    /// `UnsupportedCapability`.
+    async fn lease_acquire(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+        _holder: &str,
+        _now: i64,
+        _expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — renew a lease the caller holds (extend `expires_at`,
+    /// bump `heartbeat_at` to `now`). `NotFound` when no lease held by
+    /// `holder` exists. Default `UnsupportedCapability`.
+    async fn lease_renew(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+        _holder: &str,
+        _now: i64,
+        _expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — release a lease held by `holder`. Returns `true` when
+    /// a row was removed. Default `UnsupportedCapability`.
+    async fn lease_release(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+        _holder: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — the current lease on an action, if any. Default
+    /// `UnsupportedCapability`.
+    async fn lease_get(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+    ) -> StoreResult<Option<crate::models::Lease>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///
