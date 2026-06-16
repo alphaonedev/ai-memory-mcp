@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 61).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 62).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -603,7 +603,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 61;
+const CURRENT_SCHEMA_VERSION: i64 = 62;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1094,6 +1094,10 @@ const MIGRATION_V60_SQLITE: &str =
 // (`checkpoints`). Additive CREATE TABLE/INDEX IF NOT EXISTS — replay-safe.
 const MIGRATION_V61_SQLITE: &str =
     include_str!("../../migrations/sqlite/0051_v61_attested_checkpoints.sql");
+// v0.8.0 Pillar 1 (#1709) — routines storage foundation tables
+// (`routines` / `routine_runs`). Additive CREATE TABLE/INDEX IF NOT
+// EXISTS — replay-safe.
+const MIGRATION_V62_SQLITE: &str = include_str!("../../migrations/sqlite/0052_v62_routines.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2573,6 +2577,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // coordination gates with Ed25519-attested resolution). Pure
             // `CREATE TABLE/INDEX IF NOT EXISTS` — replay-safe.
             conn.execute_batch(MIGRATION_V61_SQLITE)?;
+        }
+
+        if version < 62 {
+            // v0.8.0 Pillar 1 (#1709) — routines storage foundation:
+            // additive `routines` / `routine_runs` tables (parameterised
+            // action+edge templates + their per-argument-binding
+            // materialisations). Pure `CREATE TABLE/INDEX IF NOT EXISTS`
+            // — replay-safe.
+            conn.execute_batch(MIGRATION_V62_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
