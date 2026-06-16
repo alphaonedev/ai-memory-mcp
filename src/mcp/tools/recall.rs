@@ -275,66 +275,6 @@ pub async fn handle_recall_with_pre_recall_hook(
     )
 }
 
-/// v0.7.0 Gap 7 (#890) — Tier-3 recall-row decoration.
-///
-/// Serialise a `(Memory, score)` pair into the JSON shape the recall
-/// response surfaces. When `verbose_provenance` is true (the default
-/// since v0.7.0), the row carries the full provenance audit trail —
-/// derived `confidence_tier`, derived `freshness_state`, and the
-/// `latest_link_attest_level` lookup over `memory_links`. Plain serde
-/// already round-trips the substrate-side columns (`confidence`,
-/// `source`, `source_uri`, `access_count`, `last_accessed_at`), so
-/// the additional decoration is the *derived* half.
-///
-/// Token-budget contract: the verbose decoration adds at most ~120
-/// bytes per row (3 short snake_case keys + 3 short snake_case
-/// values). The token-budget guards (`tests/token_budget_guard.rs`)
-/// pin the catalog totals; the per-row decoration grows with `count`
-/// not catalog size, so the guards remain accurate.
-///
-/// v0.7.x (#1155) — exposed as `pub(crate)` so the HTTP recall handler
-/// at `src/handlers/recall.rs` can apply the same verbose-decoration
-/// shape under operator opt-in via the `Accept-Provenance: verbose`
-/// HTTP header. MCP wire default is `verbose_provenance=true`
-/// (set inline at `handle_recall_dto`); HTTP default is
-/// `verbose_provenance=false` for v0.6.x wire-shape backwards compat
-/// (consumers opt in via header).
-pub(crate) fn decorate_memory(
-    mem: &Memory,
-    score: f64,
-    verbose_provenance: bool,
-    conn: &rusqlite::Connection,
-) -> Value {
-    let mut val = serde_json::to_value(mem).unwrap_or_default();
-    let Some(obj) = val.as_object_mut() else {
-        return val;
-    };
-    obj.insert(
-        "score".to_string(),
-        json!(
-            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round() / crate::SCORE_DISPLAY_ROUND_FACTOR
-        ),
-    );
-    if !verbose_provenance {
-        return val;
-    }
-    // Gap 7 (#890) — derived confidence tier (Gap 4 enum).
-    obj.insert(
-        "confidence_tier".to_string(),
-        json!(mem.confidence_tier().as_str()),
-    );
-    // Gap 7 — derived freshness_state from expires_at + last_accessed_at.
-    obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
-    // Gap 7 — latest link attest level. Best-effort: a SQL error here
-    // collapses to None so a corrupt links row doesn't break the
-    // recall response.
-    let latest_attest = latest_link_attest_level(conn, &mem.id);
-    if let Some(level) = latest_attest {
-        obj.insert("latest_link_attest_level".to_string(), json!(level));
-    }
-    val
-}
-
 /// v0.7.0 Gap 7 (#890) — derive a coarse freshness state from
 /// substrate-side timestamps.
 ///
@@ -371,34 +311,6 @@ pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
     }
 }
 
-/// v0.7.0 Gap 7 (#890) — return the strongest attestation level
-/// across every link incident on `memory_id`. `peer_attested >
-/// self_signed > unsigned`. Returns `None` when no links exist.
-/// Best-effort: a SQL error returns `None` so the recall row keeps
-/// its remaining decoration.
-pub(crate) fn latest_link_attest_level(
-    conn: &rusqlite::Connection,
-    memory_id: &str,
-) -> Option<String> {
-    let links = db::get_links(conn, memory_id).ok()?;
-    let mut best: Option<AttestLevel> = None;
-    for link in &links {
-        let Some(level_str) = link.attest_level.as_deref() else {
-            continue;
-        };
-        let Some(level) = AttestLevel::from_str(level_str) else {
-            continue;
-        };
-        let candidate_rank = attest_rank(level);
-        match best {
-            None => best = Some(level),
-            Some(curr) if candidate_rank > attest_rank(curr) => best = Some(level),
-            _ => {}
-        }
-    }
-    best.map(|l| l.as_str().to_string())
-}
-
 const fn attest_rank(level: AttestLevel) -> u8 {
     // v0.7.0 #1430 fix: new SignedByPeer (L4 capture_turn) + DaemonSigned
     // (governance audit) variants ranked alongside the original 3.
@@ -423,9 +335,11 @@ const fn attest_rank(level: AttestLevel) -> u8 {
 
 /// FX-4 / PERF-2 (2026-05-26) — batched lookup of the strongest
 /// attestation level across every link incident on each `memory_id`
-/// in `ids`. Replaces the per-row [`latest_link_attest_level`] call
-/// that the HTTP recall handler used to issue under the DB mutex
-/// (one round-trip per row × N rows = N round-trips under the lock).
+/// in `ids`. v0.8.0 #1709 §2.5 T0 — this is now the SOLE attestation
+/// decoration path; the per-row `latest_link_attest_level` lookup it
+/// replaced (one round-trip per row × N rows = N round-trips under
+/// the lock) was removed once the MCP recall path joined the HTTP
+/// path on the batched decorator.
 /// One `IN(...)` SQL emit covers the batch; the map is keyed by
 /// `memory_id` and only entries with a non-`None` level land in it.
 /// Best-effort: a SQL error returns an empty map so the recall
@@ -517,20 +431,21 @@ pub(crate) fn latest_link_attest_level_many(
     out
 }
 
-/// FX-4 / PERF-2 (2026-05-26) — batched front-end for
-/// [`decorate_memory`] used by the HTTP recall handler. Resolves
-/// the verbose-decoration link-attestation lookup for every memory
-/// in one SQL round-trip via [`latest_link_attest_level_many`]
-/// instead of N round-trips. Returns one `Value` per `(mem, score)`
-/// in input order so the caller can splice it straight into the
-/// response payload.
+/// FX-4 / PERF-2 (2026-05-26) — batched recall-row decorator used by
+/// both the HTTP recall handler and (v0.8.0 #1709 §2.5 T0) the MCP
+/// recall path. Resolves the verbose-decoration link-attestation
+/// lookup for every memory in one SQL round-trip via
+/// [`latest_link_attest_level_many`] instead of N round-trips.
+/// Returns one `Value` per `(mem, score)` in input order so the
+/// caller can splice it straight into the response payload.
 ///
-/// Per-row pure fields (`confidence_tier`, `freshness_state`, the
-/// serialised `Memory` body, and the rounded `score`) match the
-/// shape that [`decorate_memory`] produces — the only structural
-/// difference is that the attestation lookup is amortised across
-/// the batch. The verbose-OFF path is identical to the legacy
-/// per-row shape (no DB queries) and is short-circuited here.
+/// Per-row fields (`confidence_tier`, `freshness_state`, the
+/// serialised `Memory` body, the rounded `score`, and — under
+/// verbose — `latest_link_attest_level`) are byte-identical to the
+/// legacy per-row decorator this replaced; the only structural
+/// difference is that the attestation lookup is amortised across the
+/// batch. The verbose-OFF path emits the bare serde body + rounded
+/// `score` (no DB queries) and is short-circuited here.
 pub fn decorate_memory_many(
     rows: &[(Memory, f64)],
     verbose_provenance: bool,
@@ -767,10 +682,20 @@ pub fn handle_recall_dto(
     // the derived fields the substrate computes here.
     let scored_memories =
         |results: Vec<(Memory, f64)>, conn: &rusqlite::Connection| -> Vec<Value> {
-            results
-                .into_iter()
-                .map(|(mem, score)| decorate_memory(&mem, score, verbose_provenance, conn))
-                .collect()
+            // v0.8.0 #1709 §2.5 T0 — route the MCP recall path through the
+            // batched decorator. The pre-T0 per-row `decorate_memory` loop
+            // issued one `latest_link_attest_level` (→ `get_links`) query
+            // PER row under verbose provenance — O(K) DB round-trips over
+            // the top-K. `decorate_memory_many` does a single
+            // `latest_link_attest_level_many` IN(...) prefetch over the
+            // whole batch and decorates each row identically (same per-row
+            // JSON: score + confidence_tier + freshness_state +
+            // latest_link_attest_level under verbose; bare score otherwise),
+            // so the output Vec stays byte-identical while collapsing K
+            // attestation queries into one. The top-K is already a
+            // materialised `Vec<(Memory, f64)>` (bounded to the limit), so
+            // we pass it by reference with no extra allocation.
+            decorate_memory_many(&results, verbose_provenance, conn)
         };
 
     // v0.7.0 Gap 4 (#887) — filter `(Memory, f64)` candidates by the
