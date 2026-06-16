@@ -7419,6 +7419,58 @@ fn pg_row_to_lease(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Leas
     })
 }
 
+/// #1709 Pillar 1 — `signals` by-id SELECT (canonical column order matching
+/// [`pg_row_to_signal`]). One definition shared by the by-id reads.
+const PG_SIGNAL_SELECT_BY_ID: &str = "SELECT id, namespace, from_agent, to_agent, subject, body, signal_type, in_reply_to, \
+     correlation_id, reference_ids, created_at, expires_at, delivered_at, read_at, \
+     acknowledged_at, signature, sender_pubkey FROM signals WHERE id = $1";
+
+/// Map a postgres row (the signal column order) to a [`crate::models::Signal`].
+/// JSON columns (`body`, `reference_ids`) are TEXT (parity with sqlite); the
+/// Ed25519 `signature` / `sender_pubkey` columns are BYTEA → `Vec<u8>`; epoch
+/// columns are BIGINT → `i64` / `Option<i64>`. Shared by `signal_get` /
+/// `signal_inbox` / `signal_thread`.
+fn pg_row_to_signal(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Signal> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let signal_type: String = r
+        .try_get("signal_type")
+        .map_err(|e| g("signal.signal_type", e))?;
+    let body: String = r.try_get("body").map_err(|e| g("signal.body", e))?;
+    let reference_ids: String = r
+        .try_get("reference_ids")
+        .map_err(|e| g("signal.reference_ids", e))?;
+    Ok(crate::models::Signal {
+        id: r.try_get("id").map_err(|e| g("signal.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("signal.namespace", e))?,
+        from_agent: r
+            .try_get("from_agent")
+            .map_err(|e| g("signal.from_agent", e))?,
+        to_agent: r.try_get("to_agent").ok(),
+        subject: r.try_get("subject").map_err(|e| g("signal.subject", e))?,
+        body: serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        signal_type: crate::models::SignalType::from_str(&signal_type).unwrap_or_default(),
+        in_reply_to: r.try_get("in_reply_to").ok(),
+        correlation_id: r.try_get(crate::models::field_names::CORRELATION_ID).ok(),
+        reference_ids: serde_json::from_str(&reference_ids).unwrap_or(serde_json::Value::Null),
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("signal.created_at", e))?,
+        expires_at: r.try_get("expires_at").ok(),
+        delivered_at: r.try_get("delivered_at").ok(),
+        read_at: r.try_get("read_at").ok(),
+        acknowledged_at: r.try_get("acknowledged_at").ok(),
+        signature: r
+            .try_get("signature")
+            .map_err(|e| g("signal.signature", e))?,
+        sender_pubkey: r
+            .try_get("sender_pubkey")
+            .map_err(|e| g("signal.sender_pubkey", e))?,
+    })
+}
+
 /// ARCH-1 — Postgres-side adapter for the substrate
 /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
 ///
@@ -12336,6 +12388,118 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("lease_sweep_expired", e))?;
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+    }
+
+    async fn signal_send(
+        &self,
+        _ctx: &CallerContext,
+        signal: &crate::models::Signal,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns (body, reference_ids) stored as TEXT
+        // (parity with sqlite); signature/sender_pubkey are BYTEA. No Ed25519
+        // signing yet — the byte vectors are persisted verbatim.
+        sqlx::query(
+            "INSERT INTO signals \
+                (id, namespace, from_agent, to_agent, subject, body, signal_type, \
+                 in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
+                 delivered_at, read_at, acknowledged_at, signature, sender_pubkey) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+        )
+        .bind(&signal.id)
+        .bind(&signal.namespace)
+        .bind(&signal.from_agent)
+        .bind(&signal.to_agent)
+        .bind(&signal.subject)
+        .bind(signal.body.to_string())
+        .bind(signal.signal_type.as_str())
+        .bind(&signal.in_reply_to)
+        .bind(&signal.correlation_id)
+        .bind(signal.reference_ids.to_string())
+        .bind(signal.created_at)
+        .bind(signal.expires_at)
+        .bind(signal.delivered_at)
+        .bind(signal.read_at)
+        .bind(signal.acknowledged_at)
+        .bind(&signal.signature)
+        .bind(&signal.sender_pubkey)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("signal_send", e))?;
+        Ok(signal.id.clone())
+    }
+
+    async fn signal_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Signal>> {
+        sqlx::query(PG_SIGNAL_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("signal_get", e))?
+            .as_ref()
+            .map(pg_row_to_signal)
+            .transpose()
+    }
+
+    async fn signal_inbox(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_agent: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, from_agent, to_agent, subject, body, signal_type, \
+                    in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
+                    delivered_at, read_at, acknowledged_at, signature, sender_pubkey \
+               FROM signals WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(agent) = to_agent {
+            qb.push(" AND (to_agent = ")
+                .push_bind(agent.to_string())
+                .push(" OR to_agent IS NULL)");
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(" ORDER BY created_at DESC LIMIT ").push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("signal_inbox", e))?;
+        rows.iter().map(pg_row_to_signal).collect()
+    }
+
+    async fn signal_thread(
+        &self,
+        _ctx: &CallerContext,
+        correlation_id: &str,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let rows = sqlx::query(
+            "SELECT id, namespace, from_agent, to_agent, subject, body, signal_type, \
+                    in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
+                    delivered_at, read_at, acknowledged_at, signature, sender_pubkey \
+               FROM signals WHERE correlation_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(correlation_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("signal_thread", e))?;
+        rows.iter().map(pg_row_to_signal).collect()
+    }
+
+    async fn signal_ack(&self, _ctx: &CallerContext, id: &str, now: i64) -> StoreResult<bool> {
+        let res = sqlx::query(
+            "UPDATE signals SET acknowledged_at = $1 WHERE id = $2 AND acknowledged_at IS NULL",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("signal_ack", e))?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {

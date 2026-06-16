@@ -1602,6 +1602,69 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 Pillar 1 — send a signed signal (the v60 `signals` table).
+    /// Returns the signal id. No Ed25519 signing happens here yet:
+    /// `signal.signature` / `signal.sender_pubkey` are persisted verbatim as
+    /// caller-provided byte vectors. Default `UnsupportedCapability`.
+    async fn signal_send(
+        &self,
+        _ctx: &CallerContext,
+        _signal: &crate::models::Signal,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a signal by id. `Ok(None)` when the signal does
+    /// not exist. Default `UnsupportedCapability`.
+    async fn signal_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Signal>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — a namespace inbox, newest-first, capped at `limit`.
+    /// When `to_agent` is `Some`, returns both direct messages and broadcasts
+    /// (`to_agent IS NULL`); when `None`, returns every signal in the
+    /// namespace. Default `UnsupportedCapability`.
+    async fn signal_inbox(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _to_agent: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — every signal sharing `correlation_id`, oldest-first
+    /// (thread order). Default `UnsupportedCapability`.
+    async fn signal_thread(
+        &self,
+        _ctx: &CallerContext,
+        _correlation_id: &str,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — stamp `acknowledged_at` on a signal once. Returns
+    /// `true` when this call set the timestamp, `false` when it was already
+    /// acknowledged (or no row matched). Default `UnsupportedCapability`.
+    async fn signal_ack(&self, _ctx: &CallerContext, _id: &str, _now: i64) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///
