@@ -930,3 +930,46 @@ LANGUAGE SQL STABLE PARALLEL SAFE AS $$
     FROM walk
     WHERE depth >= 1
 $$;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — distributed coordination substrate foundation.
+-- actions (state machine) + action_edges (typed dependency DAG) + leases
+-- (lease/heartbeat). Mirrors migrations/sqlite/0049_v59_action_substrate.sql.
+-- Fresh schemas carry these inline; existing schemas pick them up via
+-- migrate_v59().
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS actions (
+    id           TEXT        NOT NULL PRIMARY KEY,
+    namespace    TEXT        NOT NULL,
+    kind         TEXT        NOT NULL,
+    state        TEXT        NOT NULL DEFAULT 'pending',
+    title        TEXT        NOT NULL DEFAULT '',
+    payload      TEXT        NOT NULL DEFAULT '{}',
+    priority     BIGINT      NOT NULL DEFAULT 5,
+    agent_id     TEXT,
+    claimed_by   TEXT,
+    vector_clock TEXT        NOT NULL DEFAULT '{}',
+    metadata     TEXT        NOT NULL DEFAULT '{}',
+    created_at   BIGINT      NOT NULL,
+    updated_at   BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_actions_ns_state ON actions(namespace, state);
+CREATE INDEX IF NOT EXISTS idx_actions_state_priority ON actions(state, priority DESC);
+
+CREATE TABLE IF NOT EXISTS action_edges (
+    from_action TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+    to_action   TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+    edge_type   TEXT   NOT NULL,
+    created_at  BIGINT NOT NULL,
+    PRIMARY KEY (from_action, to_action, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_action_edges_to ON action_edges(to_action);
+
+CREATE TABLE IF NOT EXISTS leases (
+    action_id    TEXT   NOT NULL PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,
+    holder       TEXT   NOT NULL,
+    acquired_at  BIGINT NOT NULL,
+    expires_at   BIGINT NOT NULL,
+    heartbeat_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at);
