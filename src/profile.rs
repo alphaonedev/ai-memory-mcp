@@ -262,7 +262,11 @@ impl Family {
             // Operator/substrate surface over the action DAG; lives in
             // Power alongside the other write-side substrate tools.
             | tn::MEMORY_ACTION_CREATE
-            | tn::MEMORY_ACTION_GET => Some(Self::Power),
+            | tn::MEMORY_ACTION_GET
+            | tn::MEMORY_ACTION_TRANSITION
+            | tn::MEMORY_ACTION_LIST
+            | tn::MEMORY_ACTION_ADD_EDGE
+            | tn::MEMORY_ACTION_EDGES => Some(Self::Power),
             // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
             // memory_recall_observations).
             tn::MEMORY_CAPABILITIES
@@ -487,10 +491,15 @@ impl Family {
                 // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-
                 // level point-to-point copy into `_shared/<from>→<to>/`.
                 tn::MEMORY_SHARE,
-                // v0.8.0 Pillar 1 (#1709) — coordination-action create/get
-                // over the `crate::actions` substrate.
+                // v0.8.0 Pillar 1 (#1709) — coordination-action DAG surface
+                // (create/get + transition/list/add_edge/edges) over the
+                // `crate::actions` substrate.
                 tn::MEMORY_ACTION_CREATE,
                 tn::MEMORY_ACTION_GET,
+                tn::MEMORY_ACTION_TRANSITION,
+                tn::MEMORY_ACTION_LIST,
+                tn::MEMORY_ACTION_ADD_EDGE,
+                tn::MEMORY_ACTION_EDGES,
             ],
             Self::Meta => &[
                 tn::MEMORY_CAPABILITIES,

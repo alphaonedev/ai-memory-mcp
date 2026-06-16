@@ -796,6 +796,97 @@
       "name": "memory_action_get"
     },
     {
+      "description": "State-guarded transition of a",
+      "inputSchema": {
+        "properties": {
+          "claimed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "to"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_transition"
+    },
+    {
+      "description": "List coordination actions by",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_action_list"
+    },
+    {
+      "description": "Add a typed DAG edge between",
+      "inputSchema": {
+        "properties": {
+          "edge_type": {
+            "type": "string"
+          },
+          "from_action": {
+            "type": "string"
+          },
+          "to_action": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "edge_type",
+          "from_action",
+          "to_action"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_add_edge"
+    },
+    {
+      "description": "List DAG edges for a",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_edges"
+    },
+    {
       "description": "Scan",
       "inputSchema": {
         "properties": {

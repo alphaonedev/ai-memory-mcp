@@ -172,7 +172,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // degraded-aware capabilities posture (#1594), and the
     // chunk-fault → per-row backfill fallback (#1595) landed the file
     // at 14_379. 14_450 = 14_379 + 71 headroom.
-    ("src/mcp/mod.rs", 14_450),
+    // 2026-06-16 (#1709 Pillar 1) — bumped 14_450 → 14_550: the 4 new
+    // coordination-action MCP tools (transition/list/add_edge/edges)
+    // added their dispatch wrappers + table arms + the expanded
+    // `use action::{…}` import, landing the file at 14_481.
+    ("src/mcp/mod.rs", 14_550),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
