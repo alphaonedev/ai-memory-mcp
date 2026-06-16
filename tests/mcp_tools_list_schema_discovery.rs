@@ -49,10 +49,11 @@ use serde_json::Value;
 // `default: null`, `$schema`, `title`, request-struct `description`). Ceilings
 // raised: 5K → 11K trimmed, 10K → 17K verbose. Aligned with
 // `tests/token_budget_guard.rs` and `tests/c2_tool_docs_field.rs`.
-// v0.8.0 #1709: verbose ceiling 17K → 18K → 20K across the Pillar-1
-// memory_action_* + memory_lease_* tool waves (84-tool catalog ~18.2K).
+// v0.8.0 #1709: verbose ceiling 17K → 18K → 20K → 22K across the Pillar-1
+// memory_action_* + memory_lease_* + memory_routine_* tool waves
+// (98-tool catalog ~20.6K).
 const TRIMMED_TOKEN_CEILING: usize = 11_000;
-const VERBOSE_TOKEN_CEILING: usize = 20_000;
+const VERBOSE_TOKEN_CEILING: usize = 22_000;
 
 /// v0.7.0 #1058 (Agent-4 F4) — regression pin: the trimmed wire form
 /// must not carry `default: null` keys on optional property fields.

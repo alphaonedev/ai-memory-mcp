@@ -181,7 +181,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (send/read/inbox/thread/ack) added the `#[path]` mod decl, the
     // `use signal::{…}` import, 5 dispatch wrappers, and 5 dispatch-table
     // arms, landing the file at 14_560. 14_620 = 14_560 + 60 headroom.
-    ("src/mcp/mod.rs", 14_620),
+    // 2026-06-16 — bumped 14_620 → 14_720 by the v0.8.0 #1709 Pillar-1
+    // routine surface: the `#[path] mod routine;` decl, `use routine::{…}`
+    // import, 5 `memory_routine_*` dispatch wrappers, and 5 dispatch-table
+    // arms, landing the file at 14_664. 14_720 = 14_664 + ~56 headroom.
+    ("src/mcp/mod.rs", 14_720),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —

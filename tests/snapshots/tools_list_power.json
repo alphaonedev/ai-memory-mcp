@@ -1219,6 +1219,109 @@
       "name": "memory_checkpoint_verify"
     },
     {
+      "description": "Create a draft routine — a",
+      "inputSchema": {
+        "properties": {
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "parameters": {},
+          "template": {}
+        },
+        "required": [
+          "name",
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_create"
+    },
+    {
+      "description": "Freeze a routine (draft ->",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_freeze"
+    },
+    {
+      "description": "Run a frozen routine —",
+      "inputSchema": {
+        "properties": {
+          "arguments": {},
+          "routine_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arguments",
+          "routine_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_run"
+    },
+    {
+      "description": "Fetch a routine run by id, with",
+      "inputSchema": {
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_status"
+    },
+    {
+      "description": "List a namespace's routines by",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_list"
+    },
+    {
       "description": "Scan",
       "inputSchema": {
         "properties": {

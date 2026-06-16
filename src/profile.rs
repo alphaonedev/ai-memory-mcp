@@ -285,7 +285,14 @@ impl Family {
             | tn::MEMORY_CHECKPOINT_CREATE
             | tn::MEMORY_CHECKPOINT_RESOLVE
             | tn::MEMORY_CHECKPOINT_QUERY
-            | tn::MEMORY_CHECKPOINT_VERIFY => Some(Self::Power),
+            | tn::MEMORY_CHECKPOINT_VERIFY
+            // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+            // (create/freeze/run/status/list) over the `crate::routines` substrate.
+            | tn::MEMORY_ROUTINE_CREATE
+            | tn::MEMORY_ROUTINE_FREEZE
+            | tn::MEMORY_ROUTINE_RUN
+            | tn::MEMORY_ROUTINE_STATUS
+            | tn::MEMORY_ROUTINE_LIST => Some(Self::Power),
             // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
             // memory_recall_observations).
             tn::MEMORY_CAPABILITIES
@@ -538,6 +545,14 @@ impl Family {
                 tn::MEMORY_CHECKPOINT_RESOLVE,
                 tn::MEMORY_CHECKPOINT_QUERY,
                 tn::MEMORY_CHECKPOINT_VERIFY,
+                // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+                // (create/freeze/run/status/list) over the
+                // `crate::routines` parameterised-template substrate.
+                tn::MEMORY_ROUTINE_CREATE,
+                tn::MEMORY_ROUTINE_FREEZE,
+                tn::MEMORY_ROUTINE_RUN,
+                tn::MEMORY_ROUTINE_STATUS,
+                tn::MEMORY_ROUTINE_LIST,
             ],
             Self::Meta => &[
                 tn::MEMORY_CAPABILITIES,

@@ -2915,6 +2915,145 @@
         "type": "object"
       },
       "name": "memory_checkpoint_verify"
+    },
+    {
+      "description": "Create a draft routine \u2014 a parameterised action+edge template (#1709).",
+      "docs": "Pillar 1 (#1709): create a routine in the draft state from a JSON template with `{{parameter}}` placeholders; freeze it before it can be run.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_create`.",
+        "properties": {
+          "created_by": {
+            "default": null,
+            "description": "Agent id that created the routine.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "default": null,
+            "description": "Arbitrary JSON metadata. Defaults to `{}`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "parameters": {
+            "default": null,
+            "description": "JSON array of declared parameter names. Defaults to `[]`."
+          },
+          "template": {
+            "default": null,
+            "description": "JSON action+edge declarations carrying `{{parameter}}` placeholders. Defaults to `{}`."
+          }
+        },
+        "required": [
+          "name",
+          "namespace"
+        ],
+        "title": "RoutineCreateRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_create"
+    },
+    {
+      "description": "Freeze a routine (draft -> frozen), Ed25519-attested when signing (#1709).",
+      "docs": "Pillar 1 (#1709): freeze a routine into its immutable regulatory-hold form; the frozen template self-signs when a signing keypair is available.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_freeze`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "RoutineFreezeRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_freeze"
+    },
+    {
+      "description": "Run a frozen routine \u2014 materialise its template into action rows (#1709).",
+      "docs": "Pillar 1 (#1709): materialise a frozen routine under a concrete argument binding into first-class action+edge rows; a malformed template records the run as failed rather than panicking.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_run`.",
+        "properties": {
+          "arguments": {
+            "description": "Concrete `{{param}} -> value` bindings substituted into the template."
+          },
+          "routine_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arguments",
+          "routine_id"
+        ],
+        "title": "RoutineRunRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_run"
+    },
+    {
+      "description": "Fetch a routine run by id, with its state and created action ids (#1709).",
+      "docs": "Pillar 1 (#1709): fetch a routine run by id; the run field is null when no row matches.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_status`.",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "RoutineStatusRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_status"
+    },
+    {
+      "description": "List a namespace's routines by state, newest-first (#1709).",
+      "docs": "Pillar 1 (#1709): list a namespace's routines, optionally narrowed by lifecycle state, newest-first.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_list`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "default": null,
+            "description": "Narrow to a single lifecycle state (`draft` / `frozen`) when set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "RoutineListRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_list"
     }
   ],
   "toolsVersion": "2026-05-06"

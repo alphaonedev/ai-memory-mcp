@@ -113,6 +113,7 @@ pub const PARENT: &str = "parent";
 pub const PATTERN: &str = "pattern";
 pub const PAYLOAD: &str = "payload";
 pub const PIPELINE_OVERRIDE: &str = "pipeline_override";
+pub const PARAMETERS: &str = "parameters";
 pub const PRIORITY: &str = "priority";
 pub const QUERY: &str = "query";
 pub const REFERENCE_IDS: &str = "reference_ids";
@@ -123,6 +124,8 @@ pub const RESOLUTION: &str = "resolution";
 pub const RESOLUTION_NOTE: &str = "resolution_note";
 pub const RESOLVED_BY: &str = "resolved_by";
 pub const RESOURCE_PATH: &str = "resource_path";
+pub const ROUTINE_ID: &str = "routine_id";
+pub const RUN_ID: &str = "run_id";
 pub const SCOPE: &str = "scope";
 pub const SECRET: &str = "secret";
 pub const SIGNAL_TYPE: &str = "signal_type";
@@ -147,6 +150,7 @@ pub const TARGET_AGENT_ID: &str = crate::models::field_names::TARGET_AGENT_ID;
 pub const TARGET_FOLDER: &str = crate::models::field_names::TARGET_FOLDER;
 pub const TARGET_ID: &str = "target_id";
 pub const TARGET_TIER: &str = "target_tier";
+pub const TEMPLATE: &str = "template";
 pub const THRESHOLD: &str = "threshold";
 pub const TIER: &str = "tier";
 pub const TITLE: &str = "title";
@@ -242,6 +246,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     OFFSET,
     OLDER_THAN_DAYS,
     ON_CONFLICT,
+    PARAMETERS,
     PARENT,
     PATTERN,
     PAYLOAD,
@@ -255,6 +260,8 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     RESOLUTION_NOTE,
     RESOLVED_BY,
     RESOURCE_PATH,
+    ROUTINE_ID,
+    RUN_ID,
     SCOPE,
     SECRET,
     SIGNATURE,
@@ -277,6 +284,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     TARGET_FOLDER,
     TARGET_ID,
     TARGET_TIER,
+    TEMPLATE,
     THRESHOLD,
     TIER,
     TITLE,
@@ -306,7 +314,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            116,
+            120,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
