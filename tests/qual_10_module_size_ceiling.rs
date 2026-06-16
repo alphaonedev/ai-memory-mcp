@@ -344,7 +344,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // headroom; new SAL surface for postgres-backed daemons. The 18.7k-LOC
     // module split remains the highest-priority manageability target under
     // EPIC #1709.
-    ("src/store/postgres.rs", 18_750),
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 ATTESTED-CHECKPOINTS storage
+    // foundation) — bumped 18_750 → 18_800: the migrate_v61() method
+    // (inline `checkpoints` CREATE TABLE/INDEX DDL + v61 dispatch arm).
+    // Measured 18_762; storage-only, no SAL/MCP surface (those land in
+    // later units). The 18.7k-LOC module split remains the highest-priority
+    // manageability target under EPIC #1709.
+    ("src/store/postgres.rs", 18_800),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

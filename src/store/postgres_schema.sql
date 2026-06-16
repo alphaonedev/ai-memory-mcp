@@ -1005,3 +1005,34 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS idx_signals_namespace ON signals(namespace, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_signals_to_agent ON signals(to_agent, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_signals_correlation ON signals(correlation_id);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — attested-checkpoints storage foundation.
+-- checkpoints (conditional coordination gates whose resolution is
+-- Ed25519-attested). Mirrors migrations/sqlite/0051_v61_attested_checkpoints.sql.
+-- Fresh schemas carry this inline; existing schemas pick it up via
+-- migrate_v61(). Epoch columns are BIGINT, the Ed25519 signature/
+-- resolver_pubkey columns are BYTEA (nullable — populated only once a
+-- checkpoint resolves).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id              TEXT NOT NULL PRIMARY KEY,
+    namespace       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    condition_type  TEXT NOT NULL,                 -- approval|external_signal|condition_predicate|deadline
+    condition       TEXT   NOT NULL DEFAULT '{}',  -- JSON condition spec
+    state           TEXT NOT NULL,                 -- pending|resolved|rejected|expired
+    created_by      TEXT NOT NULL,
+    resolved_by     TEXT,
+    resolution      TEXT,
+    resolution_note TEXT,
+    signature       BYTEA,                          -- Ed25519 over the canonical resolution (attested)
+    resolver_pubkey BYTEA,
+    created_at      BIGINT NOT NULL,
+    deadline_at     BIGINT,
+    resolved_at     BIGINT,
+    metadata        TEXT   NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_ns_state ON checkpoints(namespace, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_condition_type ON checkpoints(condition_type);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_deadline ON checkpoints(deadline_at);
