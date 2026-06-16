@@ -1812,12 +1812,19 @@ pub trait MemoryStore: Send + Sync {
     /// #1709 Pillar 1 — freeze a routine (Draft → Frozen, sets `frozen_at`).
     /// Idempotent on an already-frozen routine (the `frozen_at` is left
     /// as-is). Returns the routine, or `None` when the id does not exist.
-    /// Default `UnsupportedCapability`.
+    ///
+    /// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the frozen routine's
+    /// Ed25519 FREEZE-ATTESTATION (over the immutable frozen template) is signed
+    /// and the `signature` + `signer_pubkey` columns are persisted. A `None`
+    /// (or public-only) keypair leaves the attestation columns empty
+    /// (unattested), so [`crate::routines::verify`] returns `false` for that
+    /// row. Default `UnsupportedCapability`.
     async fn routine_freeze(
         &self,
         _ctx: &CallerContext,
         _id: &str,
         _frozen_at: i64,
+        _keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Routine>> {
         Err(StoreError::UnsupportedCapability {
             capability: "ROUTINES".to_string(),

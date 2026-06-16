@@ -15,12 +15,96 @@
 //! Back the v62 `routines` / `routine_runs` tables (parameterised
 //! action+edge templates that can be frozen into an immutable,
 //! regulatory-hold form, and their per-argument-binding materialisations).
-//! The `signature` / `signer_pubkey` columns are persisted verbatim as byte
-//! vectors — empty until the routine is frozen; the freeze-attestation
-//! signing logic lands in a subsequent unit.
+//!
+//! v0.8.0 Pillar-1 (#1709) signing: [`sign_freeze_into`] populates a frozen
+//! [`Routine`]'s `signature` (64-byte Ed25519 FREEZE-ATTESTATION over the
+//! canonical frozen template) + `signer_pubkey` (the freezer's 32-byte public
+//! key); [`verify`] re-derives the same canonical bytes and checks the
+//! signature. The persistence free-functions store / read those byte vectors
+//! verbatim — a routine written with empty `signature` / `signer_pubkey` is
+//! simply unsigned (every Draft row, and any Frozen row frozen without a
+//! signing keypair).
 
+use crate::identity::keypair::AgentKeypair;
+use crate::identity::sign::{SignableRoutineFreeze, sign_routine_freeze};
+use crate::identity::verify::verify_routine_freeze;
 use crate::models::{Routine, RoutineRun, RoutineRunState, RoutineState};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+
+/// SHA-256 over a JSON value's canonical string's UTF-8 bytes. Bounds the
+/// signed FREEZE-ATTESTATION payload to 32 bytes per hashed field regardless of
+/// template / parameter length — the same bound [`crate::signals`] uses for the
+/// signal body hash.
+fn json_sha256(v: &serde_json::Value) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(v.to_string().as_bytes());
+    hasher.finalize().into()
+}
+
+/// Build the [`SignableRoutineFreeze`] view of a frozen [`Routine`] — the
+/// immutable fields the FREEZE-ATTESTATION signature commits to, borrowing from
+/// `r` and the precomputed template / parameter hashes. Shared by
+/// [`sign_freeze_into`] (outbound) and [`verify`] (inbound) so both commit to
+/// byte-identical canonical bytes.
+fn freeze_signable<'a>(
+    r: &'a Routine,
+    template_hash: &'a [u8; 32],
+    parameters_hash: &'a [u8; 32],
+) -> SignableRoutineFreeze<'a> {
+    SignableRoutineFreeze {
+        routine_id: &r.id,
+        namespace: &r.namespace,
+        name: &r.name,
+        template_sha256: template_hash,
+        parameters_sha256: parameters_hash,
+        frozen_at: r.frozen_at.unwrap_or(0),
+    }
+}
+
+/// Sign `r`'s freeze in place with `keypair`'s private key.
+///
+/// Hashes the template + parameters, builds the [`SignableRoutineFreeze`] view,
+/// signs the canonical CBOR via [`sign_routine_freeze`], then sets
+/// `r.signature` to the 64-byte signature and `r.signer_pubkey` to the signer's
+/// 32 public-key bytes. Mirrors [`crate::signals::sign_into`] /
+/// [`crate::checkpoints::sign_resolution_into`].
+///
+/// # Errors
+/// Returns the [`sign_routine_freeze`] error when `keypair` is public-only
+/// (`can_sign() == false`) or the CBOR encode fails.
+pub fn sign_freeze_into(r: &mut Routine, keypair: &AgentKeypair) -> anyhow::Result<()> {
+    let template_hash = json_sha256(&r.template);
+    let parameters_hash = json_sha256(&r.parameters);
+    let sig = sign_routine_freeze(
+        keypair,
+        &freeze_signable(r, &template_hash, &parameters_hash),
+    )?;
+    r.signature = sig;
+    r.signer_pubkey = keypair.public.to_bytes().to_vec();
+    Ok(())
+}
+
+/// Verify a routine's Ed25519 FREEZE-ATTESTATION signature against its embedded
+/// `signer_pubkey`.
+///
+/// Returns `false` for an unsigned routine (empty `signature` OR empty
+/// `signer_pubkey`) and for any signature that does not validate against the
+/// re-derived canonical frozen bytes. Never panics. Mirrors
+/// [`crate::signals::verify`] / [`crate::checkpoints::verify`].
+#[must_use]
+pub fn verify(r: &Routine) -> bool {
+    if r.signature.is_empty() || r.signer_pubkey.is_empty() {
+        return false;
+    }
+    let template_hash = json_sha256(&r.template);
+    let parameters_hash = json_sha256(&r.parameters);
+    verify_routine_freeze(
+        &freeze_signable(r, &template_hash, &parameters_hash),
+        &r.signature,
+        &r.signer_pubkey,
+    )
+}
 
 /// SELECT column list for the `routines` table, in the canonical order
 /// [`row_to_routine`] expects. One definition shared by every routine read.
@@ -145,12 +229,23 @@ pub fn routine_list(
 /// already-frozen routine (the `frozen_at` is left as-is). Returns the
 /// routine, or `None` if the id does not exist.
 ///
+/// When a signing `keypair` is supplied (`Some(kp)` AND `kp.can_sign()`), the
+/// frozen routine's FREEZE-ATTESTATION is signed via [`sign_freeze_into`] and
+/// the `signature` + `signer_pubkey` columns are persisted — done after the
+/// state/frozen_at UPDATE so the signable view reads the final frozen surface.
+/// A `None` (or public-only) keypair leaves the attestation columns empty
+/// (unattested), so [`verify`] returns `false` for that row. Mirrors
+/// [`crate::checkpoints::resolve`]'s signed-resolution path.
+///
 /// # Errors
-/// Propagates the `rusqlite` update/query error.
+/// Propagates the `rusqlite` update/query error. A FREEZE-ATTESTATION
+/// signing failure is mapped to a SQL misuse error so the freeze fails closed
+/// rather than persisting an unsigned row the caller believed was signed.
 pub fn routine_freeze(
     conn: &Connection,
     id: &str,
     frozen_at: i64,
+    keypair: Option<&AgentKeypair>,
 ) -> rusqlite::Result<Option<Routine>> {
     // Only flip a Draft → Frozen (set frozen_at on the transition); an
     // already-frozen routine keeps its original frozen_at (idempotent no-op
@@ -165,7 +260,27 @@ pub fn routine_freeze(
             RoutineState::Draft.as_str(),
         ],
     )?;
-    routine_get(conn, id)
+    let Some(mut routine) = routine_get(conn, id)? else {
+        return Ok(None);
+    };
+    // Sign the frozen template + persist the attestation columns when a signing
+    // keypair is supplied — done after the freeze UPDATE so the signable view
+    // reads the final frozen routine_id/namespace/name/template/parameters/
+    // frozen_at.
+    if let Some(kp) = keypair {
+        if kp.can_sign() {
+            sign_freeze_into(&mut routine, kp).map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                    "routine freeze sign failed: {e:#}"
+                ))))
+            })?;
+            conn.execute(
+                "UPDATE routines SET signature = ?1, signer_pubkey = ?2 WHERE id = ?3",
+                params![routine.signature, routine.signer_pubkey, id],
+            )?;
+        }
+    }
+    Ok(Some(routine))
 }
 
 /// Map a `rusqlite` row (the [`ROUTINE_RUN_SELECT_SQL`] column order) to a
@@ -377,14 +492,18 @@ mod tests {
     fn routine_freeze_flips_draft_and_is_idempotent() {
         let conn = fresh();
         routine_insert(&conn, &sample("f1")).unwrap();
-        let frozen = routine_freeze(&conn, "f1", 1_700_000_500)
+        // Unsigned path (None keypair): attestation columns stay empty.
+        let frozen = routine_freeze(&conn, "f1", 1_700_000_500, None)
             .unwrap()
             .expect("freeze returns the updated row");
         assert_eq!(frozen.state, RoutineState::Frozen);
         assert_eq!(frozen.frozen_at, Some(1_700_000_500));
+        assert!(frozen.signature.is_empty(), "unsigned freeze has no sig");
+        assert!(frozen.signer_pubkey.is_empty());
+        assert!(!verify(&frozen), "unsigned routine must not verify");
 
         // Re-freeze is idempotent: frozen_at stays the original value.
-        let again = routine_freeze(&conn, "f1", 1_700_009_999)
+        let again = routine_freeze(&conn, "f1", 1_700_009_999, None)
             .unwrap()
             .expect("re-freeze returns the row");
         assert_eq!(again.state, RoutineState::Frozen);
@@ -392,10 +511,48 @@ mod tests {
 
         // Freezing a missing routine yields None.
         assert!(
-            routine_freeze(&conn, "does-not-exist", 1)
+            routine_freeze(&conn, "does-not-exist", 1, None)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sign_freeze_into_then_verify_round_trips_and_tamper_fails() {
+        let mut routine = sample("rs1");
+        routine.state = RoutineState::Frozen;
+        routine.frozen_at = Some(1_700_000_500);
+        // Unsigned → false.
+        assert!(!verify(&routine), "unsigned routine must not verify");
+
+        let kp = crate::identity::keypair::generate("agent-author").unwrap();
+        sign_freeze_into(&mut routine, &kp).expect("sign freeze");
+        assert_eq!(routine.signature.len(), 64);
+        assert_eq!(routine.signer_pubkey.len(), 32);
+        assert!(verify(&routine), "signed freeze must verify");
+
+        // Tamper the template after signing → verify must fail.
+        let mut tampered = routine.clone();
+        tampered.template = serde_json::json!({ "actions": ["rm -rf /"] });
+        assert!(!verify(&tampered), "tampered template must not verify");
+    }
+
+    #[test]
+    fn routine_freeze_signs_and_persists_attestation() {
+        let conn = fresh();
+        routine_insert(&conn, &sample("fs1")).unwrap();
+        let kp = crate::identity::keypair::generate("agent-author").unwrap();
+        let frozen = routine_freeze(&conn, "fs1", 1_700_000_500, Some(&kp))
+            .unwrap()
+            .expect("freeze returns the updated row");
+        assert_eq!(frozen.state, RoutineState::Frozen);
+        assert_eq!(frozen.signature.len(), 64);
+        assert_eq!(frozen.signer_pubkey.len(), 32);
+        assert!(verify(&frozen), "signed freeze must verify");
+
+        // The persisted row carries the attestation columns on re-fetch.
+        let refetched = routine_get(&conn, "fs1").unwrap().expect("present");
+        assert!(verify(&refetched), "persisted signed routine must verify");
     }
 
     #[test]

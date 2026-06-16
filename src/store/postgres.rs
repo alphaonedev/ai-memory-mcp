@@ -13049,6 +13049,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         id: &str,
         frozen_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Routine>> {
         // Only flip a Draft → Frozen (set frozen_at on the transition); an
         // already-frozen routine keeps its original frozen_at. The UPDATE is a
@@ -13068,12 +13069,39 @@ impl MemoryStore for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| to_store_err("routine_freeze", e))?;
-        match updated {
-            Some(row) => pg_row_to_routine(&row).map(Some),
+        let frozen = match updated {
+            Some(row) => pg_row_to_routine(&row)?,
             // No Draft row updated — either already frozen (return it) or
             // absent (None). Disambiguate via a by-id fetch.
-            None => self.routine_get(_ctx, id).await,
+            None => {
+                let Some(existing) = self.routine_get(_ctx, id).await? else {
+                    return Ok(None);
+                };
+                existing
+            }
+        };
+        // Sign the frozen template's FREEZE-ATTESTATION + persist the attestation
+        // columns when a signing keypair is supplied — done after the freeze
+        // UPDATE so the signable view reads the final frozen surface. Mirrors the
+        // sqlite free-fn (`crate::routines::routine_freeze`) signed path.
+        let mut frozen = frozen;
+        if let Some(kp) = keypair {
+            if kp.can_sign() {
+                crate::routines::sign_freeze_into(&mut frozen, kp).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("routine freeze sign failed: {e:#}"),
+                    }
+                })?;
+                sqlx::query("UPDATE routines SET signature = $1, signer_pubkey = $2 WHERE id = $3")
+                    .bind(&frozen.signature)
+                    .bind(&frozen.signer_pubkey)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("routine_freeze sign-persist", e))?;
+            }
         }
+        Ok(Some(frozen))
     }
 
     async fn routine_run_create(

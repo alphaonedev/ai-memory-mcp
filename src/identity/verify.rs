@@ -42,8 +42,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::identity::keypair;
 use crate::identity::sign::{
-    SignableCheckpointResolution, SignableLink, SignableSignal, SignableWrite, canonical_cbor,
-    canonical_cbor_checkpoint_resolution, canonical_cbor_signal, canonical_cbor_write,
+    SignableCheckpointResolution, SignableLink, SignableRoutineFreeze, SignableSignal,
+    SignableWrite, canonical_cbor, canonical_cbor_checkpoint_resolution,
+    canonical_cbor_routine_freeze, canonical_cbor_signal, canonical_cbor_write,
 };
 
 /// Length of an Ed25519 signature in bytes. Mirrors the constant
@@ -383,6 +384,45 @@ pub fn verify_checkpoint_resolution(
     let sig = Signature::from_bytes(&sig_arr);
 
     let Ok(payload) = canonical_cbor_checkpoint_resolution(signable) else {
+        return false;
+    };
+    public.verify_strict(&payload, &sig).is_ok()
+}
+
+/// Verify a routine's Ed25519 FREEZE-ATTESTATION signature against its raw
+/// 32-byte `signer_pubkey`.
+///
+/// Mirror of [`verify_checkpoint_resolution`] for the frozen-routine path:
+/// rebuilds the [`VerifyingKey`] from the 32-byte `signer_pubkey`, re-derives
+/// the exact bytes [`crate::identity::sign::sign_routine_freeze`] signed, and
+/// checks the 64-byte Ed25519 signature. Any divergence between the persisted
+/// frozen fields and what the freezer signed makes the verify fail — the
+/// regulatory-hold attestation cannot be replayed onto a different routine, a
+/// tampered template, or a back-/forward-dated freeze.
+///
+/// Returns `false` — never panics — on ANY error: a `signer_pubkey` that is not
+/// exactly 32 bytes or does not decode to a valid point, a `signature` that is
+/// not exactly 64 bytes, a CBOR-encode failure, or a signature that does not
+/// validate.
+#[must_use]
+pub fn verify_routine_freeze(
+    signable: &SignableRoutineFreeze<'_>,
+    signature: &[u8],
+    signer_pubkey: &[u8],
+) -> bool {
+    let Ok(pk_arr): Result<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH], _> = signer_pubkey.try_into()
+    else {
+        return false;
+    };
+    let Ok(public) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; SIGNATURE_LEN], _> = signature.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let Ok(payload) = canonical_cbor_routine_freeze(signable) else {
         return false;
     };
     public.verify_strict(&payload, &sig).is_ok()
@@ -972,5 +1012,97 @@ mod tests {
         // 16-byte pubkey is wrong (Ed25519 pubkeys are 32 bytes); empty too.
         assert!(!verify_checkpoint_resolution(&r, &sig, &[0u8; 16]));
         assert!(!verify_checkpoint_resolution(&r, &sig, &[]));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — verify_routine_freeze
+    // -----------------------------------------------------------------
+
+    fn routine_freeze_fixture<'a>(
+        template: &'a [u8; 32],
+        parameters: &'a [u8; 32],
+    ) -> SignableRoutineFreeze<'a> {
+        SignableRoutineFreeze {
+            routine_id: "rt-001",
+            namespace: "_rt",
+            name: "deploy",
+            template_sha256: template,
+            parameters_sha256: parameters,
+            frozen_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn verify_routine_freeze_accepts_valid_signature() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x40);
+        let parameters = body_hash(0x41);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&kp, &r).unwrap();
+        assert!(
+            verify_routine_freeze(&r, &sig, &kp.public.to_bytes()),
+            "happy-path routine-freeze verify must succeed"
+        );
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x42);
+        let parameters = body_hash(0x43);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let mut sig = sign::sign_routine_freeze(&kp, &r).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!verify_routine_freeze(&r, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_mutated_template() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x44);
+        let parameters = body_hash(0x45);
+        let original = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&kp, &original).unwrap();
+        // Swap the template hash after signing — must not verify.
+        let other_template = body_hash(0x99);
+        let tampered = SignableRoutineFreeze {
+            template_sha256: &other_template,
+            ..original.clone()
+        };
+        assert!(!verify_routine_freeze(
+            &tampered,
+            &sig,
+            &kp.public.to_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_wrong_pubkey() {
+        let alice = kp_mod::generate("alice").unwrap();
+        let bob = kp_mod::generate("bob").unwrap();
+        let template = body_hash(0x46);
+        let parameters = body_hash(0x47);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&alice, &r).unwrap();
+        assert!(!verify_routine_freeze(&r, &sig, &bob.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_malformed_lengths() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x48);
+        let parameters = body_hash(0x49);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&kp, &r).unwrap();
+        // 32-byte signature is wrong (Ed25519 wants 64); empty too.
+        assert!(!verify_routine_freeze(
+            &r,
+            &[0u8; 32],
+            &kp.public.to_bytes()
+        ));
+        assert!(!verify_routine_freeze(&r, &[], &kp.public.to_bytes()));
+        // 16-byte pubkey is wrong (Ed25519 pubkeys are 32 bytes); empty too.
+        assert!(!verify_routine_freeze(&r, &sig, &[0u8; 16]));
+        assert!(!verify_routine_freeze(&r, &sig, &[]));
     }
 }
