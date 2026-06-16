@@ -73,8 +73,8 @@ jobs:
           # Mechanical self-consistency: ensure the count is positive +
           # plausible (defends against a sed accident reducing registry
           # to 0 or a runaway script doubling it).
-          if [ "$count" -lt 60 ] || [ "$count" -gt 90 ]; then
-            echo "::error::registry RegisteredTool::of count $count is outside plausibility window [60, 90]"
+          if [ "$count" -lt 60 ] || [ "$count" -gt 130 ]; then
+            echo "::error::registry RegisteredTool::of count $count is outside plausibility window [60, 130]"
             echo "::error::either a registry corruption or this workflow's plausibility window needs widening"
             exit 1
           fi
@@ -122,13 +122,17 @@ jobs:
             exit 1
           fi
 
-      - name: 'release-notes 60 -> N includes derived full at v0.7.0'
+      - name: 'release-notes 60 -> 74 frozen v0.7.0 tool-count delta'
         shell: bash
         run: |
-          # v0.7.0 F-A2.1 fix: derive the v0.6.4 → v0.7.0 delta count
-          # from the registry. The "60" baseline is the v0.6.4 reference
-          # point; the target is whatever the current registry says.
-          if ! grep -qE "60 → ${EXPECTED_FULL_COUNT}" docs/v0.7.0/release-notes.md; then
-            echo "::error::docs/v0.7.0/release-notes.md missing '60 → ${EXPECTED_FULL_COUNT}' tool count delta"
+          # docs/v0.7.0/release-notes.md is a FROZEN v0.7.0 release artifact:
+          # "MCP tool count 60 → 74" is the TRUE v0.6.4 → v0.7.0 delta and
+          # must NOT track the live registry count (93 at v0.8.0-dev), or the
+          # v0.7.0 release notes would falsely claim v0.7.0 shipped the
+          # v0.8.0 surface. Pin this check to the frozen v0.7.0 value 74;
+          # the live-registry drift gate covers the current-state docs.
+          FROZEN_V070_FULL_COUNT=74
+          if ! grep -qE "60 → ${FROZEN_V070_FULL_COUNT}" docs/v0.7.0/release-notes.md; then
+            echo "::error::docs/v0.7.0/release-notes.md missing frozen '60 → ${FROZEN_V070_FULL_COUNT}' v0.7.0 tool count delta"
             exit 1
           fi
