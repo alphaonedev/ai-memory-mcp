@@ -332,7 +332,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // module past 17_820 without a lockstep bump — pre-existing QUAL-10
     // drift greened here). The 17.9k-LOC module split is the highest-
     // priority manageability target tracked under the v0.8.0 EPIC #1709.
-    ("src/store/postgres.rs", 18_540),
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 SIGNED-SIGNALS SAL surface) —
+    // bumped 18_540 → 18_750: PG_SIGNAL_SELECT_BY_ID + pg_row_to_signal +
+    // the 5 sqlx-native signal_* trait methods (signal_send / signal_get /
+    // signal_inbox / signal_thread / signal_ack). Measured 18_693 + ~57
+    // headroom; new SAL surface for postgres-backed daemons. The 18.7k-LOC
+    // module split remains the highest-priority manageability target under
+    // EPIC #1709.
+    ("src/store/postgres.rs", 18_750),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

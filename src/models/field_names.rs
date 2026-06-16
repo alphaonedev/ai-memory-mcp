@@ -88,6 +88,8 @@ pub const CONFIRMED_CONTRADICTIONS: &str = "confirmed_contradictions";
 pub const CONSOLIDATED: &str = "consolidated";
 /// `content_sha256` — wire/row field name.
 pub const CONTENT_SHA256: &str = "content_sha256";
+/// `correlation_id` — wire/row field name.
+pub const CORRELATION_ID: &str = "correlation_id";
 /// `created_at` — wire/row field name.
 pub const CREATED_AT: &str = "created_at";
 /// `created_by` — wire/row field name.

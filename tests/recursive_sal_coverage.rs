@@ -14,7 +14,7 @@
 // an empty test target.
 #![cfg(feature = "sal")]
 
-use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
+use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Signal, SignalType, Tier};
 use ai_memory::store::{CallerContext, MemoryStore};
 use std::sync::Arc;
 
@@ -452,6 +452,80 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             .expect("lease_get after sweep ok")
             .is_none(),
         "no lease after sweep"
+    );
+
+    // #1709 Pillar 1 — signal_send / signal_get / signal_inbox / signal_ack
+    // round-trip through the SAL surface on BOTH adapters. No Ed25519 signing
+    // yet: signature/sender_pubkey are empty byte vectors.
+    let sid = format!("sal-cov-sig-{}", uuid_like());
+    let signal = Signal {
+        id: sid.clone(),
+        namespace: TEST_NS.to_string(),
+        from_agent: TEST_AGENT.to_string(),
+        to_agent: Some(TEST_AGENT.to_string()),
+        subject: "sal-cov-subject".to_string(),
+        body: serde_json::json!({}),
+        signal_type: SignalType::Notify,
+        in_reply_to: None,
+        correlation_id: None,
+        reference_ids: serde_json::json!([]),
+        created_at: 1_700_003_000,
+        expires_at: None,
+        delivered_at: None,
+        read_at: None,
+        acknowledged_at: None,
+        signature: vec![],
+        sender_pubkey: vec![],
+    };
+    let sent = store
+        .signal_send(&ctx, &signal)
+        .await
+        .expect("signal_send ok");
+    assert_eq!(sent, sid);
+
+    let got_sig = store
+        .signal_get(&ctx, &sid)
+        .await
+        .expect("signal_get ok")
+        .expect("signal present");
+    assert_eq!(got_sig.namespace, TEST_NS);
+    assert_eq!(got_sig.from_agent, TEST_AGENT);
+    assert_eq!(got_sig.to_agent.as_deref(), Some(TEST_AGENT));
+    assert_eq!(got_sig.signal_type, SignalType::Notify);
+    assert!(got_sig.acknowledged_at.is_none());
+
+    let inbox = store
+        .signal_inbox(&ctx, TEST_NS, Some(TEST_AGENT), 10)
+        .await
+        .expect("signal_inbox ok");
+    assert!(
+        inbox.iter().any(|s| s.id == sid),
+        "the sent signal is in the inbox"
+    );
+
+    // First ack flips acknowledged_at; a second ack is a no-op.
+    assert!(
+        store
+            .signal_ack(&ctx, &sid, 1_700_003_100)
+            .await
+            .expect("signal_ack ok"),
+        "first ack stamps acknowledged_at"
+    );
+    assert!(
+        !store
+            .signal_ack(&ctx, &sid, 1_700_003_200)
+            .await
+            .expect("signal_ack second ok"),
+        "second ack is a no-op"
+    );
+    assert_eq!(
+        store
+            .signal_get(&ctx, &sid)
+            .await
+            .expect("signal_get after ack ok")
+            .expect("signal present")
+            .acknowledged_at,
+        Some(1_700_003_100)
     );
 }
 

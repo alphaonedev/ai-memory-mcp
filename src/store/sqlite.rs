@@ -934,6 +934,49 @@ impl MemoryStore for SqliteStore {
         crate::actions::sweep_expired_leases(&conn, now).map_err(box_err)
     }
 
+    async fn signal_send(
+        &self,
+        _ctx: &CallerContext,
+        signal: &crate::models::Signal,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::signals::insert(&conn, signal).map_err(box_err)
+    }
+
+    async fn signal_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Signal>> {
+        let conn = self.state.lock().await;
+        crate::signals::get(&conn, id).map_err(box_err)
+    }
+
+    async fn signal_inbox(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_agent: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let conn = self.state.lock().await;
+        crate::signals::list_inbox(&conn, namespace, to_agent, limit).map_err(box_err)
+    }
+
+    async fn signal_thread(
+        &self,
+        _ctx: &CallerContext,
+        correlation_id: &str,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let conn = self.state.lock().await;
+        crate::signals::thread(&conn, correlation_id).map_err(box_err)
+    }
+
+    async fn signal_ack(&self, _ctx: &CallerContext, id: &str, now: i64) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::signals::mark_acked(&conn, id, now).map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
