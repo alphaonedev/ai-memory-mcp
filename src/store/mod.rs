@@ -1470,6 +1470,40 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1709 Pillar 1 — transition an action's state, enforcing the
+    /// coordination state machine ([`crate::models::ActionState::can_transition_to`]).
+    /// Sets `claimed_by` to the supplied value and bumps `updated_at` to
+    /// `now` (epoch seconds). Returns the updated action. `NotFound` when the
+    /// action does not exist; `InvalidInput` on an illegal transition edge.
+    /// Default `UnsupportedCapability`.
+    async fn action_transition(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _to: crate::models::ActionState,
+        _claimed_by: Option<&str>,
+        _now: i64,
+    ) -> StoreResult<crate::models::Action> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list actions, optionally filtered by `namespace`
+    /// and/or `state`, newest-`updated_at` first, capped at `limit`. Default
+    /// `UnsupportedCapability`.
+    async fn action_list(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: Option<&str>,
+        _state: Option<crate::models::ActionState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///

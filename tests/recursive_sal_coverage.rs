@@ -245,6 +245,60 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .await
         .expect("action_get unknown ok");
     assert!(missing.is_none(), "unknown action id yields None");
+
+    // #1709 — action_transition (state-machine guard) + action_list.
+    let claimed = store
+        .action_transition(
+            &ctx,
+            &aid,
+            ai_memory::models::ActionState::Claimed,
+            Some(TEST_AGENT),
+            1_700_000_100,
+        )
+        .await
+        .expect("action_transition pending->claimed ok");
+    assert_eq!(claimed.state, ai_memory::models::ActionState::Claimed);
+    assert_eq!(claimed.claimed_by.as_deref(), Some(TEST_AGENT));
+    assert_eq!(claimed.updated_at, 1_700_000_100);
+    // Illegal transition (claimed→done skips in_progress) is rejected.
+    let illegal = store
+        .action_transition(
+            &ctx,
+            &aid,
+            ai_memory::models::ActionState::Done,
+            None,
+            1_700_000_200,
+        )
+        .await;
+    assert!(
+        illegal.is_err(),
+        "illegal transition claimed->done rejected"
+    );
+    // Transition on a missing action → error (NotFound).
+    let absent = store
+        .action_transition(
+            &ctx,
+            "sal-cov-act-missing",
+            ai_memory::models::ActionState::Claimed,
+            None,
+            1_700_000_300,
+        )
+        .await;
+    assert!(absent.is_err(), "transition on a missing action errors");
+    // action_list filtered by namespace + state surfaces the claimed action.
+    let listed = store
+        .action_list(
+            &ctx,
+            Some(TEST_NS),
+            Some(ai_memory::models::ActionState::Claimed),
+            50,
+        )
+        .await
+        .expect("action_list ok");
+    assert!(
+        listed.iter().any(|a| a.id == aid),
+        "the claimed action appears in the namespace+state-filtered list"
+    );
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

@@ -328,7 +328,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // module past 17_820 without a lockstep bump — pre-existing QUAL-10
     // drift greened here). The 17.9k-LOC module split is the highest-
     // priority manageability target tracked under the v0.8.0 EPIC #1709.
-    ("src/store/postgres.rs", 18_240),
+    ("src/store/postgres.rs", 18_320),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

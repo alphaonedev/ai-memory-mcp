@@ -58,6 +58,35 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #1709 Pillar 1 — SELECT column list for the `actions` table, in the
+/// canonical order [`sqlite_row_to_action`] expects. One definition shared by
+/// every action read (keeps the column order + the row mapping in lockstep).
+const ACTION_SELECT_SQL: &str = "SELECT id, namespace, kind, state, title, payload, \
+     priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
+     FROM actions";
+
+/// Map a `rusqlite` row (the [`ACTION_SELECT_SQL`] column order) to an
+/// [`crate::models::Action`]. Shared by `action_get` / `action_transition` /
+/// `action_list`.
+fn sqlite_row_to_action(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Action> {
+    Ok(crate::models::Action {
+        id: r.get(0)?,
+        namespace: r.get(1)?,
+        kind: r.get(2)?,
+        state: crate::models::ActionState::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+        title: r.get(4)?,
+        payload: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(serde_json::Value::Null),
+        priority: r.get(6)?,
+        agent_id: r.get(7)?,
+        claimed_by: r.get(8)?,
+        vector_clock: serde_json::from_str(&r.get::<_, String>(9)?)
+            .unwrap_or(serde_json::Value::Null),
+        metadata: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or(serde_json::Value::Null),
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
     fn capabilities(&self) -> Capabilities {
@@ -830,37 +859,92 @@ impl MemoryStore for SqliteStore {
         id: &str,
     ) -> StoreResult<Option<crate::models::Action>> {
         let conn = self.state.lock().await;
-        let row = conn
+        conn.query_row(
+            &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
+            rusqlite::params![id],
+            sqlite_row_to_action,
+        )
+        .optional()
+        .map_err(box_err)
+    }
+
+    async fn action_transition(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::models::Action> {
+        let conn = self.state.lock().await;
+        // Fetch current state under the held mutex (atomic with the update).
+        let current: Option<String> = conn
             .query_row(
-                "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
-                        claimed_by, vector_clock, metadata, created_at, updated_at \
-                   FROM actions WHERE id = ?1",
+                "SELECT state FROM actions WHERE id = ?1",
                 rusqlite::params![id],
-                |r| {
-                    Ok(crate::models::Action {
-                        id: r.get(0)?,
-                        namespace: r.get(1)?,
-                        kind: r.get(2)?,
-                        state: crate::models::ActionState::from_str(&r.get::<_, String>(3)?)
-                            .unwrap_or_default(),
-                        title: r.get(4)?,
-                        payload: serde_json::from_str(&r.get::<_, String>(5)?)
-                            .unwrap_or(serde_json::Value::Null),
-                        priority: r.get(6)?,
-                        agent_id: r.get(7)?,
-                        claimed_by: r.get(8)?,
-                        vector_clock: serde_json::from_str(&r.get::<_, String>(9)?)
-                            .unwrap_or(serde_json::Value::Null),
-                        metadata: serde_json::from_str(&r.get::<_, String>(10)?)
-                            .unwrap_or(serde_json::Value::Null),
-                        created_at: r.get(11)?,
-                        updated_at: r.get(12)?,
-                    })
-                },
+                |r| r.get(0),
             )
             .optional()
             .map_err(box_err)?;
-        Ok(row)
+        let Some(cs) = current else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let from = crate::models::ActionState::from_str(&cs).unwrap_or_default();
+        if !from.can_transition_to(to) {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "illegal action transition: {} -> {}",
+                    from.as_str(),
+                    to.as_str()
+                ),
+            });
+        }
+        conn.execute(
+            "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 WHERE id = ?4",
+            rusqlite::params![to.as_str(), claimed_by, now, id],
+        )
+        .map_err(box_err)?;
+        conn.query_row(
+            &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
+            rusqlite::params![id],
+            sqlite_row_to_action,
+        )
+        .map_err(box_err)
+    }
+
+    async fn action_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        state: Option<crate::models::ActionState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut sql = format!("{ACTION_SELECT_SQL} WHERE 1 = 1");
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(ns) = namespace {
+            sql.push_str(" AND namespace = ?");
+            binds.push(Box::new(ns.to_string()));
+        }
+        if let Some(st) = state {
+            sql.push_str(" AND state = ?");
+            binds.push(Box::new(st.as_str().to_string()));
+        }
+        sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
+        binds.push(Box::new(lim));
+        let mut stmt = conn.prepare(&sql).map_err(box_err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(binds.iter().map(|b| &**b)),
+                sqlite_row_to_action,
+            )
+            .map_err(box_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(box_err)?);
+        }
+        Ok(out)
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {

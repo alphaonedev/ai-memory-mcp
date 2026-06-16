@@ -7292,6 +7292,47 @@ fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     }
 }
 
+/// #1709 Pillar 1 — `actions` by-id SELECT (canonical column order matching
+/// [`pg_row_to_action`]). One definition shared by the by-id reads.
+const PG_ACTION_SELECT_BY_ID: &str = "SELECT id, namespace, kind, state, title, payload, \
+     priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
+     FROM actions WHERE id = $1";
+
+/// Map a postgres row (the action column order) to an
+/// [`crate::models::Action`]. JSON columns are TEXT (parity with sqlite).
+/// Shared by `action_get` / `action_transition` / `action_list`.
+fn pg_row_to_action(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Action> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let state: String = r.try_get("state").map_err(|e| g("action.state", e))?;
+    let payload: String = r.try_get("payload").map_err(|e| g("action.payload", e))?;
+    let vector_clock: String = r
+        .try_get("vector_clock")
+        .map_err(|e| g("action.vector_clock", e))?;
+    let metadata: String = r.try_get("metadata").map_err(|e| g("action.metadata", e))?;
+    Ok(crate::models::Action {
+        id: r.try_get("id").map_err(|e| g("action.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("action.namespace", e))?,
+        kind: r.try_get("kind").map_err(|e| g("action.kind", e))?,
+        state: crate::models::ActionState::from_str(&state).unwrap_or_default(),
+        title: r.try_get("title").map_err(|e| g("action.title", e))?,
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        priority: r.try_get("priority").map_err(|e| g("action.priority", e))?,
+        agent_id: r.try_get("agent_id").ok(),
+        claimed_by: r.try_get("claimed_by").ok(),
+        vector_clock: serde_json::from_str(&vector_clock).unwrap_or(serde_json::Value::Null),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("action.created_at", e))?,
+        updated_at: r
+            .try_get("updated_at")
+            .map_err(|e| g("action.updated_at", e))?,
+    })
+}
+
 /// ARCH-1 — Postgres-side adapter for the substrate
 /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
 ///
@@ -11944,47 +11985,96 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         id: &str,
     ) -> StoreResult<Option<crate::models::Action>> {
-        use sqlx::Row;
-        let Some(r) = sqlx::query(
+        sqlx::query(PG_ACTION_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_get", e))?
+            .as_ref()
+            .map(pg_row_to_action)
+            .transpose()
+    }
+
+    async fn action_transition(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::models::Action> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin action_transition tx", e))?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT state FROM actions WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("action_transition select", e))?;
+        let Some(cs) = current else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let from = crate::models::ActionState::from_str(&cs).unwrap_or_default();
+        if !from.can_transition_to(to) {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "illegal action transition: {} -> {}",
+                    from.as_str(),
+                    to.as_str()
+                ),
+            });
+        }
+        sqlx::query(
+            "UPDATE actions SET state = $1, claimed_by = $2, updated_at = $3 WHERE id = $4",
+        )
+        .bind(to.as_str())
+        .bind(claimed_by)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("action_transition update", e))?;
+        let row = sqlx::query(PG_ACTION_SELECT_BY_ID)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("action_transition refetch", e))?;
+        let action = pg_row_to_action(&row)?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit action_transition", e))?;
+        Ok(action)
+    }
+
+    async fn action_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        state: Option<crate::models::ActionState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
                     claimed_by, vector_clock, metadata, created_at, updated_at \
-               FROM actions WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| to_store_err("action_get", e))?
-        else {
-            return Ok(None);
-        };
-        let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
-        let state: String = r.try_get("state").map_err(|e| g("action.state", e))?;
-        let payload: String = r.try_get("payload").map_err(|e| g("action.payload", e))?;
-        let vector_clock: String = r
-            .try_get("vector_clock")
-            .map_err(|e| g("action.vector_clock", e))?;
-        let metadata: String = r.try_get("metadata").map_err(|e| g("action.metadata", e))?;
-        Ok(Some(crate::models::Action {
-            id: r.try_get("id").map_err(|e| g("action.id", e))?,
-            namespace: r
-                .try_get("namespace")
-                .map_err(|e| g("action.namespace", e))?,
-            kind: r.try_get("kind").map_err(|e| g("action.kind", e))?,
-            state: crate::models::ActionState::from_str(&state).unwrap_or_default(),
-            title: r.try_get("title").map_err(|e| g("action.title", e))?,
-            payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-            priority: r.try_get("priority").map_err(|e| g("action.priority", e))?,
-            agent_id: r.try_get("agent_id").ok(),
-            claimed_by: r.try_get("claimed_by").ok(),
-            vector_clock: serde_json::from_str(&vector_clock).unwrap_or(serde_json::Value::Null),
-            metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
-            created_at: r
-                .try_get(crate::models::field_names::CREATED_AT)
-                .map_err(|e| g("action.created_at", e))?,
-            updated_at: r
-                .try_get("updated_at")
-                .map_err(|e| g("action.updated_at", e))?,
-        }))
+               FROM actions WHERE TRUE",
+        );
+        if let Some(ns) = namespace {
+            qb.push(" AND namespace = ").push_bind(ns.to_string());
+        }
+        if let Some(st) = state {
+            qb.push(" AND state = ").push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(" ORDER BY updated_at DESC LIMIT ").push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_list", e))?;
+        rows.iter().map(pg_row_to_action).collect()
     }
 
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
