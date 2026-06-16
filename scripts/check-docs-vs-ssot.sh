@@ -124,10 +124,7 @@ DOC_FILES=(
     CLAUDE.md
     README.md
     ROADMAP.md
-    docs/MIGRATION_v0.7.md
     docs/MIGRATION_QUICKSTART.md
-    docs/migration-v0.7.0-postgres.md
-    docs/migration-v064-to-v070.md
     docs/API_REFERENCE.md
     docs/DEVELOPER_GUIDE.md
     docs/a2a-harness-integration.md
@@ -143,6 +140,14 @@ DOC_FILES=(
 # RFC files (docs/rfc/RFC-0001-*.md) similarly narrate past schema bumps.
 # The heterogeneous-AI-NHI assessment reports are historical analysis
 # artifacts.
+#
+# The three v0.7 migration guides — docs/MIGRATION_v0.7.md (the v20→v57
+# ladder), docs/migration-v0.7.0-postgres.md (schema_version=57 end
+# state), and docs/migration-v064-to-v070.md (schema_version=57 ladder
+# complete) — are likewise excluded: each describes the v0.7 migration
+# ENDING at schema 57, a TRUE historical end-state. Re-pointing them at
+# the live CURRENT_SCHEMA_VERSION (61 at v0.8.0-dev) would falsify the
+# v0.7 migration story, so they are frozen-doc snapshots like CHANGELOG.
 
 # --------------------------------------------------------------------
 # Rule executor
