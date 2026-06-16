@@ -1029,6 +1029,7 @@ impl MemoryStore for SqliteStore {
         resolution: Option<&str>,
         resolution_note: Option<&str>,
         resolved_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Checkpoint>> {
         let conn = self.state.lock().await;
         crate::checkpoints::resolve(
@@ -1039,6 +1040,7 @@ impl MemoryStore for SqliteStore {
             resolution,
             resolution_note,
             resolved_at,
+            keypair,
         )
         .map_err(box_err)
     }

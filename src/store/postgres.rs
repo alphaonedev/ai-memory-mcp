@@ -12720,6 +12720,7 @@ impl MemoryStore for PostgresStore {
         resolution: Option<&str>,
         resolution_note: Option<&str>,
         resolved_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<Option<crate::models::Checkpoint>> {
         let row = sqlx::query(
             "UPDATE checkpoints SET state = $1, resolved_by = $2, resolution = $3, \
@@ -12737,7 +12738,32 @@ impl MemoryStore for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| to_store_err("checkpoint_resolve", e))?;
-        row.as_ref().map(pg_row_to_checkpoint).transpose()
+        let Some(mut cp) = row.as_ref().map(pg_row_to_checkpoint).transpose()? else {
+            return Ok(None);
+        };
+        // Sign the resolved row's canonical RESOLUTION + persist the
+        // attestation columns when a signing keypair is supplied — mirroring
+        // the sqlite free-fn (`crate::checkpoints::resolve`) and the
+        // `signal_send` signed path.
+        if let Some(kp) = keypair {
+            if kp.can_sign() {
+                crate::checkpoints::sign_resolution_into(&mut cp, kp).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("checkpoint resolution sign failed: {e:#}"),
+                    }
+                })?;
+                sqlx::query(
+                    "UPDATE checkpoints SET signature = $1, resolver_pubkey = $2 WHERE id = $3",
+                )
+                .bind(&cp.signature)
+                .bind(&cp.resolver_pubkey)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("checkpoint_resolve sign-persist", e))?;
+            }
+        }
+        Ok(Some(cp))
     }
 
     async fn checkpoint_query(

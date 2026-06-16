@@ -539,6 +539,115 @@ pub fn sign_signal(keypair: &AgentKeypair, signal: &SignableSignal<'_>) -> Resul
     Ok(sig.to_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — SignableCheckpointResolution + sign_checkpoint_resolution
+// ---------------------------------------------------------------------------
+
+/// The fields a checkpoint *resolution* signature commits to — the
+/// separation-of-duties attestation answering "who resolved this checkpoint,
+/// to what, when".
+///
+/// Decoupled from [`crate::models::Checkpoint`] on purpose (same rationale as
+/// [`SignableSignal`] / [`SignableLink`]): the full `Checkpoint` carries
+/// mutable-before-resolution columns (`condition`, `metadata`, `deadline_at`,
+/// …) that the resolution attestation deliberately does NOT bind. The
+/// signature commits to the *immutable-once-resolved* surface only, so a
+/// verifier can re-derive the bytes from a resolved row without dragging the
+/// entire `Checkpoint` shape, and a captured signature cannot be replayed onto
+/// a different checkpoint, resolver, verdict, or timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableCheckpointResolution<'a> {
+    /// The checkpoint's id (UUIDv4). Pinned so a signature minted for one
+    /// checkpoint cannot be replayed onto another.
+    pub checkpoint_id: &'a str,
+    /// Namespace the checkpoint was created within.
+    pub namespace: &'a str,
+    /// The resolved lifecycle state spelling (`CheckpointState::as_str` — e.g.
+    /// `"resolved"` / `"rejected"`). Pinned so a signature minted for one
+    /// verdict cannot be replayed onto another.
+    pub state: &'a str,
+    /// The resolving agent — the identity-bearing field the signature attests:
+    /// the signer held the keypair bound to this `resolved_by`.
+    pub resolved_by: &'a str,
+    /// Free-text resolution verdict, or `None`.
+    pub resolution: Option<&'a str>,
+    /// Epoch-seconds resolution timestamp. Inside the signed surface so a
+    /// captured signature cannot be replayed to back- or forward-date a
+    /// resolution.
+    pub resolved_at: i64,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable
+/// checkpoint-resolution fields.
+///
+/// Same construction discipline as [`canonical_cbor_signal`]: a
+/// `BTreeMap<&str, ciborium::Value>` so map-key order is enforced at build
+/// time, `Option` lifted via [`text_or_null`] so the key set is fixed across
+/// rows, and `resolved_at` encoded as a CBOR `Integer`.
+///
+/// # Errors
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, surfaced as a `Result` so
+/// callers don't have to choose between panicking and silently signing a
+/// truncated payload.
+pub fn canonical_cbor_checkpoint_resolution(
+    r: &SignableCheckpointResolution<'_>,
+) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert(
+        "checkpoint_id",
+        ciborium::Value::Text(r.checkpoint_id.to_string()),
+    );
+    map.insert("namespace", ciborium::Value::Text(r.namespace.to_string()));
+    map.insert("state", ciborium::Value::Text(r.state.to_string()));
+    map.insert(
+        "resolved_by",
+        ciborium::Value::Text(r.resolved_by.to_string()),
+    );
+    map.insert("resolution", text_or_null(r.resolution));
+    map.insert(
+        "resolved_at",
+        ciborium::Value::Integer(ciborium::value::Integer::from(r.resolved_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out)
+        .context("CBOR encode SignableCheckpointResolution")?;
+    Ok(out)
+}
+
+/// Sign a checkpoint resolution with `keypair`'s private key.
+///
+/// Encodes the resolution via [`canonical_cbor_checkpoint_resolution`], then
+/// runs Ed25519 over the resulting bytes. Returns the 64-byte signature, ready
+/// to drop into the `signature` BLOB column on `checkpoints`.
+///
+/// # Errors
+/// - `keypair.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_checkpoint_resolution(
+    keypair: &AgentKeypair,
+    resolution: &SignableCheckpointResolution<'_>,
+) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign checkpoint resolution",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_checkpoint_resolution(resolution)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1265,6 +1374,101 @@ mod tests {
         let signal = signal_fixture(&body);
         let sig_bytes = sign_signal(&alice, &signal).unwrap();
         let payload = canonical_cbor_signal(&signal).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — SignableCheckpointResolution
+    // -----------------------------------------------------------------
+
+    fn resolution_fixture() -> SignableCheckpointResolution<'static> {
+        SignableCheckpointResolution {
+            checkpoint_id: "cp-001",
+            namespace: "_cp",
+            state: "resolved",
+            resolved_by: "agent-approver",
+            resolution: Some("approved"),
+            resolved_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_checkpoint_resolution_differs_on_field_change() {
+        // Any change in the signed surface must change the byte output —
+        // otherwise a resolution could be silently re-attributed or its
+        // verdict flipped under a stale signature.
+        let base = resolution_fixture();
+        let mut altered = base.clone();
+        altered.state = "rejected";
+        let a = canonical_cbor_checkpoint_resolution(&base).expect("encode base");
+        let b = canonical_cbor_checkpoint_resolution(&altered).expect("encode altered");
+        assert_ne!(a, b, "different state must produce different bytes");
+
+        // And the resolver field is bound too.
+        let mut altered_by = base.clone();
+        altered_by.resolved_by = "agent-impostor";
+        let c = canonical_cbor_checkpoint_resolution(&altered_by).expect("encode altered_by");
+        assert_ne!(a, c, "different resolved_by must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_checkpoint_resolution_handles_none_resolution() {
+        let r = SignableCheckpointResolution {
+            checkpoint_id: "c",
+            namespace: "n",
+            state: "rejected",
+            resolved_by: "a",
+            resolution: None,
+            resolved_at: 0,
+        };
+        let bytes = canonical_cbor_checkpoint_resolution(&r).expect("encode");
+        assert!(!bytes.is_empty());
+        // Two encodes still match (byte-stable).
+        assert_eq!(
+            bytes,
+            canonical_cbor_checkpoint_resolution(&r).expect("re-encode")
+        );
+    }
+
+    #[test]
+    fn sign_checkpoint_resolution_round_trip() {
+        let kp = keypair::generate("agent-approver").expect("generate");
+        let r = resolution_fixture();
+        let sig_bytes = sign_checkpoint_resolution(&kp, &r).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_checkpoint_resolution(&r).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_checkpoint_resolution_refuses_public_only_keypair() {
+        let kp = keypair::generate("agent-approver").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "agent-approver".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let err = sign_checkpoint_resolution(&pub_only, &resolution_fixture()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_checkpoint_resolution_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's resolution signature must not
+        // verify under Bob's public key.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let r = resolution_fixture();
+        let sig_bytes = sign_checkpoint_resolution(&alice, &r).unwrap();
+        let payload = canonical_cbor_checkpoint_resolution(&r).unwrap();
         let mut sig_arr = [0u8; 64];
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
