@@ -58,34 +58,10 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
-/// #1709 Pillar 1 — SELECT column list for the `actions` table, in the
-/// canonical order [`sqlite_row_to_action`] expects. One definition shared by
-/// every action read (keeps the column order + the row mapping in lockstep).
-const ACTION_SELECT_SQL: &str = "SELECT id, namespace, kind, state, title, payload, \
-     priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
-     FROM actions";
-
-/// Map a `rusqlite` row (the [`ACTION_SELECT_SQL`] column order) to an
-/// [`crate::models::Action`]. Shared by `action_get` / `action_transition` /
-/// `action_list`.
-fn sqlite_row_to_action(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Action> {
-    Ok(crate::models::Action {
-        id: r.get(0)?,
-        namespace: r.get(1)?,
-        kind: r.get(2)?,
-        state: crate::models::ActionState::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
-        title: r.get(4)?,
-        payload: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or(serde_json::Value::Null),
-        priority: r.get(6)?,
-        agent_id: r.get(7)?,
-        claimed_by: r.get(8)?,
-        vector_clock: serde_json::from_str(&r.get::<_, String>(9)?)
-            .unwrap_or(serde_json::Value::Null),
-        metadata: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or(serde_json::Value::Null),
-        created_at: r.get(11)?,
-        updated_at: r.get(12)?,
-    })
-}
+// #1709 Pillar 1 — the actions SELECT column list + row mapping live in
+// `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
+// a bare Connection). Referenced below as `crate::actions::{ACTION_SELECT_SQL,
+// row_to_action}`.
 
 /// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical column order for
 /// [`sqlite_row_to_lease`]). Shared by every lease read.
@@ -845,29 +821,7 @@ impl MemoryStore for SqliteStore {
         action: &crate::models::Action,
     ) -> StoreResult<String> {
         let conn = self.state.lock().await;
-        conn.execute(
-            "INSERT INTO actions \
-                (id, namespace, kind, state, title, payload, priority, agent_id, \
-                 claimed_by, vector_clock, metadata, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            rusqlite::params![
-                action.id,
-                action.namespace,
-                action.kind,
-                action.state.as_str(),
-                action.title,
-                action.payload.to_string(),
-                action.priority,
-                action.agent_id,
-                action.claimed_by,
-                action.vector_clock.to_string(),
-                action.metadata.to_string(),
-                action.created_at,
-                action.updated_at,
-            ],
-        )
-        .map_err(box_err)?;
-        Ok(action.id.clone())
+        crate::actions::create(&conn, action).map_err(box_err)
     }
 
     async fn action_get(
@@ -876,13 +830,7 @@ impl MemoryStore for SqliteStore {
         id: &str,
     ) -> StoreResult<Option<crate::models::Action>> {
         let conn = self.state.lock().await;
-        conn.query_row(
-            &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
-            rusqlite::params![id],
-            sqlite_row_to_action,
-        )
-        .optional()
-        .map_err(box_err)
+        crate::actions::get(&conn, id).map_err(box_err)
     }
 
     async fn action_transition(
@@ -922,9 +870,9 @@ impl MemoryStore for SqliteStore {
         )
         .map_err(box_err)?;
         conn.query_row(
-            &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
+            &format!("{} WHERE id = ?1", crate::actions::ACTION_SELECT_SQL),
             rusqlite::params![id],
-            sqlite_row_to_action,
+            crate::actions::row_to_action,
         )
         .map_err(box_err)
     }
@@ -938,7 +886,7 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<Vec<crate::models::Action>> {
         let conn = self.state.lock().await;
         let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut sql = format!("{ACTION_SELECT_SQL} WHERE 1 = 1");
+        let mut sql = format!("{} WHERE 1 = 1", crate::actions::ACTION_SELECT_SQL);
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(ns) = namespace {
             sql.push_str(" AND namespace = ?");
@@ -954,7 +902,7 @@ impl MemoryStore for SqliteStore {
         let rows = stmt
             .query_map(
                 rusqlite::params_from_iter(binds.iter().map(|b| &**b)),
-                sqlite_row_to_action,
+                crate::actions::row_to_action,
             )
             .map_err(box_err)?;
         let mut out = Vec::new();
