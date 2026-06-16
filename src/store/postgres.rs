@@ -12394,10 +12394,27 @@ impl MemoryStore for PostgresStore {
         &self,
         _ctx: &CallerContext,
         signal: &crate::models::Signal,
-    ) -> StoreResult<String> {
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
         // #1709 Pillar 1 — JSON columns (body, reference_ids) stored as TEXT
-        // (parity with sqlite); signature/sender_pubkey are BYTEA. No Ed25519
-        // signing yet — the byte vectors are persisted verbatim.
+        // (parity with sqlite); signature/sender_pubkey are BYTEA. Mirror
+        // `link_signed`: sign a clone when a signing keypair is present, else
+        // persist verbatim (unsigned).
+        let (to_store, attest) = match keypair {
+            Some(kp) if kp.can_sign() => {
+                let mut signed = signal.clone();
+                crate::signals::sign_into(&mut signed, kp).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("signal sign failed: {e:#}"),
+                    }
+                })?;
+                (signed, crate::models::AttestLevel::SelfSigned.as_str())
+            }
+            _ => (
+                signal.clone(),
+                crate::models::AttestLevel::Unsigned.as_str(),
+            ),
+        };
         sqlx::query(
             "INSERT INTO signals \
                 (id, namespace, from_agent, to_agent, subject, body, signal_type, \
@@ -12405,27 +12422,27 @@ impl MemoryStore for PostgresStore {
                  delivered_at, read_at, acknowledged_at, signature, sender_pubkey) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
-        .bind(&signal.id)
-        .bind(&signal.namespace)
-        .bind(&signal.from_agent)
-        .bind(&signal.to_agent)
-        .bind(&signal.subject)
-        .bind(signal.body.to_string())
-        .bind(signal.signal_type.as_str())
-        .bind(&signal.in_reply_to)
-        .bind(&signal.correlation_id)
-        .bind(signal.reference_ids.to_string())
-        .bind(signal.created_at)
-        .bind(signal.expires_at)
-        .bind(signal.delivered_at)
-        .bind(signal.read_at)
-        .bind(signal.acknowledged_at)
-        .bind(&signal.signature)
-        .bind(&signal.sender_pubkey)
+        .bind(&to_store.id)
+        .bind(&to_store.namespace)
+        .bind(&to_store.from_agent)
+        .bind(&to_store.to_agent)
+        .bind(&to_store.subject)
+        .bind(to_store.body.to_string())
+        .bind(to_store.signal_type.as_str())
+        .bind(&to_store.in_reply_to)
+        .bind(&to_store.correlation_id)
+        .bind(to_store.reference_ids.to_string())
+        .bind(to_store.created_at)
+        .bind(to_store.expires_at)
+        .bind(to_store.delivered_at)
+        .bind(to_store.read_at)
+        .bind(to_store.acknowledged_at)
+        .bind(&to_store.signature)
+        .bind(&to_store.sender_pubkey)
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("signal_send", e))?;
-        Ok(signal.id.clone())
+        Ok(attest)
     }
 
     async fn signal_get(

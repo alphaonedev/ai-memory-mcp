@@ -938,9 +938,23 @@ impl MemoryStore for SqliteStore {
         &self,
         _ctx: &CallerContext,
         signal: &crate::models::Signal,
-    ) -> StoreResult<String> {
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
+        // #1709 Pillar 1 — mirror `link_signed`: sign a clone when a signing
+        // keypair is present, else persist the signal verbatim (unsigned).
         let conn = self.state.lock().await;
-        crate::signals::insert(&conn, signal).map_err(box_err)
+        match keypair {
+            Some(kp) if kp.can_sign() => {
+                let mut signed = signal.clone();
+                crate::signals::sign_into(&mut signed, kp).map_err(box_err)?;
+                crate::signals::insert(&conn, &signed).map_err(box_err)?;
+                Ok(crate::models::AttestLevel::SelfSigned.as_str())
+            }
+            _ => {
+                crate::signals::insert(&conn, signal).map_err(box_err)?;
+                Ok(crate::models::AttestLevel::Unsigned.as_str())
+            }
+        }
     }
 
     async fn signal_get(

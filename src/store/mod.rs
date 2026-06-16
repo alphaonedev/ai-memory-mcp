@@ -1602,15 +1602,22 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
-    /// #1709 Pillar 1 — send a signed signal (the v60 `signals` table).
-    /// Returns the signal id. No Ed25519 signing happens here yet:
-    /// `signal.signature` / `signal.sender_pubkey` are persisted verbatim as
-    /// caller-provided byte vectors. Default `UnsupportedCapability`.
+    /// #1709 Pillar 1 — send a signal, optionally Ed25519-signed (the v60
+    /// `signals` table). Returns the resolved attestation level — mirrors the
+    /// [`MemoryStore::link_signed`] contract: when `keypair` is `Some(kp)` AND
+    /// `kp.can_sign()`, the signal's immutable content is CBOR-canonicalised
+    /// and signed, the 64-byte signature + 32-byte public key are persisted,
+    /// and `"self_signed"` is returned. Otherwise the signal lands verbatim
+    /// (`signature` / `sender_pubkey` as supplied — empty for an unsigned
+    /// send) and `"unsigned"` is returned.
+    ///
+    /// Default `UnsupportedCapability`.
     async fn signal_send(
         &self,
         _ctx: &CallerContext,
         _signal: &crate::models::Signal,
-    ) -> StoreResult<String> {
+        _keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
         Err(StoreError::UnsupportedCapability {
             capability: "SIGNALS".to_string(),
         })
