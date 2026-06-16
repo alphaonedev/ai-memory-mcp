@@ -333,6 +333,67 @@ const fn attest_rank(level: AttestLevel) -> u8 {
     }
 }
 
+/// v0.8.0 #1709 §2.5 T1 (C1a) — the ordered provenance-tier vocabulary
+/// surfaced as the recall-row `provenance_tier` decoration. These are
+/// the SSOT wire strings for [`provenance_tier`]; defining them once
+/// keeps the ≥3-site literal-duplication ratchet
+/// (`scripts/check-hardcoded-literals.sh`) green and makes the ordered
+/// set greppable. Ordering (strongest → weakest):
+/// `signed_peer` > `curator_derived` > `self_signed` > `unsigned_caller`.
+const PROVENANCE_TIER_SIGNED_PEER: &str = "signed_peer";
+const PROVENANCE_TIER_CURATOR_DERIVED: &str = "curator_derived";
+const PROVENANCE_TIER_SELF_SIGNED: &str = "self_signed";
+const PROVENANCE_TIER_UNSIGNED_CALLER: &str = "unsigned_caller";
+
+/// v0.8.0 #1709 §2.5 T1 (C1a) — map a row's already-fetched provenance
+/// signals to one ordered `provenance_tier` decoration string. PURE:
+/// no DB query, no LLM — it reads only the row's
+/// [`ConfidenceSource`](crate::models::ConfidenceSource) and the
+/// strongest incident link-attestation already resolved into the batch
+/// `attest_map` by [`latest_link_attest_level_many`] (passed here as the
+/// parsed [`AttestLevel`], or `None` when no link is incident).
+///
+/// This tier is **decoration only** — it is NOT a ranking key; recall
+/// ordering is untouched (the `m.confidence * 2.0` SQL term and the
+/// reranker remain the sole rank inputs).
+///
+/// Ordered mapping (strongest first; the match is evaluated top-down so
+/// a stronger arm always wins):
+///   1. attest is `SignedByPeer` / `PeerAttested` (the strongest
+///      attestation tier — an external pubkey enrollment + verified
+///      signature) → `signed_peer`.
+///   2. else `confidence_source` is engine-derived
+///      (`CuratorDerived` — atomiser/persona; `AutoDerived` — Form-5
+///      derive engine; `Calibrated` — calibration sweep) → the value
+///      was computed by the substrate, not asserted by a caller →
+///      `curator_derived`.
+///   3. else attest is `SelfSigned` / `DaemonSigned` (a writer-local /
+///      substrate-self signature) → `self_signed`.
+///   4. else → `unsigned_caller` (caller-provided / compiled-default /
+///      decayed value with no link attestation — the lowest-trust
+///      bucket).
+const fn provenance_tier(
+    confidence_source: crate::models::ConfidenceSource,
+    attest: Option<AttestLevel>,
+) -> &'static str {
+    use crate::models::ConfidenceSource;
+    match (attest, confidence_source) {
+        (Some(AttestLevel::SignedByPeer | AttestLevel::PeerAttested), _) => {
+            PROVENANCE_TIER_SIGNED_PEER
+        }
+        (
+            _,
+            ConfidenceSource::CuratorDerived
+            | ConfidenceSource::AutoDerived
+            | ConfidenceSource::Calibrated,
+        ) => PROVENANCE_TIER_CURATOR_DERIVED,
+        (Some(AttestLevel::SelfSigned | AttestLevel::DaemonSigned), _) => {
+            PROVENANCE_TIER_SELF_SIGNED
+        }
+        _ => PROVENANCE_TIER_UNSIGNED_CALLER,
+    }
+}
+
 /// FX-4 / PERF-2 (2026-05-26) — batched lookup of the strongest
 /// attestation level across every link incident on each `memory_id`
 /// in `ids`. v0.8.0 #1709 §2.5 T0 — this is now the SOLE attestation
@@ -489,9 +550,25 @@ pub fn decorate_memory_many(
                 json!(mem.confidence_tier().as_str()),
             );
             obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
+            // v0.8.0 #1709 §2.5 T1 (C1a) — the strongest incident
+            // attestation already resolved into `attest_map` (one
+            // batched IN(...) emit, no per-row query). Re-parse the
+            // wire string back to the typed `AttestLevel` so the
+            // provenance mapping stays exhaustive over the enum.
+            let attest_level = attest_map
+                .get(&mem.id)
+                .and_then(|s| AttestLevel::from_str(s));
             if let Some(level) = attest_map.get(&mem.id) {
                 obj.insert("latest_link_attest_level".to_string(), json!(level));
             }
+            // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier decoration
+            // composed PURELY from already-fetched data (the row's
+            // confidence_source + the batched attest level). No new DB
+            // query, no LLM. Decoration only — NOT a ranking key.
+            obj.insert(
+                "provenance_tier".to_string(),
+                json!(provenance_tier(mem.confidence_source, attest_level)),
+            );
             val
         })
         .collect()
@@ -1742,5 +1819,92 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("context"));
+    }
+
+    // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier mapping covers all
+    // four ordered output tiers from the (ConfidenceSource × attest)
+    // signal pair, evaluated strongest-arm-first.
+    #[test]
+    fn provenance_tier_maps_all_four_tiers() {
+        use crate::models::ConfidenceSource;
+
+        // 1. signed_peer — strongest attestation wins regardless of
+        //    confidence_source (here a caller-provided value still maps
+        //    to signed_peer because a peer signature is present).
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CallerProvided,
+                Some(AttestLevel::SignedByPeer)
+            ),
+            "signed_peer"
+        );
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CallerProvided,
+                Some(AttestLevel::PeerAttested)
+            ),
+            "signed_peer"
+        );
+
+        // 2. curator_derived — engine-derived confidence_source with no
+        //    peer attestation. All three engine-derived variants map here.
+        assert_eq!(
+            provenance_tier(ConfidenceSource::CuratorDerived, None),
+            "curator_derived"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::AutoDerived, None),
+            "curator_derived"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Calibrated, None),
+            "curator_derived"
+        );
+
+        // 3. self_signed — writer-local / daemon-self signature, no peer
+        //    attestation, and not engine-derived.
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CallerProvided,
+                Some(AttestLevel::SelfSigned)
+            ),
+            "self_signed"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Default, Some(AttestLevel::DaemonSigned)),
+            "self_signed"
+        );
+
+        // 4. unsigned_caller — lowest-trust bucket: caller-provided /
+        //    compiled-default / decayed value with no (or unsigned) link
+        //    attestation.
+        assert_eq!(
+            provenance_tier(ConfidenceSource::CallerProvided, None),
+            "unsigned_caller"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Default, Some(AttestLevel::Unsigned)),
+            "unsigned_caller"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Decayed, None),
+            "unsigned_caller"
+        );
+
+        // Ordering invariant: a peer attestation outranks an
+        // engine-derived confidence_source (arm 1 before arm 2).
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CuratorDerived,
+                Some(AttestLevel::PeerAttested)
+            ),
+            "signed_peer"
+        );
+        // And an engine-derived source outranks a self-signed
+        // attestation (arm 2 before arm 3).
+        assert_eq!(
+            provenance_tier(ConfidenceSource::AutoDerived, Some(AttestLevel::SelfSigned)),
+            "curator_derived"
+        );
     }
 }
