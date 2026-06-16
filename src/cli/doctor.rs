@@ -2992,14 +2992,15 @@ mod tests {
         assert_eq!(v["schema_version"], "v0.6.4-tokens-1");
         assert_eq!(v["tokenizer"], "cl100k_base");
         // Token count grows as schemas evolve. Assert the honest
-        // cl100k_base range from sizes.rs (5K-18K post-#987 D1.6, upper
-        // bound raised from 17K for the v0.8.0 #1709 memory_action_*
-        // tools — see `tests/token_budget_guard.rs` for the load-bearing
-        // ceilings). The exact-figure invariant lives in
+        // cl100k_base range from sizes.rs (5K-20K post-#987 D1.6, upper
+        // bound raised 17K->18K->20K across the v0.8.0 #1709 Pillar-1
+        // memory_action_* + memory_lease_* tools — see
+        // `tests/token_budget_guard.rs` for the load-bearing ceilings).
+        // The exact-figure invariant lives in
         // `sizes::tests::full_profile_total_in_honest_measured_range`.
         let total = v["full_profile_total_tokens"].as_u64().unwrap();
         assert!(
-            (5_000..=18_000).contains(&total),
+            (5_000..=20_000).contains(&total),
             "full_profile_total_tokens out of honest range: {total}"
         );
         assert!(v["active_total_tokens"].as_u64().unwrap() > 0);

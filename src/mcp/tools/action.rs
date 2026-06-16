@@ -221,6 +221,117 @@ pub fn handle_action_edges(conn: &rusqlite::Connection, params: &Value) -> Resul
     }))
 }
 
+/// MCP handler for `memory_lease_acquire`. Acquires a single-holder lease
+/// on an action via [`crate::actions::lease_acquire`]. The `expires_at`
+/// timestamp is computed internally from `ttl_secs` (default 60) so callers
+/// never marshal wall-clock time.
+///
+/// # Errors
+/// - `lease conflict: <id> held by another holder` when a non-expired lease
+///   is held by a different holder.
+/// - The stringified `rusqlite` error on query/insert failure.
+pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let action_id = params
+        .get(param_names::ACTION_ID)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let holder = params
+        .get(param_names::HOLDER)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let ttl_secs = params
+        .get(param_names::TTL_SECS)
+        .and_then(Value::as_i64)
+        .unwrap_or(60);
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = now + ttl_secs;
+    match crate::actions::lease_acquire(conn, action_id, holder, now, expires_at)
+        .map_err(|e| e.to_string())?
+    {
+        crate::actions::LeaseAcquire::Conflict => Err(format!(
+            "lease conflict: {action_id} held by another holder"
+        )),
+        crate::actions::LeaseAcquire::Acquired(l) => Ok(json!({
+            "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
+        })),
+    }
+}
+
+/// MCP handler for `memory_lease_renew`. Heartbeat-renews an owned lease via
+/// [`crate::actions::lease_renew`]. `expires_at` is computed internally from
+/// `ttl_secs` (default 60).
+///
+/// # Errors
+/// - `no lease held by <holder> on <action_id>` when no lease matches.
+/// - The stringified `rusqlite` error on query/update failure.
+pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let action_id = params
+        .get(param_names::ACTION_ID)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let holder = params
+        .get(param_names::HOLDER)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let ttl_secs = params
+        .get(param_names::TTL_SECS)
+        .and_then(Value::as_i64)
+        .unwrap_or(60);
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = now + ttl_secs;
+    match crate::actions::lease_renew(conn, action_id, holder, now, expires_at)
+        .map_err(|e| e.to_string())?
+    {
+        None => Err(format!("no lease held by {holder} on {action_id}")),
+        Some(l) => Ok(json!({
+            "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
+        })),
+    }
+}
+
+/// MCP handler for `memory_lease_release`. Releases an owned lease via
+/// [`crate::actions::lease_release`]. Returns `released: <bool>` — `false`
+/// when no matching lease existed.
+///
+/// # Errors
+/// Returns the stringified `rusqlite` error on delete failure.
+pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let action_id = params
+        .get(param_names::ACTION_ID)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let holder = params
+        .get(param_names::HOLDER)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let released =
+        crate::actions::lease_release(conn, action_id, holder).map_err(|e| e.to_string())?;
+    Ok(json!({ "released": released }))
+}
+
+/// MCP handler for `memory_lease_get`. Reads the lease on an action via
+/// [`crate::actions::lease_get`]. The `lease` field is `null` when no lease
+/// row exists, mirroring how `memory_action_get` reports an absent row.
+///
+/// # Errors
+/// Returns the stringified `rusqlite` error on query failure.
+pub fn handle_lease_get(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    let action_id = params
+        .get(param_names::ACTION_ID)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let found = crate::actions::lease_get(conn, action_id).map_err(|e| e.to_string())?;
+    let lease = match found {
+        Some(l) => serde_json::to_value(&l).map_err(|e| e.to_string())?,
+        None => Value::Null,
+    };
+    Ok(json!({ "lease": lease }))
+}
+
 // --- per-tool McpTool impls (v0.8.0 Pillar 1, #1709) ---
 
 use crate::mcp::registry::McpTool;
@@ -304,6 +415,50 @@ pub struct ActionAddEdgeRequest {
 #[allow(dead_code)]
 pub struct ActionEdgesRequest {
     pub id: String,
+}
+
+/// v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_acquire`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct LeaseAcquireRequest {
+    pub action_id: String,
+
+    pub holder: String,
+
+    /// Lease lifetime in seconds (default 60). `expires_at` is computed
+    /// internally as `now + ttl_secs`.
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+}
+
+/// v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_renew`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct LeaseRenewRequest {
+    pub action_id: String,
+
+    pub holder: String,
+
+    /// New lease lifetime in seconds (default 60). `expires_at` is computed
+    /// internally as `now + ttl_secs`.
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+}
+
+/// v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_release`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct LeaseReleaseRequest {
+    pub action_id: String,
+
+    pub holder: String,
+}
+
+/// v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_get`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct LeaseGetRequest {
+    pub action_id: String,
 }
 
 /// v0.8.0 Pillar 1 (#1709) — `McpTool` impl for `memory_action_create`.
@@ -438,6 +593,94 @@ impl McpTool for ActionEdgesTool {
     }
 }
 
+/// v0.8.0 Pillar 1 (#1709) — `McpTool` impl for `memory_lease_acquire`.
+#[allow(dead_code)]
+pub struct LeaseAcquireTool;
+
+impl McpTool for LeaseAcquireTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_LEASE_ACQUIRE
+    }
+    fn description() -> &'static str {
+        "Acquire a single-holder lease on a coordination action (#1709)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<LeaseAcquireRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Power.name()
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709) — `McpTool` impl for `memory_lease_renew`.
+#[allow(dead_code)]
+pub struct LeaseRenewTool;
+
+impl McpTool for LeaseRenewTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_LEASE_RENEW
+    }
+    fn description() -> &'static str {
+        "Heartbeat-renew an owned lease on a coordination action (#1709)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<LeaseRenewRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Power.name()
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709) — `McpTool` impl for `memory_lease_release`.
+#[allow(dead_code)]
+pub struct LeaseReleaseTool;
+
+impl McpTool for LeaseReleaseTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_LEASE_RELEASE
+    }
+    fn description() -> &'static str {
+        "Release an owned lease on a coordination action (#1709)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 1 (#1709): release an owned lease; reports whether a row was removed."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<LeaseReleaseRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Power.name()
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709) — `McpTool` impl for `memory_lease_get`.
+#[allow(dead_code)]
+pub struct LeaseGetTool;
+
+impl McpTool for LeaseGetTool {
+    fn name() -> &'static str {
+        crate::mcp::registry::tool_names::MEMORY_LEASE_GET
+    }
+    fn description() -> &'static str {
+        "Read the lease on a coordination action (#1709)."
+    }
+    fn docs() -> &'static str {
+        "Pillar 1 (#1709): return the lease on an action, or null when none is held."
+    }
+    fn input_schema() -> Value {
+        crate::mcp::registry::input_schema_for::<LeaseGetRequest>()
+    }
+    fn family() -> &'static str {
+        crate::profile::Family::Power.name()
+    }
+}
+
 #[cfg(test)]
 mod d1_6_1709_tests {
     //! D1.6 (#987) parity tests for the Pillar-1 `memory_action_*` tools.
@@ -490,6 +733,38 @@ mod d1_6_1709_tests {
         assert_eq!(ActionEdgesTool::family(), "power");
         assert!(!ActionEdgesTool::description().is_empty());
         assert!(!ActionEdgesTool::docs().is_empty());
+    }
+
+    #[test]
+    fn lease_acquire_tool_metadata() {
+        assert_eq!(LeaseAcquireTool::name(), "memory_lease_acquire");
+        assert_eq!(LeaseAcquireTool::family(), "power");
+        assert!(!LeaseAcquireTool::description().is_empty());
+        assert!(!LeaseAcquireTool::docs().is_empty());
+    }
+
+    #[test]
+    fn lease_renew_tool_metadata() {
+        assert_eq!(LeaseRenewTool::name(), "memory_lease_renew");
+        assert_eq!(LeaseRenewTool::family(), "power");
+        assert!(!LeaseRenewTool::description().is_empty());
+        assert!(!LeaseRenewTool::docs().is_empty());
+    }
+
+    #[test]
+    fn lease_release_tool_metadata() {
+        assert_eq!(LeaseReleaseTool::name(), "memory_lease_release");
+        assert_eq!(LeaseReleaseTool::family(), "power");
+        assert!(!LeaseReleaseTool::description().is_empty());
+        assert!(!LeaseReleaseTool::docs().is_empty());
+    }
+
+    #[test]
+    fn lease_get_tool_metadata() {
+        assert_eq!(LeaseGetTool::name(), "memory_lease_get");
+        assert_eq!(LeaseGetTool::family(), "power");
+        assert!(!LeaseGetTool::description().is_empty());
+        assert!(!LeaseGetTool::docs().is_empty());
     }
 
     #[test]
@@ -627,6 +902,65 @@ mod handler_tests {
             &json!({ "from_action": id, "to_action": id, "edge_type": "bogus" }),
         );
         assert!(bad_edge.is_err());
+    }
+
+    #[test]
+    fn lease_acquire_renew_release_get_roundtrip_over_mcp() {
+        let conn = fresh();
+        // A lease references a real action row, so create one first.
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        // Acquire by holder-a.
+        let acquired = handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id, "holder": "holder-a", "ttl_secs": 120 }),
+        )
+        .expect("acquire ok");
+        assert_eq!(acquired["lease"]["holder"].as_str(), Some("holder-a"));
+        assert_eq!(acquired["lease"]["action_id"].as_str(), Some(id.as_str()));
+
+        // A different holder hits the conflict error path.
+        let conflict =
+            handle_lease_acquire(&conn, &json!({ "action_id": id, "holder": "holder-b" }));
+        assert!(conflict.is_err());
+
+        // get returns the held lease.
+        let got = handle_lease_get(&conn, &json!({ "action_id": id })).expect("get ok");
+        assert_eq!(got["lease"]["holder"].as_str(), Some("holder-a"));
+
+        // Renew by the owner succeeds.
+        let renewed = handle_lease_renew(
+            &conn,
+            &json!({ "action_id": id, "holder": "holder-a", "ttl_secs": 90 }),
+        )
+        .expect("renew ok");
+        assert_eq!(renewed["lease"]["holder"].as_str(), Some("holder-a"));
+
+        // Renew by a non-owner is the no-lease error path.
+        let no_lease = handle_lease_renew(&conn, &json!({ "action_id": id, "holder": "holder-b" }));
+        assert!(no_lease.is_err());
+
+        // Release by a non-owner removes nothing.
+        let not_released =
+            handle_lease_release(&conn, &json!({ "action_id": id, "holder": "holder-b" }))
+                .expect("release ok");
+        assert_eq!(not_released["released"].as_bool(), Some(false));
+
+        // Release by the owner removes it; get then reports null.
+        let released =
+            handle_lease_release(&conn, &json!({ "action_id": id, "holder": "holder-a" }))
+                .expect("release ok");
+        assert_eq!(released["released"].as_bool(), Some(true));
+        let absent = handle_lease_get(&conn, &json!({ "action_id": id })).expect("get ok");
+        assert!(absent["lease"].is_null());
     }
 
     #[test]

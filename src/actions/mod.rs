@@ -240,6 +240,127 @@ pub fn edges_for(
     Ok(out)
 }
 
+/// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical column order for
+/// [`row_to_lease`]). One definition shared by every lease read (the SAL
+/// adapter + the MCP `memory_lease_*` handlers).
+pub const LEASE_SELECT_BY_ID_SQL: &str = "SELECT action_id, holder, acquired_at, expires_at, heartbeat_at \
+     FROM leases WHERE action_id = ?1";
+
+/// Map a `rusqlite` row (the [`LEASE_SELECT_BY_ID_SQL`] column order) to a
+/// [`crate::models::Lease`].
+///
+/// # Errors
+/// Propagates the `rusqlite` column-access error.
+pub fn row_to_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Lease> {
+    Ok(crate::models::Lease {
+        action_id: r.get(0)?,
+        holder: r.get(1)?,
+        acquired_at: r.get(2)?,
+        expires_at: r.get(3)?,
+        heartbeat_at: r.get(4)?,
+    })
+}
+
+/// Outcome of a lease acquisition (free-fn shared by SAL + MCP).
+///
+/// The SAL adapter maps `Conflict` to `StoreError::Conflict`; the MCP
+/// handler maps it to a caller-facing error string. Both share the single
+/// sqlite implementation in [`lease_acquire`].
+pub enum LeaseAcquire {
+    /// A non-expired lease held by a different holder blocks acquisition.
+    Conflict,
+    /// The lease was acquired (or re-acquired by the same holder); carries
+    /// the re-fetched lease row.
+    Acquired(crate::models::Lease),
+}
+
+/// Acquire a single-holder lease on an action. A non-expired lease held by a
+/// different holder blocks acquisition (`Conflict`); otherwise the lease is
+/// inserted-or-replaced and re-fetched (`Acquired`).
+///
+/// # Errors
+/// Propagates the `rusqlite` query/insert error.
+pub fn lease_acquire(
+    conn: &Connection,
+    action_id: &str,
+    holder: &str,
+    now: i64,
+    expires_at: i64,
+) -> rusqlite::Result<LeaseAcquire> {
+    // A non-expired lease held by a different holder blocks acquisition.
+    let existing: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT holder, expires_at FROM leases WHERE action_id = ?1",
+            params![action_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((h, exp)) = existing
+        && exp > now
+        && h != holder
+    {
+        return Ok(LeaseAcquire::Conflict);
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO leases \
+            (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+         VALUES (?1, ?2, ?3, ?4, ?3)",
+        params![action_id, holder, now, expires_at],
+    )?;
+    let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
+    Ok(LeaseAcquire::Acquired(lease))
+}
+
+/// Heartbeat-renew an owned lease (`expires_at` + `heartbeat_at` bump). Returns
+/// `None` when no lease matches `(action_id, holder)` (missing or owned by a
+/// different holder); otherwise the re-fetched lease.
+///
+/// # Errors
+/// Propagates the `rusqlite` update/query error.
+pub fn lease_renew(
+    conn: &Connection,
+    action_id: &str,
+    holder: &str,
+    now: i64,
+    expires_at: i64,
+) -> rusqlite::Result<Option<crate::models::Lease>> {
+    let n = conn.execute(
+        "UPDATE leases SET expires_at = ?1, heartbeat_at = ?2 \
+          WHERE action_id = ?3 AND holder = ?4",
+        params![expires_at, now, action_id, holder],
+    )?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
+    Ok(Some(lease))
+}
+
+/// Release an owned lease. Returns `true` when a row was deleted, `false` when
+/// no lease matched `(action_id, holder)`.
+///
+/// # Errors
+/// Propagates the `rusqlite` delete error.
+pub fn lease_release(conn: &Connection, action_id: &str, holder: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM leases WHERE action_id = ?1 AND holder = ?2",
+        params![action_id, holder],
+    )?;
+    Ok(n > 0)
+}
+
+/// Read the lease on an action. `None` when no lease row exists.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+pub fn lease_get(
+    conn: &Connection,
+    action_id: &str,
+) -> rusqlite::Result<Option<crate::models::Lease>> {
+    conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)
+        .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +486,71 @@ mod tests {
         // e2 is the `to` endpoint, so it sees the same edge.
         let from_e2 = edges_for(&conn, "e2").unwrap();
         assert_eq!(from_e2.len(), 1);
+    }
+
+    #[test]
+    fn lease_acquire_renew_release_get_roundtrips() {
+        let conn = fresh();
+        // A lease references a real action row, so create one first.
+        create(&conn, &sample("lease-1")).unwrap();
+
+        // First acquire by holder-a succeeds.
+        match lease_acquire(&conn, "lease-1", "holder-a", 1_700_000_000, 1_700_000_060).unwrap() {
+            LeaseAcquire::Acquired(l) => {
+                assert_eq!(l.action_id, "lease-1");
+                assert_eq!(l.holder, "holder-a");
+                assert_eq!(l.acquired_at, 1_700_000_000);
+                assert_eq!(l.expires_at, 1_700_000_060);
+                assert_eq!(l.heartbeat_at, 1_700_000_000);
+            }
+            LeaseAcquire::Conflict => panic!("expected Acquired"),
+        }
+
+        // A different holder cannot acquire while the lease is non-expired.
+        assert!(matches!(
+            lease_acquire(&conn, "lease-1", "holder-b", 1_700_000_010, 1_700_000_070).unwrap(),
+            LeaseAcquire::Conflict
+        ));
+
+        // The same holder may re-acquire (heartbeat-style refresh).
+        match lease_acquire(&conn, "lease-1", "holder-a", 1_700_000_020, 1_700_000_080).unwrap() {
+            LeaseAcquire::Acquired(l) => assert_eq!(l.expires_at, 1_700_000_080),
+            LeaseAcquire::Conflict => panic!("same-holder re-acquire must succeed"),
+        }
+
+        // Renew by the owner bumps expires_at + heartbeat_at.
+        let renewed = lease_renew(&conn, "lease-1", "holder-a", 1_700_000_030, 1_700_000_090)
+            .unwrap()
+            .expect("owned renew is Some");
+        assert_eq!(renewed.expires_at, 1_700_000_090);
+        assert_eq!(renewed.heartbeat_at, 1_700_000_030);
+
+        // Renew by a non-owner is a no-op (None).
+        assert!(
+            lease_renew(&conn, "lease-1", "holder-b", 1_700_000_040, 1_700_000_100)
+                .unwrap()
+                .is_none()
+        );
+        // Renew on a missing action is None.
+        assert!(
+            lease_renew(&conn, "missing", "holder-a", 1_700_000_040, 1_700_000_100)
+                .unwrap()
+                .is_none()
+        );
+
+        // get returns the present lease.
+        let got = lease_get(&conn, "lease-1").unwrap().expect("lease present");
+        assert_eq!(got.holder, "holder-a");
+        assert_eq!(got.expires_at, 1_700_000_090);
+
+        // Release by a non-owner does nothing (false), the lease persists.
+        assert!(!lease_release(&conn, "lease-1", "holder-b").unwrap());
+        assert!(lease_get(&conn, "lease-1").unwrap().is_some());
+
+        // Release by the owner removes it (true); get is then absent.
+        assert!(lease_release(&conn, "lease-1", "holder-a").unwrap());
+        assert!(lease_get(&conn, "lease-1").unwrap().is_none());
+        // Release on an already-absent lease is false.
+        assert!(!lease_release(&conn, "lease-1", "holder-a").unwrap());
     }
 }

@@ -37,6 +37,7 @@
 // defined as aliases of `crate::models::field_names::*` so each string
 // has exactly ONE spelling in the tree. The public surface (const name,
 // value, ALL_PARAM_NAMES census) is unchanged.
+pub const ACTION_ID: &str = "action_id";
 pub const AGENT_FILTER: &str = crate::models::field_names::AGENT_FILTER;
 pub const AGENT_ID: &str = "agent_id";
 pub const AGENT_TYPE: &str = crate::models::field_names::AGENT_TYPE;
@@ -74,6 +75,7 @@ pub const FORCE_RE_ATOMISE: &str = "force_re_atomise";
 pub const FORMAT: &str = "format";
 pub const FROM_ACTION: &str = "from_action";
 pub const GOVERNANCE: &str = crate::models::field_names::GOVERNANCE;
+pub const HOLDER: &str = "holder";
 pub const ID: &str = "id";
 pub const ID_A: &str = "id_a";
 pub const ID_B: &str = "id_b";
@@ -138,6 +140,7 @@ pub const TO: &str = "to";
 pub const TO_ACTION: &str = "to_action";
 pub const TO_NAMESPACE: &str = "to_namespace";
 pub const TTL_SECONDS: &str = "ttl_seconds";
+pub const TTL_SECS: &str = "ttl_secs";
 pub const UNREAD_ONLY: &str = "unread_only";
 pub const UNTIL: &str = "until";
 pub const URL: &str = "url";
@@ -156,6 +159,7 @@ pub const VALID_UNTIL: &str = crate::models::field_names::VALID_UNTIL;
 /// const that no production code references — surfaces dead consts
 /// for cleanup).
 pub const ALL_PARAM_NAMES: &[&str] = &[
+    ACTION_ID,
     AGENT_FILTER,
     AGENT_ID,
     AGENT_TYPE,
@@ -193,6 +197,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     FORMAT,
     FROM_ACTION,
     GOVERNANCE,
+    HOLDER,
     ID,
     ID_A,
     ID_B,
@@ -257,6 +262,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     TO_ACTION,
     TO_NAMESPACE,
     TTL_SECONDS,
+    TTL_SECS,
     UNREAD_ONLY,
     UNTIL,
     URL,
@@ -278,7 +284,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            106,
+            109,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
