@@ -13,6 +13,23 @@
 use crate::models::Action;
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// Outcome of a state-guarded transition (free-fn shared by SAL + MCP).
+///
+/// The SAL adapter maps these to its `StoreError` variants; the MCP
+/// handler maps them to caller-facing error strings. Both share the
+/// single sqlite implementation in [`transition`].
+pub enum TransitionOutcome {
+    /// No `actions` row matched the id.
+    NotFound,
+    /// `from → to` is not a legal coordination transition.
+    Illegal {
+        from: crate::models::ActionState,
+        to: crate::models::ActionState,
+    },
+    /// The transition applied; carries the re-fetched action.
+    Updated(Action),
+}
+
 /// SELECT column list for the `actions` table, in the canonical order
 /// [`row_to_action`] expects. One definition shared by every action read.
 pub const ACTION_SELECT_SQL: &str = "SELECT id, namespace, kind, state, title, payload, \
@@ -85,6 +102,144 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Action>> {
     .optional()
 }
 
+/// Canonical wire-message for an illegal coordination transition,
+/// shared byte-for-byte by the SAL sqlite + postgres adapters and the
+/// MCP handler (pm-v3.1: one spelling of the magic string, not three).
+#[must_use]
+pub fn illegal_transition_detail(
+    from: crate::models::ActionState,
+    to: crate::models::ActionState,
+) -> String {
+    format!(
+        "illegal action transition: {} -> {}",
+        from.as_str(),
+        to.as_str()
+    )
+}
+
+/// State-guarded transition of one action. Fetches the current state,
+/// validates `from → to` via [`crate::models::ActionState::can_transition_to`],
+/// then updates `state` / `claimed_by` / `updated_at` and re-fetches.
+///
+/// # Errors
+/// Propagates the `rusqlite` query/update error.
+pub fn transition(
+    conn: &Connection,
+    id: &str,
+    to: crate::models::ActionState,
+    claimed_by: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<TransitionOutcome> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT state FROM actions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(cs) = current else {
+        return Ok(TransitionOutcome::NotFound);
+    };
+    let from = crate::models::ActionState::from_str(&cs).unwrap_or_default();
+    if !from.can_transition_to(to) {
+        return Ok(TransitionOutcome::Illegal { from, to });
+    }
+    conn.execute(
+        "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 WHERE id = ?4",
+        params![to.as_str(), claimed_by, now, id],
+    )?;
+    let action = conn.query_row(
+        &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
+        params![id],
+        row_to_action,
+    )?;
+    Ok(TransitionOutcome::Updated(action))
+}
+
+/// List actions filtered by optional `namespace` / `state`, newest-first,
+/// capped at `limit`.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+pub fn list(
+    conn: &Connection,
+    namespace: Option<&str>,
+    state: Option<crate::models::ActionState>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Action>> {
+    let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut sql = format!("{ACTION_SELECT_SQL} WHERE 1 = 1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(ns) = namespace {
+        sql.push_str(" AND namespace = ?");
+        binds.push(Box::new(ns.to_string()));
+    }
+    if let Some(st) = state {
+        sql.push_str(" AND state = ?");
+        binds.push(Box::new(st.as_str().to_string()));
+    }
+    sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
+    binds.push(Box::new(lim));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(binds.iter().map(|b| &**b)),
+        row_to_action,
+    )?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Insert a typed DAG edge between two actions. `INSERT OR IGNORE` so a
+/// duplicate `(from, to, type)` triple is a no-op.
+///
+/// # Errors
+/// Propagates the `rusqlite` insert error.
+pub fn add_edge(
+    conn: &Connection,
+    from_action: &str,
+    to_action: &str,
+    edge_type: crate::models::EdgeType,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO action_edges (from_action, to_action, edge_type, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![from_action, to_action, edge_type.as_str(), now],
+    )?;
+    Ok(())
+}
+
+/// List every edge touching `action_id` (as either endpoint), oldest-first.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+pub fn edges_for(
+    conn: &Connection,
+    action_id: &str,
+) -> rusqlite::Result<Vec<crate::models::ActionEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT from_action, to_action, edge_type, created_at FROM action_edges \
+          WHERE from_action = ?1 OR to_action = ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![action_id], |r| {
+        Ok(crate::models::ActionEdge {
+            from_action: r.get(0)?,
+            to_action: r.get(1)?,
+            edge_type: crate::models::EdgeType::from_str(&r.get::<_, String>(2)?)
+                .unwrap_or(crate::models::EdgeType::Sibling),
+            created_at: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +280,90 @@ mod tests {
         assert_eq!(got.agent_id.as_deref(), Some("agent-x"));
         assert_eq!(got.payload, serde_json::json!({"a": 1}));
         assert!(get(&conn, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn transition_legal_illegal_notfound() {
+        let conn = fresh();
+        create(&conn, &sample("t1")).unwrap();
+
+        // Legal: pending → claimed, stamping claimed_by + updated_at.
+        match transition(
+            &conn,
+            "t1",
+            ActionState::Claimed,
+            Some("holder-1"),
+            1_700_000_500,
+        )
+        .unwrap()
+        {
+            TransitionOutcome::Updated(a) => {
+                assert_eq!(a.state, ActionState::Claimed);
+                assert_eq!(a.claimed_by.as_deref(), Some("holder-1"));
+                assert_eq!(a.updated_at, 1_700_000_500);
+            }
+            _ => panic!("expected Updated"),
+        }
+
+        // Illegal: claimed → done (must go via in_progress).
+        match transition(&conn, "t1", ActionState::Done, None, 1_700_000_600).unwrap() {
+            TransitionOutcome::Illegal { from, to } => {
+                assert_eq!(from, ActionState::Claimed);
+                assert_eq!(to, ActionState::Done);
+            }
+            _ => panic!("expected Illegal"),
+        }
+
+        // NotFound: unknown id.
+        assert!(matches!(
+            transition(&conn, "missing", ActionState::Claimed, None, 1_700_000_700).unwrap(),
+            TransitionOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn list_filters_namespace_and_state() {
+        let conn = fresh();
+        let mut a = sample("l1");
+        a.namespace = "ns-a".to_string();
+        create(&conn, &a).unwrap();
+        let mut b = sample("l2");
+        b.namespace = "ns-b".to_string();
+        create(&conn, &b).unwrap();
+
+        let all = list(&conn, None, None, 50).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let only_a = list(&conn, Some("ns-a"), None, 50).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].id, "l1");
+
+        // Move l1 to claimed, then filter by state.
+        transition(&conn, "l1", ActionState::Claimed, None, 1_700_000_500).unwrap();
+        let claimed = list(&conn, None, Some(ActionState::Claimed), 50).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "l1");
+    }
+
+    #[test]
+    fn add_edge_then_edges_for_roundtrips() {
+        use crate::models::EdgeType;
+        let conn = fresh();
+        create(&conn, &sample("e1")).unwrap();
+        create(&conn, &sample("e2")).unwrap();
+
+        add_edge(&conn, "e1", "e2", EdgeType::Requires, 1_700_000_100).unwrap();
+        // Duplicate triple is a no-op (INSERT OR IGNORE).
+        add_edge(&conn, "e1", "e2", EdgeType::Requires, 1_700_000_200).unwrap();
+
+        let from_e1 = edges_for(&conn, "e1").unwrap();
+        assert_eq!(from_e1.len(), 1);
+        assert_eq!(from_e1[0].from_action, "e1");
+        assert_eq!(from_e1[0].to_action, "e2");
+        assert_eq!(from_e1[0].edge_type, EdgeType::Requires);
+
+        // e2 is the `to` endpoint, so it sees the same edge.
+        let from_e2 = edges_for(&conn, "e2").unwrap();
+        assert_eq!(from_e2.len(), 1);
     }
 }

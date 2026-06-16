@@ -842,39 +842,17 @@ impl MemoryStore for SqliteStore {
         now: i64,
     ) -> StoreResult<crate::models::Action> {
         let conn = self.state.lock().await;
-        // Fetch current state under the held mutex (atomic with the update).
-        let current: Option<String> = conn
-            .query_row(
-                "SELECT state FROM actions WHERE id = ?1",
-                rusqlite::params![id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(box_err)?;
-        let Some(cs) = current else {
-            return Err(StoreError::NotFound { id: id.to_string() });
-        };
-        let from = crate::models::ActionState::from_str(&cs).unwrap_or_default();
-        if !from.can_transition_to(to) {
-            return Err(StoreError::InvalidInput {
-                detail: format!(
-                    "illegal action transition: {} -> {}",
-                    from.as_str(),
-                    to.as_str()
-                ),
-            });
+        match crate::actions::transition(&conn, id, to, claimed_by, now).map_err(box_err)? {
+            crate::actions::TransitionOutcome::NotFound => {
+                Err(StoreError::NotFound { id: id.to_string() })
+            }
+            crate::actions::TransitionOutcome::Illegal { from, to } => {
+                Err(StoreError::InvalidInput {
+                    detail: crate::actions::illegal_transition_detail(from, to),
+                })
+            }
+            crate::actions::TransitionOutcome::Updated(a) => Ok(a),
         }
-        conn.execute(
-            "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 WHERE id = ?4",
-            rusqlite::params![to.as_str(), claimed_by, now, id],
-        )
-        .map_err(box_err)?;
-        conn.query_row(
-            &format!("{} WHERE id = ?1", crate::actions::ACTION_SELECT_SQL),
-            rusqlite::params![id],
-            crate::actions::row_to_action,
-        )
-        .map_err(box_err)
     }
 
     async fn action_list(
@@ -885,31 +863,7 @@ impl MemoryStore for SqliteStore {
         limit: usize,
     ) -> StoreResult<Vec<crate::models::Action>> {
         let conn = self.state.lock().await;
-        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut sql = format!("{} WHERE 1 = 1", crate::actions::ACTION_SELECT_SQL);
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(ns) = namespace {
-            sql.push_str(" AND namespace = ?");
-            binds.push(Box::new(ns.to_string()));
-        }
-        if let Some(st) = state {
-            sql.push_str(" AND state = ?");
-            binds.push(Box::new(st.as_str().to_string()));
-        }
-        sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
-        binds.push(Box::new(lim));
-        let mut stmt = conn.prepare(&sql).map_err(box_err)?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params_from_iter(binds.iter().map(|b| &**b)),
-                crate::actions::row_to_action,
-            )
-            .map_err(box_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(box_err)?);
-        }
-        Ok(out)
+        crate::actions::list(&conn, namespace, state, limit).map_err(box_err)
     }
 
     async fn action_add_edge(
@@ -921,13 +875,7 @@ impl MemoryStore for SqliteStore {
         now: i64,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
-        conn.execute(
-            "INSERT OR IGNORE INTO action_edges (from_action, to_action, edge_type, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![from_action, to_action, edge_type.as_str(), now],
-        )
-        .map_err(box_err)?;
-        Ok(())
+        crate::actions::add_edge(&conn, from_action, to_action, edge_type, now).map_err(box_err)
     }
 
     async fn action_edges_for(
@@ -936,28 +884,7 @@ impl MemoryStore for SqliteStore {
         action_id: &str,
     ) -> StoreResult<Vec<crate::models::ActionEdge>> {
         let conn = self.state.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT from_action, to_action, edge_type, created_at FROM action_edges \
-                  WHERE from_action = ?1 OR to_action = ?1 ORDER BY created_at ASC",
-            )
-            .map_err(box_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![action_id], |r| {
-                Ok(crate::models::ActionEdge {
-                    from_action: r.get(0)?,
-                    to_action: r.get(1)?,
-                    edge_type: crate::models::EdgeType::from_str(&r.get::<_, String>(2)?)
-                        .unwrap_or(crate::models::EdgeType::Sibling),
-                    created_at: r.get(3)?,
-                })
-            })
-            .map_err(box_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(box_err)?);
-        }
-        Ok(out)
+        crate::actions::edges_for(&conn, action_id).map_err(box_err)
     }
 
     async fn lease_acquire(

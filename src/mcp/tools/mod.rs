@@ -104,8 +104,12 @@ pub(super) mod share;
 // internal tools:: submodule structure.
 pub(super) use self::{
     store::handle_store,
+    action::handle_action_add_edge,
     action::handle_action_create,
+    action::handle_action_edges,
     action::handle_action_get,
+    action::handle_action_list,
+    action::handle_action_transition,
     recall::handle_recall,
     recall::handle_recall_with_pre_recall_hook,
     recall_observations::handle_recall_observations,

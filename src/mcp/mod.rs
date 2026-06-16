@@ -966,7 +966,10 @@ pub fn skill_compositional_context_for_tests(
 // them directly without going through the stdio JSON-RPC layer.
 use store::handle_store;
 // v0.8.0 Pillar 1 (#1709) — coordination-action create/get handlers.
-use action::{handle_action_create, handle_action_get};
+use action::{
+    handle_action_add_edge, handle_action_create, handle_action_edges, handle_action_get,
+    handle_action_list, handle_action_transition,
+};
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
 // `handle_list_subscriptions` are also `pub use`-exported above; the
@@ -1236,6 +1239,26 @@ fn dispatch_memory_action_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_get`.
 fn dispatch_memory_action_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_action_get(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_transition`.
+fn dispatch_memory_action_transition(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_transition(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_list`.
+fn dispatch_memory_action_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_list(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_add_edge`.
+fn dispatch_memory_action_add_edge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_add_edge(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_edges`.
+fn dispatch_memory_action_edges(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_edges(ctx.conn, ctx.arguments)
 }
 
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1889,6 +1912,19 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
             dispatch_memory_action_create
         ),
         register_mcp_tool!(tool_names::MEMORY_ACTION_GET, dispatch_memory_action_get),
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_TRANSITION,
+            dispatch_memory_action_transition
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ACTION_LIST, dispatch_memory_action_list),
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_ADD_EDGE,
+            dispatch_memory_action_add_edge
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_EDGES,
+            dispatch_memory_action_edges
+        ),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
         register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),

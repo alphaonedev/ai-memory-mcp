@@ -51,6 +51,7 @@ pub const CALLER_AGENT_ID: &str = "caller_agent_id";
 pub const CANONICAL_NAME: &str = crate::models::field_names::CANONICAL_NAME;
 pub const CAPABILITIES: &str = crate::models::field_names::CAPABILITIES;
 pub const CITATIONS: &str = "citations";
+pub const CLAIMED_BY: &str = "claimed_by";
 pub const CONFIDENCE: &str = crate::models::field_names::CONFIDENCE;
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
@@ -58,6 +59,7 @@ pub const CONTEXT: &str = "context";
 pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
 pub const DEPTH: &str = "depth";
 pub const DRY_RUN: &str = "dry_run";
+pub const EDGE_TYPE: &str = "edge_type";
 pub const EDIT_SOURCE: &str = "edit_source";
 pub const ENTITY_ID: &str = crate::models::field_names::ENTITY_ID;
 pub const EVENT_TYPES: &str = "event_types";
@@ -70,6 +72,7 @@ pub const FOLDER_PATH: &str = "folder_path";
 pub const FORCE: &str = "force";
 pub const FORCE_RE_ATOMISE: &str = "force_re_atomise";
 pub const FORMAT: &str = "format";
+pub const FROM_ACTION: &str = "from_action";
 pub const GOVERNANCE: &str = crate::models::field_names::GOVERNANCE;
 pub const ID: &str = "id";
 pub const ID_A: &str = "id_a";
@@ -119,6 +122,7 @@ pub const SOURCE_IDS: &str = crate::models::field_names::SOURCE_IDS;
 pub const SOURCE_MEMORY_ID: &str = crate::models::field_names::SOURCE_MEMORY_ID;
 pub const SOURCE_SPAN: &str = crate::models::field_names::SOURCE_SPAN;
 pub const SOURCE_URI: &str = crate::models::field_names::SOURCE_URI;
+pub const STATE: &str = "state";
 pub const STATUS: &str = "status";
 pub const SUBSCRIPTION_ID: &str = crate::models::field_names::SUBSCRIPTION_ID;
 pub const SUMMARY: &str = "summary";
@@ -130,6 +134,8 @@ pub const TARGET_TIER: &str = "target_tier";
 pub const THRESHOLD: &str = "threshold";
 pub const TIER: &str = "tier";
 pub const TITLE: &str = "title";
+pub const TO: &str = "to";
+pub const TO_ACTION: &str = "to_action";
 pub const TO_NAMESPACE: &str = "to_namespace";
 pub const TTL_SECONDS: &str = "ttl_seconds";
 pub const UNREAD_ONLY: &str = "unread_only";
@@ -164,6 +170,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CANONICAL_NAME,
     CAPABILITIES,
     CITATIONS,
+    CLAIMED_BY,
     CONFIDENCE,
     CONSUMED,
     CONTENT,
@@ -171,6 +178,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CREATED_AT,
     DEPTH,
     DRY_RUN,
+    EDGE_TYPE,
     EDIT_SOURCE,
     ENTITY_ID,
     EVENT_TYPES,
@@ -183,6 +191,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     FORCE,
     FORCE_RE_ATOMISE,
     FORMAT,
+    FROM_ACTION,
     GOVERNANCE,
     ID,
     ID_A,
@@ -232,6 +241,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     SOURCE_MEMORY_ID,
     SOURCE_SPAN,
     SOURCE_URI,
+    STATE,
     STATUS,
     SUBSCRIPTION_ID,
     SUMMARY,
@@ -243,6 +253,8 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     THRESHOLD,
     TIER,
     TITLE,
+    TO,
+    TO_ACTION,
     TO_NAMESPACE,
     TTL_SECONDS,
     UNREAD_ONLY,
@@ -266,7 +278,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            100,
+            106,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

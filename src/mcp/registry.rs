@@ -34,10 +34,18 @@ use serde_json::{Value, json};
 /// `memory_<lower_snake>` so the call site reads naturally
 /// (`tool_names::MEMORY_STORE => …` ⇒ `"memory_store" => …`).
 pub mod tool_names {
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action DAG edge insert.
+    pub const MEMORY_ACTION_ADD_EDGE: &str = "memory_action_add_edge";
     /// v0.8.0 Pillar 1 (#1709) — coordination-action create.
     pub const MEMORY_ACTION_CREATE: &str = "memory_action_create";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action DAG edge list.
+    pub const MEMORY_ACTION_EDGES: &str = "memory_action_edges";
     /// v0.8.0 Pillar 1 (#1709) — coordination-action fetch-by-id.
     pub const MEMORY_ACTION_GET: &str = "memory_action_get";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action query by namespace/state.
+    pub const MEMORY_ACTION_LIST: &str = "memory_action_list";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action state-guarded transition.
+    pub const MEMORY_ACTION_TRANSITION: &str = "memory_action_transition";
     pub const MEMORY_AGENT_LIST: &str = "memory_agent_list";
     pub const MEMORY_AGENT_REGISTER: &str = "memory_agent_register";
     pub const MEMORY_ARCHIVE_LIST: &str = "memory_archive_list";
@@ -129,8 +137,12 @@ pub mod tool_names {
     /// without re-typing it.
     #[allow(dead_code)]
     pub const ALL: &[&str] = &[
+        MEMORY_ACTION_ADD_EDGE,
         MEMORY_ACTION_CREATE,
+        MEMORY_ACTION_EDGES,
         MEMORY_ACTION_GET,
+        MEMORY_ACTION_LIST,
+        MEMORY_ACTION_TRANSITION,
         MEMORY_AGENT_LIST,
         MEMORY_AGENT_REGISTER,
         MEMORY_ARCHIVE_LIST,
@@ -277,8 +289,12 @@ pub mod tool_names {
         /// `Claude Desktop reload` time.
         #[test]
         fn const_values_byte_equal_to_historical_wire_strings() {
+            assert_eq!(MEMORY_ACTION_ADD_EDGE, "memory_action_add_edge");
             assert_eq!(MEMORY_ACTION_CREATE, "memory_action_create");
+            assert_eq!(MEMORY_ACTION_EDGES, "memory_action_edges");
             assert_eq!(MEMORY_ACTION_GET, "memory_action_get");
+            assert_eq!(MEMORY_ACTION_LIST, "memory_action_list");
+            assert_eq!(MEMORY_ACTION_TRANSITION, "memory_action_transition");
             assert_eq!(MEMORY_AGENT_LIST, "memory_agent_list");
             assert_eq!(MEMORY_AGENT_REGISTER, "memory_agent_register");
             assert_eq!(MEMORY_ARCHIVE_LIST, "memory_archive_list");
@@ -636,9 +652,14 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::ingest_multistep::IngestMultistepTool>(),
         RegisteredTool::of::<crate::mcp::atomise::AtomiseTool>(),
         RegisteredTool::of::<crate::mcp::share::ShareTool>(),
-        // v0.8.0 Pillar 1 (#1709) — coordination-action create/get.
+        // v0.8.0 Pillar 1 (#1709) — coordination-action create/get +
+        // transition/list/add_edge/edges (the full DAG surface).
         RegisteredTool::of::<crate::mcp::action::ActionCreateTool>(),
         RegisteredTool::of::<crate::mcp::action::ActionGetTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionTransitionTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionListTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionAddEdgeTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionEdgesTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.

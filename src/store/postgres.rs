@@ -12045,11 +12045,7 @@ impl MemoryStore for PostgresStore {
         let from = crate::models::ActionState::from_str(&cs).unwrap_or_default();
         if !from.can_transition_to(to) {
             return Err(StoreError::InvalidInput {
-                detail: format!(
-                    "illegal action transition: {} -> {}",
-                    from.as_str(),
-                    to.as_str()
-                ),
+                detail: crate::actions::illegal_transition_detail(from, to),
             });
         }
         sqlx::query(
