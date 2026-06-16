@@ -75,9 +75,10 @@ use crate::models::{Memory, MemoryLink, Tier};
 /// and implementation of **NSA recommendation (d) Constrain and
 /// sandbox tool execution** + **(f) Filter and monitor output
 /// pipelines and chained execution** per U/OO/6030316-26 (May 2026
-/// v1.0). 25 lifecycle events (20 baseline + 5 v0.7.0 additions:
+/// v1.0). 27 lifecycle events (20 baseline + 5 v0.7.0 additions:
 /// `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`,
-/// `OnCompactionRollback`) give operators a substrate-side hook for
+/// `OnCompactionRollback`; + 2 v0.8.0 #1709 signal events:
+/// `PreSignalSend`, `PostSignalAck`) give operators a substrate-side hook for
 /// every memory operation, with the four-way decision contract
 /// (`Allow` / `Modify` / `Deny` / `AskUser`) and chain ordering
 /// (priority-desc, first-Deny short-circuits). Default-off — a v0.7
@@ -230,6 +231,28 @@ pub enum HookEvent {
     ///
     /// Classified as [`crate::hooks::EventClass::Write`].
     OnCompactionRollback,
+    /// v0.8.0 Pillar-1 #1709 — fires before a signed coordination
+    /// signal is persisted. Payload: `SignalDelta` (writable — a
+    /// hook may rewrite the proposed signal's fields before it is
+    /// committed to the append-only signal log). Mirrors the
+    /// pre-write decision contract of [`HookEvent::PreStore`] /
+    /// [`HookEvent::PreLink`]: handlers may Allow (default), Modify
+    /// (rewrite the delta), Deny (refuse the signal), or AskUser.
+    ///
+    /// Classified as [`crate::hooks::EventClass::Write`].
+    PreSignalSend,
+    /// v0.8.0 Pillar-1 #1709 — fires after a coordination signal has
+    /// been acknowledged by its recipient. Payload: `SignalAck`
+    /// (read-only). **Notify-class** hook: like
+    /// [`HookEvent::PostStore`] / [`HookEvent::PostConsolidate`],
+    /// handlers cannot veto and their return value is ignored beyond
+    /// logging.
+    ///
+    /// Classified as [`crate::hooks::EventClass::Write`] — the
+    /// `EventClass` enum has no dedicated notify class, so notify-only
+    /// post-events share the write-class deadline budget (same as
+    /// [`HookEvent::PostReflect`] / [`HookEvent::OnCompactionRollback`]).
+    PostSignalAck,
 }
 
 // ---------------------------------------------------------------------------
@@ -759,18 +782,23 @@ mod tests {
                 HookEvent::OnCompactionRollback,
                 "\"on_compaction_rollback\"",
             ),
+            // v0.8.0 Pillar-1 #1709: signed-signal events (26th + 27th).
+            (HookEvent::PreSignalSend, "\"pre_signal_send\""),
+            (HookEvent::PostSignalAck, "\"post_signal_ack\""),
         ];
 
-        // Pin the count at the type boundary so adding a 26th
+        // Pin the count at the type boundary so adding a 28th
         // variant without updating the table fails this test. G2
         // shipped 20; G10 added the 21st (`pre_recall_expand`);
         // v0.7.0 recursive-learning Task 6/8 added the 22nd +
-        // 23rd (`pre_reflect`, `post_reflect`); L1-7 adds the
-        // 24th + 25th (`pre_compaction`, `on_compaction_rollback`).
+        // 23rd (`pre_reflect`, `post_reflect`); L1-7 added the
+        // 24th + 25th (`pre_compaction`, `on_compaction_rollback`);
+        // v0.8.0 #1709 adds the 26th + 27th (`pre_signal_send`,
+        // `post_signal_ack`).
         assert_eq!(
             table.len(),
-            25,
-            "L1-7 raises the count from 23 to 25 (adds pre_compaction + on_compaction_rollback)"
+            27,
+            "v0.8.0 #1709 raises the count from 25 to 27 (adds pre_signal_send + post_signal_ack)"
         );
 
         for (variant, expected_json) in table {

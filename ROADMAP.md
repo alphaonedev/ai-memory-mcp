@@ -357,7 +357,7 @@ CI guard: `bench --baseline performance/baseline.json` fails any PR that exceeds
 - **74 MCP tools at `--profile full`** (count pinned by `Profile::full().expected_tool_count()` in `src/profile.rs`; the callable/bootstrap split is whatever that constant declares, plus the always-on `memory_capabilities`). 7 at `--profile core`.
 - **89 production HTTP route registrations** / 75 unique URL paths.
 - **82 CLI subcommands** under `--features sal`/`sal-postgres`; 80 in default build (the 2-variant gap is `Migrate` + `SchemaInit`, both `#[cfg(feature = "sal")]`; grown to 80/82 via #1598 `Reembed`; pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=80` / `EXPECTED_CLI_SUBCOMMANDS_SAL=82` + `tests/cli_subcommand_count_invariant.rs`).
-- **25 hook lifecycle events** (17 baseline + 3 transcript-capture additions `PreArchive`/`PreTranscriptStore`/`PostTranscriptStore` + 5 reflection/compaction additions `PreRecallExpand`/`PreReflect`/`PostReflect`/`PreCompaction`/`OnCompactionRollback` — per `src/hooks/events.rs::HookEvent`; 17+3+5=25).
+- **27 hook lifecycle events** (17 baseline + 3 transcript-capture additions `PreArchive`/`PreTranscriptStore`/`PostTranscriptStore` + 5 reflection/compaction additions `PreRecallExpand`/`PreReflect`/`PostReflect`/`PreCompaction`/`OnCompactionRollback` + 2 v0.8.0 #1709 signal events `pre_signal_send`/`post_signal_ack` — per `src/hooks/events.rs::HookEvent`; 17+3+5+2=27).
 - **7 Agent Skills tools** (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`) — **load-bearing for §2.4 (improvable across model generations)**.
 - **4 feature tiers:** keyword · semantic · smart · autonomous.
 - **3 memory tiers:** short (6 h) · mid (7 d) · long (permanent).

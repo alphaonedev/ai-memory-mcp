@@ -21,7 +21,7 @@
 //! What this file covers:
 //!   1. `HookEvent::PreCompaction` + `HookEvent::OnCompactionRollback` exist,
 //!      are `is_pre_event`-classified correctly, and have `EventClass::Write`.
-//!   2. `CapabilityHooks::default()` reports `hook_events_count == 25`.
+//!   2. `CapabilityHooks::default()` reports `hook_events_count == 27`.
 //!   3. `CuratorConfig.compaction.enabled` defaults to `false`.
 //!   4. `CompactionDelta` + `CompactionRollbackEvent` payloads round-trip JSON.
 //!   5. Verify-stage failure does NOT trigger rollback (notify-only event).
@@ -133,22 +133,22 @@ fn curator_config_compaction_field_defaults_to_disabled() {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 5 — hook_events_count reports 25
+// Criterion 5 — hook_events_count reports 27
 // ---------------------------------------------------------------------------
 
-/// `CapabilityHooks::default().hook_events_count` must equal 25 to
-/// satisfy the L1-7 acceptance criteria (22→24 in the issue, but the
-/// actual enum count is 25 after Task 6/8 landed the reflect events).
+/// `CapabilityHooks::default().hook_events_count` must equal 27 — the
+/// actual enum count after L1-7 (PreCompaction + OnCompactionRollback)
+/// and v0.8.0 #1709 (PreSignalSend + PostSignalAck) landed.
 #[test]
-fn capability_hooks_reports_25_events() {
+fn capability_hooks_reports_27_events() {
     let hooks = CapabilityHooks::default();
     assert_eq!(
-        hooks.hook_events_count, 25,
-        "hook_events_count must be 25 after L1-7 adds PreCompaction + OnCompactionRollback"
+        hooks.hook_events_count, 27,
+        "hook_events_count must be 27 after v0.8.0 #1709 adds PreSignalSend + PostSignalAck"
     );
     assert_eq!(
-        HOOK_EVENTS_COUNT, 25,
-        "HOOK_EVENTS_COUNT compile-time constant must be 25"
+        HOOK_EVENTS_COUNT, 27,
+        "HOOK_EVENTS_COUNT compile-time constant must be 27"
     );
 }
 
