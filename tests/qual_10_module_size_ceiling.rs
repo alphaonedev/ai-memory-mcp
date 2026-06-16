@@ -494,7 +494,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-15 (v0.8.0 #1705) — bumped 3_800 → 3_850: the in-code v58
     // recall_observations identity-column migration arm (probe-guarded
     // ALTER/CREATE, SQLite has no ADD COLUMN IF NOT EXISTS).
-    ("src/storage/migrations.rs", 3_850),
+    // 2026-06-16 (v0.8.0 #1709) — bumped 3_850 → 3_900: the v60
+    // signed-signals migration arm + the MIGRATION_V60_SQLITE include_str
+    // const + the doc-comment bump pushed the file to 3_854. Growth
+    // justified: one additive schema bump (signals storage foundation).
+    // 3_900 = 3_854 + 46 headroom.
+    ("src/storage/migrations.rs", 3_900),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

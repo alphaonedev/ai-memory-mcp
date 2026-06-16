@@ -12,6 +12,7 @@ pub mod memory;
 pub mod namespace;
 pub mod recall_request;
 pub mod reflection;
+pub mod signal;
 pub mod skill;
 pub mod tag;
 
@@ -27,6 +28,8 @@ pub use namespace::*;
 pub use recall_request::*;
 #[allow(unused_imports)]
 pub use reflection::*;
+#[allow(unused_imports)]
+pub use signal::*;
 #[allow(unused_imports)]
 pub use tag::*;
 

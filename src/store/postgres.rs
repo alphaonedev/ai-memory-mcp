@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 59;
+const CURRENT_SCHEMA_VERSION: i32 = 60;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1305,8 +1305,11 @@ impl PostgresStore {
         if current_version < 58 {
             self.migrate_v58().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 59 {
             self.migrate_v59().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v60().await?;
         }
 
         Ok(())
@@ -2686,6 +2689,64 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v59 applied (#1709 Pillar 1: actions + action_edges + leases coordination substrate)"
+        );
+        Ok(())
+    }
+
+    /// v60 (#1709, v0.8.0 Pillar 1) — signed-signals storage foundation:
+    /// additive `signals` table (typed, Ed25519-signed inter-agent messages).
+    /// Postgres twin of `migrations/sqlite/0050_v60_signed_signals.sql`. Pure
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` — idempotent + replay-safe (fresh
+    /// schemas carry the table inline in `postgres_schema.sql`). Epoch columns
+    /// are `BIGINT`, the Ed25519 `signature` / `sender_pubkey` columns are
+    /// `BYTEA`, and `reference_ids` is renamed from the ROADMAP's `references`
+    /// (a SQL reserved word).
+    async fn migrate_v60(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v60 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS signals (
+                id              TEXT NOT NULL PRIMARY KEY,
+                namespace       TEXT NOT NULL,
+                from_agent      TEXT NOT NULL,
+                to_agent        TEXT,
+                subject         TEXT NOT NULL,
+                body            TEXT NOT NULL,
+                signal_type     TEXT NOT NULL,
+                in_reply_to     TEXT REFERENCES signals(id),
+                correlation_id  TEXT,
+                reference_ids   TEXT   NOT NULL DEFAULT '[]',
+                created_at      BIGINT NOT NULL,
+                expires_at      BIGINT,
+                delivered_at    BIGINT,
+                read_at         BIGINT,
+                acknowledged_at BIGINT,
+                signature       BYTEA  NOT NULL,
+                sender_pubkey   BYTEA  NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_signals_namespace ON signals(namespace, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_signals_to_agent ON signals(to_agent, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_signals_correlation ON signals(correlation_id)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v60 signed-signals DDL", e))?;
+        }
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v60 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v60 applied (#1709 Pillar 1: signals signed-signal storage foundation)"
         );
         Ok(())
     }
