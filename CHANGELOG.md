@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v0.8.0 (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
+
+In progress on `release/v0.8.0`. Schema advances v57 → **v62** (additive: actions /
+action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
+routine_runs at v62). Surface grows to **93 MCP tools** at `--profile full` and
+**27 hook lifecycle events**.
+
+### Added
+
+- **Pillar-1 coordination substrate** — typed actions with a state machine +
+  typed DAG edges + single-holder heartbeat leases + an hourly lease-sweeper
+  (`crate::actions`, `MemoryStore::{action_*,lease_*}`, 8 MCP tools); signed
+  signals (`crate::signals`, Ed25519 over canonical content, 5 MCP tools +
+  `pre_signal_send`/`post_signal_ack` hook events); attested checkpoints
+  (`crate::checkpoints`, Ed25519-attested resolution = separation-of-duties,
+  4 MCP tools). All on both the sqlite and postgres SAL adapters.
+- **§2.5 attested — read-time attested-provenance surfacing**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709), reframed
+  from #1715). `memory_recall` now composes provenance at read from already-merged
+  signed evidence rather than treating the stored confidence scalar as truth.
+  Anchors: `src/mcp/tools/recall.rs::decorate_memory_many` (batched O(1)
+  link-attestation prefetch — was O(K) per-row `get_links`),
+  `recall.rs::provenance_tier` (composes `confidence_source` + the
+  `recall.rs::attest_rank` ladder → `signed_peer` > `curator_derived` >
+  `self_signed` > `unsigned_caller`), `recall.rs::insert_confidence_filter_meta`
+  (non-silent `confidence_tier` filter → `meta.confidence_filtered_out` +
+  `meta.had_filtered_candidates`), `recall.rs::scheduled_validity` (deterministic
+  recompute from the `Memory::effective_expires_at` anchor, quantized to a
+  `SECS_PER_HOUR` as-of bucket, under `AI_MEMORY_CONFIDENCE_DECAY`), and
+  `session_start` routed through `decorate_memory_many` for uniform decoration
+  across MCP / HTTP / session_start. All composition is **decoration-only**: the
+  stored `m.confidence` ranking term (`src/storage/mod.rs` recall `ORDER BY`) is
+  untouched, no read-path DB round-trip is added, no LLM runs on the read path,
+  and the recall determinism invariant (`tests/bias_displacement_invariants_2_6.rs`,
+  id-ranking byte-equality) holds.
+
 ## [0.7.1] — 2026-06-15
 
 Hardening patch line over v0.7.0 (`attested-cortex`). A 26-task,

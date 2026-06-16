@@ -384,6 +384,21 @@ curl -X POST http://127.0.0.1:9077/api/v1/recall \
   -d '{"context":"quarterly planning","limit":10}'
 ```
 
+**v0.8.0 §2.5 read-time attested-provenance decoration** ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709)). Under verbose provenance (the MCP default; HTTP opts in), each recall row carries read-time-composed fields in addition to `score` — all decoration-only (the stored `confidence` ranking contribution is unchanged):
+
+- `provenance_tier` — composed from the row's `confidence_source` + the strongest incident link attestation: `signed_peer` > `curator_derived` > `self_signed` > `unsigned_caller`.
+- `confidence_tier`, `freshness_state`, `latest_link_attest_level` — the existing v0.7.0 Gap-7 decoration.
+- `scheduled_validity` (`valid` | `expiring` | `expired`) — present only when `AI_MEMORY_CONFIDENCE_DECAY` is enabled **and** the row has a validity anchor (`expires_at`, else `created_at` + tier TTL); recomputed deterministically from the anchor against an hour-quantized "as-of" bucket (no exp-decay write).
+
+When a `confidence_tier` filter is requested, the response envelope adds a `meta` object reporting what the filter dropped, so `count: 0` is distinguishable from "no memory":
+
+```json
+{ "memories": [ … ], "count": 0,
+  "meta": { "confidence_filtered_out": 4, "had_filtered_candidates": true } }
+```
+
+These fields are uniform across MCP `memory_recall`, HTTP recall, and `memory_session_start`.
+
 ### `GET /api/v1/search`
 
 Read-only FTS5 keyword search. Same filter params as list, plus `q`
