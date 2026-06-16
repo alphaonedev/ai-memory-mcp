@@ -627,6 +627,34 @@ fn record_recall_observations(
     }
 }
 
+/// v0.8.0 #1709 §2.5 T3 (A2) — make the `confidence_tier` recall filter
+/// NON-SILENT. When a caller requests a tier filter and the recall comes
+/// back with `count:0`, the bare count cannot distinguish "no memory at
+/// all matched the query" from "candidates matched but every one was
+/// below the requested tier bar". This helper surfaces that distinction
+/// in the response `meta`:
+///
+/// - `confidence_filtered_out`: how many candidates the tier filter
+///   dropped at this path's filter site (BEFORE − AFTER).
+/// - `had_filtered_candidates`: `confidence_filtered_out > 0`.
+///
+/// Centralizing the two field-name string literals here keeps them at a
+/// single production site (the hardcoded-literal ratchet treats a
+/// ≥10-char literal repeated across ≥3 sites as a magic value); all three
+/// recall resp-build branches call this one function. Only invoked when
+/// the caller actually requested a tier filter — unfiltered recalls get
+/// no new meta keys (zero noise). Decoration only: `meta` is never a
+/// ranking key, so determinism is unaffected.
+fn insert_confidence_filter_meta(resp: &mut Value, filtered_out: usize) {
+    let meta = resp
+        .as_object_mut()
+        .expect("recall response is always a JSON object")
+        .entry("meta".to_string())
+        .or_insert_with(|| json!({}));
+    meta["confidence_filtered_out"] = json!(filtered_out);
+    meta["had_filtered_candidates"] = json!(filtered_out > 0);
+}
+
 /// #967 — JSON-bag entry kept as a thin wrapper around
 /// [`handle_recall_dto`]. The pre-#967 surface continues to accept the
 /// `&Value` params bag so existing call sites (tests + the MCP
@@ -1055,7 +1083,12 @@ pub fn handle_recall_dto(
                 if let Some(ce) = reranker {
                     let ce_reranked = ce.rerank(context, results);
                     let ce_reranked = apply_kinds_filter(ce_reranked, kinds_filter.as_deref());
+                    // v0.8.0 #1709 §2.5 T3 (A2) — capture before/after the
+                    // tier filter so the response can report how many
+                    // candidates were dropped for being below the bar.
+                    let ce_before = ce_reranked.len();
                     let ce_reranked = apply_confidence_tier_filter(ce_reranked);
+                    let confidence_filtered_out = ce_before - ce_reranked.len();
                     let ce_reranked = apply_visibility_filter(ce_reranked);
                     // v0.7.0 (issue #518) — session recency boost.
                     let ce_reranked = crate::reranker::apply_session_recency_boost(
@@ -1080,12 +1113,18 @@ pub fn handle_recall_dto(
                     });
                     decorate_budget(&mut resp, &outcome);
                     attach_meta(&mut resp, "hybrid", &telemetry);
+                    if confidence_tier_filter.is_some() {
+                        insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
+                    }
                     super::inject_namespace_standard(conn, namespace, &mut resp);
                     return Ok(resp);
                 }
 
                 let results = apply_kinds_filter(results, kinds_filter.as_deref());
+                // v0.8.0 #1709 §2.5 T3 (A2) — before/after the tier filter.
+                let confidence_before = results.len();
                 let results = apply_confidence_tier_filter(results);
+                let confidence_filtered_out = confidence_before - results.len();
                 let results = apply_visibility_filter(results);
                 // v0.7.0 (issue #518) — session recency boost (no
                 // cross-encoder branch).
@@ -1106,6 +1145,9 @@ pub fn handle_recall_dto(
                 });
                 decorate_budget(&mut resp, &outcome);
                 attach_meta(&mut resp, "hybrid", &telemetry);
+                if confidence_tier_filter.is_some() {
+                    insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
+                }
                 super::inject_namespace_standard(conn, namespace, &mut resp);
                 return Ok(resp);
             }
@@ -1145,7 +1187,10 @@ pub fn handle_recall_dto(
         source_uri_prefix.as_deref(),
     );
     let results = apply_kinds_filter(results, kinds_filter.as_deref());
+    // v0.8.0 #1709 §2.5 T3 (A2) — before/after the tier filter.
+    let confidence_before = results.len();
     let results = apply_confidence_tier_filter(results);
+    let confidence_filtered_out = confidence_before - results.len();
     let results = apply_visibility_filter(results);
     // v0.7.0 (issue #518) — session recency boost on the keyword-only
     // fallback branch as well, so the contract is uniform regardless
@@ -1165,6 +1210,9 @@ pub fn handle_recall_dto(
     });
     decorate_budget(&mut resp, &outcome);
     attach_meta(&mut resp, "keyword_only", &telemetry);
+    if confidence_tier_filter.is_some() {
+        insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
+    }
     super::inject_namespace_standard(conn, namespace, &mut resp);
     Ok(resp)
 }

@@ -345,3 +345,212 @@ fn gap4_recall_confidence_tier_filter_returns_only_ambiguous() {
     assert_eq!(conf_memories.len(), 1);
     assert_eq!(conf_memories[0]["id"].as_str(), Some("m-conf"));
 }
+
+/// v0.8.0 #1709 §2.5 T3 (A2) — helper: seed the canonical 0.99 / 0.85 /
+/// 0.5 trio under namespace `g4` and FTS-sync, mirroring the
+/// `gap4_recall_confidence_tier_filter_returns_only_ambiguous` setup.
+fn seed_tier_trio(conn: &rusqlite::Connection) {
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, conf) in &[("m-conf", 0.99_f64), ("m-likely", 0.85), ("m-amb", 0.5)] {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, confidence, created_at, updated_at) \
+             VALUES (?1, 'long', 'g4', ?2, ?3, ?4, ?5, ?5)",
+            params![id, format!("title-{id}"), format!("payload {id}"), conf, now],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO memories_fts(rowid, title, content) \
+         SELECT rowid, title, content FROM memories WHERE namespace = 'g4'",
+        [],
+    )
+    .ok();
+}
+
+/// v0.8.0 #1709 §2.5 T3 (A2) — a tier filter that drops at least one
+/// candidate surfaces `confidence_filtered_out > 0` AND
+/// `had_filtered_candidates == true` in the response `meta`. Includes
+/// the `count:0`-but-candidates-existed case: requesting `confirmed`
+/// against a corpus whose matching rows are all below the bar must report
+/// that the drop happened rather than silently returning an empty set.
+#[test]
+fn t3_a2_confidence_filter_meta_surfaces_dropped_candidates() {
+    use ai_memory::config::{ResolvedScoring, ResolvedTtl};
+
+    let conn = fresh_db();
+    seed_tier_trio(&conn);
+    let ttl = ResolvedTtl::default();
+    let scoring = ResolvedScoring::default();
+
+    // `confirmed` ⇒ keeps the 0.99 row, drops the 0.85 + 0.5 rows.
+    let resp = ai_memory::mcp::handle_recall(
+        &conn,
+        &serde_json::json!({
+            "context": "payload",
+            "namespace": "g4",
+            "confidence_tier": "confirmed",
+        }),
+        None,
+        None,
+        None,
+        false,
+        &ttl,
+        &scoring,
+        None,
+    )
+    .expect("recall ok");
+    assert_eq!(resp["count"].as_u64(), Some(1));
+    assert_eq!(
+        resp["meta"]["confidence_filtered_out"].as_u64(),
+        Some(2),
+        "two below-bar candidates were dropped"
+    );
+    assert_eq!(
+        resp["meta"]["had_filtered_candidates"].as_bool(),
+        Some(true)
+    );
+
+    // count:0-but-candidates-existed — a corpus with NO confirmed row.
+    // Seed two more ambiguous/likely rows under a distinct namespace and
+    // request `confirmed`: every matching candidate is below the bar, so
+    // count is 0 yet the meta proves candidates existed and were dropped.
+    let now = chrono::Utc::now().to_rfc3339();
+    for (id, conf) in &[("b-amb", 0.4_f64), ("b-likely", 0.8)] {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, confidence, created_at, updated_at) \
+             VALUES (?1, 'long', 'belowbar', ?2, ?3, ?4, ?5, ?5)",
+            params![id, format!("title-{id}"), format!("belowpayload {id}"), conf, now],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO memories_fts(rowid, title, content) \
+         SELECT rowid, title, content FROM memories WHERE namespace = 'belowbar'",
+        [],
+    )
+    .ok();
+
+    let resp_zero = ai_memory::mcp::handle_recall(
+        &conn,
+        &serde_json::json!({
+            "context": "belowpayload",
+            "namespace": "belowbar",
+            "confidence_tier": "confirmed",
+        }),
+        None,
+        None,
+        None,
+        false,
+        &ttl,
+        &scoring,
+        None,
+    )
+    .expect("recall ok");
+    assert_eq!(
+        resp_zero["count"].as_u64(),
+        Some(0),
+        "no confirmed row exists in this namespace"
+    );
+    assert_eq!(
+        resp_zero["meta"]["confidence_filtered_out"].as_u64(),
+        Some(2),
+        "both candidates were dropped for being below the confirmed bar"
+    );
+    assert_eq!(
+        resp_zero["meta"]["had_filtered_candidates"].as_bool(),
+        Some(true),
+        "count:0 with candidates that existed must be distinguishable from no-match"
+    );
+}
+
+/// v0.8.0 #1709 §2.5 T3 (A2) — a tier filter that drops nothing reports
+/// `confidence_filtered_out == 0` AND `had_filtered_candidates == false`.
+#[test]
+fn t3_a2_confidence_filter_meta_zero_when_nothing_dropped() {
+    use ai_memory::config::{ResolvedScoring, ResolvedTtl};
+
+    let conn = fresh_db();
+    // Seed a single confirmed row so a `confirmed` filter drops nothing.
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO memories (id, tier, namespace, title, content, confidence, created_at, updated_at) \
+         VALUES ('only-conf', 'long', 'g4', 'title-only', 'payload only', 0.99, ?1, ?1)",
+        params![now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memories_fts(rowid, title, content) \
+         SELECT rowid, title, content FROM memories WHERE namespace = 'g4'",
+        [],
+    )
+    .ok();
+    let ttl = ResolvedTtl::default();
+    let scoring = ResolvedScoring::default();
+
+    let resp = ai_memory::mcp::handle_recall(
+        &conn,
+        &serde_json::json!({
+            "context": "payload",
+            "namespace": "g4",
+            "confidence_tier": "confirmed",
+        }),
+        None,
+        None,
+        None,
+        false,
+        &ttl,
+        &scoring,
+        None,
+    )
+    .expect("recall ok");
+    assert_eq!(resp["count"].as_u64(), Some(1));
+    assert_eq!(
+        resp["meta"]["confidence_filtered_out"].as_u64(),
+        Some(0),
+        "nothing was below the bar"
+    );
+    assert_eq!(
+        resp["meta"]["had_filtered_candidates"].as_bool(),
+        Some(false)
+    );
+}
+
+/// v0.8.0 #1709 §2.5 T3 (A2) — an UNFILTERED recall (no
+/// `confidence_tier`) gets NO new meta keys — zero noise. The fields are
+/// absent (not merely zero) so a caller can tell the filter was never
+/// requested.
+#[test]
+fn t3_a2_unfiltered_recall_has_no_confidence_filter_meta() {
+    use ai_memory::config::{ResolvedScoring, ResolvedTtl};
+
+    let conn = fresh_db();
+    seed_tier_trio(&conn);
+    let ttl = ResolvedTtl::default();
+    let scoring = ResolvedScoring::default();
+
+    let resp = ai_memory::mcp::handle_recall(
+        &conn,
+        &serde_json::json!({
+            "context": "payload",
+            "namespace": "g4",
+        }),
+        None,
+        None,
+        None,
+        false,
+        &ttl,
+        &scoring,
+        None,
+    )
+    .expect("recall ok");
+    // All three rows surface — no tier filter applied.
+    assert_eq!(resp["count"].as_u64(), Some(3));
+    assert!(
+        resp["meta"].get("confidence_filtered_out").is_none(),
+        "unfiltered recall must NOT carry confidence_filtered_out"
+    );
+    assert!(
+        resp["meta"].get("had_filtered_candidates").is_none(),
+        "unfiltered recall must NOT carry had_filtered_candidates"
+    );
+}
