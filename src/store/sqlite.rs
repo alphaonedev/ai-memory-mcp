@@ -71,14 +71,30 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
     fn capabilities(&self) -> Capabilities {
-        // TRANSACTIONS + ATOMIC_MULTI_WRITE are NOT advertised because
-        // the adapter does not currently expose `begin_transaction()`
-        // — the trait default returns `UnsupportedCapability`. Honesty
-        // here matters: capability bits must match runtime behaviour
-        // (issue #302 item 6). Re-add these two flags once a real
-        // transaction handle is wired through the mutex-guarded
-        // `rusqlite::Connection`.
-        Capabilities::FULLTEXT | Capabilities::DURABLE | Capabilities::STRONG_CONSISTENCY
+        // #1670 — the two transaction-related bits mean DIFFERENT things;
+        // sqlite honestly holds one but not the other:
+        //
+        // * ATOMIC_MULTI_WRITE ("atomic multi-row writes ... under one
+        //   transaction") IS advertised: every multi-write op on this
+        //   adapter runs as a single `BEGIN IMMEDIATE … COMMIT` atom with
+        //   ROLLBACK on any mid-failure — `reflect` (src/storage/reflect.rs),
+        //   `consolidate` + the bulk-insert / archive+insert paths
+        //   (src/storage/mod.rs). A partial multi-row write can never
+        //   commit, so the property the bit names genuinely holds.
+        // * TRANSACTIONS ("adapter supports `begin_transaction` for
+        //   multi-op atomicity") is WITHHELD: the SAL adapter exposes no
+        //   caller-facing `begin_transaction()` handle (the trait default
+        //   returns `UnsupportedCapability`), so a caller cannot compose
+        //   its OWN multi-op atomic unit. Re-add this bit only once a real
+        //   transaction handle is wired through the mutex-guarded
+        //   `rusqlite::Connection`.
+        //
+        // Capability bits must match runtime behaviour (#302 item 6 /
+        // #1052 wire-honesty); conflating these two was the bug #1670 fixed.
+        Capabilities::FULLTEXT
+            | Capabilities::DURABLE
+            | Capabilities::STRONG_CONSISTENCY
+            | Capabilities::ATOMIC_MULTI_WRITE
     }
 
     /// v0.7.0.1 S75 — read `MAX(version)` from the live SQLite
@@ -2162,10 +2178,72 @@ mod tests {
         // happens above this layer via crate::hnsw, not inside the
         // adapter.
         assert!(!caps.contains(Capabilities::NATIVE_VECTOR));
-        // TRANSACTIONS + ATOMIC_MULTI_WRITE are NOT set — the adapter
-        // doesn't expose `begin_transaction()` (#302 item 6 fix).
+        // #1670 — TRANSACTIONS stays WITHHELD (no caller-facing
+        // `begin_transaction()` handle), but ATOMIC_MULTI_WRITE IS set:
+        // the adapter's multi-write ops run as a single BEGIN IMMEDIATE
+        // atom. The two bits name different properties; sqlite holds one.
         assert!(!caps.contains(Capabilities::TRANSACTIONS));
-        assert!(!caps.contains(Capabilities::ATOMIC_MULTI_WRITE));
+        assert!(caps.contains(Capabilities::ATOMIC_MULTI_WRITE));
+    }
+
+    /// #1670 — capability-bit ↔ runtime cross-check (extends the #1052
+    /// wire-honesty family): the adapter advertises ATOMIC_MULTI_WRITE, and
+    /// a multi-row write that fails partway genuinely leaves NO partial
+    /// commit. `consolidate` over one real + one missing id errors, and the
+    /// `BEGIN IMMEDIATE` ROLLBACK must mean the merged row never lands —
+    /// proving the advertised property at runtime, not just on the wire.
+    #[tokio::test]
+    async fn atomic_multi_write_bit_matches_consolidate_rollback_1670() {
+        let store = fresh_store();
+        assert!(
+            store
+                .capabilities()
+                .contains(Capabilities::ATOMIC_MULTI_WRITE),
+            "ATOMIC_MULTI_WRITE must be advertised"
+        );
+        let ctx = CallerContext::for_agent("ai:consolidator");
+        // Seed one real source (test_memory lands in the `sal-test` ns).
+        let real = store
+            .store(&ctx, &test_memory("src-a", "content a"))
+            .await
+            .expect("seed store");
+        let ns_filter = Filter {
+            namespace: Some("sal-test".to_string()),
+            limit: 100,
+            ..Default::default()
+        };
+        let before = store
+            .list(&ctx, &ns_filter)
+            .await
+            .expect("list before")
+            .len();
+
+        // One valid + one MISSING id → the BEGIN IMMEDIATE block must roll
+        // back, so the `merged` row is never committed.
+        let res = store
+            .consolidate(
+                &ctx,
+                &[real, "does-not-exist".to_string()],
+                "merged",
+                "summary",
+                "sal-test",
+                &Tier::Long,
+                "test",
+                "ai:consolidator",
+            )
+            .await;
+        assert!(res.is_err(), "consolidate over a missing id must error");
+
+        let after = store.list(&ctx, &ns_filter).await.expect("list after");
+        assert_eq!(
+            before,
+            after.len(),
+            "ATOMIC_MULTI_WRITE: a partially-failed consolidate must leave NO new row"
+        );
+        assert!(
+            !after.iter().any(|m| m.title == "merged"),
+            "the rolled-back `merged` consolidation row must not exist"
+        );
     }
 
     #[tokio::test]
