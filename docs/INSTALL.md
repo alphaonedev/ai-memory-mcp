@@ -148,7 +148,7 @@
    backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
                                           # deepseek | kimi | qwen | mistral | groq |
                                           # together | cerebras | openrouter |
-                                          # fireworks | lmstudio | openai-compatible
+                                          # fireworks | lmstudio | vllm | openai-compatible
    model       = "grok-4.3"               # vendor-specific identifier
    base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
    api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)

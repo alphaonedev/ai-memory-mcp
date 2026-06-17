@@ -468,7 +468,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // reranker-score-floor knobs without a lockstep bump — NOT touched
     // by #1705; greened here so the QUAL-10 gate is enforceable again).
     // Sectioned-config split tracked under v0.8.0 EPIC #1709.
-    ("src/config.rs", 10_360),
+    // 2026-06-17 (v0.8.0 #1709 §11.4.C) — bumped 10_360 → 10_395: the
+    // vLLM first-class backend alias added the
+    // `resolve_embeddings_1709_vllm_alias_default_base_url` embed-parity
+    // test pinning that AI_MEMORY_EMBED_BACKEND=vllm resolves the shared
+    // http://localhost:8000/v1 default, plus the `vllm` arm of
+    // `default_model_for_alias` referencing the shared
+    // `LOCAL_SERVER_MODEL_PLACEHOLDER` const (hoisted to keep the
+    // `local-model` literal under the hardcoded-literal-gate ratchet).
+    ("src/config.rs", 10_400),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -615,7 +623,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // embeds: `embed_texts`/`embed_texts_async` + the one-request
     // helper + `parse_openai_embeddings_batch` + 2 parse-pin tests
     // grew the file to 5_317; lockstep bump = 5_317 + 33 headroom).
-    ("src/llm.rs", 5_350),
+    // 2026-06-17 (v0.8.0 #1709 §11.4.C) — bumped 5_350 → 5_400: the
+    // vLLM first-class backend alias added the `BACKEND_VLLM` const +
+    // its doc block, the `default_base_url_for_alias` / `alias_api_key_env_vars`
+    // arms, and 2 pinning-test rows (file grew to 5_352); 5_400 = 48 headroom.
+    ("src/llm.rs", 5_400),
 ];
 
 #[test]

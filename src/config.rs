@@ -5456,7 +5456,10 @@ fn backend_default_model(backend: &str) -> &'static str {
         "cerebras" => "llama-3.3-70b",
         "openrouter" => "openai/gpt-5",
         "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct",
-        "lmstudio" => "local-model",
+        // v0.8.0 #1709 §11.4.C — vLLM shares LMStudio's single-model
+        // placeholder default (centralised in llm.rs).
+        "lmstudio" => crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER,
+        s if s == crate::llm::BACKEND_VLLM => crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER,
         // ollama / openai-compatible / any unknown alias → legacy default.
         _ => "gemma3:4b",
     }
@@ -9700,6 +9703,43 @@ max_page_size = 1000000
              vendor default from llm.rs"
         );
         assert_eq!(resolved.embedding_dim, Some(3072), "gemini-embedding-2 dim");
+    }
+
+    /// v0.8.0 #1709 §11.4.C — the dedicated `vllm` LLM alias is shared
+    /// by the embeddings resolver for free: `AI_MEMORY_EMBED_BACKEND=vllm`
+    /// classifies as an API backend (`is_api_embed_backend` — everything
+    /// but `ollama`) and falls back to the same per-alias vendor default
+    /// (`http://localhost:8000/v1`) declared once in `llm.rs`. This pins
+    /// the embed-surface parity for the new alias.
+    #[test]
+    fn resolve_embeddings_1709_vllm_alias_default_base_url() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_BACKEND, crate::llm::BACKEND_VLLM);
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_embeddings();
+        // Restore env before asserting so a failed assertion cannot leak
+        // ENV_EMBED_BACKEND into sibling tests sharing `env_var_lock()`.
+        unsafe {
+            std::env::remove_var(ENV_EMBED_BACKEND);
+        }
+        assert_eq!(
+            resolved.backend,
+            crate::llm::BACKEND_VLLM,
+            "AI_MEMORY_EMBED_BACKEND=vllm must resolve the vllm backend"
+        );
+        assert_eq!(
+            resolved.url, "http://localhost:8000/v1",
+            "#1709 §11.4.C: the vllm embed alias must fall back to the \
+             vendor default base URL from llm.rs (port 8000 /v1)"
+        );
+        assert!(
+            is_api_embed_backend(&resolved.backend),
+            "#1709: vllm must classify as an API embed backend, not ollama-native"
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ db   = "/Users/fate/.claude/ai-memory.db"
 backend     = "xai"           # ollama | openai | xai | anthropic | gemini |
                               # deepseek | kimi | qwen | mistral | groq |
                               # together | cerebras | openrouter |
-                              # fireworks | lmstudio | openai-compatible
+                              # fireworks | lmstudio | vllm | openai-compatible
 model       = "grok-4.3"      # vendor-specific identifier
 base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
 
@@ -548,6 +548,7 @@ operator does not override:
 | `openrouter`     | `https://openrouter.ai/api/v1`                    | `openai/gpt-5`                                  |
 | `fireworks`      | `https://api.fireworks.ai/inference/v1`           | `accounts/fireworks/models/llama-v3p3-70b-instruct` |
 | `lmstudio`       | `http://localhost:1234/v1`                        | `local-model`                                   |
+| `vllm`           | `http://localhost:8000/v1`                        | `local-model`                                   |
 | `openai-compatible` | _(no meaningful default — operator must set `base_url`; the env-var path errors without it)_ | `gemma3:4b` (legacy fallthrough)                |
 
 The model defaults are intentionally aggressive — operators MUST
