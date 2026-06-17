@@ -1177,6 +1177,8 @@ pub fn handle_recall_dto(
                     // SQL push-down already constrained the set; we
                     // keep it for the `has_citations` axis only.
                     source_uri_prefix.as_deref(),
+                    // v0.8.0 #1720 A3 — owner-keyed visibility caller.
+                    caller,
                 )
                 .map_err(|e| e.to_string())?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
@@ -1285,6 +1287,8 @@ pub fn handle_recall_dto(
         include_archived,
         // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
         source_uri_prefix.as_deref(),
+        // v0.8.0 #1720 A3 — owner-keyed visibility caller.
+        caller,
     )
     .map_err(|e| e.to_string())?;
     let results = crate::cli::recall::apply_form4_recall_filters(

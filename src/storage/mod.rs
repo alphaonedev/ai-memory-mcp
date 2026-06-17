@@ -189,7 +189,17 @@ fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityPrefixes {
 /// visibility (the HNSW branch of `recall_hybrid` iterates memories loaded
 /// via `get()`). Returns `true` when `as_agent` is unset (no filter) or
 /// when the memory's scope + namespace grant visibility to the caller.
-fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes) -> bool {
+///
+/// v0.8.0 #1720 A4 — the `Private` arm is now **owner-keyed**, not
+/// namespace-keyed. It delegates to the canonical
+/// [`crate::visibility::is_visible_to_caller`] (owner OR inbox-target)
+/// using `caller` (the agent's `metadata.agent_id`) rather than the
+/// pre-#1720 `&mem.namespace == ns` check, which leaked every private
+/// row in a namespace to any same-namespace caller. `caller` is
+/// DISTINCT from the `as_agent` namespace that drives the
+/// team/unit/org subtree arms (still namespace-keyed by design).
+/// Fail-closed: a `None` caller matches NO private rows.
+fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes, caller: Option<&str>) -> bool {
     // v0.7.0 multi-agent literal-sweep (scanner B finding F-B8.x):
     // typed-enum exhaustive match via `MemoryScope` + `META_KEY_SCOPE`
     // SSOT. Adding a new scope variant from here forward is a
@@ -212,7 +222,12 @@ fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes) -> bool {
     };
     match scope {
         MemoryScope::Collective => true,
-        MemoryScope::Private => p.as_ref().is_some_and(|ns| &mem.namespace == ns),
+        // v0.8.0 #1720 A4 — owner-keyed: visible iff the caller owns
+        // the row or is its inbox target. Fail-closed when `caller` is
+        // `None` (no identity → no private rows).
+        MemoryScope::Private => {
+            caller.is_some_and(|c| crate::visibility::is_visible_to_caller(mem, c))
+        }
         MemoryScope::Team => matches_subtree(&mem.namespace, t.as_deref()),
         MemoryScope::Unit => matches_subtree(&mem.namespace, u.as_deref()),
         MemoryScope::Org => matches_subtree(&mem.namespace, o.as_deref()),
@@ -327,7 +342,35 @@ fn is_archived_source(mem: &Memory) -> bool {
         .is_some_and(|v| !v.is_null())
 }
 
-fn visibility_clause(start: usize, table_alias: &str) -> String {
+/// v0.8.0 #1720 A2 — owner-keyed `scope=private` visibility.
+///
+/// Placeholder layout (explicit, not derived from `start`): the four
+/// namespace-prefix placeholders are `?start .. ?start+3`
+/// (private/team/unit/org — bind order matches
+/// [`compute_visibility_prefixes`]). The **caller** placeholder is
+/// passed explicitly as `caller_ph` so each call-site can choose a
+/// safe index (the visibility prefixes are not always the last
+/// placeholders in the host query — e.g. the `source_uri` filter binds
+/// after them on the recall/search/hybrid paths, so `caller_ph` is
+/// bound right after `?start+3` and the trailing filter renumbered up
+/// by one). `caller_ph` holds the resolved visibility caller (the
+/// agent's `metadata.agent_id`, e.g. `ai:bob`) — DISTINCT from the
+/// `as_agent` namespace that drives the team/unit/org subtree arms.
+///
+/// The private arm is **owner-keyed**: a private row is visible iff the
+/// caller owns it (`agent_id_idx = ?caller`) OR the caller is the inbox
+/// recipient (`target_agent_id_idx = ?caller`, the #1720 A1 generated
+/// column projecting `metadata.target_agent_id`). This mirrors the
+/// canonical [`crate::visibility::is_visible_to_caller`] predicate
+/// (owner OR inbox-target) rather than the pre-#1720 namespace-keyed
+/// `namespace = ?private_ph`, which leaked every private row in a
+/// namespace to any same-namespace caller.
+///
+/// Fail-closed: the `?caller_ph IS NOT NULL` guard means an
+/// unidentified caller (NULL — no stable env identity) matches NO
+/// private rows. The `?start IS NULL` sentinel (trust-all, no
+/// filtering) is unchanged.
+fn visibility_clause(start: usize, caller_ph: usize, table_alias: &str) -> String {
     let private_ph = start;
     let team_ph = start + 1;
     let unit_ph = start + 2;
@@ -337,7 +380,7 @@ fn visibility_clause(start: usize, table_alias: &str) -> String {
         "AND (\
             ?{private_ph} IS NULL \
             OR {ta}.scope_idx = 'collective' \
-            OR ({ta}.scope_idx = 'private' AND {ta}.namespace = ?{private_ph}) \
+            OR ({ta}.scope_idx = 'private' AND ?{caller_ph} IS NOT NULL AND ({ta}.agent_id_idx = ?{caller_ph} OR {ta}.target_agent_id_idx = ?{caller_ph})) \
             OR ({ta}.scope_idx = 'team' AND ?{team_ph} IS NOT NULL AND ({ta}.namespace = ?{team_ph} OR {ta}.namespace LIKE replace(replace(?{team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
             OR ({ta}.scope_idx = 'unit' AND ?{unit_ph} IS NOT NULL AND ({ta}.namespace = ?{unit_ph} OR {ta}.namespace LIKE replace(replace(?{unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
             OR ({ta}.scope_idx = 'org'  AND ?{org_ph}  IS NOT NULL AND ({ta}.namespace = ?{org_ph}  OR {ta}.namespace LIKE replace(replace(?{org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
@@ -2385,6 +2428,9 @@ pub fn search(
     // sources whose atoms surface in their place. See
     // [`recall_with_telemetry`] for the full contract.
     include_archived: bool,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See
+    // [`search_with_source_uri`].
+    caller: Option<&str>,
 ) -> Result<Vec<Memory>> {
     search_with_source_uri(
         conn,
@@ -2400,6 +2446,7 @@ pub fn search(
         as_agent,
         include_archived,
         None,
+        caller,
     )
 }
 
@@ -2427,14 +2474,24 @@ pub fn search_with_source_uri(
     as_agent: Option<&str>,
     include_archived: bool,
     source_uri: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller (the agent's
+    // `metadata.agent_id`, e.g. `ai:bob`). Bound at the
+    // `visibility_clause` caller placeholder (`?15`) so the owner-keyed
+    // private arm gates on ownership, not namespace. DISTINCT from
+    // `as_agent` (the namespace driving team/unit/org). `None` =
+    // fail-closed (no private rows).
+    caller: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
     let fts_query = sanitize_fts_query(query, false);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
     let archived_fragment = archived_source_clause(include_archived, "m");
+    // #1720 A3 — `source_uri` renumbered ?15 → ?16: the caller
+    // placeholder (?15) is bound right after the visibility prefixes
+    // (?11..?14), so the trailing source_uri filter shifts up by one.
     let source_uri_fragment = if source_uri.is_some() {
-        "AND m.source_uri = ?15"
+        "AND m.source_uri = ?16"
     } else {
         ""
     };
@@ -2467,7 +2524,7 @@ pub fn search_with_source_uri(
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
            DESC
          LIMIT ?9",
-        vis = visibility_clause(11, "m"),
+        vis = visibility_clause(11, 15, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(uri) = source_uri {
@@ -2487,7 +2544,8 @@ pub fn search_with_source_uri(
                 vis_t,
                 vis_u,
                 vis_o,
-                uri,
+                caller, // ?15
+                uri,    // ?16
             ],
             row_to_memory,
         )?
@@ -2510,6 +2568,7 @@ pub fn search_with_source_uri(
                 vis_t,
                 vis_u,
                 vis_o,
+                caller, // ?15
             ],
             row_to_memory,
         )?
@@ -2539,11 +2598,16 @@ pub fn list_by_source_uri(
     namespace: Option<&str>,
     limit: Option<usize>,
     as_agent: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See
+    // [`visibility_clause`]. `None` = fail-closed (no private rows).
+    caller: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let cap = limit.unwrap_or(LIST_DEFAULT_CAP).min(LIST_MAX_LIMIT);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
     // Placeholder layout: ?1 = uri, ?2 = namespace, ?3 = limit,
-    // ?4..?7 = visibility prefixes (private/team/unit/org).
+    // ?4..?7 = visibility prefixes (private/team/unit/org), ?8 = caller
+    // (visibility_clause owner-keyed private arm). The vis block + the
+    // caller are the trailing placeholders, so no downstream renumber.
     let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
@@ -2558,7 +2622,7 @@ pub fn list_by_source_uri(
            {vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
-        vis = visibility_clause(4, "m"),
+        vis = visibility_clause(4, 8, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -2570,6 +2634,7 @@ pub fn list_by_source_uri(
             vis_t,
             vis_u,
             vis_o,
+            caller, // ?8
         ],
         row_to_memory,
     )?;
@@ -2897,6 +2962,8 @@ pub fn recall_with_telemetry(
     // index covers the lookup and excluded rows never enter the
     // top-K. See [`recall`] for the contract.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -2916,6 +2983,7 @@ pub fn recall_with_telemetry(
         budget_tokens,
         include_archived,
         source_uri_prefix,
+        caller,
     )?;
     let telemetry = crate::models::RecallTelemetry {
         fts_candidates: results.len(),
@@ -2951,6 +3019,12 @@ pub fn recall(
     // that subsequently filtered to fewer. `None` preserves the legacy
     // no-filter behaviour for callers that filter post-hoc.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller (the agent's
+    // `metadata.agent_id`). Bound at the `visibility_clause` caller
+    // placeholder (`?12`) so the owner-keyed private arm gates on
+    // ownership, not namespace. DISTINCT from `as_agent` (the
+    // namespace). `None` = fail-closed (no private rows).
+    caller: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -2976,9 +3050,12 @@ pub fn recall(
     // already-escaped prefix + `%`; combined with the partial index
     // on `source_uri WHERE source_uri IS NOT NULL`, SQLite picks the
     // index for the lookup. See [`escape_like_pattern`].
+    // #1720 A3 — `source_uri` renumbered ?12 → ?13: the caller
+    // placeholder (?12) binds right after the visibility prefixes
+    // (?8..?11), so the trailing source_uri LIKE filter shifts up one.
     let (source_uri_fragment, source_uri_param): (&str, Option<String>) = match source_uri_prefix {
         Some(prefix) if !prefix.is_empty() => (
-            "AND m.source_uri LIKE ?12 ESCAPE '\\'",
+            "AND m.source_uri LIKE ?13 ESCAPE '\\'",
             Some(format!("{}%", escape_like_pattern(prefix))),
         ),
         _ => ("", None),
@@ -3012,10 +3089,10 @@ pub fn recall(
            {vis}
          ORDER BY score DESC
          LIMIT ?7",
-        vis = visibility_clause(8, "m"),
+        vis = visibility_clause(8, 12, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
-    // Bind ?12 only when the source-URI fragment is active; SQLite
+    // Bind ?13 only when the source-URI fragment is active; SQLite
     // errors on parameter-count mismatch.
     let row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64)> {
         let mem = row_to_memory(row)?;
@@ -3042,7 +3119,8 @@ pub fn recall(
                 vis_t,
                 vis_u,
                 vis_o,
-                uri_param,
+                caller,    // ?12
+                uri_param, // ?13
             ],
             row_handler,
         )?;
@@ -3061,6 +3139,7 @@ pub fn recall(
                 vis_t,
                 vis_u,
                 vis_o,
+                caller, // ?12
             ],
             row_handler,
         )?;
@@ -8473,6 +8552,8 @@ pub fn recall_hybrid(
     // partial `idx_memories_source_uri` index covers the lookup. See
     // [`recall`] for the contract.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -8491,6 +8572,7 @@ pub fn recall_hybrid(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )?;
     Ok((results, outcome))
 }
@@ -8519,6 +8601,8 @@ pub fn recall_hybrid_precomputed_hnsw(
     scoring: &crate::config::ResolvedScoring,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
         conn,
@@ -8537,6 +8621,7 @@ pub fn recall_hybrid_precomputed_hnsw(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )?;
     Ok((results, outcome))
 }
@@ -8581,6 +8666,13 @@ struct HybridPrep<'a> {
     fts_query: String,
     now: String,
     prefixes: VisibilityPrefixes,
+    // v0.8.0 #1720 A3 — read-path visibility caller (the agent's
+    // `metadata.agent_id`). Threaded into BOTH the SQL
+    // `visibility_clause` caller bind (FTS + linear-scan branches) and
+    // the Rust `is_visible` HNSW branch so the owner-keyed private arm
+    // gates on ownership. Owned `Option<String>` (not a borrow) so the
+    // prep struct outlives the caller arg across the phase calls.
+    caller: Option<String>,
     fts_hierarchy_fragment: String,
     sem_hierarchy_fragment: String,
     effective_namespace: Option<&'a str>,
@@ -8606,6 +8698,8 @@ fn prepare_hybrid_query<'a>(
     as_agent: Option<&str>,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`HybridPrep`].
+    caller: Option<&str>,
 ) -> HybridPrep<'a> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -8633,13 +8727,17 @@ fn prepare_hybrid_query<'a>(
         Some(prefix) if !prefix.is_empty() => Some(format!("{}%", escape_like_pattern(prefix))),
         _ => None,
     };
+    // #1720 A3 — source_uri renumbered up one on both branches because
+    // the caller placeholder binds right after the visibility prefixes:
+    // FTS ?12 → ?13 (vis ?8..?11, caller ?12); semantic ?10 → ?11
+    // (vis ?6..?9, caller ?10).
     let fts_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND m.source_uri LIKE ?12 ESCAPE '\\'"
+        "AND m.source_uri LIKE ?13 ESCAPE '\\'"
     } else {
         ""
     };
     let sem_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND memories.source_uri LIKE ?10 ESCAPE '\\'"
+        "AND memories.source_uri LIKE ?11 ESCAPE '\\'"
     } else {
         ""
     };
@@ -8647,6 +8745,7 @@ fn prepare_hybrid_query<'a>(
         fts_query,
         now,
         prefixes,
+        caller: caller.map(String::from),
         fts_hierarchy_fragment,
         sem_hierarchy_fragment,
         effective_namespace,
@@ -8703,7 +8802,7 @@ fn fts_keyword_phase(
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
         fts_archived_fragment = prep.fts_archived_fragment,
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
-        vis = visibility_clause(8, "m"),
+        vis = visibility_clause(8, 12, "m"),
     );
     // #1579 B6 — recall’s FTS branch is the hottest read statement;
     // prepare_cached amortises re-parsing across recalls (shape cardinality
@@ -8720,6 +8819,7 @@ fn fts_keyword_phase(
             Ok((mem, fts_score, embedding_bytes))
         };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
+    let caller = prep.caller.as_deref();
     let rows: Vec<(Memory, f64, Option<Vec<u8>>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             fts_stmt
@@ -8736,7 +8836,8 @@ fn fts_keyword_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        uri_param,
+                        caller,    // ?12
+                        uri_param, // ?13
                     ],
                     fts_row_handler,
                 )?
@@ -8756,6 +8857,7 @@ fn fts_keyword_phase(
                         vis_t,
                         vis_u,
                         vis_o,
+                        caller, // ?12
                     ],
                     fts_row_handler,
                 )?
@@ -8914,7 +9016,7 @@ fn semantic_phase(
             {
                 continue;
             }
-            if !is_visible(mem, &prep.prefixes) {
+            if !is_visible(mem, &prep.prefixes, prep.caller.as_deref()) {
                 continue;
             }
             if !include_archived && is_archived_source(mem) {
@@ -8957,7 +9059,7 @@ fn semantic_phase(
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         sem_archived_fragment = prep.sem_archived_fragment,
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
-        vis = visibility_clause(6, "memories"),
+        vis = visibility_clause(6, 10, "memories"),
     );
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
@@ -8970,6 +9072,7 @@ fn semantic_phase(
         Ok((mem, emb_bytes))
     };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
+    let caller = prep.caller.as_deref();
     let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             sem_stmt
@@ -8984,7 +9087,8 @@ fn semantic_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        uri_param,
+                        caller,    // ?10
+                        uri_param, // ?11
                     ],
                     sem_row_handler,
                 )?
@@ -9002,6 +9106,7 @@ fn semantic_phase(
                         vis_t,
                         vis_u,
                         vis_o,
+                        caller, // ?10
                     ],
                     sem_row_handler,
                 )?
@@ -9178,6 +9283,8 @@ pub fn recall_hybrid_with_telemetry(
     // both pools are constrained by the partial
     // `idx_memories_source_uri` index, not the post-fetch Rust filter.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -9201,6 +9308,7 @@ pub fn recall_hybrid_with_telemetry(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )
 }
 
@@ -9239,6 +9347,8 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
     scoring: &crate::config::ResolvedScoring,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -9262,6 +9372,7 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )
 }
 
@@ -9290,6 +9401,8 @@ fn recall_hybrid_with_telemetry_inner(
     scoring: &crate::config::ResolvedScoring,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -9303,6 +9416,7 @@ fn recall_hybrid_with_telemetry_inner(
         as_agent,
         include_archived,
         source_uri_prefix,
+        caller,
     );
 
     // Stage 2 — FTS5 keyword phase.
@@ -11936,13 +12050,28 @@ mod tests {
     }
 
     fn mem_with_scope(ns: &str, scope: Option<&str>) -> Memory {
+        mem_with_scope_owner(ns, scope, None)
+    }
+
+    // v0.8.0 #1720 A4 — the Private arm is owner-keyed, so the
+    // `is_visible` matrix test needs to stamp `metadata.agent_id` on
+    // private rows to assert owner / non-owner / inbox-target outcomes.
+    fn mem_with_scope_owner(ns: &str, scope: Option<&str>, owner: Option<&str>) -> Memory {
         let mut m = make_memory("scoped", ns, Tier::Long, 5);
+        let mut map = serde_json::Map::new();
         if let Some(s) = scope {
-            let mut map = serde_json::Map::new();
             map.insert(
                 crate::META_KEY_SCOPE.to_string(),
                 serde_json::Value::String(s.to_string()),
             );
+        }
+        if let Some(o) = owner {
+            map.insert(
+                crate::META_KEY_AGENT_ID.to_string(),
+                serde_json::Value::String(o.to_string()),
+            );
+        }
+        if !map.is_empty() {
             m.metadata = serde_json::Value::Object(map);
         }
         m
@@ -11955,11 +12084,20 @@ mod tests {
     // carry — leaving the other arms uncovered. Deterministic, no DB.
     #[test]
     fn is_visible_scope_matrix_covers_every_arm() {
-        // No-agent caller (all-None prefixes) bypasses the filter entirely.
+        // v0.8.0 #1720 A4 — Private is owner-keyed; team/unit/org stay
+        // namespace-keyed (by design). `caller` is the resolved
+        // visibility principal (the agent's `metadata.agent_id`),
+        // DISTINCT from the namespace prefixes.
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+
+        // No-agent (all-None prefixes) bypasses the filter entirely,
+        // regardless of caller.
         let unfiltered = (None, None, None, None);
         assert!(super::is_visible(
-            &mem_with_scope("acme/eng/web", Some("private")),
-            &unfiltered
+            &mem_with_scope_owner("acme/eng/web", Some("private"), Some(ALICE)),
+            &unfiltered,
+            Some(BOB),
         ));
 
         // 4-level agent ns populates every prefix slot:
@@ -11975,64 +12113,97 @@ mod tests {
             )
         );
 
-        // Collective: visible to anyone.
+        // Collective: visible to anyone (caller irrelevant).
         assert!(super::is_visible(
             &mem_with_scope("zzz/other", Some("collective")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
-        // Private: only the caller's own namespace (p) is visible.
+        // Private: OWNER-keyed — owner sees it regardless of namespace;
+        // a non-owner does NOT (this is the #1720 leak fix). The
+        // pre-#1720 contract (visible iff same namespace) is GONE.
         assert!(super::is_visible(
-            &mem_with_scope("acme/eng/web/team", Some("private")),
-            &prefixes
+            &mem_with_scope_owner("zzz/unrelated/ns", Some("private"), Some(ALICE)),
+            &prefixes,
+            Some(ALICE),
         ));
         assert!(!super::is_visible(
-            &mem_with_scope("acme/eng/web", Some("private")),
-            &prefixes
+            &mem_with_scope_owner("acme/eng/web/team", Some("private"), Some(ALICE)),
+            &prefixes,
+            Some(BOB),
+        ));
+        // Inbox carve-out: target_agent_id=bob lets bob read alice's
+        // private row.
+        {
+            let mut inbox = mem_with_scope_owner("acme/eng/web/team", Some("private"), Some(ALICE));
+            if let serde_json::Value::Object(map) = &mut inbox.metadata {
+                map.insert(
+                    crate::META_KEY_TARGET_AGENT_ID.to_string(),
+                    serde_json::Value::String(BOB.to_string()),
+                );
+            }
+            assert!(super::is_visible(&inbox, &prefixes, Some(BOB)));
+        }
+        // Fail-closed: a NULL caller sees NO private rows.
+        assert!(!super::is_visible(
+            &mem_with_scope_owner("acme/eng/web/team", Some("private"), Some(ALICE)),
+            &prefixes,
+            None,
         ));
 
-        // Absent scope key → MemoryScope::default() (Private) semantics.
+        // Absent scope key → MemoryScope::default() (Private) → owner-keyed.
         assert!(super::is_visible(
-            &mem_with_scope("acme/eng/web/team", None),
-            &prefixes
+            &mem_with_scope_owner("acme/eng/web/team", None, Some(ALICE)),
+            &prefixes,
+            Some(ALICE),
         ));
         assert!(!super::is_visible(
-            &mem_with_scope("acme/other", None),
-            &prefixes
+            &mem_with_scope_owner("acme/eng/web/team", None, Some(ALICE)),
+            &prefixes,
+            Some(BOB),
         ));
 
-        // Team subtree (t = acme/eng/web): exact + descendant in, sibling out.
+        // Team subtree (t = acme/eng/web): exact + descendant in, sibling
+        // out. Namespace-keyed — caller identity does not gate team/unit/org.
         assert!(super::is_visible(
             &mem_with_scope("acme/eng/web", Some("team")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(super::is_visible(
             &mem_with_scope("acme/eng/web/team/v2", Some("team")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(!super::is_visible(
             &mem_with_scope("acme/eng/api", Some("team")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // Unit subtree (u = acme/eng).
         assert!(super::is_visible(
             &mem_with_scope("acme/eng", Some("unit")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(!super::is_visible(
             &mem_with_scope("acme/sales", Some("unit")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // Org subtree (o = acme).
         assert!(super::is_visible(
             &mem_with_scope("acme", Some("org")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(!super::is_visible(
             &mem_with_scope("globex", Some("org")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // matches_subtree None arm: a shallow agent leaves the org slot empty,
@@ -12041,19 +12212,196 @@ mod tests {
         assert_eq!(shallow.3, None);
         assert!(!super::is_visible(
             &mem_with_scope("acme", Some("org")),
-            &shallow
+            &shallow,
+            Some(BOB),
         ));
 
         // Unknown scope string → from_str None → caller denied.
         assert!(!super::is_visible(
             &mem_with_scope("acme/eng/web/team", Some("definitely-not-a-scope")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // None-agent → all-None tuple (the no-filter sentinel).
         assert_eq!(
             super::compute_visibility_prefixes(None),
             (None, None, None, None)
+        );
+    }
+
+    /// v0.8.0 #1720 A5 — anti-re-drift MATRIX. Asserts the THREE
+    /// visibility predicates agree across
+    /// `scope × owner × caller × namespace-relationship`:
+    ///
+    ///   1. the SQL `visibility_clause` (exercised through a real
+    ///      `db::search` against an in-memory DB holding ONE row),
+    ///   2. the Rust `is_visible` (the HNSW-branch predicate),
+    ///   3. the canonical `crate::visibility::is_visible_to_caller`.
+    ///
+    /// The load-bearing point: **private is owner-keyed in ALL THREE**.
+    /// The team/unit/org scopes are namespace-keyed by design in the SQL
+    /// + `is_visible` predicates, while `is_visible_to_caller` only
+    /// models private/collective/owner — so the matrix asserts:
+    ///   - private + collective cells: ALL THREE agree.
+    ///   - team/unit/org cells: SQL and `is_visible` agree (both
+    ///     namespace-keyed); `is_visible_to_caller` is not asserted on
+    ///     those cells because it does not model subtree scoping
+    ///     (documented by-design divergence).
+    #[test]
+    fn visibility_private_owner_keyed_matrix_1720() {
+        use crate::models::namespace::MemoryScope;
+
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+        // The caller's namespace position. All rows live in `MATCH`;
+        // `SUBTREE` is a parent of `MATCH`; `MISMATCH` is unrelated.
+        const MATCH: &str = "fortitude/team/x";
+        const SUBTREE: &str = "fortitude/team"; // parent (team/unit arms)
+        const MISMATCH: &str = "globex/other";
+
+        // The single row always lives in MATCH so the namespace-keyed
+        // arms (team/unit/org) see it from MATCH/SUBTREE callers.
+        let row_ns = MATCH;
+
+        // Build the single matrix row.
+        let make_row = |scope: Option<&str>, owner: Option<&str>| -> Memory {
+            let mut m = make_memory("matrix-needle", row_ns, Tier::Long, 5);
+            // shared FTS token so `db::search("needle")` matches.
+            m.content = "needle in the matrix haystack".to_string();
+            let mut map = serde_json::Map::new();
+            if let Some(s) = scope {
+                map.insert(
+                    crate::META_KEY_SCOPE.to_string(),
+                    serde_json::Value::String(s.to_string()),
+                );
+            }
+            if let Some(o) = owner {
+                map.insert(
+                    crate::META_KEY_AGENT_ID.to_string(),
+                    serde_json::Value::String(o.to_string()),
+                );
+            }
+            m.metadata = serde_json::Value::Object(map);
+            m
+        };
+
+        // SQL outcome: insert the row, run a real `db::search` with the
+        // given `as_agent` (namespace) + `caller` (owner identity), and
+        // report whether the row surfaced.
+        let sql_visible = |scope: Option<&str>,
+                           owner: Option<&str>,
+                           as_agent: Option<&str>,
+                           caller: Option<&str>|
+         -> bool {
+            let conn = test_db();
+            let m = make_row(scope, owner);
+            insert(&conn, &m).expect("insert matrix row");
+            let hits = search(
+                &conn, "needle", None, None, 10, None, None, None, None, None, as_agent, false,
+                caller,
+            )
+            .expect("search");
+            !hits.is_empty()
+        };
+
+        // The matrix axes.
+        let scopes = [
+            ("private", MemoryScope::Private.as_str()),
+            ("collective", MemoryScope::Collective.as_str()),
+            ("team", MemoryScope::Team.as_str()),
+            ("unit", MemoryScope::Unit.as_str()),
+            ("org", MemoryScope::Org.as_str()),
+        ];
+        let owners = [("alice", Some(ALICE)), ("none", None)];
+        let callers = [("alice", Some(ALICE)), ("bob", Some(BOB)), ("none", None)];
+        // The namespace position the CALLER operates from (as_agent).
+        let ns_rels = [
+            ("match", MATCH),
+            ("mismatch", MISMATCH),
+            ("subtree", SUBTREE),
+        ];
+
+        for (scope_label, scope) in scopes {
+            for (owner_label, owner) in owners {
+                for (caller_label, caller) in callers {
+                    for (ns_label, as_agent) in ns_rels {
+                        let m = make_row(Some(scope), owner);
+                        let prefixes = super::compute_visibility_prefixes(Some(as_agent));
+
+                        let sql = sql_visible(Some(scope), owner, Some(as_agent), caller);
+                        let rust = super::is_visible(&m, &prefixes, caller);
+
+                        let cell = format!(
+                            "scope={scope_label} owner={owner_label} caller={caller_label} \
+                             ns={ns_label}: sql={sql} rust={rust}"
+                        );
+
+                        // SQL and the Rust HNSW predicate must ALWAYS
+                        // agree — they are the two enforcement points
+                        // for the same row (private owner-keyed,
+                        // team/unit/org namespace-keyed, collective open).
+                        assert_eq!(sql, rust, "SQL vs is_visible disagree — {cell}");
+
+                        // The canonical `is_visible_to_caller` is only
+                        // defined for a concrete caller (the `None`
+                        // fail-closed contract lives in its wrappers —
+                        // `is_visible` + the SQL `?caller IS NOT NULL`
+                        // guard — not in the predicate itself). So the
+                        // all-three agreement is asserted on the cells
+                        // `is_visible_to_caller` models: private +
+                        // collective, with a `Some` caller. team/unit/org
+                        // are namespace-keyed by design and NOT modelled
+                        // by `is_visible_to_caller` (documented
+                        // divergence); the `sql==rust` assert above pins
+                        // their agreement.
+                        if let Some(c) = caller
+                            && (scope == MemoryScope::Private.as_str()
+                                || scope == MemoryScope::Collective.as_str())
+                        {
+                            let canon = crate::visibility::is_visible_to_caller(&m, c);
+                            assert_eq!(
+                                sql, canon,
+                                "private/collective must be owner-keyed in ALL THREE — \
+                                 {cell} canon={canon}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Explicit spot-checks of the headline #1720 fix (private is
+        // owner-keyed, NOT namespace-keyed):
+        // bob in the SAME namespace as alice's private row sees NOTHING.
+        assert!(
+            !sql_visible(
+                Some(MemoryScope::Private.as_str()),
+                Some(ALICE),
+                Some(MATCH),
+                Some(BOB)
+            ),
+            "#1720: bob (same namespace) MUST NOT see alice's private row"
+        );
+        // alice (owner) sees it from ANY namespace position.
+        assert!(
+            sql_visible(
+                Some(MemoryScope::Private.as_str()),
+                Some(ALICE),
+                Some(MISMATCH),
+                Some(ALICE)
+            ),
+            "owner MUST see her own private row regardless of as_agent namespace"
+        );
+        // NULL caller (no identity) sees no private row: fail-closed.
+        assert!(
+            !sql_visible(
+                Some(MemoryScope::Private.as_str()),
+                Some(ALICE),
+                Some(MATCH),
+                None
+            ),
+            "fail-closed: NULL caller MUST NOT see private rows"
         );
     }
 
@@ -12473,6 +12821,7 @@ mod tests {
             None,
             None,
             false,
+            None, // #1720 caller — as_agent None => trust-all, caller irrelevant
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -12496,6 +12845,7 @@ mod tests {
             None,
             None,
             false,
+            None, // #1720 caller
         )
         .unwrap();
         assert_eq!(results.len(), 0);
@@ -12529,6 +12879,7 @@ mod tests {
             None,
             false,
             None,
+            None, // #1720 caller
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -12557,6 +12908,7 @@ mod tests {
             None,
             false,
             None,
+            None, // #1720 caller
         );
         // May return empty or error, both acceptable
         assert!(results.is_ok() || results.is_err());
@@ -14177,6 +14529,7 @@ mod tests {
             None,
             None,
             false,
+            None, // #1720 caller
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -14204,6 +14557,7 @@ mod tests {
             None,
             false,
             None,
+            None, // #1720 caller
         )
         .unwrap();
         assert!(!results.is_empty());

@@ -315,6 +315,16 @@ pub async fn search_memories(
         .clone()
         .or_else(|| crate::identity::resolve_http_agent_id(None, header_agent_id).ok());
 
+    // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller for
+    // the sqlite `db::search` / `db::list_by_source_uri` paths. This is
+    // the agent's `metadata.agent_id` (the header-resolved principal),
+    // DISTINCT from `effective_as_agent` (the namespace driving the
+    // team/unit/org subtree arms). Threaded to the owner-keyed
+    // `visibility_clause` private arm. `None` would be fail-closed, but
+    // the header resolver always synthesizes a principal here.
+    let visibility_caller: Option<String> =
+        crate::identity::resolve_http_agent_id(None, header_agent_id).ok();
+
     let lock = app.db.lock().await;
     // v0.6.2 (S40): mirror the `list_memories` ceiling raise so search
     // over a bulk-populated namespace isn't also capped at 200.
@@ -349,6 +359,7 @@ pub async fn search_memories(
                 p.namespace.as_deref(),
                 Some(limit),
                 effective_as_agent.as_deref(),
+                visibility_caller.as_deref(),
             ) {
                 // #1579 B4 — serialize per the negotiated format.
                 Ok(r) => crate::handlers::wire_format::search_response(
@@ -373,6 +384,7 @@ pub async fn search_memories(
         effective_as_agent.as_deref(),
         false,
         source_uri,
+        visibility_caller.as_deref(),
     ) {
         // #1579 B4 — serialize per the negotiated format.
         Ok(r) => crate::handlers::wire_format::search_response(

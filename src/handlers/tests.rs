@@ -208,6 +208,7 @@ async fn recall_via_state() {
         None,
         false,
         None,
+        None, // #1720 caller
     )
     .unwrap();
     assert!(!results.is_empty());

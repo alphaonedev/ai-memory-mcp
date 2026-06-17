@@ -271,6 +271,12 @@ pub(crate) fn run_with_embedder(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let tier_config = feature_tier.config();
+    // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller for
+    // the `db::recall*` SQL gate. CLI is single-tenant operator-as-
+    // actor: `resolve_read_visibility_caller` returns the agent_id when
+    // `AI_MEMORY_AGENT_ID` is set + shape-valid, else `None` (trust-all
+    // read posture preserved). DISTINCT from `--as-agent` (namespace).
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
     // v0.7.0 (issue #518) — when `--session-default` is passed AND a
     // given filter axis is absent on the CLI, splice in the
     // `[agents.defaults.recall_scope]` value from config.toml.
@@ -415,6 +421,7 @@ pub(crate) fn run_with_embedder(
                     &resolved_scoring,
                     args.include_archived,
                     args.source_uri_prefix.as_deref(),
+                    vis_caller.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
                     (
@@ -445,6 +452,7 @@ pub(crate) fn run_with_embedder(
                     args.budget_tokens,
                     args.include_archived,
                     args.source_uri_prefix.as_deref(),
+                    vis_caller.as_deref(),
                 )?;
                 (results, outcome, "keyword")
             }
@@ -464,6 +472,7 @@ pub(crate) fn run_with_embedder(
             args.budget_tokens,
             args.include_archived,
             args.source_uri_prefix.as_deref(),
+            vis_caller.as_deref(),
         )?;
         (results, outcome, "keyword")
     };

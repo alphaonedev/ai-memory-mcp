@@ -180,7 +180,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // full-row writer + four in-module `merge_inbound_*` regression tests.
     // No schema change; pure reuse of the existing merge primitive + a
     // full-row UPDATE. Measured 18_288; bump 17_990 → 18_340 in lockstep.
-    ("src/storage/mod.rs", 18_340),
+    // 2026-06-17 (#1720 A2-A5, security lane) — owner-keyed scope=private
+    // visibility: the `visibility_clause` private arm + the `is_visible`
+    // Private arm became owner-keyed (caller threaded through recall /
+    // search / recall_hybrid + their callers), plus the in-module
+    // `visibility_private_owner_keyed_matrix_1720` anti-re-drift test and
+    // the owner-keyed rewrite of `is_visible_scope_matrix_covers_every_arm`.
+    // No schema change. Measured 18_691; bump 18_340 → 18_700 in lockstep.
+    ("src/storage/mod.rs", 18_700),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
