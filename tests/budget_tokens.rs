@@ -73,7 +73,23 @@ use serde_json::json;
 // (provider-agnostic LLM substrate) + #1050 (memory_share registration):
 // measured ~5564 tokens 2026-05-21. Ceiling raised to 6000 with
 // ~400-token headroom, matching `.github/workflows/token-budget.yml`.
-const FULL_PROFILE_TOKEN_CEILING: usize = 6_000;
+//
+// v0.8.0 #1709 update: the substrate grew 74 → 100 advertised tools
+// (Pillar-1 coordination: signals / actions / leases / checkpoints /
+// routines). The trimmed wire payload measured 6208 cl100k tokens —
+// the overage is STRUCTURAL (tool names + inputSchema shape across the
+// 26 new tools), not prose: `wire_compact_descriptions` already strips
+// per-property descriptions + compacts every top-level description to
+// ~32 chars, so description-trimming yields ~0 wire reduction. Per the
+// per-tool-budget convention (~62 cl100k tokens/tool × 100 + ~300 head-
+// room) and the in-tree precedent of tool-count-tied ceiling raises
+// (`tests/token_budget_guard.rs` bumped the verbose ceiling 17K→22K
+// across the same Pillar-1 waves), the ceiling is raised to 6500. This
+// stays 4500 below the structural backstop `TRIMMED_FULL_PROFILE_CEILING_TOKENS`
+// (11000, still green) — the tighter 6500 remains the "we still care
+// about per-session token cost" tripwire. Decided by a 5-agent
+// adversarial vote (operator crossroads protocol, #1709 comment).
+const FULL_PROFILE_TOKEN_CEILING: usize = 6_500;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {
