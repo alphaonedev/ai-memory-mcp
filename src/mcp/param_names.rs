@@ -96,6 +96,7 @@ pub const IN_REPLY_TO: &str = "in_reply_to";
 pub const K: &str = "k";
 pub const KIND: &str = "kind";
 pub const KIND_INNER: &str = "kind_inner";
+pub const LIFECYCLE_STATE: &str = "lifecycle_state";
 pub const LIMIT: &str = "limit";
 pub const LINK_ID: &str = "link_id";
 pub const MAX_ATOM_TOKENS: &str = "max_atom_tokens";
@@ -233,6 +234,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     K,
     KIND,
     KIND_INNER,
+    LIFECYCLE_STATE,
     LIMIT,
     LINK_ID,
     MAX_ATOM_TOKENS,
