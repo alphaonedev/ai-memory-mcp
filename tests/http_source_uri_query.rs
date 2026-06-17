@@ -95,6 +95,18 @@ fn seed_many(path: &std::path::Path, namespace: &str, count: usize, uri: Option<
             created_at: now.clone(),
             updated_at: now,
             source_uri: uri.map(str::to_string),
+            // v0.8.0 #1720 A3/A4 — scope=private visibility is now
+            // OWNER-keyed (metadata.agent_id == caller), not
+            // namespace-keyed. Stamp a concrete owner equal to the
+            // namespace string (a valid agent_id) so a request that
+            // authenticates as that owner via `X-Agent-Id` can see the
+            // rows, while any other principal (a different concrete
+            // owner, or an anonymous header-less caller) is fail-closed.
+            // The default-metadata seed left agent_id absent, which under
+            // the owner-keyed model is un-ownable → hidden from every
+            // caller (the pre-#1720 `as_agent`-namespace grant was the
+            // cross-tenant leak that #1720 closed).
+            metadata: serde_json::json!({ "agent_id": namespace }),
             ..Default::default()
         };
         ai_memory::db::insert(&conn, &mem).expect("insert");
@@ -102,11 +114,32 @@ fn seed_many(path: &std::path::Path, namespace: &str, count: usize, uri: Option<
 }
 
 async fn get_search(router: &axum::Router, query: &str) -> (StatusCode, Value) {
-    let req = Request::builder()
+    get_search_inner(router, query, None).await
+}
+
+// v0.8.0 #1720 A3/A4 — authenticate as a concrete owner via the
+// `X-Agent-Id` header. The HTTP search handler resolves the owner-keyed
+// `scope=private` visibility caller exclusively from this header
+// (`memories_query.rs` → `resolve_http_agent_id`), DISTINCT from the
+// `as_agent` query-param that only drives the team/unit/org subtree
+// arms. Sending `X-Agent-Id == <row owner>` lets the caller see its own
+// private rows; a different value is fail-closed.
+async fn get_search_as(router: &axum::Router, query: &str, agent_id: &str) -> (StatusCode, Value) {
+    get_search_inner(router, query, Some(agent_id)).await
+}
+
+async fn get_search_inner(
+    router: &axum::Router,
+    query: &str,
+    agent_id: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
         .method("GET")
-        .uri(format!("/api/v1/search?{query}"))
-        .body(Body::empty())
-        .unwrap();
+        .uri(format!("/api/v1/search?{query}"));
+    if let Some(a) = agent_id {
+        builder = builder.header(ai_memory::HEADER_AGENT_ID, a);
+    }
+    let req = builder.body(Body::empty()).unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
@@ -123,14 +156,12 @@ async fn http_search_composes_q_with_source_uri_filter() {
     // per source URI (the FTS query is title-based and the seed_many
     // helper writes per-iteration distinct titles).
     //
-    // #975 (2026-05-20): pass `as_agent=ns-compose` so the post-#942
-    // visibility filter (which synthesises `anonymous:req-<uuid>` for
-    // HTTP requests without `X-Agent-Id`) sees the seeded rows.
-    // `as_agent` aligns the caller's visibility-principal namespace
-    // with the seeded rows' namespace so the `scope=private` rows
-    // are visible. Pre-#975 the test ran against a synthetic anon
-    // principal and the visibility WHERE-clause rejected every row,
-    // returning count=0.
+    // v0.8.0 #1720 A3/A4: scope=private visibility is OWNER-keyed.
+    // `seed_many` stamps `metadata.agent_id = "ns-compose"` on every
+    // row, so the caller must authenticate as that owner via the
+    // `X-Agent-Id` header to see them. (Pre-#1720 a same-namespace
+    // `as_agent` grant sufficed — that was the cross-tenant leak #1720
+    // closed; #975 originally relied on it.)
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-compose", 3, Some("doc:abc"));
     seed_many(file.path(), "ns-compose", 2, Some("doc:xyz"));
@@ -138,11 +169,8 @@ async fn http_search_composes_q_with_source_uri_filter() {
     // FTS sanitization breaks tokens apart — pick a specific title
     // token so the result set is deterministic and the URI filter
     // can be observed shrinking it.
-    let (status, body) = get_search(
-        &router,
-        "q=ns-compose&source_uri=doc%3Aabc&as_agent=ns-compose",
-    )
-    .await;
+    let (status, body) =
+        get_search_as(&router, "q=ns-compose&source_uri=doc%3Aabc", "ns-compose").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let count = body["count"].as_u64().unwrap_or_default();
     assert!(
@@ -187,7 +215,10 @@ async fn http_search_with_unknown_source_uri_intersected_returns_empty() {
     // requires the issue-#891 fix landing first).
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-unk", 3, Some("doc:abc"));
-    let (status, body) = get_search(&router, "q=body&source_uri=doc%3Anope").await;
+    // Authenticate as the rows' owner ("ns-unk") so the empty result is
+    // unambiguously the URI filter (doc:nope matches nothing), not the
+    // #1720 owner-keyed visibility gate.
+    let (status, body) = get_search_as(&router, "q=body&source_uri=doc%3Anope", "ns-unk").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["count"].as_u64(),
@@ -201,21 +232,20 @@ async fn http_search_with_source_uri_only_returns_all_rows_from_that_doc_issue_8
     // AC pin (blocked): \"HTTP `GET /api/v1/memories?source_uri=X`
     // query param\" per issue #889.
     //
-    // #975 (2026-05-20): the source_uri-only reciprocal endpoint now
+    // #975 (2026-05-20): the source_uri-only reciprocal endpoint
     // applies the same scope=private visibility gate as
-    // `search_with_source_uri` (closing the post-#942 visibility
-    // inconsistency). The test passes `as_agent=ns-doc` so the
-    // caller's visibility-principal namespace matches the seeded
-    // rows. Pre-#975 the source_uri-only path bypassed visibility
-    // entirely — any HTTP caller (no `X-Agent-Id`, no `as_agent`)
-    // could read every row in every document.
+    // `search_with_source_uri`. v0.8.0 #1720 A3/A4 made that gate
+    // OWNER-keyed: `seed_many` stamps `metadata.agent_id = "ns-doc"`,
+    // so the caller authenticates as that owner via `X-Agent-Id` to
+    // read the document's rows. Pre-#1720 the source_uri-only path
+    // bypassed visibility / granted same-namespace `as_agent` access —
+    // any caller could read every row in every document.
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-doc", 5, Some("doc:contract-2026"));
     seed_many(file.path(), "ns-doc", 3, Some("doc:other-thing"));
     seed_many(file.path(), "ns-doc", 2, None);
 
-    let (status, body) =
-        get_search(&router, "source_uri=doc%3Acontract-2026&as_agent=ns-doc").await;
+    let (status, body) = get_search_as(&router, "source_uri=doc%3Acontract-2026", "ns-doc").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["count"].as_u64(), Some(5));
     let results = body["results"].as_array().expect("results");
@@ -235,15 +265,18 @@ async fn http_search_with_source_uri_only_returns_all_rows_from_that_doc_issue_8
 async fn http_search_source_uri_only_applies_visibility_gate_975() {
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-private-doc", 4, Some("doc:secret"));
-    // Caller asks under a DIFFERENT principal namespace than the
-    // seeded rows. With scope=private (the default) the visibility
-    // WHERE-clause must reject every row.
-    let (status, body) = get_search(&router, "source_uri=doc%3Asecret&as_agent=ns-other").await;
+    // v0.8.0 #1720 A3/A4: the rows are OWNED by "ns-private-doc". A
+    // caller authenticating as a DIFFERENT concrete owner
+    // ("ns-other") must be rejected by the owner-keyed scope=private
+    // gate — a non-tautological negative (proves the gate discriminates
+    // between two real owners, not merely that an absent identity
+    // fails).
+    let (status, body) = get_search_as(&router, "source_uri=doc%3Asecret", "ns-other").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["count"].as_u64(),
         Some(0),
-        "source_uri-only path must honour the scope=private visibility gate (was leaking pre-#975)",
+        "source_uri-only path must honour the owner-keyed scope=private gate (#1720)",
     );
 }
 
@@ -256,21 +289,22 @@ async fn http_search_q_plus_source_uri_applies_visibility_gate_975() {
     let (router, file) = build_test_router();
     seed_many(file.path(), "ns-vg", 3, Some("doc:abc"));
     seed_many(file.path(), "ns-vg", 2, Some("doc:xyz"));
-    // Mismatched principal — visibility gate rejects every row.
-    let (status, body) =
-        get_search(&router, "q=ns-vg&source_uri=doc%3Aabc&as_agent=ns-other").await;
+    // v0.8.0 #1720 A3/A4 — rows are OWNED by "ns-vg". A DIFFERENT
+    // concrete owner ("ns-other") is rejected by the owner-keyed
+    // scope=private gate (non-tautological negative).
+    let (status, body) = get_search_as(&router, "q=ns-vg&source_uri=doc%3Aabc", "ns-other").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["count"].as_u64(),
         Some(0),
-        "q+source_uri must reject when caller principal mismatches seeded namespace",
+        "q+source_uri must reject when caller is not the rows' owner (#1720 owner-keyed)",
     );
-    // Matched principal — abc rows surface.
-    let (status, body) = get_search(&router, "q=ns-vg&source_uri=doc%3Aabc&as_agent=ns-vg").await;
+    // The owner ("ns-vg") authenticating via X-Agent-Id sees abc rows.
+    let (status, body) = get_search_as(&router, "q=ns-vg&source_uri=doc%3Aabc", "ns-vg").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let count = body["count"].as_u64().unwrap_or_default();
     assert!(
         (1..=3).contains(&count),
-        "matched principal sees abc rows only (got {count})",
+        "owner sees abc rows only (got {count})",
     );
 }
