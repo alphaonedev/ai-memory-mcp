@@ -121,6 +121,10 @@
           "title": {
             "description": "Short title",
             "type": "string"
+          },
+          "lifecycle_state": {
+            "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
+            "type": "string"
           }
         },
         "required": [
@@ -873,6 +877,10 @@
             "type": "string"
           },
           "title": {
+            "type": "string"
+          },
+          "lifecycle_state": {
+            "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
             "type": "string"
           }
         },
