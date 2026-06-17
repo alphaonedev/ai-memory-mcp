@@ -550,10 +550,35 @@ pub struct VectorClock {
     pub entries: std::collections::BTreeMap<String, String>,
 }
 
+/// The causal relationship between two [`VectorClock`]s, as returned by
+/// [`VectorClock::causality`].
+///
+/// v0.8.0 Pillar-3 (CRDT/consensus, #1709) / #224 Task 3a.1 CRDT-lite
+/// merge. This is the canonical comparator for the sync-state vector
+/// clock: every higher-level predicate
+/// ([`VectorClock::happens_before`], [`VectorClock::concurrent_with`])
+/// is derived from it, so there is exactly one source of truth for the
+/// causality decision.
+///
+/// `HappensBefore` means `self` is causally dominated by `other`
+/// (`other` has seen everything `self` has, strictly more). `Concurrent`
+/// means the two clocks have diverged — each has observed a peer
+/// timestamp the other has not caught up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Causality {
+    /// The two clocks carry identical per-peer timestamps.
+    Equal,
+    /// `self` is strictly causally dominated by `other`.
+    HappensBefore,
+    /// `self` strictly causally dominates `other`.
+    HappensAfter,
+    /// The clocks have diverged; neither dominates the other.
+    Concurrent,
+}
+
 impl VectorClock {
     /// Advance this clock to include `peer_id`'s latest seen timestamp.
     /// Monotonic — an older timestamp never overwrites a newer one.
-    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite merge (issue #224).
     pub fn observe(&mut self, peer_id: &str, at: &str) {
         self.entries
             .entry(peer_id.to_string())
@@ -567,9 +592,97 @@ impl VectorClock {
 
     /// Look up the latest timestamp this clock has from `peer_id`.
     #[must_use]
-    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite merge (issue #224).
     pub fn latest_from(&self, peer_id: &str) -> Option<&str> {
         self.entries.get(peer_id).map(String::as_str)
+    }
+
+    /// The timestamp this clock carries for `peer_id`, treating a peer
+    /// ABSENT from `entries` as the minimal timestamp (`""` — the empty
+    /// string sorts before every RFC3339 value, i.e. "never seen").
+    ///
+    /// Comparison is lexical, mirroring [`VectorClock::observe`] exactly
+    /// (the existing string-`max` convention; timestamps are NOT parsed
+    /// to `DateTime`). Callers therefore rely on the same zero-padded,
+    /// same-offset RFC3339 encoding the rest of the substrate emits.
+    #[must_use]
+    fn at(&self, peer_id: &str) -> &str {
+        self.entries.get(peer_id).map_or("", String::as_str)
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — pointwise-max merge.
+    ///
+    /// For every peer present in `other`, set
+    /// `self[peer] = max(self[peer], other[peer])` by lexical RFC3339
+    /// comparison (the [`VectorClock::observe`] rule). Peers only in
+    /// `self` are retained; the result is the union of both peer sets
+    /// with each entry advanced to the later timestamp. An older
+    /// `other` timestamp never regresses a newer `self` entry.
+    ///
+    /// This is the load-bearing reconciliation primitive: it is
+    /// idempotent (`merge(x, x) == x`), commutative (the merged clock is
+    /// independent of order), and associative.
+    pub fn merge(&mut self, other: &VectorClock) {
+        for (peer, at) in &other.entries {
+            self.observe(peer, at);
+        }
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — the canonical
+    /// causality comparator. Every other predicate on this type is
+    /// derived from this one method so the logic cannot diverge.
+    ///
+    /// Returns [`Causality::Equal`] when the two clocks carry identical
+    /// per-peer timestamps; [`Causality::HappensBefore`] when `other`
+    /// strictly dominates `self` (`self[p] <= other[p]` for every peer
+    /// in either clock, and they are not equal);
+    /// [`Causality::HappensAfter`] for the mirror; and
+    /// [`Causality::Concurrent`] when neither dominates the other (each
+    /// is ahead on some peer). Absent peers are treated as the minimal
+    /// timestamp, so an empty clock happens-before any non-empty clock.
+    #[must_use]
+    pub fn causality(&self, other: &VectorClock) -> Causality {
+        if self == other {
+            return Causality::Equal;
+        }
+        // `self` is dominated by `other` iff no peer (in either clock)
+        // has a strictly-greater timestamp in `self` than in `other`.
+        let mut self_le_other = true; // self <= other pointwise
+        let mut other_le_self = true; // other <= self pointwise
+        for peer in self.entries.keys().chain(other.entries.keys()) {
+            let s = self.at(peer);
+            let o = other.at(peer);
+            if s > o {
+                self_le_other = false;
+            }
+            if o > s {
+                other_le_self = false;
+            }
+        }
+        match (self_le_other, other_le_self) {
+            // Equality is handled above, so both-true is unreachable
+            // here; fold it into Equal defensively rather than panic.
+            (true, true) => Causality::Equal,
+            (true, false) => Causality::HappensBefore,
+            (false, true) => Causality::HappensAfter,
+            (false, false) => Causality::Concurrent,
+        }
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — strict causal
+    /// dominance: true iff `other` strictly dominates `self` (for every
+    /// peer `p`, `self[p] <= other[p]`, and `self != other`). Derived
+    /// from [`VectorClock::causality`] (single source of truth).
+    #[must_use]
+    pub fn happens_before(&self, other: &VectorClock) -> bool {
+        self.causality(other) == Causality::HappensBefore
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — concurrency: true iff
+    /// the two clocks have diverged (neither happens-before the other
+    /// and they are not equal). Derived from [`VectorClock::causality`].
+    #[must_use]
+    pub fn concurrent_with(&self, other: &VectorClock) -> bool {
+        self.causality(other) == Causality::Concurrent
     }
 }
 
@@ -708,6 +821,188 @@ mod tests {
             json["entries"]["peer-a"],
             serde_json::Value::String("2026-01-01T00:00:00Z".to_string())
         );
+    }
+
+    // ---- v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — VectorClock
+    // causality algebra + merge. Pure, deterministic truth table. ----
+
+    /// Build a clock from `(peer, timestamp)` pairs for the algebra tests.
+    fn vc(pairs: &[(&str, &str)]) -> VectorClock {
+        let mut c = VectorClock::default();
+        for (p, at) in pairs {
+            c.observe(p, at);
+        }
+        c
+    }
+
+    #[test]
+    fn vector_clock_causality_identical_clocks_are_equal() {
+        let a = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        let b = a.clone();
+        assert_eq!(a.causality(&b), Causality::Equal);
+        assert!(!a.happens_before(&b));
+        assert!(!a.concurrent_with(&b));
+    }
+
+    #[test]
+    fn vector_clock_causality_strict_superset_happens_after() {
+        // `b` has seen everything `a` has, plus more → a < b, b > a.
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        assert_eq!(a.causality(&b), Causality::HappensBefore);
+        assert_eq!(b.causality(&a), Causality::HappensAfter);
+        assert!(a.happens_before(&b));
+        assert!(!b.happens_before(&a));
+        assert!(!a.concurrent_with(&b));
+    }
+
+    #[test]
+    fn vector_clock_causality_newer_timestamp_same_peer_happens_after() {
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[("p1", "2026-02-01T00:00:00Z")]);
+        assert_eq!(a.causality(&b), Causality::HappensBefore);
+        assert_eq!(b.causality(&a), Causality::HappensAfter);
+    }
+
+    #[test]
+    fn vector_clock_causality_divergent_clocks_are_concurrent() {
+        // Each clock is ahead on a peer the other has not caught up on.
+        let a = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        assert_eq!(a.causality(&b), Causality::Concurrent);
+        assert_eq!(b.causality(&a), Causality::Concurrent);
+        assert!(a.concurrent_with(&b));
+        assert!(b.concurrent_with(&a));
+        assert!(!a.happens_before(&b));
+        assert!(!b.happens_before(&a));
+    }
+
+    #[test]
+    fn vector_clock_causality_empty_vs_nonempty() {
+        let empty = VectorClock::default();
+        let some = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        // Absent peer is the minimal timestamp → empty happens-before.
+        assert_eq!(empty.causality(&some), Causality::HappensBefore);
+        assert_eq!(some.causality(&empty), Causality::HappensAfter);
+        assert!(empty.happens_before(&some));
+        // Two empty clocks are equal, never concurrent.
+        let empty2 = VectorClock::default();
+        assert_eq!(empty.causality(&empty2), Causality::Equal);
+        assert!(!empty.concurrent_with(&empty2));
+    }
+
+    #[test]
+    fn vector_clock_absent_peer_is_minimal_not_concurrent() {
+        // p2 absent in `a` is treated as minimal, so `a` < `b` rather
+        // than concurrent (b only advances on the absent peer).
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        assert!(a.happens_before(&b));
+        assert!(!a.concurrent_with(&b));
+    }
+
+    #[test]
+    fn vector_clock_merge_is_pointwise_max() {
+        let mut a = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-03-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"), // newer on p1 → wins
+            ("p2", "2026-01-01T00:00:00Z"), // older on p2 → must NOT regress
+            ("p3", "2026-01-01T00:00:00Z"), // new peer → added
+        ]);
+        a.merge(&b);
+        assert_eq!(a.latest_from("p1"), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(a.latest_from("p2"), Some("2026-03-01T00:00:00Z"));
+        assert_eq!(a.latest_from("p3"), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn vector_clock_merge_is_idempotent() {
+        let a = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        let mut once = a.clone();
+        once.merge(&a);
+        assert_eq!(once, a, "merge(x, x) == x");
+    }
+
+    #[test]
+    fn vector_clock_merge_is_commutative() {
+        let a = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p3", "2026-05-01T00:00:00Z"),
+        ]);
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab, ba, "merge order must not change the result");
+    }
+
+    #[test]
+    fn vector_clock_merge_is_associative() {
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let c = vc(&[
+            ("p2", "2026-03-01T00:00:00Z"),
+            ("p3", "2026-01-01T00:00:00Z"),
+        ]);
+        // (a ∪ b) ∪ c
+        let mut left = a.clone();
+        left.merge(&b);
+        left.merge(&c);
+        // a ∪ (b ∪ c)
+        let mut bc = b.clone();
+        bc.merge(&c);
+        let mut right = a.clone();
+        right.merge(&bc);
+        assert_eq!(left, right, "merge must be associative");
+    }
+
+    #[test]
+    fn vector_clock_merge_result_dominates_both_inputs() {
+        // The merged clock causally dominates (or equals) each input —
+        // the algebra and merge agree.
+        let a = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        // a and b are concurrent, but their merge is after both.
+        assert!(a.concurrent_with(&b));
+        let mut m = a.clone();
+        m.merge(&b);
+        assert_eq!(a.causality(&m), Causality::HappensBefore);
+        assert_eq!(b.causality(&m), Causality::HappensBefore);
+        assert_eq!(m.causality(&m), Causality::Equal);
     }
 
     // ---- C-5 (#699): lift coverage on MemoryLinkRelation parsing/defaults.

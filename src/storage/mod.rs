@@ -9289,6 +9289,29 @@ pub fn sync_state_observe(
     Ok(())
 }
 
+/// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — CRDT-lite merge: fold an
+/// `incoming` peer vector clock into `agent_id`'s persisted sync-state
+/// via pointwise max. Each `(peer, last_seen_at)` entry is applied
+/// through the same monotonic [`sync_state_observe`] upsert, so an older
+/// incoming timestamp never regresses a newer stored entry, and peers
+/// the receiver had not yet seen are added.
+///
+/// Additive over [`sync_state_observe`]: where `observe` advances ONE
+/// `(peer, ts)` entry, this enriches the stored receiver clock with
+/// EVERY peer the sender has observed, so the receiver's vector clock
+/// reflects the full transitive set of peer timestamps — the
+/// reconciliation foundation for redundant-push short-circuiting.
+pub fn sync_state_merge(
+    conn: &Connection,
+    agent_id: &str,
+    incoming: &crate::models::VectorClock,
+) -> Result<()> {
+    for (peer_id, seen_at) in &incoming.entries {
+        sync_state_observe(conn, agent_id, peer_id, seen_at)?;
+    }
+    Ok(())
+}
+
 /// Load the full vector clock for `agent_id` — the set of
 /// (`peer_id` -> `last_seen_at`) this local agent tracks.
 pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::models::VectorClock> {
@@ -17903,5 +17926,34 @@ mod tests {
             .public_base64();
         bind_agent_pubkey(&conn, "ai:curator", &k2).expect("rebind k2");
         assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+    }
+
+    #[test]
+    fn sync_state_merge_applies_pointwise_max_and_never_regresses() {
+        // v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — fold an incoming
+        // peer clock into the persisted sync-state via pointwise max:
+        // a NEW peer is added, a NEWER timestamp advances an existing
+        // peer, and an OLDER incoming timestamp must NOT regress a newer
+        // stored entry.
+        let conn = test_db();
+        let local = "ai:receiver";
+        // Seed the receiver clock: p-existing at a mid timestamp.
+        sync_state_observe(&conn, local, "p-existing", "2026-03-01T00:00:00Z").expect("seed");
+        sync_state_observe(&conn, local, "p-stable", "2026-05-01T00:00:00Z").expect("seed2");
+
+        let mut incoming = crate::models::VectorClock::default();
+        incoming.observe("p-existing", "2026-04-01T00:00:00Z"); // newer → wins
+        incoming.observe("p-stable", "2026-01-01T00:00:00Z"); // older → must NOT regress
+        incoming.observe("p-new", "2026-02-01T00:00:00Z"); // new peer → added
+
+        sync_state_merge(&conn, local, &incoming).expect("merge");
+
+        let merged = sync_state_load(&conn, local).expect("reload");
+        assert_eq!(
+            merged.latest_from("p-existing"),
+            Some("2026-04-01T00:00:00Z")
+        );
+        assert_eq!(merged.latest_from("p-stable"), Some("2026-05-01T00:00:00Z"));
+        assert_eq!(merged.latest_from("p-new"), Some("2026-02-01T00:00:00Z"));
     }
 }
