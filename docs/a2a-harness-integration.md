@@ -22,10 +22,10 @@ exercising this repo's binary.
 
 ## v0.8.0 substrate guarantees the harness can rely on
 
-- 93 MCP tools at `--profile full`; 7 at `--profile core` + always-on
+- 100 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
 - 89 production HTTP routes (75 unique URL paths) registered.
-- Schema v61 (single logical version across sqlite + postgres at
+- Schema v67 (single logical version across sqlite + postgres at
   v0.8.0-dev HEAD; see `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
   and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).
 - Per-message Ed25519 federation signing (`X-Memory-Sig` header).
