@@ -477,6 +477,14 @@ impl MemoryStore for SqliteStore {
         db::insert_if_newer(&conn, memory).map_err(box_err)
     }
 
+    async fn merge_inbound(&self, _ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // v0.8.0 Pillar-3 (#1709 / #224) — delegate to the sqlite
+        // free-fn, which does the atomic read-by-id → `merge_memory` →
+        // full-row write (else `insert_if_newer` fall-through).
+        let conn = self.state.lock().await;
+        db::merge_inbound(&conn, inbound).map_err(box_err)
+    }
+
     async fn apply_remote_link(
         &self,
         _ctx: &CallerContext,

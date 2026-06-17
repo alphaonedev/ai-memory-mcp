@@ -1098,6 +1098,38 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry
+    /// that field-merges a divergent same-`id` inbound row via the
+    /// CRDT-lite [`crate::models::merge_memory`] reconciler instead of the
+    /// coarse scalar last-write-wins clobber [`apply_remote_memory`] /
+    /// `insert_if_newer` apply.
+    ///
+    /// Atomic read-merge-write. Returns the resolved row id.
+    ///
+    /// Semantics:
+    /// 1. If a row already exists BY `inbound.id`, persist
+    ///    `merge_memory(&existing, inbound)` — the SAME pure #224 Rust
+    ///    reconciler on every adapter, so there is no per-backend merge
+    ///    drift (only the read/write SQL differs).
+    /// 2. Otherwise fall through to the unchanged insert-if-newer path
+    ///    (fresh INSERT + `(title, namespace)` dedup-upsert LWW).
+    ///
+    /// The #224 invariants — `agent_id` immutable (local wins), governance
+    /// owner-only (local kept), metadata deep-merge — are preserved
+    /// automatically by `merge_memory`.
+    ///
+    /// Default implementation: `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `inbound` fails validation. Returns
+    /// `Backend` for storage errors.
+    async fn merge_inbound(&self, _ctx: &CallerContext, _inbound: &Memory) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_MERGE_INBOUND".to_string(),
+        })
+    }
+
     /// Apply a remote-origin link via the same idempotent posture as
     /// [`MemoryStore::apply_remote_memory`]. The unique
     /// `(source_id, target_id, relation)` index makes duplicate

@@ -81,6 +81,10 @@ const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
 const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
     "DELETE FROM namespace_meta WHERE standard_id = $1";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
+/// Full-row select of a single memory by id. Shared by `get`,
+/// `merge_inbound`, and the lifecycle-state reader so the projection
+/// lives in exactly one place (pm-v3.1 hardcoded-literal discipline).
+const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = $1";
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
 const SQL_LOAD_AGE: &str = "LOAD 'age'";
@@ -10223,7 +10227,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
-        let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
+        let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -11217,6 +11221,131 @@ impl MemoryStore for PostgresStore {
 
         row.try_get::<String, _>("id")
             .map_err(|e| to_store_err(READ_RETURNED_ID, e))
+    }
+
+    async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // ARCH-1 parity (mirrors apply_remote_memory) — a federation-
+        // pushed row must clear the same pre-write governance hook as a
+        // locally-authored write.
+        consult_governance_pre_write_pg(inbound)?;
+
+        // v0.8.0 Pillar-3 (#1709 / #224) — read the existing row BY id
+        // (bypassing the scope=private visibility gate: this is the
+        // federation reconciliation path, not a tenant-facing read; the
+        // federation allowlist + peer-attestation gate enforce
+        // cross-tenant isolation upstream), merge field-wise via the SAME
+        // pure `crate::models::merge_memory` Rust reconciler the sqlite
+        // path uses (no per-adapter merge SQL → no merge drift), then
+        // persist the full merged row by id inside a transaction. If no
+        // row matches by id, fall through to `apply_remote_memory` (the
+        // postgres `insert_if_newer` twin) for the fresh-insert +
+        // (title, namespace) dedup-upsert LWW path.
+        let existing_row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+            .bind(&inbound.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("merge_inbound select by id", e))?;
+
+        let Some(row) = existing_row else {
+            // No row by this id — defer to the unchanged LWW path.
+            return self.apply_remote_memory(ctx, inbound).await;
+        };
+
+        let existing = Self::row_to_memory(&row)?;
+        let merged = crate::models::merge_memory(&existing, inbound);
+
+        // Encode the JSON-shaped columns the same way the
+        // `apply_remote_memory` insert path does.
+        let created_at = parse_rfc3339_required(&merged.created_at)?;
+        let updated_at = parse_rfc3339_required(&merged.updated_at)?;
+        let last_accessed_at = parse_rfc3339_opt(merged.last_accessed_at.as_deref());
+        let expires_at = parse_rfc3339_opt(merged.effective_expires_at().as_deref());
+        let tags_json =
+            serde_json::to_value(&merged.tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("tags", e),
+            })?;
+        let citations_json =
+            serde_json::to_string(&merged.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("citations", e),
+            })?;
+        let source_span_json = match &merged.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &merged.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+                })?,
+            ),
+            None => None,
+        };
+        let confidence_decayed_at = parse_rfc3339_opt(merged.confidence_decayed_at.as_deref());
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(&merged);
+
+        // Full-row UPDATE by id — every column is written verbatim from
+        // the already-resolved merged row (NO CASE / GREATEST / COALESCE
+        // re-application; `merge_memory` resolved every field). Wrapped in
+        // a transaction so the read-merge-write is atomic.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        sqlx::query(
+            "UPDATE memories SET
+                tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
+                priority = $7, confidence = $8, source = $9, access_count = $10,
+                created_at = $11, updated_at = $12, last_accessed_at = $13,
+                expires_at = $14, metadata = $15, reflection_depth = $16,
+                memory_kind = $17, citations = $18, source_uri = $19,
+                source_span = $20, confidence_source = $21, confidence_signals = $22,
+                confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
+                version = $26, mentioned_entity_id = $27, lifecycle_state = $28
+             WHERE id = $1",
+        )
+        .bind(&merged.id)
+        .bind(merged.tier.as_str())
+        .bind(&merged.namespace)
+        .bind(&merged.title)
+        .bind(&merged.content)
+        .bind(&tags_json)
+        .bind(merged.priority)
+        .bind(merged.confidence)
+        .bind(&merged.source)
+        .bind(merged.access_count)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(last_accessed_at)
+        .bind(expires_at)
+        .bind(&merged.metadata)
+        .bind(merged.reflection_depth)
+        .bind(merged.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(merged.source_uri.as_ref())
+        .bind(source_span_json.as_deref())
+        .bind(merged.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(confidence_decayed_at)
+        .bind(merged.entity_id.as_ref())
+        .bind(merged.persona_version)
+        .bind(merged.version)
+        .bind(mentioned_entity_id.as_deref())
+        .bind(merged.lifecycle_state.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("merge_inbound commit tx", e))?;
+
+        Ok(merged.id)
     }
 
     async fn apply_remote_link(
@@ -12437,7 +12566,7 @@ impl MemoryStore for PostgresStore {
         // metadata — peer-origin, signing agent, depth — never content),
         // so fetch the raw row directly rather than through the
         // visibility-gated `get`.
-        let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
+        let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
             .await

@@ -7658,6 +7658,183 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     Ok(actual_id)
 }
 
+/// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry that
+/// makes the CRDT-lite per-field [`crate::models::merge_memory`] reconciler
+/// **load-bearing**. This is the federation reconciliation site's writer:
+/// it field-merges a divergent same-`id` inbound row instead of the coarse
+/// scalar last-write-wins clobber the `(title, namespace)` upsert in
+/// [`insert_if_newer`] applies.
+///
+/// Atomic read-merge-write (mirrors the `consolidate` / `size_gc`
+/// `BEGIN IMMEDIATE` … `COMMIT` / `ROLLBACK` idiom): the write lock is
+/// taken up front so a concurrent peer push can't slip a write between the
+/// read and the merge, and a failure rolls the whole merge back.
+///
+/// 1. Look up the existing row BY `inbound.id` ([`get`]).
+/// 2. **Existing row found** → `merged = merge_memory(&existing, inbound)`
+///    (the SAME pure #224 reconciler the postgres adapter calls in Rust,
+///    so there is no per-backend merge drift) and persist the FULL merged
+///    row by id via [`overwrite_full_row_by_id`] — every one of the 27
+///    columns is written verbatim (no MAX / CASE / COALESCE re-application,
+///    because `merge_memory` has already resolved every field). Returns the
+///    existing id.
+/// 3. **No row by that id** → fall through to [`insert_if_newer`], which
+///    keeps the OLD behaviour for a brand-new row (fresh INSERT) and for a
+///    `(title, namespace)` dedup collision (the existing newer-wins LWW
+///    upsert). Returns its result.
+///
+/// This is purely additive: fresh memories + `(title, namespace)` dedup
+/// keep the historical semantics; ONLY a same-`id`-but-divergent inbound
+/// now field-merges (tags union, priority/confidence/access_count/version
+/// max, metadata deep-merge, `agent_id`/governance immutable-to-local)
+/// instead of clobbering. The #224 invariants (`agent_id` immutable,
+/// governance owner-only, metadata deep-merge) are preserved automatically
+/// by `merge_memory`.
+///
+/// # Errors
+///
+/// Bubbles up rusqlite / serde errors from the read, the merge-write, or
+/// the `insert_if_newer` fall-through. On any error inside the merge
+/// transaction the partial write is rolled back.
+pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
+    // Take the write lock up front so the read-merge-write is atomic
+    // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
+    // `consolidate` / `size_gc`).
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let tx_result = (|| -> Result<Option<String>> {
+        match get(conn, &inbound.id)? {
+            Some(existing) => {
+                // #224 field-wise merge — the SAME pure reconciler the
+                // postgres adapter calls in Rust (no per-backend drift).
+                let merged = crate::models::merge_memory(&existing, inbound);
+                overwrite_full_row_by_id(conn, &merged)?;
+                Ok(Some(merged.id))
+            }
+            // No row by this id — defer to the (title, namespace) dedup
+            // path OUTSIDE this transaction (signalled by `None`).
+            None => Ok(None),
+        }
+    })();
+
+    match tx_result {
+        Ok(Some(id)) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(id)
+        }
+        Ok(None) => {
+            // Nothing was written in the merge transaction; close it
+            // cleanly and fall through to the unchanged LWW path
+            // (handles fresh insert + (title, namespace) dedup-upsert).
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            insert_if_newer(conn, inbound)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
+/// v0.8.0 Pillar-3 (#1709 / #224) — persist a fully-merged [`Memory`] by
+/// `id`, writing EVERY column verbatim. This is the full-row writer for
+/// [`merge_inbound`]: the row it receives has already had every field
+/// resolved by [`crate::models::merge_memory`], so this helper applies NO
+/// merge logic of its own — it is a faithful column-for-column overwrite.
+///
+/// Deliberately NOT [`update`] (which is a partial-patch interface that
+/// imposes optimistic-concurrency / governance gates that would reject a
+/// federation write) and NOT [`insert`] (which upserts on
+/// `(title, namespace)`, not `id`). The UPDATE is keyed on `id`, so it
+/// also rewrites `title` / `namespace` when the merge picked the remote's
+/// (a LWW visibility edit) without tripping the `(title, namespace)`
+/// dedup path. Writes all 27 logical columns + the denormalised
+/// `mentioned_entity_id` (re-derived from the merged row, same as the
+/// `insert` / `insert_if_newer` chokepoints).
+///
+/// # Errors
+///
+/// Bubbles up serde encode errors for the JSON-shaped columns and any
+/// rusqlite error from the UPDATE.
+fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
+    let tags_json = serde_json::to_string(&mem.tags)?;
+    let metadata_json = serde_json::to_string(&mem.metadata)?;
+    let citations_json = serde_json::to_string(&mem.citations)?;
+    let source_span_json = match mem.source_span {
+        Some(span) => Some(serde_json::to_string(&span)?),
+        None => None,
+    };
+    let confidence_signals_json = match &mem.confidence_signals {
+        Some(s) => Some(serde_json::to_string(s)?),
+        None => None,
+    };
+    // Re-derive the denormalised mention tag from the merged row, mirroring
+    // the `insert` / `insert_if_newer` write chokepoints so the indexed
+    // column stays consistent with the row's own metadata/title.
+    let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    conn.execute(
+        "UPDATE memories SET
+            tier = ?1,
+            namespace = ?2,
+            title = ?3,
+            content = ?4,
+            tags = ?5,
+            priority = ?6,
+            confidence = ?7,
+            source = ?8,
+            access_count = ?9,
+            created_at = ?10,
+            updated_at = ?11,
+            last_accessed_at = ?12,
+            expires_at = ?13,
+            metadata = ?14,
+            reflection_depth = ?15,
+            memory_kind = ?16,
+            entity_id = ?17,
+            persona_version = ?18,
+            citations = ?19,
+            source_uri = ?20,
+            source_span = ?21,
+            confidence_source = ?22,
+            confidence_signals = ?23,
+            confidence_decayed_at = ?24,
+            mentioned_entity_id = ?25,
+            version = ?26,
+            lifecycle_state = ?27
+         WHERE id = ?28",
+        params![
+            mem.tier.as_str(),
+            mem.namespace,
+            mem.title,
+            mem.content,
+            tags_json,
+            mem.priority,
+            mem.confidence,
+            mem.source,
+            mem.access_count,
+            mem.created_at,
+            mem.updated_at,
+            mem.last_accessed_at,
+            mem.effective_expires_at(),
+            metadata_json,
+            mem.reflection_depth,
+            mem.memory_kind.as_str(),
+            mem.entity_id,
+            mem.persona_version,
+            citations_json,
+            mem.source_uri,
+            source_span_json,
+            mem.confidence_source.as_str(),
+            confidence_signals_json,
+            mem.confidence_decayed_at,
+            mentioned_entity_id,
+            mem.version,
+            mem.lifecycle_state.as_str(),
+            mem.id,
+        ],
+    )?;
+    Ok(())
+}
+
 // --- Embedding support ---
 
 /// v0.6.3.1 P2 (G4): error returned by `set_embedding` when a write would
@@ -13659,6 +13836,158 @@ mod tests {
 
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.content, "Updated via sync");
+    }
+
+    // --- v0.8.0 Pillar-3 (#1709 / #224) merge_inbound tests ---
+
+    /// A divergent same-`id` inbound row is FIELD-MERGED per #224
+    /// (tags union, priority/confidence/access_count/version max,
+    /// metadata deep-merge, agent_id immutable→local) — NOT scalar
+    /// clobbered the way the bare `(title, namespace)` LWW upsert would.
+    #[test]
+    fn merge_inbound_field_merges_divergent_same_id() {
+        let conn = test_db();
+        let mut local = make_memory("merge-base", "test", Tier::Mid, 3);
+        local.tags = vec!["a".to_string(), "shared".to_string()];
+        local.confidence = 0.2;
+        local.access_count = 40;
+        local.version = 7;
+        local.metadata = serde_json::json!({
+            "agent_id": "original-owner",
+            "k_local": 1,
+            "nested": {"x": 1}
+        });
+        local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+        let id = insert(&conn, &local).unwrap();
+        // `insert` relies on the SQL DEFAULT for `version` (it is not in
+        // the INSERT column list), so seed the persisted row's version=7
+        // directly to exercise the max-merge against a real stored value.
+        conn.execute("UPDATE memories SET version = 7 WHERE id = ?1", params![id])
+            .unwrap();
+
+        // Inbound: same id, NEWER, divergent fields + a peer trying to
+        // rewrite agent_id.
+        let mut inbound = local.clone();
+        inbound.id = id.clone();
+        inbound.tags = vec!["shared".to_string(), "b".to_string()];
+        inbound.priority = 9;
+        inbound.confidence = 0.8;
+        inbound.access_count = 7;
+        inbound.version = 3;
+        inbound.metadata = serde_json::json!({
+            "agent_id": "peer-impostor",
+            "k_remote": 2,
+            "nested": {"y": 2}
+        });
+        inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+
+        let result_id = merge_inbound(&conn, &inbound).unwrap();
+        assert_eq!(result_id, id, "merge returns the existing row id");
+
+        let got = get(&conn, &id).unwrap().unwrap();
+        // tags union (both survive, "shared" deduped).
+        let mut tags = got.tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["a", "b", "shared"]);
+        // priority / confidence / access_count / version are MAX.
+        assert_eq!(got.priority, 9);
+        assert!((got.confidence - 0.8).abs() < f64::EPSILON);
+        assert_eq!(got.access_count, 40, "access_count is max(40, 7)");
+        assert_eq!(got.version, 7, "version is max(7, 3) — never rolls back");
+        // metadata deep-merge keeps disjoint keys on both sides.
+        assert_eq!(got.metadata["k_local"], serde_json::json!(1));
+        assert_eq!(got.metadata["k_remote"], serde_json::json!(2));
+        assert_eq!(got.metadata["nested"]["x"], serde_json::json!(1));
+        assert_eq!(got.metadata["nested"]["y"], serde_json::json!(2));
+        // agent_id is immutable: the original (local) value survives even
+        // though the inbound row is the newer (LWW) side.
+        assert_eq!(
+            got.metadata["agent_id"],
+            serde_json::json!("original-owner")
+        );
+    }
+
+    /// A brand-new id (no existing row) falls through to `insert_if_newer`
+    /// and creates the row fresh (OLD behaviour preserved).
+    #[test]
+    fn merge_inbound_brand_new_id_inserts_fresh() {
+        let conn = test_db();
+        let mem = make_memory("merge-fresh", "test", Tier::Mid, 5);
+        let inbound_id = mem.id.clone();
+        let result_id = merge_inbound(&conn, &mem).unwrap();
+        assert_eq!(result_id, inbound_id, "fresh insert returns the row id");
+        let got = get(&conn, &inbound_id).unwrap().unwrap();
+        assert_eq!(got.title, "merge-fresh");
+        assert_eq!(got.priority, 5);
+    }
+
+    /// The merged row is fully consistent after the atomic read-merge-write
+    /// (every column reflects the #224 resolution, not a partial write).
+    #[test]
+    fn merge_inbound_merged_row_is_fully_consistent() {
+        let conn = test_db();
+        let mut local = make_memory("merge-atomic", "test", Tier::Short, 2);
+        local.content = "local-content".to_string();
+        local.reflection_depth = 4;
+        local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+        let id = insert(&conn, &local).unwrap();
+
+        let mut inbound = local.clone();
+        inbound.id = id.clone();
+        inbound.content = "remote-content".to_string();
+        inbound.tier = Tier::Long; // durability upgrade
+        inbound.reflection_depth = 1;
+        // Inbound is immortal (no expiry). #224 `expires_at` rule: null
+        // (never-expires) wins over any non-null — so the merged row is
+        // immortal, demonstrating preservation-over-loss.
+        inbound.expires_at = None;
+        inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+
+        merge_inbound(&conn, &inbound).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        // LWW content (inbound newer) + max-durability tier + max depth —
+        // all consistent in the single persisted row.
+        assert_eq!(got.content, "remote-content");
+        assert_eq!(
+            got.tier,
+            Tier::Long,
+            "tier never downgrades (max durability)"
+        );
+        assert_eq!(got.reflection_depth, 4, "reflection_depth is max(4, 1)");
+        // expires_at: #224 null-wins rule (inbound immortal) ⇒ merged is
+        // immortal. The full-row writer persists what merge_memory chose.
+        assert_eq!(
+            got.expires_at, None,
+            "null (never-expires) wins over non-null per #224"
+        );
+    }
+
+    /// Merged `version` is `max(local, remote)` (the Gap-1 optimistic-
+    /// concurrency counter never rolls backwards on a merge).
+    #[test]
+    fn merge_inbound_version_is_max() {
+        let conn = test_db();
+        let mut local = make_memory("merge-version", "test", Tier::Mid, 5);
+        local.version = 12;
+        local.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+        let id = insert(&conn, &local).unwrap();
+        // `insert` does not persist `version` (SQL DEFAULT); seed it so the
+        // stored row genuinely carries version=12 for the max-merge.
+        conn.execute(
+            "UPDATE memories SET version = 12 WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        // Inbound is OLDER by updated_at but carries a lower version.
+        let mut inbound = local.clone();
+        inbound.id = id.clone();
+        inbound.version = 4;
+        inbound.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+
+        merge_inbound(&conn, &inbound).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.version, 12, "version is max(12, 4)");
     }
 
     // --- Metadata tests (Task 1.1) ---
