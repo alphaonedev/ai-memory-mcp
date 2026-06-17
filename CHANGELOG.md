@@ -7,17 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.8.0 (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
-In progress on `release/v0.8.0`. Schema advances v57 → **v64** (additive: actions /
+In progress on `release/v0.8.0`. Schema advances v57 → **v66** (additive: actions /
 action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
 routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
 6 → 9 relations at v63; the typed-cognition `memories.lifecycle_state` column at
-v64). Surface grows to **93 MCP tools** at `--profile full` and
+v64; the `memory_links` signature-trigger restore at v65; the
+`governance_rules.severity` CHECK extends `refuse`/`warn`/`log` → `+escalate`
+for the §22 PE-5 `Decision::Escalate` verdict at v66). Surface grows to **93 MCP tools** at `--profile full` and
 **27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
 lifecycle surface adds only permissive optional fields to the existing
 `memory_store` / `memory_update` request structs).
 
 ### Added
 
+- **§22 Policy-Engine V08-PE-5 — `Decision::Escalate` governance verdict primitive**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709),
+  epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).
+  A new severity-based human-escalation verdict, produced by a new `escalate`
+  rule severity. The agent-action engine (`src/governance/agent_action.rs`)
+  gains `Severity::Escalate` (wire string `"escalate"`) and
+  `Decision::Escalate { rule_id, reason }` (serde
+  `{"decision":"escalate", rule_id, reason}`); a matched `escalate` rule
+  returns it (escalation terminal arm, mirroring refusal-wins). **Fails
+  closed:** `Decision::is_allowed()` is restructured to an explicit
+  `Allow | Warn` allow-list (NOT `!is_refusal()`) so an unresolved Escalate
+  does NOT permit the action; new `is_blocking()` (`Refuse | Escalate`) +
+  `is_escalation()` predicates are added, and the two L1-6 governance
+  pre-write hook sites (storage pre-write + wire_check) gained an Escalate
+  arm that blocks the action (`Err`) and chain-logs it via the deferred
+  audit queue (which now gates on `is_blocking`). Schema **v66** extends the
+  sqlite `governance_rules.severity` CHECK (`refuse`/`warn`/`log` →
+  `+escalate`) via a full-table rebuild that preserves every signed-rule row
+  + column + both indexes; postgres ships no `governance_rules` table so its
+  v66 arm is a version-stamp no-op (literal 66). **No MCP tool-count change.**
+  `// #697 PE-5 follow-on:` the escalation QUEUE persistence + timeout-sweep
+  + the PE-5 profile auto-install (PE-1+PE-3+PE-4) are NOT in this primitive —
+  they are the next PE-5 unit.
 - **§22 Policy-Engine V08-PE-8 — `ai-memory verify-audit-trail` CLI**
   ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709),
   epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).

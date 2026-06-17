@@ -3237,6 +3237,24 @@ pub(crate) fn install_governance_pre_write_hook(
                     );
                     Err(reason)
                 }
+                Ok(RuleDecision::Escalate { rule_id, reason }) => {
+                    // §22 PE-5 — an `escalate` verdict FAILS CLOSED:
+                    // it blocks the write exactly like a refusal
+                    // (`Err`). The deferred audit queue chain-logs it
+                    // (the verdict is blocking, so `submit_refusal`
+                    // enqueues it). Queue persistence + the human
+                    // review queue + timeout-sweep are the #697 PE-5
+                    // follow-on, NOT this primitive — so for now the
+                    // action is paused-as-blocked.
+                    tracing::info!(
+                        "L1-6 governance pre-write escalated namespace={:?} rule_id={} \
+                             reason={} (blocked pending human review; chain-logged)",
+                        mem.namespace,
+                        rule_id,
+                        reason
+                    );
+                    Err(reason)
+                }
                 Err(e) => {
                     // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
                     // rule-consultation error and chain-log the
@@ -3375,6 +3393,21 @@ pub(crate) fn install_governance_pre_action_hook(
                     tracing::info!(
                         "wire_check refused action kind={} rule_id={} reason={} \
                          (chain-logged via deferred audit queue)",
+                        action.kind(),
+                        rule_id,
+                        reason,
+                    );
+                    Err(reason)
+                }
+                Ok(RuleDecision::Escalate { rule_id, reason }) => {
+                    // §22 PE-5 — `escalate` FAILS CLOSED: block the
+                    // action like a refusal (`Err`). Chain-logged via
+                    // the deferred queue (blocking verdict). Queue
+                    // persistence / human-review routing / timeout are
+                    // the #697 PE-5 follow-on, not this primitive.
+                    tracing::info!(
+                        "wire_check escalated action kind={} rule_id={} reason={} \
+                         (blocked pending human review; chain-logged)",
                         action.kind(),
                         rule_id,
                         reason,

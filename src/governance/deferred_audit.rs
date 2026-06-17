@@ -110,9 +110,10 @@ pub struct DeferredAuditEvent {
     pub agent_id: String,
     /// The action that was refused. Cloned from the hook input.
     pub action: AgentAction,
-    /// The verdict — must be a `Refuse` variant; non-refusal events
-    /// do not enter the queue (the submit helpers gate on
-    /// `Decision::is_refusal`).
+    /// The verdict — must be a BLOCKING variant (`Refuse` or
+    /// `Escalate`, §22 PE-5); non-blocking events (Allow / Warn) do
+    /// not enter the queue (the submit helpers gate on
+    /// `Decision::is_blocking`).
     pub decision: Decision,
     /// Wall-clock timestamp of refusal. Lands in
     /// `signed_events.timestamp` as RFC3339.
@@ -121,12 +122,15 @@ pub struct DeferredAuditEvent {
 
 impl DeferredAuditEvent {
     /// Build a deferred event from the hook's three inputs. Returns
-    /// `None` when `decision` is not a refusal — callers should
-    /// only submit refusals to the queue (Allow / Warn paths do not
-    /// chain-log a refusal row).
+    /// `None` when `decision` does not BLOCK the action — callers
+    /// should only submit blocking verdicts to the queue (Allow /
+    /// Warn paths do not chain-log a row). A blocking verdict is a
+    /// `Refuse` OR an `Escalate` (§22 PE-5): both halt the action,
+    /// so both chain-log here. The non-blocking Allow / Warn paths
+    /// still return `None`.
     #[must_use]
     pub fn from_refusal(agent_id: &str, action: &AgentAction, decision: &Decision) -> Option<Self> {
-        if !decision.is_refusal() {
+        if !decision.is_blocking() {
             return None;
         }
         Some(Self {
@@ -143,7 +147,9 @@ impl DeferredAuditEvent {
     #[must_use]
     pub fn rule_id(&self) -> Option<&str> {
         match &self.decision {
-            Decision::Refuse { rule_id, .. } => Some(rule_id.as_str()),
+            Decision::Refuse { rule_id, .. } | Decision::Escalate { rule_id, .. } => {
+                Some(rule_id.as_str())
+            }
             _ => None,
         }
     }
@@ -153,7 +159,9 @@ impl DeferredAuditEvent {
     #[must_use]
     pub fn reason(&self) -> Option<&str> {
         match &self.decision {
-            Decision::Refuse { reason, .. } => Some(reason.as_str()),
+            Decision::Refuse { reason, .. } | Decision::Escalate { reason, .. } => {
+                Some(reason.as_str())
+            }
             _ => None,
         }
     }

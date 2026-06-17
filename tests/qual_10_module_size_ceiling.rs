@@ -566,7 +566,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // existing daemon-boot / dispatch helpers (zero new production
     // surface; qual_10 counts in-module test LOC), growing the file to
     // 8_497. 8_600 = 8_497 + 103 headroom; far under the 1.5x cap.
-    ("src/daemon_runtime.rs", 8_600),
+    // 2026-06-17 — bumped 8_600 → 8_700 by §22 PE-5 (#697): the two
+    // L1-6 governance pre-write hook sites (storage pre-write +
+    // wire_check) each gained a `Decision::Escalate` block-and-chain-log
+    // arm (the compiler-forced exhaustive-match arm).
+    ("src/daemon_runtime.rs", 8_700),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -610,7 +614,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // archived_memories `lifecycle_state` column probe-then-add) and the
     // `PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES` named const (pm-v3.1 literal
     // gate), landing the file at 4_121. 4_160 = 4_121 + ~39 headroom.
-    ("src/storage/migrations.rs", 4_160),
+    // 2026-06-17 (v0.8.0 §22 PE-5 #697) — bumped 4_160 → 4_360: the
+    // governance_rules.severity escalate-CHECK extension added the
+    // MIGRATION_V66_SQLITE include_str const, the v66 ladder arm (the
+    // table-existence-guarded full-table rebuild), and the
+    // `v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity`
+    // row + signed-column + index preservation regression test, landing
+    // the file at 4_338. 4_360 = 4_338 + 22 headroom.
+    ("src/storage/migrations.rs", 4_360),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

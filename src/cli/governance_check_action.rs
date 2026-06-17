@@ -224,6 +224,19 @@ pub fn run(
                 .unwrap_or("?");
             writeln!(out.stdout, "Warn: {rule_id} — {reason}")?;
         }
+        "escalate" => {
+            // §22 PE-5 — human-escalation verdict. Fails closed
+            // (the action is blocked pending human review).
+            let rule_id = decision
+                .get("rule_id")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let reason = decision
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            writeln!(out.stdout, "Escalate: {rule_id} — {reason}")?;
+        }
         other => writeln!(out.stdout, "Unknown verdict: {other}")?,
     }
     Ok(())

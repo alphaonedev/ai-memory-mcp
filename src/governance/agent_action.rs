@@ -222,19 +222,55 @@ pub enum Decision {
     /// are present for the audit row but the harness should not
     /// block.
     Warn { rule_id: String, reason: String },
+    /// Action paused for severity-based human escalation (§22 PE-5).
+    /// The harness routes it to a human review queue; the substrate
+    /// emits + audits the verdict. `rule_id` names the firing
+    /// `escalate` rule; `reason` is its operator-authored
+    /// explanation. **Fails closed:** an unresolved `Escalate` does
+    /// NOT permit the action ([`Decision::is_allowed`] returns
+    /// `false`) — the harness MUST block until a human resolves it.
+    ///
+    /// `// #697 PE-5 follow-on:` queue persistence + timeout-sweep +
+    /// the PE-5 profile auto-install (PE-1+PE-3+PE-4) are NOT in this
+    /// verdict primitive — they are the next PE-5 unit.
+    Escalate { rule_id: String, reason: String },
 }
 
 impl Decision {
-    /// `true` if the decision blocks the action.
+    /// `true` if the decision is a refusal (`Refuse` only).
+    ///
+    /// Precise — does NOT cover `Escalate`. Callers that gate a
+    /// proceed/block choice on "does this verdict block the action?"
+    /// MUST use [`Decision::is_blocking`] (or `!is_allowed()`), not
+    /// `is_refusal`, so an `Escalate` is not silently let through.
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         matches!(self, Decision::Refuse { .. })
     }
 
+    /// `true` if the decision is an escalation (`Escalate` only).
+    #[must_use]
+    pub fn is_escalation(&self) -> bool {
+        matches!(self, Decision::Escalate { .. })
+    }
+
+    /// `true` if the decision blocks the action (`Refuse` OR
+    /// `Escalate`). The load-bearing fail-closed predicate: an
+    /// unresolved `Escalate` blocks exactly like a `Refuse`.
+    #[must_use]
+    pub fn is_blocking(&self) -> bool {
+        matches!(self, Decision::Refuse { .. } | Decision::Escalate { .. })
+    }
+
     /// `true` if the decision permits the action (Allow or Warn).
+    ///
+    /// Defined as an explicit allow-list (`Allow | Warn`), NOT as
+    /// `!is_refusal()`, so that `Escalate` — which is neither a
+    /// refusal nor permitted — fails CLOSED here. An `Escalate` that
+    /// fell through to "proceed" would be a security hole (§22 PE-5).
     #[must_use]
     pub fn is_allowed(&self) -> bool {
-        !self.is_refusal()
+        matches!(self, Decision::Allow | Decision::Warn { .. })
     }
 }
 
@@ -251,6 +287,11 @@ pub enum Severity {
     Refuse,
     Warn,
     Log,
+    /// §22 PE-5 — a matched `escalate` rule pauses the action for
+    /// severity-based human escalation. Maps to
+    /// [`Decision::Escalate`], which fails closed (does NOT permit
+    /// the action). Added at schema v66.
+    Escalate,
 }
 
 impl Severity {
@@ -261,6 +302,7 @@ impl Severity {
             Severity::Refuse => "refuse",
             Severity::Warn => "warn",
             Severity::Log => "log",
+            Severity::Escalate => "escalate",
         }
     }
 
@@ -272,6 +314,7 @@ impl Severity {
             "refuse" => Some(Severity::Refuse),
             "warn" => Some(Severity::Warn),
             "log" => Some(Severity::Log),
+            "escalate" => Some(Severity::Escalate),
             _ => None,
         }
     }
@@ -570,7 +613,10 @@ fn disk_free_gib_at_path(_path: &std::path::Path) -> Option<u64> {
 /// Adding a new severity variant or matcher field meant touching three
 /// near-identical loops. The `RuleEngine` collapses the load + routing
 /// logic into one place; the three legacy free functions remain as
-/// thin wrappers so the public API is wire-stable.
+/// thin wrappers so the public API is wire-stable. (Concretely: the
+/// §22 PE-5 `escalate` severity, schema v66, was a single new arm in
+/// [`RuleEngine::evaluate`] + the matching [`Decision::Escalate`]
+/// translation, not three.)
 ///
 /// `rules` holds the snapshot of enabled rules of the *target kind*
 /// (the engine is constructed per-action, not per-table — kind-scoped
@@ -666,6 +712,16 @@ impl RuleEngine {
             match severity {
                 Severity::Refuse => {
                     return Decision::Refuse {
+                        rule_id: rule.id.clone(),
+                        reason: rule.reason.clone(),
+                    };
+                }
+                Severity::Escalate => {
+                    // §22 PE-5 — a matched `escalate` rule pauses the
+                    // action for human review. Returns immediately
+                    // (escalation-wins, mirroring refusal-wins); the
+                    // verdict fails closed via `is_allowed() == false`.
+                    return Decision::Escalate {
                         rule_id: rule.id.clone(),
                         reason: rule.reason.clone(),
                     };
@@ -788,6 +844,7 @@ fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decis
         Decision::Allow => ("allow", String::new()),
         Decision::Refuse { rule_id, .. } => ("refuse", rule_id.clone()),
         Decision::Warn { rule_id, .. } => ("warn", rule_id.clone()),
+        Decision::Escalate { rule_id, .. } => ("escalate", rule_id.clone()),
     };
     // payload is `{action, decision_detail}` — keeps the forensic row
     // self-describing without depending on cross-table joins for a
@@ -967,7 +1024,10 @@ pub fn check_agent_action_deferred_cached(
     queue: &crate::governance::deferred_audit::DeferredAuditQueue,
 ) -> Result<Decision> {
     let decision = check_agent_action_no_audit_cached(conn, cache, action)?;
-    if decision.is_refusal() {
+    // Chain-log every BLOCKING verdict (Refuse OR Escalate, §22
+    // PE-5) to the deferred audit queue. `submit_refusal` enqueues
+    // any blocking verdict; Allow / Warn are not chain-logged here.
+    if decision.is_blocking() {
         queue.submit_refusal(agent_id, action, &decision);
     }
     Ok(decision)
@@ -1183,10 +1243,210 @@ mod tests {
 
     #[test]
     fn severity_roundtrip() {
-        for s in &[Severity::Refuse, Severity::Warn, Severity::Log] {
+        for s in &[
+            Severity::Refuse,
+            Severity::Warn,
+            Severity::Log,
+            Severity::Escalate,
+        ] {
             assert_eq!(Severity::from_str(s.as_str()), Some(*s));
         }
         assert_eq!(Severity::from_str("nope"), None);
+    }
+
+    #[test]
+    fn severity_escalate_wire_string() {
+        // §22 PE-5 — the wire string must be the stable `escalate`
+        // literal (it is the governance_rules.severity column value
+        // and the Decision::Escalate serde tag).
+        assert_eq!(Severity::Escalate.as_str(), "escalate");
+        assert_eq!(Severity::from_str("escalate"), Some(Severity::Escalate));
+    }
+
+    #[test]
+    fn decision_escalate_serde_roundtrip() {
+        // §22 PE-5 — {"decision":"escalate", rule_id, reason}.
+        let d = Decision::Escalate {
+            rule_id: "E001".into(),
+            reason: "human review required".into(),
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["decision"], "escalate");
+        assert_eq!(json["rule_id"], "E001");
+        assert_eq!(json["reason"], "human review required");
+        let back: Decision = serde_json::from_value(json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn escalate_fails_closed_is_allowed_false() {
+        // THE load-bearing safety assertion: an unresolved Escalate
+        // must NOT permit the action. is_allowed() is FALSE for
+        // Escalate (defined as an explicit Allow|Warn allow-list, not
+        // !is_refusal()), so an Escalate that fell through to
+        // "proceed" cannot happen.
+        let escalate = Decision::Escalate {
+            rule_id: "E001".into(),
+            reason: "pause".into(),
+        };
+        assert!(
+            !escalate.is_allowed(),
+            "Escalate must FAIL CLOSED — is_allowed() must be false"
+        );
+        assert!(!escalate.is_refusal(), "Escalate is not a refusal");
+        assert!(escalate.is_escalation());
+        assert!(escalate.is_blocking(), "Escalate blocks the action");
+    }
+
+    #[test]
+    fn is_allowed_is_blocking_is_escalation_partition() {
+        let allow = Decision::Allow;
+        let warn = Decision::Warn {
+            rule_id: "W".into(),
+            reason: "r".into(),
+        };
+        let refuse = Decision::Refuse {
+            rule_id: "R".into(),
+            reason: "r".into(),
+        };
+        let escalate = Decision::Escalate {
+            rule_id: "E".into(),
+            reason: "r".into(),
+        };
+
+        // is_allowed: Allow + Warn only.
+        assert!(allow.is_allowed());
+        assert!(warn.is_allowed());
+        assert!(!refuse.is_allowed());
+        assert!(!escalate.is_allowed());
+
+        // is_blocking: Refuse + Escalate.
+        assert!(!allow.is_blocking());
+        assert!(!warn.is_blocking());
+        assert!(refuse.is_blocking());
+        assert!(escalate.is_blocking());
+
+        // is_refusal: Refuse only.
+        assert!(refuse.is_refusal());
+        assert!(!escalate.is_refusal());
+
+        // is_escalation: Escalate only.
+        assert!(escalate.is_escalation());
+        assert!(!refuse.is_escalation());
+
+        // is_allowed and is_blocking are exact complements across all
+        // four verdicts (no verdict is both proceed AND block, none is
+        // neither).
+        for d in [&allow, &warn, &refuse, &escalate] {
+            assert_ne!(d.is_allowed(), d.is_blocking());
+        }
+    }
+
+    #[test]
+    fn escalate_rule_returns_escalate_verdict() {
+        // §22 PE-5 — a matched `escalate`-severity rule yields
+        // Decision::Escalate{rule_id, reason}, and emit_forensic
+        // records "escalate".
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "E001",
+            "bash",
+            r#"{"command_substring":"sudo"}"#,
+            "escalate",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "sudo rm -rf /".into(),
+            cwd: None,
+        };
+        let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+        match &decision {
+            Decision::Escalate { rule_id, reason } => {
+                assert_eq!(rule_id, "E001");
+                assert_eq!(reason, "E001: test");
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+        // Fails closed at the verdict level.
+        assert!(!decision.is_allowed());
+        assert!(decision.is_blocking());
+    }
+
+    #[test]
+    fn first_blocking_rule_by_id_order_wins_refuse_then_escalate() {
+        // The engine scans rules in `id ASC` order
+        // (`list_enabled_by_kind` ORDER BY id) and BOTH Refuse and
+        // Escalate are terminal (short-circuit) arms — so the
+        // lexicographically-first blocking rule wins. With a Refuse at
+        // 'A001' and an Escalate at 'Z001', the Refuse (scanned first)
+        // wins; either way the action is BLOCKED.
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "A001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "refuse",
+            true,
+        );
+        add_rule(
+            &conn,
+            "Z001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "escalate",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "rm x".into(),
+            cwd: None,
+        };
+        let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+        // The Refuse (id 'A001') is scanned before the Escalate (id
+        // 'Z001'), so Refuse wins; regardless, the verdict is blocking.
+        assert!(decision.is_refusal(), "lower-id Refuse wins the scan");
+        assert!(decision.is_blocking());
+    }
+
+    #[test]
+    fn lower_id_escalate_wins_over_higher_id_refuse_both_block() {
+        // Symmetric to the above: an Escalate at the lower id ('A001')
+        // is scanned before a Refuse at the higher id ('Z001'), so the
+        // Escalate wins the short-circuit. Both are blocking, so the
+        // action is paused/blocked either way — the load-bearing
+        // property is that NEITHER lets the action proceed.
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "A001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "escalate",
+            true,
+        );
+        add_rule(
+            &conn,
+            "Z001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "refuse",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "rm x".into(),
+            cwd: None,
+        };
+        let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+        assert!(decision.is_escalation(), "lower-id Escalate wins the scan");
+        assert!(decision.is_blocking());
+        assert!(!decision.is_allowed());
     }
 
     #[test]

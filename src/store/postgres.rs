@@ -508,7 +508,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 65;
+const CURRENT_SCHEMA_VERSION: i32 = 66;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1327,8 +1327,11 @@ impl PostgresStore {
         if current_version < 64 {
             self.migrate_v64().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 65 {
             self.migrate_v65().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v66().await?;
         }
 
         Ok(())
@@ -3027,6 +3030,36 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v65 applied (#1709: sqlite-only memory_links \
              signature-trigger restore; postgres signature CHECK already intact — \
+             version-stamp no-op)"
+        );
+        Ok(())
+    }
+
+    /// v66 — §22 PE-5 (#697): the sqlite `governance_rules.severity`
+    /// CHECK gains the `escalate` value (for the `Decision::Escalate`
+    /// verdict). The postgres bootstrap schema ships NO
+    /// `governance_rules` table (the agent-action governance engine is
+    /// sqlite-only), so there is no constraint to ALTER — this arm is a
+    /// version-stamp no-op (the v51 / v53 / v55 / v56 / v65 precedent).
+    /// Stamps the LITERAL 66 (crash-safety: a crash mid-ladder records
+    /// the exact applied tip, NOT `CURRENT_SCHEMA_VERSION`).
+    async fn migrate_v66(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v66 tx", e))?;
+
+        record_schema_version(&mut tx, 66).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v66 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v66 applied (#697 §22 PE-5: governance_rules.severity \
+             escalate CHECK is sqlite-only; postgres ships no governance_rules table — \
              version-stamp no-op)"
         );
         Ok(())
