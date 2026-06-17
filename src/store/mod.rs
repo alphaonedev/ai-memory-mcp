@@ -1929,6 +1929,30 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction (size-GC).
+    ///
+    /// When `namespace`'s LIVE corpus byte size
+    /// (`SUM(length(title)+length(content)+length(metadata))` over its
+    /// non-archived rows) exceeds `max_corpus_bytes`, evict the
+    /// lowest-value memories — least-durable tier first, then lowest
+    /// priority / access_count / last_accessed_at — one at a time until
+    /// the corpus is at/under the cap. When `archive` is true each victim
+    /// is archived-before-delete (restorable); otherwise it is hard
+    /// deleted. Returns the count evicted. A non-positive cap is a no-op
+    /// (`Ok(0)`). Deterministic + LLM-free (pure SQL ranking).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn size_gc(
+        &self,
+        _namespace: &str,
+        _max_corpus_bytes: i64,
+        _archive: bool,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIZE_GC".to_string(),
+        })
+    }
+
     /// Restore an archived memory back to the live `memories` table.
     /// Returns true iff a row was restored. Adapters MUST:
     /// 1. Return Ok(false) when no archive row matches.

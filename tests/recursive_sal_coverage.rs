@@ -217,6 +217,73 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .expect("recall_observation_gc ok");
     assert_eq!(pruned, 0, "recent row not pruned by a 10-year TTL");
 
+    // #1709 Pillar-2.5 — size_gc (corpus byte-cap eviction) round-trip
+    // through the SAL trait on BOTH adapters. Uses a unique namespace so
+    // the corpus arithmetic is deterministic on the shared CI postgres DB
+    // regardless of co-resident suites. Inserts three over-cap rows
+    // (lowest-value first = lower tier durability then lower priority),
+    // size_gc's to a cap that forces two evictions, and asserts (a) the
+    // count, (b) the lowest-value rows are gone, (c) the highest-value row
+    // survives.
+    let sgc_ns = format!("_sal_cov_sgc_{}", uuid_like());
+    // ~1000-byte payload rows; tier drives the primary eviction order.
+    let sgc_short = {
+        let mut m = base_memory(&format!("sgc-short-{}", uuid_like()), &sgc_ns, "sgc-short");
+        m.tier = Tier::Short;
+        m.priority = 1;
+        m.content = "x".repeat(1000);
+        m
+    };
+    let sgc_mid = {
+        let mut m = base_memory(&format!("sgc-mid-{}", uuid_like()), &sgc_ns, "sgc-mid");
+        m.tier = Tier::Mid;
+        m.priority = 5;
+        m.content = "x".repeat(1000);
+        m
+    };
+    let sgc_long = {
+        let mut m = base_memory(&format!("sgc-long-{}", uuid_like()), &sgc_ns, "sgc-long");
+        m.tier = Tier::Long;
+        m.priority = 9;
+        m.content = "x".repeat(1000);
+        m
+    };
+    let sgc_short_id = store
+        .store(&ctx, &sgc_short)
+        .await
+        .expect("store sgc-short");
+    let sgc_mid_id = store.store(&ctx, &sgc_mid).await.expect("store sgc-mid");
+    let sgc_long_id = store.store(&ctx, &sgc_long).await.expect("store sgc-long");
+
+    // Under-cap → no-op first (a generous cap evicts nothing).
+    let noop = store
+        .size_gc(&sgc_ns, 1_000_000, true)
+        .await
+        .expect("size_gc under-cap ok");
+    assert_eq!(noop, 0, "under-cap size_gc is a no-op");
+
+    // Cap forcing two evictions: short-tier then mid-tier go first; the
+    // long-tier high-priority row survives.
+    let evicted = store
+        .size_gc(&sgc_ns, 1500, true)
+        .await
+        .expect("size_gc over-cap ok");
+    assert_eq!(evicted, 2, "two lowest-value rows evicted to reach cap");
+    // `get` folds a missing row into a `NotFound` error (the trait does not
+    // leak existence via Option), so an evicted row surfaces as `Err`.
+    assert!(
+        store.get(&ctx, &sgc_short_id).await.is_err(),
+        "least-durable (short) row evicted"
+    );
+    assert!(
+        store.get(&ctx, &sgc_mid_id).await.is_err(),
+        "mid-tier row evicted next"
+    );
+    assert!(
+        store.get(&ctx, &sgc_long_id).await.is_ok(),
+        "highest-value long-tier row survives under cap"
+    );
+
     // #1709 Pillar 1 — action_create / action_get round-trip through the SAL
     // trait, on BOTH adapters (the v59 coordination substrate).
     let aid = format!("sal-cov-act-{}", uuid_like());

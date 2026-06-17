@@ -6813,6 +6813,125 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     Ok(total)
 }
 
+/// v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction (size-GC).
+///
+/// The byte-pressure sibling of [`gc`] (which evicts on TTL expiry).
+/// When a namespace's LIVE corpus byte size exceeds `max_corpus_bytes`,
+/// this evicts the lowest-value memories one at a time — archiving each
+/// (restorable, via [`archive_memory_no_tx`]) when `archive` is true, or
+/// hard-deleting it otherwise — until the running corpus total is back at
+/// or under the cap. Returns the count evicted. Deterministic and
+/// LLM-free: victim order is a pure SQL ranking, so the same corpus +
+/// cap always evicts the same rows.
+///
+/// **Corpus byte definition.** Mirrors the K8 quota accounting
+/// (`src/quotas.rs`): the per-row payload size is
+/// `length(title) + length(content) + length(metadata)`, summed over the
+/// non-archived rows in `namespace`. Distinct from
+/// [`crate::quotas::DEFAULT_MAX_STORAGE_BYTES`], which is the per-agent
+/// WRITE quota — this cap is an eviction trigger on the namespace corpus.
+///
+/// **Eviction order (victim = evicted FIRST).** Least-durable tier first,
+/// then lowest value: `tier` (short → mid → long), then `priority` ASC,
+/// then `access_count` ASC, then `last_accessed_at` ASC. So a high-value
+/// long-tier frequently-accessed row is evicted LAST — only if the corpus
+/// is still over cap after every cheaper victim is gone.
+///
+/// **Disabled-cap contract.** A non-positive `max_corpus_bytes` is treated
+/// as "disabled" — the function early-returns `Ok(0)` without scanning.
+/// Callers (the curator) gate on `Option<i64>::is_some()`, so a disabled
+/// namespace never reaches this with a positive cap.
+///
+/// Each archive+delete (or delete) is its own step that re-reads the
+/// running total, matching how [`gc`] bounds its lock-hold per victim;
+/// the FTS-trigger sync that the archive / delete primitives already
+/// perform is preserved.
+pub fn size_gc(
+    conn: &Connection,
+    namespace: &str,
+    max_corpus_bytes: i64,
+    archive: bool,
+) -> Result<usize> {
+    // Disabled-cap guard: a non-positive cap is a no-op. The curator
+    // gates on `Option::is_some`, so this only fires on a misconfigured
+    // explicit `<= 0` cap — fail safe (evict nothing) rather than panic.
+    if max_corpus_bytes <= 0 {
+        return Ok(0);
+    }
+
+    use rusqlite::OptionalExtension;
+
+    let mut corpus = namespace_corpus_bytes(conn, namespace)?;
+    if corpus <= max_corpus_bytes {
+        return Ok(0);
+    }
+
+    let mut evicted = 0usize;
+    // Evict one victim at a time, re-reading the running total after each,
+    // until the corpus is back at/under cap or the namespace is drained.
+    while corpus > max_corpus_bytes {
+        // Lowest-value victim: least-durable tier first, then lowest
+        // priority / access_count / last_accessed_at.
+        let victim: Option<(String, i64)> = conn
+            .query_row(SQL_SIZE_GC_NEXT_VICTIM, params![namespace], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        let Some((id, row_bytes)) = victim else {
+            // No live rows left in the namespace — cannot get under cap.
+            break;
+        };
+
+        if archive {
+            // Restorable eviction: archive-before-delete in one step,
+            // reusing the same primitive the supersede / GC paths use.
+            archive_memory_no_tx(conn, &id, Some(SIZE_GC_ARCHIVE_REASON))?;
+        } else {
+            conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+            conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
+        }
+
+        evicted += 1;
+        corpus -= row_bytes;
+    }
+
+    Ok(evicted)
+}
+
+/// Live corpus byte size for `namespace` — `SUM(length(title) +
+/// length(content) + length(metadata))` over the non-archived rows.
+/// Mirrors the K8 quota byte definition (`src/quotas.rs`). Shared by
+/// [`size_gc`] and its unit tests so the cap check and the eviction loop
+/// agree on the metric.
+pub(crate) fn namespace_corpus_bytes(conn: &Connection, namespace: &str) -> Result<i64> {
+    let bytes: i64 =
+        conn.query_row(SQL_NAMESPACE_CORPUS_BYTES, params![namespace], |r| r.get(0))?;
+    Ok(bytes)
+}
+
+/// `archive_reason` stamped on rows evicted by [`size_gc`], distinct from
+/// the `ttl_expired` reason [`gc`] uses so an operator can tell byte-cap
+/// eviction apart from TTL expiry in the archive.
+const SIZE_GC_ARCHIVE_REASON: &str = "size_gc";
+
+/// Live-corpus byte-size aggregate for one namespace. `COALESCE` guards
+/// the all-NULL empty-namespace case (`SUM` over zero rows is NULL).
+const SQL_NAMESPACE_CORPUS_BYTES: &str = "SELECT COALESCE(SUM(\
+     length(title) + length(content) + length(metadata)), 0) \
+     FROM memories WHERE namespace = ?1";
+
+/// Next size-GC victim id + its payload byte size. Lowest-value first:
+/// least-durable tier (short → mid → long), then lowest priority /
+/// access_count / last_accessed_at. NULL `last_accessed_at` sorts first
+/// (never-accessed rows are the cheapest to evict).
+const SQL_SIZE_GC_NEXT_VICTIM: &str = "SELECT id, \
+     length(title) + length(content) + length(metadata) \
+     FROM memories WHERE namespace = ?1 \
+     ORDER BY CASE tier \
+         WHEN 'short' THEN 0 WHEN 'mid' THEN 1 WHEN 'long' THEN 2 ELSE 3 END ASC, \
+     priority ASC, access_count ASC, last_accessed_at ASC \
+     LIMIT 1";
+
 // ---------------------------------------------------------------------------
 // Archive operations
 // ---------------------------------------------------------------------------
@@ -12653,6 +12772,179 @@ mod tests {
         assert!(archive_memory(&conn, &id, None).unwrap());
         let archived = list_archived(&conn, None, 10, 0).unwrap();
         assert_eq!(archived[0]["archive_reason"], "archive");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-2.5 (#1709) — size_gc (corpus byte-cap eviction)
+    // -----------------------------------------------------------------
+
+    /// Build a memory whose `content` is exactly `content_len` bytes (ASCII
+    /// 'x'), so the row's `length(title)+length(content)+length(metadata)`
+    /// payload size is fully predictable for cap arithmetic.
+    fn sized_memory(
+        title: &str,
+        ns: &str,
+        tier: Tier,
+        priority: i32,
+        content_len: usize,
+    ) -> Memory {
+        let mut m = make_memory(title, ns, tier, priority);
+        m.content = "x".repeat(content_len);
+        m
+    }
+
+    #[test]
+    fn size_gc_under_cap_is_noop() {
+        let conn = test_db();
+        let m = sized_memory("a", "sgc", Tier::Long, 5, 100);
+        insert(&conn, &m).unwrap();
+        // Corpus is well under a generous cap → 0 evicted, row stays live.
+        let evicted = size_gc(&conn, "sgc", 1_000_000, true).unwrap();
+        assert_eq!(evicted, 0, "under-cap is a no-op");
+        assert!(get(&conn, &m.id).unwrap().is_some(), "row stays live");
+    }
+
+    #[test]
+    fn size_gc_cap_exactly_at_corpus_does_not_evict() {
+        let conn = test_db();
+        let m = sized_memory("exact", "sgc", Tier::Long, 5, 100);
+        insert(&conn, &m).unwrap();
+        // corpus == length(title) + length(content) + length(metadata).
+        let corpus = namespace_corpus_bytes(&conn, "sgc").unwrap();
+        // Cap exactly at corpus → `corpus <= cap` holds → no eviction.
+        let evicted = size_gc(&conn, "sgc", corpus, true).unwrap();
+        assert_eq!(evicted, 0, "cap exactly at corpus evicts nothing");
+        assert!(get(&conn, &m.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn size_gc_over_cap_evicts_to_under_cap() {
+        let conn = test_db();
+        // Three ~1KB rows, all long tier so tier doesn't reorder them; the
+        // tie-break then falls to priority ASC.
+        let low = sized_memory("low", "sgc", Tier::Long, 1, 1000);
+        let mid = sized_memory("mid", "sgc", Tier::Long, 5, 1000);
+        let high = sized_memory("high", "sgc", Tier::Long, 9, 1000);
+        insert(&conn, &low).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &high).unwrap();
+
+        // Cap at ~1.5 rows so two rows must be evicted (lowest priority
+        // first: `low` then `mid`), leaving only `high` under cap.
+        let cap = 1500;
+        let evicted = size_gc(&conn, "sgc", cap, true).unwrap();
+        assert_eq!(evicted, 2, "two lowest-value rows evicted to reach cap");
+        assert!(get(&conn, &low.id).unwrap().is_none(), "low-priority gone");
+        assert!(get(&conn, &mid.id).unwrap().is_none(), "mid-priority gone");
+        assert!(
+            get(&conn, &high.id).unwrap().is_some(),
+            "highest-priority survives"
+        );
+        assert!(
+            namespace_corpus_bytes(&conn, "sgc").unwrap() <= cap,
+            "corpus is back at/under cap"
+        );
+    }
+
+    #[test]
+    fn size_gc_eviction_order_tier_dominates_priority() {
+        // A low-priority SHORT-tier row must be evicted BEFORE a
+        // high-priority LONG-tier row: tier is the primary ranking key.
+        let conn = test_db();
+        let short_lowp = sized_memory("short", "sgc", Tier::Short, 1, 1000);
+        let long_highp = sized_memory("long", "sgc", Tier::Long, 10, 1000);
+        insert(&conn, &short_lowp).unwrap();
+        insert(&conn, &long_highp).unwrap();
+
+        // Cap that forces exactly one eviction.
+        let evicted = size_gc(&conn, "sgc", 1500, true).unwrap();
+        assert_eq!(evicted, 1, "one row evicted");
+        assert!(
+            get(&conn, &short_lowp.id).unwrap().is_none(),
+            "short-tier row evicted first (least durable)"
+        );
+        assert!(
+            get(&conn, &long_highp.id).unwrap().is_some(),
+            "long-tier high-priority row survives"
+        );
+    }
+
+    #[test]
+    fn size_gc_archived_victims_are_restorable() {
+        let conn = test_db();
+        let victim = sized_memory("victim", "sgc", Tier::Short, 1, 1000);
+        let keep = sized_memory("keep", "sgc", Tier::Long, 9, 1000);
+        insert(&conn, &victim).unwrap();
+        insert(&conn, &keep).unwrap();
+
+        let evicted = size_gc(&conn, "sgc", 1500, true).unwrap();
+        assert_eq!(evicted, 1);
+        // The evicted row lands in the archive with the size_gc reason and
+        // is therefore restorable.
+        let stats = archive_stats(&conn).unwrap();
+        assert_eq!(stats["archived_total"], 1, "victim archived, not lost");
+        let archived = list_archived(&conn, Some("sgc"), 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["id"], victim.id);
+        assert_eq!(
+            archived[0]["archive_reason"], "size_gc",
+            "archive carries the size_gc reason, distinct from ttl_expired"
+        );
+        // Restore round-trips the row back to live.
+        assert!(restore_archived(&conn, &victim.id).unwrap(), "restorable");
+        assert!(
+            get(&conn, &victim.id).unwrap().is_some(),
+            "row is live again"
+        );
+    }
+
+    #[test]
+    fn size_gc_hard_delete_path_does_not_archive() {
+        let conn = test_db();
+        let victim = sized_memory("victim", "sgc", Tier::Short, 1, 1000);
+        let keep = sized_memory("keep", "sgc", Tier::Long, 9, 1000);
+        insert(&conn, &victim).unwrap();
+        insert(&conn, &keep).unwrap();
+
+        // archive=false → hard delete, nothing in the archive.
+        let evicted = size_gc(&conn, "sgc", 1500, false).unwrap();
+        assert_eq!(evicted, 1);
+        assert!(get(&conn, &victim.id).unwrap().is_none());
+        let stats = archive_stats(&conn).unwrap();
+        assert_eq!(
+            stats["archived_total"], 0,
+            "hard-delete path archives nothing"
+        );
+    }
+
+    #[test]
+    fn size_gc_nonpositive_cap_is_disabled() {
+        let conn = test_db();
+        let m = sized_memory("a", "sgc", Tier::Long, 5, 1000);
+        insert(&conn, &m).unwrap();
+        // A zero / negative cap is treated as disabled (no-op), never a
+        // total wipe.
+        assert_eq!(size_gc(&conn, "sgc", 0, true).unwrap(), 0);
+        assert_eq!(size_gc(&conn, "sgc", -1, true).unwrap(), 0);
+        assert!(get(&conn, &m.id).unwrap().is_some(), "row untouched");
+    }
+
+    #[test]
+    fn size_gc_is_namespace_scoped() {
+        // Eviction must only touch the target namespace.
+        let conn = test_db();
+        let target = sized_memory("t", "sgc-a", Tier::Long, 1, 2000);
+        let other = sized_memory("o", "sgc-b", Tier::Short, 1, 2000);
+        insert(&conn, &target).unwrap();
+        insert(&conn, &other).unwrap();
+
+        let evicted = size_gc(&conn, "sgc-a", 500, true).unwrap();
+        assert_eq!(evicted, 1, "only the target namespace row evicted");
+        assert!(get(&conn, &target.id).unwrap().is_none());
+        assert!(
+            get(&conn, &other.id).unwrap().is_some(),
+            "other namespace untouched even though it is over the same cap"
+        );
     }
 
     #[test]

@@ -100,6 +100,20 @@ pub struct CompactionConfig {
     /// globally.
     #[serde(default)]
     pub reflection_pass: reflection_pass::ReflectionPassConfig,
+    /// v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap for size-GC eviction.
+    ///
+    /// `None` (the default) disables byte-pressure eviction entirely,
+    /// matching the `enabled = false` opt-in posture of the rest of the
+    /// compaction surface. When `Some(cap)` with `cap > 0`, the curator's
+    /// size-GC pass evicts (archive-before-delete, restorable) the
+    /// lowest-value memories in each scanned namespace whose live corpus
+    /// (`length(title)+length(content)+length(metadata)` summed) exceeds
+    /// `cap`, until the namespace is back under the cap. Pure SQL ranking
+    /// — deterministic and LLM-free. Distinct from the per-agent K8 write
+    /// quota (`AI_MEMORY_MAX_STORAGE_BYTES`): this is a per-namespace
+    /// eviction trigger, not a write gate.
+    #[serde(default)]
+    pub max_corpus_bytes: Option<i64>,
 }
 
 fn default_cosine_threshold() -> f32 {
@@ -112,6 +126,7 @@ impl Default for CompactionConfig {
             enabled: false,
             cosine_threshold: default_cosine_threshold(),
             reflection_pass: reflection_pass::ReflectionPassConfig::default(),
+            max_corpus_bytes: None,
         }
     }
 }
@@ -178,6 +193,13 @@ pub struct CuratorReport {
     /// `_curator/reports` JSON self-report.
     #[serde(default)]
     pub personas_generated: usize,
+    /// v0.8.0 Pillar-2.5 (#1709) — count of memories evicted by the
+    /// size-GC (corpus byte-cap) pass this cycle. Zero when
+    /// `compaction.max_corpus_bytes` is `None`, in dry-run, or when no
+    /// scanned namespace exceeded its cap. The pass archives victims
+    /// before deleting them, so the count is restorable from the archive.
+    #[serde(default)]
+    pub memories_evicted_size_gc: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -228,6 +250,16 @@ pub fn run_once(
         .filter(|m| needs_curation(m, cfg))
         .collect();
     report.memories_eligible = eligible.len();
+
+    // v0.8.0 Pillar-2.5 (#1709) — size-GC (corpus byte-cap eviction).
+    // Pure SQL, LLM-free, and independent of the autonomy pass output, so
+    // it runs on EVERY cycle that has `compaction.max_corpus_bytes` set —
+    // including cycles with no LLM configured. Placed before the no-LLM
+    // early-return below precisely so byte-pressure eviction is NOT
+    // silently skipped on LLM-less deployments (the helper itself gates on
+    // cap.is_some() && !dry_run). Best-effort: per-namespace errors land
+    // in report.errors, never aborting the cycle.
+    run_size_gc_pass(conn, &candidates, cfg, &mut report);
 
     let Some(llm_client) = llm else {
         report.errors.push("no LLM client configured".to_string());
@@ -359,6 +391,61 @@ pub fn run_once(
     );
 
     Ok(report)
+}
+
+/// v0.8.0 Pillar-2.5 (#1709) — size-GC pass driver.
+///
+/// Gated on `cfg.compaction.max_corpus_bytes.is_some()` (a positive cap)
+/// AND `!cfg.dry_run` (dry-run must never mutate). For each distinct
+/// namespace in the cycle's candidate batch — filtered by the same
+/// include / exclude / `_`-prefix rules the rest of the curator honours
+/// — calls [`crate::storage::size_gc`] with `archive = true` so victims
+/// are restorable. Accumulates the evicted count into
+/// `report.memories_evicted_size_gc`. Best-effort: a per-namespace
+/// size_gc error is pushed to `report.errors` and the next namespace
+/// continues, matching the auto_tag / contradiction / persona passes.
+///
+/// LLM-free + deterministic (pure SQL ranking inside `size_gc`), so this
+/// runs on every cycle with a cap set, including LLM-less deployments.
+fn run_size_gc_pass(
+    conn: &Connection,
+    candidates: &[Memory],
+    cfg: &CuratorConfig,
+    report: &mut CuratorReport,
+) {
+    let Some(cap) = cfg.compaction.max_corpus_bytes else {
+        return;
+    };
+    if cap <= 0 || cfg.dry_run {
+        return;
+    }
+
+    // Distinct namespaces in the candidate set, honouring the curator's
+    // namespace scoping (skip `_`-prefixed + respect include / exclude).
+    use std::collections::BTreeSet;
+    let mut namespaces: BTreeSet<&str> = BTreeSet::new();
+    for mem in candidates {
+        let ns = mem.namespace.as_str();
+        if ns.starts_with('_') {
+            continue;
+        }
+        if !cfg.include_namespaces.is_empty() && !cfg.include_namespaces.iter().any(|n| n == ns) {
+            continue;
+        }
+        if cfg.exclude_namespaces.iter().any(|n| n == ns) {
+            continue;
+        }
+        namespaces.insert(ns);
+    }
+
+    for ns in namespaces {
+        match crate::storage::size_gc(conn, ns, cap, true) {
+            Ok(evicted) => report.memories_evicted_size_gc += evicted,
+            Err(e) => report
+                .errors
+                .push(format!("size_gc failed for namespace {ns}: {e}")),
+        }
+    }
 }
 
 /// Issue #816 — auto-persona sweep helper.
@@ -1628,6 +1715,109 @@ mod tests {
         assert!(r2.memories_scanned >= 1);
         assert_eq!(r2.memories_eligible, 0);
         assert_eq!(r2.operations_attempted, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-2.5 (#1709) — size-GC pass wiring in run_once.
+    // size_gc is LLM-free, so these run with `llm = None` (the pass runs
+    // before the no-LLM early-return). Long-tier rows are used because the
+    // curator candidate scan only collects mid + long tier.
+    // -----------------------------------------------------------------
+
+    /// Build a long-tier row with `content_len` bytes of payload in `ns`
+    /// at the given priority — predictable corpus arithmetic for the cap.
+    fn make_sized_curator_memory(
+        ns: &str,
+        title: &str,
+        priority: i32,
+        content_len: usize,
+    ) -> Memory {
+        let mut m = make_eligible_memory(ns, title);
+        m.priority = priority;
+        m.content = "x".repeat(content_len);
+        m
+    }
+
+    #[test]
+    fn run_once_size_gc_evicts_and_increments_counter() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        // Two ~1KB long-tier rows; lower-priority is the eviction victim.
+        let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
+        let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
+        db::insert(&conn, &low).unwrap();
+        db::insert(&conn, &high).unwrap();
+
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["sgc-ns".to_string()],
+            compaction: CompactionConfig {
+                max_corpus_bytes: Some(1500),
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        // No LLM needed — size_gc is pure SQL and runs before the early-return.
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(
+            report.memories_evicted_size_gc, 1,
+            "one lowest-value row evicted, counter incremented"
+        );
+        assert!(
+            db::get(&conn, &low.id).unwrap().is_none(),
+            "low-priority evicted"
+        );
+        assert!(
+            db::get(&conn, &high.id).unwrap().is_some(),
+            "high-priority kept"
+        );
+    }
+
+    #[test]
+    fn run_once_size_gc_none_cap_does_not_evict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let m = make_sized_curator_memory("sgc-ns", "a", 1, 5000);
+        db::insert(&conn, &m).unwrap();
+
+        // Default compaction → max_corpus_bytes = None → disabled.
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["sgc-ns".to_string()],
+            ..CuratorConfig::default()
+        };
+        assert!(cfg.compaction.max_corpus_bytes.is_none());
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(report.memories_evicted_size_gc, 0, "None cap = no eviction");
+        assert!(db::get(&conn, &m.id).unwrap().is_some(), "row untouched");
+    }
+
+    #[test]
+    fn run_once_size_gc_dry_run_does_not_evict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
+        let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
+        db::insert(&conn, &low).unwrap();
+        db::insert(&conn, &high).unwrap();
+
+        let cfg = CuratorConfig {
+            dry_run: true,
+            include_namespaces: vec!["sgc-ns".to_string()],
+            compaction: CompactionConfig {
+                max_corpus_bytes: Some(1500),
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(report.memories_evicted_size_gc, 0, "dry_run evicts nothing");
+        assert!(
+            db::get(&conn, &low.id).unwrap().is_some(),
+            "dry_run keeps low"
+        );
+        assert!(
+            db::get(&conn, &high.id).unwrap().is_some(),
+            "dry_run keeps high"
+        );
     }
 
     /// A multi-row cycle records multiple `operations_attempted` and the
