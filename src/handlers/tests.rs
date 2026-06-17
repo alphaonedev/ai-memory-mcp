@@ -7794,9 +7794,10 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
     let msg = &v["messages"][0];
     assert_eq!(msg["title"], "ping");
     // `from` is the resolved sender — `handle_notify` calls
-    // `identity::resolve_agent_id(None, mcp_client)` which synthesizes
-    // `ai:<client>@<host>:pid-N` when only `mcp_client` is set. We
-    // accept both the bare and synthesized forms.
+    // `identity::resolve_agent_id(None, mcp_client)` which synthesizes the
+    // durable `ai:<client>@<host>` form when only `mcp_client` is set
+    // (#1720 B1 — pid-free for restart-stable ownership). We accept both the
+    // bare and synthesized forms.
     let from = msg["from"].as_str().unwrap();
     assert!(
         from == "alice" || from.starts_with("ai:alice@"),

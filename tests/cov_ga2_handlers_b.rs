@@ -347,8 +347,9 @@ async fn inbox_populated_via_notify_round_trips() {
     assert_eq!(body["agent_id"], json!("bob"));
     assert_eq!(body["count"], json!(1));
     // `handle_notify` resolves the sender through `resolve_agent_id`,
-    // which derives an `ai:alice@<host>:pid-…` form from the bare
-    // header value — assert the substring rather than an exact match.
+    // which derives the durable `ai:alice@<host>` form from the bare
+    // header value (#1720 B1 — pid-free) — assert the substring rather
+    // than an exact match.
     let from = body["messages"][0]["from"].as_str().unwrap_or_default();
     assert!(
         from.contains("alice"),

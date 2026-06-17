@@ -674,9 +674,29 @@ with agent registration (Task 1.3, upcoming).
    `metadata.agent_id` embedded in an MCP store request)
 2. `AI_MEMORY_AGENT_ID` environment variable
 3. (MCP only) Value captured from `initialize.clientInfo.name` →
-   `ai:<client>@<hostname>:pid-<pid>`
-4. `host:<hostname>:pid-<pid>-<uuid8>` (stable per-process)
-5. `anonymous:pid-<pid>-<uuid8>` (fallback if hostname unavailable)
+   `ai:<client>@<hostname>` (**durable**; pid-free since #1720 B1)
+4. `host:<hostname>` (**durable** host-scoped default; pid-free since #1720 B1)
+5. `anonymous:pid-<pid>-<uuid8>` (ephemeral fallback if hostname unavailable)
+
+> **#1720 B1 — durable owner stamps (Op-0 posture).** Steps 3 + 4
+> intentionally omit the live `pid`/`uuid` discriminator so the owner id is
+> **stable across process restarts**. The default substrate posture is
+> single-operator trust-all reads (`resolve_read_visibility_caller` → `None`
+> when `AI_MEMORY_AGENT_ID` is unset, so the read-path ownership filter is
+> skipped). A pid-suffixed stamp would change every boot — and the moment an
+> operator opts in to enforced-multi-agent reads by setting
+> `AI_MEMORY_AGENT_ID`, every pre-existing `scope=private` row owned by the
+> old `host:<host>:pid-N` id would be orphaned (un-ownable by any live
+> caller), self-locking the operator out of their own private memories.
+> Safe opt-in rests on three pieces: durable stamps (B1), the `ai-memory
+> reown` re-ownership tool (B2), and the boot lockout guard (B3). Per-agent
+> isolation across processes on one host is achieved by giving each agent a
+> distinct explicit `AI_MEMORY_AGENT_ID` (step 2), NOT the process
+> discriminator (`process_discriminator()` now backs only the ephemeral
+> anonymous principals). This changes the default owner id on a live
+> deployment — new rows get the stable id; old pid-suffixed rows keep theirs
+> until `ai-memory reown` — but is non-breaking because filtering is OFF by
+> default.
 
 **HTTP daemon mode** is multi-tenant, so there is no process-level default:
 
@@ -703,10 +723,14 @@ tools that enforce per-row `scope=private` ownership — `memory_session_start`,
 `memory_list`, `memory_search`, `memory_recall` — resolve their *visibility
 caller* through a separate, narrower ladder (`crate::identity::resolve_read_visibility_caller`):
 `AI_MEMORY_AGENT_ID` if set + shape-valid, else `None` (trust-all). The
-pid-synthesized `ai:<client>@<host>:pid-<pid>` clientInfo id is deliberately
-NOT used here — it embeds the live PID, so it could never equal the
+clientInfo/host synthesized ids are deliberately NOT used here — historically
+(pre-#1720 B1) they embedded the live PID, so they could never equal the
 `metadata.agent_id` an earlier process wrote, which would hide every
-prior-session private row from its own owner (#1469). When the caller is
+prior-session private row from its own owner (#1469). #1720 B1 makes the
+*write*-side clientInfo/host stamps pid-free + durable, but this read ladder
+still resolves the caller from `AI_MEMORY_AGENT_ID` only — durable stamps make
+a future enforced-read opt-in safe, they do not flip filtering on. When the
+caller is
 `Some`, rows owned by a different agent and marked `scope=private` (or with no
 scope key, which defaults to private) are dropped via
 `crate::visibility::is_visible_to_caller` before serialization (#1468);
@@ -722,9 +746,11 @@ trust-all reads.
 - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by
   `ai-memory mine` alongside the caller's `agent_id`
 
-**Defaults that leak:** The fallback `host:<hostname>:pid-…` exposes hostname and
-PID. When writing memories to a shared or upstream database, set `--agent-id` or
-`AI_MEMORY_AGENT_ID` to something scrubbed (an opaque identifier, `alice`, etc.).
+**Defaults that leak:** The fallback `host:<hostname>` exposes the hostname
+(since #1720 B1 it no longer carries the PID). When writing memories to a
+shared or upstream database, set `--agent-id` or `AI_MEMORY_AGENT_ID` to
+something scrubbed (an opaque identifier, `alice`, etc.), or set
+`AI_MEMORY_ANONYMIZE=1` to use the `anonymous:pid-…` fallback instead.
 Tracking issue: #198.
 
 ## Adding New Functionality

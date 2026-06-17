@@ -13,8 +13,8 @@
 //! 1. Explicit id passed by the caller (`--agent-id`, MCP tool param)
 //! 2. `AI_MEMORY_AGENT_ID` environment variable
 //! 3. (MCP only) `initialize.clientInfo.name` captured at handshake time
-//!    → `ai:<client>@<hostname>:pid-<pid>`
-//! 4. `host:<hostname>:pid-<pid>-<uuid8>` — stable per-process
+//!    → `ai:<client>@<hostname>` (durable; #1720 B1)
+//! 4. `host:<hostname>` — durable host-scoped default (#1720 B1)
 //! 5. `anonymous:pid-<pid>-<uuid8>` — fallback if hostname is unavailable
 //!
 //! # Precedence (HTTP)
@@ -24,6 +24,33 @@
 //! 1. Request body `agent_id` field
 //! 2. `X-Agent-Id` request header
 //! 3. Per-request `anonymous:req-<uuid8>` (emits a `WARN` log line)
+//!
+//! # Owner-stamp durability — Op-0 posture (#1720 B1)
+//!
+//! The owner-stamp fallbacks (steps 3 + 4) are **stable across process
+//! restarts**: they intentionally OMIT the live `pid` discriminator. This
+//! is the Op-0 posture — the substrate's default is **single-operator,
+//! trust-all** reads (`resolve_read_visibility_caller` returns `None` when
+//! `AI_MEMORY_AGENT_ID` is unset, so the read-path ownership filter is
+//! skipped entirely). Under that default the host-scoped owner id need not
+//! be unique-per-process; it needs to be *durable*, so that a memory written
+//! by one process (e.g. `host:laptop`) is still owned by that same id after
+//! a restart. A pid-suffixed stamp would change every boot, which — the
+//! moment an operator opts in to enforced multi-agent reads by setting
+//! `AI_MEMORY_AGENT_ID` — would orphan every pre-existing `scope=private`
+//! row (the row's owner `host:laptop:pid-123` can never again equal a live
+//! caller), locking the operator out of their own private memories (#1720).
+//!
+//! Safe opt-in to enforced-multi-agent therefore rests on three pieces:
+//! durable owner stamps (this B1 change), the `ai-memory reown` tool (B2)
+//! to re-own legacy pid-suffixed rows, and the boot lockout guard (B3) that
+//! warns when `AI_MEMORY_AGENT_ID` is set but live rows are owned by a
+//! different / pid-suffixed id. Per-agent isolation across processes on one
+//! host is achieved by giving each agent a distinct explicit
+//! `AI_MEMORY_AGENT_ID` (step 2), NOT by the process discriminator.
+//! `process_discriminator()` is unchanged and still backs the anonymous
+//! fallback (step 5) + anonymous HTTP request ids, which are deliberately
+//! ephemeral / non-attributable.
 //!
 //! # Trust
 //!
@@ -97,8 +124,13 @@ fn anonymize_default_enabled() -> bool {
 }
 
 /// Returns a stable-for-this-process discriminator of the form
-/// `<pid>-<uuid8>`. Used to make process-level defaults collision-free
-/// when many agents share a host (e.g., 25 MCP clients on one machine).
+/// `pid-<pid>-<uuid8>`. Backs the **ephemeral / non-attributable**
+/// principals only: the `anonymous:` fallback (step 5) and the anonymous
+/// HTTP request id. Since #1720 B1 the durable owner stamps (steps 3 + 4)
+/// no longer use it — they are intentionally pid-free so they survive a
+/// process restart (see the module-level "Op-0 posture" docs). Per-process
+/// uniqueness for attributable identities is the operator's job via an
+/// explicit `AI_MEMORY_AGENT_ID`, not this discriminator.
 pub fn process_discriminator() -> &'static str {
     static DISCRIMINATOR: OnceLock<String> = OnceLock::new();
     DISCRIMINATOR.get_or_init(|| {
@@ -181,29 +213,35 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
         return Ok(v);
     }
 
-    // 3. MCP clientInfo-synthesized id (only when the MCP server captured it)
+    // 3. MCP clientInfo-synthesized id (only when the MCP server captured it).
+    //    DURABLE: omits the live pid so the same client on the same host
+    //    resolves to the SAME owner id across process restarts (#1720 B1 —
+    //    a pid-suffixed stamp orphans the owner's own private rows the
+    //    moment enforced-multi-agent reads are enabled). Per-agent isolation
+    //    is via an explicit `AI_MEMORY_AGENT_ID` (step 2), not the pid.
     if let Some(client) = mcp_client
         && !client.is_empty()
     {
         let client_s = sanitize_component(client);
         let host_s =
             hostname_opt().map_or_else(|| "unknown".to_string(), |h| sanitize_component(&h));
-        let pid = std::process::id();
-        let id = format!("ai:{client_s}@{host_s}:pid-{pid}");
+        let id = format!("ai:{client_s}@{host_s}");
         if validate::validate_agent_id(&id).is_ok() {
             return Ok(id);
         }
         // Fall through to host: default if the synthesized id is somehow invalid
     }
 
-    // 4. host:<hostname>:<discriminator> — unless operator opted out (#198).
+    // 4. host:<hostname> — durable host-scoped default, unless operator opted
+    //    out (#198). DURABLE: omits the pid/uuid discriminator (#1720 B1) for
+    //    the same reason as step 3 — stability across restarts so an opt-in to
+    //    enforced reads doesn't lock the operator out of pre-existing rows.
     if !anonymize_default_enabled()
         && let Some(host) = hostname_opt()
     {
         let host_s = sanitize_component(&host);
         if !host_s.is_empty() {
-            let discriminator = process_discriminator();
-            let id = format!("host:{host_s}:{discriminator}");
+            let id = format!("host:{host_s}");
             if validate::validate_agent_id(&id).is_ok() {
                 return Ok(id);
             }
@@ -449,7 +487,38 @@ mod tests {
         }
         let id = resolve_agent_id(None, Some("claude-code")).unwrap();
         assert!(id.starts_with("ai:claude-code@"));
-        assert!(id.contains(":pid-"));
+        // #1720 B1 — the clientInfo owner stamp is DURABLE: it must NOT embed
+        // the live pid, so it is stable across process restarts and a future
+        // enforced-read opt-in does not orphan the owner's own private rows.
+        assert!(
+            !id.contains(":pid-"),
+            "clientInfo stamp must be pid-free (durable) per #1720 B1; got: {id}"
+        );
+    }
+
+    #[test]
+    fn resolve_default_host_id_is_durable_pid_free() {
+        // #1720 B1 — the host-scoped fallback (step 4) must be stable across
+        // restarts: no pid/uuid discriminator. Skip when the host opts into
+        // the anonymize default (which legitimately yields anonymous:pid-…).
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        if let Some(rest) = id.strip_prefix("host:") {
+            assert!(
+                !rest.contains(":pid-") && !rest.contains("pid-"),
+                "host fallback must be pid-free (durable) per #1720 B1; got: {id}"
+            );
+        } else {
+            // No hostname available → anonymous fallback, which is allowed to
+            // carry the ephemeral discriminator.
+            assert!(id.starts_with("anonymous:"), "got: {id}");
+        }
     }
 
     #[test]
