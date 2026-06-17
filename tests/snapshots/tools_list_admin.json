@@ -38,6 +38,12 @@
               "null"
             ]
           },
+          "lifecycle_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metadata": {
             "additionalProperties": true,
             "type": [
@@ -523,6 +529,12 @@
           },
           "id": {
             "type": "string"
+          },
+          "lifecycle_state": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "metadata": {
             "additionalProperties": true,
