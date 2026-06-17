@@ -7,19 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.8.0 (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
-In progress on `release/v0.8.0`. Schema advances v57 → **v66** (additive: actions /
+In progress on `release/v0.8.0`. Schema advances v57 → **v67** (additive: actions /
 action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
 routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
 6 → 9 relations at v63; the typed-cognition `memories.lifecycle_state` column at
 v64; the `memory_links` signature-trigger restore at v65; the
 `governance_rules.severity` CHECK extends `refuse`/`warn`/`log` → `+escalate`
-for the §22 PE-5 `Decision::Escalate` verdict at v66). Surface grows to **93 MCP tools** at `--profile full` and
+for the §22 PE-5 `Decision::Escalate` verdict at v66; the
+`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A)). Surface grows to **93 MCP tools** at `--profile full` and
 **27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
 lifecycle surface adds only permissive optional fields to the existing
 `memory_store` / `memory_update` request structs).
 
 ### Added
 
+- **#1720 A — owner-keyed `scope=private` visibility (cross-tenant leak closed, both adapters).**
+  The three divergent `scope=private` read predicates (recall / search / list) are collapsed
+  onto ONE owner-keyed canonical check: a private row is visible to a caller iff
+  `metadata.agent_id == caller` OR `metadata.target_agent_id == caller` (the inbox carve-out),
+  NOT namespace-keyed. Closes a confirmed cross-tenant private-memory leak on the recall + search
+  paths. sqlite enforces it via `storage::visibility_clause` (`src/storage/mod.rs`) +
+  the `scope_idx` / `agent_id_idx` / `target_agent_id_idx` generated columns (schema v67);
+  the postgres predicates are owner-keyed to match. The canonical owner check is
+  `crate::visibility::is_visible_to_caller` (`src/visibility.rs`). Admin / curator
+  `bypass_visibility` trusts-all on recall + search (A7). Leak + bypass regression tests on
+  both backends (`tests/visibility_private_leak_1720.rs`,
+  `tests/sqlite_admin_bypass_visibility_a7_1720.rs`).
+- **#1720 B — durable agent identity + safe enforced-multi-agent opt-in.**
+  B1: the `resolve_agent_id` owner-stamp fallbacks (MCP `clientInfo` + host) are now pid-free +
+  durable (`ai:<client>@<host>`, `host:<host>`) so ownership survives process restarts (the Op-0
+  posture; `process_discriminator()` still backs only the ephemeral `anonymous:` principals).
+  B2: the new `ai-memory reown` CLI rewrites `metadata.agent_id` across a namespace
+  (`--dry-run` / `--claim-unowned`, both adapters). B3: a boot-time owner-lockout guard
+  (`storage::lockout::count_private_rows_hidden_from` + `identity::enforce_owner_lockout_guard`)
+  WARNs — or refuses under `AI_MEMORY_REQUIRE_OWNED_ROWS` — when `AI_MEMORY_AGENT_ID` is set but
+  pre-existing private rows are owned by a different / pid-suffixed / unowned id, naming
+  `ai-memory reown` as the fix.
+- **#1720 D — curator reflections stamped explicit `collective` scope.**
+  Curator-written reflections (`ReflectionPass::summarize`) now carry an explicit `collective`
+  scope instead of the accidental default-private-owned-by-curator (which leaked under trust-all
+  and went operator-invisible under enforcement); the owner stays the curator for attribution.
+  The read posture (D1) is decided + documented: the curator keeps its `bypass_visibility` read
+  for substrate maintenance under the single-operator default.
 - **#1720 C — per-namespace `required_scope` (refuse-only) governance knob, both adapters + SDK parity.**
   A new `CorePolicy.required_scope: Option<MemoryScope>` knob (rides in the existing
   `metadata.governance` blob; no schema migration). When a namespace standard pins it, a
