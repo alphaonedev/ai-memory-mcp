@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 62;
+const CURRENT_SCHEMA_VERSION: i32 = 63;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1314,8 +1314,11 @@ impl PostgresStore {
         if current_version < 61 {
             self.migrate_v61().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 62 {
             self.migrate_v62().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v63().await?;
         }
 
         Ok(())
@@ -2565,7 +2568,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("v57 drop memories_content_fts", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — a
+        // mid-ladder crash after this commit must resume at v58, not skip
+        // to the head (same crash-safety invariant as the v61/v62 arms).
+        record_schema_version(&mut tx, 57).await?;
 
         tx.commit()
             .await
@@ -2619,7 +2625,8 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("v58 create idx_recall_observations_namespace", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 58).await?;
 
         tx.commit()
             .await
@@ -2686,7 +2693,8 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("v59 action-substrate DDL", e))?;
         }
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 59).await?;
 
         tx.commit()
             .await
@@ -2744,7 +2752,8 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("v60 signed-signals DDL", e))?;
         }
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 60).await?;
 
         tx.commit()
             .await
@@ -2793,7 +2802,11 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("v61 attested-checkpoints DDL", e))?;
         }
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v61
+        // is no longer the schema tip (v63 typed-cognition relations).
+        // Mirrors the v35 precedent so a v60 DB migrating up records
+        // 61/62/63 in sequence rather than jumping straight to the tip.
+        record_schema_version(&mut tx, 61).await?;
 
         tx.commit()
             .await
@@ -2862,7 +2875,9 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("v62 routines DDL", e))?;
         }
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v62
+        // is no longer the schema tip (v63 typed-cognition relations).
+        record_schema_version(&mut tx, 62).await?;
 
         tx.commit()
             .await
@@ -2871,6 +2886,62 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v62 applied (#1709 Pillar 1: routines/routine_runs storage foundation)"
+        );
+        Ok(())
+    }
+
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition relation taxonomy
+    /// extension. Extends the closed `memory_links.relation` CHECK with
+    /// `decomposes_into` / `depends_on` / `advances` so the
+    /// Goal/Plan/Step `MemoryKind` vocabulary can be wired into a typed
+    /// plan graph (6 -> 9 relations). Postgres twin of the SQLite
+    /// `0053_v63_memory_links_typed_cognition_relations.sql`
+    /// full-table-rebuild; postgres uses the native
+    /// `ALTER TABLE ... DROP CONSTRAINT ... ADD CONSTRAINT ...` rather
+    /// than a rebuild (mirrors the v35 `derives_from` CHECK-extend).
+    /// Idempotent: re-running `DROP CONSTRAINT IF EXISTS` + re-`ADD`
+    /// under the migration tx is replay-safe, and fresh installs carry
+    /// the extended constraint inline from `postgres_schema.sql`. The
+    /// 9-relation set MUST stay byte-identical to the SQLite CHECK,
+    /// `postgres_schema.sql`, and `crate::validate::VALID_RELATIONS`.
+    async fn migrate_v63(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v63 tx", e))?;
+
+        // Drop + re-add the closed-taxonomy CHECK under the pinned
+        // `_wt1a` constraint name (unchanged since v35) with the
+        // extended 9-relation set. `DROP CONSTRAINT IF EXISTS` keeps the
+        // migration idempotent / replay-safe.
+        for stmt in [
+            "ALTER TABLE memory_links \
+             DROP CONSTRAINT IF EXISTS memory_links_relation_check_wt1a",
+            "ALTER TABLE memory_links \
+             ADD CONSTRAINT memory_links_relation_check_wt1a \
+             CHECK (relation IN ('related_to', 'supersedes', 'contradicts', \
+                                 'derived_from', 'reflects_on', 'derives_from', \
+                                 'decomposes_into', 'depends_on', 'advances'))",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v63 memory_links relation CHECK extend", e))?;
+        }
+
+        // Literal arm version (crash-safety) — the terminal arm stamps its
+        // own number too, so adding v64 needs no edit here (see v57 note).
+        record_schema_version(&mut tx, 63).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v63 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v63 applied (#1709 Pillar 2: memory_links.relation CHECK \
+             extended with decomposes_into / depends_on / advances)"
         );
         Ok(())
     }

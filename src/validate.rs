@@ -129,6 +129,15 @@ const VALID_RELATIONS: &[&str] = &[
     // `memories.atom_of` FK. Distinct from `derived_from` (consolidation
     // provenance).
     crate::models::MemoryLinkRelation::DerivesFrom.as_str(),
+    // v0.8.0 Pillar-2 (Typed Cognition, #1709) — the Goal/Plan/Step
+    // wiring relations. `decomposes_into` (parent -> child structural),
+    // `depends_on` (sibling ordering / prerequisite), `advances` (child
+    // -> ancestor progress). MUST stay byte-identical to the three SQL
+    // CHECK sites (sqlite bootstrap SCHEMA + sqlite migration v63 +
+    // postgres constraint) or migrations/validation drift.
+    crate::models::MemoryLinkRelation::DecomposesInto.as_str(),
+    crate::models::MemoryLinkRelation::DependsOn.as_str(),
+    crate::models::MemoryLinkRelation::Advances.as_str(),
 ];
 
 fn is_valid_rfc3339(s: &str) -> bool {

@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 pub(crate) const REL_CONTRADICTS: &str = "contradicts";
 pub(crate) const REL_REFLECTS_ON: &str = "reflects_on";
 pub(crate) const REL_DERIVES_FROM: &str = "derives_from";
+// v0.8.0 Pillar-2 (Typed Cognition, #1709) — the Goal/Plan/Step wiring
+// relations. Each spelling is ≥ 10 chars and is referenced from both
+// `from_str` and `as_str` (plus the SQL CHECK mirror in
+// `crate::validate::VALID_RELATIONS`), so it follows the named-const
+// pattern of the long relations above rather than a bare literal.
+pub(crate) const REL_DECOMPOSES_INTO: &str = "decomposes_into";
+pub(crate) const REL_DEPENDS_ON: &str = "depends_on";
+pub(crate) const REL_ADVANCES: &str = "advances";
 
 /// v0.7 Track H — attestation level for a `memory_links` row.
 ///
@@ -141,6 +149,36 @@ pub enum MemoryLinkRelation {
     /// memories into one and emits `derived_from` edges from the
     /// consolidated memory back to each source.
     DerivesFrom,
+    /// v0.8.0 Pillar-2 (Typed Cognition, #1709) — a parent breaks down
+    /// into children: a `Goal` decomposes_into `Plan`s; a `Plan`
+    /// decomposes_into `Step`s (the [`crate::models::MemoryKind`]
+    /// Goal/Plan/Step vocabulary). Directionality is **parent → child**
+    /// (`source_id` = the parent, `target_id` = the child) — the
+    /// structural inverse of the provenance relations `DerivedFrom` /
+    /// `ReflectsOn` / `DerivesFrom`, which all point newer/derived →
+    /// older/source. This is the structural decomposition spine of a
+    /// typed-cognition plan tree.
+    DecomposesInto,
+    /// v0.8.0 Pillar-2 (Typed Cognition, #1709) — an ordering /
+    /// prerequisite edge between SIBLINGS: a `Step` depends_on another
+    /// `Step` that must complete first. Directionality is **dependent →
+    /// prerequisite** (`source_id` = the step that waits, `target_id` =
+    /// the step it waits on). This is the memory-link-vocab analogue of
+    /// the action-DAG `EdgeType::Requires` ordering concept, but it is
+    /// the typed `memory_links` RELATION — deliberately distinct from
+    /// and NOT a duplicate of `crate::models::action::EdgeType`, which
+    /// models the executable action graph rather than the memory graph.
+    DependsOn,
+    /// v0.8.0 Pillar-2 (Typed Cognition, #1709) — a child contributes
+    /// progress toward an ANCESTOR: a `Step` advances a `Plan` or
+    /// `Goal`. Directionality is **child → ancestor** (`source_id` =
+    /// the contributing child, `target_id` = the ancestor it advances).
+    /// It is the progress-rollup counterpart of `DecomposesInto`: where
+    /// `DecomposesInto` runs parent → child to describe structure,
+    /// `advances` runs child → ancestor to describe contribution, so a
+    /// traversal can roll Step completion up into Plan / Goal progress
+    /// without re-walking the decomposition spine in reverse.
+    Advances,
 }
 
 impl MemoryLinkRelation {
@@ -159,6 +197,9 @@ impl MemoryLinkRelation {
             "derived_from" => Some(Self::DerivedFrom),
             REL_REFLECTS_ON => Some(Self::ReflectsOn),
             REL_DERIVES_FROM => Some(Self::DerivesFrom),
+            REL_DECOMPOSES_INTO => Some(Self::DecomposesInto),
+            REL_DEPENDS_ON => Some(Self::DependsOn),
+            REL_ADVANCES => Some(Self::Advances),
             _ => None,
         }
     }
@@ -175,6 +216,9 @@ impl MemoryLinkRelation {
             Self::DerivedFrom => "derived_from",
             Self::ReflectsOn => REL_REFLECTS_ON,
             Self::DerivesFrom => REL_DERIVES_FROM,
+            Self::DecomposesInto => REL_DECOMPOSES_INTO,
+            Self::DependsOn => REL_DEPENDS_ON,
+            Self::Advances => REL_ADVANCES,
         }
     }
 
@@ -192,14 +236,15 @@ impl MemoryLinkRelation {
     /// a new variant requires bumping this const AND the [`all()`]
     /// slice in the same commit, or the parity test pin in
     /// `tests/memory_link_relation_count_invariant.rs` fails the build.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 9;
 
     /// Canonical enumeration of every variant in declaration order
     /// (`related_to`, `supersedes`, `contradicts`, `derived_from`,
-    /// `reflects_on`, `derives_from`). Use this anywhere external code
-    /// would otherwise hand-roll the list — kg traversal, federation
-    /// peer-handshake, capability advertisement, parity tests. The
-    /// `length == COUNT` invariant is pinned by
+    /// `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`,
+    /// `advances`). Use this anywhere external code would otherwise
+    /// hand-roll the list — kg traversal, federation peer-handshake,
+    /// capability advertisement, parity tests. The `length == COUNT`
+    /// invariant is pinned by
     /// `tests/memory_link_relation_count_invariant.rs`.
     #[must_use]
     pub const fn all() -> &'static [Self; Self::COUNT] {
@@ -210,6 +255,9 @@ impl MemoryLinkRelation {
             Self::DerivedFrom,
             Self::ReflectsOn,
             Self::DerivesFrom,
+            Self::DecomposesInto,
+            Self::DependsOn,
+            Self::Advances,
         ]
     }
 }
@@ -233,7 +281,8 @@ impl std::str::FromStr for MemoryLinkRelation {
         Self::from_str(s).ok_or_else(|| {
             format!(
                 "invalid memory_link relation '{s}' (expected one of: related_to, \
-                 supersedes, contradicts, derived_from, reflects_on, derives_from)"
+                 supersedes, contradicts, derived_from, reflects_on, derives_from, \
+                 decomposes_into, depends_on, advances)"
             )
         })
     }
@@ -698,6 +747,9 @@ mod tests {
             ("derived_from", MemoryLinkRelation::DerivedFrom),
             ("reflects_on", MemoryLinkRelation::ReflectsOn),
             ("derives_from", MemoryLinkRelation::DerivesFrom),
+            ("decomposes_into", MemoryLinkRelation::DecomposesInto),
+            ("depends_on", MemoryLinkRelation::DependsOn),
+            ("advances", MemoryLinkRelation::Advances),
         ] {
             // Disambiguate against the inherent `from_str` (which returns
             // Option) by going through the `FromStr` trait fully qualified.
@@ -707,6 +759,32 @@ mod tests {
             // Display impl round-trip.
             assert_eq!(format!("{v}"), s);
         }
+    }
+
+    #[test]
+    fn memory_link_relation_typed_cognition_relations_round_trip() {
+        // v0.8.0 Pillar-2 (#1709) — the Goal/Plan/Step wiring relations
+        // round-trip through as_str/from_str, are enumerated by all(),
+        // and never displace the RelatedTo default.
+        for (s, v) in [
+            ("decomposes_into", MemoryLinkRelation::DecomposesInto),
+            ("depends_on", MemoryLinkRelation::DependsOn),
+            ("advances", MemoryLinkRelation::Advances),
+        ] {
+            assert_eq!(MemoryLinkRelation::from_str(s), Some(v));
+            assert_eq!(v.as_str(), s);
+            assert_eq!(format!("{v}"), s);
+            assert!(
+                MemoryLinkRelation::all().contains(&v),
+                "all() must enumerate the typed-cognition variant {v:?}"
+            );
+        }
+        // Unknown still returns None and the default is unchanged.
+        assert_eq!(MemoryLinkRelation::from_str("decomposes"), None);
+        assert_eq!(MemoryLinkRelation::from_str("advance"), None);
+        assert_eq!(MemoryLinkRelation::default(), MemoryLinkRelation::RelatedTo);
+        assert_eq!(MemoryLinkRelation::all().len(), MemoryLinkRelation::COUNT);
+        assert_eq!(MemoryLinkRelation::COUNT, 9);
     }
 
     #[test]

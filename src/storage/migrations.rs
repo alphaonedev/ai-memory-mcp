@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 62).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 63).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -238,8 +238,10 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- v23 RAISE-trigger validation to a column-level invariant. Closed
     -- taxonomy mirrors `crate::validate::VALID_RELATIONS`. v36 (WT-1-A)
     -- extended the closed set with `derives_from` for atomisation
-    -- provenance edges (atom -> parent).
-    CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from'))
+    -- provenance edges (atom -> parent). v63 (v0.8.0 Pillar-2 typed
+    -- cognition, #1709) extended it with `decomposes_into` / `depends_on`
+    -- / `advances` for the Goal/Plan/Step wiring relations.
+    CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances'))
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -596,6 +598,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       `idx_memories_expires` + USE TEMP B-TREE FOR ORDER BY
 //       (P1-measured 141 ms -> 0.06 ms at 100k rows). Pure additive
 //       CREATE INDEX IF NOT EXISTS — fully idempotent.
+//
+//   * v63 — #1709 (v0.8.0 Pillar-2 Typed Cognition). Extend the closed
+//       `memory_links.relation` CHECK taxonomy with `decomposes_into`
+//       (parent -> child structural), `depends_on` (sibling ordering /
+//       prerequisite), and `advances` (child -> ancestor progress) so
+//       the Goal/Plan/Step MemoryKind vocabulary can be wired into a
+//       typed plan graph. 6 -> 9 relations. SQLite has no column-level
+//       `ADD CONSTRAINT CHECK`, so this is a full-table-rebuild on
+//       `memory_links` (the same dance as v33's 0027 + v36's
+//       `MIGRATION_V36_REBUILD_LINKS_SQL`). The rebuild SQL
+//       (`0053_v63_memory_links_typed_cognition_relations.sql`) is
+//       gated behind an `existing_sql.contains('decomposes_into')`
+//       idempotency probe so fresh installs (the bootstrap SCHEMA ships
+//       the 9-relation CHECK inline) and replays skip it. Pre-existing
+//       link rows are preserved verbatim — the extension only widens
+//       the accepted set.
 /// Current schema tip — the single source of truth for the sqlite
 /// schema version. The literal lives HERE and nowhere else on the
 /// sqlite side; every migration arm/gate/stamp/meta entry references
@@ -603,7 +621,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 62;
+const CURRENT_SCHEMA_VERSION: i64 = 63;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1098,6 +1116,13 @@ const MIGRATION_V61_SQLITE: &str =
 // (`routines` / `routine_runs`). Additive CREATE TABLE/INDEX IF NOT
 // EXISTS — replay-safe.
 const MIGRATION_V62_SQLITE: &str = include_str!("../../migrations/sqlite/0052_v62_routines.sql");
+// v0.8.0 Pillar 2 (#1709) — typed-cognition relation taxonomy extension.
+// Full-table-rebuild of `memory_links` adding `decomposes_into` /
+// `depends_on` / `advances` to the closed `relation` CHECK (6 -> 9).
+// Mirrors the v33 (0027) and v36 (MIGRATION_V36_REBUILD_LINKS_SQL)
+// rebuild dance exactly; the only delta is the extended CHECK clause.
+const MIGRATION_V63_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0053_v63_memory_links_typed_cognition_relations.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2588,6 +2613,68 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V62_SQLITE)?;
         }
 
+        if version < 63 {
+            // v0.8.0 Pillar 2 (#1709) — typed-cognition relation
+            // taxonomy extension. Full-table-rebuild of `memory_links`
+            // adding `decomposes_into` / `depends_on` / `advances` to
+            // the closed `relation` CHECK clause (6 -> 9). SQLite has no
+            // `ALTER TABLE ADD CONSTRAINT CHECK` for a column-level
+            // CHECK, so we rebuild — the same dance as the v33 (0027)
+            // and v36 (`MIGRATION_V36_REBUILD_LINKS_SQL`) extensions.
+            //
+            // Idempotency probe: the rebuild runs only when
+            // `memory_links` exists AND its declared SQL does not yet
+            // carry the extended taxonomy. Fresh installs (the bootstrap
+            // SCHEMA already ships the 9-relation CHECK inline) and a
+            // previous run of this migration both leave the
+            // `decomposes_into` substring present, so the rebuild is
+            // skipped — mirrors the v36 `existing_sql.contains(...)`
+            // probe.
+            let memory_links_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'memory_links')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if memory_links_exists {
+                let existing_sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master \
+                         WHERE type = 'table' AND name = 'memory_links'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let needs_rebuild = !existing_sql
+                    .contains(crate::models::MemoryLinkRelation::DecomposesInto.as_str());
+                if needs_rebuild {
+                    // Full rebuild: table CHECK is still the pre-v63
+                    // 6-relation set. The migration SQL also drops the
+                    // stale v23 relation RAISE triggers (see below).
+                    conn.execute_batch(MIGRATION_V63_SQLITE)?;
+                } else {
+                    // Fresh install / replay: the table already carries
+                    // the 9-relation CHECK inline from the bootstrap
+                    // SCHEMA, so no rebuild is needed — BUT the legacy
+                    // v23 RAISE triggers (`memory_links_ck_relation_*`,
+                    // migration 0023) can still be present from the v23
+                    // ladder arm, and they enforce the OLD six-relation
+                    // set with a `RAISE(ABORT, ...)`. Left in place they
+                    // would refuse `decomposes_into` / `depends_on` /
+                    // `advances` even though the column CHECK admits
+                    // them. Drop them so the column-level CHECK is the
+                    // sole relation gate post-v63 (matches the rebuild
+                    // path, which drops them too).
+                    conn.execute_batch(
+                        "DROP TRIGGER IF EXISTS memory_links_ck_relation_ins; \
+                         DROP TRIGGER IF EXISTS memory_links_ck_relation_upd;",
+                    )?;
+                }
+            }
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -2834,6 +2921,109 @@ mod tests {
         assert_eq!(
             super::current_schema_version_for_tests(),
             CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v63_rebuild_preserves_links_and_accepts_typed_cognition_relations() {
+        // v0.8.0 Pillar-2 (#1709) — the load-bearing risk: the v63
+        // full-table-rebuild of `memory_links` must preserve every
+        // pre-existing row AND begin accepting the three typed-cognition
+        // relations. We build a pre-v63 (6-relation CHECK) `memory_links`
+        // table directly, seed two memories + a `related_to` link, stamp
+        // the DB at v62, then run the migrate ladder and assert:
+        //   (a) the seeded link survives the rebuild verbatim, and
+        //   (b) a fresh `decomposes_into` link inserts cleanly post-v63.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // The full SCHEMA already ships the v63 (9-relation) memory_links
+        // shape, so drop it and recreate the pre-v63 form to exercise the
+        // rebuild rather than the idempotent skip path.
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute_batch(
+            "DROP TABLE memory_links;
+             CREATE TABLE memory_links (
+                 source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 relation     TEXT NOT NULL DEFAULT 'related_to',
+                 created_at   TEXT NOT NULL,
+                 valid_from   TEXT,
+                 valid_until  TEXT,
+                 observed_by  TEXT,
+                 signature    BLOB,
+                 attest_level TEXT,
+                 PRIMARY KEY (source_id, target_id, relation),
+                 CHECK (relation IN ('related_to', 'supersedes', 'contradicts',
+                                     'derived_from', 'reflects_on', 'derives_from'))
+             );",
+        )
+        .expect("recreate pre-v63 memory_links");
+
+        // Seed two memories so the FK-constrained link can reference them.
+        let now = "2026-06-16T00:00:00Z";
+        for (id, title) in [("src-1", "source"), ("tgt-1", "target")] {
+            conn.execute(
+                "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+                 VALUES (?1, 'long', 'v63-test', ?2, 'body', ?3, ?3)",
+                params![id, title, now],
+            )
+            .expect("seed memory");
+        }
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES ('src-1', 'tgt-1', 'related_to', ?1)",
+            params![now],
+        )
+        .expect("seed pre-v63 link");
+
+        // Stamp the DB at v62 so the migrate ladder runs the v63 arm.
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (62)", [])
+            .expect("stamp v62");
+
+        super::migrate(&conn).expect("migrate to v63 succeeds");
+
+        // (final) version reached the tip.
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // (a) the pre-existing link survived the rebuild verbatim.
+        let surviving: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links \
+                 WHERE source_id = 'src-1' AND target_id = 'tgt-1' AND relation = 'related_to'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count surviving link");
+        assert_eq!(
+            surviving, 1,
+            "v63 rebuild must preserve the pre-existing related_to link"
+        );
+
+        // (b) a new decomposes_into link inserts cleanly under the
+        // extended CHECK.
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES ('src-1', 'tgt-1', ?1, ?2)",
+            params![
+                crate::models::MemoryLinkRelation::DecomposesInto.as_str(),
+                now
+            ],
+        )
+        .expect("decomposes_into link must insert cleanly post-v63");
+
+        // And the rebuild re-created the relation index the rebuild drops.
+        let rel_index_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_links_relation')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("probe idx_links_relation");
+        assert!(
+            rel_index_present,
+            "v63 rebuild must recreate idx_links_relation"
         );
     }
 

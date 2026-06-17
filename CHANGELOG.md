@@ -7,9 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.8.0 (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
-In progress on `release/v0.8.0`. Schema advances v57 → **v62** (additive: actions /
+In progress on `release/v0.8.0`. Schema advances v57 → **v63** (additive: actions /
 action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
-routine_runs at v62). Surface grows to **93 MCP tools** at `--profile full` and
+routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
+6 → 9 relations at v63). Surface grows to **93 MCP tools** at `--profile full` and
 **27 hook lifecycle events**.
 
 ### Added
@@ -21,6 +22,15 @@ routine_runs at v62). Surface grows to **93 MCP tools** at `--profile full` and
   `pre_signal_send`/`post_signal_ack` hook events); attested checkpoints
   (`crate::checkpoints`, Ed25519-attested resolution = separation-of-duties,
   4 MCP tools). All on both the sqlite and postgres SAL adapters.
+- **Pillar-2 typed-cognition link relations** — the closed
+  `memory_links.relation` CHECK taxonomy extends 6 → 9 with `decomposes_into`
+  (parent → child structural: a Goal decomposes_into Plans, a Plan
+  decomposes_into Steps), `depends_on` (sibling ordering / prerequisite: a Step
+  depends_on another Step), and `advances` (child → ancestor progress: a Step
+  advances a Plan/Goal) so the Goal/Plan/Step `MemoryKind` vocabulary can be
+  wired into a typed plan graph. Schema v63 on both adapters (sqlite
+  full-table-rebuild migration `0053`, postgres `migrate_v63` CHECK-extend);
+  `MemoryLinkRelation` + `validate::VALID_RELATIONS` carry the matching set.
 - **§2.5 attested — read-time attested-provenance surfacing**
   ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709), reframed
   from #1715). `memory_recall` now composes provenance at read from already-merged

@@ -188,6 +188,11 @@ fn sqlite_check_constraint_accepts_every_canonical_relation() {
         "contradicts",
         "derived_from",
         "reflects_on",
+        "derives_from",
+        // v0.8.0 Pillar-2 (#1709) typed-cognition wiring relations.
+        "decomposes_into",
+        "depends_on",
+        "advances",
     ] {
         raw_insert_link(&conn, &src, &tgt, rel)
             .unwrap_or_else(|e| panic!("canonical relation `{rel}` was rejected: {e}"));
@@ -247,6 +252,11 @@ fn sqlite_check_clause_visible_in_table_schema() {
         "contradicts",
         "derived_from",
         "reflects_on",
+        "derives_from",
+        // v0.8.0 Pillar-2 (#1709) typed-cognition wiring relations.
+        "decomposes_into",
+        "depends_on",
+        "advances",
     ] {
         assert!(
             ddl.contains(rel),

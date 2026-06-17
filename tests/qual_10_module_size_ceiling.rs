@@ -369,7 +369,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // / routine_run_set_state). Measured 19_367 + 133 headroom; new SAL
     // surface for postgres-backed daemons. The 19k-LOC module split remains
     // the highest-priority manageability target under EPIC #1709.
-    ("src/store/postgres.rs", 19_500),
+    // 2026-06-16 — bumped 19_500 → 19_640 by the v0.8.0 #1709 Pillar-2
+    // typed-cognition migration: the `migrate_v63` method (the
+    // memory_links.relation CHECK-extend) + its dispatch arm + the two
+    // literal-version stamps on v61/v62. Measured 19_540 + ~100 headroom.
+    ("src/store/postgres.rs", 19_640),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -536,7 +540,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // const + the doc-comment bump pushed the file to 3_854. Growth
     // justified: one additive schema bump (signals storage foundation).
     // 3_900 = 3_854 + 46 headroom.
-    ("src/storage/migrations.rs", 3_900),
+    // 2026-06-16 (v0.8.0 #1709 Pillar-2) — bumped 3_900 → 4_120: the v63
+    // typed-cognition relation taxonomy extension — the MIGRATION_V63_SQLITE
+    // include_str const, the v63 ladder arm (rebuild + stale-trigger-drop
+    // probe), the SCHEMA/version-ladder doc-comments, and the
+    // `v63_rebuild_preserves_links_and_accepts_typed_cognition_relations`
+    // row-preservation regression test pushed the file to 4_069. Growth
+    // justified: one schema bump + its load-bearing rebuild coverage.
+    // 4_120 = 4_069 + 51 headroom.
+    ("src/storage/migrations.rs", 4_120),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

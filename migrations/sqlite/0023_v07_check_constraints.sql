@@ -101,20 +101,25 @@ END;
 -- defense-in-depth (see `apply_check_constraint_triggers`). Keep the
 -- closed set here in sync with the column-level CHECK and the
 -- Rust-side enum so taxonomy drift surfaces loudly on either side.
+-- v0.8.0 Pillar-2 (schema v63, #1709) extended the closed set with the
+-- Goal/Plan/Step typed-cognition wiring relations `decomposes_into` /
+-- `depends_on` / `advances`; this SQL re-applies on every open, so the
+-- nine-relation set here MUST match the column-level CHECK, the
+-- postgres constraint, and `crate::validate::VALID_RELATIONS`.
 CREATE TRIGGER IF NOT EXISTS memory_links_ck_relation_ins
 BEFORE INSERT ON memory_links
 FOR EACH ROW
-WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from')
+WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances')
 BEGIN
-    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on/derives_from');
+    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on/derives_from/decomposes_into/depends_on/advances');
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_links_ck_relation_upd
 BEFORE UPDATE OF relation ON memory_links
 FOR EACH ROW
-WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from')
+WHEN NEW.relation NOT IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances')
 BEGIN
-    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on/derives_from');
+    SELECT RAISE(ABORT, 'CHECK constraint failed: memory_links.relation must be one of related_to/supersedes/contradicts/derived_from/reflects_on/derives_from/decomposes_into/depends_on/advances');
 END;
 
 -- ---------- memory_links.attest_level ----------
