@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 64;
+const CURRENT_SCHEMA_VERSION: i32 = 65;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1320,8 +1320,11 @@ impl PostgresStore {
         if current_version < 63 {
             self.migrate_v63().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 64 {
             self.migrate_v64().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v65().await?;
         }
 
         Ok(())
@@ -2987,6 +2990,40 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v64 applied (#1709 Pillar 2: memories.lifecycle_state \
              + archived_memories mirror)"
+        );
+        Ok(())
+    }
+
+    /// v65 — postgres version-stamp no-op (#1709).
+    ///
+    /// The v65 schema bump restores the sqlite memory_links
+    /// `(attest_level, signature)` atomicity TRIGGERS that the v63
+    /// sqlite full-table-rebuild dropped. Postgres enforces the same
+    /// invariant through a real column CHECK constraint
+    /// (#902 / `migrate_v47`), and the v63 postgres migration swapped
+    /// only the relation CHECK in place — it never touched the
+    /// signature constraint. So there is nothing to apply on postgres;
+    /// this arm exists purely to keep `CURRENT_SCHEMA_VERSION` in
+    /// lockstep with sqlite (the v51 / v55 / v56 version-stamp-no-op
+    /// precedent). Records the LITERAL 65 (crash-safety invariant).
+    async fn migrate_v65(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v65 tx", e))?;
+
+        record_schema_version(&mut tx, 65).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v65 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v65 applied (#1709: sqlite-only memory_links \
+             signature-trigger restore; postgres signature CHECK already intact — \
+             version-stamp no-op)"
         );
         Ok(())
     }
