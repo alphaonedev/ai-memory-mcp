@@ -11,7 +11,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ai-memory &mdash; persistent memory, knowledge graph, and governance for AI agents</title>
+<title>ai-memory &mdash; attested, endpoint-resident memory for AI agents (local-first, model-neutral)</title>
 <meta name="description" content="ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. Typed memory, a knowledge graph with temporal validity, signed reflections, programmable hooks. One Rust binary. Runs on a laptop, a server rack, a region — or a cellphone. Apache-2.0.">
 <meta name="theme-color" content="#000">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/">
@@ -375,16 +375,16 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <header class="hero">
   <div class="container">
     <span class="badge">v0.7.1 &middot; attested-cortex &middot; Apache-2.0</span>
-    <h1>Persistent memory, a knowledge graph, and governance for <span class="accent">AI agents</span>.</h1>
+    <h1>Memory for AI agents that runs on <span class="accent">your hardware</span> &mdash; and proves what they did.</h1>
     <p class="subtitle">
-      ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. <strong>Typed memory.</strong> A <strong>knowledge graph</strong> with temporal validity. <strong>Signed reflections</strong> on an append-only audit chain. One Rust binary &mdash; runs on a laptop, a server rack, a region, or a <strong>cellphone</strong>.
+      ai-memory is the <strong>endpoint-resident, model-neutral</strong> memory layer for AI agents &mdash; local-first Rust&nbsp;+&nbsp;SQLite on <strong>your own hardware</strong>, from servers to mobile to fully <strong>air-gapped</strong>, with no cloud dependency and no phone-home. Every state-changing operation lands in an <strong>append-only, tamper-evident audit chain</strong> &mdash; enable attestation and each write is Ed25519-signed at the source &mdash; so you can reconstruct what any agent knew, and when. Neutral by construction: any <strong>MCP</strong> client (Claude, GPT, Grok, Gemini, Llama, local models) reads and writes the same store. It doesn't just retrieve &mdash; it <strong>governs</strong>: typed, deterministic refusals at the endpoint, so the substrate can be stopped and audited without corrupting the record.
     </p>
     <div class="meta">
-      <span>74 MCP tools</span>
-      <span>89 HTTP routes (75 unique paths)</span>
-      <span>80 CLI subcommands</span>
-      <span>Ed25519 attested</span>
+      <span>Local-first &middot; air-gappable</span>
+      <span>Model-neutral (MCP)</span>
+      <span>Ed25519 audit chain</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
+      <span>74 MCP tools &middot; 80 CLI</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
       <span><a href="evidence.html" style="color:#6ee7ff">15,951 / 0 regression suite</a></span>
     </div>
@@ -394,6 +394,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <a class="cta ghost" href="#why">Why ai-memory?</a>
     </div>
     <pre style="display:inline-block;text-align:left;margin-top:1.75rem;font-size:.82rem;padding:.7rem 1.1rem"><code>brew install alphaonedev/tap/ai-memory   <span style="color:#666"># or: cargo install ai-memory</span></code></pre>
+    <p style="color:var(--text-dim);font-size:.78rem;line-height:1.55;max-width:680px;margin:1.5rem auto 0">
+      Append-only <code>signed_events</code> chain with a SHA-256 cross-row hash &mdash; verify any window with <code>ai-memory verify-chain</code>. Local-first; no telemetry, no phone-home. Complements your identity plane (Entra&nbsp;/&nbsp;Okta&nbsp;/&nbsp;SailPoint) &mdash; it doesn't replace it. Security is self-attested; no third-party audit yet &mdash; <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md" style="color:#6ee7ff">read the threat model</a>.
+    </p>
   </div>
 </header>
 
