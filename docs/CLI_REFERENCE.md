@@ -777,6 +777,36 @@ Pair with `ai-memory doctor` (section "Embeddings Reachability
 (#1598)") to verify the target backend is reachable and authenticated
 *before* a long re-embed run.
 
+### `reown` — re-stamp `metadata.agent_id` ownership (#1720 B2)
+
+Rewrites the `metadata.agent_id` owner stamp on every memory in a
+namespace to `<agent_id>`. This is the operational tool to establish
+**durable ownership** before turning on enforced-multi-agent
+`scope=private` reads (#1720): the owner-keyed visibility filter (A)
+drops rows owned by a different agent, so an operator who enables it
+against a namespace of legacy / foreign-owned rows would lock
+themselves out of their own data. `reown` claims the namespace first.
+
+```bash
+ai-memory reown --namespace prod --to alice --dry-run   # count, no writes
+ai-memory reown --namespace prod --to alice             # re-own owned rows
+ai-memory reown --namespace prod --to alice --claim-unowned --json
+```
+
+| Flag | Notes |
+|---|---|
+| `--namespace <ns>` | The namespace whose memories are re-owned. **EXACT** match — the subtree is NOT included. |
+| `--to <agent_id>` | The new owner stamped onto `metadata.agent_id`. Validated against the wire agent_id shape; a malformed value is rejected before any write. |
+| `--dry-run` | Count the matched rows and print the plan WITHOUT writing. |
+| `--claim-unowned` | ALSO re-own rows with an absent / empty `metadata.agent_id` (the legacy "owned by nobody" class). Without it, only rows with an existing owner are rewritten. |
+| `--json` | Emit the machine-readable `{matched, rewritten, dry_run}` report instead of the human summary. |
+
+Only `metadata.agent_id` is touched (a single-key `json_set` on sqlite
+/ `jsonb_set` on postgres); every other metadata key is preserved and
+the `agent_id_idx` generated column auto-reprojects the new owner.
+Both sqlite + postgres. See the §"Agent Identity" durable-stamp
+posture in `CLAUDE.md` for why this precedes enabling enforced reads.
+
 ### `identity` — Ed25519 keypair management (H-track)
 
 | Subcommand | Notes |
