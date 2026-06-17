@@ -93,6 +93,17 @@ CREATE TABLE IF NOT EXISTS memories (
     agent_id_idx      TEXT GENERATED ALWAYS AS (
         metadata ->> 'agent_id'
     ) STORED,
+    -- v0.8.0 #1720 A1 — generated column indexing metadata.target_agent_id
+    -- so the A2 owner-keyed `private` visibility clause resolves inbox /
+    -- share rows via `agent_id_idx = ?caller OR target_agent_id_idx =
+    -- ?caller` as a real index lookup rather than a json-extract scan.
+    -- Mirrors SQLite migration v67 (a VIRTUAL generated column there;
+    -- STORED here because Postgres has no VIRTUAL generated columns).
+    -- Fresh schemas carry this inline; existing schemas pick it up via
+    -- migrate_v67().
+    target_agent_id_idx TEXT GENERATED ALWAYS AS (
+        metadata ->> 'target_agent_id'
+    ) STORED,
     -- v0.7.0 M15 — schema v30: enforce that metadata is a JSON object.
     -- The two generated columns above silently project NULL when
     -- metadata is anything else (array / scalar / NULL), which masks
@@ -216,6 +227,9 @@ CREATE INDEX IF NOT EXISTS memories_scope_idx_idx ON memories (scope_idx);
 -- v0.6.0 / Ultrareview #342 — agent_id_idx (generated column) + created_at.
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id_idx);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);
+-- v0.8.0 #1720 A1 — target_agent_id_idx (generated column) for the A2
+-- owner-keyed `private` visibility clause. Mirrors SQLite migration v67.
+CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id ON memories (target_agent_id_idx);
 -- v0.6.3.1 P2 / G4 — partial index on embedding_dim for hot-spot doctor
 -- queries and the per-namespace "first write establishes dim" check.
 CREATE INDEX IF NOT EXISTS idx_memories_embedding_dim

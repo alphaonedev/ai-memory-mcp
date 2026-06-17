@@ -422,7 +422,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // per-adapter merge SQL — the merge is the same pure Rust fn the sqlite
     // path uses. Measured 19_926 + ~34 headroom. The 19k-LOC module split
     // remains the highest-priority manageability target.
-    ("src/store/postgres.rs", 19_960),
+    // 2026-06-17 (#1720 A1) — bumped 19_960 → 20_050: the migrate_v67
+    // STORED-generated target_agent_id_idx column + index arm, its dispatch
+    // wiring, and the v67 doc-comment landed the file at 20_027.
+    // 20_050 = 20_027 + 23 headroom.
+    ("src/store/postgres.rs", 20_050),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -621,7 +625,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity`
     // row + signed-column + index preservation regression test, landing
     // the file at 4_338. 4_360 = 4_338 + 22 headroom.
-    ("src/storage/migrations.rs", 4_360),
+    // 2026-06-17 (#1720 A1) — bumped 4_360 → 4_480: the v67 ladder arm
+    // (probe-then-add VIRTUAL generated target_agent_id_idx + index), the
+    // v67 history doc-comment, the historical-replay column/index
+    // assertions, and the v67_target_agent_id_idx_projects_* generated-
+    // column regression test landed the file at 4_455. 4_480 = 4_455 + 25
+    // headroom.
+    ("src/storage/migrations.rs", 4_480),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

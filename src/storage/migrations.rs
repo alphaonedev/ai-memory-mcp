@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 66).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 67).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -627,6 +627,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       the 9-relation CHECK inline) and replays skip it. Pre-existing
 //       link rows are preserved verbatim — the extension only widens
 //       the accepted set.
+//
+//   * v67 = #1720 A1 (v0.8.0 Workstream-A) — index `metadata.target_agent_id`
+//       so the A2 owner-keyed `private` visibility clause can resolve
+//       inbox/share rows via `agent_id_idx = ?caller OR
+//       target_agent_id_idx = ?caller` as a real two-column index
+//       lookup rather than a per-row json-extract scan. Mirrors the v14
+//       `agent_id_idx` precedent exactly: a probe-then-add VIRTUAL
+//       generated column (`json_extract(metadata, '$.target_agent_id')`
+//       guarded by `json_valid(metadata)`) plus
+//       `idx_memories_target_agent_id`. ADD COLUMN of a VIRTUAL
+//       generated column is in-place — it spends no row bytes and does
+//       NOT rebuild the table, so the `memories` CHECK triggers + every
+//       existing index survive. This unit ONLY adds the column + index;
+//       the visibility-predicate change itself is A2 (separate). Postgres
+//       twin (`migrate_v67`) uses a STORED generated column because
+//       Postgres has no VIRTUAL generated columns.
 /// Current schema tip — the single source of truth for the sqlite
 /// schema version. The literal lives HERE and nowhere else on the
 /// sqlite side; every migration arm/gate/stamp/meta entry references
@@ -634,7 +650,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 66;
+const CURRENT_SCHEMA_VERSION: i64 = 67;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2756,7 +2772,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V65_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 66 {
             // v66 = v0.8.0 §22 PE-5 (#697) — extend the
             // governance_rules.severity CHECK (refuse/warn/log →
             // +escalate) for the Decision::Escalate verdict primitive.
@@ -2785,6 +2801,48 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             if has_governance_rules {
                 conn.execute_batch(MIGRATION_V66_SQLITE)?;
             }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v67 = #1720 A1 (v0.8.0 Workstream-A) — index
+            // `metadata.target_agent_id` for the A2 owner-keyed `private`
+            // visibility clause (`agent_id_idx = ?caller OR
+            // target_agent_id_idx = ?caller`). Mirrors the v14
+            // `agent_id_idx` arm exactly: a probe-then-add VIRTUAL
+            // generated column plus a conventional B-tree index.
+            //
+            // The expression is guarded by `json_valid(metadata)` so rows
+            // with legacy / corrupt metadata stay writable (SQLite
+            // evaluates generated-column expressions on every write that
+            // touches the source column, and an uncaught `json_extract`
+            // failure would turn every corrupt-row write into a
+            // constraint error). NULL on rows whose metadata omits
+            // `target_agent_id` (non-inbox / non-share rows).
+            //
+            // ADD COLUMN of a VIRTUAL generated column is IN-PLACE — it
+            // spends no row bytes and does NOT rebuild the table, so the
+            // `memories` CHECK triggers + every existing index survive.
+            // This unit ONLY adds the column + index; the
+            // visibility-predicate change itself is A2 (separate).
+            let has_target_agent_id_idx: bool = conn
+                .prepare("SELECT target_agent_id_idx FROM memories LIMIT 0")
+                .is_ok();
+            if !has_target_agent_id_idx {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN target_agent_id_idx TEXT \
+                     GENERATED ALWAYS AS (\
+                         CASE WHEN json_valid(metadata) \
+                         THEN json_extract(metadata, '$.target_agent_id') \
+                         ELSE NULL END\
+                     ) VIRTUAL",
+                    [],
+                )?;
+            }
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id \
+                 ON memories(target_agent_id_idx)",
+                [],
+            )?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
@@ -2992,6 +3050,59 @@ mod tests {
     fn migrate_brings_v0_to_current() {
         let conn = fresh_db_via_migrate();
         assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v67_target_agent_id_idx_projects_metadata_target_agent_id() {
+        // #1720 A1 — the v67 VIRTUAL generated column must project
+        // `metadata.target_agent_id` so the A2 owner-keyed `private`
+        // visibility clause can resolve inbox/share rows via the
+        // `idx_memories_target_agent_id` index. Verify on a fully
+        // migrated DB: a row WITH the key projects it; a row WITHOUT the
+        // key projects NULL (non-inbox / non-share rows).
+        let conn = fresh_db_via_migrate();
+
+        // Row carrying metadata.target_agent_id (an inbox / share row).
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, \
+             created_at, updated_at, metadata) \
+             VALUES ('m_inbox', 'short', 'ns', 'inbox_title', 'c', \
+             '2026-06-17T00:00:00Z', '2026-06-17T00:00:00Z', \
+             '{\"target_agent_id\":\"ai:bob\"}')",
+            [],
+        )
+        .expect("insert inbox row");
+
+        // Row with no target_agent_id key (an ordinary memory).
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, \
+             created_at, updated_at, metadata) \
+             VALUES ('m_plain', 'short', 'ns', 'plain_title', 'c', \
+             '2026-06-17T00:00:00Z', '2026-06-17T00:00:00Z', \
+             '{\"agent_id\":\"ai:alice\"}')",
+            [],
+        )
+        .expect("insert plain row");
+
+        // The generated column projects the key for the inbox row.
+        let projected: Option<String> = conn
+            .query_row(
+                "SELECT target_agent_id_idx FROM memories WHERE id = 'm_inbox'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("select target_agent_id_idx for inbox row");
+        assert_eq!(projected.as_deref(), Some("ai:bob"));
+
+        // The generated column is NULL for the row without the key.
+        let plain: Option<String> = conn
+            .query_row(
+                "SELECT target_agent_id_idx FROM memories WHERE id = 'm_plain'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("select target_agent_id_idx for plain row");
+        assert_eq!(plain, None);
     }
 
     #[test]
@@ -3963,6 +4074,12 @@ mod tests {
         assert!(index_exists(&conn, "idx_memories_list_order"));
         assert!(index_exists(&conn, "idx_memories_ns_list_order"));
         assert!(index_exists(&conn, "idx_archived_ns_archived_at"));
+        // v67 (#1720 A1) — target_agent_id_idx VIRTUAL generated column +
+        // its index. The legacy v1 schema has neither, so their presence
+        // here proves the v67 migration arm actually ran. Mirrors the v14
+        // agent_id_idx proof shape above.
+        assert!(column_exists(&conn, "memories", "target_agent_id_idx"));
+        assert!(index_exists(&conn, "idx_memories_target_agent_id"));
     }
 
     #[test]
